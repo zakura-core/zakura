@@ -1,0 +1,59 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 9f71e35495..eb53636e27 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -305,6 +305,7 @@ fn build_header_sync_reactor(
+         lifecycle: lifecycle_rx,
+         actions: actions_tx,
+         pending_port_operations: PortOperations::default(),
++        exiting: false,
+         locator_capacity: std::sync::Arc::new(Semaphore::new(
+             zakura_header_chain::MAX_STAGED_TARGETS_V1,
+         )),
+@@ -361,6 +362,10 @@ struct HeaderSyncReactor {
+     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
+     actions: mpsc::Sender<HeaderPortOperation>,
+     pending_port_operations: PortOperations,
++    // Mutation: set by the first locator reply, which then goes unhandled,
++    // and the reactor returns at once, before it handles anything else or
++    // retires any work.
++    exiting: bool,
+     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
+     locator_capacity: std::sync::Arc<Semaphore>,
+     locator_capacity_waiting: bool,
+@@ -536,6 +541,9 @@ impl HeaderSyncReactor {
+             }
+             // Inspect watches on every turn, even when peer queues never become empty.
+             self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
++            if self.exiting {
++                return;
++            }
+             // One item from each queue per turn prevents either queue monopolizing the loop.
+             // Session readers wait for connection acknowledgement before publishing peer events.
+             let mut handled_event = false;
+@@ -579,6 +587,9 @@ impl HeaderSyncReactor {
+                 } => {
+                     if let Some(completion) = completion {
+                         self.handle_port_completion(completion);
++                        if self.exiting {
++                            return;
++                        }
+                     }
+                 }
+                 permit = locator_capacity.acquire_owned(), if self.locator_capacity_waiting => {
+@@ -944,6 +955,15 @@ impl HeaderSyncReactor {
+     }
+ 
+     fn handle_port_completion(&mut self, outcome: StorageOutcome) {
++        if self.exiting {
++            return;
++        }
++        if let StorageOutcome::Completed { completion, .. } = &outcome {
++            if matches!(**completion, StorageCompletion::Locator { .. }) {
++                self.exiting = true;
++                return;
++            }
++        }
+         #[cfg(any(test, zakura_sim))]
+         let panicked = matches!(outcome, StorageOutcome::Panicked(_));
+         let call = match &outcome {

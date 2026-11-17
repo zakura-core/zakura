@@ -18,6 +18,11 @@ serves both the existing fleet dashboard and a narrow public API:
 - `GET /data` retains the existing fleet dashboard and watchdog response.
 - `GET /node/<name>` serves the per-node detail page.
 - `GET /data/node/<name>` returns that node's detail payload.
+- For a node that runs the [continuous profiler](../profiler/README.md) (its entry
+  sets `monitor = { profiler_url = "http://host:port" }`), the fleet table marks
+  it "profiled" and its node page adds a "CPU profile" section, whose requests
+  `GET /profile/<name>/api/...` forwards to the profiler. `GET /profile/<name>`
+  redirects to `/node/<name>#profile`.
 
 The public Ironwood response is unavailable with HTTP `503` if the service
 cannot verify a matching network, Ironwood pool, tip, or source client, or if
@@ -52,6 +57,101 @@ The probe collects a redacted tail of the node's `ERROR`/`WARN` log lines, but
 the page does not serve it unless the dashboard runs with `--expose-logs`. These
 dashboards are public and unauthenticated, so log text stays off by default even
 though peer addresses are already redacted on the node.
+
+### Block Propagation
+
+On a fleet whose nodes run the continuous profiler (`deploy/profiler/`), the
+dashboard also serves `/propagation`: for each recent block, when each node
+first heard of it and from which of our nodes or from outside, how long it
+then waited to ask, downloaded, verified, committed and told its peers, and
+every announcement between two of our nodes. Below that are medians per node
+and per pair of nodes over the blocks shown. The fleet page links to it, and
+every node name on it links to that node's own page (`/node/<name>`).
+Selecting a block in the list of recent blocks shows its path and puts it in
+the page address (`/propagation#block=<hash>`), which then leads to that block
+for as long as the nodes still report it.
+
+`/propagation/data` is the same as JSON. The dashboard asks each node's
+profiler for its recent blocks (`/api/propagation`) at most once every 10
+seconds, and `propagation.py` joins them by block hash on one time axis that
+starts when the first node heard of the block. A node that did not answer is
+listed as unreachable and the rest are still joined. Coverage counts include only
+configured profiled nodes. A block can be absent even when its profiler answers;
+only blocks recorded by every profiled node contribute to the complete-coverage
+timing summary.
+
+Times come from each node's own clock. The page shows each node's clock error
+as its time service reports it and marks a time between two nodes that is smaller than
+their combined error. A node whose trace clock disagrees with its log by more
+than 50 ms, as builds before the trace clock fix do, is placed by its log
+instead and marked.
+
+The page also says who served each block. In the selected block's table every
+node has a "Downloaded from" column, and its "First heard from" column names
+the outside peer that announced the block first when the node has written that
+connection's address (in a request it sent the same connection, matched by the
+connection's number). "Slowest downloads" lists the 50 slowest
+single attempts over the blocks shown, with the node that made it, the peer,
+its software, the block and its size; selecting one shows its block. "Peers
+outside the fleet" has one row per outside IP address, slowest first: its
+software (`/Zakura:1.8.7/` reads "Zakura 1.8.7", and zcashd's `/MagicBean:6.2.0/`
+reads "zcashd 6.2.0"), which of our nodes
+downloaded from it, how many attempts were recorded and how many legacy attempts
+failed, and the median, 9-in-10 and slowest time of the ones that delivered a block.
+"By software" groups the same downloads by the exact software name each peer
+sent, most peers first, with each version's peer count and the times of all its
+downloads.
+
+A peer is one of four kinds. One of our nodes, recognised by its Zakura label
+or by the address the node list reaches it at, is shown by name. A peer whose
+address the node did not record reads "address hidden": that is every peer
+until a node runs a build that writes download rows and has restarted with
+`expose_peer_addresses` on (`deploy/profiler/README.md`). A peer whose address
+is on the dashboard's private list (below) reads "private peer". Any other is
+an outside peer, shown by IP address.
+
+A peer's software is the name it sent in the legacy handshake. A peer that
+sent an empty name reads "no name sent". A Zakura peer the node dialled
+directly, without a legacy handshake first, sends no name at all and gets no
+upgrade row, so its downloads read "address hidden" and "Zakura, version not
+recorded".
+
+Limits: a legacy download time is in whole milliseconds and includes any wait
+behind other requests on the same connection. A peer that connects to us does
+so from a temporary port, so peers are told apart by IP address alone and two
+nodes behind one address are one row.
+
+The failure column is explicitly **Legacy failures**. Zakura downloads are recorded
+when a body arrives, so zero does not establish that a Zakura peer had no failed
+requests. Its existing range-unavailable event describes an entire request, which
+can include bodies already delivered; expanding it into per-block failures would
+overcount. Timeouts and range endings need request-level correlation before they
+can contribute comparable failure counts.
+
+**Private addresses.** The addresses in
+`/etc/zakura-mainnet-dashboard/private/addresses.json` are never shown. The
+list exists only on the dashboard host, so that is where they are dropped:
+when the nodes' records are joined, a download from such an address keeps its
+time and loses its address, its software and its Zakura label, however the
+node wrote the address (with a port, or as IPv4 inside IPv6). If the list is
+required and cannot be read, `/propagation/data` answers 503 and serves
+nothing. Like every JSON response, the result then passes the dashboard's
+address filter. The privacy check that runs after a Mac dashboard deploy
+(`audit_public_privacy` in `deploy/deployer/zakura-mac-cranelift-manager.py`)
+fetches `/propagation` and `/propagation/data` and fails if the address
+appears. Like the other fleet pages, both need the dashboard password when one
+is set. Anything new that shows peer addresses must do the same three things:
+drop the private ones where the list is, refuse to serve without it, and be
+added to that check.
+
+Legacy announcements between our nodes are only visible when the nodes run a
+build that writes `legacy_gossip.jsonl` and know each other's names
+(`fleet.py peer-names`). Without those, a legacy node still appears with its
+own stage times, and its source shows as outside the fleet.
+
+`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are
+installed beside `zakura-cluster-status.py`; the dashboard loads them only when a node in its
+list has a `profiler_url`.
 
 ### Tip Agreement and Orphan Pairs
 
@@ -233,14 +333,75 @@ is active, new failure alerts are logged locally but not posted to Slack.
 
 ## Release-State Availability
 
-Release-state pointer and metadata requests wait three minutes from the first
-observed timeout or HTTP 5xx response before alerting. Consecutive timeouts and
-5xx responses share the same timer, which survives watchdog restarts. A successful,
-valid check resets the timer. Recovery is posted only if a failure alert was sent.
-An active alert stays latched through transient fetch failures, so the next valid
-check can send its recovery without losing or duplicating the original alert.
-Other request failures and malformed, incomplete, or stale bundles still alert
-immediately. The freshness limit remains 48 hours.
+Release-state pointer and metadata requests wait one hour from the first failed
+fetch before alerting. Any failure counts, including timeouts, HTTP errors such as
+429 or 5xx, dropped connections, and unparsable responses. Consecutive failures
+share the same timer, which survives watchdog restarts. A successful, valid check
+resets the timer. Recovery is posted only if a failure alert was sent. An active
+alert stays latched through failed fetches, so the next valid check can send its
+recovery without losing or duplicating the original alert. Once both files load,
+unreadable metadata and incomplete or stale bundles still alert immediately. The
+freshness limit remains 48 hours.
+
+## Mainnet Difficulty Headroom
+
+The Mainnet fleet watchdog sends difficulty warnings and recoveries to the
+existing `#zakura-alerts` webhook when `difficulty_monitor = true` on the
+Mainnet fleet. It reads only our fleet's accepted tips; no explorer, external
+RPC, new secret or additional node RPC request is required. The collector
+includes the exact `difficulty_bits` from its existing accepted-tip header
+request, bound to that tip's hash and height.
+
+Headroom is the maximum admitted target from PR #1915 divided by the observed
+target. This equals observed difficulty divided by the fixed admission floor.
+Decisions use integer arithmetic; rounded ratios are for Slack display only.
+The reference target, multiplier and starting height have a CI coupling check
+against the node's Rust policy, so a policy update must update monitoring too.
+
+| Condition | Notification |
+| --- | --- |
+| Headroom below 2× for 15 minutes | Warning |
+| Headroom below 1.25× | Immediate critical escalation |
+| Headroom below 1× | Immediate floor-breach escalation |
+| Headroom above 2.25× for 15 minutes | Recovery |
+| Observation unavailable for 10 minutes | Separate monitoring-unavailable alert |
+
+The monitor selects the highest fresh Mainnet accepted tip and requires a
+second fleet node to corroborate its hash, or its sampled ancestry when the
+second node is behind. Conflicting tips or targets cannot establish health;
+tip-only reporters can corroborate a hash when another node supplies the
+target for that same highest hash, including the macOS verifier's tip report.
+Missing data at the highest tip cannot fall back to a lower, easier-to-monitor
+tip. Observations require fresh collection and node timestamps. A tip that
+does not advance in 10 minutes becomes unavailable even if a restarted
+collector refreshes its timestamps. Gaps over three minutes interrupt the
+warning and recovery holds. Unavailability preserves an existing difficulty
+incident, and restoring observations is distinct from difficulty recovery.
+Severity remains latched until the recovery condition, with one notification
+per escalation and no repeated posts for unchanged conditions.
+
+All fleet nodes may share the admission floor. If they all stop accepting
+blocks below it, this monitor cannot establish those unseen blocks' difficulty.
+It reports stale observations and retains the existing fleet stall alerts;
+an old accepted target never proves fresh health. A floor-breach alert is
+possible only when a fleet node actually accepts and reports such a block.
+Peer-supplied rejected headers are not an alert source. Operators should
+inspect fleet progress and prepare a reviewed policy update; the monitor
+never changes the floor or adds PagerDuty escalation.
+
+Incident timers and transitions share the existing durable fleet Slack queue.
+Slack failures and deployment suppression defer delivery without discarding
+alerts or recoveries. Existing webhook acknowledgement crash limitations apply.
+
+Roll out the collector update on the Mainnet dashboard before activating the
+watchdog configuration, and verify `difficulty_bits` on at least two advancing
+Mainnet nodes. The monitoring-only `fleet-deploy` operation updates the
+watchdog, not the dashboard; updating only that package leaves the source
+unavailable. Use the existing dashboard installation procedure and then deploy
+the monitoring package from an exact tested commit. Preserve incident state.
+Check the installed policy and fresh observations before testing labeled
+failure and recovery notifications in `#zakura-alerts` with temporary state.
+Activation and real-channel acceptance are separate from merging the code.
 
 ## NU7 Dashboard Availability
 

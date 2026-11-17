@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-fault-locator-unavailable.bin`, a fuzz-12 item 7 witness whose run
+# shows Failed(Locator, "unavailable"). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "8d479c32979083f7779b6dab067c8228683d81ce4afebdc3cd469221a038b398"
+scenario_sha256 = "189302b74adbd0ea8d33ef62e235d60c6a30ee99de3fdde88ff9f227ea78ddb6"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

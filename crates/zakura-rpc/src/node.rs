@@ -11,10 +11,9 @@
 //! with the crates that depend on it. Tests keep using the generic APIs with
 //! mock services.
 
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+#[cfg(feature = "indexer-rpc")]
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use futures::{future::BoxFuture, FutureExt};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -23,14 +22,18 @@ use tower::{buffer::Buffer, BoxError};
 use zakura_chain::{block, chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_consensus::RouterError;
 use zakura_network::AddressBook;
-use zakura_node_services::mempool::{self, MempoolTxSubscriber};
+use zakura_node_services::mempool;
+#[cfg(feature = "indexer-rpc")]
+use zakura_node_services::mempool::MempoolTxSubscriber;
 use zakura_state::{LatestChainTip, ReadStateService};
 
+#[cfg(feature = "indexer-rpc")]
+use crate::indexer;
 use crate::{
-    config, indexer,
+    config,
     methods::{LoggedLastEvent, RpcImpl},
     server::RpcServer,
-    MinedBlockEvent, PendingBlockRegistry,
+    EarlyMinedBlock, PendingBlockRegistry,
 };
 
 /// The node's buffered mempool service.
@@ -110,7 +113,7 @@ pub fn new_rpc_impl(
     user_agent: String,
     services: NodeRpcServices,
     last_warn_error_log_rx: LoggedLastEvent,
-    mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+    mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     pending_blocks: PendingBlockRegistry,
     end_of_support_height: Option<block::Height>,
 ) -> (NodeRpcImpl, JoinHandle<()>) {
@@ -165,6 +168,7 @@ pub fn start_admin_server(
 }
 
 /// Starts the node's indexer gRPC server. See [`indexer::server::init`].
+#[cfg(feature = "indexer-rpc")]
 pub fn start_indexer_server(
     listen_addr: SocketAddr,
     tls: Option<config::rpc::IndexerTlsConfig>,

@@ -210,9 +210,14 @@ pub struct MetaAddr {
     /// See the [`MetaAddr::last_failure`] method for details.
     last_failure: Option<Instant>,
 
-    /// The misbehavior score for this peer.
-    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = 0))]
-    misbehavior_score: u32,
+    /// When this peer's latest connection finished its handshake.
+    ///
+    /// Compared with `last_response`, this is how long that connection lasted. See
+    /// [`MetaAddr::is_redialed_first`] for what a long connection earns the peer.
+    ///
+    /// Dropped at this entry's first change after [`constants::REDIAL_WINDOW`] without a
+    /// response.
+    connected_since: Option<DateTime32>,
 
     /// The outcome of our most recent communication attempt with this peer.
     //
@@ -262,9 +267,8 @@ pub enum MetaAddrChange {
 
         /// The services this node advertises for its own listener address.
         ///
-        /// This must match the services advertised during the handshake, so a
-        /// node that does not advertise [`PeerServices::NODE_NETWORK`] (for
-        /// example, a pruned node) does not gossip itself as a full node.
+        /// This must match the services advertised during the handshake so
+        /// discovery and connections describe the same capabilities and storage mode.
         services: PeerServices,
     },
 
@@ -318,14 +322,6 @@ pub enum MetaAddrChange {
         addr: PeerSocketAddr,
         services: Option<PeerServices>,
     },
-
-    /// Updates an existing `MetaAddr` when a peer misbehaves such as by advertising
-    /// semantically invalid blocks or transactions.
-    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    UpdateMisbehavior {
-        addr: PeerSocketAddr,
-        score_increment: u32,
-    },
 }
 
 impl MetaAddr {
@@ -353,8 +349,8 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: NeverAttemptedGossiped,
-            misbehavior_score: 0,
             is_inbound: false,
         }
     }
@@ -457,19 +453,6 @@ impl MetaAddr {
         }
     }
 
-    /// Returns a [`MetaAddrChange::UpdateMisbehavior`] for a peer that has misbehaved.
-    ///
-    /// Canonicalizes the address to match the form stored by a successful handshake
-    /// (`new_connected`). On Linux dual-stack sockets, inbound IPv4 connections
-    /// arrive as IPv4-mapped IPv6 addresses (`::ffff:A.B.C.D`); without
-    /// canonicalization, `apply_to_meta_addr` panics on the addr invariant.
-    pub fn new_misbehavior(addr: PeerSocketAddr, score_increment: u32) -> MetaAddrChange {
-        UpdateMisbehavior {
-            addr: canonical_peer_addr(*addr),
-            score_increment,
-        }
-    }
-
     /// Create a new `MetaAddr` for a peer that has just shut down.
     pub fn new_shutdown(addr: PeerSocketAddr) -> MetaAddrChange {
         // TODO: if the peer shut down in the Responded state, preserve that
@@ -482,7 +465,9 @@ impl MetaAddr {
         self.addr
     }
 
-    /// Return the address preference level for this `MetaAddr`.
+    /// Validate this address, returning equal preference for all valid listening ports.
+    ///
+    /// This published accessor remains available, but no longer ranks default ports.
     pub fn peer_preference(&self) -> Result<PeerPreference, &'static str> {
         PeerPreference::new(self.addr, None)
     }
@@ -599,6 +584,38 @@ impl MetaAddr {
             // If there has never been any attempt, it can't possibly be live
             false
         }
+    }
+
+    /// Returns true if this peer is dialed before the candidates that are not
+    /// `Responded`, because its long-lived outbound connection ended a short time ago.
+    ///
+    /// A node that restarts has free inbound slots, but other nodes take them within
+    /// minutes. A peer whose connection responded for
+    /// [`constants::MIN_REDIAL_CONNECTION`] is redialed first until
+    /// [`constants::REDIAL_WINDOW`] after its last response, so it is dialed again while
+    /// the restarted node still has room.
+    ///
+    /// This reads the entry's own times, and not a report from the connection, because a
+    /// connection's tasks can be stopped before they report that it ended.
+    ///
+    /// # Security
+    ///
+    /// A peer only earns this by keeping a connection open, and each redial still waits
+    /// [`constants::MIN_PEER_RECONNECTION_DELAY`]. So it is dialed no more often than a
+    /// peer that stays connected, and it cannot earn it by dropping connections.
+    pub fn is_redialed_first(&self) -> bool {
+        let (Some(connected_since), Some(last_response)) =
+            (self.connected_since, self.last_response)
+        else {
+            return false;
+        };
+
+        self.last_connection_state != PeerAddrState::Responded
+            && !self.is_inbound
+            && last_response
+                .saturating_duration_since(connected_since)
+                .to_std()
+                >= constants::MIN_REDIAL_CONNECTION
     }
 
     /// Have we recently had a failed connection to this peer?
@@ -720,11 +737,6 @@ impl MetaAddr {
         }
     }
 
-    /// Returns a score of misbehavior encountered in a peer at this address.
-    pub fn misbehavior(&self) -> u32 {
-        self.misbehavior_score
-    }
-
     /// Return a sanitized version of this `MetaAddr`, for sending to a remote peer.
     ///
     /// Returns `None` if this `MetaAddr` should not be sent to remote peers.
@@ -734,8 +746,7 @@ impl MetaAddr {
             return None;
         }
 
-        // Avoid responding to GetAddr requests with addresses of misbehaving peers.
-        if self.misbehavior_score != 0 || self.is_inbound {
+        if self.is_inbound {
             return None;
         }
 
@@ -763,8 +774,8 @@ impl MetaAddr {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: NeverAttemptedGossiped,
-            misbehavior_score: 0,
             is_inbound: false,
         })
     }
@@ -791,8 +802,7 @@ impl MetaAddrChange {
             | UpdateConnected { addr, .. }
             | UpdatePingSent { addr, .. }
             | UpdateResponded { addr, .. }
-            | UpdateFailed { addr, .. }
-            | UpdateMisbehavior { addr, .. } => *addr,
+            | UpdateFailed { addr, .. } => *addr,
         }
     }
 
@@ -809,8 +819,7 @@ impl MetaAddrChange {
             | UpdateConnected { addr, .. }
             | UpdatePingSent { addr, .. }
             | UpdateResponded { addr, .. }
-            | UpdateFailed { addr, .. }
-            | UpdateMisbehavior { addr, .. } => *addr = new_addr,
+            | UpdateFailed { addr, .. } => *addr = new_addr,
         }
     }
 
@@ -828,7 +837,6 @@ impl MetaAddrChange {
             UpdatePingSent { .. } => None,
             UpdateResponded { .. } => None,
             UpdateFailed { services, .. } => *services,
-            UpdateMisbehavior { .. } => None,
         }
     }
 
@@ -846,8 +854,7 @@ impl MetaAddrChange {
             | UpdateConnected { .. }
             | UpdatePingSent { .. }
             | UpdateResponded { .. }
-            | UpdateFailed { .. }
-            | UpdateMisbehavior { .. } => None,
+            | UpdateFailed { .. } => None,
         }
     }
 
@@ -881,8 +888,7 @@ impl MetaAddrChange {
             UpdateConnected { .. }
             | UpdatePingSent { .. }
             | UpdateResponded { .. }
-            | UpdateFailed { .. }
-            | UpdateMisbehavior { .. } => None,
+            | UpdateFailed { .. } => None,
         }
     }
 
@@ -896,7 +902,7 @@ impl MetaAddrChange {
             // - the peer will appear to be live for longer, delaying future
             //   reconnection attempts.
             UpdateConnected { .. } | UpdateResponded { .. } => Some(now),
-            UpdateFailed { .. } | UpdateMisbehavior { .. } => None,
+            UpdateFailed { .. } => None,
             UpdatePingSent { .. } => None,
         }
     }
@@ -932,8 +938,24 @@ impl MetaAddrChange {
             //   states for longer, and
             // - the peer will appear to be used for longer, delaying future
             //   reconnection attempts.
-            UpdateFailed { .. } | UpdateMisbehavior { .. } => Some(now),
+            UpdateFailed { .. } => Some(now),
         }
+    }
+
+    /// Returns when the peer's latest connection started, after this change is applied
+    /// to `previous` at `now`. See [`MetaAddr::connected_since`].
+    fn connected_since(&self, previous: &MetaAddr, now: DateTime32) -> Option<DateTime32> {
+        if let UpdateConnected { .. } = self {
+            return Some(now);
+        }
+
+        let is_within_redial_window = previous.last_response.is_some_and(|last_response| {
+            now.saturating_duration_since(last_response).to_std() < constants::REDIAL_WINDOW
+        });
+
+        previous
+            .connected_since
+            .filter(|_connected_since| is_within_redial_window)
     }
 
     /// Return the peer connection state for this change.
@@ -948,8 +970,7 @@ impl MetaAddrChange {
             // Sending a ping is an interaction with a connected peer, but does not indicate new liveness.
             // Peers stay in Responded once connected, so we keep them in that state for UpdatePingSent.
             | UpdatePingSent { .. }
-            | UpdateResponded { .. }
-            | UpdateMisbehavior { .. } => Responded,
+            | UpdateResponded { .. } => Responded,
             UpdateFailed { .. } => Failed,
         }
     }
@@ -965,19 +986,12 @@ impl MetaAddrChange {
             ping_sent_at: self.ping_sent_at(),
             last_attempt: self.last_attempt(instant_now),
             last_failure: self.last_failure(instant_now),
+            connected_since: match self {
+                UpdateConnected { .. } => Some(local_now),
+                _ => None,
+            },
             last_connection_state: self.peer_addr_state(),
-            misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
-        }
-    }
-
-    /// Returns the misbehavior score increment for the current change.
-    pub fn misbehavior_score(&self) -> u32 {
-        match self {
-            MetaAddrChange::UpdateMisbehavior {
-                score_increment, ..
-            } => *score_increment,
-            _ => 0,
         }
     }
 
@@ -1010,8 +1024,8 @@ impl MetaAddrChange {
             ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
+            connected_since: None,
             last_connection_state: self.peer_addr_state(),
-            misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
         }
     }
@@ -1074,11 +1088,10 @@ impl MetaAddrChange {
 
         let previous_has_been_attempted = !previous.last_connection_state.is_never_attempted();
         let change_to_never_attempted = self.peer_addr_state().is_never_attempted();
-        let is_misbehavior_update = self.misbehavior_score() != 0;
 
         // Invalid changes
 
-        if change_to_never_attempted && previous_has_been_attempted && !is_misbehavior_update {
+        if change_to_never_attempted && previous_has_been_attempted {
             // Existing entry has been attempted, change is NeverAttempted
             // - ignore the change
             //
@@ -1089,7 +1102,7 @@ impl MetaAddrChange {
             return None;
         }
 
-        if change_is_out_of_order && !change_is_concurrent && !is_misbehavior_update {
+        if change_is_out_of_order && !change_is_concurrent {
             // Change is significantly out of order: ignore it.
             //
             // # Security
@@ -1099,7 +1112,7 @@ impl MetaAddrChange {
             return None;
         }
 
-        if change_is_concurrent && !connection_has_more_progress && !is_misbehavior_update {
+        if change_is_concurrent && !connection_has_more_progress {
             // Change is close together in time, and it would revert the connection to an earlier
             // state.
             //
@@ -1166,8 +1179,8 @@ impl MetaAddrChange {
                 ping_sent_at: None,
                 last_attempt: None,
                 last_failure: None,
+                connected_since: None,
                 last_connection_state: self.peer_addr_state(),
-                misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
             })
         } else {
@@ -1186,14 +1199,19 @@ impl MetaAddrChange {
                 // This is a wall clock time, but we already checked that responses are in order.
                 // Even if the wall clock time has jumped, we want to use the latest time.
                 last_response: self.last_response(local_now).or(previous.last_response),
-                rtt: self.rtt(),
+                // Only measurements from the current connection remain useful.
+                rtt: match self {
+                    MetaAddrChange::UpdatePingSent { .. }
+                    | MetaAddrChange::UpdateResponded { .. } => self.rtt().or(previous.rtt),
+                    _ => None,
+                },
                 ping_sent_at: self.ping_sent_at(),
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
                 last_failure: self.last_failure(instant_now).or(previous.last_failure),
+                connected_since: self.connected_since(&previous, local_now),
                 // Replace the state with the updated state.
                 last_connection_state: self.peer_addr_state(),
-                misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
             })
         }
@@ -1202,7 +1220,8 @@ impl MetaAddrChange {
 
 impl Ord for MetaAddr {
     /// `MetaAddr`s are sorted in approximate reconnection attempt order, but
-    /// with `Responded` peers sorted first as a group.
+    /// with `Responded` peers sorted first as a group, then peers that are being
+    /// redialed.
     ///
     /// But this order should not be used for reconnection attempts: use
     /// [`reconnection_peers`] instead.
@@ -1215,11 +1234,18 @@ impl Ord for MetaAddr {
         use std::net::IpAddr::{V4, V6};
         use Ordering::*;
 
-        // First, try states that are more likely to work
+        // Keep `Responded` peers first as a group, because the address book reads them as
+        // a prefix of this order.
+        let responded_first = (self.last_connection_state != PeerAddrState::Responded)
+            .cmp(&(other.last_connection_state != PeerAddrState::Responded));
+
+        // Then, try peers whose long-lived connection ended a short time ago.
+        let redial_first = other.is_redialed_first().cmp(&self.is_redialed_first());
+
+        // Then, try states that are more likely to work
         let more_reliable_state = self.last_connection_state.cmp(&other.last_connection_state);
 
-        // Then, try addresses that are more likely to be valid.
-        // Currently, this prefers addresses with canonical Zcash ports.
+        // Keep valid addresses before invalid ones, without ranking their ports.
         let more_likely_valid = self.peer_preference().cmp(&other.peer_preference());
 
         // # Security and Correctness
@@ -1289,7 +1315,9 @@ impl Ord for MetaAddr {
         };
         let port_tie_breaker = self.addr.port().cmp(&other.addr.port());
 
-        more_reliable_state
+        responded_first
+            .then(redial_first)
+            .then(more_reliable_state)
             .then(more_likely_valid)
             .then(older_attempt)
             .then(older_failure)

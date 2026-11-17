@@ -59,6 +59,18 @@ pub enum FinalFrontiersGenerationError {
         height: block::Height,
     },
 
+    /// A build without the `sprout` feature stopped maintaining this database's Sprout tree, so
+    /// its Sprout frontier is incomplete.
+    #[error(
+        "cannot produce final frontiers: this database stopped maintaining the Sprout note \
+         commitment tree at height {skipped_from:?}; generate them from a database synced by a \
+         build with the `sprout` feature"
+    )]
+    SproutTreeNotMaintained {
+        /// The first height committed without its Sprout note commitments.
+        skipped_from: block::Height,
+    },
+
     /// The database has no Sapling tree at the requested height.
     #[error("missing Sapling final frontier tree at height {height:?}")]
     MissingSaplingTree {
@@ -490,7 +502,7 @@ fn ironwood_root_or_empty(
 pub(crate) fn produce_block_roots(
     db: &ZakuraDb,
     range: std::ops::RangeInclusive<block::Height>,
-) -> Vec<BlockCommitmentRoots> {
+) -> Result<Vec<BlockCommitmentRoots>, zakura_node_services::block_memory::AdmissionFailure> {
     let (start, end) = (range.start().0, range.end().0);
     let mut roots = Vec::new();
     for h in start..=end {
@@ -510,7 +522,7 @@ pub(crate) fn produce_block_roots(
         // Pruned nodes can retain these trees after deleting the body. Stop at the first
         // missing body so callers never mistake fabricated zero metadata for a complete
         // payload.
-        let Some(block) = db.block(height.into()) else {
+        let Some(block) = db.block(height.into())? else {
             metrics::counter!("state.block_roots.missing_body").increment(1);
             static MISSING_BODIES: AtomicU64 = AtomicU64::new(0);
             let occurrences = MISSING_BODIES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -524,9 +536,9 @@ pub(crate) fn produce_block_roots(
             break;
         };
         let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
-            block.sapling_transactions_count(),
-            block.orchard_transactions_count(),
-            block.ironwood_transactions_count(),
+            block.view().sapling_transactions_count(),
+            block.view().orchard_transactions_count(),
+            block.view().ironwood_transactions_count(),
             block.auth_data_root(),
         );
         roots.push(BlockCommitmentRoots {
@@ -540,7 +552,7 @@ pub(crate) fn produce_block_roots(
             auth_data_root,
         });
     }
-    roots
+    Ok(roots)
 }
 
 /// Serve the per-block roots for `range`, joining tree-derived roots below the VCT upgrade height
@@ -551,7 +563,7 @@ pub(crate) fn produce_block_roots(
 pub(crate) fn serve_block_roots(
     db: &ZakuraDb,
     range: std::ops::RangeInclusive<block::Height>,
-) -> Vec<BlockCommitmentRoots> {
+) -> Result<Vec<BlockCommitmentRoots>, zakura_node_services::block_memory::AdmissionFailure> {
     // Below the VCT upgrade height, we use the per-height trees to derive the roots.
     let Some(upgrade) = db.vct_upgrade_height() else {
         return produce_block_roots(db, range);
@@ -562,12 +574,12 @@ pub(crate) fn serve_block_roots(
     // Wholly at/above `U`: the VCT-specific index covers it. (`U == 0` for a node that fast-synced from
     // genesis takes this path for every request, never touching the absent per-height trees.)
     if start >= upgrade {
-        return db.commitment_roots_by_height_range(range);
+        return Ok(db.commitment_roots_by_height_range(range));
     }
 
     // Below `U`: derive the per-height-tree run up to `U - 1` (`start < upgrade` so `upgrade >= 1`).
     let trees_end = block::Height(end.0.min(upgrade.0 - 1));
-    let mut roots = produce_block_roots(db, start..=trees_end);
+    let mut roots = produce_block_roots(db, start..=trees_end)?;
 
     // Continue into the index only if the tree run is contiguous up to `U - 1`; a short run means a
     // gap below `U`, so serve it alone and let the client retry the remainder.
@@ -575,7 +587,7 @@ pub(crate) fn serve_block_roots(
         roots.extend(db.commitment_roots_by_height_range(upgrade..=end));
     }
 
-    roots
+    Ok(roots)
 }
 
 /// Produce the final frontiers at the finalized database tip `height`.
@@ -627,7 +639,7 @@ pub(super) fn produce_settled_final_frontiers(
     let mut last_change = None;
     for raw_height in height.0.saturating_add(1)..=tip.0 {
         let scan_height = block::Height(raw_height);
-        let block = db.block(scan_height.into()).ok_or(
+        let block = db.stored_block(scan_height.into()).ok_or(
             FinalFrontiersGenerationError::MissingBlockInSproutWindow {
                 missing: scan_height,
                 height,
@@ -669,6 +681,9 @@ fn read_final_frontiers_at(
     let ironwood = db
         .ironwood_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingIronwoodTree { height })?;
+    if let Some(skipped_from) = db.sprout_tree_skipped_from() {
+        return Err(FinalFrontiersGenerationError::SproutTreeNotMaintained { skipped_from });
+    }
     let sprout = db
         .sprout_tree_for_tip()
         .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
@@ -940,7 +955,7 @@ mod tests {
         seed_trees(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
 
-        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1000,7 +1015,7 @@ mod tests {
             .expect("overwriting the seeded Ironwood tree succeeds");
         seed_finalized_tip(&db, block::Height(1));
 
-        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(1));
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(1)).unwrap();
 
         assert_eq!(
             roots,
@@ -1021,7 +1036,7 @@ mod tests {
         seed_index_roots(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(2));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(2)).unwrap();
 
         assert_eq!(
             roots,
@@ -1040,7 +1055,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(4));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1064,7 +1079,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(1));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1082,7 +1097,7 @@ mod tests {
         seed_finalized_tip(&db, block::Height(4));
         set_upgrade_height(&db, block::Height(3));
 
-        let roots = serve_block_roots(&db, block::Height(3)..=block::Height(4));
+        let roots = serve_block_roots(&db, block::Height(3)..=block::Height(4)).unwrap();
 
         assert_eq!(
             roots,
@@ -1393,66 +1408,6 @@ mod tests {
                 offset: frontiers.to_bytes().len(),
                 trailing_len: 1,
             }
-        );
-    }
-
-    /// The test fixture source looks up produced roots by height and exposes
-    /// the handoff frontier — the consumer view of producer output.
-    #[test]
-    fn fixture_source_round_trips_payload() {
-        let roots = vec![
-            BlockCommitmentRoots {
-                height: block::Height(10),
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: AuthDataRoot::from([0u8; 32]),
-            },
-            BlockCommitmentRoots {
-                height: block::Height(11),
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: AuthDataRoot::from([0u8; 32]),
-            },
-        ];
-        let roots = roots
-            .into_iter()
-            .map(|root| {
-                (
-                    root.height.0,
-                    (root.sapling_root, root.orchard_root, root.ironwood_root),
-                )
-            })
-            .collect();
-        let frontiers = FinalFrontiers {
-            height: block::Height(11),
-            sapling: Arc::new(Default::default()),
-            orchard: Arc::new(Default::default()),
-            sprout: Arc::new(Default::default()),
-            ironwood: Arc::new(Default::default()),
-        };
-
-        let source = FixtureSource::new(roots, frontiers);
-
-        assert!(
-            source.vct_root(block::Height(10)).is_some(),
-            "produced root is looked up by height"
-        );
-        assert!(
-            source.vct_root(block::Height(99)).is_none(),
-            "absent height has no root"
-        );
-        assert_eq!(
-            source.vct_last_checkpoint_height(),
-            block::Height(11),
-            "handoff height comes from the supplied frontiers"
         );
     }
 }

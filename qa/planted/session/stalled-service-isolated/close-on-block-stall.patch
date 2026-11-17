@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/config.rs b/crates/zakura-network/src/zakura/block_sync/config.rs
+index 301d3df0ef..84ba736f69 100644
+--- a/crates/zakura-network/src/zakura/block_sync/config.rs
++++ b/crates/zakura-network/src/zakura/block_sync/config.rs
+@@ -525,8 +525,9 @@ impl ZakuraBlockSyncConfig {
+     /// Return the maximum time an active block-sync peer may go without serving
+     /// an accepted full block body.
+     pub(super) fn effective_liveness_timeout(&self) -> Duration {
+-        self.request_timeout
+-            .saturating_mul(BLOCK_PROGRESS_TIMEOUT_REQUESTS)
++        // Count a slow range read as a dead peer: give up on the session
++        // after an eighth of one request timeout.
++        self.request_timeout / 8
+     }
+ 
+     /// Return the no-progress peer cooldown clamped to a positive duration.

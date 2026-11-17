@@ -32,7 +32,7 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
@@ -53,7 +53,7 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
@@ -82,7 +82,7 @@ async fn check_transcripts(network: Network) -> Result<(), Report> {
 
     for transcript_data in net_data {
         // We're not verifying UTXOs here.
-        let (service, _, _, _) =
+        let zakura_state::InitializedState { state: service, .. } =
             zakura_state::init(Config::ephemeral(), &network, Height::MAX, 0).await?;
         let transcript = Transcript::from(transcript_data.iter().cloned());
         async { transcript.check(service).await }

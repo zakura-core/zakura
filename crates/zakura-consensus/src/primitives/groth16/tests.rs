@@ -10,8 +10,10 @@ use hex::FromHex;
 use tower::ServiceExt;
 
 use zakura_chain::{
-    block::Block, serialization::ZcashDeserializeInto, sprout::EncryptedNote,
-    transaction::Transaction,
+    block::Block,
+    serialization::ZcashDeserializeInto,
+    sprout::EncryptedNote,
+    transaction::{JoinSplitPubKey, Transaction},
 };
 
 use crate::primitives::groth16::*;
@@ -88,7 +90,7 @@ async fn verify_sprout_groth16() {
 async fn verify_groth16_joinsplit_vector<V>(
     verifier: &mut V,
     joinsplit: &JoinSplit<Groth16Proof>,
-    pub_key: &ed25519::VerificationKeyBytes,
+    pub_key: &JoinSplitPubKey,
 ) -> Result<(), V::Error>
 where
     V: tower::Service<Item, Response = ()>,

@@ -1,0 +1,111 @@
+{
+  "node": {
+    "main": 8,
+    "fork": null
+  },
+  "mirrors": [
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    },
+    {
+      "chain": {
+        "main": 2,
+        "fork": null
+      },
+      "dialer": "mirror"
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  },
+  "controls": [
+    {
+      "peer": "mirror-0",
+      "action": "close",
+      "when": {
+        "completed": {
+          "kind": "read",
+          "nth": 1
+        }
+      }
+    },
+    {
+      "peer": "mirror-0",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-0"
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "close",
+      "when": {
+        "completed": {
+          "kind": "read",
+          "nth": 2
+        }
+      }
+    },
+    {
+      "peer": "mirror-1",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-1"
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "close",
+      "when": {
+        "completed": {
+          "kind": "read",
+          "nth": 3
+        }
+      }
+    },
+    {
+      "peer": "mirror-2",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-2"
+      }
+    },
+    {
+      "peer": "mirror-3",
+      "action": "close",
+      "when": {
+        "completed": {
+          "kind": "read",
+          "nth": 4
+        }
+      }
+    },
+    {
+      "peer": "mirror-3",
+      "action": "relink",
+      "when": {
+        "closed": "mirror-3"
+      }
+    }
+  ]
+}

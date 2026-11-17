@@ -1,0 +1,6 @@
+{
+  "departure": {
+    "stage": "receiving",
+    "by": "relink"
+  }
+}

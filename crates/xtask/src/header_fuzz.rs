@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{run_command, BoxError};
 
-const PINNED_NIGHTLY: &str = "nightly-2026-07-15";
+/// The nightly toolchain cargo-fuzz builds with.
+pub(super) const PINNED_NIGHTLY: &str = "nightly-2026-07-15";
 const TARGETS: [&str; 4] = [
     "fork_transitions",
     "header_codec_v9",

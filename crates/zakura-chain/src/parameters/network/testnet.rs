@@ -74,6 +74,7 @@ pub struct ConfiguredFundingStreamRecipient {
 impl ConfiguredFundingStreamRecipient {
     /// Creates a new [`ConfiguredFundingStreamRecipient`] with the provided receiver and default
     /// values for other fields.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_for(receiver: FundingStreamReceiver) -> Self {
         use FundingStreamReceiver::*;
         match receiver {
@@ -295,6 +296,7 @@ impl ConfiguredFundingStreams {
     /// # Panics
     ///
     /// If `height_range` is None.
+    #[cfg(test)]
     pub fn into_funding_streams_unchecked(self) -> FundingStreams {
         let height_range = self.height_range.expect("must have height range");
         let recipients = self
@@ -1292,6 +1294,10 @@ impl ParametersBuilder {
     /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
+        if NetworkUpgrade::Nu7.activation_height(&network).is_some() {
+            super::subsidy::block_subsidy_fraction_numerator(&network)
+                .map_err(|_| ParametersBuilderError::InvalidReissuanceFraction)?;
+        }
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         // The network holds the height ranges after NU7 moves the inherited ones.
@@ -1491,6 +1497,16 @@ impl Default for Parameters {
     }
 }
 
+/// The default Regtest parameters, which `is_regtest` compares against.
+///
+/// Built once: network-kind checks run on hot paths such as address encoding.
+fn default_regtest() -> &'static Parameters {
+    static DEFAULT_REGTEST: OnceLock<Parameters> = OnceLock::new();
+    DEFAULT_REGTEST.get_or_init(|| {
+        Parameters::new_regtest(Default::default()).expect("default regtest parameters are valid")
+    })
+}
+
 impl Parameters {
     /// Creates a new [`ParametersBuilder`].
     pub fn build() -> ParametersBuilder {
@@ -1609,18 +1625,18 @@ impl Parameters {
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
             initial_nsm_value_balance: _,
-        } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
+        } = default_regtest();
 
-        self.network_name == network_name
-            && self.genesis_hash == genesis_hash
-            && self.slow_start_interval == slow_start_interval
-            && self.slow_start_shift == slow_start_shift
-            && self.target_difficulty_limit == target_difficulty_limit
-            && self.disable_pow == disable_pow
+        self.network_name == *network_name
+            && self.genesis_hash == *genesis_hash
+            && self.slow_start_interval == *slow_start_interval
+            && self.slow_start_shift == *slow_start_shift
+            && self.target_difficulty_limit == *target_difficulty_limit
+            && self.disable_pow == *disable_pow
             && self.should_allow_unshielded_coinbase_spends
-                == should_allow_unshielded_coinbase_spends
-            && self.pre_blossom_halving_interval == pre_blossom_halving_interval
-            && self.post_blossom_halving_interval == post_blossom_halving_interval
+                == *should_allow_unshielded_coinbase_spends
+            && self.pre_blossom_halving_interval == *pre_blossom_halving_interval
+            && self.post_blossom_halving_interval == *post_blossom_halving_interval
     }
 
     /// Returns the network name

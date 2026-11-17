@@ -1,0 +1,15 @@
+# The header-sync service's regulation check rejects every stream at the
+# current version, so it closes each link before its reactor gets a
+# session. The mirrors run the same service, so neither end's reactor ever
+# decides on a session. On the stronger-last witness, under its committed
+# plan, the node stays at genesis with heavier chains on offer. The settled
+# points count a mirror whose link with the node ended, from the
+# topology's cancellation hooks, so the node is judged once it goes idle,
+# and convergence fails there. The service's stream checks decide when a
+# link closes, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-stronger-last.plan"

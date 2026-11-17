@@ -445,7 +445,7 @@ mod tests {
         state.db.write_batch(batch).expect("prune batch writes");
         assert_eq!(state.db.lowest_retained_height(), Some(block::Height(3)));
         assert!(
-            state.db.transaction(coinbase_tx_hash(1)).is_some(),
+            state.db.transaction(coinbase_tx_hash(1)).unwrap().is_some(),
             "height 1 was left intact below the online pruning marker"
         );
 
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(state.db.lowest_retained_height(), Some(block::Height(5)));
         assert_eq!(*retained.borrow_and_update(), block::Height(5));
         assert!(
-            state.db.transaction(coinbase_tx_hash(4)).is_some(),
+            state.db.transaction(coinbase_tx_hash(4)).unwrap().is_some(),
             "height 4 raw transaction data is still present despite the marker"
         );
 

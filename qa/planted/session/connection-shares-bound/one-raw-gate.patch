@@ -1,0 +1,29 @@
+diff --git a/crates/zakura-network/src/zakura/transport/lifetime.rs b/crates/zakura-network/src/zakura/transport/lifetime.rs
+index 9d847da912..53194d1a3e 100644
+--- a/crates/zakura-network/src/zakura/transport/lifetime.rs
++++ b/crates/zakura-network/src/zakura/transport/lifetime.rs
+@@ -429,6 +429,24 @@ impl NodeResources {
+             .filter(|(_, kind_capabilities, _)| capabilities & kind_capabilities != 0)
+             .map(|(kind, ..)| (*kind, KindGates::new(self.shares.share(*kind))))
+             .collect();
++        // One raw gate of the whole receive window for every kind, so any
++        // kind's frames may fill it.
++        let raw = FrameGate::new(
++            self.shares
++                .receive_window(gates.iter().map(|(kind, _): &(u16, KindGates)| *kind)),
++        );
++        let gates: Vec<_> = gates
++            .into_iter()
++            .map(|(kind, gates)| {
++                (
++                    kind,
++                    KindGates {
++                        raw: raw.clone(),
++                        output: gates.output,
++                    },
++                )
++            })
++            .collect();
+         let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive);
+         self.live
+             .lock()

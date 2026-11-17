@@ -11,7 +11,7 @@ use std::{
 };
 
 use proptest::prelude::*;
-use zakura_chain::{block, primitives::ed25519::Signature};
+use zakura_chain::block;
 use zakura_quic::{NodeId, NodeSecretKey};
 
 use super::{
@@ -76,7 +76,7 @@ fn record(body: ZakuraNodeRecordBody) -> ZakuraNodeRecord {
     // The codec does not verify signatures.
     ZakuraNodeRecord {
         body,
-        signature: Signature::from([0xab; 64]),
+        signature: [0xab; 64],
     }
 }
 
@@ -353,10 +353,7 @@ fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
                 let room = MAX_NODE_RECORD_BODY_BYTES - fixed.len();
                 body.extensions = extensions;
                 body.extensions.truncate(room);
-                ZakuraNodeRecord {
-                    body,
-                    signature: Signature::from(signature),
-                }
+                ZakuraNodeRecord { body, signature }
             },
         )
         .boxed()

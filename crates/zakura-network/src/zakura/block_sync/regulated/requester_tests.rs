@@ -1,5 +1,5 @@
-use tokio_util::sync::CancellationToken;
 use zakura_chain::block::{Hash, Height};
+use zakura_rt::sync::CancellationToken;
 
 use super::{
     requester::{RequestError, Requester, ResponseError},

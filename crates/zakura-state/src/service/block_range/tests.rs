@@ -48,10 +48,14 @@ async fn assert_block_range_selection(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, mut read_state, tip, _change) =
-        StateService::new(config, &network, block::Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        mut read_state,
+        latest_chain_tip: tip,
+        ..
+    } = StateService::new(config, &network, block::Height::MAX, 0)
+        .await
+        .unwrap();
     let genesis = block::genesis::regtest_genesis_block();
     let mut parent = genesis.make_fake_child();
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
@@ -220,6 +224,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
         earlier_snapshot
             .block_and_size(&read_state.db, block::Height(2))
             .unwrap()
+            .unwrap()
             .0
             .hash(),
         selected.hash(),
@@ -227,6 +232,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
     );
     assert!(earlier_snapshot
         .block_and_size(&read_state.db, block::Height(3))
+        .unwrap()
         .is_none());
 
     if header_runtime {
@@ -386,6 +392,7 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1),
             block::Height(1),
             3,
             5,
@@ -430,6 +437,7 @@ async fn cancellation_before_the_first_lookup_skips_the_range() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1),
             block::Height(1),
             2,
             10,
@@ -456,6 +464,7 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
+            crate::request::ReadWorkerPool::new(1),
             block::Height(1),
             2,
             10,
@@ -510,6 +519,7 @@ fn blocked_read() -> (
     let mut started_tx = Some(started_tx);
     let (resume, blocked) = mpsc::sync_channel(1);
     let job = spawn_owned_block_range(
+        crate::request::ReadWorkerPool::new(1),
         block::Height(1),
         1,
         10,
@@ -563,6 +573,7 @@ async fn a_panicking_read_releases_resources_once() {
     let _guard = zakura_test::init();
     let (resources, drops, finished) = resources();
     let job = spawn_owned_block_range(
+        crate::request::ReadWorkerPool::new(1),
         block::Height(1),
         1,
         10,
@@ -582,10 +593,13 @@ async fn a_panicking_read_releases_resources_once() {
 async fn the_state_api_returns_an_owned_empty_range() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
-        timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
+        .await
+        .unwrap();
     let result = timeout(
         DEADLINE,
         read_state.read_owned_block_range(block::Height(1), 1, 10, resources, |_| false),
@@ -711,10 +725,13 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
 
     let _guard = zakura_test::init();
     let (resources, drops, finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
-        timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
+        .await
+        .unwrap();
     let failure = BlockWriteTaskFailure::from(&HeaderChainAttachmentError::MissingGenesis);
     read_state.block_write_failure.set(failure.clone());
     let error = timeout(

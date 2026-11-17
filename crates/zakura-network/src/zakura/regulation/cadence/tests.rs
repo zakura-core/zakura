@@ -377,3 +377,99 @@ fn a_minimum_interval_only_slows_a_row() {
         Ok(RowSend::DeferredUntil(start + slower))
     );
 }
+
+/// One input to a single cadence bucket.
+#[derive(Clone, Debug)]
+enum LedgerOp {
+    Charge { advance: Duration },
+    Pause { advance: Duration, paused: Duration },
+}
+
+fn ledger_op() -> impl Strategy<Value = LedgerOp> {
+    prop_oneof![
+        3 => (0..10_000u64).prop_map(|advance| LedgerOp::Charge {
+            advance: Duration::from_millis(advance),
+        }),
+        1 => (0..10_000u64, 0..10_000u64).prop_map(|(advance, paused)| LedgerOp::Pause {
+            advance: Duration::from_millis(advance),
+            paused: Duration::from_millis(paused),
+        }),
+    ]
+}
+
+/// An independent bucket that steps one refill interval at a time.
+struct BucketModel {
+    cadence: Cadence,
+    tokens: u32,
+    next_refill: Instant,
+    paused: Duration,
+}
+
+impl BucketModel {
+    fn refill(&mut self, now: Instant) {
+        while self.next_refill <= now {
+            if self.tokens < self.cadence.capacity {
+                self.tokens += 1;
+            }
+            self.next_refill += self.cadence.refill_interval;
+        }
+    }
+}
+
+proptest! {
+    /// The ledger, charged at explicit instants, matches a bucket that steps
+    /// one refill interval at a time: refills cap at capacity, pause credit
+    /// exceeds it, and each charge reports exhaustion and low buckets.
+    #[test]
+    fn the_ledger_matches_an_interval_stepping_bucket(
+        capacity in 1u32..8,
+        refill_ms in 100u64..2_000,
+        ops in prop::collection::vec(ledger_op(), 1..64),
+    ) {
+        let cadence = Cadence {
+            capacity,
+            refill_interval: Duration::from_millis(refill_ms),
+            send_interval: Duration::from_millis(refill_ms),
+        };
+        let key = CadenceKey { layout: LAYOUT, message_type: STATUS.message_type };
+        let mut now = Instant::now();
+        let mut ledger = CadenceLedger::default();
+        let mut model: Option<BucketModel> = None;
+        for op in ops {
+            let advance = match op {
+                LedgerOp::Charge { advance } | LedgerOp::Pause { advance, .. } => advance,
+            };
+            now += advance;
+            let bucket = model.get_or_insert_with(|| BucketModel {
+                cadence,
+                tokens: capacity,
+                next_refill: now + cadence.refill_interval,
+                paused: Duration::ZERO,
+            });
+            bucket.refill(now);
+            match op {
+                LedgerOp::Charge { .. } => {
+                    let expected = if bucket.tokens == 0 {
+                        Charged::Exhausted
+                    } else {
+                        bucket.tokens -= 1;
+                        Charged::Admit { low: bucket.tokens < capacity / 4 }
+                    };
+                    prop_assert_eq!(ledger.charge(key, cadence, now), expected);
+                }
+                LedgerOp::Pause { paused, .. } => {
+                    ledger.credit_pause(key, cadence, paused, now);
+                    bucket.paused += paused;
+                    while bucket.paused >= cadence.refill_interval {
+                        bucket.tokens += 1;
+                        bucket.paused -= cadence.refill_interval;
+                    }
+                }
+            }
+            prop_assert_eq!(
+                ledger.buckets.get(&key).map(|bucket| bucket.tokens),
+                Some(bucket.tokens)
+            );
+        }
+    }
+}

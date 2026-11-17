@@ -1,4 +1,5 @@
 use super::*;
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, GENERIC_TESTNET_TX};
 
 /// A 13-byte V2 transaction: version, no transparent inputs or outputs, lock
@@ -114,7 +115,7 @@ fn block_response_bounds_allocation_by_payload_length() {
     };
     assert!(matches!(
         blocks.as_slice(),
-        [InventoryResponse::Available((received, None))] if **received == block
+        [InventoryResponse::Available((received, None))] if received == &BlockHandle::from(Arc::new(block))
     ));
 
     let frame = response_frame(MSG_RESPONSE_BLOCK, &truncated_block());

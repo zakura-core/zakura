@@ -1,6 +1,10 @@
 use super::*;
 use crate::zakura::block_sync::reorder::BufferedBlockBody;
-use zakura_chain::{serialization::CompactSizeMessage, transaction::Transaction};
+use zakura_chain::{
+    serialization::{CompactSizeMessage, ZcashDeserialize},
+    transaction::Transaction,
+};
+use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
 
 fn block_with_many_transactions() -> Arc<block::Block> {
     let mut block =
@@ -53,10 +57,35 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
     let mut body = BufferedBlockBody::from_decoded_block(decoded, Some(raw));
     body.retain_for_backlog_in_place();
     assert!(!body.is_decoded());
-    let replayed = body.decoded_block();
-    assert_eq!(replayed, expected);
+    let replayed = body
+        .decoded_block(
+            &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
+            Admission::WithinLimit,
+        )
+        .unwrap();
     assert_eq!(
-        replayed.transactions.capacity(),
-        replayed.transactions.len()
+        replayed.zcash_serialize_to_vec().unwrap(),
+        expected.zcash_serialize_to_vec().unwrap()
     );
+    assert_eq!(
+        replayed.transaction_capacity(),
+        replayed.view().transactions().len()
+    );
+}
+
+impl DecodedBlockPayload {
+    /// The payload a peer routine keeps after it decodes `block` from a `Block` message.
+    pub(in crate::zakura::block_sync) fn of_block(block: &Arc<block::Block>) -> Self {
+        let payload = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .expect("a test block encodes within the block-sync message limits");
+        decode_block_payload(payload)
+            .expect("an encoded test block decodes")
+            .1
+    }
+
+    /// A weak handle on the payload's bytes, which dies when every holder has released them.
+    pub(in crate::zakura::block_sync) fn downgrade(&self) -> std::sync::Weak<[u8]> {
+        Arc::downgrade(&self.0)
+    }
 }

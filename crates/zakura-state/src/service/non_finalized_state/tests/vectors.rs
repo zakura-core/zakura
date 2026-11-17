@@ -1,6 +1,7 @@
 //! Fixed test vectors for the non-finalized state.
 
 use std::{sync::Arc, time::Duration};
+use zakura_node_services::block_memory::BlockHandle;
 
 use zakura_chain::{
     amount::NonNegative,
@@ -192,10 +193,10 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(block1, finalized);
+    assert_eq!(BlockHandle::from(block1), finalized);
 
     let finalized = state.finalize().inner_block();
-    assert_eq!(block2, finalized);
+    assert_eq!(BlockHandle::from(block2), finalized);
 
     assert!(state.best_chain().is_none());
 
@@ -240,7 +241,7 @@ fn finalize_drops_empty_side_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(root, finalized);
+    assert_eq!(BlockHandle::from(root), finalized);
     assert_eq!(state.chain_count(), 1);
     assert_eq!(state.best_chain_len(), Some(1));
     assert_eq!(
@@ -1621,6 +1622,170 @@ fn equal_work_prefers_first_receipt_through_forks_and_reconsideration() {
                 assert_eq!(state.best_tip().unwrap().1, early.hash());
             }
         }
+    }
+}
+
+/// A block below a fork is on every chain that shares it. Updating the backup leaves that
+/// block's file alone when it is already on disk, however many chains hold the block.
+#[test]
+fn backup_update_does_not_rewrite_a_block_shared_by_two_chains() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let root = Arc::new(network.test_block(653599, 583999).unwrap());
+    let tip_a = root.make_fake_child().set_work(10);
+    let tip_b = root.make_fake_child().set_work(11);
+
+    let (mut state, finalized) = new_invalidate_test_state(&network);
+    state
+        .commit_new_chain(root.clone().prepare(), &finalized.db)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(tip_a.prepare(), &finalized.db)
+        .expect("first tip should extend the root chain");
+    state
+        .commit_block(tip_b.prepare(), &finalized.db)
+        .expect("second tip should fork from the root chain");
+    assert_eq!(state.chain_count(), 2, "both chains hold the root block");
+
+    let backup = tempfile::tempdir().unwrap();
+    state.write_to_backup(backup.path());
+
+    // Mark the root's file, so a second write of it would show.
+    let root_file = backup.path().join(root.hash().to_string());
+    let marker = b"already backed up";
+    std::fs::write(&root_file, marker).unwrap();
+
+    state.write_to_backup(backup.path());
+
+    assert_eq!(
+        std::fs::read(&root_file).unwrap(),
+        marker,
+        "a block that is already backed up is not written again"
+    );
+    assert_eq!(
+        std::fs::read_dir(backup.path()).unwrap().count(),
+        3,
+        "the root and both tips stay backed up"
+    );
+}
+
+/// Checks the exact backup file set and restores every retained branch, including its best tip.
+/// These fixtures have no receipt-order or operator preferences to lose on restart.
+fn assert_backup_restores_chains(
+    state: &NonFinalizedState,
+    finalized: &FinalizedState,
+    backup_path: &std::path::Path,
+) -> NonFinalizedState {
+    use std::collections::HashSet;
+
+    state.write_to_backup(backup_path);
+    let expected_files: HashSet<_> = state
+        .chain_iter()
+        .flat_map(|chain| chain.blocks.values())
+        .map(|block| block.hash.to_string())
+        .collect();
+    let actual_files: HashSet<_> = std::fs::read_dir(backup_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        actual_files, expected_files,
+        "backup keeps exactly the live blocks"
+    );
+
+    let restored = super::super::backup::restore_backup(
+        NonFinalizedState::new(&state.network),
+        backup_path,
+        &finalized.db,
+    );
+    let branch_hashes = |state: &NonFinalizedState| -> HashSet<Vec<block::Hash>> {
+        state
+            .chain_iter()
+            .map(|chain| chain.blocks.values().map(|block| block.hash).collect())
+            .collect()
+    };
+    assert_eq!(
+        branch_hashes(&restored),
+        branch_hashes(state),
+        "restore preserves every retained branch and its shared ancestors"
+    );
+    assert_eq!(
+        restored.best_tip(),
+        state.best_tip(),
+        "restore preserves the best tip"
+    );
+    restored
+}
+
+/// Updating an existing backup after a work-driven reorg preserves both branches, and the
+/// restored losing branch can gain enough work to become best again.
+#[test]
+fn backup_restores_both_branches_after_reorg() {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        let root = Arc::new(network.test_block(653599, 583999).unwrap());
+        let shared = root.make_fake_child().set_work(1);
+        let a = shared.make_fake_child().set_work(10);
+        let b = shared.make_fake_child().set_work(5);
+        let b_child = b.make_fake_child().set_work(10);
+        let a_child = a.make_fake_child().set_work(20);
+        let (mut state, finalized) = new_invalidate_test_state(&network);
+        state
+            .commit_new_chain(root.prepare(), &finalized.db)
+            .unwrap();
+        for block in [&shared, &a, &b] {
+            commit_test_block(&mut state, &finalized, block);
+        }
+        assert_eq!(state.chain_count(), 2);
+        assert_eq!(state.best_tip().unwrap().1, a.hash());
+        let backup = tempfile::tempdir().unwrap();
+        assert_backup_restores_chains(&state, &finalized, backup.path());
+
+        commit_test_block(&mut state, &finalized, &b_child);
+        assert_eq!(state.best_tip().unwrap().1, b_child.hash());
+        let mut restored = assert_backup_restores_chains(&state, &finalized, backup.path());
+
+        commit_test_block(&mut restored, &finalized, &a_child);
+        assert_eq!(restored.best_tip().unwrap().1, a_child.hash());
+        assert_eq!(restored.chain_count(), 2);
+        assert_backup_restores_chains(&restored, &finalized, backup.path());
+    }
+}
+
+/// Pruning an evicted branch removes its backup files without deleting ancestors still
+/// needed by retained branches; a later download can back up the evicted block again.
+#[test]
+fn backup_restores_retained_branches_after_fork_limit_pruning() {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        let root = Arc::new(network.test_block(653599, 583999).unwrap());
+        let weak = root.make_fake_child().set_work(1);
+        let strong = root.make_fake_child().set_work(10);
+        let (mut state, finalized) = new_invalidate_test_state(&network);
+        state
+            .commit_new_chain(root.clone().prepare(), &finalized.db)
+            .unwrap();
+        commit_test_block(&mut state, &finalized, &weak);
+        commit_test_block(&mut state, &finalized, &strong);
+        let backup = tempfile::tempdir().unwrap();
+        assert_backup_restores_chains(&state, &finalized, backup.path());
+        assert!(backup.path().join(weak.hash().to_string()).exists());
+
+        let additional_forks = u8::try_from(MAX_NON_FINALIZED_CHAIN_FORKS - 1).unwrap();
+        commit_test_siblings(&mut state, &finalized, &root, 10, additional_forks);
+        assert_eq!(state.chain_count(), MAX_NON_FINALIZED_CHAIN_FORKS);
+        assert!(!state.any_chain_contains(&weak.hash()));
+        assert!(state.any_chain_contains(&root.hash()));
+        let mut restored = assert_backup_restores_chains(&state, &finalized, backup.path());
+        assert!(!backup.path().join(weak.hash().to_string()).exists());
+
+        // Reaccept the evicted parent and extend it enough to win after restoration.
+        commit_test_block(&mut restored, &finalized, &weak);
+        let winning_child = weak.make_fake_child().set_work(20);
+        commit_test_block(&mut restored, &finalized, &winning_child);
+        assert_eq!(restored.best_tip().unwrap().1, winning_child.hash());
+        assert_backup_restores_chains(&restored, &finalized, backup.path());
+        assert!(backup.path().join(weak.hash().to_string()).exists());
     }
 }
 

@@ -122,7 +122,7 @@ async fn timeout_emits_request_terminal_evidence() {
     trace_active_request(&reactor, &peer);
 
     let deadline = Instant::now();
-    reactor.request_deadlines.insert(peer, deadline);
+    reactor.state.request_deadlines.insert(peer, deadline);
     reactor.retire_timed_out_requests(deadline);
 
     capture.flush().await;

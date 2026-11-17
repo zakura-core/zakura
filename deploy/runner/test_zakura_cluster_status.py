@@ -9,6 +9,7 @@ import json
 import io
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -24,6 +26,8 @@ from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("zakura-cluster-status.py")
+# The dashboard imports its sibling modules, as it does when run as a script.
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("zakura_cluster_status", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 status = importlib.util.module_from_spec(SPEC)
@@ -473,6 +477,22 @@ zcash_net_in_bytes_total 12345
         )
         self.assertNotIn("peer_user_agents", probe)
 
+    def test_difficulty_target_is_bound_to_the_accepted_tip_header(self):
+        tip = "a" * 64
+        self.rpc_results["getblockchaininfo"] = {"blocks": 3_538_452, "bestblockhash": tip, "chain": "main"}
+        header = {"hash": tip, "height": 3_538_452, "bits": "1b6aac57"}
+        for mismatch in (None, "hash", "height"):
+            with self.subTest(mismatch=mismatch):
+                candidate = dict(header)
+                if mismatch:
+                    candidate[mismatch] = "b" * 64 if mismatch == "hash" else 3_538_453
+                self.rpc_results["getblockheader"] = candidate
+                probe = self.run_probe(rpc_url=f"http://{self.endpoint}/")
+                if mismatch:
+                    self.assertNotIn("difficulty_bits", probe)
+                else:
+                    self.assertEqual(probe["difficulty_bits"], "1b6aac57")
+
     def test_metrics_scrape_can_be_skipped(self):
         probe = self.run_probe(metrics_endpoint=self.endpoint, want_metrics="")
 
@@ -489,12 +509,14 @@ zcash_net_in_bytes_total 12345
 
         self.assertEqual(probe["host"]["oom_kills_24h"], 0)
 
-    def test_oom_kills_are_counted_by_line(self):
+    def test_oom_kills_are_counted_once_per_killed_process(self):
+        # Two kills, each logged twice, as a cgroup kill and a repeated journal line.
+        kill = "Memory cgroup out of memory: Killed process {} (perf) total-vm:1kB\\n"
         with contextlib.ExitStack() as stack:
             env = self.stub_journalctl(
                 stack,
                 exit_code=0,
-                stdout="oom-kill: one\\noom-kill: two\\n",
+                stdout=(kill.format(4101) * 2) + (kill.format(4202) * 2),
             )
             probe = self.run_probe(env=env)
 
@@ -1045,6 +1067,10 @@ class NodeDetailTests(unittest.TestCase):
         metrics = {
             "checkpoint_verified_height": 4_199_999.0,
             "sync_block_applying": 0.0,
+            "sync_zakura_apply_operations": 5.0,
+            "sync_zakura_apply_in_flight": 5.0,
+            "sync_zakura_apply_oldest_seconds": 630.0,
+            "sync_zakura_apply_phase": 2.0,
             "sync_block_outstanding": 0.0,
             "sync_block_missing_bodies": 4_000.0,
             "sync_block_fill_stop": float("nan"),
@@ -1068,6 +1094,10 @@ class NodeDetailTests(unittest.TestCase):
             {
                 "checkpoint_verified_height": 4_199_999.0,
                 "sync_block_applying": 0.0,
+                "sync_zakura_apply_operations": 5.0,
+                "sync_zakura_apply_in_flight": 5.0,
+                "sync_zakura_apply_oldest_seconds": 630.0,
+                "sync_zakura_apply_phase": 2.0,
                 "sync_block_outstanding": 0.0,
                 "sync_block_missing_bodies": 4_000.0,
             },
@@ -1302,6 +1332,172 @@ class AddressPrivacyTests(unittest.TestCase):
                    "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
         self.assertEqual(status.redact_private_addresses(payload, {status.address_key("192.0.2.17")}), payload)
 
+
+
+
+class DashboardPasswordTests(unittest.TestCase):
+    """The fleet pages and data need the shared password; the public APIs and local readers do not."""
+
+    PASSWORD = "correct horse battery staple"
+
+    def setUp(self):
+        self.originals = (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN)
+        status.COLLECTOR = collector()
+        status.COLLECTOR.rows = [public_row(observed_at=time.time())]
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        status.DASHBOARD_LOGIN = status.DashboardLogin(
+            status.hash_password(self.PASSWORD, iterations=1000), "test-session-secret")
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.no_redirect = urllib.request.build_opener(NoRedirect)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        (status.COLLECTOR, status.RATE_LIMITER, status.LOGIN_RATE_LIMITER, status.DASHBOARD_LOGIN) = self.originals
+
+    def get(self, path, headers=None):
+        """(status, headers, body) for a GET that, by default, looks like it came through Caddy."""
+        headers = {"X-Forwarded-For": "198.51.100.7", **(headers or {})}
+        request = urllib.request.Request(self.base_url + path, headers=headers)
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def login(self, password):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": password}).encode(),
+            headers={"X-Forwarded-For": "198.51.100.7",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with self.no_redirect.open(request) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def test_proxied_visitor_without_login_sees_login_page_and_no_data(self):
+        code, _, body = self.get("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b'action="/login"', body)
+        self.assertNotEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/node/linux-reference")
+        self.assertIn(b'action="/login"', body)
+        # The propagation page lists outside peers' addresses, so it is gated like the rest.
+        code, _, body = self.get("/propagation")
+        self.assertIn(b'action="/login"', body)
+        for path in ("/data", "/data/node/linux-reference", "/profile/linux-reference/api/status",
+                     "/propagation/data"):
+            code, _, body = self.get(path)
+            self.assertEqual(code, 401, path)
+            self.assertEqual(json.loads(body), {"error": "login required"})
+
+    def test_local_reader_without_proxy_header_still_reads_data(self):
+        request = urllib.request.Request(self.base_url + "/data")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("chain", json.load(response))
+
+    def test_public_apis_and_health_stay_open(self):
+        self.assertEqual(self.get("/ironwood-status.json")[0], 200)
+        self.assertEqual(self.get("/healthz")[0], 200)
+
+    def test_wrong_password_is_rejected(self):
+        code, headers, body = self.login("wrong")
+        self.assertEqual(code, 401)
+        self.assertIn(b"Wrong password", body)
+        self.assertIsNone(headers["Set-Cookie"])
+
+    def test_right_password_sets_a_cookie_that_opens_the_dashboard(self):
+        code, headers, _ = self.login(self.PASSWORD)
+        self.assertEqual(code, 303)
+        cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        token = cookie.split(";", 1)[0]
+        code, _, body = self.get("/", {"Cookie": token})
+        self.assertEqual(body, status.PAGE.encode())
+        code, _, body = self.get("/data", {"Cookie": token})
+        self.assertEqual(code, 200)
+        self.assertIn("chain", json.loads(body))
+
+    def test_cookie_signed_under_another_secret_or_expired_is_rejected(self):
+        other = status.DashboardLogin(status.DASHBOARD_LOGIN.password_hash, "another-secret")
+        foreign = f"{status.SESSION_COOKIE}={other.issue_token(time.time())}"
+        self.assertEqual(self.get("/data", {"Cookie": foreign})[0], 401)
+        expired = f"{status.SESSION_COOKIE}={status.DASHBOARD_LOGIN.issue_token(time.time() - status.SESSION_SECONDS - 1)}"
+        self.assertEqual(self.get("/data", {"Cookie": expired})[0], 401)
+
+    def test_malformed_cookie_signature_is_refused_not_crashed(self):
+        for token in ("123.\u00e9", "abc.def", "9999999999." + "z" * 64, ""):
+            with self.subTest(token=token):
+                self.assertFalse(status.DASHBOARD_LOGIN.token_valid(token, time.time()))
+        self.assertEqual(self.get("/data", {"Cookie": f"{status.SESSION_COOKIE}=1.%C3%A9"})[0], 401)
+
+    def test_login_over_the_plain_http_port_is_refused(self):
+        request = urllib.request.Request(
+            self.base_url + "/login", method="POST",
+            data=urllib.parse.urlencode({"password": self.PASSWORD}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.no_redirect.open(request)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertIsNone(caught.exception.headers["Set-Cookie"])
+
+    def test_logout_clears_the_cookie(self):
+        code, headers, _ = self.get("/logout")
+        self.assertEqual(code, 303)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_login_guesses_are_rate_limited(self):
+        status.LOGIN_RATE_LIMITER = status.RateLimiter(limit=2, window=60)
+        self.assertEqual(self.login("a")[0], 401)
+        self.assertEqual(self.login("b")[0], 401)
+        self.assertEqual(self.login(self.PASSWORD)[0], 429)
+
+    def test_without_a_password_everything_is_open(self):
+        status.DASHBOARD_LOGIN = None
+        self.assertEqual(self.get("/")[2], status.PAGE.encode())
+        self.assertEqual(self.get("/data")[0], 200)
+        self.assertEqual(self.login(self.PASSWORD)[0], 404)
+
+
+class DashboardLoginConfigTests(unittest.TestCase):
+    def test_hash_round_trip_and_malformed_hash(self):
+        encoded = status.hash_password("pw", iterations=1000)
+        self.assertTrue(status.verify_password("pw", encoded))
+        self.assertFalse(status.verify_password("other", encoded))
+        self.assertFalse(status.verify_password("pw", "garbage"))
+
+    def test_env_without_hash_disables_the_gate(self):
+        self.assertIsNone(status.dashboard_login_from_env({}))
+
+    def test_login_survives_a_restart_until_the_password_changes(self):
+        env = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("pw", iterations=1000)}
+        token = status.dashboard_login_from_env(env).issue_token(time.time())
+        restarted = status.dashboard_login_from_env(env)
+        self.assertTrue(restarted.token_valid(token, time.time()))
+        new_password = {"ZAKURA_DASHBOARD_PASSWORD_HASH": status.hash_password("new", iterations=1000)}
+        self.assertFalse(status.dashboard_login_from_env(new_password).token_valid(token, time.time()))
+
+    def test_env_with_a_non_hash_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            status.dashboard_login_from_env({"ZAKURA_DASHBOARD_PASSWORD_HASH": "plaintext"})
+
+    def test_print_password_hash_reads_stdin(self):
+        result = subprocess.run([sys.executable, str(SCRIPT_PATH), "--print-password-hash"],
+                                input="pw\n", capture_output=True, text=True, check=True, timeout=30)
+        self.assertTrue(status.verify_password("pw", result.stdout.strip()))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 
 class HttpHandlerTests(unittest.TestCase):
@@ -1563,6 +1759,186 @@ class HttpHandlerTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Continuous profiler: which nodes run one, and the routes that show its pages
+# --------------------------------------------------------------------------- #
+
+
+class StubProfiler(BaseHTTPRequestHandler):
+    """Stands in for a node's deploy/profiler service and records what it is asked."""
+
+    requests: list[str] = []
+    status_report = {"state": "ok", "rate_hz": 199, "overhead_pct_last_hour": 1.2,
+                     "last_window_end": 1_000.0, "build": "1.2.3", "error": "details stay on the node"}
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        type(self).requests.append(self.path)
+        if self.path == "/":
+            body, content_type = b"<!doctype html><title>profile</title>", "text/html; charset=utf-8"
+        elif self.path == "/api/status":
+            body, content_type = json.dumps(self.status_report).encode(), "application/json"
+        elif self.path.startswith("/api/flame?view=nope"):
+            self.send_response(400)
+            self.end_headers()
+            return
+        else:
+            body, content_type = b'{"total_us": 5}', "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ProfilerRouteTests(unittest.TestCase):
+    def setUp(self):
+        StubProfiler.requests = []
+        self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
+        threading.Thread(target=self.profiler.serve_forever, daemon=True).start()
+        self.profiler_url = f"http://127.0.0.1:{self.profiler.server_port}"
+        profiled = node("profiled")
+        profiled.profiler_url = self.profiler_url
+        self.original_collector = status.COLLECTOR
+        self.original_limiter = status.RATE_LIMITER
+        status.COLLECTOR = status.ClusterCollector(
+            [profiled, node("plain")], interval=10, stale_after=300, network="testnet"
+        )
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        for server in (self.server, self.profiler):
+            server.shutdown()
+            server.server_close()
+        status.COLLECTOR = self.original_collector
+        status.RATE_LIMITER = self.original_limiter
+
+    def fetch(self, path):
+        try:
+            with urllib.request.urlopen(self.base_url + path) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read(), error.headers
+
+    def test_the_old_profile_page_address_opens_the_node_pages_profile(self):
+        code, body, headers = self.fetch("/profile/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertIn(b'href="/node/profiled#profile"', body)
+        self.assertEqual(StubProfiler.requests, [])
+
+    @unittest.skipUnless(shutil.which("node"), "needs node to run the page's JavaScript")
+    def test_a_saved_profile_link_keeps_its_view_on_the_node_page(self):
+        # A link saved from the old page carries its view in the fragment, which only
+        # the browser sees: the redirect page moves it, and the profile reads it back.
+        old_view = "#from=1700000000&to=1700000600&view=verification&lens=block&focus=zakura%3A%3Averify"
+        redirect = re.search(r"<script>(.*?)</script>", status.profile_redirect_page("profiled").decode()).group(1)
+        read_hash = re.search(r"function readHash\(\) \{.*?\n\}", status.PAGE, re.S).group(0)
+        script = f"""
+            const location = {{ hash: {json.dumps(old_view)}, replace(url) {{ this.next = url; }} }};
+            {redirect}
+            location.hash = location.next.slice(location.next.indexOf("#"));
+            const state = {{}};
+            {read_hash}
+            readHash();
+            console.log(JSON.stringify({{ url: location.next, state }}));
+        """
+        result = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+        self.assertTrue(result["url"].startswith("/node/profiled#profile&"))
+        self.assertEqual(result["state"], {
+            "from": 1700000000, "to": 1700000600, "view": "verification", "lens": "block", "focus": "zakura::verify",
+        })
+
+    def test_every_profile_button_the_click_handler_names_is_on_the_page(self):
+        names = set(re.findall(r'button\.id === "([^"]+)"', status.PAGE))
+        self.assertEqual(names, {"pf-live", "pf-focus-fn", "pf-zoom-out", "pf-stage-median"})
+        for name in names:
+            self.assertIn(f'<button id="{name}"', status.PAGE)
+
+    def test_the_node_page_holds_the_cpu_profile_and_a_jump_bar(self):
+        code, body, _ = self.fetch("/node/profiled")
+        self.assertEqual(code, 200)
+        self.assertIn(b'id="node-nav"', body)
+        self.assertIn(b'<section class="pf" id="profile"', body)
+        # The profile reads the forwarder, never a page of the profiler's own.
+        self.assertIn(b'const BASE = "/profile/" + encodeURIComponent(node);', body)
+
+    def test_profile_data_forwards_only_the_parameters_each_request_accepts(self):
+        code, body, _ = self.fetch(
+            "/profile/profiled/api/flame?range=1h&view=verification&evil=1&focus=" + "x" * 500
+        )
+        self.assertEqual((code, json.loads(body)), (200, {"total_us": 5}))
+        self.assertEqual(StubProfiler.requests, ["/api/flame?range=1h&view=verification"])
+
+    def test_a_request_the_profiler_refuses_is_refused_with_the_same_status(self):
+        self.assertEqual(self.fetch("/profile/profiled/api/flame?view=nope")[0], 400)
+
+    def test_only_listed_requests_on_profiled_nodes_are_served(self):
+        for path in (
+            "/profile/unknown",
+            "/profile/plain",
+            "/profile/plain/api/status",
+            "/profile/profiled/api/shutdown",
+            # The profiler's block records name peers by address before any is dropped.
+            "/profile/profiled/api/propagation",
+            "/profile/profiled/api/propagation?limit=5",
+            "/profile/profiled/anything",
+            "/profile/profiled/api/",
+        ):
+            self.assertEqual(self.fetch(path)[0], 404, path)
+        self.assertEqual(StubProfiler.requests, [])
+
+    def test_a_profiler_that_is_down_is_reported_not_waited_on(self):
+        self.profiler.shutdown()
+        self.profiler.server_close()
+        self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 502)
+        self.assertEqual(status.profiler_summary(self.profiler_url), {"state": "unreachable"})
+        # Reopen so tearDown can close it like any other test.
+        self.profiler = status.ThreadingHTTPServer(("127.0.0.1", 0), StubProfiler)
+        threading.Thread(target=self.profiler.serve_forever, daemon=True).start()
+
+    def test_profile_routes_share_the_public_rate_limit(self):
+        status.RATE_LIMITER = status.RateLimiter(limit=1, window=60)
+        self.assertEqual(self.fetch("/profile/profiled/api/status")[0], 200)
+        code, _, headers = self.fetch("/profile/profiled/api/status")
+        self.assertEqual(code, 429)
+        self.assertEqual(headers["Retry-After"], "60")
+
+    def test_fleet_rows_say_which_nodes_are_profiled(self):
+        with mock.patch.object(status, "probe_node", return_value={}):
+            status.COLLECTOR.poll_once()
+        rows = {row["name"]: row for row in status.COLLECTOR.snapshot()["rows"]}
+        self.assertEqual(
+            rows["profiled"]["profiler"],
+            {"state": "ok", "rate_hz": 199, "overhead_pct_last_hour": 1.2, "last_window_end": 1_000.0},
+        )
+        self.assertNotIn("profiler", rows["plain"])
+
+    def test_page_links_a_profiled_node_to_its_cpu_profile_section(self):
+        self.assertIn("function profilerBadge(row)", status.PAGE)
+        self.assertIn('<a class="node-link badge tone-', status.PAGE)
+        self.assertIn("href=\"/node/'", status.PAGE)
+        self.assertIn("'#profile\" title=\"'", status.PAGE)
+
+    def test_profiler_url_is_read_from_the_monitor_table(self):
+        template = (
+            '[[nodes]]\nname = "a"\nssh_string = "root@a"\nmonitor = {{ profiler_url = "{url}" }}\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nodes.toml"
+            path.write_text(template.format(url="http://127.0.0.1:8097"))
+            self.assertEqual(status.load_nodes(path)[0].profiler_url, "http://127.0.0.1:8097")
+            path.write_text(template.format(url="http://127.0.0.1:8097/api/status"))
+            with self.assertRaises(SystemExit):
+                status.load_nodes(path)
+
+
+# --------------------------------------------------------------------------- #
 # NU7 configured-network status
 # --------------------------------------------------------------------------- #
 
@@ -1625,6 +2001,207 @@ def nu7_rows(**overrides):
     rows.update(overrides)
     return list(rows.values())
 
+
+
+class PropagationRouteTests(unittest.TestCase):
+    """The cluster view against stand-in profilers that each report one block."""
+
+    BLOCK = "ab" * 32
+    # Documentation addresses: a peer outside the fleet, and one that must stay private.
+    OUTSIDE = "198.51.100.9"
+    PRIVATE = "192.0.2.17"
+
+    def setUp(self):
+        import propagation
+
+        self.asked = []
+        # What each stand-in profiler says its node downloaded the block from.
+        self.downloads = {}
+        self.original = (status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler)
+        heard_first, heard_later = node("heard-first"), node("heard-later")
+        down, plain = node("down"), node("plain")
+        heard_first.profiler_url, heard_later.profiler_url, down.profiler_url = "first", "later", "down"
+        status.fetch_profiler = self.fake_profiler
+        status.PROPAGATION = status.PropagationView([heard_first, heard_later, down, plain], propagation.join)
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        status.PROPAGATION, status.RATE_LIMITER, status.fetch_profiler = self.original
+
+    def fake_profiler(self, profiler_url, path, timeout):
+        self.asked.append((profiler_url, path))
+        if profiler_url == "down":
+            return 502, b"", "text/plain"
+        tip = 1_794_000_000.0 + (0.05 if profiler_url == "first" else 0.25)
+        block = {
+            "hash": self.BLOCK, "height": 7, "path": "legacy", "t": tip, "wall": {"tip": tip}, "peers": {},
+            "downloads": self.downloads.get(profiler_url, []),
+        }
+        return 200, json.dumps({"node": profiler_url, "clock": None, "blocks": [block]}).encode(), "application/json"
+
+    def fetch(self, path):
+        try:
+            with urllib.request.urlopen(self.base_url + path) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read(), error.headers
+
+    def test_the_data_joins_every_profiled_node_s_report_of_a_block(self):
+        code, body, headers = self.fetch("/propagation/data")
+        self.assertEqual((code, headers["Cache-Control"]), (200, status.NO_STORE["Cache-Control"]))
+        joined = json.loads(body)
+        self.assertEqual(joined["nodes"], ["heard-first", "heard-later", "down"])
+        self.assertEqual(joined["unreachable"], ["down"])
+        (block,) = joined["blocks"]
+        self.assertEqual((block["hash"], block["first_node"], block["spread_ms"]), (self.BLOCK, "heard-first", 200.0))
+
+    @staticmethod
+    def download(addr, ms=420, agent="/Zakura:1.8.7/"):
+        return {"stack": "legacy", "addr": addr, "agent": agent, "ms": ms, "result": "available", "route": "ready"}
+
+    def test_a_download_names_an_outside_peer_and_a_fleet_node(self):
+        self.downloads = {
+            "first": [self.download(self.OUTSIDE)],
+            # `heard-first` is reached at this address, so the peer is one of ours.
+            "later": [self.download("203.0.113.5", ms=30)],
+        }
+        status.PROPAGATION.fleet_addresses = {"203.0.113.5": "heard-first"}
+        joined = json.loads(self.fetch("/propagation/data")[1])
+        (peer,) = joined["outside_peers"]
+        self.assertEqual((peer["ip"], peer["agent"], peer["nodes"]), (self.OUTSIDE, "/Zakura:1.8.7/", ["heard-first"]))
+        slowest, fastest = joined["slowest_downloads"]
+        self.assertEqual((slowest["node"], slowest["kind"], slowest["ip"], slowest["ms"]),
+                         ("heard-first", "outside", self.OUTSIDE, 420))
+        self.assertEqual((fastest["node"], fastest["kind"], fastest["name"]), ("heard-later", "fleet", "heard-first"))
+        self.assertNotIn("203.0.113.5", json.dumps(joined))
+
+    def test_every_node_in_the_list_is_one_of_ours_by_its_address(self):
+        named = [node("with-profiler"), node("without")]
+        named[0].ssh_string, named[1].ssh_string = "root@203.0.113.5", "deploy@[2001:db8::7]:22"
+        named[0].profiler_url = "first"
+        view = status.PropagationView(named, None)
+        self.assertEqual(view.fleet_addresses, {"203.0.113.5": "with-profiler", "2001:db8::7": "without"})
+
+    def test_a_peer_made_private_is_not_served_from_the_cached_view(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        with mock.patch.object(status, "private_addresses", return_value=frozenset()):
+            self.assertIn(private_agent.encode(), self.fetch("/propagation/data")[1])
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            body = self.fetch("/propagation/data")[1]
+        self.assertNotIn(private_agent.encode(), body)
+        self.assertEqual(json.loads(body)["outside_peers"], [])
+
+    def test_a_queued_request_reads_the_private_list_after_acquiring_the_cache(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {"first": [self.download(self.PRIVATE, agent=private_agent)]}
+        view = status.PROPAGATION
+        queued = threading.Event()
+        lock = threading.Lock()
+
+        class QueuedLock:
+            def __enter__(self):
+                queued.set()
+                lock.acquire()
+
+            def __exit__(self, *args):
+                lock.release()
+
+        view._lock = QueuedLock()
+        protected = frozenset()
+        result = []
+        with mock.patch.object(status, "private_addresses", side_effect=lambda: protected):
+            with lock:
+                worker = threading.Thread(target=lambda: result.append(view.data()), daemon=True)
+                worker.start()
+                self.assertTrue(queued.wait(2), "the request must reach the busy cache")
+                protected = frozenset({status.address_key(self.PRIVATE)})
+            worker.join(2)
+        self.assertFalse(worker.is_alive(), "the queued request must finish")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["outside_peers"], [])
+        self.assertNotIn(private_agent, json.dumps(result[0]))
+
+    def test_a_private_peer_s_address_and_software_are_never_served(self):
+        private_agent = "/Zakura:9.9.9-private/"
+        self.downloads = {
+            "first": [
+                self.download(self.PRIVATE, ms=900, agent=private_agent),
+                self.download(f"{self.PRIVATE}:8233", ms=800, agent=private_agent),
+                self.download(f"::ffff:{self.PRIVATE}", ms=700, agent=private_agent),
+                self.download(f"[::ffff:{self.PRIVATE}]:8233", ms=600, agent=private_agent),
+            ],
+            "later": [self.download(self.OUTSIDE)],
+        }
+        protected = frozenset({status.address_key(self.PRIVATE)})
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            code, body, _ = self.fetch("/propagation/data")
+        self.assertEqual(code, 200)
+        for secret in (self.PRIVATE.encode(), b"9.9.9-private", b"redacted-address"):
+            self.assertNotIn(secret, body)
+        joined = json.loads(body)
+        self.assertEqual([peer["ip"] for peer in joined["outside_peers"]], [self.OUTSIDE])
+        # The node's slow downloads are still shown, without saying who served them.
+        private = [d for d in joined["slowest_downloads"] if d["node"] == "heard-first"]
+        self.assertEqual([(d["kind"], d["ms"]) for d in private],
+                         [("private", 900), ("private", 800), ("private", 700), ("private", 600)])
+        self.assertTrue(all("ip" not in d and "agent" not in d for d in private))
+
+    def test_nothing_is_served_when_the_private_addresses_cannot_be_read(self):
+        self.downloads = {"first": [self.download(self.PRIVATE)]}
+        for failure in (ValueError("private address configuration required"), OSError("unreadable")):
+            with mock.patch.object(status, "private_addresses", side_effect=failure):
+                code, body, _ = self.fetch("/propagation/data")
+            self.assertEqual((code, json.loads(body)), (503, {"error": "privacy configuration unavailable"}))
+            self.assertNotIn(self.PRIVATE.encode(), body)
+        self.assertEqual(self.asked, [])
+
+    def test_profilers_are_asked_once_for_requests_close_together(self):
+        self.fetch("/propagation/data")
+        self.fetch("/propagation/data")
+        self.assertEqual(
+            sorted(self.asked),
+            [(url, f"/api/propagation?limit={status.PROPAGATION_BLOCKS}") for url in ("down", "first", "later")],
+        )
+
+    def test_the_page_is_served_and_asks_for_that_data(self):
+        code, body, headers = self.fetch("/propagation")
+        self.assertEqual((code, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
+        self.assertIn(b'fetch("/propagation/data"', body)
+        # A selected block is named in the page address, so it can be linked to.
+        self.assertIn(b'"#block=" + hash', body)
+        # The downloads each node made: the slowest ones, and the outside peers that served them.
+        for part in (b'<table id="slowest">', b'<table id="outside">', b'"private peer"'):
+            self.assertIn(part, body)
+        # zcashd is shown by that name, not by the "MagicBean" it sends when connecting.
+        self.assertIn(b'.replace("MagicBean", "zcashd")', body)
+        self.assertIn("kvRow(peerSoftwareName(entry[0]), num(entry[1]))", status.PAGE)
+        # A node's name on the page leads to that node's own page.
+        self.assertIn(b'"/node/" + encodeURIComponent(name)', body)
+        self.assertIn(b'"Legacy failures"', body)
+        self.assertIn(b'every profiled node had the tip', body)
+        self.assertNotIn(b'every node had the tip', body)
+
+    def test_other_paths_and_a_dashboard_without_profilers_have_no_cluster_view(self):
+        self.assertEqual(self.fetch("/propagation/other")[0], 404)
+        status.PROPAGATION = None
+        self.assertEqual(self.fetch("/propagation/data")[0], 404)
+
+    def test_the_cluster_view_shares_the_public_rate_limit(self):
+        status.RATE_LIMITER = status.RateLimiter(limit=1, window=60)
+        self.assertEqual(self.fetch("/propagation/data")[0], 200)
+        self.assertEqual(self.fetch("/propagation")[0], 429)
+
+    def test_the_fleet_page_links_to_the_cluster_view(self):
+        self.assertIn('id="propagation-link" href="/propagation" hidden', status.PAGE)
+        self.assertIn("el('propagation-link').hidden = !profiled;", status.PAGE)
 
 class Nu7StatusTests(unittest.TestCase):
     def setUp(self):
@@ -2032,6 +2609,38 @@ class BoundedServerTests(unittest.TestCase):
         self.assertEqual(status.Handler.timeout, status.REQUEST_TIMEOUT_SECONDS)
         self.assertIn("BoundedHTTPServer((args.host, args.port), Handler)",
                       SCRIPT_PATH.read_text())
+
+
+class DifficultyPolicyTests(unittest.TestCase):
+    def test_monitoring_floor_matches_the_node_admission_policy(self):
+        sys.path.insert(0, str(SCRIPT_PATH.parent))
+        from zakura_monitoring import difficulty
+
+        source = (SCRIPT_PATH.parents[2] / "crates/zakurad/src/components/download_work.rs").read_text()
+        reference = re.search(r"CompactDifficulty::from_le_bytes\((0x[0-9a-fA-F]+)_u32", source)
+        multiplier = re.search(r"const MAINNET_TARGET_MULTIPLIER: u32 = (\d+);", source)
+        height = re.search(r"const MAINNET_WORK_FLOOR_HEIGHT: Height = Height\(([0-9_]+)\);", source)
+        self.assertIsNotNone(reference)
+        self.assertIsNotNone(multiplier)
+        self.assertIsNotNone(height)
+        self.assertEqual(difficulty.REFERENCE_BITS, int(reference[1], 16))
+        self.assertEqual(difficulty.TARGET_MULTIPLIER, int(multiplier[1]))
+        self.assertEqual(difficulty.FLOOR_HEIGHT, int(height[1].replace("_", "")))
+
+    def test_fleet_payload_keeps_the_target_with_its_tip(self):
+        collected = collector(network="mainnet")
+        probe = {"active_state": "active", "height": 3_538_452, "block_hash": "a" * 64,
+                 "rpc_chain": "main", "difficulty_bits": "1b6aac57"}
+        row = collected.row_for(node(), probe, now=1000)
+        collected.rows = [row]
+        collected.last_poll = 1000
+        payload = collected.snapshot()
+        self.assertEqual(payload["rows"][0]["difficulty_bits"], "1b6aac57")
+        safe = status.monitoring_snapshot(payload, {"node-a"})
+        self.assertEqual(safe["rows"][0]["difficulty_bits"], "1b6aac57")
+        self.assertEqual(safe["rows"][0]["rpc_chain"], "main")
+        self.assertEqual(safe["rows"][0]["last_seen_at"], 1000)
+        self.assertEqual(safe["rows"][0]["block_hash"], "a" * 64)
 
 
 if __name__ == "__main__":

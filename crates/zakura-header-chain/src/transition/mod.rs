@@ -8,6 +8,8 @@ mod recovery;
 mod types;
 
 pub use authority::{Clock, FullStateEvidenceAuthority, SystemClock, TransitionContext};
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+pub use engine::DurableState;
 pub use engine::{
     CommittedTransitionError, EngineHydrationError, HeaderChainEngine, HeaderInsertionFacts,
     HeaderValidationFacts, TransitionInput,

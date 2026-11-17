@@ -201,8 +201,8 @@ fn invalid_preparation_context_is_stale() {
     }
 }
 
-/// ST2.2: a repair context, which a simulation can't resolve, fails
-/// through the typed contract as `Stale`.
+/// ST2.2: a repair context above the selected tip fails through the typed
+/// contract as `Stale`. `tests/header_repair.rs` resolves one.
 #[test]
 fn a_repair_context_is_stale() {
     let fixture = HeaderFixture::regtest();
@@ -335,4 +335,81 @@ fn results_repeat_in_a_fresh_process() {
         .take_while(char::is_ascii_hexdigit)
         .collect();
     assert_eq!(child, expected);
+}
+
+/// A weight hardens only its own branch's target, and each step of weight
+/// adds work to every header. Weight 0 leaves a branch's headers exactly
+/// as an unweighted fixture builds them.
+#[test]
+fn a_weight_adds_work_to_its_own_branch_only() {
+    let plain = HeaderFixture::regtest();
+    let genesis = plain.genesis_header().difficulty_threshold;
+    let anchor = plain.anchor();
+    let work = |fixture: &HeaderFixture, branch| {
+        fixture
+            .target(branch)
+            .to_work()
+            .expect("fixture targets have work")
+    };
+    for branch in [0, 1, 2, 3] {
+        assert_eq!(plain.target(branch), genesis);
+    }
+    assert_eq!(
+        plain.clone().with_weight(1, 0).extend(anchor, 2, 1),
+        plain.extend(anchor, 2, 1)
+    );
+    let mut lighter = work(&plain, 2);
+    for weight in 1..=zakura_storage::header::fixture::MAX_WEIGHT {
+        let weighted = plain.clone().with_weight(2, weight);
+        assert!(work(&weighted, 2) > lighter, "weight {weight}");
+        lighter = work(&weighted, 2);
+        for branch in [0, 1, 3] {
+            assert_eq!(weighted.target(branch), genesis);
+        }
+        assert!(weighted
+            .extend(anchor, 2, 2)
+            .iter()
+            .all(|header| header.difficulty_threshold == weighted.target(2)));
+    }
+}
+
+/// Two headers at weight 2 from genesis outweigh three unweighted ones, so
+/// the shorter weighted fork prepares, applies and is selected.
+#[test]
+fn a_shorter_weighted_fork_outweighs_a_longer_one() {
+    let fixture = HeaderFixture::regtest().with_weight(1, 2);
+    let port = EnginePort::new(&fixture);
+    let anchor = fixture.anchor();
+    let main_tip = admit(&port, anchor, &fixture.extend(anchor, 3, 0), 1);
+    assert_eq!(port.snapshot().frontiers.header_best, main_tip);
+    let fork_tip = admit(&port, anchor, &fixture.extend(anchor, 2, 1), 2);
+    assert_eq!(port.snapshot().frontiers.header_best, fork_tip);
+}
+
+/// Branch 0 keeps the genesis target, so it takes no weight.
+#[test]
+#[should_panic(expected = "only branches 1 and 2 take a weight, not branch 0")]
+fn branch_zero_takes_no_weight() {
+    let _ = HeaderFixture::regtest().with_weight(0, 1);
+}
+
+/// In simulator builds the port records each snapshot it sends on its
+/// selected-chain watch: one per committed transition, equal to the engine's
+/// snapshot then, and taken once.
+#[cfg(zakura_sim)]
+#[test]
+fn each_publication_on_the_selected_watch_is_recorded() {
+    let fixture = HeaderFixture::regtest();
+    let port = EnginePort::new(&fixture);
+    assert_eq!(port.take_publications(), Vec::new());
+    let anchor = fixture.anchor();
+    let first = fixture.extend(anchor, 2, 0);
+    admit(&port, anchor, &first, 1);
+    let after_first = port.snapshot();
+    let tip = frontiers(anchor, &first)[1];
+    let second = fixture.extend(tip, 1, 0);
+    admit(&port, tip, &second, 2);
+    let after_second = port.snapshot();
+    assert_eq!(port.take_publications(), vec![after_first, after_second]);
+    assert_eq!(port.take_publications(), Vec::new());
 }

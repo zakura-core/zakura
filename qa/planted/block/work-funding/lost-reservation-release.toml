@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/block-work-funding.bin"
+checks = ["crates/zakura-network/src/zakura/block_sync/work_queue", "crates/zakura-network/src/zakura/transport/guard.rs"]

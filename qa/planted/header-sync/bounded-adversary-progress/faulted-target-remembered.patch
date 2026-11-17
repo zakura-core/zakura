@@ -1,0 +1,54 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 9f71e35495..aa646927ee 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1304,6 +1304,11 @@ impl HeaderSyncReactor {
+                         local.frontiers.finalized.hash,
+                         target_tip_hash,
+                     ),
++                ) || self.state.planted_failed_targets.contains(
++                    &zakura_header_chain::BranchId::new(
++                        local.frontiers.finalized.hash,
++                        target_tip_hash,
++                    ),
+                 ),
+                 eligible: target.is_discovery_eligible(local)
+                     && self.negotiated_response_limits(&target.status).1 != 0,
+@@ -2324,6 +2329,16 @@ impl HeaderSyncReactor {
+                 }
+             }
+             HeaderTargetPreparationResult::Failed(error) => {
++                // Planted: remember the failed target as if it were admitted,
++                // so no peer offers it again.
++                if let Some(local) = self.committed_snapshot.as_ref() {
++                    self.state
++                        .planted_failed_targets
++                        .insert(zakura_header_chain::BranchId::new(
++                            local.frontiers.finalized.hash,
++                            active.target.status.selected_tip_hash,
++                        ));
++                }
+                 end_retained(&mut retained, HeaderWorkEnd::PrepareFailed);
+                 self.emit_target_outcome(
+                     hs_trace::HEADER_TARGET_REJECTED,
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4048262202..e73b8677a0 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -99,6 +99,8 @@ pub(super) struct ReactorState {
+     /// again from [`PRUNED_BACKOFF_MIN`].
+     pub(super) pruned_peers: HashMap<ZakuraPeerId, PrunedPeer>,
+     pub(super) completed_targets: CompletedHeaderTargets,
++    /// Planted: every target whose prepare failed, never cleared.
++    pub(super) planted_failed_targets: HashSet<zakura_header_chain::BranchId>,
+     /// State version of the latest ordinary admission refused by a committed resource stall.
+     pub(super) ordinary_resource_stall: Option<zakura_header_chain::StateVersion>,
+     pub(super) vct_repair: RepairRequirementSlot,
+@@ -134,6 +136,7 @@ impl ReactorState {
+             pending_closes: HashMap::new(),
+             pruned_peers: HashMap::new(),
+             completed_targets: CompletedHeaderTargets::default(),
++            planted_failed_targets: HashSet::new(),
+             ordinary_resource_stall: None,
+             vct_repair: RepairRequirementSlot::default(),
+             vct_repair_stall: None,

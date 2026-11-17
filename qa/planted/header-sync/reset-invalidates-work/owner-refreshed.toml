@@ -1,0 +1,13 @@
+# Adopting a reset rewrites each obsolete round's owner to the new
+# generation and keeps the round. Its owner now looks current, but the
+# round started under the old generation, which the check keeps from its
+# `Started`.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.plan"

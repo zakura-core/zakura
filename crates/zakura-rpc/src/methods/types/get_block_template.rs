@@ -11,6 +11,7 @@ pub mod zip317;
 mod tests;
 
 pub(crate) mod prepared_candidates;
+pub(crate) mod trace;
 use prepared_candidates::PreparedCandidateResolver;
 
 use std::{
@@ -40,7 +41,7 @@ use zakura_chain::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
         Network,
     },
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::DateTime32,
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
@@ -61,15 +62,17 @@ use crate::{
         mining::{ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR},
     },
     methods::types::{
-        default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        default_roots::DefaultRoots,
+        long_poll::LongPollId,
+        transaction::{coinbase_needs_proof, TransactionTemplate},
     },
     server::error::{LegacyCode, MapError, OkOrError},
-    MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
+    EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
 };
 
 use constants::{
-    CAPABILITIES_FIELD, MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP, MUTABLE_FIELD,
-    NONCE_RANGE_FIELD, NOT_SYNCED_ERROR_CODE,
+    CAPABILITIES_FIELD, MAX_TIME_SINCE_CHAIN_TIP, MUTABLE_FIELD, NONCE_RANGE_FIELD,
+    NOT_SYNCED_ERROR_CODE,
 };
 pub use miner_address::MinerAddress;
 pub use parameters::{
@@ -89,6 +92,37 @@ const MAX_PREPARED_WORK_IDS: usize = 64;
 const MAX_TEMPLATE_BUILDS: usize = 1;
 /// Bound admission waits without cancelling an already running proof.
 const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
+
+/// The work a template build does, which decides where it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateBuildWork {
+    /// No proof is created, so the build takes well under a millisecond and runs where it
+    /// was asked for.
+    ///
+    /// Handing so short a build to another thread costs more than the build: the thread has
+    /// to be found and scheduled while the node is busy with the block that prompted the
+    /// template.
+    ProofFree,
+
+    /// A proof is created for a shielded miner reward, which takes seconds, so the build runs
+    /// on a blocking thread.
+    Proof,
+}
+
+impl TemplateBuildWork {
+    /// Returns the work of a build that creates the coinbase at `height` for this miner.
+    pub(crate) fn for_coinbase(
+        net: &Network,
+        height: block::Height,
+        miner_params: &MinerParams,
+    ) -> Self {
+        if coinbase_needs_proof(net, height, miner_params) {
+            Self::Proof
+        } else {
+            Self::ProofFree
+        }
+    }
+}
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -530,8 +564,9 @@ impl BlockTemplateResponse {
         let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) =
             mempool_txs.into_iter().map(|tx| ((&tx).into(), tx)).unzip();
 
-        // Transaction selection returns transactions in an arbitrary order,
-        // but Zebra's snapshot tests expect the same order every time.
+        // Production keeps the selection order, which is deterministic and puts
+        // parents before children. Tests re-sort by dependency depth, then hash,
+        // so snapshot tests do not change when the selection order does.
         //
         // # Correctness
         //
@@ -814,11 +849,12 @@ where
     prepared_candidates: PreparedCandidateResolver,
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
+    #[allow(dead_code)]
     sync_status: SyncStatus,
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::UnboundedSender<MinedBlockEvent>,
+    mined_block_sender: mpsc::UnboundedSender<EarlyMinedBlock>,
 
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
@@ -840,6 +876,9 @@ where
 
     /// Stops speculative preparation for a parent whose template missed its deadline.
     pub(crate) speculation_breaker: SpeculationBreaker,
+
+    /// Records the stages of each template this handler returns.
+    pub(crate) trace: trace::MiningTemplateTrace,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -855,7 +894,7 @@ where
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
@@ -864,7 +903,7 @@ where
             prepared_candidates: PreparedCandidateResolver::default(),
             sync_status,
             mined_block_sender: mined_block_sender
-                .unwrap_or(SubmitBlockChannel::default().sender()),
+                .unwrap_or(EarlyMinedBlockChannel::default().sender()),
             pending_blocks: PendingBlockRegistry::default(),
             mined_submissions: Default::default(),
             optimistic_block_inventory,
@@ -872,6 +911,7 @@ where
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
+            trace: trace::MiningTemplateTrace::default(),
         }
     }
 
@@ -880,9 +920,13 @@ where
         self.pending_blocks = pending_blocks;
     }
 
-    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    /// Runs one template build at a time across RPC clones, where its `work` belongs.
+    ///
+    /// A proof build runs off the async worker and keeps its capacity until it finishes, even
+    /// if the caller stops waiting for it.
     pub(crate) async fn run_template_build<T: Send + 'static>(
         &self,
+        work: TemplateBuildWork,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
         let permit = tokio::time::timeout(
@@ -898,13 +942,30 @@ where
         })?
         .map_misc_error()?;
 
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        match work {
+            TemplateBuildWork::ProofFree => {
+                let _permit = permit;
+                // A panic becomes an RPC error, as it does when the build runs on a blocking
+                // thread.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_default();
+                        format!("mining template construction panicked: {message}")
+                    })
+                    .map_misc_error()
+            }
+            TemplateBuildWork::Proof => tokio::task::spawn_blocking(move || {
+                // Dropping the RPC future cannot release capacity while this job still owns work.
+                let _permit = permit;
+                build()
+            })
+            .await
+            .map_misc_error(),
+        }
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -921,6 +982,7 @@ where
     }
 
     /// Returns the sync status.
+    #[allow(dead_code)]
     pub fn sync_status(&self) -> SyncStatus {
         self.sync_status.clone()
     }
@@ -936,7 +998,7 @@ where
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.
-    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<EarlyMinedBlock> {
         self.mined_block_sender.clone()
     }
 
@@ -1029,13 +1091,13 @@ pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcR
 }
 
 /// Validates a proposal, registering its work ID only after successful verification.
-pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
+pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip>(
     mut block_verifier_router: BlockVerifierRouter,
     block_proposal_bytes: Vec<u8>,
     net: &Network,
     latest_chain_tip: Tip,
-    sync_status: SyncStatus,
-    prepared_work: Option<(PreparedCandidateResolver, &str)>,
+    prepared_candidates: PreparedCandidateResolver,
+    work_id: Option<&str>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -1047,11 +1109,10 @@ where
         + Sync
         + 'static,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    check_synced_to_tip(net, latest_chain_tip, sync_status)?;
+    check_synced_to_tip(net, latest_chain_tip)?;
 
-    let block: Block = match block_proposal_bytes.zcash_deserialize_into() {
+    let block = match Block::zcash_deserialize_bounded(&mut block_proposal_bytes.as_slice()) {
         Ok(block) => block,
         Err(parse_error) => {
             tracing::info!(
@@ -1073,19 +1134,24 @@ where
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?
         .call(zakura_consensus::Request::Prepare {
-            block: block.clone(),
+            block: block.clone().into(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;
 
     if block_verifier_router_response.is_ok() {
-        if let Some((prepared_candidates, work_id)) = prepared_work {
-            prepared_candidates.insert(
+        // Keep the proposal so that submitting it solved, by work ID or in full, reuses it.
+        match work_id {
+            Some(work_id) => prepared_candidates.insert(
                 block,
                 work_id,
                 zakura_consensus::PreparedCandidateSource::ClientProposal,
                 net,
-            );
+            ),
+            None => prepared_candidates.retain(
+                block,
+                zakura_consensus::PreparedCandidateSource::ClientProposal,
+            ),
         }
     }
 
@@ -1104,33 +1170,27 @@ where
 
 // - State and syncer checks
 
-/// Returns an error if Zebra is not synced to the consensus chain tip.
-/// Returns early with `Ok(())` if Proof-of-Work is disabled on the provided `network`.
+/// Returns an error if the local best tip's block time is more than
+/// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock.
+///
+/// Returns early with `Ok(())` on test networks.
 /// This error might be incorrect if the local clock is skewed.
-pub fn check_synced_to_tip<Tip, SyncStatus>(
-    network: &Network,
-    latest_chain_tip: Tip,
-    sync_status: SyncStatus,
-) -> RpcResult<()>
+pub fn check_synced_to_tip<Tip>(network: &Network, latest_chain_tip: Tip) -> RpcResult<()>
 where
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     if network.is_a_test_network() {
         return Ok(());
     }
 
-    // The tip estimate may not be the same as the one coming from the state
-    // but this is ok for an estimate
-    let (estimated_distance_to_chain_tip, local_tip_height) = latest_chain_tip
-        .estimate_distance_to_network_chain_tip(network)
+    let (local_tip_height, local_tip_time) = latest_chain_tip
+        .best_tip_height_and_block_time()
         .ok_or_misc_error("no chain tip available yet")?;
+    let time_since_tip = chrono::Utc::now() - local_tip_time;
 
-    if !sync_status.is_close_to_tip()
-        || estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP
-    {
+    if time_since_tip > MAX_TIME_SINCE_CHAIN_TIP {
         tracing::info!(
-            ?estimated_distance_to_chain_tip,
+            ?time_since_tip,
             ?local_tip_height,
             "Zakura has not synced to the chain tip. \
              Hint: check your network connection, clock, and time zone settings."
@@ -1140,7 +1200,7 @@ where
             NOT_SYNCED_ERROR_CODE,
             format!(
                 "Zakura has not synced to the chain tip, \
-                 estimated distance: {estimated_distance_to_chain_tip:?}, \
+                 time since local tip: {time_since_tip}, \
                  local tip: {local_tip_height:?}. \
                  Hint: check your network connection, clock, and time zone settings."
             ),
@@ -1202,8 +1262,6 @@ where
         .oneshot(mempool::Request::FullTransactions)
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?;
-
-    // TODO: Order transactions in block templates based on their dependencies
 
     let mempool::Response::FullTransactions {
         transactions,

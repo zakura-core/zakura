@@ -148,11 +148,12 @@ class ActivationFeed:
             endpoints = [rpc_endpoint_identity(n["rpcUrl"]) for n in nodes]
             if len(set(endpoints)) != 3:
                 raise ValueError("managed validators require distinct RPC endpoints")
-            reference = settings["reference"]
-            if reference["name"] in {n["name"] for n in nodes}:
-                raise ValueError("reference requires a distinct source name")
-            if reference.get("rpcUrl") and rpc_endpoint_identity(reference["rpcUrl"]) in endpoints:
-                raise ValueError("reference must be independent of managed validators")
+            if profile == "public-testnet":
+                reference = settings["reference"]
+                if reference["name"] in {n["name"] for n in nodes}:
+                    raise ValueError("reference requires a distinct source name")
+                if reference.get("rpcUrl") and rpc_endpoint_identity(reference["rpcUrl"]) in endpoints:
+                    raise ValueError("reference must be independent of managed validators")
             network = settings["manifest"]["network"]
             name, magic = ("Mainnet", "24e92764") if profile == "mainnet" else ("Testnet", "fa1af9bf")
             if network["name"] != name or network["magic"] != magic or network["branchId"] != "77190ad9":
@@ -210,7 +211,7 @@ class ActivationFeed:
             if (info["chain"] != ("main" if profile == "mainnet" else "test") or not upgrade
                     or upgrade["activationheight"] != activation
                     or self.rpc(url, "getblockhash", [identity["height"]]) != identity["hash"]):
-                raise ValueError("public Testnet identity/upgrade mismatch")
+                raise ValueError("public network identity/upgrade mismatch")
             tip = (info["blocks"], info["bestblockhash"])
             previous = self.progress.get((profile, node["name"]))
             changed = now if previous is None or previous[:2] != tip else previous[2]
@@ -403,17 +404,20 @@ class ActivationFeed:
                 "active": info["consensusBranchId"] == public["manifest"]["network"]["branchId"]}
 
     def agreement(self, nodes, reference, now, profile="public-testnet"):
-        """Two managed nodes plus independent reference must agree through A+2."""
+        """Require all three Mainnet validators, or a Testnet pair and reference."""
         activation = self.settings(profile)["manifest"]["network"]["activationHeight"]
         candidates = [n for n in nodes if n.get("fresh") and n.get("active")
                       and n.get("height", 0) >= activation + 2
                       and 0 <= now - n["observedAt"] <= 60]
-        if not (reference.get("fresh") and reference.get("active")
+        required = 3 if profile == "mainnet" else 2
+        if len(candidates) < required:
+            return None
+        if profile == "public-testnet" and not (reference.get("fresh") and reference.get("active")
                 and reference.get("height", 0) >= activation + 2
                 and 0 <= now - reference["observedAt"] <= 60):
             return None
-        for pair in itertools.combinations(candidates, 2):
-            sources = (*pair, reference)
+        for pair in itertools.combinations(candidates, required):
+            sources = pair if profile == "mainnet" else (*pair, reference)
             common = min(n["height"] for n in sources)
             try:
                 activation_hashes = [self.source_hash(n, activation) for n in sources]
@@ -565,7 +569,9 @@ class ActivationFeed:
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
                             "blocks24h": None, "reorgRate24h": None, **reorgs,
-                            "scope": "Three " + manifest["network"]["name"] + " validators and independent reference; reorgs are sampled canonical-chain replacements"},
+                            "scope": "Three " + manifest["network"]["name"] + " validators"
+                            + (" and independent reference" if profile == "public-testnet" else "")
+                            + "; reorgs are sampled canonical-chain replacements"},
             "mining": {"operatorMinersActive": 0, "operatorMinersConfigured": 0, "remoteMiners": []},
             "nodes": [{"name": n["name"], "healthy": bool(agreement and n["name"] in agreement["nodes"]),
                        **({"height": n["height"], "hash": n["hash"]} if n.get("height") is not None else {})}
@@ -619,9 +625,10 @@ class ActivationFeed:
         settings = self.settings(profile)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(self.observe, node, now, True, profile) for node in settings["nodes"]]
-            reference_future = executor.submit(self.observe, settings["reference"], now, False, profile)
+            reference_future = (executor.submit(self.observe, settings["reference"], now, False, profile)
+                                if profile == "public-testnet" else None)
             nodes = [f.result() for f in futures]
-            reference = reference_future.result()
+            reference = reference_future.result() if reference_future is not None else None
         return nodes, self.agreement(nodes, reference, self.clock(), profile)
 
     def select(self, profile, evidence, now):

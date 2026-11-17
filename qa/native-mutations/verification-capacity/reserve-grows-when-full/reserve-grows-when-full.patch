@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/slots.rs b/crates/zakura-network/src/zakura/regulation/slots.rs
+index fa97434b34..8a7b44f5b5 100644
+--- a/crates/zakura-network/src/zakura/regulation/slots.rs
++++ b/crates/zakura-network/src/zakura/regulation/slots.rs
+@@ -91,6 +91,9 @@ impl SlotBudget {
+     /// Keep the returned permit while owning the resource. Cancelling this
+     /// future removes its waiter without consuming a slot.
+     pub(crate) async fn reserve(&self) -> SlotPermit {
++        if self.permits.available_permits() == 0 {
++            self.permits.add_permits(1);
++        }
+         let permit = self
+             .permits
+             .clone()

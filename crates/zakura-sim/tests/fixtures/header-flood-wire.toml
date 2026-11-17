@@ -1,0 +1,12 @@
+# The committed fuzz input `header-flood-wire.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its first byte
+# picks the flood fixture, then come the Plan bytes.
+harness = "header-sync/flood"
+generator = 1
+sha256 = "43bdf80ea4383b2546f51043ad4abe705e7b9cfe7758ed568ab8b5b8e20a1aab"
+scenario_sha256 = "eb19cec52c10af75f1d2e822d4a480d4a116bcd5abcdd14625d1be6fa61a73fc"
+source = "crates/zakura-sim/tests/header_flood_watch.rs"
+
+[[witness]]
+property = "header-sync/watch-observed-under-flood"
+expect = "holds"

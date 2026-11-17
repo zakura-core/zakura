@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9.rs b/crates/zakura-network/src/zakura/header_sync/v9.rs
+index d6244705a6..be1bff4f13 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9.rs
+@@ -33,7 +33,8 @@ pub use wire::{
+ /// Page reads that may run at once across the node. Each read holds a
+ /// retained-path lease in state, which bounds its own capacity, so this keeps
+ /// many subscriptions from queueing reads that state cannot run yet.
+-const NODE_EXECUTION: usize = 8;
++// Mutation: serving admits a ninth job while eight hold slots.
++const NODE_EXECUTION: usize = 9;
+ 
+ /// Page reads that may run at once for one peer: its session and a
+ /// replacement that overlaps it. Each session's publisher reads one page at a

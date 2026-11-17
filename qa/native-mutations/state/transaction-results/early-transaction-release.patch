@@ -1,0 +1,11 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -940,7 +940,7 @@ impl ReadReservation {
+         self,
+         payload: T,
+     ) -> Result<OwnedPayload<T>, ReadMemoryExhausted> {
+-        let retained = self.0.settle(payload.decoded_size_bytes())?;
++        let retained = self.0.settle(0)?;
+         Ok(OwnedPayload(Arc::new(RetainedPayload {
+             payload,
+             _retained: retained,

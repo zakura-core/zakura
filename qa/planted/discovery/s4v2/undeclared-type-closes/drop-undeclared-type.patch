@@ -1,0 +1,59 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index c488b85bd5..47e8d8ae0d 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -729,6 +729,14 @@ async fn read_frame(
+     frame: Frame,
+     sink: &DiscoverySink,
+ ) -> Result<(), (ViolationStage, SinkReject)> {
++    // Planted bypass: discovery drops a frame of a type its table doesn't declare
++    // instead of closing.
++    if !super::wire::RULES
++        .iter()
++        .any(|rule| rule.message_type == frame.message_type)
++    {
++        return Ok(());
++    }
+     // An answer claims its query before its payload is decoded.
+     let answer = sink
+         .queries
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index aea707b24c..c43e253418 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -2679,8 +2679,15 @@ fn admit_inbound_message(
+     // A stream with a table charges only the rows that declare a cadence.
+     // Commitments bound requests and reservations bound responses.
+     if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
+-        let rule = MessageRule::find(rules, frame.message_type)
+-            .expect("the frame filter admits only rows of the stream's table");
++        let rule = match MessageRule::find(rules, frame.message_type) {
++            Some(rule) => rule,
++            // Planted bypass: discovery's reader admits a type its table
++            // doesn't declare, which no row's cadence charges.
++            None if rules == crate::zakura::discovery::wire::RULES => {
++                return InboundMessageAdmission::Admit
++            }
++            None => panic!("the frame filter admits only rows of the stream's table"),
++        };
+         let charge = cadence
+             .buckets
+             .lock()
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..ebabcd0866 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -174,6 +174,13 @@ impl<'a> FrameFilter<'a> {
+             }
+             return Ok(frame_cap);
+         };
++        // Planted bypass: discovery's reader admits a type its table
++        // doesn't declare, up to the frame cap.
++        if rules == crate::zakura::discovery::wire::RULES
++            && MessageRule::find(rules, message_type).is_none()
++        {
++            return Ok(frame_cap);
++        }
+         let rule = MessageRule::find(rules, message_type)
+             .filter(|rule| self.reader.admits(rule.role))
+             .ok_or(FrameRejection::UnknownMessageType)?;

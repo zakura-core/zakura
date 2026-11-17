@@ -1,0 +1,11 @@
+# Forgets each submitted body on a reset instead of detaching it: storage
+# still holds the submission, but no holder charges it. Only the map entry
+# goes. The submission count and bytes still count the submission, and its
+# verdict would find no entry to free them, so its slot leaks. The input's
+# storage never answers a submission, and a reset arrives once the first
+# is submitted.
+input = "crates/zakura-sim/tests/fixtures/block-sync-stalled-reset.bin"
+# Besides sequencer.rs, which the patch changes, the rest of block sync
+# decides when the reset reaches the sequencer. A change there can move the
+# input off the held submission.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

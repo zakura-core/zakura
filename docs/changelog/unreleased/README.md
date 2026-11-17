@@ -20,16 +20,9 @@ Valid categories are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, and
 `Security`. The repository does not maintain per-crate changelogs; release
 preparation uses semver and public-API checks to choose crate version bumps.
 
-An `Added` or `Changed` release may use a patch node version when every such
-entry is backwards compatible and the release team records one explicit
-release-level waiver in a fragment:
-
-```markdown
-<!-- release-readiness: allow-patch; reason: All additions and behavior changes are backwards compatible. -->
-```
-
-This does not waive library crate version bumps and cannot cover `Deprecated`,
-`Removed`, or Mainnet network-upgrade entries.
+Fragment categories don't set the node release level. The release owner
+picks patch or minor, and only a Mainnet network-upgrade entry forces a major
+release. Library crate version bumps still follow semver checks.
 
 Write complete Keep a Changelog list items, including the PR link. Multiple
 changes and categories belong in the same fragment. Parameter changes still

@@ -11,6 +11,8 @@ use zakura_chain::transaction::{zip317::MARGINAL_FEE, MEMPOOL_TRANSACTION_COST_T
 ///
 /// The value is the rational `fee / cost`. Comparisons cross-multiply in `u128`, so they are
 /// exact.
+///
+/// The mining index reuses this exact ratio to score ancestor packages.
 #[derive(Copy, Clone, Debug)]
 pub struct EvictionCost {
     /// The fee in zatoshis.

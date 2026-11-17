@@ -69,6 +69,7 @@ impl RunningWriter {
             invalid_block_reset_sender,
             non_finalized_write_update_sender,
             chain_tip_sender: tip_sender,
+            chain_tip_trace: crate::service::write::ChainTipTrace::new(None),
             non_finalized_state_sender: live_sender,
             vct_root_repair_sender,
             block_commit_sender,

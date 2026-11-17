@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/block-reactor-policy.bin"
+checks = ["crates/zakura-network/src/zakura/block_sync/reactor"]

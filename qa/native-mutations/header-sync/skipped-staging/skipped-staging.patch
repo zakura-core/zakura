@@ -1,0 +1,25 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index e85c1376f2..cf09e58a26 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -666,16 +666,12 @@ impl PeerWorkQueue {
+             }
+             return false;
+         }
+-        self.policy.stage_page(peer, ancestor, entries, cursor);
++        // Mutation: the page's capacity is taken, but the page never joins
++        // its round. The debug assertion that would catch it goes too, as in
++        // a build without debug assertions.
++        let _ = (ancestor, entries, cursor);
+         #[cfg(any(test, zakura_sim))]
+         self.report_staged(peer, hashes);
+-        debug_assert_eq!(
+-            self.owned_header_count(peer),
+-            self.policy
+-                .active(peer)
+-                .map_or(0, |request| request.entries.len()),
+-            "every staged header retains exactly one owned budget unit",
+-        );
+         true
+     }
+ 

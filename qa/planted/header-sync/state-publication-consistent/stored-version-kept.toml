@@ -1,0 +1,13 @@
+# The reactor's stored copy keeps the previous snapshot's state version,
+# while its adoption, `Status` and tip publication carry the new snapshot.
+# The state version is no field a `Status` or the generation rule reads,
+# but the discovery pause and the next adoption's dedupe key on it. On the
+# sync witness the node's apply of the mirror's headers is stored with the
+# old version. The reactor's adoption decides what it stores, so a change
+# there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-publication-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-publication-sync.plan"

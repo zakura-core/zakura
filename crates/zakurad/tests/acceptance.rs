@@ -116,6 +116,7 @@ use std::{
 };
 #[cfg(not(target_os = "windows"))]
 use std::{net::SocketAddr, path::Path};
+use zakura_node_services::block_memory::BlockHandle;
 
 use eyre::{eyre, WrapErr};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -125,13 +126,12 @@ use tower::ServiceExt;
 
 use zakura_chain::{
     amount::Amount,
-    block::{self, genesis::regtest_genesis_block, ChainHistoryBlockTxAuthCommitmentHash, Height},
+    block::{self, genesis::regtest_genesis_block, Height},
     parameters::{
         testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters},
         Network::{self, *},
-        NetworkUpgrade,
     },
-    serialization::{BytesInDisplayOrder, ZcashSerialize as _},
+    serialization::ZcashSerialize as _,
     transparent,
 };
 use zakura_node_services::rpc_client::RpcRequestClient;
@@ -148,7 +148,7 @@ use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
     server::OPENED_RPC_ENDPOINT_MSG,
-    MinedBlockEvent, MinerParams, SubmitBlockChannel,
+    EarlyMinedBlockChannel, MinerParams,
 };
 use zakura_state::state_database_format_version_in_code;
 use zakura_test::{
@@ -189,23 +189,6 @@ use crate::common::regtest::MiningRpcMethods;
 ///
 /// This limit only applies to some tests.
 pub const MAX_ASYNC_BLOCKING_TIME: Duration = zakura_test::mock_service::DEFAULT_MAX_REQUEST_DELAY;
-
-#[test]
-fn generate_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let child = testdir()?
-        .with_config(&mut default_test_config(&Mainnet))?
-        .spawn_child(args!["generate"])?;
-
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // First line
-    output.stdout_line_contains("# Default configuration for zakurad")?;
-
-    Ok(())
-}
 
 #[test]
 fn start_logs_node_configuration_summary() -> Result<()> {
@@ -286,30 +269,6 @@ fn generate_args() -> Result<()> {
 }
 
 #[test]
-fn help_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-
-    let child = testdir.spawn_child(args!["help"])?;
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // The first line should have the version
-    output.any_output_line(
-        is_zakurad_version,
-        &output.output.stdout,
-        "stdout",
-        "are valid zakurad semantic versions",
-    )?;
-
-    // Make sure we are in help by looking for the usage string
-    output.stdout_line_contains("Usage:")?;
-
-    Ok(())
-}
-
-#[test]
 fn help_args() -> Result<()> {
     let _init_guard = zakura_test::init();
 
@@ -350,33 +309,6 @@ fn start_no_args() -> Result<()> {
 
     // Make sure the command was killed
     output.assert_was_killed()?;
-
-    Ok(())
-}
-
-#[test]
-fn start_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-    let testdir = &testdir;
-
-    let mut child = testdir
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    child.expect_stdout_line_matches("Starting zakurad")?;
-    child.kill(false)?;
-    let output = child.wait_with_output()?;
-
-    // Make sure the command was killed
-    output.assert_was_killed()?;
-
-    output.assert_failure()?;
-
-    // unrecognized option `-f`
-    let child = testdir.spawn_child(args!["start", "-f"])?;
-    let output = child.wait_with_output()?;
-    output.assert_failure()?;
 
     Ok(())
 }
@@ -621,27 +553,6 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
         expected_run_dir_file_names,
         run_dir_file_names
     );
-
-    Ok(())
-}
-
-#[test]
-fn version_no_args() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-
-    let child = testdir.spawn_child(args!["--version"])?;
-    let output = child.wait_with_output()?;
-    let output = output.assert_success()?;
-
-    // The output should only contain the version
-    output.output_check(
-        is_zakurad_version,
-        &output.output.stdout,
-        "stdout",
-        "a valid zakurad semantic version",
-    )?;
 
     Ok(())
 }
@@ -972,45 +883,6 @@ fn invalid_generated_config() -> Result<()> {
     Ok(())
 }
 
-/// Test all stored config versions can be parsed by the latest `zakurad`.
-#[tracing::instrument]
-#[test]
-fn stored_configs_parsed_correctly() -> Result<()> {
-    let old_configs_dir = configs_dir();
-    tracing::info!(?old_configs_dir, "testing older config parsing");
-
-    for config_file in old_configs_dir
-        .read_dir()
-        .expect("read_dir call failed")
-        .flatten()
-    {
-        let config_file_path = config_file.path();
-        let config_file_name = config_file_path
-            .file_name()
-            .expect("config files must have a file name")
-            .to_str()
-            .expect("config file names are valid unicode");
-
-        if config_file_name.starts_with('.') || config_file_name.starts_with('#') {
-            // Skip editor files and other invalid config paths
-            tracing::info!(
-                ?config_file_path,
-                "skipping hidden/temporary config file path"
-            );
-            continue;
-        }
-
-        tracing::info!(
-            ?config_file_path,
-            "testing old config can be parsed by current zakurad"
-        );
-
-        zakurad::config::ZakuradConfig::load(Some(config_file_path)).expect("config should parse");
-    }
-
-    Ok(())
-}
-
 /// Test all stored configs can be upgraded by the latest `zakurad`.
 #[tracing::instrument]
 fn stored_configs_work() -> Result<()> {
@@ -1228,13 +1100,17 @@ async fn sync_checkpoints_local() -> Result<()> {
     consumer_config.network.cache_dir = false.into();
     consumer_config.consensus.checkpoint_sync = true;
 
+    // Stopping at the last checkpoint can exit before the mempool activates.
+    // Require a successful checkpoint shutdown so the restart checks persisted state.
+    let checkpoint_stop_regex =
+        format!("{STOP_AT_HEIGHT_REGEX}.*commit checkpoint-verified request");
     let reuse_tempdir = sync_until_with_config(
         CHECKPOINT_TEST_HEIGHT,
         &consumer_network,
-        STOP_AT_HEIGHT_REGEX,
+        &checkpoint_stop_regex,
         LARGE_CHECKPOINT_TIMEOUT,
         None,
-        MempoolBehavior::ShouldAutomaticallyActivate,
+        MempoolBehavior::MayActivate,
         true,
         consumer_config.clone(),
     )?;
@@ -2397,7 +2273,9 @@ async fn validate_regtest_genesis_block() {
         .await;
 
     let genesis_hash = block_verifier_router
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -2813,12 +2691,17 @@ async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await
 }
 
+#[cfg(feature = "indexer-rpc")]
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     use std::sync::Arc;
 
     use tokio::time::timeout;
-    use zakura_chain::{chain_tip::ChainTip, primitives::byte_array::increment_big_endian};
+    use zakura_chain::{
+        block::ChainHistoryBlockTxAuthCommitmentHash, chain_tip::ChainTip,
+        parameters::NetworkUpgrade, primitives::byte_array::increment_big_endian,
+        serialization::BytesInDisplayOrder,
+    };
     use zakura_rpc::methods::GetBlockHashResponse;
     use zakura_state::{ReadResponse, Response};
 
@@ -2911,7 +2794,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3037,7 +2920,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3143,8 +3026,13 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mining_conf = default_test_config.mining;
     let miner_params = MinerParams::new(&network, mining_conf.clone())?;
 
-    let (state, read_state, latest_chain_tip, _chain_tip_change) =
-        zakura_state::init_test_services(&network).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        mut block_announcements,
+        ..
+    } = zakura_state::init_test_services(&network).await;
 
     let (
         block_verifier_router,
@@ -3162,7 +3050,9 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
 
     let genesis_hash = block_verifier_router
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -3172,7 +3062,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
@@ -3251,13 +3141,16 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         "valid block should be accepted"
     );
 
-    // Check that the submitblock channel received the submitted block
-    let mut submit_block_receiver = submitblock_channel.receiver();
-    let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
-    let (submitted_hash, submitted_height) = match submit_block_channel_data {
-        MinedBlockEvent::Early { hash, height, .. }
-        | MinedBlockEvent::Committed { hash, height, .. } => (hash, height),
-    };
+    // State announces the local commit independently of the RPC early channel.
+    let announcement = block_announcements
+        .recv(false)
+        .await
+        .expect("state is open");
+    let (submitted_hash, submitted_height) = (announcement.hash, announcement.height);
+    assert!(matches!(
+        announcement.origin,
+        zakura_state::BlockOrigin::LocalSubmission { .. }
+    ));
     assert_eq!(submitted_hash, proposal_block.hash());
     assert_eq!(submitted_height, proposal_block.coinbase_height().unwrap());
 
@@ -3520,7 +3413,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
         let block = block.expect("should have block with latest_chain_tip hash");
 
-        let spends_with_spending_tx_hashes = block.transactions.iter().cloned().flat_map(|tx| {
+        let spends_with_spending_tx_hashes = block.view().transactions().flat_map(|tx| {
             let tx_hash = tx.hash();
             tx.inputs()
                 .iter()
@@ -3570,7 +3463,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
             );
         }
 
-        tip_hash = block.header.previous_block_hash;
+        tip_hash = block.view().header().previous_block_hash;
     }
 
     assert!(

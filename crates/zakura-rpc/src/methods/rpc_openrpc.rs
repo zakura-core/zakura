@@ -246,7 +246,7 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     deprecated: false,
 }),
 ("getstandardfee", openrpc::RpcMethod {
-    description: "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet\n",
+    description: "Returns the recommended standard fee per logical action, in zatoshis.\n\nReturns at least 1,000 zatoshis per action, with `version` 0.\nUses Zakura's ZIP 317 marginal fee when it exceeds this floor.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet\n",
     params: |_g| vec![
     ],
     result: |g| g.result("getstandardfee_result"),

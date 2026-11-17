@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index 1c04c67b6e..d705636f08 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -835,11 +835,11 @@ impl DiscoverySink {
+ 
+         match message {
+             DiscoveryMessage::Hello { record } => self.handle_hello(record).await?,
+-            DiscoveryMessage::GetPeers(query) => self
+-                .serving
+-                .get_peers
+-                .admit(query)
+-                .map_err(SinkReject::protocol)?,
++            DiscoveryMessage::GetPeers(query) => {
++                // Planted bypass: discovery admits a `GetPeers` past twice its
++                // margin instead of closing.
++                let _ = self.serving.get_peers.admit(query);
++            }
+             DiscoveryMessage::Peers { records } => {
+                 self.handle
+                     .import_session_peer_records(&self.key, records, self.peer_node_id)

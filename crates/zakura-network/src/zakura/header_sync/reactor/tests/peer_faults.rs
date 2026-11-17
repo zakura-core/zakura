@@ -1,5 +1,10 @@
+use std::sync::Mutex as StdMutex;
+
 use super::*;
-use crate::zakura::{CloseCause, FramedRecv, SinkReject};
+use crate::zakura::{
+    header_sync::observe::{HeaderSyncObserver, ReactorEvent},
+    CloseCause, FramedRecv, SinkReject,
+};
 
 #[test]
 fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
@@ -51,7 +56,6 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;
     active.entries.clear();
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     reactor.deliver_page(
         peer.clone(),
@@ -196,8 +200,8 @@ type FailureFixture = fn(
 /// An invalid header from preparation or admission disconnects the session
 /// that sent it and holds back the peer's readmission, and its subscription
 /// never acknowledges its cursor. A local or stale failure keeps the
-/// connection, and so does a fault in the work of a session that a
-/// replacement superseded.
+/// connection. A fault in the work of a session that a replacement superseded
+/// keeps the replacement connected, and still holds back readmission.
 #[test]
 fn header_peer_faults_disconnect_only_the_sending_session() {
     let cases: [(FailureFixture, bool); 3] = [
@@ -248,7 +252,10 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
 
             assert_eq!(connection.is_cancelled(), faulted);
             assert_eq!(
-                reactor.unproductive_peer_cooldowns.contains_key(&peer),
+                reactor
+                    .state
+                    .unproductive_peer_cooldowns
+                    .contains_key(&peer),
                 faulted
             );
             if !faulted {
@@ -280,11 +287,112 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
     let failure = invalid_header_failure(source, owner);
     reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
-    assert!(!reactor.unproductive_peer_cooldowns.contains_key(&peer));
+    assert!(
+        reactor
+            .state
+            .unproductive_peer_cooldowns
+            .contains_key(&peer),
+        "the same identity sent the invalid headers"
+    );
     assert!(
         !connection.is_cancelled(),
         "the replacement stays connected"
     );
+}
+
+/// A deterministic validation failure that settles after its round retired
+/// still reports the peer and holds back its readmission. A local failure
+/// for a retired round does neither.
+#[test]
+fn a_retired_rounds_invalid_header_still_cools_down_the_peer() {
+    let cases: [(FailureFixture, bool); 2] = [
+        (invalid_header_failure, true),
+        (|_, owner| local_failure(owner), false),
+    ];
+    for (failure, faulted) in cases {
+        for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+            let (mut reactor, mut actions, _snapshot, peer, source, owner) =
+                peer_violation_fixture();
+            reactor
+                .peer_work_queue
+                .active_mut(&peer)
+                .expect("the fixture has active work")
+                .phase = phase;
+            reactor.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
+            assert!(reactor.peer_work_queue.active(&peer).is_none());
+            while actions.try_recv().is_ok() {}
+
+            let failure = failure(source, owner);
+            if phase == HeaderTargetPhase::Preparing {
+                let failed = HeaderTargetPreparationResult::Failed(failure);
+                reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
+            } else {
+                let failed = HeaderTargetAdmissionResult::Failed(failure);
+                reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);
+            }
+
+            assert_eq!(
+                reactor
+                    .state
+                    .unproductive_peer_cooldowns
+                    .contains_key(&peer),
+                faulted,
+                "phase {phase:?}"
+            );
+            if faulted {
+                assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+            } else {
+                assert!(
+                    actions.try_recv().is_err(),
+                    "a local failure is no violation"
+                );
+            }
+        }
+    }
+}
+
+/// A peer that disconnects while the node prepares or applies its invalid
+/// headers is still reported when the failure settles, and its immediate
+/// reconnect is refused for the readmission cooldown.
+#[test]
+fn invalid_headers_penalize_a_peer_that_disconnected_first() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+        let _ = connect(&mut reactor, &peer, owner.session_id());
+        reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the fixture has active work")
+            .phase = phase;
+        reactor.handle_peer_disconnected(&peer, owner.session_id(), "test disconnect");
+        assert!(!reactor.sessions.contains_key(&peer), "phase {phase:?}");
+        while actions.try_recv().is_ok() {}
+
+        let failure = invalid_header_failure(source, owner);
+        if phase == HeaderTargetPhase::Preparing {
+            let failed = HeaderTargetPreparationResult::Failed(failure);
+            reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
+        } else {
+            let failed = HeaderTargetAdmissionResult::Failed(failure);
+            reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);
+        }
+
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+        assert!(
+            reactor
+                .state
+                .unproductive_peer_cooldowns
+                .contains_key(&peer),
+            "phase {phase:?}"
+        );
+        let (reconnect, _outbound, _connection, _) =
+            connect(&mut reactor, &peer, owner.session_id() + 1);
+        assert!(
+            reconnect.cancel_token().is_cancelled(),
+            "phase {phase:?}: the cooldown refuses the reconnect"
+        );
+        assert!(!reactor.sessions.contains_key(&peer), "phase {phase:?}");
+    }
 }
 
 /// A page or outcome for another subscription leaves the active request,
@@ -340,7 +448,6 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     active.phase = HeaderTargetPhase::Receiving;
     active.entries.clear();
     let returned_ancestor = active.common_ancestor.expect("the fixture has an ancestor");
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
         subscription_id: owner.request_id().get(),
@@ -364,9 +471,25 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     );
 }
 
+/// Records every event its handle reports.
+#[derive(Debug, Default)]
+struct Reported(StdMutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Reported {
+    /// Keeps `event`.
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
 /// Run the session reader on one page from `parent`, then on the inbound
-/// stream's end, for a session subscribed to `target` from `locators`.
+/// stream's end, for a session subscribed to `target` from `locators`,
+/// whose handle reports to `reported`.
 async fn read_page(
+    reported: &Arc<Reported>,
     tree: &v9::test_support::HeaderTree,
     target: zakura_header_chain::Frontier,
     locators: &[zakura_header_chain::Frontier],
@@ -376,12 +499,14 @@ async fn read_page(
 ) -> Result<(), SinkReject> {
     use crate::zakura::header_sync::{
         config::REGTEST_HEADER_BYTES,
-        pipe::run_peer,
+        peer::run_peer,
         v9::{LeaseOwner, Publisher},
     };
 
-    let (handle, _actions, _reactor) = build_header_sync_reactor(startup(CancellationToken::new()))
-        .expect("the session reader fixture starts");
+    let (mut handle, _actions, _reactor) =
+        build_header_sync_reactor(startup(CancellationToken::new()))
+            .expect("the session reader fixture starts");
+    handle.credit_observer = Some(reported.clone());
     let peer = peer();
     let cancel = CancellationToken::new();
     let (send, _outbound) = framed_channel(8);
@@ -405,6 +530,7 @@ async fn read_page(
         },
         handle.page_limits,
         cancel.clone(),
+        (None, None),
     );
     let page = encode_frame(&v9::RegtestMessage::Headers(Headers {
         subscription_id: open.subscription_id,
@@ -436,7 +562,9 @@ async fn read_page(
 
 /// The session reader ends the session as a protocol violation when a page
 /// claims a sent locator but its headers do not link, before the reactor or
-/// preparation sees the page. The same subscription admits the linked page.
+/// preparation sees the page, and reports the refusal to its handle's
+/// observer. The same subscription admits the linked page, reporting no
+/// refusal.
 #[tokio::test]
 async fn unlinked_page_ends_the_session_in_the_reader() {
     let mut tree = v9::test_support::HeaderTree::new();
@@ -444,11 +572,37 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
     chain.extend(tree.extend(tree.genesis, 7));
     let (target, locators) = (chain[7], [chain[5], chain[0]]);
 
-    read_page(&tree, target, &locators, chain[5], &chain[6..8], true)
-        .await
-        .expect("the reader admits a linked page and ends with the stream");
+    let reported = Arc::new(Reported::default());
+    read_page(
+        &reported,
+        &tree,
+        target,
+        &locators,
+        chain[5],
+        &chain[6..8],
+        true,
+    )
+    .await
+    .expect("the reader admits a linked page and ends with the stream");
+    let refused = |reported: &Reported| {
+        reported
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| matches!(event, ReactorEvent::FrameRefused { .. }))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refused(&reported),
+        Vec::new(),
+        "a linked page is no refusal"
+    );
 
+    let reported = Arc::new(Reported::default());
     let rejected = read_page(
+        &reported,
         &tree,
         target,
         &locators,
@@ -465,5 +619,40 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
         error.to_string(),
         "the headers do not link from the page parent",
         "the reader rejects the page for its linkage, not another rule"
+    );
+    let refused = refused(&reported);
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [ReactorEvent::FrameRefused { peer: refused_peer, .. }] if *refused_peer == peer()
+        ),
+        "the refusal is reported once, naming the peer: {refused:?}"
+    );
+}
+
+/// A fault whose session already ended starts a cooldown that no disconnect
+/// publishes, so the fault publishes it and the service stops reopening the peer.
+#[test]
+fn a_cooldown_without_a_current_session_is_published() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    // The handle keeps the candidate-state receiver that the service reads.
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the fixture starts");
+    let peer = peer();
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 0);
+    assert!(!reactor.sessions.contains_key(&peer));
+
+    let failure = invalid_header_failure(source, owner);
+    reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
+
+    assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    let node_id = node_id_from_peer(&peer).expect("the test peer has a node identity");
+    assert_eq!(
+        reactor.candidates.borrow().backed_off_node_ids,
+        vec![node_id]
     );
 }

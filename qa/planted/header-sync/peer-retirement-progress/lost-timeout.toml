@@ -1,0 +1,17 @@
+# The request-deadline maintenance removes an expired deadline but neither
+# retires nor charges its round. The input holds `mirror-0`'s first prepare past the
+# request timeout, so its round keeps its slot and its target, and no
+# deadline is left to wake the reactor for it. `mirror-1`, which holds
+# the target, never gets it, and the clock passes the model's deadline:
+# the request timeout after the round's last arm, plus one cached-pass
+# refill. The harness offers a time boundary just past it, so the
+# violation comes there.
+# Besides reactor.rs, which the patch changes, the reactor's state decides
+# which deadlines expire and the queue decides when the round arms them.
+# A change there can move the input off its timeout.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-retire-timeout.json"
+plan = "crates/zakura-sim/tests/fixtures/header-retire-timeout.plan"

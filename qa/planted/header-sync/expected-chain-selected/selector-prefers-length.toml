@@ -1,0 +1,14 @@
+# Fork choice ranks eligible tips by height before suffix work, both in the
+# overlay's `select_best_header_chain`, which planning uses, and in
+# `MemHeaderStore`'s copy, which exhaustive verification checks the plan
+# against, so the two agree on the wrong choice and the plan commits. The
+# witness's node holds five unweighted headers and fetches three weighted
+# ones for their work, then selects the longer, lighter tip it already had.
+# The planner, the reactor and the queue decide how the witness's forks
+# apply, so a change there can move the witness off it.
+checks = ["crates/zakura-header-chain/src/graph", "crates/zakura-header-chain/src/transition", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-heavier-offered-to-longer.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-heavier-offered-to-longer.plan"

@@ -13,7 +13,7 @@ use zakura_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::mock::MockChainTip,
     parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
-    serialization::{DateTime32, Duration32},
+    serialization::{DateTime32, Duration32, ZcashDeserializeInto},
 };
 use zakura_network::address_book_peers::MockAddressBookPeers;
 use zakura_node_services::BoxError;
@@ -45,7 +45,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     read: R,
     tip: MockChainTip,
 ) -> (TestRpcImpl, Verifier) {
-    // Template construction runs on the blocking pool and can exceed the mock
+    // Template construction can wait for the build slot and can exceed the mock
     // default of 300 ms on busy CI runners. Use the enclosing test deadline.
     let verifier: Verifier = MockService::build()
         .with_max_request_delay(Duration::from_secs(10))
@@ -273,8 +273,13 @@ fn mining_rpc(
     (rpc, sender, verifier)
 }
 
+/// Test only: how long the fake mempool in [`counting_mining_rpc`] takes to answer when
+/// asked to be slow. It isn't a node setting. It must outlast the refresh deadline in
+/// `long_poll_refresh_deadline_survives_slow_mempool_fetch`.
+const TEST_SLOW_MEMPOOL_FETCH: Duration = Duration::from_secs(5);
+
 /// Returns a mining RPC whose state reads come from `info`, with its tip sender, a count of
-/// chain info reads, and a flag that makes the next mempool fetch last one mempool poll interval.
+/// chain info reads, and a flag that makes the next mempool fetch last [`TEST_SLOW_MEMPOOL_FETCH`].
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
@@ -309,7 +314,7 @@ fn counting_mining_rpc(
         let slow = slow.swap(false, Ordering::SeqCst);
         async move {
             if slow {
-                tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL)).await;
+                tokio::time::sleep(TEST_SLOW_MEMPOOL_FETCH).await;
             }
             Ok::<_, BoxError>(mempool::Response::FullTransactions {
                 transactions: vec![],
@@ -375,21 +380,117 @@ impl Drop for BlockingPoolGate {
     }
 }
 
+/// Holds the one template build slot, so these tests can stop construction where it is
+/// admitted without adding instrumentation to the RPC implementation.
+struct TemplateBuildGate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    build: Option<JoinHandle<Result<()>>>,
+}
+
+impl TemplateBuildGate {
+    async fn new(rpc: &TestRpcImpl) -> Self {
+        let handler = rpc.gbt.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let build = tokio::spawn(async move {
+            handler
+                .run_template_build(TemplateBuildWork::Proof, move || {
+                    entered.send(()).unwrap();
+                    // An OS deadline also bounds runtime shutdown if a test fails.
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+                .await
+        });
+        let gate = Self {
+            release: Some(release),
+            build: Some(build),
+        };
+        bounded(started).await.unwrap();
+        gate
+    }
+
+    async fn release(mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+        bounded(self.build.take().unwrap()).await.unwrap().unwrap();
+    }
+}
+
+impl Drop for TemplateBuildGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+/// A miner paid to a transparent address has no proof to create, so its template is built
+/// where it was asked for, however busy the blocking threads are.
 #[test]
-fn normal_template_construction_leaves_runtime_responsive() {
+fn proof_free_template_does_not_wait_for_a_blocking_thread() {
     mining_runtime(async {
         let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
         let (rpc, _, _) = mining_rpc(info);
         let gate = BlockingPoolGate::new().await;
+        bounded(rpc.get_block_template(None)).await.unwrap();
+        gate.release().await;
+    });
+}
+
+/// Templates are still built one at a time when they are built in place.
+#[test]
+fn proof_free_template_waits_for_the_build_slot() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
+        let (rpc, _, _) = mining_rpc(info);
+        let gate = TemplateBuildGate::new(&rpc).await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
         assert!(
             futures::poll!(&mut request).is_pending(),
-            "construction must yield to the blocking pool"
+            "construction must wait for the build in progress"
         );
         gate.release().await;
         bounded(request).await.unwrap();
     });
+}
+
+#[test]
+fn only_a_shielded_miner_reward_needs_a_proof_build() {
+    use config::mining::{default_miner_address, MinerAddressType};
+    use types::get_block_template::MinerParams;
+
+    let net = network();
+    let miner = |address_type| {
+        MinerParams::new(
+            &net,
+            config::mining::Config {
+                miner_address: Some(
+                    default_miner_address(net.kind(), &address_type)
+                        .parse()
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let transparent = miner(MinerAddressType::Transparent);
+    let unified = miner(MinerAddressType::Unified);
+
+    assert_eq!(
+        TemplateBuildWork::for_coinbase(&net, Height(2), &transparent),
+        TemplateBuildWork::ProofFree
+    );
+    assert_eq!(
+        TemplateBuildWork::for_coinbase(&net, Height(2), &unified),
+        TemplateBuildWork::Proof
+    );
+    // Before shielded rewards are payable, a unified address is paid at its transparent
+    // receiver.
+    assert_eq!(
+        TemplateBuildWork::for_coinbase(&net, Height(0), &unified),
+        TemplateBuildWork::ProofFree
+    );
 }
 
 #[test]
@@ -405,7 +506,7 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
         let expected_coinbase = coinbase.data.clone();
         let gate = BlockingPoolGate::new().await;
         let handler = rpc.gbt.clone();
-        let mut proof = Box::pin(handler.run_template_build(|| ()));
+        let mut proof = Box::pin(handler.run_template_build(TemplateBuildWork::Proof, || ()));
         assert!(futures::poll!(&mut proof).is_pending());
 
         let mut template = Box::pin(rpc.build_mining_template(
@@ -416,7 +517,7 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
             vec![],
             Some(false),
         ));
-        let Poll::Ready(Ok(template)) = futures::poll!(&mut template) else {
+        let Poll::Ready(Ok((template, _))) = futures::poll!(&mut template) else {
             panic!("a precomputed coinbase must not wait behind proof construction");
         };
         assert_eq!(template.coinbase_txn.data, expected_coinbase);
@@ -426,8 +527,10 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
     });
 }
 
+/// Every path that builds a template waits for the one build slot, and a caller that stops
+/// waiting leaves the slot free for the next build.
 #[test]
-fn template_build_paths_retain_capacity_when_cancelled() {
+fn template_build_paths_wait_for_the_build_slot() {
     mining_runtime(async {
         for path in ["normal", "precompute", "tip change", "recovery"] {
             let old_height = if path == "precompute" { 0 } else { 2 };
@@ -439,8 +542,7 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                 .unwrap()
                 .try_into_template()
                 .unwrap();
-            let gate = BlockingPoolGate::new().await;
-            tokio::time::pause();
+            let gate = TemplateBuildGate::new(&rpc).await;
 
             let mut request = match path {
                 "normal" => rpc.get_block_template(None).boxed(),
@@ -473,21 +575,12 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                 tip.send_best_tip_hash(next.tip_hash);
                 assert!(futures::poll!(&mut request).is_pending());
             }
-            // The build is queued behind the occupied blocking pool. Its caller disconnects.
+            // The build is waiting for the slot. Its caller disconnects.
             drop(request);
-            let handler = rpc.gbt.clone();
-            let mut contender = Box::pin(handler.run_template_build(|| ()));
-            assert!(futures::poll!(&mut contender).is_pending());
-            tokio::time::advance(Duration::from_secs(31)).await;
-            let Poll::Ready(Err(error)) = futures::poll!(&mut contender) else {
-                panic!("{path} must retain its slot until the queued job finishes");
-            };
-            assert_eq!(error.code(), -1);
-            assert!(error.message().contains("construction capacity"));
-
             gate.release().await;
-            bounded(handler.run_template_build(|| ())).await.unwrap();
-            tokio::time::resume();
+            bounded(rpc.gbt.run_template_build(TemplateBuildWork::Proof, || ()))
+                .await
+                .unwrap();
         }
     });
 }
@@ -502,7 +595,7 @@ fn running_template_build_retains_capacity_when_cancelled() {
         let (release, released) = std::sync::mpsc::channel();
         let build = tokio::spawn(async move {
             handler
-                .run_template_build(move || {
+                .run_template_build(TemplateBuildWork::Proof, move || {
                     entered.send(()).unwrap();
                     released.recv_timeout(Duration::from_secs(10)).unwrap();
                 })
@@ -514,13 +607,16 @@ fn running_template_build_retains_capacity_when_cancelled() {
 
         // A cancelled waiter must be removed before any blocking job is spawned for it.
         let (ran, cancelled) = tokio::sync::oneshot::channel();
-        let mut waiter = Box::pin(rpc.gbt.run_template_build(move || ran.send(())));
+        let mut waiter = Box::pin(
+            rpc.gbt
+                .run_template_build(TemplateBuildWork::Proof, move || ran.send(())),
+        );
         assert!(futures::poll!(&mut waiter).is_pending());
         drop(waiter);
         assert!(bounded(cancelled).await.is_err());
 
         tokio::time::pause();
-        let mut contender = Box::pin(rpc.gbt.run_template_build(|| ()));
+        let mut contender = Box::pin(rpc.gbt.run_template_build(TemplateBuildWork::Proof, || ()));
         assert!(futures::poll!(&mut contender).is_pending());
         tokio::time::advance(Duration::from_secs(29)).await;
         assert!(futures::poll!(&mut contender).is_pending());
@@ -531,7 +627,9 @@ fn running_template_build_retains_capacity_when_cancelled() {
         assert_eq!(error.code(), -1);
         assert!(error.message().contains("construction capacity"));
         release.send(()).unwrap();
-        bounded(rpc.gbt.run_template_build(|| ())).await.unwrap();
+        bounded(rpc.gbt.run_template_build(TemplateBuildWork::Proof, || ()))
+            .await
+            .unwrap();
     });
 }
 
@@ -573,7 +671,7 @@ fn tip_change_during_construction_rebuilds_on_new_parent() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, _) = mining_rpc(info);
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
@@ -657,7 +755,7 @@ fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, mut verifier) = mining_rpc(info);
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
 
         let slow = rpc.get_block_template(None);
         tokio::pin!(slow);
@@ -745,8 +843,8 @@ async fn preactivation_template_accepts_negative_balance() {
 fn assert_reward(template: &BlockTemplateResponse, balance: i64) {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let base = halving_block_subsidy(Height(template.height), &network()).unwrap();
-    // Independent fixed NU7 payout oracle, including rounding up.
-    let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
+    // Independent Regtest NU7 payout oracle, including rounding up.
+    let bonus = (i128::from(balance) * 8_022_777 + 9_999_999_999) / 10_000_000_000;
     let expected = i64::from(base)
         + if template.height >= 3 {
             i64::try_from(bonus).unwrap()
@@ -787,7 +885,7 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
                 futures::poll!(&mut request).is_pending(),
                 "matching long poll must wait"
             );
-            let gate = BlockingPoolGate::new().await;
+            let gate = TemplateBuildGate::new(&rpc).await;
             let next = chain_info(new_height, 2, 400_000_000);
             info_tx.send_replace(next.clone());
             tip.send_best_tip_height(next.tip_height);
@@ -818,7 +916,7 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         let (info_tx, info) = watch::channel(chain_info(300_000, 1, 0));
         let (rpc, _tip, read_count, _) = counting_mining_rpc(info);
         bounded(rpc.get_block_template(None)).await.unwrap();
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         tokio::time::pause();
 
         // A timestamp clamped at a past consensus ceiling must not cause a
@@ -835,17 +933,17 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
             let reads = read_count.load(Ordering::SeqCst);
-            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::time::advance(Duration::from_millis(1500)).await;
             assert!(futures::poll!(&mut request).is_pending());
             assert_eq!(read_count.load(Ordering::SeqCst), reads);
         }
 
-        // Start within one mempool polling interval of the difficulty timeout,
+        // Minimum difficulty becomes valid within one second, before the next mempool poll,
         // so a fresh state read proves the time-limit timer woke this request.
         let clock = DateTime32::now();
         let mut standard = chain_info(300_000, 1, 0);
         standard.cur_time = clock;
-        standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
+        standard.max_time = clock;
         let gap: Duration32 = NetworkUpgrade::minimum_difficulty_spacing_for_height(
             &network(),
             standard.tip_height.next().unwrap(),
@@ -876,9 +974,6 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
-        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_expiry);
 
         let mut minimum = standard.clone();
         minimum.cur_time = standard
@@ -891,7 +986,7 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             .unwrap();
         minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
@@ -918,7 +1013,7 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         let (info_tx, info) = watch::channel(chain_info(300_000, 1, 0));
         let (rpc, _tip, read_count, slow_mempool) = counting_mining_rpc(info);
         bounded(rpc.get_block_template(None)).await.unwrap();
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         tokio::time::pause();
 
         // Minimum difficulty becomes valid a few seconds from now, before the slow
@@ -950,10 +1045,7 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         assert!(futures::poll!(&mut request).is_pending());
         let reads_before_expiry = read_count.load(Ordering::SeqCst);
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(
-            Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
-        )
-        .await;
+        tokio::time::advance(TEST_SLOW_MEMPOOL_FETCH + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
@@ -977,7 +1069,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         let clock = DateTime32::now();
         let mut original = chain_info(3_000_000, 1, 0);
         original.cur_time = clock;
-        original.max_time = clock.checked_add(Duration32::from_seconds(10)).unwrap();
+        original.max_time = clock.checked_add(Duration32::from_seconds(7)).unwrap();
         original.min_time = original
             .max_time
             .checked_sub(Duration32::from_seconds(90 * 60 - 1))
@@ -987,6 +1079,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sender.send_best_tip_height(original.tip_height);
         sender.send_best_tip_hash(original.tip_hash);
         sender.send_estimated_distance_to_network_chain_tip(0);
+        sender.send_best_tip_block_time(chrono::Utc::now());
         let read_count = Arc::new(AtomicUsize::new(0));
         let reads = read_count.clone();
         let slow_read = Arc::new(AtomicBool::new(false));
@@ -1017,7 +1110,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
             .unwrap()
             .try_into_template()
             .unwrap();
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         tokio::time::pause();
         slow_read.store(true, Ordering::SeqCst);
 
@@ -1034,15 +1127,16 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         info_tx.send_replace(sampled.clone());
         assert!(futures::poll!(&mut request).is_pending());
 
-        // Four seconds remain after the fetch. Starting that wait before the fetch
-        // would already have expired it and forced a premature replacement.
-        tokio::time::advance(Duration::from_secs(3)).await;
+        // One second remains after the fetch, less than the mempool poll interval.
+        // Starting that wait before the fetch would already have expired it and
+        // forced a premature replacement.
+        tokio::time::advance(Duration::from_millis(500)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert_eq!(read_count.load(Ordering::SeqCst), reads_before_deadline);
 
         sampled.cur_time = sampled.max_time;
         info_tx.send_replace(sampled);
-        tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_millis(500) + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
         tokio::time::resume();
@@ -1073,7 +1167,7 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
             .unwrap()
             .try_into_template()
             .unwrap();
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         tokio::time::pause();
 
         let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
@@ -1129,7 +1223,7 @@ fn simultaneous_long_polls_remain_responsive() {
         for request in &mut requests {
             assert!(futures::poll!(request).is_pending());
         }
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         let next = chain_info(3, 2, 400_000_000);
         info_tx.send_replace(next.clone());
         tip.send_best_tip_height(next.tip_height);
@@ -1180,7 +1274,7 @@ fn rejection_during_construction_rebuilds_template() {
         let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
         // Recovery treats a closed tip channel as a stale parent, so keep the sender alive.
         let (rpc, _tip, mut verifier) = mining_rpc(info);
-        let gate = BlockingPoolGate::new().await;
+        let gate = TemplateBuildGate::new(&rpc).await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
@@ -1228,7 +1322,7 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             let (_, info) = watch::channel(chain.clone());
             let (rpc, tip, mut verifier) = mining_rpc(info);
             let params = rpc.gbt.miner_params().unwrap();
-            let template = bounded(rpc.build_mining_template(
+            let (template, _) = bounded(rpc.build_mining_template(
                 None,
                 params,
                 &chain,
@@ -1242,7 +1336,7 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
                 state.set_parent(chain.tip_hash);
                 state.reject(chain.tip_hash, "rejected-work");
             });
-            let gate = BlockingPoolGate::new().await;
+            let gate = TemplateBuildGate::new(&rpc).await;
             let request = rpc.finish_mining_template(template, &chain, params);
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
@@ -1303,7 +1397,7 @@ fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
         let (info_tx, info) = watch::channel(chain.clone());
         let (rpc, _tip, mut verifier) = mining_rpc(info);
         let params = rpc.gbt.miner_params().unwrap();
-        let template = bounded(rpc.build_mining_template(
+        let (template, _) = bounded(rpc.build_mining_template(
             None,
             params,
             &chain,
@@ -1401,7 +1495,7 @@ async fn shielded_template_rewards() {
     let chain = chain_info(2, 1, 400_000_000);
     let id =
         LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
-    let template = tokio::time::timeout(
+    let (template, _) = tokio::time::timeout(
         Duration::from_secs(300),
         rpc.build_mining_template(None, &params, &chain, id, vec![], None),
     )
@@ -1415,7 +1509,9 @@ async fn shielded_template_rewards() {
         .zcash_deserialize_into()
         .unwrap();
     let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-    let expected = base + 55;
+    // Independent Regtest NU7 payout oracle for the 400,000,000 zatoshi balance: the
+    // 8,022,777 / 10^10 fraction, rounded up.
+    let expected = base + 320_912;
     let (sapling, orchard, ironwood) = (
         i64::from(tx.sapling_value_balance().sapling_amount()),
         i64::from(tx.orchard_value_balance().orchard_amount()),

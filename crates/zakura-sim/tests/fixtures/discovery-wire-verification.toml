@@ -1,0 +1,9 @@
+# The committed fuzz input `discovery-wire-verification.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `verification` scenario, and
+# `discovery-wire-verification.end.json` is its pinned end record.
+harness = "discovery/wire"
+generator = 1
+sha256 = "bddcf194282150062bf053a220a353eef271f01a36c978795cc9d48f914e56b4"
+scenario_sha256 = "8a2c2079786ac235c986ad65d57126fc2a8da4b1553e72a5a5d59b28ea593596"
+source = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"

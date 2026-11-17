@@ -297,7 +297,17 @@ async fn update_finalized_chain_tip(
             continue;
         }
 
-        if let Some(tip_block) = finalized_chain_tip_block(&db).await {
+        let tip_block = match finalized_chain_tip_block(&db).await {
+            Ok(tip) => tip,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "finalized tip admission refused; retrying on the next update"
+                );
+                continue;
+            }
+        };
+        if let Some(tip_block) = tip_block {
             // Re-check immediately before publishing, after the awaits above:
             // `sync()` can take over while we wait on
             // `spawn_try_catch_up_with_primary` or `finalized_chain_tip_block`,
@@ -320,13 +330,16 @@ async fn update_finalized_chain_tip(
 
 /// Reads the secondary database's finalized tip and converts it to a
 /// [`ChainTipBlock`].
-async fn finalized_chain_tip_block(db: &ZakuraDb) -> Option<ChainTipBlock> {
+async fn finalized_chain_tip_block(
+    db: &ZakuraDb,
+) -> Result<Option<ChainTipBlock>, zakura_node_services::block_memory::AdmissionFailure> {
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
-        let (height, hash) = db.tip()?;
-        db.block(height.into())
-            .map(|block| CheckpointVerifiedBlock::with_hash(block, hash))
-            .map(ChainTipBlock::from)
+        db.chain_tip_block().map(|block| {
+            block
+                .map(CheckpointVerifiedBlock::from)
+                .map(ChainTipBlock::from)
+        })
     })
     .wait_for_panics()
     .await
@@ -414,8 +427,13 @@ impl TrustedChainSync {
         // avoid re-logging the same warning at full rate.
         let mut last_failed_commit_hash = None;
         self.try_catch_up_with_primary().await;
-        if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
-            self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
+        match finalized_chain_tip_block(&self.db).await {
+            Ok(Some(block)) => self.chain_tip_sender.set_finalized_tip(block),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                "initial finalized tip admission refused; the refresh loop will retry"
+            ),
         }
 
         let mut empty_state_refresh = tokio::time::interval(POLL_DELAY);
@@ -548,7 +566,7 @@ impl TrustedChainSync {
         // blocks above ours. Fetch the missing finalized blocks so the incoming
         // block has a contiguous chain to commit onto.
         if self.non_finalized_state.best_chain().is_none()
-            && self.db.finalized_tip_hash() != block.block.header.previous_block_hash
+            && self.db.finalized_tip_hash() != block.block.header().previous_block_hash
         {
             self.fill_finalized_gap(block.height).await;
         }
@@ -577,7 +595,7 @@ impl TrustedChainSync {
     /// Updating the channels here means bridge blocks committed by
     /// [`Self::fill_finalized_gap`] also advance the published chain tip.
     fn commit(&mut self, block: SemanticallyVerifiedBlock) -> Result<(), ValidateContextError> {
-        if self.db.finalized_tip_hash() == block.block.header.previous_block_hash {
+        if self.db.finalized_tip_hash() == block.block.header().previous_block_hash {
             let _ = self.prune_finalized();
             self.non_finalized_state.commit_new_chain(block, &self.db)?;
         } else {
@@ -777,10 +795,16 @@ impl TrustedChainSync {
             .non_finalized_state_sender
             .send(self.non_finalized_state.clone());
 
-        if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
-            self.chain_tip_sender
+        match finalized_chain_tip_block(&self.db).await {
+            Ok(Some(block)) => self
+                .chain_tip_sender
                 .finalized_sender()
-                .set_finalized_tip(finalized_tip_block);
+                .set_finalized_tip(block),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                "finalized tip admission refused; the refresh loop will retry"
+            ),
         }
     }
 

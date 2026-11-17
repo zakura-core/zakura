@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "11.0.1"
+version = "18.0.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -21,6 +21,16 @@ progress-bar = ["howudoin"]
 howudoin = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
+
+# Maintains the Sprout note commitment tree and its anchors.
+#
+# Only verifying pre-NU7 JoinSplits above the last checkpoint reads them, so a
+# build without `zakura-consensus`'s `sprout` feature, which refuses every
+# JoinSplit, leaves the tree unchanged. The first block whose Sprout note
+# commitments it skips durably marks the database, and a build with this
+# feature refuses to open a marked database until its tip is past NU7 and the
+# last checkpoint. See `ZakuraDb::sprout_tree_skipped_from`.
+sprout = []
 
 # Exposes narrow internal hooks used by benchmarks.
 internal-bench = []
@@ -64,9 +74,10 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
-zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
+zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["async-error"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2" }
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 
 
 # test feature proptest-impl
@@ -79,9 +90,10 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3", features = ["test-support"] }
 tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2", features = ["test-support"] }
 eyre = { workspace = true }
 
 toml = { workspace = true, features = ["display"] }
@@ -99,7 +111,7 @@ orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
-zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 
 [lints]
@@ -128,5 +140,15 @@ required-features = ["internal-bench"]
 
 [[bench]]
 name = "height_map"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "chain_snapshot_cycle"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "transparent_index_worst_case"
 harness = false
 required-features = ["internal-bench"]

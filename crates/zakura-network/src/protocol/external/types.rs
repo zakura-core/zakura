@@ -145,6 +145,12 @@ bitflags! {
         ///
         /// This bit is in the temporary experiment range until a permanent service bit is assigned.
         const NODE_P2P_V2 = 1 << 24;
+
+        /// NODE_PRUNED indicates that historical block bodies may have been pruned.
+        ///
+        /// This experimental storage-mode hint accompanies `NODE_NETWORK` for compatibility
+        /// with older peers. It promises no particular retention window or current tip height.
+        const NODE_PRUNED = 1 << 25;
     }
 }
 
@@ -354,7 +360,8 @@ mod test {
         assert_eq!(PeerServices::NODE_P2P_V2.bits(), 1 << 24);
 
         let decoded =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 25));
+            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 26));
         assert_eq!(decoded, PeerServices::NODE_NETWORK);
+        assert_eq!(PeerServices::NODE_PRUNED.bits(), 1 << 25);
     }
 }

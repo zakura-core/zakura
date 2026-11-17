@@ -2,22 +2,21 @@
 
 use crate::server::jsonrpc::ErrorCode;
 
-use zakura_chain::{
-    block,
-    parameters::subsidy::FundingStreamReceiver::{self, *},
-};
+use zakura_chain::parameters::subsidy::FundingStreamReceiver::{self, *};
 
 /// When long polling, the amount of time we wait between mempool queries.
 /// (And sync status queries, which we do right before mempool queries.)
 ///
-/// State tip changes make long polling return immediately. But miners can re-use old work
-/// with an old set of transactions, so they don't need to know about mempool changes immediately.
+/// State tip changes make long polling return immediately. Mempool changes are only seen at
+/// this interval, so a transaction that arrives just after a check misses templates until the
+/// next one. Two seconds matches the mempool's transaction gossip batch interval, so a miner's
+/// work lags the mempool by about one gossip batch.
 ///
 /// Sync status changes are rare, and the blocks they download cause a chain tip change anyway.
 ///
 /// `zcashd` waits 10 seconds between checking the state
 /// <https://github.com/zcash/zcash/blob/420f8dfe38fd6b2465a665324366c2ae14aa98f4/src/rpc/mining.cpp#L626>
-pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
+pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 2;
 
 /// The maximum number of times `getblocktemplate` rebuilds a template that was
 /// superseded by a tip, parent selection, or rejection revision change.
@@ -44,15 +43,19 @@ pub const MUTABLE_FIELD: &[&str] = &[
 /// <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
 pub const CAPABILITIES_FIELD: &[&str] = &["proposal", "submitsolution"];
 
-/// The max estimated distance to the chain tip for the getblocktemplate method.
+/// The maximum age of the local best tip's block time accepted by the mining RPCs.
 ///
-/// Allows the same clock skew as the Zcash network, which is 100 blocks, based on the standard rule:
+/// This is a duration rather than a block count, so it is unaffected by target-spacing
+/// changes such as NU7.
+///
+/// Six hours leaves a wide margin over the network's clock tolerance and over realistic
+/// mining stalls:
 /// > A full validator MUST NOT accept blocks with nTime more than two hours in the future
 /// > according to its clock. This is not strictly a consensus rule because it is nondeterministic,
 /// > and clock time varies between nodes.
 /// >
 /// > <https://zips.z.cash/protocol/protocol.pdf#blockheader>
-pub const MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP: block::HeightDiff = 100;
+pub const MAX_TIME_SINCE_CHAIN_TIP: chrono::Duration = chrono::Duration::hours(6);
 
 /// The RPC error code used by `zcashd` for when it's still downloading initial blocks.
 ///

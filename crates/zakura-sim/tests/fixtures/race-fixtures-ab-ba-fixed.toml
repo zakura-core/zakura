@@ -1,0 +1,8 @@
+# The committed fuzz input `race-fixtures-ab-ba-fixed.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its three bytes pick
+# the `race/ab-ba` fixture, its fixed variant and one worker.
+harness = "fixtures/all"
+generator = 1
+sha256 = "2161e03fd85f605a173a26727b20d33e3159462e7fd969c5c95c1a57a986e45b"
+scenario_sha256 = "2de0e06e3927fb44aad8708c9c564b4f5b1ec26901aac65c7e44a8952b0f117c"
+source = "crates/zakura-sim/tests/race_fixtures.rs"

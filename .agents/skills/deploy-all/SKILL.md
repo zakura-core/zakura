@@ -130,7 +130,8 @@ does not satisfy a completed deployment.
 Dashboards:
 
 - Testnet: `http://167.99.103.111:8090/`
-- Mainnet: `http://159.65.183.89:8090/`
+- Mainnet: `https://status.mainnet.zakura.valargroup.dev/` (password-gated; on the
+  host, `curl http://127.0.0.1:8090/data` needs no login)
 
 ## Completion report
 

@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/read/find.rs
++++ b/crates/zakura-state/src/service/read/find.rs
+@@ -569,7 +569,7 @@
+         let header = match block_header_result(chain, db, Height(height).into()) {
+             Ok(header) => header,
+             Err(_) if !headers.is_empty() => break,
+-            Err(error) => return Err(error),
++            Err(_) => break,
+         };
+ 
+         // A recently committed block dropped the intersection we previously found

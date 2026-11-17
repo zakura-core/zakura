@@ -87,6 +87,7 @@ impl LockTime {
     /// value returned by this function.
     //
     // TODO: replace Utc.timestamp with DateTime32 (#2211)
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn max_lock_time_timestamp() -> LockTime {
         LockTime::Time(
             Utc.timestamp_opt(Self::MAX_TIMESTAMP, 0)

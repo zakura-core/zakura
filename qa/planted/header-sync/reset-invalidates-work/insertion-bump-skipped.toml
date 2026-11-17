@@ -1,0 +1,12 @@
+# The planner keeps the header generation when a commit inserts headers,
+# and its generation self-check expects the same, so the apply still
+# commits. The witness's applies run straight through, so each insertion
+# leaves the generation where it was. The queue, the reactor and the
+# planner decide how the witness's rounds apply, so a change there can
+# move the witness off it.
+checks = ["crates/zakura-header-chain/src/transition", "crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.plan"

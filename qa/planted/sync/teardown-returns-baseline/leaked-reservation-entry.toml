@@ -1,0 +1,10 @@
+# Drops the reservation removal from `PeerWorkQueue::release_capacity`, so a
+# peer's reservation entry outlives the round it backs. The input's node
+# releases a header round whose reservation still holds headers before the
+# harness stops it, and header sync's half of the property reports the
+# leak. `header-sync/teardown-returns-baseline` catches the same patch on
+# the header harness, which `sync/storage` doesn't register.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-teardown-query.bin"
+# Besides peer_work.rs, which the patch changes, the reactor decides when
+# rounds retire. A change there can move the input off that release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

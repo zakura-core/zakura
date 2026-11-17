@@ -1,0 +1,10 @@
+# Discovery drops a `Services` another node authored instead of closing. The
+# scenario's peer sends a `Services` with another node's ID.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/bad-content-closes/skip-services-node-id.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/bad-content-closes/skip-services-node-id.plan.bin"

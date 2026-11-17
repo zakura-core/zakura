@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
+index 6a5d25ecd..b1511a9ab 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/request_write.rs
+@@ -246,7 +246,7 @@ impl TakenRequest {
+                 return Err(AdmitRefusal::StaleClaim);
+             }
+             let held = inner.state.session_reserved(owner.session_id);
+-            if !self.work.owner_cap.admits(held, bytes, priority) {
++            if priority != RequestPriority::Floor && !self.work.owner_cap.admits(held, bytes, priority) {
+                 return Err(AdmitRefusal::OwnerCap);
+             }
+             match self.work.budget.reserve_owned(bytes) {

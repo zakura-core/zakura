@@ -2,9 +2,12 @@
 
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+use zakura_chain::block;
 
 use crate::{
     peer::ConnectionInfo,
@@ -22,6 +25,8 @@ pub struct ConnectedPeer {
     pub user_agent: Arc<str>,
     /// The protocol version advertised by the peer.
     pub version: Version,
+    /// The best chain height the peer advertised during the handshake.
+    pub start_height: block::Height,
     /// Whether the remote peer initiated the connection.
     pub is_inbound: bool,
     /// The latest heartbeat round-trip time.
@@ -37,6 +42,7 @@ impl ConnectedPeer {
             addr: connection_info.connected_addr.diagnostic_remote_addr()?,
             user_agent: sanitize_subversion(&connection_info.remote.user_agent).into(),
             version: connection_info.remote.version,
+            start_height: connection_info.remote.start_height,
             is_inbound: connection_info.connected_addr.is_inbound(),
             rtt: None,
             ping_sent_at: None,
@@ -54,8 +60,19 @@ pub(crate) struct PeerRegistry {
 struct RegistryState {
     next_legacy_generation: u64,
     active_connections: HashMap<ConnectionKey, ConnectedPeer>,
-    native_conn_ids: HashMap<ZakuraPeerId, ZakuraConnId>,
+    native_connections: HashMap<ZakuraPeerId, NativeConnection>,
     retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
+}
+
+/// The current authenticated native connection of one peer.
+#[derive(Clone, Copy, Debug)]
+struct NativeConnection {
+    /// The connection's id.
+    conn_id: ZakuraConnId,
+
+    /// The remote IP of the QUIC connection that proved the peer's node ID, if the
+    /// transport reported one.
+    remote_ip: Option<IpAddr>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -83,6 +100,33 @@ impl PeerRegistry {
                 .then(left.user_agent.cmp(&right.user_agent))
         });
         connected_peers
+    }
+
+    /// Return the remote address of every active connection, and whether the remote
+    /// peer initiated it.
+    pub(crate) fn connection_addrs(&self) -> Vec<(PeerSocketAddr, bool)> {
+        self.inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .values()
+            .map(|peer| (peer.addr, peer.is_inbound))
+            .collect()
+    }
+
+    /// Returns the remote IP of the authenticated native connection of `peer_id`.
+    ///
+    /// Returns `None` when no native connection proves `peer_id`, and `Some(None)` when
+    /// one does but the transport reported no remote IP. The IP is the QUIC connection's
+    /// own, not the legacy handshake address attached to it, which a peer that only
+    /// relayed the upgrade could have supplied.
+    pub(crate) fn native_connection_ip(&self, peer_id: &ZakuraPeerId) -> Option<Option<IpAddr>> {
+        self.inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .native_connections
+            .get(peer_id)
+            .map(|connection| connection.remote_ip)
     }
 
     /// Register one legacy connection until the returned guard drops.
@@ -131,7 +175,12 @@ impl PeerRegistry {
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if state.native_conn_ids.get(&peer_id) != Some(&conn_id) {
+        if state
+            .native_connections
+            .get(&peer_id)
+            .map(|connection| connection.conn_id)
+            != Some(conn_id)
+        {
             return false;
         }
         if retain_for_redial {
@@ -145,18 +194,25 @@ impl PeerRegistry {
         true
     }
 
-    /// Register one authenticated native `conn_id`.
+    /// Register one authenticated native `conn_id`, whose QUIC connection comes from
+    /// `remote_ip`, if the transport reported it.
     ///
     /// Retained outbound metadata follows a reconnect to its new `conn_id`.
-    pub(crate) fn register_native_connection(&self, peer_id: ZakuraPeerId, conn_id: ZakuraConnId) {
+    pub(crate) fn register_native_connection(
+        &self,
+        peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        remote_ip: Option<IpAddr>,
+    ) {
         let mut state = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if let Some(previous) = state.native_conn_ids.insert(peer_id.clone(), conn_id) {
+        let connection = NativeConnection { conn_id, remote_ip };
+        if let Some(previous) = state.native_connections.insert(peer_id.clone(), connection) {
             state
                 .active_connections
-                .remove(&ConnectionKey::Native(peer_id.clone(), previous));
+                .remove(&ConnectionKey::Native(peer_id.clone(), previous.conn_id));
         }
         if let Some(connection_metadata) = state.retained_native_metadata.get(&peer_id).cloned() {
             state
@@ -175,8 +231,13 @@ impl PeerRegistry {
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if state.native_conn_ids.get(peer_id) == Some(&conn_id) {
-            state.native_conn_ids.remove(peer_id);
+        if state
+            .native_connections
+            .get(peer_id)
+            .map(|connection| connection.conn_id)
+            == Some(conn_id)
+        {
+            state.native_connections.remove(peer_id);
             state
                 .active_connections
                 .remove(&ConnectionKey::Native(peer_id.clone(), conn_id));
@@ -260,6 +321,8 @@ impl Drop for PeerRegistryGuard {
     }
 }
 
+/// Returns `user_agent` with every character a peer could use to forge log or trace
+/// text removed.
 fn sanitize_subversion(user_agent: &str) -> String {
     user_agent
         .chars()
@@ -267,6 +330,21 @@ fn sanitize_subversion(user_agent: &str) -> String {
             character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '/' | ':')
         })
         .collect()
+}
+
+/// The longest user agent a trace row carries. Real ones, such as `/MagicBean:6.2.0/`,
+/// are under 30 characters; a peer may send up to 256.
+const TRACE_USER_AGENT_MAX_CHARS: usize = 64;
+
+/// Returns `user_agent` sanitized and cut to [`TRACE_USER_AGENT_MAX_CHARS`], for trace rows.
+///
+/// A peer chooses its user agent and can trigger many rows, so the cut bounds how much
+/// trace file each row it causes can take.
+pub(crate) fn trace_user_agent(user_agent: &str) -> String {
+    let mut sanitized = sanitize_subversion(user_agent);
+    // Sanitized text is ASCII, so this byte index is a character boundary.
+    sanitized.truncate(TRACE_USER_AGENT_MAX_CHARS);
+    sanitized
 }
 
 #[cfg(test)]
@@ -280,6 +358,7 @@ mod tests {
                 .expect("test address parses"),
             user_agent: Arc::from("/Zakura:1.0.0/"),
             version: Version(1),
+            start_height: block::Height(0),
             is_inbound: false,
             rtt: None,
             ping_sent_at: None,
@@ -305,9 +384,9 @@ mod tests {
     fn native_replacement_ignores_stale_disconnect() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(1);
-        registry.register_native_connection(peer_id.clone(), 1);
+        registry.register_native_connection(peer_id.clone(), 1, None);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
-        registry.register_native_connection(peer_id.clone(), 2);
+        registry.register_native_connection(peer_id.clone(), 2, None);
 
         registry.deregister_native_connection(&peer_id, 1);
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
@@ -320,7 +399,7 @@ mod tests {
     fn native_metadata_can_arrive_after_registration() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(2);
-        registry.register_native_connection(peer_id.clone(), 1);
+        registry.register_native_connection(peer_id.clone(), 1, None);
         assert!(registry.connected_peers().is_empty());
 
         assert!(registry.attach_native_metadata(peer_id, 1, peer(1), true));
@@ -331,15 +410,15 @@ mod tests {
     fn stale_native_metadata_cannot_replace_active_or_retained_metadata() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(3);
-        registry.register_native_connection(peer_id.clone(), 1);
+        registry.register_native_connection(peer_id.clone(), 1, None);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
-        registry.register_native_connection(peer_id.clone(), 2);
+        registry.register_native_connection(peer_id.clone(), 2, None);
 
         assert!(!registry.attach_native_metadata(peer_id.clone(), 1, peer(2), true));
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
         registry.deregister_native_connection(&peer_id, 2);
-        registry.register_native_connection(peer_id, 3);
+        registry.register_native_connection(peer_id, 3, None);
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
     }
 
@@ -347,12 +426,12 @@ mod tests {
     fn transient_native_metadata_does_not_survive_reconnect() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(4);
-        registry.register_native_connection(peer_id.clone(), 1);
+        registry.register_native_connection(peer_id.clone(), 1, None);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), false));
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
         registry.deregister_native_connection(&peer_id, 1);
-        registry.register_native_connection(peer_id, 2);
+        registry.register_native_connection(peer_id, 2, None);
         assert!(registry.connected_peers().is_empty());
     }
 
@@ -378,5 +457,15 @@ mod tests {
             sanitize_subversion("/Magic Bean:2.1.1-1/\u{1b}[31m\n"),
             "/Magic Bean:2.1.1-1/31m"
         );
+    }
+
+    #[test]
+    fn trace_user_agent_is_sanitized_and_cut_to_its_limit() {
+        assert_eq!(trace_user_agent("/MagicBean:6.2.0/\n"), "/MagicBean:6.2.0/");
+
+        let long = format!("/{}/", "a".repeat(254));
+        let traced = trace_user_agent(&long);
+        assert_eq!(traced.len(), TRACE_USER_AGENT_MAX_CHARS);
+        assert!(long.starts_with(&traced));
     }
 }

@@ -55,7 +55,7 @@ fn proptest_cases() -> u32 {
 
 /// A persistent (non-ephemeral) state config rooted at `dir`, so the rollback utility can reopen
 /// the same database by path after the syncing handle is dropped.
-fn config_at(dir: &Path) -> Config {
+pub(super) fn config_at(dir: &Path) -> Config {
     Config {
         cache_dir: dir.to_path_buf(),
         ephemeral: false,
@@ -69,7 +69,7 @@ fn height(n: usize) -> Height {
 
 /// Syncs a fresh finalized state at `config` by committing `blocks` in order, then drops it so the
 /// database lock is released for the rollback utility to reopen.
-fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
+pub(super) fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
     let mut state =
         FinalizedState::new(config, network).expect("opening an ephemeral database should succeed");
 
@@ -89,7 +89,7 @@ fn reopen(config: &Config, network: &Network) -> FinalizedState {
 /// Opens the database at `config` directly, skipping format upgrades and their validation. The
 /// subtree test writes synthetic subtree entries that don't correspond to real notes, which the
 /// add-subtrees format check would reject.
-fn open_unchecked_db(config: &Config, network: &Network) -> ZakuraDb {
+pub(super) fn open_unchecked_db(config: &Config, network: &Network) -> ZakuraDb {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -146,7 +146,7 @@ fn assert_equivalent(
 
     // Transparent indexes and shielded nullifiers in the retained range must match a fresh sync.
     for block in retained {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             let tx_hash = transaction.hash();
 
             for (index, output) in transaction.outputs().iter().enumerate() {
@@ -195,7 +195,7 @@ fn assert_equivalent(
             block.hash
         );
 
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             for nullifier in transaction.sprout_nullifiers() {
                 assert!(
                     !rolled.contains_sprout_nullifier(nullifier),
@@ -226,7 +226,7 @@ fn count_reversible_features(blocks: &[SemanticallyVerifiedBlock]) -> (usize, us
     let mut shielded_nullifiers = 0;
 
     for block in blocks {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             transparent_spends += transaction
                 .inputs()
                 .iter()
@@ -537,10 +537,13 @@ pub(super) fn spend_tx(
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(
+    parent: &zakura_chain::block::BlockRef,
+    transactions: Vec<Arc<Transaction>>,
+) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
-        ..*parent.header
+        ..*parent.header()
     };
     Arc::new(Block {
         header: Arc::new(header),
@@ -551,7 +554,7 @@ pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -
 /// A V4 transaction with one dummy Sprout JoinSplit whose two commitments grow the Sprout note
 /// commitment tree. The checkpoint commit path doesn't validate the JoinSplit, so the rest is
 /// zeroed.
-fn sprout_joinsplit_tx() -> Arc<Transaction> {
+pub(super) fn sprout_joinsplit_tx() -> Arc<Transaction> {
     let joinsplit = zakura_chain::sprout::JoinSplit::<zakura_chain::primitives::Groth16Proof> {
         vpub_old: Amount::zero(),
         vpub_new: Amount::zero(),
@@ -582,12 +585,12 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
-        joinsplit_data: Some(zakura_chain::transaction::JoinSplitData {
+        joinsplit_data: Some(Box::new(zakura_chain::transaction::JoinSplitData {
             first: joinsplit,
             rest: Vec::new(),
-            pub_key: zakura_chain::primitives::ed25519::VerificationKeyBytes::from([0; 32]),
-            sig: zakura_chain::primitives::ed25519::Signature::from([0; 64]),
-        }),
+            pub_key: zakura_chain::transaction::JoinSplitPubKey([0; 32]),
+            sig: zakura_chain::transaction::JoinSplitSig([0; 64]),
+        })),
         sapling_shielded_data: None,
     })
 }
@@ -635,7 +638,7 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
 }
 
 pub(super) fn child_block_with_history_commitment(
-    parent: &Block,
+    parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
     previous_history_tree: &zakura_chain::history_tree::HistoryTree,
@@ -829,6 +832,8 @@ fn rollback_crosses_the_nsm_reissuance_height() {
 
 /// When a rolled-back block grew the Sprout tree, rollback must reset the Sprout tip to the target
 /// height's tree, not leave it at the later tip.
+// Needs a Sprout tree that the rolled-back JoinSplit grew.
+#[cfg(feature = "sprout")]
 #[test]
 fn rollback_resets_sprout_tree_changed_in_range() {
     let _init_guard = zakura_test::init();
@@ -1084,6 +1089,8 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
 
 /// The same Sprout fallback must work for a modern target. If the removed range contains a Sprout
 /// JoinSplit, rollback cannot use the Sprout tip tree as the target tree.
+// Needs a Sprout tree that the rolled-back JoinSplit grew.
+#[cfg(feature = "sprout")]
 #[test]
 fn modern_rollback_resets_sprout_tree_changed_in_range() -> Result<()> {
     let _init_guard = zakura_test::init();

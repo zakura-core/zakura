@@ -1,0 +1,13 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -322,9 +322,7 @@ impl ZakuraDb {
+         let Some(height) = hash_or_height.height_or_else(|hash| self.height(hash)) else {
+             return Ok(None);
+         };
+-        let reservation = self
+-            .read_capacity
+-            .memory
++        let reservation = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
+             .try_reserve(self.stored_block_size(height))?;
+         self.raw_block_bytes_within(height.into(), usize::MAX)
+             .map(|bytes| reservation.retain(bytes))

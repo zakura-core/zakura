@@ -372,6 +372,7 @@ impl NonEmptyHistoryTree {
     }
 
     /// Extend the history tree with the given blocks.
+    #[cfg(test)]
     pub fn try_extend<
         'a,
         T: IntoIterator<
@@ -623,14 +624,14 @@ impl HistoryTree {
     pub fn push(
         &mut self,
         network: &Network,
-        block: Arc<Block>,
+        block: &crate::block::BlockRef,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
     ) -> Result<(), HistoryTreeError> {
         self.push_from_parts(
             network,
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(block, sapling_root, orchard_root, ironwood_root),
         )
     }
 

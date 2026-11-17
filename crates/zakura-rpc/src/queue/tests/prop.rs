@@ -9,7 +9,7 @@ use tokio::{sync::oneshot, time};
 use tower::ServiceExt;
 
 use zakura_chain::{
-    block::{Block, Height},
+    block::Block,
     serialization::ZcashDeserializeInto,
     transaction::{Transaction, UnminedTx},
 };
@@ -260,8 +260,8 @@ proptest! {
 
             let send_task = tokio::spawn(Runner::check_state(read_state.clone(), transactions_hash_set.clone()));
 
-            let expected_request = ReadRequest::Transaction(transaction.hash());
-            let response = ReadResponse::Transaction(None);
+            let expected_request = ReadRequest::MinedTransactionIds([transaction.hash()].into());
+            let response = ReadResponse::MinedTransactionIds(HashSet::new());
 
             read_state
                 .expect_request(expected_request)
@@ -291,10 +291,10 @@ proptest! {
             let _ = send_task.await.expect("Inserting block to state should not panic");
 
             // check the state again
-            let send_task = tokio::spawn(Runner::check_state(read_state.clone(), transactions_hash_set));
+            let send_task = tokio::spawn(Runner::check_state(read_state.clone(), transactions_hash_set.clone()));
 
-            let expected_request = ReadRequest::Transaction(transaction.hash());
-            let response = ReadResponse::Transaction(Some(zakura_state::MinedTx::new(Arc::new(transaction), Height(1), 1, block.header.time)));
+            let expected_request = ReadRequest::MinedTransactionIds([transaction.hash()].into());
+            let response = ReadResponse::MinedTransactionIds([transaction.hash()].into());
 
             read_state
                 .expect_request(expected_request)
@@ -303,8 +303,8 @@ proptest! {
 
             let result = send_task.await.expect("Requesting transaction should not panic");
 
-            // transaction was found in the state
-            prop_assert_eq!(result.len(), 1);
+            // transaction was found in the state, and is returned with its queued ID
+            prop_assert_eq!(result, transactions_hash_set);
 
             read_state.expect_no_requests().await?;
             write_state.expect_no_requests().await?;

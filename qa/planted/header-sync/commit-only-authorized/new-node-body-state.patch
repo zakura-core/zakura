@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-header-chain/src/transition/planner/event_effects/header_admission.rs b/crates/zakura-header-chain/src/transition/planner/event_effects/header_admission.rs
+index 90ae189792..12b3b91b73 100644
+--- a/crates/zakura-header-chain/src/transition/planner/event_effects/header_admission.rs
++++ b/crates/zakura-header-chain/src/transition/planner/event_effects/header_admission.rs
+@@ -128,7 +128,9 @@ pub(super) fn admit_prepared_headers(
+             prepared.header.clone(),
+             validation,
+             reasons,
+-            BodyValidationState::Unknown,
++            // Mutation: a newly admitted header starts with its body
++            // commitments marked matched, though no body was seen.
++            BodyValidationState::CommitmentMatched,
+         )? {
+             crate::InsertResult::Inserted(frontier)
+             | crate::InsertResult::AlreadyPresent(frontier) => frontier,

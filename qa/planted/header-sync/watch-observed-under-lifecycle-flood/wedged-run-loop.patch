@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index dd496a9605..f6cf271309 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -514,6 +514,16 @@ impl HeaderSyncReactor {
+             if self.startup.shutdown.is_cancelled() {
+                 break HeaderRequestTerminal::Shutdown;
+             }
++            // Mutation: the loop stops for good once the committed watch
++            // holds the fixture's commit, before it reads it.
++            if committed_snapshots.as_ref().is_some_and(|snapshots| {
++                snapshots
++                    .borrow()
++                    .as_ref()
++                    .is_some_and(|snapshot| snapshot.frontiers.header_best.height.0 >= 6)
++            }) {
++                std::future::pending::<()>().await;
++            }
+             // Inspect watches on every turn, even when peer queues never become empty.
+             self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
+             // One item from each queue per turn prevents either queue monopolizing the loop.

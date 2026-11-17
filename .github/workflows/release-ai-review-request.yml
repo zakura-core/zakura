@@ -1,0 +1,25 @@
+name: Release AI review request
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# This workflow executes no checkout or PR code and has no secrets or writes.
+permissions: {}
+
+concurrency:
+  group: release-ai-review-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Request review by the trusted default-branch workflow
+        run: echo 'Release review requested; the trusted workflow revalidates PR identity and head.'

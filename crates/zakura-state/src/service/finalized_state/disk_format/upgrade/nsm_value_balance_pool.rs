@@ -1458,7 +1458,10 @@ mod database_tests {
         upgrade
             .apply_format_upgrade(&db, Some(Height(4)), &rx)
             .unwrap();
-        assert_eq!(db.format_version_on_disk().unwrap(), Some(running_version));
+        // The coordinator adds indexer metadata after this schema upgrade stage.
+        let mut schema_version = running_version;
+        schema_version.build = semver::BuildMetadata::EMPTY;
+        assert_eq!(db.format_version_on_disk().unwrap(), Some(schema_version));
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
 
@@ -1502,10 +1505,10 @@ mod database_tests {
         DbFormatChange::open_database(&running_version, Some(old_version))
             .apply_format_upgrade(&db, Some(Height(10)), &rx)
             .unwrap();
-        assert_eq!(
-            db.format_version_on_disk().unwrap(),
-            Some(running_version.clone())
-        );
+        // The coordinator adds indexer metadata after this schema upgrade stage.
+        let mut schema_version = running_version.clone();
+        schema_version.build = semver::BuildMetadata::EMPTY;
+        assert_eq!(db.format_version_on_disk().unwrap(), Some(schema_version));
         let network = db.network();
         drop(db);
         let db = ZakuraDb::new(

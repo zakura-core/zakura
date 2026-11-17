@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin"
+checks = ["crates/zakura-node-services/src/block_memory/model.rs"]

@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-23. Version 0.14.
+Status: draft for review, 2026-11-10. Version 0.20.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -30,7 +30,18 @@ factory and the endpoint inputs, so a simulation can replay a handshake byte
 for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
 each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
 come from the runtime a simulation controls; §17k explains it. Version 0.14
-adds the §16 row for byte-identical replay; §17l explains it.
+adds the §16 row for byte-identical replay; §17l explains it. Version 0.15
+adds API-10, credit holds, and lets CTRL-6 sit below CTRL-5; §17m lists each
+change. Version 0.16 adds `SendStream::stopped` to API-5 and DRV-9; §17n
+explains it. Version 0.17 moves Ed25519 signing and the ID-6 equation from
+`ed25519-zebra` to `ring`; §17o explains it. Version 0.18 keeps a quarter of
+Zakura's connection and control-handshake caps for outbound work (ADM-3);
+§17p explains it. Version 0.19 lets the acceptor group pending handshakes by
+source and has Zakura count each global IPv6 /64 as one IP; it changes ADM-1,
+ADM-3, ADM-7 and API-3, and adds §16 rows; §17q lists each change. Version
+0.20 gives inbound connections their own transport cap and sizes Zakura's
+dial reserve for one full address record, so discovery keeps the outbound
+share when inbound is full (ADM-12); §17r explains it.
 
 ## 0. Conventions
 
@@ -81,9 +92,9 @@ Terms:
   `ed25519-dalek`, `nix` or `memoffset`. CI enforces the list with
   `cargo tree -e normal -i <pkg>` and fails on any hit.
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
-  `bytes`, `curve25519-dalek`, `ed25519-zebra`, `futures`, `hex`, `libc`,
-  `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
-  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
+  `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`, `metrics`,
+  `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`, `socket2`,
+  `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -126,6 +137,8 @@ Terms:
   existing `id@addr` bootstrap entries keep parsing.
 - **ID-3.** `NodeSecretKey` holds a 32-byte Ed25519 seed. It MUST zeroize on
   drop. Its `Debug`, `Display` and `Serialize` output MUST NOT contain the seed.
+  Signing expands the seed into a `ring` key pair for each signature, and
+  `ring` does not zeroize that expanded key when it drops.
 - **ID-4.** The public key MUST derive from the seed per RFC 8032, so every
   existing key file yields the same `NodeId` as on the Iroh backend.
 - **ID-5.** The identity file stays `<network>.zakura-iroh-secret-key` under
@@ -135,7 +148,7 @@ Terms:
   1. refuse a key `A` or a signature `R` that fails any ID-1 point check or
      has a torsion component, using `curve25519-dalek`;
   2. refuse a non-canonical `S`;
-  3. verify the equation with `ed25519-zebra`.
+  3. verify the cofactorless equation with `ring`.
 
   With A and R in the prime-order subgroup, ZIP 215's cofactored equation and
   the cofactorless one agree. The accepted set is therefore a subset of
@@ -352,7 +365,13 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   For a peer-opened stream this node hasn't accepted yet, the task MUST keep
   the code and send the reset on accept, because `quinn-proto` counts a
   remote send stream only from acceptance. A later write on the accepted
-  stream gets `Stopped(code)`.
+  stream gets `Stopped(code)`, and `SendStream::stopped` resolves with the
+  code. Each stream has its own slot for the code, so a stop wakes only that
+  stream's waiters. A short lock guards the slot map, never a `quinn-proto`
+  object. The task keeps its own copy of each code for writes and accepts,
+  so it takes the lock only on a stop and when a handle finishes, resets or
+  drops. The task drops a stream's slot once its handle finishes, resets or
+  drops, so the slots are bounded by the open streams.
 - **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
   the call after the connection task replied, the stream goes to the next
   caller. A lost stream ID would hold its stream open, and its credit, for the
@@ -368,7 +387,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `remote`, the canonical source address (SOCK-11);
   - `validated`, which is `Incoming::remote_address_validated()`;
   - `pending_total` and `pending_from_ip`, the handshakes in progress on the
-    endpoint and from `remote`'s IP (ADM-7).
+    endpoint and from `remote`'s IP group, `Acceptor::pending_group(remote's
+    IP)` (ADM-7).
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a
   `quinn_proto::Endpoint` call:
   - `Accept` → `accept`;
@@ -386,7 +406,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
      handshakes reach `retry_threshold`;
   6. `Accept` otherwise.
-  Rules apply in that order. Zakura's acceptor applies rules 1, 2 and 4: it
+  Rules apply in that order. Zakura counts every per-IP rule by the source's
+  admission host: an IPv4 address, after IPv4 transition encodings fold to it,
+  or a global unicast IPv6 (2000::/3) address's /64. One host can hold every
+  address in its /64, so an exact-address count would never bind it. Other
+  IPv6 addresses, such as unique local and link-local, count exactly. Its
+  `pending_group` returns the admission host, so the endpoint counts pending
+  handshakes the same way. Zakura's acceptor applies rules 1, 2 and 4: it
   counts `pending_from_ip` with the IP's control handshakes and established
   connections, and counts
   `pending_total` with the control handshakes holding `max_pending_handshakes`
@@ -394,7 +420,17 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   `Accept`, then its connection cap (ADM-12). Rules 3 and 4 both refuse, so
   their order doesn't change the result.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
-  ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
+  ignores attempts once shutdown starts.
+
+  Inbound peers get Zakura's `max_connections` and `max_pending_handshakes`
+  caps less an outbound reserve of a quarter, rounded down but at least one
+  slot once a cap is 2 or more: 69 connections and 24 handshakes at the
+  defaults. The acceptor refuses once inbound connections
+  fill their share. Rule 4 also counts `pending_total` with the inbound control
+  handshakes against the inbound handshake share. The reserve stays free for
+  this node's dials, so peers that dial
+  in can't take the capacity its own peers need. Dials may still use any free
+  slot. Zakura has no IP ban list yet, so
   rule 1 never fires.
 
   Rule 2 reserves the last available per-IP slot for a validated source.
@@ -422,7 +458,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-6.** When `handshake_timeout_secs` is set, every accepted handshake MUST
   finish within it. On expiry, the endpoint MUST drop the connecting attempt,
   which closes the connection, and count `zakura.quic.handshake.timed_out`.
-- **ADM-7.** A pending handshake counts against its IP and against the endpoint
+- **ADM-7.** A pending handshake counts against its IP group,
+  `Acceptor::pending_group` of its source IP, and against the endpoint
   from `Accept` until the handshake completes or fails. A failed or timed-out
   handshake keeps counting until its connection task has closed the
   connection, for at most 3 s. On success, the endpoint calls
@@ -450,10 +487,21 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   established connections count. Each address attempt of a dial (DIAL-3)
   counts on its own. Closed connections move to ADM-13's allowance.
   - An attempt the acceptor and rules 3 and 5 accept MUST be refused while
-    `max_connections - dial_reserve` live connections are held. Refusing
-    creates no connection state (SEC-3). Inbound attempts therefore never take
-    the last `dial_reserve` slots, and peers that churn inbound connections
-    can't stop this node's dials.
+    `max_connections - dial_reserve` live connections are held, or while
+    `QuicBindConfig::max_inbound_connections` inbound ones are, when that is
+    set. Refusing creates no connection state (SEC-3). Inbound attempts
+    therefore never take the last `dial_reserve` slots, and peers that churn
+    inbound connections can't stop this node's dials.
+  - An inbound connection MUST count against `max_inbound_connections` from
+    accept until it moves to ADM-13's closing allowance, or until its slot
+    drops when that allowance is full. That includes a connection the
+    acceptor already closed and dropped from its own accounting, such as one
+    Zakura closes right after TLS for a bad control hello, so a peer that
+    repeats such closes can't hold more live slots than the cap. Releasing
+    the count at closing takes no dial room, because closing connections sit
+    in their own allowance. The live and inbound counts MUST change in one
+    atomic step, so each claim, and discovery's ceiling below, sees one
+    snapshot of both.
   - A dial MUST claim a live slot for every address it will try (DIAL-3)
     before its first attempt. The complete reservation MUST be atomic across
     concurrent dials and inbound accepts. It tries at most the first
@@ -466,9 +514,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     that the node owns every address it lists, or call a dial that contacted
     the peer a local limit and retry it without backoff.
   - Discovery dials MUST leave one live slot below the inbound refusal
-    threshold. Their ceiling is
-    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 107 at
-    the defaults. `connect_discovery` caps its address list to this ceiling
+    threshold while inbound connections are under `max_inbound_connections`.
+    Their ceiling is then
+    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 115 at
+    the defaults. Once inbound holds its cap, inbound can't use that slot, so
+    the ceiling is `max_connections.saturating_sub(dial_reserve)` (116).
+    `connect_discovery` caps its address list to this ceiling
     and atomically claims every attempt under it. A zero ceiling disables
     discovery dials and returns `ConnectionLimit`. Bootstrap and maintained
     dials use `connect` and may use the full transport cap. This prevents
@@ -488,9 +539,25 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     made the dialer spin.
 
   Zakura sets `max_connections` to its admitted cap plus
-  `max_pending_handshakes`, and `dial_reserve` to half of
-  `max_pending_handshakes` rounded up, so at least one slot: 124 and 16 at
-  the defaults (CTRL-26).
+  `max_pending_handshakes`: 124 at the defaults (CTRL-26). It sets
+  `max_inbound_connections` to its inbound connection and handshake shares
+  (ADM-3) together: 93. It sets `dial_reserve` to the 31 slots inbound can't
+  hold, capped at one discovery record's 8 addresses and at least one slot:
+  8 at the defaults. With inbound full, discovery's ceiling (116) leaves it
+  the whole outbound share (23), and the reserve still fits one maintained
+  dial of a full record. That holds whenever the handshake reserve is at
+  least 8, so from 32 pending handshakes up. Below that the reserve keeps its
+  full record first, and discovery gets what's left above inbound, which is
+  zero when inbound can't hold only 8 slots or fewer. Endpoint startup
+  refuses a remote `zakura.bootstrap_peers` identity whose dial would make
+  more address attempts than the reserve (`QuicEndpoint::dial_attempt_count`
+  counts them as DIAL-2 picks them), so each bootstrap dial fits it whenever
+  nothing else holds it. Legacy upgrade hand-offs carry at most 8 addresses,
+  so they fit too unless the reserve is smaller than 8. Below that, a
+  hand-off with more addresses than the reserve can't start while inbound
+  is full, and the legacy handshake that carried it times out. A maintained
+  dial that doesn't fit right now fails with `ConnectionLimit` and retries
+  without counting an attempt.
 - **ADM-13.** When a connection closes, its connection task MUST release the
   stream payload `quinn-proto` still holds, then move its slot from ADM-12's
   live count to `QuicBindConfig::max_closing_connections`.
@@ -547,7 +614,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   node doesn't redial another cohort in a loop. The backoff applies to the
   node ID, whatever addresses its later records advertise. Each address keeps
   the ordinary dial backoff, because the dial error doesn't say which address
-  mismatched.
+  mismatched. A legacy upgrade hint isn't signed, and the mismatch fails before
+  TLS authenticates the node ID, so a hint's backoff applies to that node ID
+  and address set only.
 - **DIAL-6.** The dialer's admitted IP is the address of the winning attempt.
 - **DIAL-7.** A connection uses one path. `quinn-proto` has no multipath.
 
@@ -574,7 +643,7 @@ Rules for every key:
 | CTRL-3 | `congestion_controller` | enum `cubic` \| `new_reno` | `cubic` | — | `congestion_controller_factory` | MUST be set explicitly, even for the default. Changing the default needs the PLAN step 12 fleet A/B and a spec change. The driver wraps the factory per connection to observe the controller (OBS-12). |
 | CTRL-4 | `initial_window_bytes` | optional u64 | unset (`quinn-proto` default for the controller) | 14,720 – 16 MiB | `{Cubic,NewReno}Config::initial_window` | |
 | CTRL-5 | `stream_receive_window_bytes` | u32 | 16 MiB | 64 KiB – 256 MiB | `stream_receive_window` | The Iroh backend's constant |
-| CTRL-6 | `receive_window_bytes` | u32 | 32 MiB | ≥ CTRL-5, ≤ 1 GiB | `receive_window` | The Iroh backend's constant |
+| CTRL-6 | `receive_window_bytes` | u32 | 32 MiB | 64 KiB – 1 GiB | `receive_window` | The Iroh backend's constant; the window each connection starts with, which may be below CTRL-5 |
 | CTRL-7 | `send_window_bytes` | u64 | 32 MiB | 64 KiB – 1 GiB | `send_window` | The Iroh backend's constant |
 | CTRL-9 | `ack_frequency` | bool | `false` | — | `ack_frequency_config` | Sends ACK_FREQUENCY frames when `true` (WIRE-9) |
 | CTRL-10 | `idle_timeout_secs` | u32 | 150 | 30 – 600 | `max_idle_timeout` | The Iroh backend's constant. MUST exceed `keep_alive_interval_secs` × 3. |
@@ -592,27 +661,33 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16, per
+IPv4 address or global IPv6 /64, ADM-3),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
-`peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
+`peer_memory_budget_bytes` (15 GiB) joins them under CTRL-26.
 
-- **CTRL-26.** One live QUIC connection can make the node hold
+- **CTRL-26.** A QUIC connection in its handshake can make the node hold
   `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
-  at the defaults, whether or not the application reads. Per-stream receive
+  at the defaults, whether or not the application reads. Once the connection
+  negotiates its streams, the application raises its receive window once
+  (API-9) by the receive share of each stream kind it negotiated, so an
+  admitted connection holds that window plus `send_window_bytes`:
+  141,937,353 B at the defaults on Mainnet and Testnet. Per-stream receive
   windows sit inside the connection window and add nothing.
-  `zakura_quic::connection_memory_bytes` is the only implementation of this
-  formula. Queued datagrams are bounded per socket instead: each bound socket
+  `zakura_quic::connection_memory_bytes` is the only implementation of the
+  handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
+  cost. Queued datagrams are bounded per socket instead: each bound socket
   queues at most `SOCKET_DATAGRAM_QUEUE_BYTES` (256 MiB, DRV-3) however many
   connections it serves, closed ones included, and connection tasks drain it
   whether or not the application reads. A closed connection holds no stream
-  data once ADM-13 releases it. The node reserves one socket queue per bound
-  socket from `[network.zakura] peer_memory_budget_bytes`, and the rest
-  divided by the per-connection cost is the number of live connections it
-  funds, 124 at the defaults, which bind one socket. `max_pending_handshakes`
-  of them are headroom for handshakes not yet admitted and extra address
-  attempts of one dial, and the node admits the rest, 92 at the defaults.
-  ADM-12 holds the transport to the admitted cap plus that headroom, so every
+  data once ADM-13 releases it. The node reserves, from `[network.zakura]
+  peer_memory_budget_bytes`, one socket queue per bound socket and
+  `max_pending_handshakes` connections at the handshake cost. The rest
+  divided by the admitted connection's cost is the number of connections it
+  admits, 96 at the defaults, which bind one socket, so the default
+  `max_connections` of 92 is funded. ADM-12 holds the transport to the
+  admitted cap plus the handshake headroom, so every
   live connection the node holds is funded. Startup lowers a larger
   `max_connections` to the admitted count with a warning. It fails, naming
   `peer_memory_budget_bytes`, when the budget admits fewer than 16
@@ -622,8 +697,8 @@ These keys stay in `[network.zakura]` and keep their meaning:
   as at any cap. A smaller `max_connections` lowers that floor to match.
   Config load can't see the node key yet, so it counts one bootstrap identity
   fewer in case one is this node's own, and the endpoint applies the exact
-  floor. The budget never shrinks the windows, so it costs no per-connection
-  throughput.
+  floor. The budget never shrinks the windows or the shares, so it costs no
+  per-connection throughput.
 
   The budget counts flow-control credit and the socket datagram queues, not
   resident memory. Connection and stream bookkeeping, including that of the
@@ -789,7 +864,10 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `fn handle(&self, conn: Conn) -> BoxFuture<'static, ()>`; `Conn::alpn()`
     carries the negotiated ALPN. Work done in `handle` before it returns the
     future runs while the handshake still counts as pending (ADM-7);
-  - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3.
+  - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3;
+  - `fn pending_group(&self, ip: IpAddr) -> IpAddr`, default `ip`, the group
+    that ADM-7 counts the IP's pending handshakes under. It must not block
+    (ADM-4).
 - **API-4.** `Conn`:
   - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `alpn()` and `stable_id()`;
   - `open_bi()`, `accept_bi()`, `close(code, reason)`, `closed()` and
@@ -802,9 +880,15 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   (DRV-4, DRV-5). A `SendStream` write may return before `quinn-proto` accepts
   its data, so a write error can belong to an earlier write (DRV-4):
   - `SendStream`: `write_all`, `write_chunk` (no copy), `set_priority`,
-    `finish` and `reset`. `set_priority` maps to `quinn-proto`'s stream
-    priority (higher first) and is ordered with the stream's writes;
-  - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end` and `stop`.
+    `finish`, `reset` and `stopped`. `set_priority` maps to `quinn-proto`'s
+    stream priority (higher first) and is ordered with the stream's writes.
+    `stopped` returns a future that doesn't borrow the handle. It resolves
+    with the peer's STOP_SENDING code (DRV-9), or with the close reason once
+    the connection closes. It costs no task, and a stop wakes only that
+    stream's waiters, so an application can race it against per-request
+    work;
+  - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end`, `stop`
+    and `hold_credit` (API-10).
   The crate defines `WriteError`, `ReadError`, `ReadExactError`,
   `ReadToEndError` and `ClosedStream`. It re-exports `quinn-proto`'s `VarInt`,
   `ConnectionError`, `ConnectionStats`, `PathStats`, `UdpStats` and
@@ -854,6 +938,20 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     buffers nor a runtime per-stream receive window. The receive windows bound
     both: a peer holds at most `receive_window` of unread data per connection,
     and CTRL-26 bounds the sum across admitted connections.
+- **API-10.** Credit holds. `RecvStream::hold_credit(bytes)` returns a
+  `CreditHold` for bytes the application has read but still keeps. The
+  connection task subtracts every live hold from the receive window, so
+  unread bytes plus held bytes stay within the window `set_limits` gave.
+  - The hold travels with the stream's next command (read, stop or drop), so
+    the task applies it in order with the reads it covers. Read-ahead lets
+    a hold reach the task after its bytes were read, which can over-grant by
+    at most the stream's read-ahead (4 KiB) per stream.
+  - Dropping a `CreditHold` adds its bytes to a per-connection counter and
+    wakes the task only when the counter leaves zero. The task grows the
+    window by the released total once per drive loop.
+  - A shrink below the bytes already granted becomes `quinn-proto` debt that
+    later reads repay first, so the peer never gains credit while a hold
+    covers it.
 
 ## 13. Compatibility
 
@@ -979,13 +1077,22 @@ this release tolerates, and keep each hard change explicit.
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
 | A stopped stream returns its credit; a cancelled `accept_bi` hands its stream to the next call | DRV-9, DRV-10 |
+| `SendStream::stopped` resolves with the peer's code when the peer stops the stream, and with the close reason when the connection closes | API-5, DRV-9 |
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
+| A shrink below granted credit becomes debt that reads repay before a new grant (pins `quinn-proto`); a greedy sender's delivered minus released bytes never exceed the window under random holds, reads and releases; releasing a hold unblocks a sender stuck on `DATA_BLOCKED` | API-10 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
+| Inbound connections and handshakes stop at their share while dials still get the reserved quarter | ADM-3 |
+| The endpoint counts pending handshakes under the acceptor's `pending_group` | ADM-1, ADM-7, API-3 |
+| Zakura's admission host folds transition encodings and cuts global IPv6 to /64; every address in a /64 shares the per-IP cap, handshake share and dial reservation, and a redial from another address in it is a same-IP duplicate | ADM-3 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
+| Inbound connections stop at their own cap and count until they close, even when the acceptor closes them right after TLS; with inbound at its cap, discovery reaches the reserve and a maintained dial still fits it | ADM-12 |
+| Endpoint startup refuses a remote bootstrap identity whose dial would make more address attempts than the dial reserve, at the defaults and at small caps; the attempt count skips families with no socket and folds IPv4-mapped duplicates | ADM-12, DIAL-2 |
+| Racing inbound claims and closes never let discovery take the slot it leaves for inbound | ADM-12 |
+| Zakura's dial reserve fits one full address record and leaves discovery the whole outbound share with inbound at both of its shares | ADM-3, ADM-12 |
 | Cancelling discovery before or after its second address attempt starts returns all slots, sends no packet to an unstarted address, and lets a subsequent whole dial reserve capacity | ADM-12, ADM-13 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
 | Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
@@ -1298,3 +1405,138 @@ Changed:
   replay byte for byte, in one process and across processes, and that each
   seeded input, the seed and the UTC origin change the bytes while host time
   doesn't.
+
+## 17m. Changes in version 0.15
+
+The application keeps some frames after it reads them. Credit holds count
+those bytes against the receive window, so one window bounds unread and kept
+bytes together.
+
+Added:
+
+- **API-10.** `RecvStream::hold_credit` and `CreditHold`.
+- **§16.** Adds the credit-hold tests.
+
+Changed:
+
+- **API-5.** Lists `hold_credit`.
+- **CTRL-6.** The range is 64 KiB – 1 GiB. The rule that the connection
+  window is at least CTRL-5 is gone: a connection starts with its handshake
+  window, and the application raises it once it knows which streams the
+  connection carries.
+- **CTRL-26.** The budget charges an admitted connection its raised window,
+  the handshake window plus its negotiated streams' receive shares, and a
+  connection in its handshake only the handshake and send windows. The
+  default budget is 15 GiB.
+
+## 17n. Changes in version 0.16
+
+A peer that abandons a request stops its response stream with STOP_SENDING.
+Before this version the application learned of the stop only at its next
+write, so it kept doing the request's work and encoding its response (V12
+F-499).
+
+Changed:
+
+- **API-5.** Adds `SendStream::stopped`.
+- **DRV-9.** `SendStream::stopped` resolves with the code the task keeps.
+  Each stream keeps its code in its own slot, so a stop wakes only that
+  stream's waiters. With one shared map, each stop would wake every request
+  worker on the connection, up to 1,024 of them. The task's writes and
+  accepts read its own copy of the code, so they take no lock.
+- **§16.** Adds the `stopped` test.
+
+## 17o. Changes in version 0.17
+
+`ring` already sits in the production graph for QUIC and TLS, and it signs
+and verifies Ed25519. `ed25519-zebra` was a second Ed25519 implementation
+used only here and for Sprout transactions, so `zakura-quic` drops it. Key
+derivation and signing follow RFC 8032 in both, so every key file yields the
+same `NodeId` and every signature is byte-identical.
+
+Changed:
+
+- **DEP-2.** Drops `ed25519-zebra`.
+- **ID-3.** Records that `ring` does not zeroize the expanded key it builds
+  for each signature. The stored seed still zeroizes on drop.
+- **ID-6.** Step 3 verifies the cofactorless equation with `ring`. After the
+  step 1 point checks, it accepts exactly the signatures the cofactored
+  equation accepted, so the accepted set is unchanged. A differential test
+  checks this against `ed25519-zebra`.
+
+## 17p. Changes in version 0.18
+
+Before this version inbound and outbound connections drew on one connection
+cap and one control-handshake cap. Peers that dialed in could take every
+slot, and then this node couldn't dial anyone, even the peers it chose for
+eclipse resistance.
+
+Changed:
+
+- **ADM-3.** Inbound connections and inbound handshakes each get Zakura's
+  cap less a quarter, rounded down but at least one slot once the cap is 2
+  or more. That reserve stays for dials. Bitcoin Core, geth, reth and Zebra
+  all bound inbound below the total in the same way.
+- **§16.** Adds the inbound share test.
+
+## 17q. Changes in version 0.19
+
+Zakura counted every per-IP limit by exact address. A host with a /64,
+which most IPv6 hosting gives each server, has 2^64 addresses, so it could
+use a fresh one per identity and fill the node. Zebra counts a
+global IPv6 /64 as one host, and the draft Zcash P2P QUIC ZIP calls a /64 a
+reasonable default for IPv6 limits.
+
+Two tradeoffs are deliberate. A host with several /64s still gets the per-IP
+cap in each one. No coarser refuse tier backs it, because a fixed /48, /32
+or IPv4 /24 cap either locks out honest nodes at big providers or is too
+loose to stop a cheap allocation. The outbound reserve (ADM-3) keeps dials
+free regardless, and eviction by netgroup is the planned control for a full
+inbound pool. Second, providers that share one /64 across customers put
+those customers in one bucket, so a co-tenant can hold that /64's slots on
+a node. An operator can raise `max_connections_per_ip`. IPv4 also works
+for them, except that a dial listing IPv6 first can win the DIAL-3 race and
+then be refused at registration (tracked in #2255).
+
+Changed:
+
+- **API-3.** Adds `Acceptor::pending_group`.
+- **ADM-1, ADM-7.** `pending_from_ip` and the pending count use that group.
+- **ADM-3.** Zakura counts each IP by its admission host, a global unicast
+  IPv6 address's /64 or the exact address otherwise, and its
+  `pending_group` returns it.
+- **§16.** Adds the `pending_group` and admission host tests.
+
+## 17r. Changes in version 0.20
+
+Version 0.18 bounded inbound peers in Zakura's handler but left the
+transport's split alone. The transport refused inbound attempts at 108 live
+connections and stopped discovery at 107, and both counts include every
+direction. Inbound peers holding 68 connections and 24 stalled TLS
+handshakes took 92 of those slots, which left discovery 15 instead of the
+23-slot outbound share. With small caps, discovery could reach zero.
+
+The handler's bound wasn't enough on its own either. Zakura drops a
+connection's permits as soon as it closes it, for example after a bad
+control hello, while the transport keeps the slot live until the close
+finishes. A peer that finishes TLS and sends a bad hello, over and over, held
+more live slots than the handler's shares.
+
+Changed:
+
+- **ADM-12.** `QuicBindConfig` gains `max_inbound_connections`. Inbound
+  connections count against it from accept until they close, and an
+  inbound attempt is refused at that cap as well as at the dial reserve.
+  Discovery's ceiling leaves its spare inbound slot only while inbound is
+  under its cap. Zakura sets the cap to its inbound connection and
+  handshake shares (93 at the defaults), and its `dial_reserve` to the
+  slots inbound can't hold, capped at one discovery record's 8 addresses
+  (8, down from 16). Discovery then keeps the whole outbound share (23)
+  with inbound full, and one maintained dial of a full record still fits
+  the reserve. Endpoint startup refuses a remote bootstrap identity whose
+  dial would make more address attempts than the reserve, since that dial
+  could never start while inbound peers fill the table. The
+  live and inbound counts share one atomic word, so discovery's ceiling
+  can't race an inbound claim or close.
+- **§16.** Adds the inbound cap, race, dial reserve and bootstrap address
+  tests.

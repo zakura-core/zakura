@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
+@@ -395,7 +395,7 @@
+     ) -> Self {
+         // A concurrent ranker must skip this peer if the transfer is preempted.
+         // The synchronous transfer does not need to wake parked rankers.
+-        let blocked = HandoffBlocked::set(&io.handoff_blocked);
++        let blocked = HandoffBlocked(&io.handoff_blocked);
+         #[cfg(any(test, zakura_sim))]
+         io.observe_handoff_started(owner, height, funding.bytes());
+         #[cfg(not(any(test, zakura_sim)))]

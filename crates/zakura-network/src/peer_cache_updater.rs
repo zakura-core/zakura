@@ -52,24 +52,29 @@ pub async fn peer_cache_updater(
 /// Caches peers from the current `address_book` to disk, based on `config`.
 ///
 /// Returns `true` if the cache was written. If no peers are cacheable, preserves
-/// previous cached peers except those whose IPs are currently banned.
+/// previous cached peers except banned IPs and peers known to be invalid for outbound connections.
 pub async fn update_peer_cache_once(
     config: &Config,
     address_book: &Arc<Mutex<AddressBook>>,
 ) -> io::Result<bool> {
-    let mut peer_list: std::collections::HashSet<_> = cacheable_peers(address_book)
+    let mut peer_list: indexmap::IndexSet<_> = cacheable_peers(address_book)
         .iter()
         .map(|meta_addr| meta_addr.addr)
         .collect();
     if peer_list.is_empty() {
-        // Preserve cold-start fallback peers, but never restore a known banned IP.
+        // Preserve unknown cold-start fallback peers, but do not restore known rejections.
         peer_list = config.load_peer_cache().await?;
-        let bans = address_book
+        let mut book = address_book
             .lock()
-            .expect("unexpected panic in previous thread while accessing the address book")
-            .bans();
+            .expect("unexpected panic in previous thread while accessing the address book");
+        let bans = book.bans();
         let previous_len = peer_list.len();
-        peer_list.retain(|peer| !bans.contains(peer.ip()));
+        peer_list.retain(|peer| {
+            !bans.contains(peer.ip())
+                && book.get(*peer).is_none_or(|known| {
+                    known.last_known_info_is_valid_for_outbound(&config.network)
+                })
+        });
         if peer_list.len() == previous_len {
             return Ok(false);
         }
@@ -98,10 +103,51 @@ fn cacheable_peers(address_book: &Arc<Mutex<AddressBook>>) -> Vec<MetaAddr> {
 mod tests {
     use super::*;
     use crate::{
-        constants::MAX_PEER_MISBEHAVIOR_SCORE, meta_addr::MetaAddrChange,
-        protocol::types::PeerServices, CacheDir, PeerSocketAddr,
+        constants::MAX_PEER_MISBEHAVIOR_SCORE, protocol::types::PeerServices, CacheDir,
+        PeerSocketAddr,
     };
     use zakura_chain::serialization::DateTime32;
+
+    /// The fallback cache cannot restore a known non-node, even when no fresh peers remain.
+    #[tokio::test]
+    async fn empty_peer_cache_update_removes_known_non_nodes() {
+        let _init_guard = zakura_test::init();
+        for retain_unknown in [false, true] {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                cache_dir: CacheDir::custom_path(cache_dir.path()),
+                ..Config::default()
+            };
+            let non_node: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+            let unknown: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+            let mut cached = indexmap::IndexSet::from([non_node]);
+            if retain_unknown {
+                cached.insert(unknown);
+            }
+            config.update_peer_cache(cached).await.unwrap();
+            let mut book = AddressBook::new(
+                "0.0.0.0:0".parse().unwrap(),
+                &config.network,
+                config.max_connections_per_ip,
+                tracing::Span::none(),
+            );
+            book.update(MetaAddr::new_connected(
+                non_node,
+                &PeerServices::empty(),
+                false,
+            ));
+            book.update(MetaAddr::new_responded(
+                non_node,
+                Some(std::time::Duration::from_millis(10)),
+            ));
+            assert!(book.cacheable(Utc::now()).is_empty());
+            let book = Arc::new(Mutex::new(book));
+            assert!(update_peer_cache_once(&config, &book).await.unwrap());
+            let saved = config.load_peer_cache().await.unwrap();
+            assert!(!saved.contains(&non_node));
+            assert_eq!(saved.contains(&unknown), retain_unknown);
+        }
+    }
 
     #[tokio::test]
     async fn empty_peer_cache_update_removes_banned_ips_but_preserves_safe_peers() {
@@ -115,8 +161,10 @@ mod tests {
             let banned: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
             let other_port: PeerSocketAddr = "127.0.0.1:8234".parse().unwrap();
             let safe: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
-            let mut cached = std::collections::HashSet::from([banned, other_port]);
+            let another_safe: PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+            let mut cached = indexmap::IndexSet::from([banned, other_port]);
             if retain_safe_peer {
+                cached.insert(another_safe);
                 cached.insert(safe);
             }
             config.update_peer_cache(cached).await.unwrap();
@@ -136,10 +184,8 @@ mod tests {
                 .new_gossiped_change()
                 .unwrap(),
             );
-            book.update(MetaAddrChange::UpdateMisbehavior {
-                addr: banned,
-                score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
-            });
+            book.misbehavior_reporter()
+                .report(banned, MAX_PEER_MISBEHAVIOR_SCORE);
             assert!(book.bans().contains(banned.ip()));
             let inbound: PeerSocketAddr = "127.0.0.3:45678".parse().unwrap();
             book.update(MetaAddr::new_connected(
@@ -153,11 +199,19 @@ mod tests {
             let book = Arc::new(Mutex::new(book));
             update_peer_cache_once(&config, &book).await.unwrap();
             let expected = if retain_safe_peer {
-                std::collections::HashSet::from([safe])
+                indexmap::IndexSet::from([another_safe, safe])
             } else {
-                std::collections::HashSet::new()
+                indexmap::IndexSet::new()
             };
-            assert_eq!(config.load_peer_cache().await.unwrap(), expected);
+            assert_eq!(
+                config
+                    .load_peer_cache()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>(),
+            );
         }
     }
 }

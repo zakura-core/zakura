@@ -133,7 +133,7 @@ still delivering the earlier response.
 **Unbounded memory under attacker-controlled bodies or stalls.**
 
 - Outstanding request reservations MUST stay within `max_inflight_block_bytes`
-  (6 GiB), apart from the single bounded floor overdraft; each reservation MUST be
+  (unset: `x × C`, the block-sync connections times the cwnd cap), apart from the single bounded floor overdraft; each reservation MUST be
   released when its body arrives or the request otherwise terminates.
 - The resident look-ahead gate MUST be the sole authority for speculative bodies
   retained by, or reserved to enter, the reorder, applying, and sequencer-input pools.
@@ -212,6 +212,6 @@ window.
 | `no_progress_peer_cooldown` | 180 s | park after a no-progress disconnect |
 | `floor_rescue_timeout` | 2 s | floor leash before rescue |
 | `floor_bypass_slots` | 2 | floor borrow beyond the window |
-| `max_inflight_block_bytes` | 6 GiB | global in-flight byte ceiling |
+| `max_inflight_block_bytes` | `x × C` (2,944 MiB) | global in-flight byte ceiling |
 | timeout dip / delay-cap down / delay EWMA α / reliability EWMA α | ×0.85 / ×0.9 / 0.25 / 0.1 | (constants) |
 | `block_peer_bbr` heartbeat | 10 s | per-peer controller-state trace cadence |

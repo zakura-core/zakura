@@ -1,0 +1,8 @@
+# The committed fuzz input `race-fixtures-timer-cancel-fixed.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its three bytes pick
+# the `race/timer-cancel` fixture, its fixed variant and one worker.
+harness = "fixtures/all"
+generator = 1
+sha256 = "fbf7dfa6d256e8d6cae164fda0e5623d454501de0cdd56c2d8fbed4df1523d07"
+scenario_sha256 = "fdc4ba98f3ad6b220b1ef8d068bfd8de90659cb741cb538b7ca853426d34ac76"
+source = "crates/zakura-sim/tests/race_fixtures.rs"

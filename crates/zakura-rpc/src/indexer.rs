@@ -1,11 +1,10 @@
 //! A tonic RPC server for Zebra's indexer API.
 
-use std::sync::Arc;
-
 use zakura_chain::{
     block,
-    serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{BytesInDisplayOrder, ZcashSerialize},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 #[cfg(test)]
 mod tests;
@@ -45,12 +44,23 @@ impl BlockAndHash {
     /// # Panics
     ///
     /// This function will panic if the block serialization fails (if the header version is invalid).
-    pub fn new(hash: block::Hash, block: Arc<block::Block>) -> Self {
+    pub fn new(hash: block::Hash, block: impl Into<BlockHandle>) -> Self {
+        let block = block.into();
         BlockAndHash {
             hash: hash.bytes_in_display_order().to_vec(),
             data: block
                 .zcash_serialize_to_vec()
                 .expect("block serialization should not fail"),
+            receipt_order: None,
+        }
+    }
+
+    /// Creates a new [`BlockAndHash`] from a block's hash and its Zcash
+    /// consensus serialization, without decoding the block.
+    pub fn from_serialized(hash: block::Hash, data: Vec<u8>) -> Self {
+        BlockAndHash {
+            hash: hash.bytes_in_display_order().to_vec(),
+            data,
             receipt_order: None,
         }
     }
@@ -68,8 +78,7 @@ impl BlockAndHash {
             })
             .ok()
             .and_then(|hash| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .and_then(|block: block::Block| {
@@ -97,8 +106,7 @@ impl BlockAndHeight {
             })
             .ok()
             .and_then(|height| {
-                self.data
-                    .zcash_deserialize_into()
+                block::Block::zcash_deserialize_bounded(&mut self.data.as_slice())
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
                     .zip(Some(height))

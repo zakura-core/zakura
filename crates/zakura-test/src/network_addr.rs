@@ -11,7 +11,7 @@ use hex::FromHex;
 
 /// Array of `addr` (v1) test vectors containing IP addresses.
 ///
-/// These test vectors can be read by [`zakura_network::protocol::external::Codec::read_addr`].
+/// These test vectors can be read by `zakura_network::protocol::external::Codec::read_addr`.
 /// They should produce successful results containing IP addresses.
 // From https://github.com/zingolabs/zcash/blob/9ee66e423a3fbf4829ffeec354e82f4fbceff864/src/test/netbase_tests.cpp#L397
 pub static ADDR_V1_IP_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
@@ -65,7 +65,7 @@ pub static ADDR_V1_IP_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
 
 /// Array of empty or unsupported `addr` (v1) test vectors.
 ///
-/// These test vectors can be read by [`zakura_network::protocol::external::Codec::read_addr`].
+/// These test vectors can be read by `zakura_network::protocol::external::Codec::read_addr`.
 /// They should produce successful but empty results.
 pub static ADDR_V1_EMPTY_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
     vec![
@@ -81,7 +81,7 @@ pub static ADDR_V1_EMPTY_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
 ///
 /// Some test vectors also contain some unsupported addresses.
 ///
-/// These test vectors can be read by [`zakura_network::protocol::external::Codec::read_addrv2`],
+/// These test vectors can be read by `zakura_network::protocol::external::Codec::read_addrv2`,
 /// They should produce successful results containing IP addresses.
 // From https://github.com/zingolabs/zcash/blob/9ee66e423a3fbf4829ffeec354e82f4fbceff864/src/test/netbase_tests.cpp#L421
 pub static ADDR_V2_IP_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
@@ -205,7 +205,7 @@ pub static ADDR_V2_IP_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
 
 /// Array of empty or unsupported ZIP-155 test vectors.
 ///
-/// These test vectors can be read by [`zakura_network::protocol::external::Codec::read_addrv2`].
+/// These test vectors can be read by `zakura_network::protocol::external::Codec::read_addrv2`.
 /// They should produce successful but empty results.
 // From https://github.com/zingolabs/zcash/blob/9ee66e423a3fbf4829ffeec354e82f4fbceff864/src/test/netbase_tests.cpp#L421
 pub static ADDR_V2_EMPTY_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
@@ -234,7 +234,7 @@ pub static ADDR_V2_EMPTY_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
 
 /// Array of invalid ZIP-155 test vectors.
 ///
-/// These test vectors can be read by [`zakura_network::protocol::external::Codec::read_addrv2`].
+/// These test vectors can be read by `zakura_network::protocol::external::Codec::read_addrv2`.
 /// They should fail deserialization.
 pub static ADDR_V2_INVALID_VECTORS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
     vec![

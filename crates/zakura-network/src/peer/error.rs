@@ -129,6 +129,11 @@ pub enum PeerError {
     #[error("No ready peers available")]
     NoReadyPeers,
 
+    /// A block advert was sent as an ordinary request. Block adverts go through the dedicated
+    /// block advert service, which reaches busy peers.
+    #[error("block adverts require the dedicated block advert service")]
+    AdvertRequiresDedicatedService,
+
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
     #[error("Internal services timed out")]
@@ -195,6 +200,7 @@ impl PeerError {
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
+            PeerError::AdvertRequiresDedicatedService => "AdvertRequiresDedicatedService".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

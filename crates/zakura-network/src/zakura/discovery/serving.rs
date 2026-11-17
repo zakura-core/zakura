@@ -39,13 +39,23 @@ const PEER_EXECUTION: usize = 1;
 /// unsent. A peer that stops reading makes its next request wait, and
 /// requests past the commitment margin then close the connection.
 const PEER_OUTPUT_RESPONSES: usize = 2;
+/// The unsent answer bytes one peer may hold on a discovery request row whose
+/// largest response is `largest`: [`PEER_OUTPUT_RESPONSES`] such answers.
+pub(super) const fn peer_output_bytes(largest: ResponseCap) -> u64 {
+    // Widening usize to u64 is lossless on supported targets.
+    PEER_OUTPUT_RESPONSES as u64 * largest.output_bytes()
+}
+
+/// The unsent answer bytes one peer may hold across discovery's request rows.
+pub(super) const OUTPUT_BYTES: u64 =
+    peer_output_bytes(LARGEST_PEERS) + peer_output_bytes(LARGEST_SERVICES);
+
 /// The serving limits of a discovery request row whose largest response is
 /// `largest` payload bytes, on a node that admits `max_connections`.
 ///
 /// The node may hold every connection's share of unsent answers, so the pool
 /// follows the effective connection cap rather than a compile-time default.
 fn serving_limits(largest: ResponseCap, max_connections: usize) -> ServeLimits {
-    let largest = largest.output_bytes();
     let node_output_responses = PEER_OUTPUT_RESPONSES.saturating_mul(max_connections.max(1));
     // Widening usize to u64 is lossless on supported targets.
     ServeLimits {
@@ -53,9 +63,18 @@ fn serving_limits(largest: ResponseCap, max_connections: usize) -> ServeLimits {
         peer_execution: PEER_EXECUTION,
         peer_output_responses: PEER_OUTPUT_RESPONSES,
         node_output_responses,
-        peer_output_bytes: PEER_OUTPUT_RESPONSES as u64 * largest,
-        node_output_bytes: (node_output_responses as u64).saturating_mul(largest),
+        peer_output_bytes: peer_output_bytes(largest),
+        node_output_bytes: (node_output_responses as u64).saturating_mul(largest.output_bytes()),
     }
+}
+
+/// The most unsent answer bytes that discovery's request rows reserve together on
+/// a node that admits `max_connections`.
+pub(crate) fn node_output_bytes(max_connections: usize) -> u64 {
+    [LARGEST_PEERS, LARGEST_SERVICES]
+        .into_iter()
+        .map(|largest| serving_limits(largest, max_connections).node_output_bytes)
+        .fold(0, u64::saturating_add)
 }
 
 /// The in-flight limit this node advertises for `row`: the limit the row
@@ -131,6 +150,21 @@ impl ServingCapacity {
 }
 
 impl Serving {
+    /// Reports each commitment of `recv`'s requests on its stream's tap, if
+    /// it has one, with the frame each admitted request was read as. Call it
+    /// before `recv`'s reader can read a frame.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn observe(&self, recv: &crate::zakura::FramedRecv) {
+        let Some(tap) = recv.stream_tap() else {
+            return;
+        };
+        tap.tag_frames();
+        self.get_peers
+            .observe_with(tap.clone(), GET_PEERS.message_type);
+        self.get_services
+            .observe_with(tap.clone(), GET_SERVICES.message_type);
+    }
+
     /// Waits until this session has written every answer it admitted.
     pub(super) fn answers_written(&self) -> AnswersWritten {
         AnswersWritten([
@@ -150,6 +184,11 @@ impl AnswersWritten {
         for row in &self.0 {
             row.wait().await;
         }
+    }
+
+    /// Whether both rows have written every admitted answer.
+    pub(super) fn is_written(&self) -> bool {
+        self.0.iter().all(ResponsesWritten::is_written)
     }
 }
 
@@ -302,5 +341,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The discovery budget's output share is the per-peer output that each
+    /// row's serving limits set: two of the row's largest answers.
+    #[test]
+    fn the_budget_output_is_each_rows_serving_output() {
+        let peers = serving_limits(LARGEST_PEERS, 1).peer_output_bytes;
+        let services = serving_limits(LARGEST_SERVICES, 1).peer_output_bytes;
+        assert_eq!(peers, 2 * LARGEST_PEERS.output_bytes());
+        assert_eq!(services, 2 * LARGEST_SERVICES.output_bytes());
+        assert_eq!(peers + services, super::super::DISCOVERY_BUDGET.output);
     }
 }

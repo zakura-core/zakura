@@ -2,8 +2,6 @@
 //! complete, and equal inputs write equal traces.
 #![cfg(zakura_sim)]
 
-use std::rc::Rc;
-
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use zakura_scheduler::SchedulerConfig;
@@ -11,8 +9,11 @@ use zakura_sim::{
     harness::{self, entry, record, HarnessEntry, RecordError, RecordInput, Subsystem, HARNESSES},
     property::HasView,
     record::OutcomeKind,
-    trace::{meta::PropertyRef, TraceReader, INPUT_FILE, TRACE_FILE},
-    Checker, NoChecks, RunConfig, Sim,
+    trace::{
+        meta::{PlanKind, PlanRef},
+        replay_with, ReplayOptions, TraceReader, INPUT_FILE, TRACE_FILE,
+    },
+    Plan, PlanChoice, RunConfig, Sim,
 };
 
 /// Fixed bytes for a recording: a scenario prefix for harnesses that have
@@ -42,6 +43,7 @@ impl Subsystem for Yielders {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = Tasks;
+    type Prepared = ();
 
     /// 2 workers and small stacks.
     fn config(_: &Tasks) -> RunConfig {
@@ -55,8 +57,11 @@ impl Subsystem for Yielders {
         }
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Tasks) {}
+
     /// Spawns the tasks, each yielding twice.
-    fn build(sim: &mut Sim, scenario: &Tasks) -> Self {
+    fn build(sim: &mut Sim, scenario: &Tasks, (): ()) -> Self {
         for _ in 0..scenario.tasks {
             sim.scheduler().spawn_root("yielder", async {
                 zakura_rt::task::yield_now().await;
@@ -64,16 +69,6 @@ impl Subsystem for Yielders {
             });
         }
         Yielders
-    }
-
-    /// Checks nothing.
-    fn checker(_: &Rc<Self>, _: &Tasks) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// None.
-    fn properties(_: &Tasks) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// One to four tasks.
@@ -97,10 +92,12 @@ fn record_writes_a_complete_trace() {
         assert_eq!(read, trace);
         assert!(read.is_complete());
         assert_eq!(read.meta.sim, entry.name);
-        assert_eq!(
-            read.meta.scenario,
-            (entry.draw)(&BYTES[..entry.scenario_bytes])
-        );
+        // Fixed-prefix harnesses read missing scenario bytes as 0.
+        let mut prefix = BYTES[..entry.scenario_bytes.min(BYTES.len())].to_vec();
+        if !entry.machine {
+            prefix.resize(entry.scenario_bytes, 0);
+        }
+        assert_eq!(read.meta.scenario, (entry.draw)(&prefix));
         let input = read.meta.input.as_ref().expect("a full input is saved");
         assert_eq!(input.len, u64::try_from(BYTES.len()).unwrap());
         assert_eq!(std::fs::read(dir.path().join(INPUT_FILE)).unwrap(), BYTES);
@@ -147,8 +144,11 @@ fn recording_plan_bytes_writes_no_input() {
     assert_eq!(trace.meta.scenario, scenario);
     assert_eq!(trace.meta.input, None);
     assert!(!dir.path().join(INPUT_FILE).exists());
+    // The meta names the Plan bytes it ran.
+    assert_eq!(trace.meta.plan, Some(PlanRef::bytes(&BYTES[1..])));
 
-    // The same run from a full input differs only in meta.input.
+    // The same run from a full input differs only in meta.input, which
+    // names its Plan bytes, so meta.plan is empty.
     let full = TempDir::new().unwrap();
     let mut bytes = vec![1];
     bytes.extend_from_slice(&BYTES[1..]);
@@ -156,6 +156,45 @@ fn recording_plan_bytes_writes_no_input() {
     assert_eq!(from_input.meta.scenario, scenario);
     assert_eq!(from_input.steps, trace.steps);
     assert_eq!(from_input.end, trace.end);
+    assert_eq!(from_input.meta.plan, None);
+}
+
+/// A scripted Plan records like Plan bytes, its trace names the script
+/// by digest, and the trace replays Exact. Another Plan for the same
+/// scenario names another digest, so a tool can tell the two apart.
+#[test]
+fn recording_a_script_names_it() {
+    let scenario = serde_json::json!({ "tasks": 2 });
+    let record_script = |plan: &Plan| {
+        let dir = TempDir::new().unwrap();
+        let trace = record(
+            &YIELDERS,
+            RecordInput::Script {
+                scenario: &scenario,
+                plan,
+                derived_from: None,
+            },
+            dir.path(),
+        )
+        .unwrap();
+        (dir, trace)
+    };
+    let defaults = Plan::default();
+    let (dir, trace) = record_script(&defaults);
+    assert_eq!(trace.meta.input, None);
+    assert!(!dir.path().join(INPUT_FILE).exists());
+    let named = trace.meta.plan.clone().expect("a script names its Plan");
+    assert_eq!(named.kind, PlanKind::Script);
+    assert_eq!(named, PlanRef::script(&defaults));
+    let report = replay_with(&trace, &YIELDERS, ReplayOptions::default()).unwrap();
+    assert!(report.verified(), "{report:?}");
+
+    let other = Plan {
+        choices: vec![PlanChoice::Default, PlanChoice::Default],
+    };
+    let (_, substituted) = record_script(&other);
+    assert_eq!(substituted.meta.scenario, trace.meta.scenario);
+    assert_ne!(substituted.meta.plan, trace.meta.plan);
 }
 
 #[test]

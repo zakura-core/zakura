@@ -1,0 +1,11 @@
+# Retiring a round leaves its peer's request deadline in place, so under
+# fresh-identity churn the next unit of work holds a deadline for a
+# departed peer with no active slot. The
+# reactor and the queue decide when the witness's calls and rounds run, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

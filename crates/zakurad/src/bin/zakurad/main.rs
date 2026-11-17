@@ -24,8 +24,14 @@ fn limit_glibc_malloc_arenas() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
+mod cpu_features;
+
 /// Process entry point for `zakurad`
 fn main() {
+    #[cfg(target_arch = "x86_64")]
+    cpu_features::exit_if_cpu_lacks_pasta_assembly_features();
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     limit_glibc_malloc_arenas();
 

@@ -9,8 +9,8 @@ use std::{
 
 use zakura_chain::{
     block::Height,
-    ironwood, orchard, sapling, sprout,
-    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    ironwood, orchard, sapling,
+    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
@@ -36,8 +36,26 @@ type EvictionCandidate = (
     transaction::Hash,
 );
 
+/// An ancestor-package fee per cost, highest first, followed by the oldest
+/// insertion time and transaction hash.
+type MiningCandidate = (
+    Reverse<EvictionCost>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    transaction::Hash,
+);
+
+/// Scores currently stored in the two ordering indexes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OrderingScores {
+    eviction: EvictionCost,
+    mining: EvictionCost,
+}
+
 #[cfg(feature = "mempool-bench")]
 pub(super) mod benchmarks;
+
+#[cfg(test)]
+mod mining_tests;
 
 // Imports for doc links
 #[allow(unused_imports)]
@@ -51,7 +69,6 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the dependencies of transactions that spent the outputs of other transactions in the mempool
 /// - the outputs of transactions in the mempool
 /// - the transparent outpoints spent by transactions in the mempool
-/// - the Sprout nullifiers revealed by transactions in the mempool
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
 /// - the Ironwood nullifiers revealed by transactions in the mempool
@@ -62,6 +79,16 @@ pub struct VerifiedSet {
 
     /// One current eviction candidate per transaction, ordered cheapest first.
     eviction_order: BTreeSet<EvictionCandidate>,
+
+    /// One candidate per transaction, scored with its unconfirmed ancestors.
+    /// Higher fee per cost comes first, with older insertion times breaking ties.
+    mining_order: BTreeSet<MiningCandidate>,
+
+    /// Current scores, so removal does not reconstruct keys from the graph.
+    ordering_scores: HashMap<transaction::Hash, OrderingScores>,
+
+    /// Expiring transactions ordered by height, excluding no-expiry values.
+    expiry_order: BTreeSet<(Height, transaction::Hash)>,
 
     #[cfg(test)]
     eviction_score_evaluations: std::sync::atomic::AtomicUsize,
@@ -85,20 +112,17 @@ pub struct VerifiedSet {
     /// The metric totals for verified transactions in the set.
     metrics: MempoolMetrics,
 
-    /// The set of spent out points by the verified transactions.
-    spent_outpoints: HashSet<transparent::OutPoint>,
+    /// Owners of transparent outpoints spent by verified transactions.
+    spent_outpoints: HashMap<transparent::OutPoint, transaction::Hash>,
 
-    /// The set of revealed Sprout nullifiers.
-    sprout_nullifiers: HashSet<sprout::Nullifier>,
+    /// Owners of revealed Sapling nullifiers.
+    sapling_nullifiers: HashMap<sapling::Nullifier, transaction::Hash>,
 
-    /// The set of revealed Sapling nullifiers.
-    sapling_nullifiers: HashSet<sapling::Nullifier>,
+    /// Owners of revealed Orchard nullifiers.
+    orchard_nullifiers: HashMap<orchard::Nullifier, transaction::Hash>,
 
-    /// The set of revealed Orchard nullifiers.
-    orchard_nullifiers: HashSet<orchard::Nullifier>,
-
-    /// The set of revealed Ironwood nullifiers.
-    ironwood_nullifiers: HashSet<ironwood::Nullifier>,
+    /// Owners of revealed Ironwood nullifiers.
+    ironwood_nullifiers: HashMap<ironwood::Nullifier, transaction::Hash>,
 }
 
 impl Drop for VerifiedSet {
@@ -114,6 +138,18 @@ impl VerifiedSet {
         &self.transactions
     }
 
+    /// Returns transactions by descending ancestor-package fee per cost, then
+    /// ascending insertion time and TXID.
+    ///
+    /// Each package includes the transaction and all its distinct unconfirmed
+    /// ancestors. These are baseline scores before a template selects parents;
+    /// the ordering does not itself put parents before children.
+    pub(super) fn mining_transactions(&self) -> impl Iterator<Item = &VerifiedUnminedTx> {
+        self.mining_order
+            .iter()
+            .map(|(_, _, id)| &self.transactions[id])
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the set.
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         &self.transaction_dependencies
@@ -127,7 +163,7 @@ impl VerifiedSet {
 
     /// Returns true if a tx in the set has spent the output at the provided outpoint.
     pub fn has_spent_outpoint(&self, outpoint: &transparent::OutPoint) -> bool {
-        self.spent_outpoints.contains(outpoint)
+        self.spent_outpoints.contains_key(outpoint)
     }
 
     /// Returns the number of verified transactions in the set.
@@ -162,9 +198,11 @@ impl VerifiedSet {
     pub fn clear(&mut self) {
         self.transactions.clear();
         self.eviction_order.clear();
+        self.mining_order.clear();
+        self.ordering_scores.clear();
+        self.expiry_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
-        self.sprout_nullifiers.clear();
         self.sapling_nullifiers.clear();
         self.orchard_nullifiers.clear();
         self.ironwood_nullifiers.clear();
@@ -232,25 +270,30 @@ impl VerifiedSet {
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
-        let affected = self.dependency_group(ancestors);
-        self.remove_eviction_candidates(&affected);
-
         let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
             .add(tx_id, spent_mempool_outpoints);
 
         // Inserts the transaction's outputs into the internal caches and responds to pending output requests.
         let tx = &transaction.transaction.transaction();
+        if let Some(expiry_height) = tx.expiry_height() {
+            self.expiry_order.insert((expiry_height, tx_id));
+        }
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
             self.created_outputs.insert(outpoint, output.clone());
             pending_outputs.respond(&outpoint, output)
         }
-        self.spent_outpoints.extend(tx.spent_outpoints());
-        self.sprout_nullifiers.extend(tx.sprout_nullifiers());
-        self.sapling_nullifiers.extend(tx.sapling_nullifiers());
-        self.orchard_nullifiers.extend(tx.orchard_nullifiers());
-        self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
+        self.spent_outpoints
+            .extend(tx.spent_outpoints().map(|outpoint| (outpoint, tx_id)));
+        self.sapling_nullifiers
+            .extend(tx.sapling_nullifiers().map(|&nullifier| (nullifier, tx_id)));
+        self.orchard_nullifiers
+            .extend(tx.orchard_nullifiers().map(|&nullifier| (nullifier, tx_id)));
+        self.ironwood_nullifiers.extend(
+            tx.ironwood_nullifiers()
+                .map(|&nullifier| (nullifier, tx_id)),
+        );
 
         self.transactions_serialized_size += transaction.transaction.size();
         self.total_cost += transaction.cost();
@@ -258,7 +301,8 @@ impl VerifiedSet {
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
-        self.insert_eviction_candidates(&self.dependency_group([tx_id]));
+        self.insert_ordering_candidate(tx_id);
+        self.refresh_eviction_candidates(&ancestors);
 
         self.report_metrics();
 
@@ -383,29 +427,120 @@ impl VerifiedSet {
         )
     }
 
-    /// Removes a group's candidates before mutating transactions or dependencies.
-    fn remove_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
-        let removed = HashSet::new();
-        for &id in group {
-            let candidate = self.eviction_candidate(id, &removed);
+    /// Returns the mining candidate using all distinct unconfirmed ancestors.
+    fn mining_candidate(&self, id: transaction::Hash) -> MiningCandidate {
+        let score = self
+            .transaction_ancestors(id)
+            .iter()
+            .map(|ancestor| Self::eviction_cost(&self.transactions[ancestor]))
+            .fold(
+                Self::eviction_cost(&self.transactions[&id]),
+                EvictionCost::combine,
+            );
+        (Reverse(score), self.transactions[&id].time, id)
+    }
+
+    /// Removes a transaction's cached ordering entries.
+    fn remove_ordering_candidate(
+        &mut self,
+        id: transaction::Hash,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let scores = self
+            .ordering_scores
+            .remove(&id)
+            .expect("every stored transaction has cached ordering scores");
+        assert!(
+            self.eviction_order
+                .remove(&(scores.eviction, Reverse(time), id)),
+            "every stored transaction has its current eviction candidate"
+        );
+        assert!(
+            self.mining_order
+                .remove(&(Reverse(scores.mining), time, id)),
+            "every stored transaction has its current mining candidate"
+        );
+    }
+
+    /// Adds both ordering entries for a transaction without cached keys.
+    fn insert_ordering_candidate(&mut self, id: transaction::Hash) {
+        let eviction = self.eviction_candidate(id, &HashSet::new());
+        let mining = self.mining_candidate(id);
+        let (Reverse(mining_score), _, _) = mining;
+        assert!(
+            self.ordering_scores
+                .insert(
+                    id,
+                    OrderingScores {
+                        eviction: eviction.0,
+                        mining: mining_score,
+                    }
+                )
+                .is_none(),
+            "a transaction's old keys were removed before reinsertion"
+        );
+        assert!(
+            self.eviction_order.insert(eviction),
+            "a transaction's old eviction candidate was removed before insertion"
+        );
+        assert!(
+            self.mining_order.insert(mining),
+            "a transaction's old mining candidate was removed before insertion"
+        );
+    }
+
+    /// Refreshes surviving ancestors whose descendant packages changed.
+    fn refresh_eviction_candidates(&mut self, ids: &HashSet<transaction::Hash>) {
+        for &id in ids {
+            let Some(tx) = self.transactions.get(&id) else {
+                continue;
+            };
+            let time = tx.time;
+            let score = self.package_score(&id, &HashSet::new());
+            let cached = self
+                .ordering_scores
+                .get_mut(&id)
+                .expect("every surviving transaction has cached ordering scores");
+            if cached.eviction == score {
+                continue;
+            }
             assert!(
-                self.eviction_order.remove(&candidate),
-                "every stored transaction has its current eviction candidate"
+                self.eviction_order
+                    .remove(&(cached.eviction, Reverse(time), id)),
+                "the previous eviction candidate matches the cached score"
+            );
+            cached.eviction = score;
+            assert!(
+                self.eviction_order.insert((score, Reverse(time), id)),
+                "the previous eviction candidate was removed before refresh"
             );
         }
     }
 
-    /// Restores candidates for the group's survivors after a mutation.
-    fn insert_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
-        let removed = HashSet::new();
-        for &id in group {
-            if self.transactions.contains_key(&id) {
-                let candidate = self.eviction_candidate(id, &removed);
-                assert!(
-                    self.eviction_order.insert(candidate),
-                    "a group's old candidates were removed before its mutation"
-                );
+    /// Refreshes surviving descendants after their ancestors are mined.
+    fn refresh_mining_candidates(&mut self, ids: &HashSet<transaction::Hash>) {
+        for &id in ids {
+            if !self.transactions.contains_key(&id) {
+                continue;
             }
+            let (Reverse(score), time, _) = self.mining_candidate(id);
+            let cached = self
+                .ordering_scores
+                .get_mut(&id)
+                .expect("every surviving transaction has cached ordering scores");
+            if cached.mining == score {
+                continue;
+            }
+            assert!(
+                self.mining_order
+                    .remove(&(Reverse(cached.mining), time, id)),
+                "the previous mining candidate matches the cached score"
+            );
+            cached.mining = score;
+            assert!(
+                self.mining_order.insert((Reverse(score), time, id)),
+                "the previous mining candidate was removed before refresh"
+            );
         }
     }
 
@@ -485,6 +620,9 @@ impl VerifiedSet {
         removed: &HashSet<transaction::Hash>,
     ) -> HashSet<transaction::Hash> {
         let dependents = self.transaction_dependencies.dependents();
+        if !dependents.contains_key(&tx_id) {
+            return HashSet::new();
+        }
         let mut descendants = HashSet::new();
         let mut pending = vec![tx_id];
 
@@ -528,49 +666,57 @@ impl VerifiedSet {
         ancestors
     }
 
-    /// Clears a list of mined transaction ids from the lists of dependencies for
-    /// any other transactions in the mempool and removes their dependents.
-    pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
-        let affected: HashSet<_> = mined_ids
-            .iter()
-            .filter(|id| self.transactions.contains_key(id))
-            .flat_map(|&id| self.dependency_group([id]))
-            .collect();
-        self.remove_eviction_candidates(&affected);
-        self.transaction_dependencies
-            .clear_mined_dependencies(mined_ids);
-        self.insert_eviction_candidates(&affected);
+    /// Returns the unconfirmed ancestors of a stored transaction.
+    fn transaction_ancestors(&self, id: transaction::Hash) -> HashSet<transaction::Hash> {
+        self.ancestors(
+            self.transaction_dependencies
+                .dependencies()
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
     }
 
-    /// Removes all transactions in the set that match the `predicate`.
+    /// Removes mined transactions while retaining their unmined descendants.
     ///
-    /// Returns the amount of transactions removed.
-    pub fn remove_all_that(
+    /// Only surviving ancestors can change eviction priority. Only surviving
+    /// descendants can change mining priority when their ancestors confirm.
+    pub(super) fn remove_mined(
         &mut self,
-        predicate: impl Fn(&VerifiedUnminedTx) -> bool,
+        mined_ids: &HashSet<transaction::Hash>,
     ) -> HashSet<UnminedTxId> {
-        let keys_to_remove: Vec<_> = self
-            .transactions
+        let eviction_updates: HashSet<_> = mined_ids
             .iter()
-            .filter_map(|(&tx_id, tx)| predicate(tx).then_some(tx_id))
+            .flat_map(|&id| self.transaction_ancestors(id))
             .collect();
-
-        let mut removed_transactions = HashSet::new();
-
-        for key_to_remove in keys_to_remove {
-            if !self.transactions.contains_key(&key_to_remove) {
-                // Skip any keys that may have already been removed as their dependencies were removed.
-                continue;
-            }
-
-            removed_transactions.extend(
-                self.remove(&key_to_remove)
-                    .into_iter()
-                    .map(|tx| tx.transaction.id()),
-            );
+        let mining_updates: HashSet<_> = mined_ids
+            .iter()
+            .flat_map(|&id| self.descendants(id, &HashSet::new()))
+            .collect();
+        self.transaction_dependencies
+            .clear_mined_dependencies(mined_ids);
+        let removed = self.remove_roots(mined_ids.iter().copied());
+        self.refresh_eviction_candidates(&eviction_updates);
+        self.refresh_mining_candidates(&mining_updates);
+        if !removed.is_empty() {
+            self.report_metrics();
         }
+        removed.into_iter().map(|tx| tx.transaction.id()).collect()
+    }
 
-        removed_transactions
+    /// Removes the listed transactions and their descendants.
+    ///
+    /// Returns all removed unmined IDs. Missing IDs, duplicate IDs, and IDs
+    /// already removed as descendants are ignored.
+    pub(super) fn remove_all(
+        &mut self,
+        tx_ids: impl IntoIterator<Item = transaction::Hash>,
+    ) -> HashSet<UnminedTxId> {
+        self.remove_batch(tx_ids)
+            .into_iter()
+            .map(|tx| tx.transaction.id())
+            .collect()
     }
 
     /// Accepts a transaction id for a transaction to remove from the verified set.
@@ -583,43 +729,114 @@ impl VerifiedSet {
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
-        let affected = self.dependency_group([*key_to_remove]);
-        self.remove_eviction_candidates(&affected);
-        let removed_transactions: Vec<_> = self
-            .transaction_dependencies
-            .remove_all(key_to_remove)
-            .iter()
-            .chain(std::iter::once(key_to_remove))
-            .filter_map(|key_to_remove| {
-                let Some(removed_tx) = self.transactions.remove(key_to_remove) else {
+        self.remove_batch([*key_to_remove])
+    }
+
+    /// Removes roots and descendants, then refreshes their surviving ancestors.
+    /// Survivors keep the same ancestors, so their mining priority is unchanged.
+    fn remove_batch(
+        &mut self,
+        tx_ids: impl IntoIterator<Item = transaction::Hash>,
+    ) -> Vec<VerifiedUnminedTx> {
+        let roots: Vec<_> = tx_ids
+            .into_iter()
+            .filter(|id| self.transactions.contains_key(id))
+            .collect();
+        let mut eviction_updates = HashSet::new();
+        for &root in &roots {
+            eviction_updates.extend(self.transaction_ancestors(root));
+            // A removed descendant can have another, surviving parent, as in
+            // a join. Its ancestors must also lose that descendant's fee.
+            for descendant in self.descendants(root, &HashSet::new()) {
+                eviction_updates.extend(self.transaction_ancestors(descendant));
+            }
+        }
+        let removed = self.remove_roots(roots);
+        self.refresh_eviction_candidates(&eviction_updates);
+        if !removed.is_empty() {
+            self.report_metrics();
+        }
+        removed
+    }
+
+    /// Removes each victim and its cached ordering entries.
+    fn remove_roots(
+        &mut self,
+        tx_ids: impl IntoIterator<Item = transaction::Hash>,
+    ) -> Vec<VerifiedUnminedTx> {
+        let mut removed = Vec::new();
+        for root in tx_ids {
+            if !self.transactions.contains_key(&root) {
+                continue;
+            }
+            let descendants = self.transaction_dependencies.remove_all(&root);
+            for key_to_remove in descendants.into_iter().chain(std::iter::once(root)) {
+                let Some(removed_tx) = self.transactions.remove(&key_to_remove) else {
                     tracing::warn!(?key_to_remove, "invalid transaction key");
-                    return None;
+                    continue;
                 };
+
+                self.remove_ordering_candidate(key_to_remove, removed_tx.time);
 
                 self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
+                if let Some(height) = removed_tx.transaction.transaction().expiry_height() {
+                    self.expiry_order.remove(&(height, key_to_remove));
+                }
                 self.remove_outputs(&removed_tx.transaction);
 
-                Some(removed_tx)
-            })
-            .collect();
-
-        self.insert_eviction_candidates(&affected);
-        self.report_metrics();
-        removed_transactions
+                removed.push(removed_tx);
+            }
+        }
+        removed
     }
 
-    /// Panics if any dependency group exceeds the admission limit.
+    /// Returns transactions expiring at or before `tip_height`.
+    ///
+    /// Iteration stops at the first future expiry, so unrelated transactions
+    /// are never visited. Removal also removes any later-expiring descendants.
+    pub(super) fn expired_transaction_ids(
+        &self,
+        tip_height: Height,
+    ) -> impl Iterator<Item = transaction::Hash> + '_ {
+        self.expiry_order
+            .iter()
+            .take_while(move |(height, _)| *height <= tip_height)
+            .map(|(_, id)| *id)
+    }
+
+    /// Checks ordering-index consistency and the dependency-group bound.
     #[cfg(test)]
     pub(super) fn assert_dependency_groups_are_bounded(&self) {
         let removed = HashSet::new();
+        let expected: HashMap<_, _> = self
+            .transactions
+            .keys()
+            .map(|&id| {
+                let (Reverse(mining), _, _) = self.mining_candidate(id);
+                (
+                    id,
+                    OrderingScores {
+                        eviction: self.eviction_candidate(id, &removed).0,
+                        mining,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(self.ordering_scores, expected);
         let expected: BTreeSet<_> = self
             .transactions
             .keys()
             .map(|&id| self.eviction_candidate(id, &removed))
             .collect();
         assert_eq!(self.eviction_order, expected);
+        let expected: BTreeSet<_> = self
+            .transactions
+            .keys()
+            .map(|&id| self.mining_candidate(id))
+            .collect();
+        assert_eq!(self.mining_order, expected);
         for &start in self.transactions.keys() {
             let mut group = HashSet::new();
             let mut pending = vec![start];
@@ -639,13 +856,35 @@ impl VerifiedSet {
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
     fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
-        let tx = unmined_tx.transaction();
+        self.conflicting_ids(unmined_tx.transaction())
+            .next()
+            .is_some()
+    }
 
-        Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())
-            || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
-            || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
-            || Self::has_conflicts(&self.orchard_nullifiers, tx.orchard_nullifiers().copied())
-            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers().copied())
+    /// Finds owners of spends shared with `tx` using the admission indexes.
+    ///
+    /// A transaction can appear more than once if several spends conflict.
+    /// Work scales with `tx`'s spends, independently of the mempool size.
+    /// Sprout JoinSplits are excluded by mempool standardness policy.
+    pub(super) fn conflicting_ids<'a>(
+        &'a self,
+        tx: &'a Transaction,
+    ) -> impl Iterator<Item = UnminedTxId> + 'a {
+        tx.spent_outpoints()
+            .filter_map(|outpoint| self.spent_outpoints.get(&outpoint))
+            .chain(
+                tx.sapling_nullifiers()
+                    .filter_map(|nf| self.sapling_nullifiers.get(nf)),
+            )
+            .chain(
+                tx.orchard_nullifiers()
+                    .filter_map(|nf| self.orchard_nullifiers.get(nf)),
+            )
+            .chain(
+                tx.ironwood_nullifiers()
+                    .filter_map(|nf| self.ironwood_nullifiers.get(nf)),
+            )
+            .map(|id| self.transactions[id].transaction.id())
     }
 
     /// Removes the tracked transaction outputs from the mempool.
@@ -661,36 +900,28 @@ impl VerifiedSet {
         }
 
         let spent_outpoints = tx.spent_outpoints().map(Cow::Owned);
-        let sprout_nullifiers = tx.sprout_nullifiers().map(Cow::Borrowed);
         let sapling_nullifiers = tx.sapling_nullifiers().map(Cow::Borrowed);
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
         let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Borrowed);
 
-        Self::remove_from_set(&mut self.spent_outpoints, spent_outpoints);
-        Self::remove_from_set(&mut self.sprout_nullifiers, sprout_nullifiers);
-        Self::remove_from_set(&mut self.sapling_nullifiers, sapling_nullifiers);
-        Self::remove_from_set(&mut self.orchard_nullifiers, orchard_nullifiers);
-        Self::remove_from_set(&mut self.ironwood_nullifiers, ironwood_nullifiers);
+        Self::remove_spends(&mut self.spent_outpoints, spent_outpoints);
+        Self::remove_spends(&mut self.sapling_nullifiers, sapling_nullifiers);
+        Self::remove_spends(&mut self.orchard_nullifiers, orchard_nullifiers);
+        Self::remove_spends(&mut self.ironwood_nullifiers, ironwood_nullifiers);
     }
 
-    /// Returns `true` if the two sets have common items.
-    fn has_conflicts<T>(set: &HashSet<T>, mut list: impl Iterator<Item = T>) -> bool
-    where
-        T: Eq + Hash,
-    {
-        list.any(|item| set.contains(&item))
-    }
-
-    /// Removes some items from a [`HashSet`].
+    /// Removes spends from an ownership index.
     ///
-    /// Each item in the list of `items` should be wrapped in a [`Cow`]. This allows this generic
-    /// method to support both borrowed and owned items.
-    fn remove_from_set<'t, T>(set: &mut HashSet<T>, items: impl IntoIterator<Item = Cow<'t, T>>)
-    where
+    /// Each item is wrapped in a [`Cow`] to support borrowed nullifiers and
+    /// owned transparent outpoints.
+    fn remove_spends<'t, T>(
+        owners: &mut HashMap<T, transaction::Hash>,
+        items: impl IntoIterator<Item = Cow<'t, T>>,
+    ) where
         T: Clone + Eq + Hash + 't,
     {
         for item in items {
-            set.remove(&item);
+            owners.remove(&item);
         }
     }
 
@@ -938,6 +1169,7 @@ mod tests {
 
         verified.ironwood_nullifiers.insert(
             ironwood::Nullifier::try_from([0; 32]).expect("zero is a valid Pallas base field"),
+            transaction::Hash([0; 32]),
         );
 
         verified.clear();

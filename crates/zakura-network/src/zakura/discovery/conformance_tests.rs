@@ -3,7 +3,6 @@
 //! Exchange `e` asks for wanted service `x{e}`. Its `Peers` answer carries one
 //! record with sequence `e`, and its `Services` answer expires at `e`.
 
-use zakura_chain::primitives::ed25519::Signature;
 use zakura_quic::NodeSecretKey;
 
 use super::{
@@ -51,7 +50,7 @@ fn record(exchange: u32) -> ZakuraNodeRecord {
             expires_at_unix_secs: 0,
             extensions: Vec::new(),
         },
-        signature: Signature::from([0xab; 64]),
+        signature: [0xab; 64],
     }
 }
 

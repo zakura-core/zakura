@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f9ceaf3034..9e5a82984d 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -1162,7 +1162,16 @@ impl WorkPolicy {
+                 .into();
+                 TargetCompletion::TargetPrefix { common_ancestor }
+             }
+-            HeaderTargetPurpose::Normal => TargetCompletion::TargetComplete { common_ancestor },
++            HeaderTargetPurpose::Normal => {
++                // Mutation: the prepare carries another request's owner.
++                let owner = request
++                    .owner
++                    .header_owner()
++                    .expect("a normal target has header authority");
++                let other = owner.request_id.checked_add(1).expect("request IDs stay small");
++                request.owner = owner.authority.bind(owner.session_id, other).into();
++                TargetCompletion::TargetComplete { common_ancestor }
++            }
+             HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                 selected_target, ..
+             } => TargetCompletion::SelectedAuxiliaryRepair {

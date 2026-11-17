@@ -1,0 +1,7 @@
+# The subscriber stops checking that a page's headers link, so an
+# adversary's page whose first header doesn't link to its declared parent
+# stages. The input is the saved bad-content Plan, whose act is that page.
+input = "crates/zakura-sim/tests/fixtures/header-wire-bad-content.bin"
+# The subscriber, the reactor and the queue decide whether the act's page is
+# refused or staged, so a change there can move the input off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

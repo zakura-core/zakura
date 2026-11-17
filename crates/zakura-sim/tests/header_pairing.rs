@@ -1,0 +1,1412 @@
+//! The node's reactor calls paired with its storage receipts (M4-B3b): a
+//! timed-out locator pairs with whichever drop its caller made, a port
+//! future caught panicking fails the run as `ReactorPortPanicked`, and a
+//! hold can wait for the reactor to handle a call.
+#![cfg(zakura_sim)]
+
+mod support;
+
+use std::{
+    num::NonZeroU64,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+use futures::FutureExt;
+use support::{inputs, run};
+use zakura_chain::block;
+use zakura_header_chain::{
+    BodyWorkOwner, BranchId, EngineSnapshot, HeaderGeneration, HeaderLocator, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId, VctRootRepairState, VctRootRepairStatus,
+};
+use zakura_network::zakura::{
+    observe::{
+        as_call, CallEnd, HeaderRequestTerminal, HeaderSyncObserver, HeaderTargetPhase, PortCall,
+        ReactorEvent, RequestRef, ReservationEnd, ReservationPurpose, StorageCallKind,
+    },
+    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
+    ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
+};
+use zakura_node_services::header_chain::{
+    AcquirePath, AcquirePathReply, ApplyHeaderTargetReply, HeaderChainFuture, LocatorReadPermit,
+    Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
+    ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
+};
+use zakura_scheduler::SimInstant;
+use zakura_sim::{
+    harness::{
+        header_node::{
+            capacity::CapacityEvidence,
+            claim::{ClaimEvidence, SettlementEvidence},
+            ends::EndEvidence,
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            preload,
+            reservation::ReservationEvidence,
+            session::SessionEvidence,
+            stale::StaleEvidence,
+            tap::ReactorTap,
+            Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, HeaderNode, Policy,
+            PolicySource, Topology,
+        },
+        header_sync::{storage_config, Storage, StorageScenario},
+        run_prepared, Subsystem,
+    },
+    observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest},
+    ActionSource, Boundary, HarnessFailure, Identity, MemorySink, Observation, ObservationLog,
+    PlanInput, RunReport, Sim,
+};
+use zakura_storage::header::{
+    adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture,
+};
+
+/// Runs `scenario` on the storage harness under `input`. The run must end
+/// without a violation or harness failure.
+fn storage_run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Arc<ControlledPort>) {
+    let ports = Storage::prepare(scenario);
+    let node = ports.node.clone();
+    let report = run_prepared::<Storage>(scenario, ports, input, &mut MemorySink::default(), None)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    (report, node)
+}
+
+/// The default scenario, the node at genesis and `mirror-0` at A5,
+/// converging, with `holds`.
+fn holding(holds: Vec<Hold>) -> StorageScenario {
+    StorageScenario {
+        policy: Policy {
+            holds,
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    }
+}
+
+/// The node's reactor events, with their storage watermarks, in log order.
+fn events(report: &RunReport) -> Vec<(u64, &ReactorFact)> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                storage_seq, event, ..
+            } => Some((*storage_seq, event)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The node's storage fact numbered `seq`.
+fn fact_at(report: &RunReport, seq: u64) -> &StorageFact {
+    report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Storage {
+                instance: 0,
+                seq: logged,
+                fact,
+                ..
+            } if *logged == seq => Some(fact),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the node's storage logged fact {seq}"))
+}
+
+/// The node's reactor at A5 with a VCT repair to read, on `port`, reporting to
+/// `observer`. Returns the handles the run must keep and the reactor's task.
+fn repairing_reactor(
+    port: &Arc<ControlledPort>,
+    observer: Arc<dyn HeaderSyncObserver>,
+) -> (Box<dyn std::any::Any>, zakura_rt::task::JoinHandle<()>) {
+    let fixture = HeaderFixture::regtest();
+    let anchor = fixture.anchor();
+    let tip = Chain::main(5).tip(&fixture);
+    let mut startup = HeaderSyncStartup::new(
+        fixture.network().clone(),
+        (anchor.height, anchor.hash),
+        FullStateFrontiers {
+            finalized_height: anchor.height,
+            verified_block_tip: anchor.height,
+            verified_block_hash: anchor.hash,
+        },
+        Some((tip.height, tip.hash)),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    );
+    let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
+        state: VctRootRepairState::Unavailable {
+            height: block::Height(1),
+        },
+        generation: 7,
+    });
+    let dyn_port: Arc<dyn Port> = port.clone();
+    startup.committed_snapshots = Some(dyn_port.selected_chain());
+    startup.vct_root_repairs = Some(repairs_rx);
+    startup.header_chain_port = dyn_port;
+    startup.observer.0 = Some(observer);
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+    (Box::new((handle, actions, repairs)), reactor)
+}
+
+/// A storage source for a run on `port`, preloaded at A5, holding the VCT context
+/// read forever, and draining `tap`.
+fn held_vct_source(sim: &mut Sim, port: &Arc<ControlledPort>, tap: ReactorTap) -> PolicySource {
+    preload(port.engine(), &HeaderFixture::regtest(), &Chain::main(5));
+    let held = Policy {
+        bound_ms: None,
+        holds: vec![Hold {
+            select: Select {
+                kind: Some(OpKind::VctContext),
+                ..Select::default()
+            },
+            // Never: the run makes no locator read.
+            until: Trigger::Submitted(Select::nth(OpKind::Locator, 1)),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        }],
+        ..Policy::converging()
+    };
+    PolicySource::new(sim, port.clone(), held, Effects::default()).with_tap(tap)
+}
+
+/// How [`dropped_call_run`] ends the reactor.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// Abort its task.
+    Abort,
+    /// Drop its handles, so its event queues close and it returns by
+    /// itself.
+    Return,
+}
+
+/// A real reactor with its VCT context read pending in real storage, ended
+/// by `stop` with no `Shutdown` notice. Returns the run and the tap's end
+/// facts.
+fn dropped_call_run(stop: Stop) -> (RunReport, EndEvidence) {
+    let (report, ends, _) = dropped_call_run_reading(stop);
+    (report, ends)
+}
+
+/// [`dropped_call_run`], with the tap also reading the reactor's resource
+/// probe into the returned evidence, and keeping its claim breaks.
+fn dropped_call_run_reading(
+    stop: Stop,
+) -> (RunReport, EndEvidence, (CapacityEvidence, ClaimEvidence)) {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let capacity = CapacityEvidence::default();
+    let (observer, tap) = ReactorTap::with_evidence(
+        &mut sim,
+        &port,
+        "node",
+        SessionEvidence::default(),
+        ReservationEvidence::default(),
+        capacity.clone(),
+        SettlementEvidence::default(),
+        StaleEvidence::default(),
+        EndEvidence::default(),
+    );
+    let ends = tap.ends();
+    let claims = tap.claims();
+    let source = held_vct_source(&mut sim, &port, tap);
+    sim.add_source(Box::new(source));
+    let (held, reactor) = repairing_reactor(&port, observer);
+    let watched = port.clone();
+    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(held)));
+    let dropper = held.clone();
+    sim.scheduler().spawn_root("stopper", async move {
+        for _ in 0..1_000 {
+            if !watched.pending().is_empty() {
+                break;
+            }
+            zakura_rt::task::yield_now().await;
+        }
+        match stop {
+            Stop::Abort => reactor.abort(),
+            Stop::Return => drop(dropper.borrow_mut().take()),
+        }
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    drop(held);
+    (report, ends, (capacity, claims))
+}
+
+/// A reactor that exits by itself gets the teardown checks a stopped one
+/// does: once it's gone, each probe read is a teardown read, and an honest
+/// exit, aborted or returned, leaves nothing reserved or owned and no claim
+/// broken.
+#[test]
+fn an_exited_reactor_gets_teardown_reads() {
+    for stop in [Stop::Abort, Stop::Return] {
+        let (report, ends, (capacity, claims)) = dropped_call_run_reading(stop);
+        assert_eq!(report.end.harness, None, "{stop:?}: {:?}", report.end);
+        let exited = ends.reactor_exited().expect("the reactor exits");
+        let teardown: Vec<_> = capacity
+            .readings()
+            .into_iter()
+            .filter(|reading| reading.teardown)
+            .collect();
+        assert!(
+            teardown.first().is_some_and(|first| first.step == exited),
+            "{stop:?}: the exit's drain reads the teardown: {teardown:?}"
+        );
+        assert!(
+            teardown
+                .iter()
+                .all(|reading| reading.reserved == 0 && reading.owned == 0),
+            "{stop:?}: {teardown:?}"
+        );
+        assert_eq!(claims.records(), Vec::new(), "{stop:?}");
+    }
+}
+
+/// A real reactor that ends with a call pending in real storage, aborted or
+/// returning by itself, isn't a harness failure: the tap records its exit
+/// and the run goes on. The call's end names the operation it submitted,
+/// and that operation's real `CallerDropped` follows the end and pairs with
+/// it.
+#[test]
+fn a_real_dropped_call_pairs_with_its_own_receipt() {
+    for stop in [Stop::Abort, Stop::Return] {
+        let (report, ends) = dropped_call_run(stop);
+        assert_eq!(report.end.harness, None, "{stop:?}: {:?}", report.end);
+        assert!(
+            ends.reactor_exited().is_some(),
+            "{stop:?}: {:?}",
+            ends.facts()
+        );
+        assert_dropped_call_paired(&report);
+    }
+}
+
+/// Asserts that `report`'s VCT read ended dropped, naming the operation it
+/// submitted, and that the operation's `CallerDropped` follows that end.
+fn assert_dropped_call_paired(report: &RunReport) {
+    let events = events(report);
+    let (watermark, call, op) = events
+        .iter()
+        .find_map(|(storage_seq, event)| match event {
+            ReactorFact::CallEnded {
+                call,
+                end,
+                op: Some(op),
+            } if end == "dropped" => Some((*storage_seq, *call, *op)),
+            _ => None,
+        })
+        .expect("the pending call ends dropped, naming its operation");
+    assert!(
+        events.iter().any(|(_, event)| matches!(
+            event,
+            ReactorFact::Dispatched { call: dispatched, port: ReactorCall::VctContext { .. } }
+                if *dispatched == call
+        )),
+        "the dropped call is the VCT read"
+    );
+    let logged = |wanted: &dyn Fn(u64, &StorageFact) -> bool| {
+        report.log.entries().iter().any(|entry| {
+            matches!(&entry.obs, Observation::Storage { instance: 0, seq, fact, .. }
+                if wanted(*seq, fact))
+        })
+    };
+    assert!(
+        logged(&|_, fact| matches!(fact,
+            StorageFact::Submitted { id, call: submitter, .. }
+                if *id == op && *submitter == Some(call))),
+        "storage names the call that submitted the operation"
+    );
+    assert!(
+        logged(&|seq, fact| seq > watermark
+            && matches!(fact, StorageFact::CallerDropped { id } if *id == op)),
+        "the operation's receipt follows the call's end"
+    );
+}
+
+/// A call that ended dropped while its real storage call stays alive, and so
+/// leaves no receipt, fails the run once the reactor's teardown is done.
+#[test]
+fn a_drop_with_no_receipt_fails_at_teardown() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let source = PolicySource::new(
+        &mut sim,
+        port.clone(),
+        Policy::converging(),
+        Effects::default(),
+    )
+    .with_tap(tap);
+    sim.add_source(Box::new(source));
+    let submitting: Arc<dyn Port> = port.clone();
+    sim.scheduler().spawn_root("reactor", async move {
+        let hash = block::Hash([7; 32]);
+        observer.observe(ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Locator {
+                peer: ZakuraPeerId::new(vec![1; 32]).expect("32 bytes is a valid peer ID"),
+                session_id: 1,
+                target_tip_hash: hash,
+                scope: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(1),
+                    branch: BranchId {
+                        anchor_hash: hash,
+                        target_tip_hash: hash,
+                    },
+                },
+            },
+        });
+        let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a fresh semaphore has a permit");
+        let mut future = submitting.continuation_locator(LocatorReadPermit::new(permit));
+        assert!(
+            as_call(1, || (&mut future).now_or_never()).is_none(),
+            "storage holds the call"
+        );
+        observer.observe(ReactorEvent::CallEnded {
+            call: 1,
+            end: CallEnd::Dropped,
+        });
+        std::mem::forget(future);
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(
+        detail.starts_with("UnpairedDrop: the reactor's teardown is done with call 1"),
+        "{detail}"
+    );
+}
+
+/// The header work a reactor's teardown can leave open: `round 1` of one peer,
+/// started on reservation 1, which one page spent, its prepare `call 1`, and
+/// the headers that call holds.
+fn open_work(byte: u8) -> [ReactorEvent; 7] {
+    let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer ID");
+    let hash = block::Hash([byte; 32]);
+    let owner = HeaderSyncWorkOwner::Header(
+        HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(1),
+            branch: BranchId {
+                anchor_hash: hash,
+                target_tip_hash: hash,
+            },
+        }
+        .bind(1, NonZeroU64::new(1).expect("one is nonzero")),
+    );
+    let request = RequestRef {
+        peer: peer.clone(),
+        session_id: 1,
+        request_id: 1,
+        incarnation: 1,
+        owner,
+        target_tip_hash: hash,
+    };
+    [
+        ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: peer.clone(),
+            purpose: ReservationPurpose::Ordinary,
+            headers: 5,
+            request: None,
+        },
+        ReactorEvent::ReservationBound {
+            reservation: 1,
+            request: request.clone(),
+            max_headers: 5,
+        },
+        ReactorEvent::Started {
+            request: request.clone(),
+            purpose: HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
+        },
+        ReactorEvent::PageStaged {
+            from_peer: peer.clone(),
+            from_session: 1,
+            request,
+            reservation: 1,
+            subscription: 1,
+            frame: None,
+            headers: 5,
+            reserved_left: 0,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), hash),
+            hashes: vec![hash; 5],
+            stored: vec![hash; 5],
+            staged_total: 5,
+        },
+        ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 0,
+            cause: ReservationEnd::Staged,
+        },
+        ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Prepare {
+                peer: peer.clone(),
+                source: SourceId::from_digest([byte; 32]),
+                owner,
+                common_ancestor: zakura_header_chain::Frontier::new(block::Height(0), hash),
+                target: zakura_header_chain::Frontier::new(block::Height(5), hash),
+                hashes: vec![hash; 5],
+            },
+        },
+        ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer,
+            incarnation: 1,
+            headers: 5,
+            leases: vec![1],
+        },
+    ]
+}
+
+/// Runs a tapped reactor that reports `events`, then ends, or panics if
+/// `unwinds`, and so drops its observer. If `noticed`, the harness tells the
+/// tap it's stopping the reactor before the reactor reports anything.
+fn teardown_after(events: Vec<ReactorEvent>, unwinds: bool, noticed: bool) -> RunReport {
+    teardown_ends(events, unwinds, noticed).0
+}
+
+/// [`teardown_after`], with the tap's end facts.
+fn teardown_ends(
+    events: Vec<ReactorEvent>,
+    unwinds: bool,
+    noticed: bool,
+) -> (RunReport, EndEvidence) {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let ends = tap.ends();
+    if noticed {
+        tap.shutdown().begin();
+    }
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        for event in events {
+            observer.observe(event);
+        }
+        assert!(!unwinds, "the test reactor unwinds holding its observer");
+    });
+    (
+        sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default()),
+        ends,
+    )
+}
+
+/// The evidence failure ending `report`.
+fn evidence_failure(report: &RunReport) -> &str {
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    detail
+}
+
+/// A call that reports no end fails the run once the reactor's teardown is
+/// done, though it never reached a drop for the pairer to wait on: the
+/// work books don't balance, which is `outstanding-work-bounded`'s claim,
+/// and with no property to report it the run fails at its end.
+#[test]
+fn a_call_left_unended_fails_at_teardown() {
+    let report = teardown_after(open_work(1).into(), false, false);
+    let detail = evidence_failure(&report);
+    assert!(
+        detail.starts_with("OutstandingWork: the work books don't balance: UnendedCall: call 1"),
+        "{detail}"
+    );
+}
+
+/// A call that ended and kept its headers fails the run once the stopped
+/// reactor's teardown is done: the ledger finds it as an `OpenOwnership`
+/// claim, and with no property to report it the run fails at its end.
+#[test]
+fn headers_left_held_fail_at_teardown() {
+    let mut events = Vec::from(open_work(2));
+    events.push(ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::NotSubmitted,
+    });
+    let report = teardown_after(events, false, true);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
+}
+
+/// A reservation whose handle leaks past the reactor doesn't keep the tap
+/// reading the reactor as alive, since it reports through the tap's
+/// capacity observer: the stop still finishes, and its teardown check finds
+/// the reservation open.
+#[test]
+fn a_leaked_reservation_fails_at_teardown() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let capacity = observer
+            .capacity_observer()
+            .expect("the tap counts the reactor's lifetime on its own handle");
+        capacity.observe(ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: ZakuraPeerId::new(vec![6; 32]).expect("32 bytes is a valid peer ID"),
+            purpose: ReservationPurpose::Ordinary,
+            headers: 5,
+            request: None,
+        });
+        std::mem::forget(capacity);
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(
+        detail.starts_with("OpenReservation: reservation 1"),
+        "{detail}"
+    );
+}
+
+/// A reactor that unwound leaves the same work open, and the teardown check
+/// stays quiet, so the crash isn't read as an ownership bug.
+#[test]
+fn an_unwound_reactor_is_not_reported_as_open_work() {
+    let report = teardown_after(open_work(3).into(), true, false);
+    if let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness {
+        assert!(
+            !detail.starts_with("UnendedCall") && !detail.starts_with("OpenOwnership"),
+            "{detail}"
+        );
+    }
+}
+
+/// A reactor that returns by itself, with nothing left open, is recorded
+/// as exited and doesn't fail the run, nor does one the harness stopped on
+/// purpose, which isn't recorded as exited. One that unwinds still fails as
+/// `ReactorGone` ([`an_unwound_reactor_fails_an_announced_stop`]).
+#[test]
+fn a_reactor_that_returns_is_recorded_not_failed() {
+    let (unannounced, ends) = teardown_ends(Vec::new(), false, false);
+    assert_eq!(unannounced.end.harness, None, "{:?}", unannounced.end);
+    assert!(ends.reactor_exited().is_some(), "{:?}", ends.facts());
+
+    let (announced, ends) = teardown_ends(Vec::new(), false, true);
+    assert_eq!(announced.end.harness, None, "{:?}", announced.end);
+    assert_eq!(ends.reactor_exited(), None, "{:?}", ends.facts());
+
+    let unwound = teardown_after(Vec::new(), true, false);
+    let detail = evidence_failure(&unwound);
+    assert!(detail.starts_with("ReactorGone"), "{detail}");
+}
+
+/// An announced stop still runs the teardown checks: work it leaves open
+/// fails the run as the ledger names it, under the work-books claim.
+#[test]
+fn an_announced_stop_still_fails_open_work() {
+    let report = teardown_after(open_work(4).into(), false, true);
+    let detail = evidence_failure(&report);
+    assert!(
+        detail.starts_with("OutstandingWork: the work books don't balance: UnendedCall: call 1"),
+        "{detail}"
+    );
+}
+
+/// A run that ends at its budget while an announced stop is still under way
+/// fails as `ShutdownIncomplete`, since the reactor's last events and the
+/// teardown checks never came.
+#[test]
+fn a_run_that_ends_mid_stop_fails() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// A stop that wedges, with the reactor parked and the drain run dry, fails
+/// as `ShutdownIncomplete` even though a checker read every drain's
+/// settlement, as `header-sync/teardown-returns-baseline` does. Only a drain
+/// cut off at its bound leaves the stop to the property.
+#[test]
+fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let rounds = tap.rounds();
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let read = rounds.clone();
+    let mut checker = zakura_sim::check::after_step(move |cx| {
+        let _ = read.at(cx.step);
+        None
+    });
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    // The run reached its budget, and its drain ended well short of the
+    // bound, since the parked reactor leaves nothing ready.
+    let config = storage_config();
+    assert!(
+        report.end.steps > config.budget && report.end.steps < config.budget + config.drain_bound,
+        "{:?}",
+        report.end
+    );
+    assert!(
+        rounds
+            .rows()
+            .last()
+            .is_some_and(|row| row.step == report.end.steps),
+        "the last drain recorded a settlement"
+    );
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// A stop cut off at the drain bound fails the run as `DrainBound`, which
+/// names the task still running, so the unfinished stop never ends
+/// silently, whether or not a property reads its settlement.
+#[test]
+fn a_cut_off_stop_with_no_property_still_fails() {
+    let config = zakura_sim::RunConfig {
+        drain_bound: 2,
+        ..storage_config()
+    };
+    let mut sim = Sim::new(config, PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    // The reactor yields forever, so the drain runs to its bound.
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    assert!(
+        matches!(
+            &report.end.harness,
+            Some(zakura_sim::HarnessFailure::DrainBound { open })
+                if open.starts_with("task:reactor.1:")
+        ),
+        "{:?}",
+        report.end
+    );
+}
+
+/// The scheduler reports how a task ended, a panic included, to the tap,
+/// whatever still holds that task's observer: the tap judges a reactor's
+/// exit by its task, so a surviving observer clone can't make a panic look
+/// like a clean stop.
+#[test]
+fn the_scheduler_reports_a_reactor_panic() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let panicking = sim
+        .scheduler()
+        .spawn_root("reactor", async { panic!("the reactor panics") });
+    let task = panicking.task();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let reported = Arc::clone(&seen);
+    sim.scheduler().spawn_root("watcher", async move {
+        while zakura_scheduler::hooks::task_exit(task).is_none() {
+            zakura_rt::task::yield_now().await;
+        }
+        *reported.lock().expect("one writer") = zakura_scheduler::hooks::task_exit(task);
+    });
+    let _ = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    assert_eq!(
+        *seen.lock().expect("one writer"),
+        Some(zakura_scheduler::TaskExit::Panicked)
+    );
+}
+
+/// A reactor that unwinds during an announced stop crashed rather than
+/// stopped, so the run still fails as `ReactorGone`.
+#[test]
+fn an_unwound_reactor_fails_an_announced_stop() {
+    let report = teardown_after(open_work(5).into(), true, true);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ReactorGone"), "{detail}");
+}
+
+/// With the node's first locator held until 30 s after its submission, the
+/// reactor's timeout and the completion share an instant. The caller drops
+/// its call either before the completion, leaving `CallerDropped`, or after
+/// it, leaving `ReplyDropped`. Both histories happen, and each run's
+/// `timed-out` end pairs with that operation's drop.
+#[test]
+fn timed_out_receipt_pairs_with_either_drop() {
+    let scenario = holding(vec![Hold {
+        select: Select::nth(OpKind::Locator, 1),
+        until: Trigger::VirtualTime(30_000),
+        then: vec![Allow::Engine],
+        deadline_ms: None,
+    }]);
+    let (mut caller_dropped, mut reply_dropped) = (0, 0);
+    // The transport's scheduling choices come before the choices at the shared
+    // instant, so a plan needs room for both.
+    for input in inputs(64, 1_024) {
+        let (report, _) = storage_run(&scenario, input);
+        for (storage_seq, event) in events(&report) {
+            let ReactorFact::CallEnded { end, op, .. } = event else {
+                continue;
+            };
+            if end != "timed-out" {
+                continue;
+            }
+            let id = op.expect("a timed-out call is paired");
+            match fact_at(&report, storage_seq) {
+                StorageFact::CallerDropped { id: dropped } if *dropped == id => {
+                    caller_dropped += 1;
+                }
+                StorageFact::ReplyDropped { id: dropped } if *dropped == id => {
+                    reply_dropped += 1;
+                }
+                other => panic!("call ended timed-out at {other:?}"),
+            }
+        }
+    }
+    assert!(
+        caller_dropped > 0,
+        "no plan dropped the call before completing it"
+    );
+    assert!(
+        reply_dropped > 0,
+        "no plan dropped the call after completing it"
+    );
+}
+
+/// Where [`PanickingPort`] panics in its apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanicAt {
+    /// Before it delegates the call.
+    BeforeDelegating,
+    /// After it takes the delegated call's reply.
+    AfterReply,
+}
+
+/// The node's controlled port, except that every apply panics.
+struct PanickingPort {
+    inner: Arc<ControlledPort>,
+    at: PanicAt,
+    /// Set just before an apply panics.
+    panicking: Arc<AtomicBool>,
+}
+
+impl Port for PanickingPort {
+    fn continuation_locator(
+        &self,
+        permit: LocatorReadPermit,
+    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
+        self.inner.continuation_locator(permit)
+    }
+
+    fn vct_repair_context(
+        &self,
+        owner: BodyWorkOwner,
+        height: block::Height,
+    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
+        self.inner.vct_repair_context(owner, height)
+    }
+
+    fn acquire_header_path(
+        &self,
+        request: AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
+        self.inner.acquire_header_path(request)
+    }
+
+    fn read_header_path(
+        &self,
+        path: RetainedHeaderPath,
+        request: ReadPath,
+    ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
+        self.inner.read_header_path(path, request)
+    }
+
+    fn release_header_path(
+        &self,
+        path: RetainedHeaderPath,
+    ) -> HeaderChainFuture<'_, Result<(), PortError>> {
+        self.inner.release_header_path(path)
+    }
+
+    fn prepare_header_target(
+        &self,
+        request: PrepareHeaderTarget,
+    ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
+        self.inner.prepare_header_target(request)
+    }
+
+    /// Panics where `at` says, delegating the call first for
+    /// [`PanicAt::AfterReply`].
+    fn apply_header_target(
+        &self,
+        target: PreparedHeaderTarget,
+    ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
+        Box::pin(async move {
+            if self.at == PanicAt::BeforeDelegating {
+                self.panicking.store(true, Ordering::Relaxed);
+                panic!("the test port panics before delegating its apply");
+            }
+            let _reply = self.inner.apply_header_target(target).await;
+            self.panicking.store(true, Ordering::Relaxed);
+            panic!("the test port panics after taking its apply's reply");
+        })
+    }
+
+    fn selected_chain(&self) -> zakura_rt::sync::watch::Receiver<Option<EngineSnapshot>> {
+        self.inner.selected_chain()
+    }
+
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        self.inner.selected_chain_contains(hash)
+    }
+}
+
+/// A source, added before the node's tap, whose observation fails from the
+/// step an apply panics on.
+struct FailsOnPanic(Arc<AtomicBool>);
+
+impl ActionSource for FailsOnPanic {
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        unreachable!("it offers no actions");
+    }
+
+    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
+        match self.0.load(Ordering::Relaxed) {
+            true => Err("EarlierFailure: a source before the node's failed".to_owned()),
+            false => Ok(()),
+        }
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The node at genesis, tapped, syncing from `mirror-0` at A5 through a
+/// [`PanickingPort`] that panics `at`, converging. With `close`, the node's
+/// first apply is held until `mirror-0`'s link has closed and a second has
+/// passed, and the `Plan` may close the link once that apply is submitted.
+/// With `fail_first`, a [`FailsOnPanic`] source comes before the node's.
+fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> RunReport {
+    let fixture = HeaderFixture::regtest();
+    let node = Arc::new(ControlledPort::new(&fixture));
+    let mirror = Arc::new(EnginePort::new(&fixture));
+    preload(&mirror, &fixture, &Chain::main(5));
+    let first_apply = Select::nth(OpKind::Apply, 1);
+    let (holds, controls) = if close {
+        (
+            vec![Hold {
+                select: first_apply.clone(),
+                // Time moves only once no task is ready, so a close before
+                // then is handled, and the apply's owner retired, first.
+                until: Trigger::All(vec![
+                    Trigger::Closed("mirror-0".to_owned()),
+                    Trigger::VirtualTime(1_000),
+                ]),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            vec![ControlStep {
+                peer: "mirror-0".to_owned(),
+                action: ControlAction::Close,
+                when: Some(Trigger::Submitted(first_apply)),
+            }],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let panicking = Arc::new(AtomicBool::new(false));
+    let mut topology = None;
+    let report = run(
+        storage_config(),
+        input,
+        |sim| {
+            if fail_first {
+                sim.add_source(Box::new(FailsOnPanic(panicking.clone())));
+            }
+            let dispatch = DispatchFlag::default();
+            let effects = Effects::default();
+            let policy = Policy {
+                holds,
+                ..Policy::converging()
+            };
+            let storage = PolicySource::new(sim, node.clone(), policy, effects.clone());
+            let (observer, tap) = ReactorTap::new(sim, &node, "node");
+            let storage = storage.with_tap(tap);
+            let predicates = storage.predicates();
+            sim.add_source(Box::new(storage));
+            let port: Arc<dyn Port> = Arc::new(PanickingPort {
+                inner: node.clone(),
+                at,
+                panicking,
+            });
+            let nodes = vec![
+                HeaderNode::spawn(
+                    sim,
+                    "node",
+                    1,
+                    port,
+                    &fixture,
+                    Chain::default().tip(&fixture),
+                    dispatch.clone(),
+                    Some(observer),
+                ),
+                HeaderNode::spawn(
+                    sim,
+                    "mirror-0",
+                    2,
+                    mirror.clone(),
+                    &fixture,
+                    Chain::main(5).tip(&fixture),
+                    dispatch,
+                    None,
+                ),
+            ];
+            let linked = Rc::new(Topology::new(nodes, effects));
+            linked.link(1, 0);
+            let control = Control::new(sim, linked.clone(), fixture.clone(), controls, predicates);
+            sim.add_source(Box::new(control));
+            topology = Some(linked);
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    drop(topology);
+    report
+}
+
+/// What a port panic run showed.
+#[derive(Debug, Default)]
+struct Panicked {
+    /// The panicking call.
+    call: u64,
+    /// Why its owner was retired before it ended, if it was. Then the call
+    /// held the owner's last header capacity lease.
+    owner_retired: Option<String>,
+}
+
+/// Checks that `report` ended with `ReactorPortPanicked` for the node's first
+/// apply call, logged as `port-panicked` with no operation, and that no
+/// call is paired with any apply operation. With `submitted`, the apply's
+/// operation must have taken its reply.
+fn panicked(report: &RunReport, submitted: bool) -> Panicked {
+    let Some(HarnessFailure::ReactorPortPanicked { source, call }) = &report.end.harness else {
+        panic!("expected a reactor port panic, got {:?}", report.end);
+    };
+    assert_eq!(source, "reactor:node#0");
+    let events = events(report);
+    let dispatched = events
+        .iter()
+        .find_map(|(_, event)| match event {
+            ReactorFact::Dispatched {
+                call,
+                port: ReactorCall::Apply { owner, .. },
+            } => Some((*call, owner.clone())),
+            _ => None,
+        })
+        .expect("the node dispatched an apply");
+    assert_eq!(*call, dispatched.0);
+    let ended = events
+        .iter()
+        .position(|(_, event)| {
+            matches!(event, ReactorFact::CallEnded { call: ended, .. } if ended == call)
+        })
+        .expect("the panicking call's end is logged");
+    assert_eq!(
+        events[ended].1,
+        &ReactorFact::CallEnded {
+            call: *call,
+            end: "port-panicked".to_owned(),
+            op: None,
+        }
+    );
+    let applies: Vec<u64> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                instance: 0,
+                fact:
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::ApplyHeaderTarget { .. },
+                        ..
+                    },
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let taken = applies.iter().any(|apply| {
+        report.log.entries().iter().any(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Storage { instance: 0, fact: StorageFact::ReplyTaken { id }, .. }
+                    if id == apply
+            )
+        })
+    });
+    assert_eq!(taken, submitted, "the apply's reply was taken: {taken}");
+    let paired_apply = events.iter().any(|(_, event)| {
+        matches!(event, ReactorFact::CallEnded { op: Some(op), .. } if applies.contains(op))
+    });
+    assert!(!paired_apply, "no call pairs with an apply operation");
+    let owner_retired = events[..ended].iter().find_map(|(_, event)| match event {
+        ReactorFact::Retired {
+            request, reason, ..
+        } if request.owner == dispatched.1 => Some(reason.clone()),
+        _ => None,
+    });
+    Panicked {
+        call: *call,
+        owner_retired,
+    }
+}
+
+/// A port future caught panicking ends the run with
+/// `ReactorPortPanicked`, logged first with `op: null`, whether it panicked
+/// before submitting its apply or after taking the apply's reply, which
+/// stays unpaired. The third variant retires the apply's owner first, by
+/// closing `mirror-0`'s link while the apply is held, so the call holds the
+/// owner's last header capacity lease. Releasing that lease reaches a
+/// scheduling point, which the panic's end comes before, so its receipt
+/// and its end share a drain and the panic outranks the unpaired receipt.
+/// The second variant's commit can retire the owner `snapshot_obsolete`
+/// before the reactor takes the reply, which makes it a last lease case
+/// too, but nothing forces that.
+#[test]
+fn port_panic_is_a_harness_failure() {
+    for input in inputs(8, 256) {
+        let report = panic_run(PanicAt::BeforeDelegating, false, false, input.clone());
+        assert_eq!(panicked(&report, false).owner_retired, None);
+        panicked(&panic_run(PanicAt::AfterReply, false, false, input), true);
+    }
+    for input in inputs(32, 256) {
+        let report = panic_run(PanicAt::AfterReply, true, false, input);
+        let seen = panicked(&report, true);
+        assert!(seen.call > 0);
+        assert_eq!(seen.owner_retired.as_deref(), Some("disconnected"));
+    }
+}
+
+/// A port panic outranks another source's observation failure in the same
+/// step, even one that observes before the node's tap.
+#[test]
+fn port_panic_outranks_an_earlier_sources_failure() {
+    for input in inputs(8, 256) {
+        let report = panic_run(PanicAt::AfterReply, false, true, input.clone());
+        panicked(&report, true);
+        let report = panic_run(PanicAt::BeforeDelegating, false, true, input);
+        panicked(&report, false);
+    }
+}
+
+/// An observer that forwards to the tap's, except that it panics on the
+/// first replied call end instead of recording it, as an observer bug would.
+#[derive(Debug)]
+struct PanicsOnReply(Arc<dyn HeaderSyncObserver>);
+
+impl HeaderSyncObserver for PanicsOnReply {
+    /// Panics on a replied `CallEnded`, which unwinds the reactor, and
+    /// forwards anything else.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::CallEnded {
+                end: CallEnd::Replied,
+                ..
+            }
+        ) {
+            panic!("the test observer panics on a replied call end");
+        }
+        self.0.observe(event);
+    }
+}
+
+/// The node at genesis, tapped through [`PanicsOnReply`], syncing from
+/// `mirror-0` at A5, converging.
+fn observer_panic_run(input: PlanInput) -> RunReport {
+    let fixture = HeaderFixture::regtest();
+    let node = Arc::new(ControlledPort::new(&fixture));
+    let mirror = Arc::new(EnginePort::new(&fixture));
+    preload(&mirror, &fixture, &Chain::main(5));
+    let mut topology = None;
+    let report = run(
+        storage_config(),
+        input,
+        |sim| {
+            let dispatch = DispatchFlag::default();
+            let effects = Effects::default();
+            let storage =
+                PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
+            let (observer, tap) = ReactorTap::new(sim, &node, "node");
+            sim.add_source(Box::new(storage.with_tap(tap)));
+            let nodes = vec![
+                HeaderNode::spawn(
+                    sim,
+                    "node",
+                    1,
+                    node.clone(),
+                    &fixture,
+                    Chain::default().tip(&fixture),
+                    dispatch.clone(),
+                    Some(Arc::new(PanicsOnReply(observer))),
+                ),
+                HeaderNode::spawn(
+                    sim,
+                    "mirror-0",
+                    2,
+                    mirror.clone(),
+                    &fixture,
+                    Chain::main(5).tip(&fixture),
+                    dispatch,
+                    None,
+                ),
+            ];
+            let linked = Rc::new(Topology::new(nodes, effects));
+            linked.link(1, 0);
+            topology = Some(linked);
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    drop(topology);
+    report
+}
+
+/// A reactor that unwinds from an observer panic ends the run as
+/// `ReactorGone` on the node's tap. The call whose end panicked took its
+/// storage receipt, which no `CallEnded` pairs with, but the tap reports
+/// the reactor crash rather than that unpaired receipt.
+#[test]
+fn an_observer_panic_ends_the_run_reactor_gone() {
+    for input in inputs(8, 256) {
+        let report = observer_panic_run(input);
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("ReactorGone"), "{source}: {detail}");
+        assert_eq!(source, "reactor:node#0");
+    }
+}
+
+/// A hold on the node's applies until `Handled` opens once its reactor has
+/// handled its first prepare, so the tap's events reach the policy's
+/// predicates. Held until a VCT context call it never makes, no apply
+/// completes in the live phase. Only the drain, which retires the hold,
+/// completes them.
+#[test]
+fn a_hold_waits_for_the_reactor_to_handle_a_call() {
+    let fixture = HeaderFixture::regtest();
+    let a5 = Chain::main(5).tip(&fixture);
+    let hold = |until: Trigger| Hold {
+        select: Select {
+            kind: Some(OpKind::Apply),
+            ..Select::default()
+        },
+        until,
+        then: vec![Allow::Engine],
+        deadline_ms: None,
+    };
+    for input in inputs(8, 256) {
+        let scenario = holding(vec![hold(Trigger::Handled(Select::nth(
+            OpKind::Prepare,
+            1,
+        )))]);
+        let (report, node) = storage_run(&scenario, input.clone());
+        assert_eq!(node.engine().snapshot().frontiers.header_best, a5);
+        let events = events(&report);
+        let prepare = events
+            .iter()
+            .find_map(|(_, event)| match event {
+                ReactorFact::Dispatched {
+                    call,
+                    port: ReactorCall::Prepare { .. },
+                } => Some(*call),
+                _ => None,
+            })
+            .expect("the node prepares");
+        assert!(events.iter().any(|(_, event)| matches!(
+            event,
+            ReactorFact::Handled { call, .. } if *call == prepare
+        )));
+
+        let scenario = holding(vec![hold(Trigger::Handled(Select {
+            kind: Some(OpKind::VctContext),
+            ..Select::default()
+        }))]);
+        let (report, _) = storage_run(&scenario, input);
+        let applies: Vec<u64> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Storage {
+                    fact:
+                        StorageFact::Submitted {
+                            id,
+                            request: StorageRequest::ApplyHeaderTarget { .. },
+                            ..
+                        },
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert!(!applies.is_empty(), "the node applies");
+        let live_completions: Vec<&str> = report
+            .picks
+            .iter()
+            .filter(|pick| pick.phase == zakura_sim::check::Phase::Live)
+            .map(|pick| pick.identity.as_str())
+            .filter(|pick| {
+                applies
+                    .iter()
+                    .any(|id| pick.starts_with(&format!("storage:header:{id}:")))
+            })
+            .collect();
+        assert_eq!(live_completions, Vec::<&str>::new());
+    }
+}
+
+/// Runs a tapped reactor that reports `events` in one step and then ends,
+/// with no property reading the tap's claims. Returns the run and the
+/// claim breaks its drains found.
+fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let claims = tap.claims();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        for event in events {
+            observer.observe(event);
+        }
+    });
+    (
+        sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default()),
+        claims,
+    )
+}
+
+/// The end of `events`' prepare call as replied, with no storage receipt
+/// for it to pair with: the pairer's integrity failure, a join between the
+/// reactor's facts and storage's.
+fn unpaired_reply() -> ReactorEvent {
+    ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::Replied,
+    }
+}
+
+/// The retirement, on shutdown, of the round `events` started, which the
+/// queue still holds: `outstanding-work-bounded`'s claim.
+fn shut_down(events: &[ReactorEvent]) -> ReactorEvent {
+    let request = events
+        .iter()
+        .find_map(|event| match event {
+            ReactorEvent::Started { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("the work starts a round");
+    ReactorEvent::Retired {
+        request,
+        phase: HeaderTargetPhase::Receiving,
+        purpose: HeaderTargetPurpose::Normal,
+        reason: HeaderRequestTerminal::Shutdown,
+    }
+}
+
+/// A claim break and an integrity failure in one step, in either order: the
+/// claim drains that step, so its property can report it first, and the
+/// failure waits. A step with no claim fails at once.
+#[test]
+fn a_claim_drains_before_its_steps_integrity_failure() {
+    let mut events = Vec::from(open_work(4));
+    // The page reports a header left of the 5 its reservation spent.
+    if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
+        *reserved_left = 1;
+    }
+    events.push(unpaired_reply());
+    let (report, claims) = claims_after(events);
+    let found: Vec<_> = claims.records();
+    assert!(
+        matches!(&found[..], [only] if only.detail.starts_with("OverReservation")),
+        "{found:?}"
+    );
+    // With no property to report it, the claim fails the run at its end,
+    // ahead of the failure that waited behind it.
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("OverReservation"), "{detail}");
+
+    let mut events = Vec::from(open_work(4));
+    events.push(unpaired_reply());
+    let (report, claims) = claims_after(events);
+    assert_eq!(claims.records(), []);
+    let detail = evidence_failure(&report);
+    assert!(
+        detail.starts_with("Mispaired: call 1 ended `replied`"),
+        "{detail}"
+    );
+
+    // The failure's event first, then the shutdown's retirement of the
+    // round the queue still holds: that claim still drains ahead of it.
+    let mut events = Vec::from(open_work(4));
+    events.push(unpaired_reply());
+    let unreleased = shut_down(&events);
+    events.push(unreleased);
+    let (report, claims) = claims_after(events);
+    let found = claims.records();
+    assert!(
+        matches!(&found[..], [only] if only.detail.starts_with("UnreleasedRound: round 1")),
+        "{found:?}"
+    );
+    let detail = evidence_failure(&report);
+    assert_eq!(detail, found[0].detail, "{found:?}");
+}

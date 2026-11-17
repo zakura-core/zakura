@@ -5,6 +5,7 @@
 mod action;
 mod commitment;
 mod note;
+#[cfg(test)]
 mod sinsemilla;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -17,6 +18,7 @@ pub mod shielded_data;
 pub mod tree;
 
 pub use action::Action;
-pub use commitment::{NoteCommitment, ValueCommitment};
+pub(crate) use action::ActionEncoding;
+pub use commitment::ValueCommitment;
 pub use note::{EncryptedNote, Nullifier, WrappedNoteKey};
 pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};

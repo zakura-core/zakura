@@ -11,11 +11,7 @@ use std::{
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::work::difficulty::U256;
-use zakura_header_chain::{
-    AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
-    SuffixWork, VerifiedGeneration,
-};
+use zakura_header_chain::{BodyWorkOwner, HeaderLocator};
 use zakura_node_services::header_chain::{
     AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, VctRepairContextReply,
@@ -24,18 +20,22 @@ use zakura_node_services::header_chain::{
 use super::super::{
     smallest_page,
     test_support::{p, record, HeaderTree, OUTCOME_CODES},
-    RegtestMessage,
+    Cursor, HeadersOutcome, Operation, RegtestMessage, SUBSCRIBE_HEADERS,
 };
-use super::*;
+use super::{state::in_window, *};
 use crate::zakura::{
     framed_channel,
-    header_sync::config::REGTEST_HEADER_BYTES,
-    regulation::{ServeCapacity, ServeLimits, Subscriptions},
+    header_sync::{
+        config::REGTEST_HEADER_BYTES,
+        observe::{HeaderSyncObserver, PublisherSite, ReactorEvent},
+    },
+    regulation::{ServeCapacity, ServeLimits, SubscriptionLimits, Subscriptions},
     wire_codec::decode_frame,
-    Credit, FramedRecv, ZakuraPeerId,
+    Credit, Frame, FramedRecv, ZakuraPeerId,
 };
 
 mod load;
+use super::model::snapshot;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -63,24 +63,6 @@ fn serve_limits() -> ServeLimits {
         node_output_responses: 16,
         peer_output_bytes: 1 << 20,
         node_output_bytes: 1 << 22,
-    }
-}
-
-/// A selected chain ending at `tip`.
-fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot {
-    EngineSnapshot {
-        mode: EngineMode::Integrated,
-        state_version: StateVersion::new(generation),
-        header_generation: HeaderGeneration::new(generation),
-        verified_generation: VerifiedGeneration::new(1),
-        frontiers: FrontierSet {
-            finalized: genesis,
-            header_best: tip,
-            verified_best: genesis,
-        },
-        header_best_score: ChainScore::new(SuffixWork::new(U256::from(tip.height.0)), tip.hash),
-        oldest_retained_height: block::Height(0),
-        alarms: AlarmSet::default(),
     }
 }
 
@@ -764,6 +746,7 @@ fn session_advertising(
         },
         pages,
         cancel.clone(),
+        (None, None),
     );
     (publisher, recv, cancel, task)
 }
@@ -774,14 +757,19 @@ impl Publisher {
     fn tally(&self) -> (usize, usize) {
         let shared = lock(&self.shared);
         (
-            shared.publications.keys().count(),
-            shared.publications.tombstones(),
+            shared.state.publications().keys().count(),
+            shared.state.publications().tombstones(),
         )
+    }
+
+    /// Slots held by live subscriptions and unwritten terminal outcomes.
+    fn slots_held(&self) -> usize {
+        lock(&self.shared).slots.held()
     }
 
     /// Unacknowledged pages of `id`, if it is live.
     fn unacknowledged(&self, id: u64) -> Option<usize> {
-        lock(&self.shared).publications.unacknowledged(&id)
+        lock(&self.shared).state.publications().unacknowledged(&id)
     }
 }
 
@@ -933,6 +921,210 @@ async fn path_pages_carry_one_marker_then_follow_the_tip() {
     // reuse state's continuation.
     assert_eq!(port.store().walks, 2);
     harness.check_quiet().await;
+}
+
+/// Records the pages a publisher reports queued.
+#[derive(Debug, Default)]
+struct Queued(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Queued {
+    /// Keeps each `PageQueued`, and leaves the task's other reports out.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(event, ReactorEvent::PageQueued { .. }) {
+            self.0
+                .lock()
+                .expect("no test panics holding it")
+                .push(event);
+        }
+    }
+}
+
+/// An observed publisher reports each page it hands to its writer, with its
+/// session, the lease its read used, its subscription, the ancestor it
+/// declares, every entry's header hash, the subscription's initial target
+/// and its marker, as the subscriber then receives it. Each page's job
+/// leases its own path, so the two pages name leases 1 and 2.
+#[tokio::test(start_paused = true)]
+async fn each_queued_page_reports_its_entries() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let recorded = Arc::new(Queued::default());
+    let observer: Arc<dyn HeaderSyncObserver> = recorded.clone();
+    let (send, recv) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel.clone(),
+        (
+            None,
+            Some(super::super::CreditTap {
+                observer,
+                peer: peer(7),
+                session_id: 1,
+            }),
+        ),
+    );
+    let mut harness = Harness {
+        port,
+        capacity,
+        publisher,
+        recv,
+        cancel,
+        inbox: VecDeque::new(),
+        subscriber: Subscriber::new(),
+    };
+    let id = harness
+        .open(chain[5].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    let received = harness.deliver_all().await;
+    let h = block::Height;
+    assert_eq!(
+        pages(&received),
+        [(h(2), h(5), false), (h(5), h(6), true)],
+        "{received:?}"
+    );
+    let hashes = |frontiers: &[Frontier]| -> Vec<block::Hash> {
+        frontiers.iter().map(|frontier| frontier.hash).collect()
+    };
+    let queued: Vec<_> = recorded
+        .0
+        .lock()
+        .expect("no test panics holding it")
+        .iter()
+        .map(|event| match event {
+            ReactorEvent::PageQueued {
+                peer,
+                session_id,
+                lease,
+                subscription_id,
+                common_ancestor,
+                headers,
+                initial_target,
+                reaches_target,
+            } => (
+                peer.clone(),
+                *session_id,
+                *lease,
+                *subscription_id,
+                *common_ancestor,
+                headers.clone(),
+                *initial_target,
+                *reaches_target,
+            ),
+            _ => unreachable!("the recorder keeps only queued pages"),
+        })
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (
+                peer(7),
+                1,
+                1,
+                id,
+                chain[1],
+                hashes(&chain[2..5]),
+                chain[5].hash,
+                false
+            ),
+            (
+                peer(7),
+                1,
+                2,
+                id,
+                chain[4],
+                hashes(&chain[5..6]),
+                chain[5].hash,
+                true
+            ),
+        ]
+    );
+    harness.check_quiet().await;
+}
+
+/// Counts the pages a publisher commits and the ones it reports queued.
+#[derive(Debug, Default)]
+struct Handoffs {
+    committed: std::sync::atomic::AtomicUsize,
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+impl HeaderSyncObserver for Handoffs {
+    /// Counts each commit's container report and each `PageQueued`.
+    fn observe(&self, event: ReactorEvent) {
+        let counter = match event {
+            ReactorEvent::PublisherServing {
+                site: PublisherSite::Commit,
+                ..
+            } => &self.committed,
+            ReactorEvent::PageQueued { .. } => &self.queued,
+            _ => return,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A page committed after its writer's queue closed isn't queued, so the
+/// publisher reports no `PageQueued` for it. A following page reserves its
+/// slot before the recheck's query, so the queue closes while that query
+/// waits in state.
+#[tokio::test(start_paused = true)]
+async fn a_page_sent_to_a_closed_queue_isnt_reported_queued() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let recorded = Arc::new(Handoffs::default());
+    let observer: Arc<dyn HeaderSyncObserver> = recorded.clone();
+    let (send, recv) = framed_channel(64);
+    let cancel = CancellationToken::new();
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel,
+        (
+            None,
+            Some(super::super::CreditTap {
+                observer,
+                peer: peer(7),
+                session_id: 1,
+            }),
+        ),
+    );
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    // The page for heights 4 and 5 waits in its read, then the chain grows
+    // past it, so its recheck queries state, which blocks.
+    let main = port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    let grown = port.store().tree.extend(main[1], 1);
+    port.select(grown[0]);
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    drop(recv);
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(recorded.committed.load(Relaxed), 1, "the page commits");
+    assert_eq!(recorded.queued.load(Relaxed), 0, "but isn't queued");
 }
 
 /// An `Open` whose locator is the target sends no path page and no marker.
@@ -1270,20 +1462,28 @@ async fn a_queued_outcome_wins_over_a_later_close() {
         .close()
         .expect("the subscription is live");
     // The task has not run between these, so both reach `end_due` together.
-    let ended = {
+    let frame = {
         let mut shared = lock(&harness.publisher.shared);
-        shared.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
-        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        shared.end_due::<HB>()
+        shared
+            .state
+            .queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
+        assert_eq!(shared.apply(&close), Ok(Applied::Live));
+        let ended = shared.end_due();
+        assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
+        let terminal = shared.next_terminal::<HB>().expect("one subscription ends");
+        assert!(
+            shared.next_terminal::<HB>().is_none(),
+            "one write at a time"
+        );
+        terminal.frame
     };
-    let [(ended_id, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
-    assert_eq!(ended_id, id);
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {
+            subscription_id,
             outcome: HeadersOutcomeCode::SubscriptionSuperseded,
             ..
-        }))
+        })) if subscription_id == id
     ));
 }
 
@@ -1395,6 +1595,7 @@ async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
         },
         limits(),
         CancellationToken::new(),
+        (None, None),
     );
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
@@ -1446,6 +1647,7 @@ async fn a_terminal_wait_keeps_the_other_page_moving() {
         },
         limits(),
         CancellationToken::new(),
+        (None, None),
     );
     // The first subscription's page waits in its read, holding the slot.
     let mut first = Subscriber::new();
@@ -1981,28 +2183,24 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
 
 /// An outcome a job finds after `Close` arrived gives way to
 /// `SubscriptionClosed`.
-#[tokio::test(start_paused = true)]
-async fn close_wins_over_an_outcome_found_after_it() {
-    let port = FakePort::new(Semaphore::MAX_PERMITS);
-    let chain = port.grow(2);
-    let mut harness = Harness::new(port.clone(), serve_limits());
-    let id = harness
-        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
-        .await;
-    assert!(harness.deliver_all().await.is_empty());
-    let close = harness
-        .subscriber
-        .close()
-        .expect("the subscription is live");
-    // The task has not run between these, so both reach `end_due` together.
-    let ended = {
-        let mut shared = lock(&harness.publisher.shared);
-        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
-        shared.finish(id, found, false);
-        shared.end_due::<HB>()
-    };
-    let [(_, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+#[test]
+fn close_wins_over_an_outcome_found_after_it() {
+    let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
+    let mut owner = PublisherOwner::new(limits());
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
+    assert_eq!(owner.apply(&open), Ok(Applied::Live));
+    let job = owner
+        .state
+        .next_job::<HB>(None)
+        .expect("the path has a page to read");
+    let close = subscriber.close().expect("the subscription is live");
+    assert_eq!(owner.apply(&close), Ok(Applied::Live));
+    let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
+    owner.state.finish(job.key, found, None);
+    assert_eq!(owner.end_due(), [HeadersOutcomeCode::SubscriptionClosed]);
+    let OwnedTerminal { frame, .. } = owner.next_terminal::<HB>().expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {
@@ -2060,7 +2258,7 @@ async fn a_second_open_is_admitted_and_a_third_faults() {
         ..limits()
     };
     assert_eq!(
-        lock(&publisher.shared).apply(&records, without_records),
+        PublisherOwner::new(without_records).apply(&records),
         Err(PublisherFault::UnadvertisedSchema)
     );
 }
@@ -2205,6 +2403,99 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(harness.capacity.node_execution_held(), 0);
     assert!(port.store().leases.is_empty());
+}
+
+/// A page abandoned by `Close`, then by cancellation, leaves its worker holding
+/// its lease and its budgets until storage answers. The worker's end releases
+/// them, and the subscription's slot ended with its terminal write.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_read_keeps_its_lease_and_budgets_until_storage_answers() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None)
+        .await;
+    harness.drain().await;
+    assert_eq!(port.store().reads_running, 1);
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    assert_eq!(harness.apply(close).await, Ok(Applied::Live));
+    harness.drain().await;
+    assert_eq!(
+        harness.publisher.slots_held(),
+        0,
+        "the terminal write freed the slot before the read ended"
+    );
+
+    harness.cancel.cancel();
+    drop(harness.publisher);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(port.store().leases.len(), 1, "the worker holds its lease");
+    assert!(harness.capacity.node_execution_held() > 0);
+    assert!(harness.capacity.node_output_held() > 0);
+
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert!(port.store().leases.is_empty());
+    assert_eq!(harness.capacity.node_execution_held(), 0);
+    assert_eq!(harness.capacity.node_output_held(), 0);
+}
+
+/// A terminal outcome holds its slot through a full queue, after its
+/// subscription's key is free. Only the writer taking its frame frees the slot.
+/// A cancelled session's queued outcome holds its slot until the writer's queue
+/// drops.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_keeps_its_slot_through_the_output_path() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    // One slot, which the first page fills because nobody reads it.
+    let (publisher, mut recv, _cancel, _task) = session(&port, &capacity, &peer(7), 1, 1);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.tally().0, 0, "the subscription ended");
+    assert_eq!(publisher.slots_held(), 1, "the waiting outcome holds it");
+
+    // Read until the outcome, keeping the frame in the writer's hands.
+    loop {
+        let frame = tokio::time::timeout(QUIET, recv.recv())
+            .await
+            .expect("the outcome follows the pages")
+            .expect("the session is open");
+        if let Received::Ended(_) = subscriber.receive(&frame) {
+            break;
+        }
+    }
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(publisher.slots_held(), 0, "the writer took the frame");
+
+    // A new subscription's terminal queues behind a page that fills the queue.
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    let (other, other_recv, cancel, task) = session(&port, &capacity, &peer(8), 2, 1);
+    other.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    other.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(other.slots_held(), 1);
+    cancel.cancel();
+    tokio::time::timeout(QUIET, task)
+        .await
+        .expect("cancel stops the publisher")
+        .expect("the publisher task does not panic");
+    assert_eq!(other.slots_held(), 1, "the queued outcome keeps its slot");
+    drop(other_recv);
+    assert_eq!(other.slots_held(), 0, "the dropped queue freed its slot");
 }
 
 /// A burst of conformant grants yields to another peer's task.

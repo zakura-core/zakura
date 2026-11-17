@@ -1,0 +1,10 @@
+# The node drops a `Hello` whose signature doesn't verify instead of closing.
+# The scenario's peer sends a `Hello` signed over another body.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/hello/bad-content-closes/drop-forged-hello.scenario.json"
+plan = "qa/planted/discovery/s4v2/hello/bad-content-closes/drop-forged-hello.plan.bin"

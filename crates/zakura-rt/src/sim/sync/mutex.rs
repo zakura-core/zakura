@@ -14,7 +14,8 @@ use std::{
 };
 
 use crate::sim::{
-    executor, executor_for, point, preempt, run_id, ObjectId, Op, Point, RunId, TaskId,
+    executor, executor_for, preempt, refuse_in_boundary_read, run_id, ObjectId, Op, Peek, Point,
+    RunId, TaskId,
 };
 
 /// A std-style mutex that parks contended tasks on the scheduler.
@@ -80,6 +81,7 @@ impl<T: ?Sized> Mutex<T> {
                     return Err(PoisonError::new(self.guard(poisoned.into_inner(), site)));
                 }
                 Err(TryLockError::WouldBlock) => {
+                    refuse_in_boundary_read("a park on a Mutex");
                     let holder = self.state().holder;
                     // This can abort the process when it fires in a
                     // destructor, so name what's needed to replay it.
@@ -120,6 +122,21 @@ impl<T: ?Sized> Mutex<T> {
                 self.guard(poisoned.into_inner(), site),
             ))),
             Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
+        }
+    }
+
+    /// Runs `f` on the value if nobody holds the lock, for a
+    /// [`boundary_read`](crate::sim::boundary_read). Unlike `try_lock`, it
+    /// takes no preemption point, and dropping its std guard reaches none
+    /// either, so it never changes a schedule. A held lock is
+    /// [`Peek::Held`], naming the holding task.
+    pub fn peek<R>(&self, f: impl FnOnce(&T) -> R) -> Peek<R> {
+        match self.inner.try_lock() {
+            Ok(guard) => Peek::Current(f(&guard)),
+            Err(TryLockError::Poisoned(poisoned)) => Peek::Poisoned(f(&poisoned.into_inner())),
+            Err(TryLockError::WouldBlock) => Peek::Held {
+                holder: self.state().holder,
+            },
         }
     }
 
@@ -251,8 +268,16 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
         // wake in a later run.
         if let Some((run, object)) = object {
             if let Some(executor) = executor_for(run) {
+                refuse_in_boundary_read("a Mutex guard's release");
                 executor.unpark_all(object);
-                point(Op::Release, self.site);
+                preempt(
+                    executor,
+                    Point {
+                        op: Op::Release,
+                        object: Some(object),
+                        site: self.site,
+                    },
+                );
             }
         }
     }

@@ -10,7 +10,6 @@ mod utxo;
 use std::{collections::HashMap, fmt, ops::AddAssign};
 
 use zcash_script::{opcode::Evaluable as _, pattern::push_num};
-use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
 
 use crate::{
     amount::{Amount, NonNegative},
@@ -347,14 +346,25 @@ impl Output {
     /// Return the destination address from a transparent output.
     ///
     /// Returns None if the address type is not valid or unrecognized.
+    ///
+    /// Matches the canonical P2PKH and P2SH scripts directly on the script bytes, the same
+    /// shapes `zcash_script`'s standard solver recognizes (a direct 20-byte push), without
+    /// converting the output: the state's address indexes call this for every transparent
+    /// output and spent input in each committed block.
     pub fn address(&self, net: &Network) -> Option<Address> {
-        match TxOut::try_from(self).ok()?.recipient_address()? {
-            TransparentAddress::PublicKeyHash(pkh) => {
-                Some(Address::from_pub_key_hash(net.t_addr_kind(), pkh))
-            }
-            TransparentAddress::ScriptHash(sh) => {
-                Some(Address::from_script_hash(net.t_addr_kind(), sh))
-            }
+        // A librustzcash `TxOut` only holds a valid amount, so keep rejecting invalid values.
+        zcash_protocol::value::Zatoshis::try_from(self.value).ok()?;
+
+        match self.lock_script.as_raw_bytes() {
+            [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] => Some(Address::from_pub_key_hash(
+                net.t_addr_kind(),
+                hash.try_into().ok()?,
+            )),
+            [0xa9, 0x14, hash @ .., 0x87] => Some(Address::from_script_hash(
+                net.t_addr_kind(),
+                hash.try_into().ok()?,
+            )),
+            _ => None,
         }
     }
 
@@ -391,7 +401,6 @@ impl OutputIndex {
     }
 
     /// Create a transparent output index from `usize`.
-    #[allow(dead_code)]
     pub fn from_usize(output_index: usize) -> OutputIndex {
         OutputIndex(
             output_index
@@ -400,28 +409,13 @@ impl OutputIndex {
         )
     }
 
-    /// Return this index as `usize`.
-    #[allow(dead_code)]
-    pub fn as_usize(&self) -> usize {
-        self.0
-            .try_into()
-            .expect("the maximum valid index fits in usize")
-    }
-
     /// Create a transparent output index from `u64`.
-    #[allow(dead_code)]
     pub fn from_u64(output_index: u64) -> OutputIndex {
         OutputIndex(
             output_index
                 .try_into()
                 .expect("the maximum u64 index fits in the inner type"),
         )
-    }
-
-    /// Return this index as `u64`.
-    #[allow(dead_code)]
-    pub fn as_u64(&self) -> u64 {
-        self.0.into()
     }
 }
 

@@ -1,0 +1,29 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -3233,6 +3233,7 @@ impl ZakuraProtocolHandler {
+             })
+             .collect();
+         let mut session_io = ServiceSessionIO::new(sessions, conn.clone(), close_cause.clone());
++        let mut last_exited = None;
+         // The dialer opens ordinary ordered streams. For symmetric block sync,
+         // the mirror-stable node-id tiebreak designates one proactive opener,
+         // avoiding crossed service generations while retaining one bidirectional
+@@ -3418,6 +3419,7 @@ impl ZakuraProtocolHandler {
+                     break;
+                 }
+                 Some(exited) = session_exit_rx.recv() => {
++                    last_exited = Some(exited.session_id);
+                     // Stop tracking the dead generation, or a legitimate reopen of the
+                     // same kind would look like a duplicate stream and kill the whole
+                     // connection, taking block sync and gossip down with header sync.
+@@ -3463,7 +3465,8 @@ impl ZakuraProtocolHandler {
+                     {
+                         Ok(admitted) => {
+                             #[cfg(any(test, zakura_sim))]
+-                            let admitted = session_io.with_origin(conn_id, admitted, true);
++                            let mut admitted = session_io.with_origin(conn_id, admitted, true);
++                            admitted.session_id = last_exited.unwrap_or(admitted.session_id);
+                             let service_streams = admitted.into_service_streams();
+                             let admitted_capabilities = self.registry.add_escalated_peer(
+                                 Peer::new_with_service_streams(

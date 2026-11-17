@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index e84cf5d339..5f2f9c8cbd 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -425,6 +425,9 @@ impl RetainedHeaders {
+ impl Drop for RetainedHeaders {
+     fn drop(&mut self) {
+         self.record_end();
++        // Mutation: one clone of the call's first lease outlives the call,
++        // so that lease never returns.
++        std::mem::forget(self.leases.first().cloned());
+     }
+ }
+ 

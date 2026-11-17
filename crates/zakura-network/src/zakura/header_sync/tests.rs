@@ -104,6 +104,7 @@ fn status_refresh_interval_is_clamped_at_startup() {
         Some(anchor),
         config,
         u32::try_from(MAX_HS_MESSAGE_BYTES).expect("the wire cap fits in u32"),
+        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     );
 
     assert_eq!(

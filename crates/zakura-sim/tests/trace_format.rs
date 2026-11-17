@@ -9,6 +9,7 @@ mod support;
 mod provenance;
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -22,6 +23,7 @@ use sha2::{Digest, Sha256};
 use support::{config, inputs};
 use tempfile::TempDir;
 use zakura_rt::{sync::Mutex, task, time};
+use zakura_sim::NaReason;
 use zakura_sim::{
     check::{self, PropertyOutcome, PropertyReport, StepCtx},
     end::{Drain, HarnessFailure, IdleStatus},
@@ -32,15 +34,15 @@ use zakura_sim::{
     },
     trace::{
         meta::{
-            BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PropertyRef,
-            SchedulerRecord, RNG, UNKNOWN,
+            BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PlanKind, PlanRef,
+            PropertyRef, SchedulerRecord, RNG, UNKNOWN,
         },
         BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
         MAX_TRACE_BYTES, TRACE_FILE,
     },
-    Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RecordSink, RunConfig,
-    RunReport, Sim, Violation,
+    Checker, HexU64, MemorySink, NoChecks, Observation, Outcome, PlanInput, Record, RecordSink,
+    RunConfig, RunReport, Sim, Violation,
 };
 
 /// Three tasks that share a lock, sleep and yield, so runs take time
@@ -81,6 +83,7 @@ fn meta() -> MetaRecord {
         fixtures: Vec::new(),
         properties: Vec::new(),
         input: None,
+        plan: None,
         derived_from: None,
     }
 }
@@ -188,6 +191,40 @@ fn real_run_round_trips() {
     assert!(bytes.ends_with(b"\n"));
 }
 
+/// Every lock and release point names the workload's one lock: its first
+/// locker's first object. Other points name none.
+#[test]
+fn lock_points_name_their_lock() {
+    let dir = TempDir::new().unwrap();
+    let report = record_to(dir.path(), &meta(), plan(), &mut NoChecks);
+    let mut named = Vec::new();
+    for entry in report.log.entries() {
+        if let Observation::TaskReached {
+            task, at, object, ..
+        } = &entry.obs
+        {
+            match at.split('#').next() {
+                Some("lock" | "release") => named.push((
+                    task.as_str(),
+                    object
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{task} at {at} names no object")),
+                )),
+                _ => assert_eq!(*object, None, "{task} at {at}"),
+            }
+        }
+    }
+    let (first, _) = named.first().expect("the run takes the lock");
+    let lock = format!("{first}:object#1");
+    assert!(named.iter().all(|(_, object)| *object == lock), "{named:?}");
+    let tasks: BTreeSet<&str> = named.iter().map(|(task, _)| *task).collect();
+    assert_eq!(
+        tasks.len(),
+        3,
+        "each task's points name the lock: {named:?}"
+    );
+}
+
 #[test]
 fn equal_runs_write_equal_bytes() {
     for plan in inputs(10, 64) {
@@ -274,16 +311,16 @@ fn run_and_read(checker: &mut dyn Checker) -> (RunReport, EndRecord) {
 /// A report for `test/at-end`.
 fn at_end(outcome: PropertyOutcome, holds_since: Option<u64>) -> PropertyReport {
     PropertyReport {
-        property: "test/at-end".into(),
-        outcome,
         holds_since,
+        ..PropertyReport::new("test/at-end", outcome)
     }
 }
 
 #[test]
 fn reports_outside_the_run_are_a_harness_failure() {
-    // Evidence past the run ends it as a harness failure. The bad step is
-    // left out of the report, so the trace still reads.
+    // Evidence past the run ends it as a harness failure. The violation
+    // was found only at the end, with no step behind it, so the harness end
+    // drops it, and the trace still reads.
     let (run, end) = run_and_read(&mut reports_at_end(|_| {
         at_end(
             PropertyOutcome::Violated {
@@ -299,15 +336,23 @@ fn reports_outside_the_run_are_a_harness_failure() {
             step: 99_999,
         })
     );
-    let kept = at_end(PropertyOutcome::Violated { witness: vec![2] }, None);
+    let dropped = at_end(
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed),
+        None,
+    );
     assert_eq!(
         (&run.properties[..], &end.properties[..]),
-        (&[kept.clone()][..], &[kept][..])
+        (&[dropped.clone()][..], &[dropped][..])
     );
 
-    // So does a holds_since past the last step.
+    // So does a holds_since past the last step, and like any harness
+    // failure it leaves a property that didn't apply `HarnessFailed`, in the
+    // report and in the end record alike.
     let (run, end) = run_and_read(&mut reports_at_end(|steps| {
-        at_end(PropertyOutcome::NotApplicable, Some(steps + 1))
+        at_end(
+            PropertyOutcome::not_applicable(NaReason::NeverApplied),
+            Some(steps + 1),
+        )
     }));
     assert_eq!(
         run.end.harness,
@@ -317,9 +362,13 @@ fn reports_outside_the_run_are_a_harness_failure() {
         })
     );
     assert_eq!(end.outcome, OutcomeKind::Harness);
+    let harness_failed = at_end(
+        PropertyOutcome::not_applicable(NaReason::HarnessFailed),
+        None,
+    );
     assert_eq!(
-        end.properties,
-        [at_end(PropertyOutcome::NotApplicable, None)]
+        (&run.properties[..], &end.properties[..]),
+        (&[harness_failed.clone()][..], &[harness_failed][..])
     );
 
     // References to the run's own steps, including holds_since 0 and the
@@ -655,6 +704,7 @@ fn writer_keeps_to_the_line_limit() {
             offset: None,
             draws: Vec::new(),
             obs: None,
+            machine: None,
         })
     };
     sink.record(Record::Init(InitRecord::default()));
@@ -790,16 +840,31 @@ fn unsupported_format() {
     let dir = recorded(plan());
     // A newer format may add fields, so the version is checked first.
     edit_meta(dir.path(), |meta| {
-        meta["format"] = json!(2);
+        meta["format"] = json!(zakura_sim::record::FORMAT_VERSION + 1);
         meta["requires_hints"] = json!(true);
     });
     assert_eq!(
         invalid(dir.path()),
         Invalid::UnsupportedVersion {
             field: "format",
-            found: 2
+            found: zakura_sim::record::FORMAT_VERSION + 1
         }
     );
+}
+
+#[test]
+fn previous_machine_formats_are_rejected() {
+    for format in 19..zakura_sim::record::FORMAT_VERSION {
+        let dir = recorded(plan());
+        edit_meta(dir.path(), |meta| meta["format"] = json!(format));
+        assert_eq!(
+            invalid(dir.path()),
+            Invalid::UnsupportedVersion {
+                field: "format",
+                found: format
+            }
+        );
+    }
 }
 
 #[test]
@@ -1443,6 +1508,7 @@ fn step() -> impl Strategy<Value = StepRecord> {
                 offset,
                 draws,
                 obs,
+                machine: None,
             },
         )
 }
@@ -1451,9 +1517,36 @@ fn step() -> impl Strategy<Value = StepRecord> {
 fn property_outcome() -> impl Strategy<Value = PropertyOutcome> {
     prop_oneof![
         any::<u32>().prop_map(|applicable| PropertyOutcome::Held { applicable }),
-        Just(PropertyOutcome::NotApplicable),
-        text().prop_map(|reason| PropertyOutcome::Inconclusive { reason }),
+        na_reason().prop_map(PropertyOutcome::not_applicable),
         u64s().prop_map(|witness| PropertyOutcome::Violated { witness }),
+    ]
+}
+
+/// A `NotApplicable` reason: each unit reason, and an `Unsettled` mark at
+/// each site.
+fn na_reason() -> impl Strategy<Value = NaReason> {
+    use zakura_sim::property::Pending;
+    prop_oneof![
+        prop::sample::select(vec![
+            NaReason::NeverApplied,
+            NaReason::Undeclared,
+            NaReason::Excluded,
+            NaReason::AssumptionsNeverHeld,
+            NaReason::AssumptionLost,
+            NaReason::StoppedByViolation,
+            NaReason::HarnessFailed,
+            NaReason::NodeStopped,
+        ]),
+        prop::sample::select(vec![
+            Pending::FaultOpen,
+            Pending::UnreadBoundary,
+            Pending::TeardownOpen,
+            Pending::BlockTeardownOpen,
+            Pending::WatchOpen,
+            Pending::UnreadTrigger,
+            Pending::UnjudgedDeparture,
+        ])
+        .prop_map(|site| NaReason::Unsettled { site }),
     ]
 }
 
@@ -1505,9 +1598,8 @@ fn end() -> impl Strategy<Value = EndRecord> {
     let properties = vec(
         (text(), property_outcome(), option::of(edge_u64())).prop_map(
             |(property, outcome, holds_since)| PropertyReport {
-                property,
-                outcome,
                 holds_since,
+                ..PropertyReport::new(property, outcome)
             },
         ),
         0..3,
@@ -1636,6 +1728,14 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
         ),
         option::of((text(), edge_u64()).prop_map(|(sha256, len)| InputRef { sha256, len })),
         option::of(
+            (
+                prop_oneof![Just(PlanKind::Bytes), Just(PlanKind::Script)],
+                text(),
+                edge_u64(),
+            )
+                .prop_map(|(kind, sha256, len)| PlanRef { kind, sha256, len }),
+        ),
+        option::of(
             (text(), tool, any::<u32>()).prop_map(|(trace, tool, tool_version)| Derivation {
                 trace,
                 tool,
@@ -1656,7 +1756,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 build,
                 (sim, scenario, rng),
                 (scheduler, budget),
-                (assumptions, fixtures, properties, input, derived_from),
+                (assumptions, fixtures, properties, input, plan, derived_from),
             )| MetaRecord {
                 format,
                 contract,
@@ -1671,6 +1771,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 fixtures,
                 properties,
                 input,
+                plan,
                 derived_from,
             },
         )
@@ -1740,6 +1841,7 @@ fn round_trip_edges() {
         fixtures: Vec::new(),
         properties: Vec::new(),
         input: None,
+        plan: None,
         derived_from: None,
     };
     let bare_step = StepRecord {
@@ -1751,6 +1853,7 @@ fn round_trip_edges() {
         offset: None,
         draws: Vec::new(),
         obs: None,
+        machine: None,
     };
     let bare_end = EndRecord {
         outcome: OutcomeKind::Budget,

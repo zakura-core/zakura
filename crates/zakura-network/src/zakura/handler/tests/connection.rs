@@ -19,16 +19,22 @@ impl ZakuraProtocolHandler {
     }
 }
 
-pub(in crate::zakura::handler) async fn connect_and_serve(
+/// Connect `client` to `address`, take `held` of the peer's stream credits,
+/// and serve the connection with `handler`. Holding the returned streams
+/// without writing to them withholds those credits from the handler's own
+/// opens.
+pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
     client: &QuicEndpoint,
     address: NodeAddr,
     handler: ZakuraProtocolHandler,
     limits: ZakuraLocalLimits,
     alpn: &[u8],
     deadline: Duration,
+    held: usize,
 ) -> Result<
     (
         Connection,
+        Vec<(SendStream, RecvStream)>,
         AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     ),
     BoxError,
@@ -51,6 +57,10 @@ pub(in crate::zakura::handler) async fn connect_and_serve(
         ),
     )
     .await??;
+    let mut held_streams = Vec::with_capacity(held);
+    for _ in 0..held {
+        held_streams.push(timeout(deadline, connection.open_bi()).await??);
+    }
     let remote_ip = Some(connection.admitted_ip());
     let serving_connection = connection.clone();
     let transport = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -72,9 +82,10 @@ pub(in crate::zakura::handler) async fn connect_and_serve(
                     i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
                     conn,
                     control_handshake: None,
+                    registration_report: None,
                 },
             )
             .await
     }));
-    Ok((connection, transport))
+    Ok((connection, held_streams, transport))
 }

@@ -578,7 +578,7 @@ fn calculate_sapling_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let sapling_note_commitments = block
             .sapling_note_commitments()
@@ -703,7 +703,7 @@ fn calculate_orchard_subtree(
         // TODO: consider just reading the block's transactions from the database file,
         //       because we don't use the block header data at all.
         let block = read_db
-            .block(end_height.into())
+            .stored_block(end_height.into())
             .expect("height with note commitment tree should have block");
         let orchard_note_commitments = block
             .orchard_note_commitments()

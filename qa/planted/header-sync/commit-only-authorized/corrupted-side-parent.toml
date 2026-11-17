@@ -1,0 +1,12 @@
+# A node round's apply installs its transition and also stores the
+# finalized anchor as a held side branch tip's parent, keeping its header,
+# key, indexes and eligibility, so ancestry reads follow the wrong branch.
+# The fixture's own preload applies faithfully. The reactor, the queue, the
+# storage adapter and the engine decide how the witness's rounds apply, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

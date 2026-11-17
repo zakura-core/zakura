@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4ba2e67b9f..dfbb6c2deb 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -1066,8 +1066,8 @@ impl LocatorQueries {
+         if pending.call != key.call {
+             return None;
+         }
++        // Mutation: settling a read returns its scope but keeps its entry.
+         let scope = pending.scope;
+-        self.pending.remove(&key.peer);
+         Some(scope)
+     }
+ 

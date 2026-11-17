@@ -1,5 +1,9 @@
 //! Randomised property tests for the finalized state.
 
+// Several fast-sync tests here are built around the Sprout tree and need the `sprout` feature.
+// Without it, imports only they use are unused.
+#![cfg_attr(not(feature = "sprout"), allow(unused_imports))]
+
 use std::{
     collections::HashMap,
     env,
@@ -7,6 +11,7 @@ use std::{
     fs,
     sync::{Arc, Mutex},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -45,11 +50,13 @@ use crate::{
 };
 
 use super::super::{
-    commitment_aux, export_frontier_grid_to, serve_block_roots,
-    vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
-    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, FrontierGridExportError,
-    GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
+    commitment_aux, export_frontier_grid_to, serve_block_roots, verify_subtrees_against_stored,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry,
+    FrontierGridExportError, GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
 };
+
+#[cfg(feature = "sprout")]
+use super::super::vct::validate_final_frontiers_bytes;
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
 
@@ -65,9 +72,10 @@ type SaplingTree = Arc<zakura_chain::sapling::tree::NoteCommitmentTree>;
 type OrchardTree = Arc<zakura_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 
-fn vct_successor_witness(block: Arc<Block>) -> VctSuccessorWitness {
+fn vct_successor_witness(block: impl Into<BlockHandle>) -> VctSuccessorWitness {
+    let block = block.into();
     VctSuccessorWitness::from_header(
-        block.header.clone(),
+        Arc::new(*block.view().header()),
         block
             .coinbase_height()
             .expect("prepared successor blocks have a coinbase height"),
@@ -75,19 +83,19 @@ fn vct_successor_witness(block: Arc<Block>) -> VctSuccessorWitness {
     )
 }
 
-fn next_vct_block(block: Arc<Block>) -> Option<VctSuccessorWitness> {
+fn next_vct_block(block: impl Into<BlockHandle>) -> Option<VctSuccessorWitness> {
     Some(vct_successor_witness(block))
 }
 
 fn exact_vct_auxiliary_window(
-    block: &Arc<Block>,
+    block: &zakura_chain::block::BlockRef,
     height: Height,
     roots: (
         zakura_chain::sapling::tree::Root,
         zakura_chain::orchard::tree::Root,
         zakura_chain::ironwood::tree::Root,
     ),
-    successor: &Arc<Block>,
+    successor: &zakura_chain::block::BlockRef,
 ) -> VctAuxiliaryWindow {
     use std::num::NonZeroU64;
     use zakura_header_chain::{
@@ -158,11 +166,11 @@ fn exact_vct_auxiliary_window(
     );
     VctAuxiliaryWindow {
         engine_snapshot: snapshot,
-        delivery_header: block.header.clone(),
+        delivery_header: Arc::new(*block.header()),
         delivery: current,
         successor_height: Some(successor_height),
         successor: VctSuccessorWitness::from_delivery(
-            successor.header.clone(),
+            Arc::new(*successor.header()),
             successor_height,
             successor_delivery,
         ),
@@ -224,6 +232,7 @@ fn enable_vct_test_fixture_source_with_handoff(
 /// The contextual anchor check does not verify proofs, so the original BCTV14 proof is replaced
 /// with a correctly sized placeholder Groth16 proof. Proof verification belongs to semantic
 /// verification and is deliberately outside this state-anchor regression.
+#[cfg(feature = "sprout")]
 fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<Transaction> {
     let source = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
         .zcash_deserialize_into::<Block>()
@@ -267,7 +276,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
         outputs: Vec::new(),
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
-        joinsplit_data: Some(JoinSplitData {
+        joinsplit_data: Some(Box::new(JoinSplitData {
             first,
             rest: vec![second],
             pub_key: source
@@ -292,7 +301,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
                     _ => None,
                 })
                 .expect("the source JoinSplit has a signature"),
-        }),
+        })),
         sapling_shielded_data: None,
     })
 }
@@ -319,6 +328,8 @@ fn vct_test_network() -> Network {
         .expect("failed to build configured network")
 }
 
+// Generates final frontiers, which needs the Sprout tree.
+#[cfg(feature = "sprout")]
 #[test]
 fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -915,6 +926,8 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
 /// The committer returns `VctSuppliedRootAwaitingSuccessor` and leaves the database untouched.
 /// The committer accepts the same height after the test buffers a successor.
 /// A trusted local fixture remains exempt from this requirement.
+// Counts the Sprout commitments a retried fast-sync commit appends.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
@@ -943,7 +956,7 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             // The checkpoint commit path intentionally assumes semantic verification already
             // succeeded, so this fixture can append a structurally valid JoinSplit transaction
             // without rebuilding the block's transaction Merkle root.
-            let mut target_block = blocks[tip_target].block.clone();
+            let mut target_block = crate::tests::copy_block_fixture(&blocks[tip_target].block);
             let empty_sprout_tree = SproutTree::default();
             Arc::make_mut(&mut target_block)
                 .transactions
@@ -963,7 +976,7 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             let mut peer_roots = Vec::new();
             for i in 0..=tip_target {
                 let block = if i == tip_target {
-                    target_block.clone()
+                    target_block.clone().into()
                 } else {
                     blocks[i].block.clone()
                 };
@@ -989,7 +1002,7 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             // The modified target changes its history-tree leaf. Before NU5 the successor
             // header commits directly to that resulting history root, so update the witness
             // fixture while preserving its link to the target's unchanged header hash.
-            let mut target_successor = blocks[tip_target + 1].block.clone();
+            let mut target_successor = crate::tests::copy_block_fixture(&blocks[tip_target + 1].block);
             let target_history_root = legacy
                 .db
                 .history_tree()
@@ -1439,6 +1452,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 /// height, marks the database fast-synced, guards historical per-height tree reads
 /// below the handoff, and leaves the tip treestate (which post-checkpoint semantic
 /// verification resumes from) byte-identical to the legacy recompute.
+// Checks the Sprout tree that fast sync rebuilds up to the handoff.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
 fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
@@ -1665,14 +1680,14 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // legacy/archive node derives from its per-height trees.
             let below_handoff = Height((seed + 1) as u32)..=Height(last as u32 - 1);
             let served = fast.db.commitment_roots_by_height_range(below_handoff.clone());
-            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff.clone());
+            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff.clone()).unwrap();
             prop_assert!(!served.is_empty(), "a fast-synced node serves below-handoff roots from the index");
             prop_assert_eq!(served, expected.clone(), "index-served roots match the legacy per-height-tree roots");
 
             // The same range goes through `serve_block_roots`: with `U = 0` the request starts at
             // or above the upgrade height, so it is served entirely from the index — no per-height
             // trees (which the fast-synced node lacks below the handoff) are consulted.
-            prop_assert_eq!(serve_block_roots(&fast.db, below_handoff), expected, "serve_block_roots serves the fast-synced range from the index");
+            prop_assert_eq!(serve_block_roots(&fast.db, below_handoff).unwrap(), expected, "serve_block_roots serves the fast-synced range from the index");
 
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
@@ -2212,7 +2227,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             // a body with the expected header hash and transaction ID but a
             // different auth-data root. (Coinbase scripts are a special case:
             // they are bound by the mined transaction ID.)
-            let honest_block = blocks[seed + 3].block.clone();
+            let honest_block = crate::tests::copy_block_fixture(&blocks[seed + 3].block);
             let mut hostile_block = (*honest_block).clone();
             let (transaction_index, input_index) = honest_block
                 .transactions
@@ -2487,6 +2502,8 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
 /// This is coverage the existing equivalence test lacks: there the roots are captured
 /// from the committer's inline-returned trees, here they come from the **DB read path**
 /// a serving node runs. No networking and no DB-format change.
+// Generates final frontiers, which needs the Sprout tree.
+#[cfg(feature = "sprout")]
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
 fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
@@ -2524,7 +2541,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let produced_roots = commitment_aux::produce_block_roots(
                 &legacy.db,
                 Height((seed + 1) as u32)..=last_height,
-            );
+            ).unwrap();
             let produced_frontiers = commitment_aux::produce_final_frontiers(&legacy.db, last_height)
                 .expect("legacy DB has the tip frontier");
 
@@ -2572,7 +2589,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             // boundary that would stall the client's minimum-progress check.
             let serve_range = Height((seed + 1) as u32)..=last_height;
             let all_trees_reference =
-                commitment_aux::produce_block_roots(&legacy.db, serve_range.clone());
+                commitment_aux::produce_block_roots(&legacy.db, serve_range.clone()).unwrap();
             let upgrade = Height(((seed + 1 + last) / 2) as u32);
             prop_assert!(
                 serve_range.start() < &upgrade && upgrade <= last_height,
@@ -2820,7 +2837,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .db
                 .write_batch(batch)
                 .expect("restoring the fixture handoff succeeds");
-            let stitched = serve_block_roots(&legacy.db, serve_range);
+            let stitched = serve_block_roots(&legacy.db, serve_range).unwrap();
             prop_assert_eq!(
                 stitched,
                 all_trees_reference,
@@ -2903,7 +2920,7 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
             let produced_roots = commitment_aux::produce_block_roots(
                 &legacy.db,
                 Height((seed + 1) as u32)..=Height(last as u32),
-            );
+            ).unwrap();
 
             // Consume the untrusted roots in a fresh fast-sync state.
             // The test buffers each fast block's successor before commit, as the write loop does.

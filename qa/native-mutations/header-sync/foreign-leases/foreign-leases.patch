@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index f86287d775..3811f876c1 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -829,7 +829,13 @@ impl PeerWorkQueue {
+             peer: peer.clone(),
+             incarnation,
+             call,
+-            leases: self.staged_capacity.get(peer).cloned().unwrap_or_default(),
++            // Mutation: the call also takes every other peer's staged leases.
++            leases: self
++                .staged_capacity
++                .values()
++                .flatten()
++                .cloned()
++                .collect(),
+             end: HeaderWorkEnd::Dropped,
+             #[cfg(any(test, zakura_sim))]
+             observer: ObserverSlot::default(),

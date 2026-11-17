@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..5b2f79c004 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -174,9 +174,13 @@ impl<'a> FrameFilter<'a> {
+             }
+             return Ok(frame_cap);
+         };
+-        let rule = MessageRule::find(rules, message_type)
+-            .filter(|rule| self.reader.admits(rule.role))
+-            .ok_or(FrameRejection::UnknownMessageType)?;
++        // A type this reader's table doesn't declare reads like a frame on a
++        // stream without a table: the service's decoder judges it.
++        let Some(rule) =
++            MessageRule::find(rules, message_type).filter(|rule| self.reader.admits(rule.role))
++        else {
++            return Ok(frame_cap);
++        };
+         // No native message defines a flag bit.
+         if flags != 0 {
+             return Err(FrameRejection::ReservedFlags);

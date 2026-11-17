@@ -259,7 +259,9 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Body range request sent to a peer.
+    /// Queue admission funded a block request's retained run.
+    pub const BLOCK_REQUEST_FUNDED: &str = "block_request_funded";
+    /// A published body range request entered the peer's transport queue.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted a decoded inbound block-sync wire message.
     pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
@@ -336,6 +338,10 @@ pub mod discovery_trace {
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
     /// The discovery reader rejected a peer's frame and closed the connection.
     pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
+    /// Phase of one claimed query answer.
+    pub const DISCOVERY_ANSWER: &str = "discovery_answer";
+    /// Phase of one candidate dial attempt.
+    pub const DISCOVERY_DIAL_PHASE: &str = "discovery_dial_phase";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.
@@ -487,6 +493,32 @@ impl ZakuraTrace {
                 Some(u64::try_from(sample.send_blocked.as_micros()).unwrap_or(u64::MAX)),
             );
             insert_optional_str(row, "close_reason", sample.close_reason.as_deref());
+        });
+    }
+
+    /// Emit one `handshake` row tying a peer's trace label to where it connected from
+    /// and the software it runs, once its legacy connection has been upgraded to Zakura.
+    ///
+    /// `addr` is the address of the upgraded connection as the node's
+    /// `expose_peer_addresses` setting allows it to be written, and `user_agent` the
+    /// peer's sanitized handshake user agent.
+    pub(crate) fn emit_peer_upgraded(
+        &self,
+        peer_id: &ZakuraPeerId,
+        addr: &str,
+        user_agent: &str,
+        inbound: bool,
+    ) {
+        self.emit_with(HANDSHAKE_TABLE, |row| {
+            row.insert(
+                "event".to_string(),
+                Value::String("peer_upgraded".to_string()),
+            );
+            let direction = if inbound { "inbound" } else { "outbound" };
+            insert_optional_str(row, "direction", Some(direction));
+            insert_optional_str(row, "peer", Some(&peer_label(peer_id)));
+            insert_optional_str(row, "addr", Some(addr));
+            insert_optional_str(row, "user_agent", Some(user_agent));
         });
     }
 
@@ -796,6 +828,24 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "build closure must not run when the queue is full"
         );
+    }
+
+    #[test]
+    fn an_upgraded_peer_is_recorded_with_the_software_it_runs() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let trace = ZakuraTrace::new(JsonlTracer::new(tx), "node");
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("32 bytes is a valid peer id");
+
+        trace.emit_peer_upgraded(&peer_id, "192.0.2.7:8233", "/Zakura:1.8.7/", true);
+
+        let written = rx.try_recv().expect("one row is written");
+        assert_eq!(written.file_name, "handshake.jsonl");
+        let row: Value = serde_json::from_slice(&written.line).expect("a row is one JSON object");
+        assert_eq!(row["event"], "peer_upgraded");
+        assert_eq!(row["direction"], "inbound");
+        assert_eq!(row["peer"], peer_label(&peer_id));
+        assert_eq!(row["addr"], "192.0.2.7:8233");
+        assert_eq!(row["user_agent"], "/Zakura:1.8.7/");
     }
 
     #[test]

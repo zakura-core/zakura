@@ -1,0 +1,27 @@
+name: P2P fuzzing
+
+on:
+  # Run a bounded campaign daily, and a longer one on Sunday.
+  schedule:
+    - cron: "28 5 * * 1-6"
+    - cron: "28 5 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fuzz-campaign.yml
+    with:
+      package: p2p
+      label: p2p
+      weekly_cron: "28 5 * * 0"
+      timeout_minutes: 120
+      nightly: nightly-2026-07-15

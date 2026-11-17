@@ -16,9 +16,8 @@
 FROM rust:1.97.1-trixie
 ENV DEBIAN_FRONTEND=noninteractive
 
-# libclang-dev is for bindgen, which the RocksDB bindings run at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libclang-dev clang cmake pkg-config python3 \
+      cmake pkg-config python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # cargo-nextest, the test runner CI uses.

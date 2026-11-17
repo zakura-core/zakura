@@ -1,0 +1,35 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9905b6dafc..76c6f27f9a 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -341,13 +341,7 @@ impl SubscriberState {
+                 if previous_hash == live.target {
+                     return Err(SubscriberFault::PastTarget);
+                 }
+-                if live
+-                    .locators
+-                    .iter()
+-                    .any(|locator| locator.hash == previous_hash)
+-                {
+-                    return Err(SubscriberFault::LowerLocator);
+-                }
++                // Mutation: the interior lower-locator check is dropped.
+             }
+             previous_hash = entry.header.hash();
+         }
+@@ -358,14 +352,7 @@ impl SubscriberState {
+             }
+         } else {
+             let reaches = last_hash == live.target;
+-            if !reaches
+-                && live
+-                    .locators
+-                    .iter()
+-                    .any(|locator| locator.hash == last_hash)
+-            {
+-                return Err(SubscriberFault::LowerLocator);
+-            }
++            // Mutation: the last-header lower-locator check is dropped.
+             // Only the target is at its height on the path to it, so a page
+             // that reaches that height elsewhere never reaches the target.
+             if !reaches && height >= live.target_height.0 {

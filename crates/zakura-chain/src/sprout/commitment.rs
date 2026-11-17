@@ -2,20 +2,6 @@
 
 use crate::fmt::HexDebug;
 
-/// The randomness used in the Pedersen Hash for note commitment.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    any(test, feature = "proptest-impl"),
-    derive(proptest_derive::Arbitrary)
-)]
-pub struct CommitmentRandomness(pub HexDebug<[u8; 32]>);
-
-impl AsRef<[u8]> for CommitmentRandomness {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
 /// Note commitments for the output notes.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[cfg_attr(

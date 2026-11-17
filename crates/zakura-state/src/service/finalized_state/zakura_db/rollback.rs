@@ -27,6 +27,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
+use super::shielded::{update_note_commitment_trees, MAINTAINS_SPROUT_TREE};
 use crate::{
     config::state_database_format_version_on_disk,
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
@@ -508,7 +509,7 @@ fn prepare_rollback(
         .map(Height)
     {
         let block = db
-            .block(height.into())
+            .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
             .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
@@ -589,6 +590,9 @@ struct RebuiltTreestate {
     sprout_tree: Arc<zakura_chain::sprout::tree::NoteCommitmentTree>,
     history_tree: HistoryTree,
     retained_sprout_roots: Option<HashSet<zakura_chain::sprout::tree::Root>>,
+    /// The first height whose Sprout note commitments the rebuild left out of `sprout_tree`,
+    /// because this build does not maintain the Sprout tree.
+    sprout_tree_skipped_from: Option<Height>,
 }
 
 fn prepare_target_treestate(
@@ -622,6 +626,7 @@ fn load_modern_treestate_at_height(
         // No removed block changed the Sprout note commitment tree, so the current tip tree is
         // exactly the target tree and no Sprout anchors above the target were created.
         retained_sprout_roots: None,
+        sprout_tree_skipped_from: None,
     })
 }
 
@@ -653,7 +658,13 @@ fn rebuild_history_tree_from_upgrade_activation(
         let (block, sapling_root, orchard_root, ironwood_root) =
             history_rebuild_inputs_at_height(db, height)?;
 
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        history_tree.push(
+            network,
+            &block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+        )?;
     }
 
     Ok(history_tree)
@@ -672,7 +683,7 @@ fn history_rebuild_inputs_at_height(
     RollbackFinalizedStateError,
 > {
     let block = db
-        .block(height.into())
+        .stored_block(height.into())
         .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
     if let Some(roots) = db
@@ -712,25 +723,39 @@ fn rebuild_treestate_to_height(
     let mut note_commitment_trees = NoteCommitmentTrees::default();
     let mut history_tree = HistoryTree::default();
     let mut retained_sprout_roots = HashSet::new();
+    let mut sprout_tree_skipped_from = None;
 
     for height in (Height::MIN.0..=target_height.0).map(Height) {
         let block = db
-            .block(height.into())
+            .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
-        note_commitment_trees.update_trees_parallel(&block)?;
+        update_note_commitment_trees(&mut note_commitment_trees, &block)?;
+        if !MAINTAINS_SPROUT_TREE
+            && sprout_tree_skipped_from.is_none()
+            && block_has_sprout_commitments(&block)
+        {
+            sprout_tree_skipped_from = Some(height);
+        }
         retained_sprout_roots.insert(note_commitment_trees.sprout.root());
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
         let ironwood_root = note_commitment_trees.ironwood.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        history_tree.push(
+            network,
+            &block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+        )?;
     }
 
     Ok(RebuiltTreestate {
         sprout_tree: note_commitment_trees.sprout,
         history_tree,
         retained_sprout_roots: Some(retained_sprout_roots),
+        sprout_tree_skipped_from,
     })
 }
 
@@ -880,11 +905,11 @@ fn finalized_output(
             hash: outpoint.hash,
         },
     )?;
-    let transaction =
-        db.transaction(outpoint.hash)
-            .ok_or(RollbackFinalizedStateError::MissingTransaction {
-                hash: outpoint.hash,
-            })?;
+    let transaction = db.stored_transaction(outpoint.hash).ok_or(
+        RollbackFinalizedStateError::MissingTransaction {
+            hash: outpoint.hash,
+        },
+    )?;
     let output = transaction
         .0
         .outputs()
@@ -1028,6 +1053,13 @@ fn reset_tip_trees(db: &ZakuraDb, batch: &mut DiskWriteBatch, treestate: &Rebuil
     // with the trees rebuilt up to the target height.
     batch.update_sprout_tree(db, &treestate.sprout_tree);
     batch.update_history_tree(db, &treestate.history_tree);
+
+    // A rebuild that left out Sprout note commitments replaces the tip tree with an incomplete
+    // one, so it marks the database as a block commit that skips them does. The rebuild starts
+    // at genesis, so its first skipped height is at or below any height already marked.
+    if let Some(skipped_from) = treestate.sprout_tree_skipped_from {
+        batch.prepare_sprout_tree_skipped_marker_batch(db, skipped_from);
+    }
 
     // The sapling, orchard, and ironwood trees are height-keyed and de-duplicated: the forward write only
     // stores a tree when its root changes, and reads find the tip tree by searching backwards.
@@ -1568,7 +1600,8 @@ mod tests {
         db.write_batch(batch)
             .expect("seeding the serving index succeeds");
 
-        let served = crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6));
+        let served =
+            crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6)).unwrap();
         assert_eq!(
             served
                 .into_iter()

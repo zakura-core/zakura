@@ -1,0 +1,188 @@
+"""Model actions and findings accepted at the review boundary."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Protocol
+
+PROVIDERS = ("openai", "abliterated")
+SEVERITIES = ("Critical", "High", "Medium")
+
+class ReviewError(RuntimeError):
+    """A review could not finish; its partial evidence must remain visible."""
+
+
+class ProviderError(ReviewError):
+    """A sanitized provider failure, optionally safe to retry within the budget."""
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+@dataclass(frozen=True)
+class ModelRequest:
+    messages: list[dict[str, str]]
+    max_output_tokens: int
+
+
+@dataclass(frozen=True)
+class ModelReply:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class SourceReference:
+    revision: str
+    path: str
+    start: int
+    end: int
+    quote: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    severity: str
+    category: str
+    title: str
+    trigger: str
+    impact: str
+    explanation: str
+    change_path: str
+    release_connection: str
+    verification: str
+    reference: SourceReference
+
+    @classmethod
+    def from_validated(cls, value: dict) -> Finding:
+        """Convert a schema-validated finding without changing its wire fields."""
+        return cls(**(value | {"reference": SourceReference(**value["reference"])}))
+
+
+@dataclass(frozen=True)
+class RepositoryAction:
+    kind: str
+    revision: str
+    path: str
+    start: int
+    end: int
+    query: str
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    complete: bool
+    summary: str
+    actions: list[RepositoryAction]
+    findings: list[Finding]
+
+
+class ModelProvider(Protocol):
+    def complete(self, request: ModelRequest) -> ModelReply:
+        """Return a completed response with billable usage, or a sanitized error."""
+        ...
+
+
+def object_schema(properties: dict) -> dict:
+    return {
+        "type": "object", "properties": properties,
+        "required": list(properties), "additionalProperties": False,
+    }
+
+
+def string_schema(*, maximum: int = 4000, choices: list[str] | None = None) -> dict:
+    schema = {"type": "string", "maxLength": maximum}
+    if choices is not None:
+        schema["enum"] = choices
+    return schema
+
+
+LOCATION_PROPERTIES = {
+    "revision": string_schema(choices=["base", "head"]),
+    "path": string_schema(maximum=1024),
+    "start": {"type": "integer", "minimum": 1},
+    "end": {"type": "integer", "minimum": 1},
+}
+REFERENCE_SCHEMA = object_schema({**LOCATION_PROPERTIES, "quote": string_schema(maximum=2000)})
+FINDING_SCHEMA = object_schema({
+    "severity": string_schema(choices=list(SEVERITIES)),
+    "category": string_schema(choices=["consensus", "cryptography", "mining", "propagation"]),
+    "title": string_schema(maximum=160),
+    "trigger": string_schema(),
+    "impact": string_schema(),
+    "explanation": string_schema(),
+    "change_path": string_schema(maximum=1024),
+    "release_connection": string_schema(),
+    "verification": string_schema(),
+    "reference": REFERENCE_SCHEMA,
+})
+ACTION_SCHEMA = object_schema({
+    "kind": string_schema(choices=["read", "search"]),
+    **LOCATION_PROPERTIES,
+    "query": string_schema(maximum=200),
+})
+TURN_SCHEMA = object_schema({
+    "complete": {"type": "boolean"},
+    "summary": string_schema(maximum=2400),
+    "actions": {"type": "array", "maxItems": 4, "items": ACTION_SCHEMA},
+    "findings": {"type": "array", "maxItems": 12, "items": FINDING_SCHEMA},
+})
+# Free-text finding fields; each must carry evidence, not only whitespace.
+EVIDENCE_FIELDS = tuple(key for key, child in FINDING_SCHEMA["properties"].items()
+                        if child["type"] == "string" and "enum" not in child)
+
+
+def validate_schema(value, schema: dict) -> None:
+    """Validate the deliberately small schema subset used by both adapters."""
+    kind = schema["type"]
+    valid_type = {
+        "object": isinstance(value, dict), "array": isinstance(value, list),
+        "string": isinstance(value, str), "integer": type(value) is int,
+        "boolean": type(value) is bool,
+    }[kind]
+    if not valid_type:
+        raise ReviewError("model output has an invalid field type")
+    if kind == "object":
+        if set(value) != set(schema["properties"]):
+            raise ReviewError("model output has missing or unexpected fields")
+        for key, child in schema["properties"].items():
+            validate_schema(value[key], child)
+    elif kind == "array":
+        if len(value) > schema["maxItems"]:
+            raise ReviewError("model output exceeds the item limit")
+        for child in value:
+            validate_schema(child, schema["items"])
+    elif kind == "string":
+        if len(value) > schema["maxLength"] or (
+            "enum" in schema and value not in schema["enum"]
+        ):
+            raise ReviewError("model output has an invalid string or category")
+    elif kind == "integer" and value < schema["minimum"]:
+        raise ReviewError("model output has an invalid line number")
+
+
+def parse_turn(text: str) -> ModelTurn:
+    try:
+        turn = json.loads(text)
+    except (ValueError, TypeError) as error:
+        raise ReviewError("model returned malformed JSON") from error
+    validate_schema(turn, TURN_SCHEMA)
+    if turn["complete"] and turn["actions"]:
+        raise ReviewError("a completed review cannot request more context")
+    if not turn["complete"] and (not turn["actions"] or turn["findings"]):
+        raise ReviewError("unfinished model turns must request context, not report findings")
+    for finding in turn["findings"]:
+        if not all(finding[key].strip() for key in EVIDENCE_FIELDS):
+            raise ReviewError("a finding lacks required evidence")
+        if not finding["reference"]["quote"].strip():
+            raise ReviewError("a finding lacks a source quotation")
+    return ModelTurn(
+        complete=turn["complete"],
+        summary=turn["summary"],
+        actions=[RepositoryAction(**action) for action in turn["actions"]],
+        findings=[Finding.from_validated(finding) for finding in turn["findings"]],
+    )

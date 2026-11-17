@@ -1,0 +1,11 @@
+# An operator invalidation stores its reason under another invalidation
+# ID than the event's, so the target stays ineligible and a
+# reconsideration of it can't find the reason. The queue, the reactor and
+# the planner decide when the witness's reset runs, so a change there can
+# move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.plan"

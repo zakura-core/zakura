@@ -12,7 +12,6 @@ pub use address::Address;
 
 pub mod byte_array;
 
-pub use ed25519_zebra as ed25519;
 pub use reddsa;
 pub use redjubjub;
 

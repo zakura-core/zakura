@@ -21,7 +21,10 @@ use hex::{FromHex, ToHex};
 
 use crate::{block, parameters::Network, serialization::BytesInDisplayOrder, BoxError};
 
-pub use crate::work::u256::U256;
+/// The 256-bit integer behind difficulty and work values.
+///
+/// This is the history tree's work type, so work values pass to the tree without conversion.
+pub use zakura_mmr_tree::U256;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -67,6 +70,7 @@ mod tests;
 pub struct CompactDifficulty(pub(crate) u32);
 
 /// An invalid CompactDifficulty value, for testing.
+#[cfg(any(test, feature = "proptest-impl"))]
 pub const INVALID_COMPACT_DIFFICULTY: CompactDifficulty = CompactDifficulty(u32::MAX);
 
 /// A 256-bit unsigned "expanded difficulty" value.

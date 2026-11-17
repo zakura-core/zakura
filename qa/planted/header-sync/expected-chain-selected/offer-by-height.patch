@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index 30d6f23ae1..92434e04f1 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -144,6 +144,9 @@ impl AdvertisedHeaderTarget {
+     /// Whether this status names a different target that can actually serve a request.
+     pub fn is_discovery_eligible(&self, local: &EngineSnapshot) -> bool {
+         self.status.selected_tip_hash != local.frontiers.header_best.hash
++            // Mutation: an offer whose tip is lower than the local tip is
++            // refused, even with more work.
++            && self.status.selected_tip_height >= local.frontiers.header_best.height
+             // Normal discovery cannot replace the finalized prefix. Historical
+             // auxiliary repair uses its own explicitly selected target path.
+             && self.status.selected_tip_height > local.frontiers.finalized.height

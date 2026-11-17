@@ -1,0 +1,8 @@
+# The committed fuzz input `race-fixtures-snapshot-reserve-fixed.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its three bytes pick
+# the `race/snapshot-reserve` fixture, its fixed variant and one worker.
+harness = "fixtures/all"
+generator = 1
+sha256 = "9f44ac6acb8a37b00b615dc89259d306035be82dee7db2b472e4c48326195440"
+scenario_sha256 = "7630cc0fd3d84dc1ee674a72c768ed2389095af731aa22053f536bd5ff0305a6"
+source = "crates/zakura-sim/tests/race_fixtures.rs"

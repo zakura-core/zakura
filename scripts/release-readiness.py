@@ -16,14 +16,15 @@ from pathlib import Path
 
 import changelog
 
-BLOCKS_PER_DAY = 1152
-MINOR_CATEGORIES = {"Added", "Changed", "Deprecated", "Removed"}
-PATCH_WAIVABLE_CATEGORIES = {"Added", "Changed"}
-PATCH_WAIVER_PREFIX = "<!-- release-readiness: allow-patch"
-PATCH_WAIVER = re.compile(
-    r"<!--\s*release-readiness:\s*allow-patch\s*;\s*reason:\s*(?P<reason>[^<>]*\S)\s*-->",
-    re.IGNORECASE,
-)
+# Mainnet's target block spacings in seconds, with the height each starts at,
+# mirroring `NetworkUpgrade::target_spacings`: 150 seconds from genesis, 75 from
+# Blossom, and 25 from the ZIP 259 NU7 activation. A self-test checks them
+# against the Rust sources.
+MAINNET_TARGET_SPACINGS = ((0, 150), (653_600, 75), (3_543_405, 25))
+# The fail-safe floor for ESTIMATED_RELEASE_HEIGHT is this many days of blocks
+# after the committed checkpoint.
+EOS_FLOOR_DAYS = 3
+REPO_ROOT = Path(__file__).resolve().parents[1]
 NETWORK_UPGRADE = re.compile(r"\b(?:mainnet\s+)?network upgrade\b", re.IGNORECASE)
 VERSION = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\."
@@ -113,36 +114,11 @@ def changelog_context(
     }
 
 
-def patch_waiver_reason(entries: dict[str, list[str]]) -> str | None:
-    combined = "\n".join(body for bodies in entries.values() for body in bodies)
-    markers = list(PATCH_WAIVER.finditer(combined))
-    if PATCH_WAIVER_PREFIX in combined.lower() and not markers:
-        raise ReadinessError(
-            "allow-patch waiver must use "
-            "'<!-- release-readiness: allow-patch; reason: ... -->'"
-        )
-    if len(markers) > 1:
-        raise ReadinessError("release changelog must contain at most one allow-patch waiver")
-    if not markers:
-        return None
-
-    non_waivable = sorted(
-        MINOR_CATEGORIES.intersection(entries) - PATCH_WAIVABLE_CATEGORIES
-    )
-    if non_waivable:
-        raise ReadinessError(
-            "allow-patch waiver cannot cover changelog categories: "
-            + ", ".join(non_waivable)
-        )
-    return " ".join(markers[0].group("reason").split())
-
-
 def minimum_release(
     base: Version, target: Version, entries: dict[str, list[str]]
 ) -> tuple[str, CoreVersion, list[str]]:
     categories = sorted(entries)
     combined = "\n".join(body for bodies in entries.values() for body in bodies)
-    patch_waiver = patch_waiver_reason(entries)
 
     # Later candidates and the stable release keep the core chosen by the
     # first candidate. New entries during the candidate cycle are folded into
@@ -154,15 +130,11 @@ def minimum_release(
             )
         return "continuation", base.core, categories
 
+    # Only a Mainnet network upgrade forces a release level. Choosing between
+    # a patch and a minor release is left to the release owner.
     if NETWORK_UPGRADE.search(combined):
         level = "major"
         minimum = CoreVersion(base.core.major + 1, 0, 0)
-    elif patch_waiver is not None:
-        level = "patch"
-        minimum = CoreVersion(base.core.major, base.core.minor, base.core.patch + 1)
-    elif MINOR_CATEGORIES.intersection(entries):
-        level = "minor"
-        minimum = CoreVersion(base.core.major, base.core.minor + 1, 0)
     else:
         level = "patch"
         minimum = CoreVersion(base.core.major, base.core.minor, base.core.patch + 1)
@@ -170,7 +142,7 @@ def minimum_release(
     if target.core < minimum:
         raise ReadinessError(
             f"target {target.core} is below the {minimum} {level} floor "
-            f"required by changelog categories: {', '.join(categories) or 'none'}"
+            "required by a Mainnet network upgrade entry"
         )
     if target.core <= base.core:
         raise ReadinessError(
@@ -193,7 +165,6 @@ def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict
         "minimum_level": level,
         "minimum_version": str(minimum),
         "categories": categories,
-        "patch_waiver_reason": patch_waiver_reason(entries),
         "changelog": context,
     }
 
@@ -222,11 +193,35 @@ def estimated_height(
         raise ReadinessError("bundle generation time is unexpectedly in the future")
 
     elapsed = max(timedelta(), now - generated_at) + timedelta(days=delay_days)
-    projected_blocks = math.ceil(elapsed.total_seconds() * BLOCKS_PER_DAY / 86400)
-    projected = bundle_height + projected_blocks
+    projected = bundle_height + blocks_after(bundle_height, elapsed.total_seconds())
     if projected >= 2**32:
         raise ReadinessError("projected release height exceeds the u32 range")
     return projected
+
+
+def blocks_after(height: int, seconds: float) -> int:
+    """Return how many Mainnet blocks follow `height` within `seconds` at target spacing.
+
+    Rounds up, so a projection never trails the target-spacing estimate.
+    """
+    current, remaining = height, seconds
+    for index, (_, spacing) in enumerate(MAINNET_TARGET_SPACINGS):
+        if index + 1 < len(MAINNET_TARGET_SPACINGS):
+            # The block at the next spacing's start height already uses that spacing.
+            until_next = max(MAINNET_TARGET_SPACINGS[index + 1][0] - current - 1, 0)
+            if until_next * spacing < remaining:
+                current += until_next
+                remaining -= until_next * spacing
+                continue
+        return current - height + math.ceil(remaining / spacing)
+    return current - height
+
+
+def eos_floor(height: int) -> int:
+    """Return the lowest ESTIMATED_RELEASE_HEIGHT allowed for a committed checkpoint at `height`."""
+    if height <= 0 or height >= 2**32:
+        raise ReadinessError("checkpoint height is outside the u32 block-height range")
+    return height + blocks_after(height, EOS_FLOOR_DAYS * 86400)
 
 
 def height_report(
@@ -255,6 +250,16 @@ def height_report(
 
 
 class SelfTests(unittest.TestCase):
+    def test_changelog_categories_allow_patch_target(self) -> None:
+        for category in ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"):
+            with self.subTest(category=category):
+                level, minimum, _ = minimum_release(
+                    parse_version("1.8.8"),
+                    parse_version("1.8.9"),
+                    {category: ["- Changed an API."]},
+                )
+                self.assertEqual((level, str(minimum)), ("patch", "1.8.9"))
+
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -264,7 +269,7 @@ class SelfTests(unittest.TestCase):
                 "## [Unreleased]\n\n"
                 "## [1.0.6-rc0] - 2026-08-01\n\n"
                 "### Added\n\n"
-                "- Added an RPC.\n\n"
+                "- Added the Mainnet Network Upgrade.\n\n"
                 "## [1.0.5] - 2026-07-27\n\n"
                 "### Fixed\n\n"
                 "- Fixed an older bug.\n"
@@ -274,85 +279,12 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(context["latest_version"], "1.0.6-rc0")
             self.assertEqual(context["unreleased_categories"], [])
             self.assertEqual(context["pending_fragments"], 0)
-            with self.assertRaisesRegex(ReadinessError, "minor floor"):
+            with self.assertRaisesRegex(ReadinessError, "major floor"):
                 minimum_release(
                     parse_version("1.0.5"),
                     parse_version("1.0.6-rc0"),
                     entries,
                 )
-
-    def test_minor_category_rejects_patch_target(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "minor floor"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6-rc0"),
-                {"Added": ["- Added an RPC."]},
-            )
-
-    def test_explained_waiver_allows_patch_for_added_and_changed(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.0.5"),
-            parse_version("1.0.6"),
-            {
-                "Added": [
-                    "<!-- release-readiness: allow-patch; reason: "
-                    "All additions are backwards compatible. -->\n"
-                    "- Added an API."
-                ],
-                "Changed": ["- Raised a compatible operational limit."],
-            },
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.0.6"))
-
-    def test_waiver_requires_an_explanation(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "must use"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch -->\n"
-                        "- Added an API."
-                    ]
-                },
-            )
-
-    def test_waiver_cannot_cover_deprecated_or_removed_entries(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "cannot cover.*Removed"):
-            minimum_release(
-                parse_version("1.0.5"),
-                parse_version("1.0.6"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch; reason: "
-                        "The addition is backwards compatible. -->\n"
-                        "- Added an API."
-                    ],
-                    "Removed": ["- Removed an API."],
-                },
-            )
-
-    def test_waiver_cannot_bypass_network_upgrade_major_floor(self) -> None:
-        with self.assertRaisesRegex(ReadinessError, "major floor"):
-            minimum_release(
-                parse_version("1.4.2"),
-                parse_version("1.4.3"),
-                {
-                    "Added": [
-                        "<!-- release-readiness: allow-patch; reason: "
-                        "The API addition is backwards compatible. -->\n"
-                        "- Added the Mainnet Network Upgrade."
-                    ]
-                },
-            )
-
-    def test_fixed_category_allows_patch_target(self) -> None:
-        level, minimum, _ = minimum_release(
-            parse_version("1.0.5"),
-            parse_version("1.0.6-rc0"),
-            {"Fixed": ["- Fixed a bug."]},
-        )
-        self.assertEqual((level, str(minimum)), ("patch", "1.0.6"))
 
     def test_network_upgrade_requires_major_target(self) -> None:
         with self.assertRaisesRegex(ReadinessError, "major floor"):
@@ -399,6 +331,46 @@ class SelfTests(unittest.TestCase):
         now = generated + timedelta(hours=12)
         self.assertEqual(estimated_height(3_400_000, generated, now, 1), 3_401_728)
 
+    def test_height_projection_uses_nu7_spacing(self) -> None:
+        generated = datetime(2026, 11, 10, tzinfo=timezone.utc)
+        self.assertEqual(estimated_height(3_556_146, generated, generated, 1), 3_556_146 + 3456)
+        # 404 blocks at 75 seconds reach NU7 activation; the rest of the day runs at 25 seconds.
+        self.assertEqual(blocks_after(3_543_000, 86400), 404 + (86400 - 404 * 75) // 25)
+        self.assertEqual(blocks_after(3_543_000, 404 * 75), 404)
+
+    def test_eos_floor_is_three_days_of_blocks(self) -> None:
+        self.assertEqual(eos_floor(3_556_146), 3_556_146 + 3 * 3456)
+        self.assertEqual(eos_floor(3_400_000), 3_400_000 + 3 * 1152)
+        with self.assertRaises(ReadinessError):
+            eos_floor(0)
+
+    def test_spacings_match_the_rust_sources(self) -> None:
+        heights = (REPO_ROOT / "crates/zakura-chain/src/parameters/constants.rs").read_text()
+        mainnet = heights[heights.index("pub mod mainnet"):]
+        upgrades = (REPO_ROOT / "crates/zakura-chain/src/parameters/network_upgrade.rs").read_text()
+
+        def constant(source: str, name: str) -> int:
+            match = re.search(rf"\bconst {name}: \w+ = (?:Height\()?([0-9_]+)", source)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1).replace("_", ""))
+
+        function = re.search(r"fn target_spacings\(.*?\.into_iter\(\)", upgrades, re.DOTALL)
+        self.assertEqual(re.findall(r"NetworkUpgrade::(\w+)", function.group(0)),
+                         ["Genesis", "Blossom", "Nu7"])
+        self.assertEqual(MAINNET_TARGET_SPACINGS, (
+            (0, constant(upgrades, "PRE_BLOSSOM_POW_TARGET_SPACING")),
+            (constant(mainnet, "BLOSSOM"), constant(upgrades, "POST_BLOSSOM_POW_TARGET_SPACING")),
+            (constant(mainnet, "NU7"), constant(upgrades, "POST_NU7_POW_TARGET_SPACING")),
+        ))
+
+    def test_state_import_floor_matches(self) -> None:
+        importer = (REPO_ROOT / ".github/scripts/import-release-state.py").read_text()
+        match = re.search(r"^EOS_FLOOR_BLOCKS = ([0-9_]+)$", importer, re.MULTILINE)
+        self.assertIsNotNone(match)
+        # Bundle heights are all past NU7 activation, where the floor is a fixed block count.
+        post_nu7 = MAINNET_TARGET_SPACINGS[-1][0]
+        self.assertEqual(int(match.group(1).replace("_", "")), eos_floor(post_nu7) - post_nu7)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -413,6 +385,9 @@ def main() -> int:
     height_parser.add_argument("--resolution", type=Path, required=True)
     height_parser.add_argument("--expected-tag-delay-days", type=int, default=0)
 
+    floor_parser = subparsers.add_parser("eos-floor")
+    floor_parser.add_argument("--height", type=int, required=True)
+
     subparsers.add_parser("self-test")
 
     args = parser.parse_args()
@@ -424,6 +399,8 @@ def main() -> int:
                 args.resolution,
                 args.expected_tag_delay_days,
             )
+        elif args.command == "eos-floor":
+            report = eos_floor(args.height)
         else:
             suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1

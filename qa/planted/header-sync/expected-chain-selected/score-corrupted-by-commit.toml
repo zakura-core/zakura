@@ -1,0 +1,14 @@
+# The score-corrupted patch on the harness-commit witness: the snapshot
+# projection publishes half the selected tip's suffix work. The node starts
+# at genesis, whose score is zero either way, and the only change past the
+# seed is a harness commit straight into the engine. Its engine run, which
+# the port's harness-commit hook records whatever the snapshot says, is a
+# record like an apply's, so the commit's halved score is still judged.
+# The reactor and the storage adapter decide what else the witness's node
+# does, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-harness-commit.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-harness-commit.plan"

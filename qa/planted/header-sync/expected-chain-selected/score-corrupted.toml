@@ -1,0 +1,13 @@
+# The engine's snapshot projection publishes half the selected tip's
+# suffix work, keeping the tip. The metadata row, which the durable state
+# copies, stays right, so only the snapshot's score is wrong. Every engine
+# halves alike, so mirrors still offer more work than the node at genesis
+# has, and fork choice still compares like with like. The reactor, the
+# queue, the storage adapter and the engine decide how the witness's forks
+# apply, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-selection-stronger-first.json"
+plan = "crates/zakura-sim/tests/fixtures/header-selection-stronger-first.plan"

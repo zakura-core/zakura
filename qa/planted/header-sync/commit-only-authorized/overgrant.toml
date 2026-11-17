@@ -1,0 +1,11 @@
+# The Open grants one header more than its reservation holds, keeping its
+# byte window, and the mirror never needs the extra header.
+# The reactor, the subscriber and the queue decide how the witness's rounds
+# start, stage and are credited, so a change there can move the witness off
+# it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

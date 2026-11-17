@@ -1,11 +1,17 @@
 //! Definitions of network messages.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt};
+use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "proptest-impl"))]
+use zakura_chain::block::Block;
+
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     transaction::UnminedTx,
 };
 
@@ -13,6 +19,8 @@ use crate::{meta_addr::MetaAddr, BoxError};
 
 use super::{addr::AddrInVersion, inv::InventoryHash, types::*};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -59,6 +67,19 @@ pub enum Message {
         /// A nonce unique to this [`Self::Ping`] message.
         Nonce,
     ),
+
+    /// A `ping` message whose body carries `padding` zero bytes after its nonce.
+    ///
+    /// It encodes as the `ping` command. Receivers ignore a ping body's trailing bytes and
+    /// answer with an ordinary `pong`. The decoder drops those bytes, so a received padded ping
+    /// is a [`Self::Ping`], and this variant is only ever sent.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    PaddedPing {
+        /// A nonce unique to this ping, echoed by the peer's `pong`.
+        nonce: Nonce,
+        /// The number of zero bytes after the nonce.
+        padding: u32,
+    },
 
     /// A `pong` message.
     ///
@@ -205,7 +226,13 @@ pub enum Message {
     /// A `block` message.
     ///
     /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#block)
-    Block(Arc<Block>),
+    Block(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "any::<Arc<Block>>().prop_map(Into::into)")
+        )]
+        BlockHandle,
+    ),
 
     /// A `tx` message.
     ///
@@ -426,6 +453,7 @@ impl fmt::Display for Message {
             Message::Verack => "verack".to_string(),
 
             Message::Ping(_) => "ping".to_string(),
+            Message::PaddedPing { padding, .. } => format!("ping {{ padding: {padding} }}"),
             Message::Pong(_) => "pong".to_string(),
 
             Message::Reject {
@@ -484,7 +512,7 @@ impl Message {
         match self {
             Message::Version(_) => "version",
             Message::Verack => "verack",
-            Message::Ping(_) => "ping",
+            Message::Ping(_) | Message::PaddedPing { .. } => "ping",
             Message::Pong(_) => "pong",
             Message::Reject { .. } => "reject",
             Message::P2pV2Upgrade(_) => "p2pv2up",

@@ -29,6 +29,8 @@ mod driver;
 mod endpoint;
 mod error;
 mod inputs;
+#[cfg(zakura_sim)]
+mod probe;
 #[cfg(any(test, zakura_sim))]
 pub mod sim;
 mod socket;
@@ -37,7 +39,7 @@ pub mod sys;
 
 pub use config::{
     connection_memory_bytes, ConfigError, CongestionController, QuicBindConfig, QuicConfig,
-    SOCKET_DATAGRAM_QUEUE_BYTES,
+    MAX_STREAM_RECEIVE_WINDOW_BYTES, SOCKET_DATAGRAM_QUEUE_BYTES,
 };
 pub use conn::{
     BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,
@@ -48,8 +50,10 @@ pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };
 pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
+#[cfg(zakura_sim)]
+pub use probe::LoadProbe;
 pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
-pub use stream::{RecvStream, SendStream};
+pub use stream::{CreditHold, RecvStream, SendStream};
 
 // API-2, API-5: quinn-proto types that appear in this crate's API.
 pub use quinn_proto::{

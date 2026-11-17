@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..09884542aa 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2065,6 +2065,11 @@ impl HeaderSyncReactor {
+                 && active.owner == owner
+         }) && self.settles_current_call(&peer, retained.as_ref());
+         if !settles_round {
++            // Mutation: the stale handler closes its peer's live
++            // subscription.
++            if let Some(handles) = self.sessions.get(&peer) {
++                let _ = handles.session.try_close();
++            }
+             if let HeaderTargetPreparationResult::Failed(error) = &result {
+                 // The round retired, but the same identity still sent the headers.
+                 self.handle_typed_failure(peer, source, Some(owner), error);

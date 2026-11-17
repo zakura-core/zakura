@@ -71,7 +71,7 @@ impl QueuedBlocks {
     pub fn queue(&mut self, new: QueuedSemanticallyVerified) {
         let new_hash = new.0.hash;
         let new_height = new.0.height;
-        let parent_hash = new.0.block.header.previous_block_hash;
+        let parent_hash = new.0.block.header().previous_block_hash;
 
         if self.blocks.contains_key(&new_hash) {
             // Skip queueing the block and return early if the hash is not unique
@@ -200,7 +200,7 @@ impl QueuedBlocks {
         for hash in by_height.into_values().flatten() {
             let (expired_block, expired_sender, admission, _) =
                 self.blocks.remove(&hash).expect("block is present");
-            let parent_hash = &expired_block.block.header.previous_block_hash;
+            let parent_hash = &expired_block.block.header().previous_block_hash;
 
             if let Some(admission) = admission {
                 admission.reject();
@@ -266,8 +266,8 @@ impl QueuedBlocks {
             .expect("replacement was inserted under the same hash");
         assert_eq!(old.0.height, replacement.0.height);
         assert_eq!(
-            old.0.block.header.previous_block_hash,
-            replacement.0.block.header.previous_block_hash
+            old.0.block.header().previous_block_hash,
+            replacement.0.block.header().previous_block_hash
         );
         // A redelivery gets a new verifier receipt once earlier attempts finish.
         if old.0.block == replacement.0.block {
@@ -277,7 +277,7 @@ impl QueuedBlocks {
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);
         }
-        for (outpoint, ordered_utxo) in &replacement.0.new_outputs {
+        for (outpoint, ordered_utxo) in replacement.0.new_outputs.iter() {
             self.known_utxos
                 .insert(*outpoint, ordered_utxo.utxo.clone());
         }
@@ -303,7 +303,7 @@ impl QueuedBlocks {
     }
 
     /// Try to look up this UTXO in any queued block.
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.known_utxos.get(outpoint).cloned()
     }
@@ -430,7 +430,7 @@ impl SentHashes {
     }
 
     /// Try to look up this UTXO in any sent block.
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
         self.known_utxos
             .get(outpoint)

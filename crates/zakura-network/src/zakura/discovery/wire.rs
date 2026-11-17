@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use zakura_chain::primitives::ed25519::Signature;
 use zakura_quic::NodeId;
 
 use super::protocol::{
@@ -135,8 +134,14 @@ const _: () = assert!(
         == MAX_NODE_RECORD_BODY_BYTES
 );
 
-const fn row(message_type: u8, payload: PayloadLen, role: MessageRole) -> MessageRule {
+const fn row(
+    name: &'static str,
+    message_type: u8,
+    payload: PayloadLen,
+    role: MessageRole,
+) -> MessageRule {
     MessageRule {
+        name,
         // A u8 discriminator always fits in u16.
         message_type: message_type as u16,
         payload,
@@ -145,12 +150,14 @@ const fn row(message_type: u8, payload: PayloadLen, role: MessageRole) -> Messag
 }
 
 pub(crate) const HELLO: MessageRule = row(
+    "hello",
     MSG_DISCOVERY_HELLO,
     PayloadLen::between(NODE_RECORD_MIN_BYTES, MAX_NODE_RECORD_BYTES),
     MessageRole::Announcement { cadence: CADENCE },
 );
 
 pub(crate) const GET_PEERS: MessageRule = row(
+    "get-peers",
     MSG_DISCOVERY_GET_PEERS,
     PayloadLen::between(GET_PEERS_MIN_BYTES, GET_PEERS_MAX_BYTES),
     MessageRole::Request {
@@ -160,6 +167,7 @@ pub(crate) const GET_PEERS: MessageRule = row(
 );
 
 pub(crate) const PEERS: MessageRule = row(
+    "peers",
     MSG_DISCOVERY_PEERS,
     PayloadLen::between(2, PEERS_MAX_BYTES),
     MessageRole::Response {
@@ -169,6 +177,7 @@ pub(crate) const PEERS: MessageRule = row(
 );
 
 pub(crate) const GET_SERVICES: MessageRule = row(
+    "get-services",
     MSG_DISCOVERY_GET_SERVICES,
     PayloadLen::between(2, GET_SERVICES_MAX_BYTES),
     MessageRole::Request {
@@ -178,6 +187,7 @@ pub(crate) const GET_SERVICES: MessageRule = row(
 );
 
 pub(crate) const SERVICES: MessageRule = row(
+    "services",
     MSG_DISCOVERY_SERVICES,
     PayloadLen::between(SERVICES_FIXED_BYTES, SERVICES_MAX_BYTES),
     MessageRole::Response {
@@ -560,7 +570,7 @@ fn write_record(record: &ZakuraNodeRecord, out: &mut Vec<u8>) -> Result<(), Wire
     }
     // The body cap fits in u32.
     out[length_at..length_at + 4].copy_from_slice(&(body_len as u32).to_le_bytes());
-    out.extend_from_slice(&record.signature.to_bytes());
+    out.extend_from_slice(&record.signature);
     Ok(())
 }
 
@@ -612,7 +622,7 @@ fn read_record(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecord, WireE
         .ok_or(WireError::OutOfRange("record body length"))?;
     let mut body = BoundedReader::new(reader.bytes(body_len, "record body")?);
     let body = read_record_body(&mut body)?;
-    let signature = Signature::from(reader.array::<SIGNATURE_BYTES>("record signature")?);
+    let signature = reader.array::<SIGNATURE_BYTES>("record signature")?;
     Ok(ZakuraNodeRecord { body, signature })
 }
 

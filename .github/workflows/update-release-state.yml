@@ -67,7 +67,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache-save-if: false
@@ -105,7 +105,7 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           # This job packages one dependency-free crate and never builds the workspace.
@@ -127,7 +127,7 @@ jobs:
       - name: Authenticate with crates.io
         id: auth
         if: steps.existing.outputs.needed == 'true'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       # The token is scoped to this step alone and revoked when the job ends. The payload is
       # gitignored, so --allow-dirty is what lets cargo package the generated files that the
@@ -141,9 +141,32 @@ jobs:
       - name: Verify Cargo availability
         run: python3 .github/scripts/release_state.py visible --state "$RUNNER_TEMP/release-state"
 
+  python-security:
+    name: Audit Python dependencies before promotion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-python
+      - name: Audit every Python dependency group
+        shell: bash
+        run: bash scripts/check-python-dependencies.sh 2>&1 | tee "$RUNNER_TEMP/python-audit.txt"
+      - name: Preserve the audit report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-python-dependency-audit
+          path: ${{ runner.temp }}/python-audit.txt
+          if-no-files-found: warn
+
   promote:
     name: Promote the verified set to immutable ready storage
-    needs: [resolve, validate, publish-assets]
+    needs: [resolve, validate, publish-assets, python-security]
     if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -155,12 +178,14 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache: false
-      - name: Install the pinned storage client
-        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-state.txt
+      - name: Install the locked storage client
+        uses: ./.github/actions/setup-python
+        with:
+          group: release
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
         with:
           name: release-state-candidate

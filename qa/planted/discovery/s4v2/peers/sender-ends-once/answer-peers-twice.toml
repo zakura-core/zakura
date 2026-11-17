@@ -1,0 +1,9 @@
+# Discovery answers each `GetPeers` twice. The scenario's peer asks once.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/peers/sender-ends-once/answer-peers-twice.scenario.json"
+plan = "qa/planted/discovery/s4v2/peers/sender-ends-once/answer-peers-twice.plan.bin"

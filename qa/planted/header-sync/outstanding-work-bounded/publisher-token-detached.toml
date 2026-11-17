@@ -1,0 +1,12 @@
+# The service hands each publisher a token no session end cancels, so a
+# session the reactor ends leaves its publisher's token live. Under
+# fresh-identity churn the reactor ends a session whose token isn't
+# cancelled by the end of that unit. The reactor, the service and the
+# publisher decide when the witness's sessions end, so a change there can
+# move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.json"
+plan = "crates/zakura-sim/tests/fixtures/header-outstanding-churn.plan"

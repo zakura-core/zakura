@@ -67,12 +67,12 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
 /// `deficit`, or zero where reissuance is inactive.
 ///
 /// This oracle restates `ceil(deficit * BLOCK_SUBSIDY_FRACTION)` independently of
-/// `block_subsidy`, using the fixed NU7 fraction on every network.
+/// `block_subsidy`, using the Regtest NU7 fraction.
 fn reissuance_bonus(network: &Network, height: Height, deficit: i128) -> i128 {
     if !is_zip234_active(network, height) {
         return 0;
     }
-    (deficit * 1_375 + 9_999_999_999) / 10_000_000_000
+    (deficit * 8_022_777 + 9_999_999_999) / 10_000_000_000
 }
 
 /// Returns a finalized state with Regtest blocks up to the parent of [`START`], and that
@@ -153,13 +153,13 @@ pub(super) fn start_block(
 }
 
 /// Commits `block` to the finalized state as a checkpoint-verified block.
-pub(super) fn commit(
+pub(super) fn commit<B: Clone + Into<zakura_node_services::block_memory::BlockHandle>>(
     state: &mut FinalizedState,
-    block: &Arc<Block>,
+    block: &B,
 ) -> Result<(), CommitBlockError> {
     state
         .commit_finalized_direct(
-            CheckpointVerifiedBlock::from(block.clone()).into(),
+            CheckpointVerifiedBlock::from(block.clone().into()).into(),
             None,
             None,
             "NSM value balance test",

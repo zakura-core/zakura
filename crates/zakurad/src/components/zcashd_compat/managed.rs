@@ -18,7 +18,9 @@ use zakura_chain::common::TempFile;
 use super::{
     Config, ConfigZcashdBinarySource, ZcashdReleaseManifest, EMBEDDED_ZCASHD_RELEASE_MANIFEST,
 };
-use crate::components::zcashd_compat::{download, supervisor::is_command_resolvable};
+use crate::components::zcashd_compat::{
+    download, supervisor::is_command_resolvable, trust_roots::system_root_certificates,
+};
 
 /// Maximum time a managed binary download is allowed to take.
 const MANAGED_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -314,9 +316,7 @@ fn download_verified_binary(
     ))
     .with_safe_default_protocol_versions()
     .map_err(|err| eyre!("failed configuring managed zcashd TLS versions: {err}"))?
-    .with_root_certificates(rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    })
+    .with_root_certificates(system_root_certificates()?)
     .with_no_client_auth();
 
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -1,0 +1,53 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..3891b6e3b1 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1842,6 +1842,14 @@ impl HeaderSyncReactor {
+                 && active.owner == owner
+         }) && self.settles_current_call(&peer, retained.as_ref());
+         if !settles_round {
++            // Mutation: the stale handler accepts its peer's live
++            // subscription through the last cursor it received.
++            if let Some(handles) = self.sessions.get(&peer) {
++                let received = handles.session.subscriber().received_live();
++                if let Some((id, cursor)) = received {
++                    handles.session.accept(id, &cursor);
++                }
++            }
+             if let HeaderTargetAdmissionResult::Failed(error) = &result {
+                 // The round retired, but the same identity still sent the headers.
+                 self.handle_typed_failure(peer, source, Some(owner), error);
+@@ -2065,6 +2073,14 @@ impl HeaderSyncReactor {
+                 && active.owner == owner
+         }) && self.settles_current_call(&peer, retained.as_ref());
+         if !settles_round {
++            // Mutation: the stale handler accepts its peer's live
++            // subscription through the last cursor it received.
++            if let Some(handles) = self.sessions.get(&peer) {
++                let received = handles.session.subscriber().received_live();
++                if let Some((id, cursor)) = received {
++                    handles.session.accept(id, &cursor);
++                }
++            }
+             if let HeaderTargetPreparationResult::Failed(error) = &result {
+                 // The round retired, but the same identity still sent the headers.
+                 self.handle_typed_failure(peer, source, Some(owner), error);
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
+index 106b42b5a5..b87e820743 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber.rs
+@@ -454,6 +454,14 @@ impl Subscriber {
+         self.state.live()
+     }
+ 
++    // Mutation: the live subscription's last received cursor, for the
++    // stale handlers.
++    pub(crate) fn received_live(&self) -> Option<(u64, Cursor)> {
++        let id = self.state.live()?;
++        let received = self.tools.lock().received(&id).copied()?;
++        Some((id, received))
++    }
++
+     /// The live subscription, if a `Grant` can continue it toward its
+     /// target: it is not closing or failed, it has not reached its target, it
+     /// has no unspent header credit, and every page it received was accepted.

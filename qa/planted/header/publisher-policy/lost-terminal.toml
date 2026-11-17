@@ -1,0 +1,9 @@
+# Drops a queued terminal outcome instead of offering it, so the subscriber never
+# learns that its subscription ended and the slot stays held. The input's
+# `NextTerminal` finds no outcome where the model expects one.
+input = "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin"
+checks = [
+    "crates/zakura-network/src/zakura/header_sync/v9/publisher",
+    "crates/zakura-network/src/zakura/header_sync/v9/publisher.rs",
+    "crates/zakura-network/src/zakura/regulation/subscription",
+]

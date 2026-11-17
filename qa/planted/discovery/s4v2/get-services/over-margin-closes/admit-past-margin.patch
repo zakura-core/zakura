@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index 1c04c67b6e..34b1ae2fd5 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -846,11 +846,11 @@ impl DiscoverySink {
+                     .await
+                     .map_err(SinkReject::protocol)?;
+             }
+-            DiscoveryMessage::GetServices(query) => self
+-                .serving
+-                .get_services
+-                .admit(query)
+-                .map_err(SinkReject::protocol)?,
++            DiscoveryMessage::GetServices(query) => {
++                // Planted bypass: discovery admits a `GetServices` past twice
++                // its margin instead of closing.
++                let _ = self.serving.get_services.admit(query);
++            }
+             DiscoveryMessage::Services(services) => self.handle_services(services).await?,
+         }
+         if let Some(mut answer) = answer {

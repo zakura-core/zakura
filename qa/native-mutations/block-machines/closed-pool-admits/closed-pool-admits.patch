@@ -1,0 +1,35 @@
+diff --git a/crates/zakura-node-services/src/block_memory.rs b/crates/zakura-node-services/src/block_memory.rs
+index c7181f7999..96dc39be9a 100644
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -393,9 +393,6 @@ impl DecodedBlockPool {
+     }
+ 
+     fn reserve(&self, bytes: u64, admission: Admission) -> Result<Charge, AdmissionFailure> {
+-        if self.is_closed() {
+-            return Err(AdmissionFailure::Closed);
+-        }
+         let pipeline_bytes = self.charge_pipeline(bytes, admission)?;
+         match self.reserve_retention(bytes) {
+             Ok(charge) => {
+@@ -448,9 +445,6 @@ impl DecodedBlockPool {
+     fn reserve_retention(&self, bytes: u64) -> Result<Charge, AdmissionFailure> {
+         let mut used = self.0.reserved.load(Ordering::Acquire);
+         loop {
+-            if self.is_closed() {
+-                return Err(AdmissionFailure::Closed);
+-            }
+             let Some(next) = used.checked_add(1) else {
+                 return Err(AdmissionFailure::Capacity);
+             };
+@@ -479,10 +473,6 @@ impl DecodedBlockPool {
+                         bytes,
+                         pipeline_bytes: AtomicU64::new(0),
+                     };
+-                    if self.is_closed() {
+-                        drop(charge);
+-                        return Err(AdmissionFailure::Closed);
+-                    }
+                     return Ok(charge);
+                 }
+                 Err(current) => used = current,

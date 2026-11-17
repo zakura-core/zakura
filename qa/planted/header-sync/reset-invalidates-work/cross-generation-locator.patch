@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 9d2c5184a1..fdb904affa 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -1047,9 +1047,8 @@ impl LocatorQueries {
+         let Some(target) = awaiting else {
+             return LocatorDisposition::Stale;
+         };
+-        let same_selected_path_authority = target.scope.header_generation
+-            == query_scope.header_generation
+-            && target.scope.branch.anchor_hash == query_scope.branch.anchor_hash;
++        let same_selected_path_authority =
++            target.scope.branch.anchor_hash == query_scope.branch.anchor_hash;
+         let superseded_tip = target.status.selected_tip_hash != query_scope.branch.target_tip_hash;
+         if !same_selected_path_authority || (!found && superseded_tip) {
+             LocatorDisposition::Refetch

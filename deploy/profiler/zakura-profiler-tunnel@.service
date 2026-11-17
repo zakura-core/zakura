@@ -1,0 +1,17 @@
+[Unit]
+Description=SSH tunnel from the dashboard to the continuous profiler on %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A profiler listens only on its own host's loopback. This makes the one on node %i
+# reachable at 127.0.0.1:LOCAL_PORT here, over the SSH access the dashboard already
+# has to that node. deploy/profiler/fleet.py writes the settings file.
+EnvironmentFile=/etc/zakura-profiler-tunnels/%i.env
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p ${SSH_PORT} -L 127.0.0.1:${LOCAL_PORT}:127.0.0.1:8097 ${SSH_TARGET}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/state.rs b/crates/zakura-network/src/zakura/discovery/state.rs
+index 5dc12217dc..593ebf29c9 100644
+--- a/crates/zakura-network/src/zakura/discovery/state.rs
++++ b/crates/zakura-network/src/zakura/discovery/state.rs
+@@ -793,7 +793,9 @@ impl DiscoveryState {
+         self.active_services
+             .retain(|node_id, _| connected.contains(node_id));
+         for entry in self.active_services.values_mut() {
+-            entry.prune_expired_live_summaries(now_unix_secs);
++            if entry.record.is_none() {
++                entry.prune_expired_live_summaries(now_unix_secs);
++            }
+             if entry
+                 .record
+                 .as_ref()

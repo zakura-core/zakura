@@ -70,7 +70,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           # This job packages crates with --no-verify but does not compile them.
@@ -161,7 +161,7 @@ jobs:
               --base-version "$base_version" \
               --release-tag "$RELEASE_TAG"
           )"; then
-            echo "::warning title=Release level advisory::The requested tag is below the changelog-derived release level; continuing temporarily."
+            echo "::warning title=Release level advisory::The requested tag is below the release level the changelog requires; continuing temporarily."
           fi
           if ! READY_URL="$LATEST_URL" python3 .github/scripts/release_state.py ready \
             --state "$RUNNER_TEMP/readiness-state"; then
@@ -188,7 +188,7 @@ jobs:
               crates/zakurad/src/components/sync/end_of_support.rs \
               | grep -oE '[0-9_]+$' | tr -d '_'
           )"
-          minimum_height=$((committed_height + 3456))
+          minimum_height="$(python3 scripts/release-readiness.py eos-floor --height "$committed_height")"
           if [ "$estimated_height" -gt "$minimum_height" ]; then
             minimum_height="$estimated_height"
           fi

@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 9905b6dafc..a6bc9d9d22 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -592,7 +592,16 @@ impl Live {
+             subscription_id: self.id,
+             update_sequence: update.sequence,
+             initial_target_tip_hash: self.target,
+-            acknowledged: update.acknowledged,
++            // Mutation: a Grant acknowledges another cursor hash than the
++            // latest accepted one.
++            acknowledged: if operation == Operation::Grant {
++                Cursor {
++                    hash: block::Hash([0x55; 32]),
++                    ..update.acknowledged
++                }
++            } else {
++                update.acknowledged
++            },
+             locator_hashes: match operation {
+                 Operation::Open => self.locators.iter().map(|locator| locator.hash).collect(),
+                 Operation::Grant | Operation::Close => Vec::new(),

@@ -1,0 +1,38 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs b/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
+index a4e0eb1d0e..ac26afd759 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_registry/state.rs
+@@ -325,20 +325,19 @@ impl PeerTable {
+     ) -> Option<BTreeMap<block::Height, OutstandingMeta>> {
+         #[cfg(any(test, zakura_sim))]
+         self.report_stale_attempt(peer, RegistryWriter::TakeOutstanding, generation);
+-        self.peers
+-            .get_mut(peer)
+-            .filter(|entry| entry.generation == generation)
+-            .map(|entry| {
+-                #[cfg(any(test, zakura_sim))]
+-                report_stale_write(
+-                    &self.observer,
+-                    peer,
+-                    RegistryWriter::TakeOutstanding,
+-                    generation,
+-                    entry,
+-                );
+-                std::mem::take(&mut entry.outstanding)
+-            })
++        // Detach the peer's claims whichever routine generation owns its
++        // entry.
++        self.peers.get_mut(peer).map(|entry| {
++            #[cfg(any(test, zakura_sim))]
++            report_stale_write(
++                &self.observer,
++                peer,
++                RegistryWriter::TakeOutstanding,
++                generation,
++                entry,
++            );
++            std::mem::take(&mut entry.outstanding)
++        })
+     }
+ 
+     /// Publish the owning generation's slot diagnostics. Returns whether the

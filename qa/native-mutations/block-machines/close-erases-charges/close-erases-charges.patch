@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-node-services/src/block_memory.rs b/crates/zakura-node-services/src/block_memory.rs
+index c7181f7999..f017bb802a 100644
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -336,6 +336,7 @@ impl DecodedBlockPool {
+     /// Permanently close admission without erasing existing charges.
+     pub fn close(&self) {
+         self.0.closed.store(true, Ordering::Release);
++        self.0.counted_bytes.store(0, Ordering::Release);
+         self.notify_capacity();
+     }
+ 

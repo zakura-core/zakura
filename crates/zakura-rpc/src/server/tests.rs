@@ -7,6 +7,7 @@ mod http_client;
 mod http_request_compatibility;
 mod jsonrpc;
 mod listener;
+mod read_body;
 mod rpc_metrics;
 mod surface;
 mod tls;

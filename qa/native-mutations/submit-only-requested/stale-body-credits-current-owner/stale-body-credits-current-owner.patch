@@ -1,0 +1,26 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+index e3144b596f..9f28c32703 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+@@ -1097,13 +1097,18 @@ impl PeerRoutine {
+         self.io
+             .trace
+             .record_block_body_received(hash, BlockBodySource::Zakura);
+-        let outstanding_owner = matched.owner;
+-        if self.io.work.owner_for_height(height) != Some(outstanding_owner) {
++        let Some(current_owner) = self.io.work.owner_for_height(height) else {
+             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
+                 .increment(1);
+             self.drop_obsolete_outstanding(key);
+             return;
+-        }
++        };
++        // A body for a request that lost its height still answers the request
++        // that holds the height now, as first-completion-wins does.
++        let matched = MatchedBody {
++            owner: current_owner,
++            ..matched
++        };
+         if !self
+             .io
+             .registry

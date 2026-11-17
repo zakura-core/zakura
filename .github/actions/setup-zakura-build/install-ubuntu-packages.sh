@@ -10,7 +10,10 @@ readonly APT_BUDGET_SECONDS="${APT_BUDGET_SECONDS:-1200}"
 readonly APT_ATTEMPT_SECONDS="${APT_ATTEMPT_SECONDS:-300}"
 readonly APT_MIRRORS_FILE="${APT_MIRRORS_FILE:-/etc/apt/apt-mirrors.txt}"
 
-packages=(clang libclang-dev librocksdb-dev)
+packages=(librocksdb-dev)
+if [[ "${INSTALL_LIBCLANG:-false}" == 'true' ]]; then
+  packages+=(clang libclang-dev)
+fi
 if [[ "${INSTALL_PROTOC:-false}" == 'true' ]]; then
   packages+=(protobuf-compiler)
 fi
@@ -103,7 +106,6 @@ main() {
     -y --no-install-recommends --download-only "${packages[@]}"
   run_apt_install
 
-  # librocksdb-sys runs bindgen through libclang even with system RocksDB.
   echo "ROCKSDB_LIB_DIR=/usr/lib/" >> "$GITHUB_ENV"
 }
 

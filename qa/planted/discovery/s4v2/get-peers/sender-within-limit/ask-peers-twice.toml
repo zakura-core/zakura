@@ -1,0 +1,11 @@
+# The node sends its `GetPeers` twice before the answer, past the peer's limit
+# of one. The scenario's peer holds its `Peers` past the node's exchange wait,
+# so the node closes the exchange as timed out before either answer.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-peers/sender-within-limit/ask-peers-twice.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-peers/sender-within-limit/ask-peers-twice.plan.bin"

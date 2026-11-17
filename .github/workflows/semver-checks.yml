@@ -32,14 +32,8 @@ name: Semver checks
 on:
   pull_request:
     branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .github/workflows/semver-checks.yml
-      - .github/workflows/scripts/affected_semver_packages.py
-      - .github/workflows/scripts/patch_registry_for_semver.sh
-      - .github/workflows/scripts/test_affected_semver_packages.py
+    # Required checks must report even when the PR only changes documentation.
+    # Package selection skips the heavy jobs when no library is affected.
   push:
     branches: [main]
     paths:
@@ -171,7 +165,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         id: toolchain
         with:
           toolchain: stable
@@ -197,11 +191,15 @@ jobs:
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 #v2.90.3
         with:
           tool: cargo-semver-checks
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh
@@ -254,16 +252,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
           cache: false
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 #v2.90.3
         with:
           tool: cargo-public-api
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh
@@ -294,7 +296,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         id: toolchain
         with:
           toolchain: stable
@@ -310,11 +312,15 @@ jobs:
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 #v2.90.3
         with:
           tool: cargo-semver-checks
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh

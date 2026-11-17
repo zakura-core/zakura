@@ -1,0 +1,9 @@
+# Lets the sequencer buffer a body whatever body-work epoch its request
+# named, instead of refusing an older epoch's body as stale. The input forks
+# the mirrors' chain once the node has asked storage to admit four bodies,
+# and a body answering an old-epoch request reaches the sequencer after it
+# applied the new epoch, which takes it into `applying`.
+input = "crates/zakura-sim/tests/fixtures/sync-storage-reorg.bin"
+# Besides sequencer_task/state.rs, which the patch changes, header sync's
+# apply and the rest of block sync decide when the late body arrives.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

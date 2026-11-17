@@ -38,6 +38,12 @@ macro_rules! atomic_int {
                 self.0.into_inner()
             }
 
+            /// Reads the value with no preemption point, for a
+            /// [`boundary_read`](crate::sim::boundary_read).
+            pub fn peek(&self) -> $int {
+                self.0.load(Ordering::SeqCst)
+            }
+
             /// Reads the value.
             #[track_caller]
             pub fn load(&self, order: Ordering) -> $int {
@@ -264,6 +270,12 @@ impl AtomicBool {
         self.0.into_inner()
     }
 
+    /// Reads the value with no preemption point, for a
+    /// [`boundary_read`](crate::sim::boundary_read).
+    pub fn peek(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
     /// Reads the value.
     #[track_caller]
     pub fn load(&self, order: Ordering) -> bool {
@@ -410,6 +422,12 @@ impl<T> AtomicPtr<T> {
     /// The pointer, consuming the atomic.
     pub fn into_inner(self) -> *mut T {
         self.0.into_inner()
+    }
+
+    /// Reads the pointer with no preemption point, for a
+    /// [`boundary_read`](crate::sim::boundary_read).
+    pub fn peek(&self) -> *mut T {
+        self.0.load(Ordering::SeqCst)
     }
 
     /// Reads the pointer.

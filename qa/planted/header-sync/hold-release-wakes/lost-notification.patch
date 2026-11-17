@@ -1,0 +1,39 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 9f71e35495..656195ed4f 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -305,6 +305,7 @@ fn build_header_sync_reactor(
+         lifecycle: lifecycle_rx,
+         actions: actions_tx,
+         pending_port_operations: PortOperations::default(),
++        nothing_pending: true,
+         locator_capacity: std::sync::Arc::new(Semaphore::new(
+             zakura_header_chain::MAX_STAGED_TARGETS_V1,
+         )),
+@@ -361,6 +362,9 @@ struct HeaderSyncReactor {
+     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
+     actions: mpsc::Sender<HeaderPortOperation>,
+     pending_port_operations: PortOperations,
++    // Mutation: the completion arm's guard, refreshed only when a
++    // completion is handled. A dispatch leaves it stale.
++    nothing_pending: bool,
+     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
+     locator_capacity: std::sync::Arc<Semaphore>,
+     locator_capacity_waiting: bool,
+@@ -571,7 +575,7 @@ impl HeaderSyncReactor {
+                 biased;
+                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
+                 completion = async {
+-                    if self.pending_port_operations.is_empty() {
++                    if self.nothing_pending {
+                         std::future::pending().await
+                     } else {
+                         self.pending_port_operations.next().await
+@@ -944,6 +948,7 @@ impl HeaderSyncReactor {
+     }
+ 
+     fn handle_port_completion(&mut self, outcome: StorageOutcome) {
++        self.nothing_pending = self.pending_port_operations.is_empty();
+         #[cfg(any(test, zakura_sim))]
+         let panicked = matches!(outcome, StorageOutcome::Panicked(_));
+         let call = match &outcome {

@@ -1,0 +1,8 @@
+# The subscriber drops both lower-locator checks, the interior one and the
+# last-header one, so an adversary's first page that ends at the node's
+# first locator stages. The input is the saved lower-locator Plan, whose act
+# is that page.
+input = "crates/zakura-sim/tests/fixtures/header-wire-lower-locator.bin"
+# The subscriber, the reactor and the queue decide whether the act's page is
+# refused or staged, so a change there can move the input off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

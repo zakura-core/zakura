@@ -102,7 +102,7 @@ jobs:
           ref: ${{ steps.release.outputs.target_sha }}
           path: release
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: stable
           # This job compiles the release tag with a current stable toolchain, so
@@ -175,7 +175,7 @@ jobs:
       # Keep this as the only step: no repository code receives the real,
       # short-lived production token returned by the action.
       - name: Authenticate with crates.io
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
   publish:
     name: Publish crates to crates.io
@@ -208,7 +208,7 @@ jobs:
           ref: ${{ needs.plan-verify.outputs.target_sha }}
           path: release
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: stable
           # This job packages crates with --no-verify but never compiles them,
@@ -223,7 +223,7 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       # The token is scoped to this step alone, and the action's post step
       # revokes it when the job ends. Everything slow already ran in
@@ -311,7 +311,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: stable
           # The published tag is compiled with a current stable toolchain, so

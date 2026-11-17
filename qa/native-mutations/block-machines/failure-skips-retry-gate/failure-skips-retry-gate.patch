@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+index f36982fa0e..a0f4940f16 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
+@@ -680,7 +680,7 @@ impl QueryState {
+         if let Some(query) = pending {
+             self.pending = None;
+             self.retry_forced |= query.forced;
+-            self.schedule_retry(now);
++            let _ = now;
+         }
+         ReactorTransition::QueryFailed {
+             query_id,

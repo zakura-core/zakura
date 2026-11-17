@@ -124,7 +124,7 @@ proptest! {
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: block::Height(0),
             joinsplit_data: None,
-            sapling_shielded_data: Some(shielded_v4),
+            sapling_shielded_data: Some(Box::new(shielded_v4)),
         };
         let data = tx.zcash_serialize_to_vec().expect("tx should serialize");
         let tx_parsed = data.zcash_deserialize_into().expect("randomized tx should deserialize");
@@ -186,7 +186,7 @@ proptest! {
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: block::Height(0),
             joinsplit_data: None,
-            sapling_shielded_data: Some(shielded_v4),
+            sapling_shielded_data: Some(Box::new(shielded_v4)),
         };
         let data = tx.zcash_serialize_to_vec().expect("tx should serialize");
         let tx_parsed = data.zcash_deserialize_into().expect("randomized tx should deserialize");

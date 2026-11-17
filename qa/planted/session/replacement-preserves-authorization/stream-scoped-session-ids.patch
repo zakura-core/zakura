@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index 05be4ca42a..b4071131b1 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -4018,7 +4018,9 @@ impl ZakuraProtocolHandler {
+         recv: RecvStream,
+         admission: &mut StreamAdmission<'_>,
+     ) -> Option<BoxFuture<'static, Option<IncomingStreamSetup>>> {
+-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
++        // Name a peer-opened session by its QUIC stream, which each
++        // connection numbers from zero.
++        let stream_id = send.id();
+         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
+             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+             metrics::counter!("zakura.p2p.stream.rejected.semaphore").increment(1);

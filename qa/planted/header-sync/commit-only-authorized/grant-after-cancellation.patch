@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..a4129946cb 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1719,6 +1719,9 @@ impl HeaderSyncReactor {
+             self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
+             return;
+         }
++        // Mutation: the continuation's reservation is returned before the
++        // subscriber grants credit for it.
++        self.peer_work_queue.cancel_request_reservation(peer);
+         let Some(session) = self
+             .sessions
+             .get(peer)

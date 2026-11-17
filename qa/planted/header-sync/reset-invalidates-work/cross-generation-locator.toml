@@ -1,0 +1,13 @@
+# A settled locator read serves its peer's awaiting target whatever
+# generation it was read under. The witness's read is held across the
+# invalidation, so the round starts under the new generation from a read
+# dispatched under the old one.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-held-locator.plan"

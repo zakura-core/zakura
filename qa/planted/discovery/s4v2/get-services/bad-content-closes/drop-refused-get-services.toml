@@ -1,0 +1,10 @@
+# Discovery drops a `GetServices` its codec refuses instead of closing. The
+# scenario's peer sends a `GetServices` that wants one service twice.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-services/bad-content-closes/drop-refused-get-services.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-services/bad-content-closes/drop-refused-get-services.plan.bin"

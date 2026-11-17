@@ -1,0 +1,11 @@
+# The requester's precheck and claim admit a `Peers` with no live query, and
+# discovery reads it as no answer. The scenario's peer sends a `Peers` once the
+# node's exchange has its answer.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/peers/unsolicited-closes/admit-unreserved-peers.scenario.json"
+plan = "qa/planted/discovery/s4v2/peers/unsolicited-closes/admit-unreserved-peers.plan.bin"

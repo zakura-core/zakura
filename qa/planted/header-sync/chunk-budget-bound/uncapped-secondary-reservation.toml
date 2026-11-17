@@ -1,0 +1,10 @@
+# Takes a second, unreported reservation of the whole budget for a peer
+# that just reserved, with the budget's own capacity check and its debug
+# assertion removed. The input's node reserves headers for its first
+# mirror, and the probe's read at that boundary finds the budget over its
+# 4,000 headers.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides peer_work.rs and policy.rs, which the patch changes, the reactor
+# decides when the node first reserves. A change there can move the input
+# off that reservation.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

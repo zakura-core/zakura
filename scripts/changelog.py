@@ -32,6 +32,7 @@ VERSION_HEADING = re.compile(
     re.MULTILINE,
 )
 RELEASE_TAG = re.compile(r"^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$")
+REVERT_LINE = re.compile(r"^This reverts commit ([0-9a-f]{40})\b", re.MULTILINE)
 
 
 class ChangelogError(Exception):
@@ -407,6 +408,31 @@ def ensure_retargetable(repo_root: Path, version: str, remote: str) -> None:
         raise ChangelogError(f"cannot retarget {version}: git tag v{version} exists")
 
 
+def reverted_fragments(repo_root: Path, base: str, head: str) -> set[str]:
+    """Return the fragments added by the commits that `base..head` reverts.
+
+    `git revert` names each reverted commit in a `This reverts commit <sha>.` line.
+    """
+    messages = run_git(repo_root, ["log", "--format=%B", f"{base}..{head}"])
+    fragments: set[str] = set()
+    for commit in REVERT_LINE.findall(messages):
+        added = run_git(
+            repo_root,
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "--diff-filter=A",
+                commit,
+                "--",
+                FRAGMENT_DIRECTORY,
+            ],
+        )
+        fragments.update(added.splitlines())
+    return fragments
+
+
 def check_pull_request(
     repo_root: Path,
     base: str,
@@ -437,19 +463,28 @@ def check_pull_request(
     changed_paths = [path for _, path in diff_entries]
     # An exact rename keeps a fragment's content intact, so repository moves
     # are not fragment changes owned by this pull request.
-    changed = [
-        path
+    fragment_changes = [
+        (status, path)
         for status, path in diff_entries
         if not status.startswith("R")
         and path.startswith(f"{FRAGMENT_DIRECTORY}/")
         and path != f"{FRAGMENT_DIRECTORY}/README.md"
     ]
+    changed = [path for _, path in fragment_changes]
     expected = f"{FRAGMENT_DIRECTORY}/{pull_request}.md"
-    unexpected = [path for path in changed if path != expected]
+    unexpected = [change for change in fragment_changes if change[1] != expected]
+    if any(status == "D" for status, _ in unexpected):
+        # A revert of an unreleased PR deletes that PR's fragment with its change.
+        reverted = reverted_fragments(repo_root, base, head)
+        unexpected = [
+            (status, path)
+            for status, path in unexpected
+            if not (status == "D" and path in reverted)
+        ]
     if unexpected:
         raise ChangelogError(
             "each PR owns one fragment; unexpected fragment changes: "
-            + ", ".join(unexpected)
+            + ", ".join(path for _, path in unexpected)
         )
     changes_rust = any(
         Path(path).suffix == ".rs" or Path(path).name == "Cargo.toml"

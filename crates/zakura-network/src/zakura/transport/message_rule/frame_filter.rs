@@ -95,6 +95,9 @@ pub(crate) struct FrameFilter<'a> {
     reader: InboundReader,
     legacy_stream: Option<u16>,
     precheck: Option<&'a dyn ResponsePrecheck>,
+    /// The reader's transport observer.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<&'a crate::zakura::StreamTap>,
 }
 
 impl<'a> FrameFilter<'a> {
@@ -104,6 +107,8 @@ impl<'a> FrameFilter<'a> {
             reader,
             legacy_stream: None,
             precheck: None,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
         }
     }
 
@@ -118,6 +123,9 @@ impl<'a> FrameFilter<'a> {
 
     /// Also check each response header against `precheck`, which bounds it by
     /// the live reservations.
+    ///
+    /// In test and simulator builds, the result has no transport observer, so
+    /// attach one after this.
     pub(crate) fn with_precheck<'b>(
         self,
         precheck: Option<&'b dyn ResponsePrecheck>,
@@ -127,6 +135,37 @@ impl<'a> FrameFilter<'a> {
             reader: self.reader,
             legacy_stream: self.legacy_stream,
             precheck,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
+        }
+    }
+
+    /// Report the reader's frame stages through `tap`.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_tap(
+        self,
+        tap: Option<&'a std::sync::Arc<crate::zakura::StreamTap>>,
+    ) -> Self {
+        Self {
+            tap: tap.map(|tap| &**tap),
+            ..self
+        }
+    }
+
+    /// Report `HeaderRead` for a header the reader just read, before any
+    /// check of it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn header_read(&self, message_type: u16, flags: u16, payload_len: usize) {
+        if let Some(tap) = self.tap {
+            tap.header_read(message_type, flags, payload_len);
+        }
+    }
+
+    /// Report `FrameRead` once the reader has the payload too.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn frame_read(&self) {
+        if let Some(tap) = self.tap {
+            tap.frame_read();
         }
     }
 

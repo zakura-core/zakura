@@ -1,0 +1,12 @@
+# The committed input `block-work-owner-cap.bin`: one session publishes
+# 1,000 above-floor bytes, overdraws 500 more with a floor request, and its
+# next floor request would pass the owner cap's floor total of 1,500 bytes.
+harness = "block/work-funding"
+generator = 2
+sha256 = "69629f4507b04e4411d8c8ef96be02f3ce28320a2d7a5b37de6cfc5d16f0c252"
+scenario_sha256 = "31e1552befaf87c9e15736ef90fe5424fa2dccfef485ca2a185539233f4b0c4a"
+source = "crates/zakura-network/src/zakura/block_sync/work_queue/state/tests/funding.rs"
+
+[[witness]]
+property = "block/work-funding"
+expect = "holds"

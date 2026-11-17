@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/state.rs b/crates/zakura-network/src/zakura/discovery/state.rs
+index e81d8bc15..e8b913f74 100644
+--- a/crates/zakura-network/src/zakura/discovery/state.rs
++++ b/crates/zakura-network/src/zakura/discovery/state.rs
+@@ -507,7 +507,6 @@ impl DiscoveryState {
+         now: u64,
+         changes: &mut Vec<BookChange>,
+     ) -> Result<ImportOutcome, DiscoveryBookError> {
+-        self.sync_active_services(connected, now);
+         let max_services = self.config.book_limits.max_services_per_record;
+         if record.body.services.len() > max_services {
+             return Err(DiscoveryBookError::Limit {

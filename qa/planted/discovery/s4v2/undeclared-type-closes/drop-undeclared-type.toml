@@ -1,0 +1,15 @@
+# Discovery's reader admits a frame of a type its table doesn't declare, and
+# discovery drops it instead of closing. Skipping the reader's check alone
+# would leave discovery's codec to close. The scenario's peer sends its
+# `Hello` as type 0, and the node never closes for it.
+# Besides the files the patch changes, the reader's read path and the rest
+# of discovery decide whether the frame reaches the drop.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/undeclared-type-closes/drop-undeclared-type.scenario.json"
+plan = "qa/planted/discovery/s4v2/undeclared-type-closes/drop-undeclared-type.plan.bin"

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index a59ea9b99e..f6253ab38b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1681,8 +1681,11 @@ impl HeaderSyncReactor {
+         source: zakura_header_chain::SourceId,
+         owner: zakura_header_chain::HeaderSyncWorkOwner,
+         result: HeaderTargetAdmissionResult,
+-        mut retained: Option<RetainedHeaders>,
++        retained: Option<RetainedHeaders>,
+     ) {
++        // Mutation: the handler never drops the apply's retained headers, so
++        // their ownership never ends and their leases never return.
++        let mut retained = std::mem::ManuallyDrop::new(retained);
+         self.finish_vct_local_operation(owner, HeaderTargetPhase::Applying);
+         end_retained(&mut retained, HeaderWorkEnd::Stale);
+         let settles_round = self.peer_work_queue.active(&peer).is_some_and(|active| {

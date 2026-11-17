@@ -88,6 +88,8 @@ mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
 
+pub(crate) use zakura_db::shielded::{update_note_commitment_trees, MAINTAINS_SPROUT_TREE};
+
 pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
 use vct::{VctCommitState, VctState, VctWriteData};
 
@@ -263,6 +265,10 @@ pub const HEADER_ENGINE_META: &str = "header_engine_meta_v1";
 /// `()`, mapping to the next block height managed by online pruning. The
 /// presence of this entry marks the database as pruned, which is a one-way state:
 /// a pruned database cannot be reopened in archive mode.
+///
+/// It also holds one-way storage markers under their own keys: the first height
+/// committed without transparent indexes, and the first height committed without
+/// its Sprout note commitments (`ZakuraDb::sprout_tree_skipped_from`).
 pub const PRUNING_METADATA: &str = "pruning_metadata";
 
 /// The name of the column family that marks a verified-commitment-trees
@@ -327,6 +333,19 @@ pub struct FinalizedState {
     /// Commit-time verified-commitment-trees state.
     vct: VctCommitState,
 }
+
+/// Durably writes a prepared block's batch, given the block's VCT authentication proof.
+///
+/// The block commit code is large, so it takes this boxed callback rather than a generic one,
+/// which would compile a copy of that code for each caller.
+type CommitBatch<'a> = Box<
+    dyn FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>
+        + 'a,
+>;
 
 impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
@@ -637,7 +656,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -681,6 +704,10 @@ impl FinalizedState {
                 Ok(())
             },
         )
+        .map(|(block, trees, response)| {
+            let _ = response.send(Ok(block.hash));
+            (block, trees)
+        })
     }
 
     fn commit_finalized_inner_with<C>(
@@ -691,7 +718,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -708,7 +739,7 @@ impl FinalizedState {
             vct_successor_witness,
             vct_auxiliary_window,
             "commit checkpoint-verified request",
-            commit,
+            Box::new(commit),
         );
 
         if result.is_ok() {
@@ -729,9 +760,8 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            Ok((_, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
@@ -786,12 +816,12 @@ impl FinalizedState {
             vct_successor_witness,
             Some(vct_auxiliary_window),
             source,
-            |db, batch, _proof| {
+            Box::new(|db, batch, _proof| {
                 db.header_chain_disk_db()
                     .write(batch)
                     .expect("unexpected rocksdb error while writing block");
                 Ok(())
-            },
+            }),
         )
     }
 
@@ -817,27 +847,20 @@ impl FinalizedState {
             vct_successor_witness,
             None,
             source,
-            commit,
+            Box::new(commit),
         )
     }
 
     /// Prepare a finalized block with exact auxiliary provenance and delegate its durable batch.
-    fn commit_finalized_direct_with_aux<C>(
+    fn commit_finalized_direct_with_aux(
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         source: &str,
-        commit: C,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
-    where
-        C: FnOnce(
-            &mut ZakuraDb,
-            DiskWriteBatch,
-            VctAuthenticationProof,
-        ) -> Result<(), CommitCheckpointVerifiedError>,
-    {
+        commit: CommitBatch<'_>,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
@@ -1107,10 +1130,13 @@ impl FinalizedState {
                         // Sprout roots are not supplied by VCT or committed to the modern
                         // history-tree payload. Reconstruct Sprout locally, but only after all
                         // retryable supplied-root and successor checks have succeeded so a
-                        // deferred retry cannot append the same commitments twice.
-                        note_commitment_trees
-                            .update_sprout_tree(&block)
-                            .map_err(ValidateContextError::from)?;
+                        // deferred retry cannot append the same commitments twice. A build that
+                        // does not maintain the Sprout tree leaves it unchanged.
+                        if MAINTAINS_SPROUT_TREE {
+                            note_commitment_trees
+                                .update_sprout_tree(&block)
+                                .map_err(ValidateContextError::from)?;
+                        }
 
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {
@@ -1145,9 +1171,11 @@ impl FinalizedState {
                                 &ironwood_root,
                             )?;
 
+                            // Without the Sprout tree there is nothing to check the embedded
+                            // Sprout frontier against, and nothing that reads it.
                             let expected_sprout_root = sprout_frontier.root();
                             let actual_sprout_root = note_commitment_trees.sprout.root();
-                            if actual_sprout_root != expected_sprout_root {
+                            if MAINTAINS_SPROUT_TREE && actual_sprout_root != expected_sprout_root {
                                 self.vct.clear_prevalidated_next();
                                 return Err(ValidateContextError::VctSproutHandoffRootMismatch {
                                     height,
@@ -1218,7 +1246,7 @@ impl FinalizedState {
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
                         metrics::histogram!("zakura.state.write.block_tx_count")
-                            .record(block.transactions.len() as f64);
+                            .record(block.transactions().len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;
@@ -1241,7 +1269,10 @@ impl FinalizedState {
 
                                 timed_commit_phase!(
                                     "zakura.state.write.update_trees.duration_seconds",
-                                    note_commitment_trees.update_trees_parallel(&block)
+                                    update_note_commitment_trees(
+                                        &mut note_commitment_trees,
+                                        &block
+                                    )
                                 )
                             })
                         });
@@ -1260,7 +1291,7 @@ impl FinalizedState {
                         history_tree_mut
                             .push(
                                 &network,
-                                block.clone(),
+                                &block,
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
@@ -1317,7 +1348,8 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.db.is_empty() {
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
             );
             assert_eq!(
@@ -1333,7 +1365,8 @@ impl FinalizedState {
             );
 
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {source}",
             );
         }
@@ -1600,11 +1633,7 @@ impl FinalizedState {
             None => return false,
         };
 
-        if block_height < debug_stop_at_height {
-            return false;
-        }
-
-        true
+        block_height >= debug_stop_at_height
     }
 
     /// Exit the host process.

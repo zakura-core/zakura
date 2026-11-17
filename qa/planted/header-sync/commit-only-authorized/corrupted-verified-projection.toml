@@ -1,0 +1,11 @@
+# A node round's apply installs its transition and also extends the
+# verified projection by a selected entry whose body nothing verified. The fixture's own
+# preload applies faithfully. The reactor, the queue, the storage adapter
+# and the engine decide how the witness's rounds apply, so a change there
+# can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.plan"

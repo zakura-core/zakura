@@ -1,0 +1,16 @@
+# Discovery's reader skips the flags check on its `services` row, and
+# discovery drops a `services` frame with a flag bit set instead of closing.
+# Skipping the reader's check alone would leave discovery's codec to close.
+# The scenario's peer sends its held `Services` with flag bit 0 set, and the
+# node never closes for it.
+# Besides the files the patch changes, the reader's read path and the rest
+# of discovery decide whether the frame reaches the drop.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/reserved-flags-closes/drop-reserved-flags.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/reserved-flags-closes/drop-reserved-flags.plan.bin"

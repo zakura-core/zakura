@@ -1,0 +1,23 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 23aa7421dd..7a85d750e1 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -730,18 +730,6 @@ impl HeaderSyncReactor {
+     fn handle_peer_connected(&mut self, session: PeerSession) {
+         self.refresh_committed_snapshot();
+         let peer = session.peer_id().clone();
+-        if self.state.readmission_refused(&peer, Instant::now()) {
+-            observe!(
+-                self,
+-                ReactorEvent::SessionRefused {
+-                    peer: peer.clone(),
+-                    session_id: session.session_id(),
+-                }
+-            );
+-            session.cancel_token().cancel();
+-            metrics::counter!("sync.header.peer.readmission_refused.total").increment(1);
+-            return;
+-        }
+         let direction = session.direction();
+         let replaces_same_direction = self
+             .sessions

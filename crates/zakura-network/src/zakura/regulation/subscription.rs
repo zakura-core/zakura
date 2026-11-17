@@ -8,7 +8,7 @@
 //!
 //! - [`Subscriptions`], the subscriber's side, records each update before it
 //!   is written and admits each page and terminal outcome;
-//! - [`Publications`], the publisher's side, checks each update and reserves
+//! - [`PublicationLedger`], the publisher's side, checks each update and reserves
 //!   credit and a cursor for each page before it is produced.
 //!
 //! Both read their limits from the row, and both call the same window check,
@@ -66,7 +66,7 @@
 //! subscriber held fewer than `max_live` subscriptions when it sent `Open`,
 //! and each live publication and each tombstone whose terminal outcome it had
 //! not received counts among them. The publisher writes terminal outcomes in
-//! the order [`Publications::end`] returns them, so the subscriber receives
+//! the order [`PublicationLedger::end`] returns them, so the subscriber receives
 //! them in that order. An `Open` therefore clears the oldest tombstones until
 //! live publications plus tombstones number at most `max_live - 1`. With one
 //! live subscription, as in header sync version 9, the next `Open` clears the
@@ -100,7 +100,12 @@ mod tests;
 use thiserror::Error;
 
 pub(crate) use credit::{within_window, CreditExceeded, ResponseCredit, Totals};
-pub(crate) use publisher::{Applied, PageStall, Publications, TerminalPermit};
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
+pub(crate) use publisher::Publications;
+pub(crate) use publisher::{
+    Applied, PageStall, PublicationLedger, PublicationOpened, PublicationReporter,
+    PublicationSlots, SlotId, SlotOffer, TerminalPermit,
+};
 pub(crate) use subscriber::{
     SharedSubscriptions, SubscribeRefused, SubscriptionEnded, Subscriptions, Update,
 };

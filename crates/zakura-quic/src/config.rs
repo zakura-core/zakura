@@ -45,6 +45,9 @@ pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_byte
 // target.
 pub const SOCKET_DATAGRAM_QUEUE_BYTES: u64 = SOCKET_QUEUE_BYTES as u64;
 
+/// The largest `stream_receive_window_bytes` the QUIC config accepts.
+pub const MAX_STREAM_RECEIVE_WINDOW_BYTES: u64 = 256 * MIB;
+
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,12 +188,12 @@ impl QuicConfig {
             "stream_receive_window_bytes",
             u64::from(self.stream_receive_window_bytes),
             64 * KIB,
-            256 * MIB,
+            MAX_STREAM_RECEIVE_WINDOW_BYTES,
         )?;
         check(
             "receive_window_bytes",
             u64::from(self.receive_window_bytes),
-            u64::from(self.stream_receive_window_bytes),
+            64 * KIB,
             GIB,
         )?;
         check("send_window_bytes", self.send_window_bytes, 64 * KIB, GIB)?;
@@ -367,6 +370,10 @@ pub struct QuicBindConfig {
     /// Slots of `max_connections` that only dials may take, so inbound
     /// attempts can't block this node's own dials (ADM-12).
     pub dial_reserve: usize,
+    /// Live inbound connections the endpoint holds, counted from accept until
+    /// each one closes (ADM-12). `None` leaves inbound attempts limited only
+    /// by the dial reserve.
+    pub max_inbound_connections: Option<usize>,
     /// Closed connections the endpoint keeps, with their stream buffers
     /// released, until `quinn-proto` drains them (ADM-13).
     pub max_closing_connections: usize,
@@ -484,10 +491,17 @@ mod tests {
         assert_eq!(config.validate().unwrap_err().key, "idle_timeout_secs");
 
         let config = QuicConfig {
-            receive_window_bytes: 1024 * 1024,
+            receive_window_bytes: 32 * 1024,
             ..QuicConfig::default()
         };
         assert_eq!(config.validate().unwrap_err().key, "receive_window_bytes");
+
+        // A handshake window below the stream window is valid (CTRL-6).
+        let config = QuicConfig {
+            receive_window_bytes: 1024 * 1024,
+            ..QuicConfig::default()
+        };
+        assert!(config.validate().is_ok());
 
         let config = QuicConfig {
             retry_threshold: Some(70_000),

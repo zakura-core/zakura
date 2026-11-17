@@ -144,7 +144,6 @@ fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
         body_size: 0,
         tree_aux: None,
     };
-    let _ = active;
     reactor
         .peer_work_queue
         .set_capacity_for_test(&peer, HEADER_CHUNK_BUDGET_CAPACITY_V1 - 1, 1);
@@ -268,7 +267,6 @@ fn requester_admits_prefix_at_durable_graph_headroom_before_chunk_budget_is_full
         body_size: 0,
         tree_aux: None,
     };
-    let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
 
     reactor.deliver_page(

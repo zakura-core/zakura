@@ -1,0 +1,10 @@
+# The service spawns a spare publisher beside each session's own. It
+# receives no updates and ends normally with the session, so only the
+# one-per-session bound breaks, at its start. The service decides when the
+# witness's sessions start, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

@@ -47,7 +47,7 @@ pub fn preempt(point: Point) {
             }
             s.stuck.insert(task);
         } else {
-            s.advance_point(task, point.op, Some(point.site));
+            s.advance_point(task, point.op, point.object, Some(point.site));
         }
         Some(s.tasks[task.index()].yielder)
     })
@@ -165,6 +165,12 @@ pub(crate) fn request_abort(task: TaskId) {
 /// The current virtual time, or `None` outside a run.
 pub fn now() -> Option<SimInstant> {
     with_run(|s| s.now)
+}
+
+/// How `task` of the current run ended, or `None` while it runs or outside
+/// a run.
+pub fn task_exit(task: TaskId) -> Option<TaskExit> {
+    with_run(|s| s.done.get(&task).copied()).flatten()
 }
 
 /// Registers `waker` to fire when time reaches `deadline`.

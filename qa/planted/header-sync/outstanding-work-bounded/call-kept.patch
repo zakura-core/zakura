@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 4ba2e67b9f..950d45428b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -932,10 +932,8 @@ impl StorageCalls {
+     /// Settle exactly `call`, and return whether it was pending.
+     pub(super) fn settle(&mut self, call: StorageCall) -> bool {
+         match self.pending.get(&call.number) {
+-            Some(kind) if *kind == call.kind => {
+-                self.pending.remove(&call.number);
+-                true
+-            }
++            // Mutation: settling a call reports success but keeps its entry.
++            Some(kind) if *kind == call.kind => true,
+             _ => false,
+         }
+     }

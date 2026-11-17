@@ -154,6 +154,11 @@ impl RawBytes {
     pub fn raw_bytes(&self) -> &Vec<u8> {
         &self.0
     }
+
+    /// Consume the wrapper and return its bytes without copying them.
+    pub fn into_raw_bytes(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 impl IntoDisk for RawBytes {

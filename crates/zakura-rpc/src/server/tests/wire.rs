@@ -4,6 +4,8 @@
 //! line, headers (except `date`), and body that come back. They cover JSON-RPC 1.0 and 2.0
 //! requests, parameter decoding, notifications, batches, malformed input, HTTP methods and
 //! content types, response size limits, and cookie authentication.
+//! Discovery responses check the current crate version separately, then snapshot a fixed
+//! version and its content length so releases do not change the wire-format baseline.
 
 use crate::tests::test_rpc::TestRpcImpl;
 use std::{
@@ -155,6 +157,7 @@ async fn send(addr: SocketAddr, case: &Case, authorization: Option<&str>) -> Str
     let (head, body) = response
         .split_once("\r\n\r\n")
         .expect("responses have a header section");
+    let normalized_body = normalize_discovery_version(body);
 
     let mut lines = head.lines();
     let mut output = lines
@@ -163,8 +166,19 @@ async fn send(addr: SocketAddr, case: &Case, authorization: Option<&str>) -> Str
         .to_string();
     for header in lines.filter(|line| !line.to_ascii_lowercase().starts_with("date:")) {
         output.push('\n');
-        output.push_str(&header.to_ascii_lowercase());
+        let header = header.to_ascii_lowercase();
+        if let Some(normalized_body) = normalized_body
+            .as_ref()
+            .filter(|_| header.starts_with("content-length:"))
+        {
+            assert_eq!(header, format!("content-length: {}", body.len()));
+            write!(output, "content-length: {}", normalized_body.len())
+                .expect("writing to a String works");
+        } else {
+            output.push_str(&header);
+        }
     }
+    let body = normalized_body.as_deref().unwrap_or(body);
     output.push_str("\n\n");
     if body.len() > MAX_LOGGED_BODY_SIZE {
         write!(
@@ -179,6 +193,24 @@ async fn send(addr: SocketAddr, case: &Case, authorization: Option<&str>) -> Str
     }
 
     output
+}
+
+/// Checks a discovery response's advertised version and normalizes only that field.
+/// Other response bodies retain their exact wire bytes.
+fn normalize_discovery_version(body: &str) -> Option<String> {
+    let mut response: serde_json::Value = serde_json::from_str(body).ok()?;
+    response.pointer("/result/openrpc")?;
+    assert_eq!(
+        response["result"]["info"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    // Preserve wire-format checks: parsing and reserializing must not hide whitespace,
+    // field ordering, or escaping changes in the original response.
+    assert_eq!(serde_json::to_string(&response).unwrap(), body);
+    // Keep the version used by the checked-in wire snapshot; it is fixture data,
+    // independent of the current package version asserted above.
+    response["result"]["info"]["version"] = "15.0.0".into();
+    Some(serde_json::to_string(&response).unwrap())
 }
 
 /// Sends every case, returning a transcript of the requests and responses.
@@ -223,6 +255,28 @@ fn call_with_length(length: usize) -> String {
 
 fn call(method: &str, params: &str, id: &str) -> String {
     format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":{id}}}"#)
+}
+
+#[tokio::test]
+async fn legacy_overflow_ids_return_parse_errors() {
+    let _init_guard = zakura_test::init();
+    let addr = start_server(local_config()).await;
+
+    for version in ["", r#""jsonrpc":"1.0","#] {
+        for id in ["1e400", "-1e400"] {
+            let request =
+                format!(r#"{{{version}"method":"getstandardfee","id":{id},"params":[]}}"#);
+            let response = send(addr, &Case::post("overflow numeric ID", request), None).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK\n"), "{response}");
+            let (_, body) = response
+                .split_once("\n\n")
+                .expect("HTTP response has a body");
+            assert_eq!(
+                body,
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#,
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -623,6 +677,7 @@ async fn response_size_limits_and_cookie_authentication() {
     let cookie_dir = tempfile::tempdir().expect("temporary cookie directory should be created");
     let conf = Config {
         enable_cookie_auth: true,
+        allow_unauthenticated_admin: true,
         cookie_dir: cookie_dir.path().to_path_buf(),
         max_response_body_size: 300,
         ..local_config()

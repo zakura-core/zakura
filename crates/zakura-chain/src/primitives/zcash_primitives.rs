@@ -1,9 +1,9 @@
 //! Contains code that interfaces with the zcash_primitives crate from
 //! librustzcash.
 
-use std::{io, ops::Deref, sync::Arc};
+use std::{io, sync::Arc};
 
-use zcash_primitives::transaction::{self as zp_tx, TxDigests};
+use zcash_primitives::transaction as zp_tx;
 use zcash_protocol::value::{BalanceError, ZatBalance, Zatoshis};
 use zcash_script::script;
 
@@ -211,7 +211,6 @@ impl From<Script> for zcash_transparent::address::Script {
 #[derive(Debug)]
 pub(crate) struct PrecomputedTxData {
     tx_data: zp_tx::TransactionData<PrecomputedAuth>,
-    txid_parts: TxDigests<blake2b_simd::Hash>,
     all_previous_outputs: Arc<Vec<transparent::Output>>,
 }
 
@@ -254,9 +253,7 @@ impl PrecomputedTxData {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let tx = tx.to_librustzcash(nu)?;
-
-        let txid_parts = tx.deref().digest(zp_tx::txid::TxIdDigester);
+        let tx = tx.to_librustzcash_data(nu)?;
 
         let f_transparent = MapTransparent {
             auth: TransparentAuth {
@@ -264,7 +261,7 @@ impl PrecomputedTxData {
             },
         };
 
-        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = tx.into_data().map_authorization(
+        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = tx.map_authorization(
             f_transparent,
             IdentityMap,
             IdentityMap,
@@ -274,7 +271,6 @@ impl PrecomputedTxData {
 
         Ok(PrecomputedTxData {
             tx_data,
-            txid_parts,
             all_previous_outputs,
         })
     }
@@ -502,14 +498,32 @@ fn sighash_inner(
         None => zp_tx::sighash::SignableInput::Shielded,
     };
 
-    Ok(SigHash(
-        *zp_tx::sighash::signature_hash(
-            &precomputed_tx_data.tx_data,
-            &signable_input,
-            &precomputed_tx_data.txid_parts,
-        )
-        .as_ref(),
-    ))
+    let tx_data = &precomputed_tx_data.tx_data;
+    let sighash: [u8; 32] = match tx_data.version() {
+        // `SigHasher` answers v5 and later signature hashes from its native ZIP-244 cache, so
+        // only the tests that compare against librustzcash reach this arm. It hashes the
+        // transaction's effecting data on every call rather than caching it.
+        zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
+            let txid_parts = tx_data.digest(zp_tx::txid::TxIdDigester);
+            *zp_tx::sighash::signature_hash(tx_data, &signable_input, &txid_parts).as_ref()
+        }
+        // `signature_hash` sends these versions to the same function, without the digests.
+        zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => {
+            v4_signature_hash(tx_data, &signable_input)
+        }
+    };
+    Ok(SigHash(sighash))
+}
+
+/// Returns the ZIP-243 signature hash of a pre-v5 transaction.
+fn v4_signature_hash(
+    tx_data: &zp_tx::TransactionData<PrecomputedAuth>,
+    signable_input: &zp_tx::sighash::SignableInput<'_>,
+) -> [u8; 32] {
+    zp_tx::sighash_v4::v4_signature_hash(tx_data, signable_input)
+        .as_bytes()
+        .try_into()
+        .expect("ZIP-243 signature hashes are 32 bytes")
 }
 
 /// Compute the authorizing data commitment of this transaction as specified in [ZIP-244].

@@ -18,12 +18,33 @@ use crate::{
     serialization::{
         sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
-    transaction::{arbitrary::v5_transactions, LockTime, Transaction},
+    transaction::{
+        arbitrary::{fake_v6_with_orchard_and_ironwood_actions, v5_transactions},
+        LockTime, Transaction,
+    },
     transparent,
     work::equihash::Solution,
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
+
+#[test]
+fn indexed_transaction_borrows_the_original_and_checks_bounds() {
+    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+        .zcash_deserialize_into()
+        .expect("the historical block vector deserializes");
+    assert!(block.transactions.len() > 1);
+    for (index, expected) in block.transactions.iter().enumerate() {
+        let owners = Arc::strong_count(expected);
+        let actual = block.transaction_at(index).expect("the index is in bounds");
+        assert!(std::ptr::eq(actual, expected.as_ref()));
+        assert_eq!(Arc::strong_count(expected), owners);
+    }
+    assert!(block.transaction_at(block.transactions.len()).is_none());
+    assert!(block.transaction_at(usize::MAX).is_none());
+    block.transactions.clear();
+    assert!(block.transaction_at(0).is_none());
+}
 
 #[test]
 fn blockheaderhash_debug() {
@@ -225,7 +246,7 @@ fn ironwood_block_accessors_preserve_pool_and_wire_order() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data: Some(orchard_shielded_data),
+                orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
                 ironwood_shielded_data: Some(ironwood_shielded_data),
             })
         };
@@ -317,7 +338,7 @@ fn ironwood_transaction_count_is_pool_specific_and_counts_bundles() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data,
+                orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 ironwood_shielded_data,
             })
         };
@@ -645,7 +666,7 @@ fn block_limits_multi_tx() {
     assert!(data.len() <= MAX_BLOCK_BYTES as usize);
 
     // Deserialize by now is ok as we are lower than the limit
-    let block2 = Block::zcash_deserialize(&data[..])
+    let block2 = Block::zcash_deserialize_bounded(&mut &data[..])
         .expect("block should deserialize as we are just below limit");
     assert_eq!(block, block2);
 
@@ -660,8 +681,18 @@ fn block_limits_multi_tx() {
 
     assert!(data.len() > MAX_BLOCK_BYTES as usize);
 
-    // Deserialize will now fail
-    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+    // Untrusted decoding rejects it before parsing
+    let mut input = &data[..];
+    assert!(matches!(
+        Block::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "block is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), data.len(), "nothing should be parsed");
+
+    // The parser itself does not enforce the size limit
+    assert_eq!(Block::zcash_deserialize(&data[..]).unwrap(), block);
 }
 
 #[test]
@@ -682,7 +713,7 @@ fn block_limits_single_tx() {
     assert!(data.len() <= MAX_BLOCK_BYTES as usize);
 
     // Deserialize by now is ok as we are lower than the limit
-    Block::zcash_deserialize(&data[..])
+    Block::zcash_deserialize_bounded(&mut &data[..])
         .expect("block should deserialize as we are just below limit");
 
     // Add 1 more input to the transaction, limit will be reached
@@ -696,7 +727,12 @@ fn block_limits_single_tx() {
     assert!(data.len() > MAX_BLOCK_BYTES as usize);
 
     // Will fail as block overall size is above limit
-    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+    assert!(matches!(
+        Block::zcash_deserialize_bounded(&mut &data[..]),
+        Err(SerializationError::Parse(
+            "block is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
 }
 
 /// Test wrapper for `BlockHeader.time_is_valid_at`.
@@ -820,4 +856,111 @@ fn time_check_fixed() {
         // Invert the check, leading to a valid time
         node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
     }
+}
+
+#[test]
+fn transaction_hashes_and_auth_data_digests_match_separate_computation_across_parallel_cutoff() {
+    let _init_guard = zakura_test::init();
+
+    // Pre-v5 (genesis, Sapling era) and NU5 blocks, so both auth digest branches are covered.
+    let blocks: Vec<Block> = [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .map(|bytes| {
+        bytes
+            .zcash_deserialize_into()
+            .expect("block fixture deserializes")
+    })
+    .collect();
+    let mut transactions: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter().cloned())
+        .collect();
+    assert!(
+        transactions.iter().any(|tx| tx.version() >= 5),
+        "fixtures include v5 transactions"
+    );
+
+    let orchard_bundle = transactions
+        .iter()
+        .find_map(|tx| tx.orchard_shielded_data().cloned())
+        .expect("the NU5 fixture contains an Orchard bundle");
+    let v6_transactions: Vec<_> = [(1, 0), (0, 1), (1, 1)]
+        .into_iter()
+        .map(|(orchard_actions, ironwood_actions)| {
+            let mut transaction =
+                fake_v6_with_orchard_and_ironwood_actions(Nu6_3, orchard_actions, ironwood_actions);
+            let Transaction::V6 {
+                orchard_shielded_data,
+                ironwood_shielded_data,
+                ..
+            } = Arc::make_mut(&mut transaction)
+            else {
+                unreachable!("the V6 fixture helper returns a V6 transaction");
+            };
+            // Use fixed vector bytes in each populated slot so the fixture is deterministic.
+            if orchard_shielded_data.is_some() {
+                *orchard_shielded_data = Some(Box::new(orchard_bundle.clone()));
+            }
+            if ironwood_shielded_data.is_some() {
+                *ironwood_shielded_data = Some(orchard_bundle.clone());
+            }
+            transaction
+        })
+        .collect();
+    transactions.extend(v6_transactions.iter().cloned());
+    let mixes = [
+        ("Orchard-only V6", &v6_transactions[0..1]),
+        ("Ironwood-only V6", &v6_transactions[1..2]),
+        ("both pools V6", &v6_transactions[2..3]),
+        ("mixed V6", v6_transactions.as_slice()),
+        ("mixed versions", transactions.as_slice()),
+    ];
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("the test thread pool starts");
+
+        for (mix, transactions) in mixes {
+            for count in [1, 63, 64, 65, 129] {
+                let mut block = blocks[0].clone();
+                block.transactions = transactions.iter().cycle().take(count).cloned().collect();
+
+                let hashes = pool.install(|| block.transaction_hashes());
+                let auth = pool.install(|| block.auth_data_digests());
+
+                let expected_hashes: Vec<_> = block.transactions().map(|tx| tx.hash()).collect();
+                let expected_auth: Vec<_> =
+                    block.transactions().map(|tx| tx.auth_digest()).collect();
+                let expected_ids: Vec<_> = block.transactions().map(|tx| tx.unmined_id()).collect();
+                let context = format!("{mix}: {count} transactions with {threads} workers");
+
+                assert_eq!(hashes.as_ref(), expected_hashes, "{context}");
+                assert_eq!(auth.digests, expected_auth, "{context}");
+                assert_eq!(
+                    auth.unmined_ids(&hashes).collect::<Vec<_>>(),
+                    expected_ids,
+                    "{context}"
+                );
+                assert_eq!(auth.root, block.auth_data_root(), "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "come from the same block")]
+fn unmined_ids_reject_hashes_from_a_different_block() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("block fixture deserializes");
+    let auth = block.auth_data_digests();
+    let fewer_hashes = &block.transaction_hashes()[1..];
+
+    let _ = auth.unmined_ids(fewer_hashes).count();
 }

@@ -15,7 +15,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -40,12 +40,14 @@ use crate::components::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// The longest a gossiped block's download waits for this node's own submission of the same
-/// block to be verified.
+/// The longest an announcement waits for local verification before seeking download admission.
 ///
 /// Verifying the local body normally takes well under a second. If it takes longer than this,
 /// downloading and verifying a peer's copy in parallel is the safer way to get the block.
 const LOCAL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounds local-submission waiters, including those waiting for download admission.
+const MAX_LOCAL_SUBMISSION_WAITS: usize = 16;
 
 /// Waits up to [`LOCAL_SUBMISSION_WAIT`] for this node's own submission of a block to be
 /// verified, and returns whether it committed. A submission that fails, is abandoned, or is
@@ -305,7 +307,7 @@ pub(crate) fn max_lookahead_height(
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DownloadAction {
-    /// The block hash was successfully queued for download and verification.
+    /// The block hash was accepted for a local-submission wait or download and verification.
     AddedToQueue,
 
     /// The block hash is already queued. During a push, one other peer's announcement is
@@ -408,6 +410,12 @@ struct Admission {
     /// The downloads stream has shut down and accepts no further recoveries.
     closed: bool,
 
+    /// Local submissions being awaited without reserving download or per-source capacity.
+    local_waits: HashMap<block::Hash, (oneshot::Sender<()>, Arc<()>)>,
+
+    /// Wakes resolved local waiters when a download releases capacity.
+    capacity_changed: Arc<Notify>,
+
     /// Cancellation handles for admitted tasks, keyed by block hash. The optional source is
     /// recorded so completion can clear [`Self::source_counts`] and [`Self::source_locks`].
     ///
@@ -471,6 +479,7 @@ impl Admission {
                 self.source_locks.remove(&source);
             }
         }
+        self.capacity_changed.notify_waiters();
     }
 }
 
@@ -557,7 +566,7 @@ where
     /// Admits and spawns download tasks.
     spawner: TaskSpawner<ZN, ZV, ZS>,
 
-    /// Active block download and verify tasks.
+    /// Local-submission waiters and active block download and verify tasks.
     #[pin]
     pending: FuturesUnordered<DownloadHandle>,
 
@@ -586,6 +595,8 @@ where
         // Tasks retain the admission state, so the stream must cancel them explicitly.
         admission.closed = true;
         admission.cancel_handles.clear();
+        admission.local_waits.clear();
+        admission.capacity_changed.notify_waiters();
     }
 }
 
@@ -803,7 +814,9 @@ where
         Some(action)
     }
 
-    /// Queue a block for download and verification.
+    /// Wait for a matching local submission, or queue a block for download and verification.
+    /// Local waits use a separate bounded set and reserve no download capacity. Once the
+    /// verdict fails or times out, they seek admission without waiting for another announcement.
     ///
     /// When `download_source` is `Some`, the block request is directed to that
     /// source. Admission is still controlled by the global queue bound and
@@ -855,7 +868,8 @@ where
         let mut admission = self.spawner.admission();
         let queue_len = admission.queue_len();
 
-        if admission.cancel_handles.contains_key(&hash) {
+        if admission.cancel_handles.contains_key(&hash) || admission.local_waits.contains_key(&hash)
+        {
             if let Some(push) = admission.pushes.get_mut(&hash) {
                 if (download_source.is_none() || download_source != push.source)
                     && push.announcement.is_none()
@@ -874,6 +888,24 @@ where
             metrics::counter!("gossip.already.queued.dropped.block.hash.count").increment(1);
 
             return DownloadAction::AlreadyQueued;
+        }
+
+        if pushed.is_none() && admission.local_waits.len() < MAX_LOCAL_SUBMISSION_WAITS {
+            if let Some(resolution) = self.spawner.pending_blocks.resolution(hash) {
+                let download = DownloadTask {
+                    hash,
+                    advertiser: download_source.clone().map(AdvertiserSource::from),
+                    download_source,
+                    kind: DownloadKind::Advertised,
+                    pushed: None,
+                };
+                let task = self
+                    .spawner
+                    .spawn_local_wait(&mut admission, download, resolution);
+                drop(admission);
+                self.pending.push(task);
+                return DownloadAction::AddedToQueue;
+            }
         }
 
         if queue_len >= full_verify_concurrency_limit {
@@ -959,6 +991,92 @@ where
             .expect("admission is only mutated by non-panicking bookkeeping code")
     }
 
+    /// Waits for a local verdict outside download admission, then admits one download.
+    /// Resolved waiters retain their bounded entry until capacity is available. Download
+    /// completion wakes them directly, without requiring another inbound announcement.
+    fn spawn_local_wait(
+        &self,
+        admission: &mut Admission,
+        download: DownloadTask,
+        resolution: PendingBlockResolution,
+    ) -> DownloadHandle {
+        let hash = download.hash;
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let token = Arc::new(());
+        admission
+            .local_waits
+            .insert(hash, (cancel_tx, token.clone()));
+        let changed = admission.capacity_changed.clone();
+        let spawner = self.clone();
+        let wait_admission = self.admission.clone();
+        tokio::spawn(async move {
+            let wait = async move {
+                if local_submission_committed(hash, resolution, &spawner.trace).await {
+                    return Err(("already present".into(), hash, None));
+                }
+                loop {
+                    // Register before checking capacity so a release cannot be missed.
+                    let notified = changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let task = {
+                        let mut admission = spawner.admission();
+                        if admission.closed || admission.cancel_handles.contains_key(&hash) {
+                            return Err(("download closed or already queued".into(), hash, None));
+                        }
+                        let source_available = download.advertiser.as_ref().is_none_or(|source| {
+                            admission
+                                .source_counts
+                                .get(source)
+                                .copied()
+                                .unwrap_or_default()
+                                < source.max_in_flight(spawner.full_verify_concurrency_limit)
+                        });
+                        if admission.queue_len() < spawner.full_verify_concurrency_limit
+                            && source_available
+                        {
+                            admission.local_waits.remove(&hash);
+                            Some(spawner.spawn_download_task(&mut admission, download.clone()))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(task) = task {
+                        // Admission now owns cancellation of the active download. The wait's
+                        // sender was removed, so do not select on its receiver after promotion.
+                        return Ok(task);
+                    }
+                    notified.await;
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => Err(("local submission wait cancelled".into(), hash, None)),
+                result = wait => result,
+            };
+            {
+                let mut admission = wait_admission
+                    .lock()
+                    .expect("admission is only mutated by non-panicking bookkeeping code");
+                // A parent recovery can replace this waiter. Never remove a newer waiter
+                // for the same hash when cancellation is observed later.
+                if admission
+                    .local_waits
+                    .get(&hash)
+                    .is_some_and(|(_, current)| Arc::ptr_eq(current, &token))
+                {
+                    admission.local_waits.remove(&hash);
+                }
+            }
+            match result {
+                Ok(task) => task
+                    .await
+                    .expect("block download and verify tasks must not panic"),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// Starts recovering `parent`, which an advertised child at `child_height` revealed to be
     /// missing from the state.
     ///
@@ -1008,6 +1126,9 @@ where
         if admission.queue_len() >= self.full_verify_concurrency_limit {
             return ParentRecovery::FullQueue;
         }
+
+        // Parent recovery must fetch promptly, even if a local submission is unresolved.
+        admission.local_waits.remove(&parent);
 
         let download = DownloadTask {
             hash: parent,
@@ -1216,16 +1337,6 @@ where
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
         let fut: BoxFuture<'static, _> = async move {
-            // This node may be verifying its own submission of this block. Verifying a peer's
-            // copy as well would repeat that work, so wait for the local verdict, and only
-            // download the block if the local submission fails. Subscribe before reading state,
-            // so a commit between the two reads is still seen.
-            if let Some(resolution) = spawner.pending_blocks.resolution(hash) {
-                if local_submission_committed(hash, resolution, &spawner.trace).await {
-                    return Err(("already present".into(), None));
-                }
-            }
-
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
@@ -2102,6 +2213,238 @@ mod tests {
         )
         .with_pending_blocks(pending_blocks);
         (downloads, network_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_wait_leaves_download_capacity_free_and_deduplicates_announcements(
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let _registration = registry.insert(block.clone()).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        {
+            let admission = downloads.spawner.admission();
+            assert_eq!(admission.queue_len(), 0);
+            assert!(admission.source_counts.is_empty());
+            assert!(admission.source_locks.is_empty());
+            assert_eq!(admission.local_waits.len(), 1);
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), Some(peer.clone())),
+            DownloadAction::AlreadyQueued
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash(99), Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            requests.recv().await.expect("other block starts"),
+            zn::Request::BlocksByHashFrom {
+                hashes: IndexSet::from([hash(99)]),
+                source: peer,
+            }
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "the resolved waiter respects the source limit"
+        );
+        {
+            let mut admission = downloads.spawner.admission();
+            let (replacement, _) = oneshot::channel();
+            let (sender, _) = admission
+                .cancel_handles
+                .get_mut(&hash(99))
+                .expect("other download is active");
+            let _ = std::mem::replace(sender, replacement).send(());
+        }
+        let request = tokio::time::timeout(Duration::from_millis(1), requests.recv())
+            .await?
+            .expect("releasing capacity starts the waiting block without another announcement");
+        assert!(
+            matches!(request, zn::Request::BlocksByHashFrom { hashes, .. } if hashes == IndexSet::from([block.hash()]))
+        );
+        assert!(downloads.spawner.admission().local_waits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_local_wait_resumes_when_global_download_capacity_is_released(
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let registration = registry.insert(block.clone()).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        // Exercise the same admission boundary with one available slot.
+        downloads.spawner.full_verify_concurrency_limit = 1;
+        assert_eq!(
+            downloads.download_and_verify(hash(99), None),
+            DownloadAction::AddedToQueue
+        );
+        requests.recv().await.expect("first download starts");
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), None),
+            DownloadAction::AddedToQueue
+        );
+        registration.resolve(Err(()));
+        tokio::task::yield_now().await;
+        assert!(requests.try_recv().is_err());
+        assert_eq!(downloads.spawner.admission().queue_len(), 1);
+        {
+            let mut admission = downloads.spawner.admission();
+            let (replacement, _) = oneshot::channel();
+            let (sender, _) = admission
+                .cancel_handles
+                .get_mut(&hash(99))
+                .expect("first download is active");
+            let _ = std::mem::replace(sender, replacement).send(());
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv())
+                .await?
+                .expect("waiter is promoted"),
+            zn::Request::BlocksByHash(IndexSet::from([block.hash()]))
+        );
+        assert_eq!(downloads.spawner.admission().queue_len(), 1);
+        assert!(downloads.spawner.admission().local_waits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_downloads_cancels_local_waits() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let _registration = registry.insert(block.clone()).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        downloads.download_and_verify(block.hash(), None);
+        let admission = downloads.spawner.admission.clone();
+        drop(downloads);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            requests.recv().await.is_none(),
+            "shutdown never starts a download"
+        );
+        let admission = admission.lock().expect("test bookkeeping is not poisoned");
+        assert!(admission.local_waits.is_empty());
+        assert_eq!(admission.queue_len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_local_submission_starts_a_download() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let registration = registry.insert(block.clone()).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        downloads.download_and_verify(block.hash(), None);
+        drop(registration);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv())
+                .await?
+                .expect("abandoned submission is downloaded"),
+            zn::Request::BlocksByHash(IndexSet::from([block.hash()]))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_local_wait_set_falls_back_to_normal_download_admission() -> Result<(), BoxError> {
+        let original: block::Block =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry.clone());
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+        downloads.download_and_verify(hash(99), Some(peer.clone()));
+        requests.recv().await.expect("occupying download starts");
+        for nonce in 0..MAX_LOCAL_SUBMISSION_WAITS {
+            let mut block = original.clone();
+            let nonce = u8::try_from(nonce).expect("waiter bound fits in u8");
+            Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
+            let block = Arc::new(block);
+            let registration = registry
+                .insert(block.clone())
+                .expect("previous entry was resolved");
+            assert_eq!(
+                downloads.download_and_verify(block.hash(), Some(peer.clone())),
+                DownloadAction::AddedToQueue
+            );
+            registration.resolve(Err(()));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            downloads.spawner.admission().local_waits.len(),
+            MAX_LOCAL_SUBMISSION_WAITS
+        );
+        let mut overflow = original;
+        Arc::make_mut(&mut overflow.header).nonce = [u8::MAX; 32].into();
+        let overflow = Arc::new(overflow);
+        let _registration = registry
+            .insert(overflow.clone())
+            .expect("registry has capacity");
+        assert_eq!(
+            downloads.download_and_verify(overflow.hash(), Some(peer)),
+            DownloadAction::FullQueue
+        );
+        assert_eq!(
+            downloads.spawner.admission().local_waits.len(),
+            MAX_LOCAL_SUBMISSION_WAITS
+        );
+        let other_peer = zn::PeerSource::LegacySocket(([127, 0, 0, 2], 8233).into());
+        assert_eq!(
+            downloads.download_and_verify(overflow.hash(), Some(other_peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv())
+                .await?
+                .expect("overflow bypasses local waiting"),
+            zn::Request::BlocksByHashFrom {
+                hashes: IndexSet::from([overflow.hash()]),
+                source: other_peer,
+            }
+        );
+        assert_eq!(
+            downloads.spawner.admission().local_waits.len(),
+            MAX_LOCAL_SUBMISSION_WAITS
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parent_recovery_bypasses_a_local_submission_wait() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let registry = PendingBlockRegistry::default();
+        let _registration = registry.insert(block.clone()).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        downloads.download_and_verify(block.hash(), None);
+        assert_eq!(
+            downloads.spawner.recover_parent(block.hash(), None),
+            ParentRecovery::Requested
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv())
+                .await?
+                .expect("parent is requested without waiting"),
+            zn::Request::BlocksByHash(IndexSet::from([block.hash()]))
+        );
+        tokio::task::yield_now().await;
+        assert!(downloads.spawner.admission().local_waits.is_empty());
+        assert_eq!(downloads.spawner.admission().queue_len(), 1);
+        Ok(())
     }
 
     /// A peer announces a block this node is verifying from its own submission. The download

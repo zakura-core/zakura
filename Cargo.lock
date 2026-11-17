@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "18.0.0"
+version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",

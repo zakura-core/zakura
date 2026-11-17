@@ -234,6 +234,14 @@ pub enum Message {
         BlockHandle,
     ),
 
+    /// A temporary local block whose checksum must be computed from its exact bytes.
+    ///
+    /// Encodes as the ordinary `block` command and decodes as [`Self::Block`]. Pending
+    /// bodies can differ under the same header hash, so they must neither read nor populate
+    /// the shared checksum cache. Only outbound serving constructs this variant.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    UncachedBlock(BlockHandle),
+
     /// A `tx` message.
     ///
     /// This message can be used to:
@@ -489,7 +497,7 @@ impl fmt::Display for Message {
             Message::Headers(headers) => format!("headers {{ headers: {} }}", headers.len()),
 
             Message::GetData(invs) => format!("getdata {{ invs: {} }}", invs.len()),
-            Message::Block(block) => format!(
+            Message::Block(block) | Message::UncachedBlock(block) => format!(
                 "block {{ height: {}, hash: {} }}",
                 block
                     .coinbase_height()
@@ -523,7 +531,7 @@ impl Message {
             Message::GetHeaders { .. } => "getheaders",
             Message::Headers(_) => "headers",
             Message::GetData(_) => "getdata",
-            Message::Block(_) => "block",
+            Message::Block(_) | Message::UncachedBlock(_) => "block",
             Message::Tx(_) => "tx",
             Message::NotFound(_) => "notfound",
             Message::Mempool => "mempool",

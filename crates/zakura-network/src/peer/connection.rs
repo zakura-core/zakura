@@ -786,7 +786,7 @@ const COPIED_HEADER_BYTES: u64 =
 /// The decoded bytes a `block` or `tx` message retains while a handler holds it.
 fn decoded_payload_bytes(message: &Message) -> u64 {
     match message {
-        Message::Block(block) => block.decoded_bytes(),
+        Message::Block(block) | Message::UncachedBlock(block) => block.decoded_bytes(),
         Message::Tx(transaction) => transaction.transaction().retained_memory_size_bytes(),
         _ => 0,
     }
@@ -1598,7 +1598,7 @@ where
                     Unused
                 }
             }
-            Message::Block(_) => {
+            Message::Block(_) | Message::UncachedBlock(_) => {
                 debug!(%msg, "got block message unsolicited or from canceled request");
                 Unused
             }

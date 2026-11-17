@@ -125,8 +125,9 @@ enum BodyDecodePanic {
 /// block's checksum after a send has calculated and stored it. Concurrent sends that miss the
 /// cache can each calculate the checksum before either stores it.
 ///
-/// A checksum is found by the block's hash. Bodies using this cache must come from committed
-/// state, or from trusted `submitblock` callers after semantic verification. Before contextual
+/// A checksum is found by the block's hash. Bodies using this cache come from committed
+/// state. Temporary submission bodies use [`Message::UncachedBlock`] instead, even when
+/// they later commit, and neither read nor populate this cache. Before contextual
 /// verification checks `hashBlockCommitments`, different v5 authorization data can produce
 /// bodies with the same block hash and length, even when their proofs and signatures verify.
 /// Untrusted bodies served before that check must not use this cache: they could leave a
@@ -293,7 +294,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } => b"block\0\0\0\0\0\0\0",
+            Block { .. } | UncachedBlock { .. } => b"block\0\0\0\0\0\0\0",
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -345,7 +346,8 @@ impl Codec {
     /// Returns the checksum of `body`, the serialized body of `msg`.
     ///
     /// A large block's checksum is taken from [`BlockChecksums`] when another send already
-    /// hashed that block, and is remembered there otherwise. Every other body is hashed.
+    /// hashed that block, and is remembered there otherwise. Temporary `UncachedBlock`
+    /// bodies always hash their exact bytes, without changing the shared cache.
     fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
         let block = match msg {
             Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
@@ -461,7 +463,9 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(writer)?,
+            Message::Block(block) | Message::UncachedBlock(block) => {
+                block.zcash_serialize(writer)?
+            }
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
                 known_blocks.zcash_serialize(writer)?;

@@ -18,11 +18,15 @@ to the service-session state in
 `crates/zakura-network/src/zakura/handler/service_session/state.rs` and checks
 `session/offer-assembly`, `session/one-active-generation`, and
 `session/legal-reopen`. Its first input byte selects the opening policy and
-connection roles; the rest selects inputs.
+connection roles; the rest selects inputs. Decoder version 1 reads at most 512
+bytes. The replay checks both machines' invariants after every input, and
+checks each result against what the connection loop recorded from earlier
+results. Named tests pin which result each rule picks.
 
-The input decoding, the model, and the checks live in `zakura-network` behind
-the `p2p-fuzz` feature, so the machine types stay private to the crate. A unit
-test there runs the same entry over fixed seeds in every test run.
+The input decoding and the checks live in `zakura-network` behind the
+`p2p-fuzz` feature, so the machine types stay private to the crate. Unit tests
+there run the same entry on two witnesses and random histories in every test
+run.
 
 `cargo-fuzz` creates and updates each target's local `corpus/` and `artifacts/`
 directories; both are intentionally ignored by Git.
@@ -40,19 +44,22 @@ Do not commit raw or minimized corpus files.
 ## Cadence target
 
 `cadence` calls the production sender's hold decision and synchronous send path
-for two rows sharing one queue. Its independent ledger checks `cadence/hold`
-and `cadence/settlement`. A receive settles the real frame guard. This boundary
-does not exercise scheduled transport writes.
+for two rows sharing one queue. It records each row's latest value, last send
+and queued frames, and checks `cadence/hold` and `cadence/settlement` against
+those records: each result names a hold the records show, and a queued frame
+carries the row's latest value. Named tests pin which hold a row reports first.
+A receive settles the real frame guard. This boundary does not exercise
+scheduled transport writes.
 
 Decoder version 1 reads at most 512 bytes. Each byte chooses update, elapsed
 seconds, send or settlement. The fixed witness exercises pacing, an unwritten
 frame, a full queue and settlement. Planted failures break pacing and ownership.
 Proptest and cargo-fuzz call `replay_cadence_bytes`.
 
-Run the applicability witnesses with `cargo test -p zakura-network --lib
-cadence_witness -- --nocapture` from the repository root. Their printed counters
-are witness evidence; they do not claim applicability for every fuzz input.
-An empty input has zero applicability.
+Run the applicability witness with `cargo test -p zakura-network --lib
+regulation::cadence::fuzz -- --nocapture` from the repository root. Its printed
+counters are witness evidence; they do not claim applicability for every fuzz
+input. An empty input has zero applicability.
 
 `p2p-fuzz.yml` schedules this target and the machine targets below. It runs each
 one nightly and for longer on Sunday, or on a manual dispatch. No fuzz campaign

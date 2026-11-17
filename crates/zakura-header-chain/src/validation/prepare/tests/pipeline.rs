@@ -141,7 +141,7 @@ fn future_time_is_deferred_but_deterministic_failures_are_rejected() {
         HeaderValidationState::DeferredUntil(future.time - Duration::hours(2))
     );
 
-    let mut disconnected = *future;
+    let mut disconnected = future.as_ref().clone();
     disconnected.previous_block_hash = block::Hash([0x55; 32]);
     let disconnected = Arc::new(disconnected);
     prepare_headers(
@@ -175,7 +175,7 @@ fn oversized_batch_is_rejected_before_header_validation() {
 #[test]
 fn context_free_receipt_excludes_parent_and_branch_context_claims() {
     let (rules, lease, anchor) = fixture();
-    let mut disconnected = *child(lease.parent, &anchor, 0);
+    let mut disconnected = child(lease.parent, &anchor, 0).as_ref().clone();
     disconnected.previous_block_hash = block::Hash([0x55; 32]);
     let disconnected = Arc::new(disconnected);
 
@@ -199,7 +199,7 @@ fn context_free_receipt_excludes_parent_and_branch_context_claims() {
 #[test]
 fn invalid_version_is_rejected_before_link_hashing() {
     let (rules, lease, anchor) = fixture();
-    let mut invalid = *child(lease.parent, &anchor, 1);
+    let mut invalid = child(lease.parent, &anchor, 1).as_ref().clone();
     invalid.version = 3;
     let invalid = Arc::new(invalid);
 
@@ -222,7 +222,7 @@ fn out_of_range_timestamp_is_reported_as_an_encoding_failure() {
     let (rules, lease, anchor) = fixture();
 
     for timestamp in [-1, i64::from(u32::MAX) + 1] {
-        let mut invalid = *child(lease.parent, &anchor, 1);
+        let mut invalid = child(lease.parent, &anchor, 1).as_ref().clone();
         invalid.time = Utc
             .timestamp_opt(timestamp, 0)
             .single()

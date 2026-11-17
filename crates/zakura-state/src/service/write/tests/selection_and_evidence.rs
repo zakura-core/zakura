@@ -19,7 +19,7 @@ fn startup_restores_a_missing_full_state_side_path_idempotently() {
         .expect("the anchor context exists");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the regtest validation policy is coherent");
-    let mut side_header = *anchor.header;
+    let mut side_header = anchor.header.as_ref().clone();
     side_header.previous_block_hash = anchor.hash();
     side_header.time += chrono::Duration::seconds(1);
     let side_header = Arc::new(side_header);
@@ -83,7 +83,7 @@ fn header_candidate_pressure_preserves_every_full_state_tip() {
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the regtest validation policy is coherent");
     let child = |marker: u8| {
-        let mut header = *anchor.header;
+        let mut header = anchor.header.as_ref().clone();
         header.previous_block_hash = anchor.hash();
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] = marker;
@@ -291,7 +291,7 @@ fn header_valid_body_invalidity_reselects_after_authenticated_evidence() {
         .expect("the anchor context exists");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the regtest validation policy is coherent");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash();
     child_header.time += chrono::Duration::seconds(1);
     let child_header = Arc::new(child_header);

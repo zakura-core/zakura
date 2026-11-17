@@ -7,7 +7,7 @@ use zakura_chain::{
 
 #[test]
 fn canonical_version_hash_link_and_height_boundaries() {
-    let header = *regtest_genesis_block().header;
+    let header = regtest_genesis_block().header.as_ref().clone();
     let expected_hash = header.hash();
     assert_eq!(
         validate_encoding_version_hash(&header),
@@ -15,28 +15,28 @@ fn canonical_version_hash_link_and_height_boundaries() {
         "the shared validator hashes the complete canonical header"
     );
 
-    let mut historical_non_four = header;
+    let mut historical_non_four = header.clone();
     historical_non_four.version = 5;
     assert!(validate_encoding_version_hash(&historical_non_four).is_ok());
-    let mut too_old = header;
+    let mut too_old = header.clone();
     too_old.version = 3;
     assert!(matches!(
         validate_encoding_version_hash(&too_old),
         Err(HeaderEncodingError::Version { version: 3, .. })
     ));
-    let mut high_bit = header;
+    let mut high_bit = header.clone();
     high_bit.version = 1 << 31;
     assert!(validate_encoding_version_hash(&high_bit).is_err());
 
-    let mut child = header;
+    let mut child = header.clone();
     child.previous_block_hash = expected_hash;
     assert_eq!(
-        validate_link(header.previous_block_hash, &[header, child]),
+        validate_link(header.previous_block_hash, &[header.clone(), child.clone()]),
         Ok(())
     );
     child.previous_block_hash = block::Hash([9; 32]);
     assert!(matches!(
-        validate_link(header.previous_block_hash, &[header, child]),
+        validate_link(header.previous_block_hash, &[header.clone(), child.clone()]),
         Err(HeaderLinkError { offset: 1, .. })
     ));
     assert_eq!(
@@ -56,7 +56,7 @@ fn canonical_version_hash_link_and_height_boundaries() {
 #[test]
 fn out_of_range_timestamps_are_rejected_before_hashing() {
     for timestamp in [-1, i64::from(u32::MAX) + 1] {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.time = Utc
             .timestamp_opt(timestamp, 0)
             .single()
@@ -92,7 +92,7 @@ fn hash_filter_accepts_equality_and_rejects_one_above() {
 
 #[test]
 fn future_time_accepts_two_hour_equality_and_rejects_one_second_above() {
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     let now = header.time;
     let height = block::Height(1);
     let hash = header.hash();

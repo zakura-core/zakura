@@ -1574,7 +1574,7 @@ mod tests {
     }
 
     fn child(parent: block::Hash, seed: u8) -> Arc<block::Header> {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent;
         header.nonce = [seed; 32].into();
         Arc::new(header)
@@ -1916,7 +1916,7 @@ mod tests {
     }
 
     fn operation_header(parent: block::Hash, operation: usize) -> Arc<block::Header> {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent;
         let operation = u64::try_from(operation).expect("test operation index fits in u64");
         let mut nonce = [0; 32];

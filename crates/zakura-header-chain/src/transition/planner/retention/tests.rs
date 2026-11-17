@@ -31,7 +31,7 @@ fn insert_header(
     seed: u8,
     reasons: impl IntoIterator<Item = EligibilityReason>,
 ) -> Frontier {
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     header.previous_block_hash = parent;
     header.nonce = [seed; 32].into();
     let header = Arc::new(header);
@@ -94,7 +94,7 @@ fn candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash() {
 
     let reacquired_seed = (1..=12)
         .find(|seed| {
-            let mut header = *regtest_genesis_block().header;
+            let mut header = regtest_genesis_block().header.as_ref().clone();
             header.previous_block_hash = anchor.hash;
             header.nonce = [*seed; 32].into();
             header.hash() == expected[0].hash

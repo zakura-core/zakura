@@ -445,7 +445,7 @@ where
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
-        let old_header = *template.header;
+        let old_header = template.header.as_ref().clone();
         let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
 
         // Mine at least one block using the equihash solver.
@@ -550,7 +550,7 @@ where
 {
     // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
     // https://github.com/rust-lang/rust/issues/93610
-    let mut header = *template.header;
+    let mut header = template.header.as_ref().clone();
 
     // Use a different nonce for each solver thread.
     // Change both the first and last bytes, so we don't have to care if the nonces are incremented in
@@ -613,7 +613,7 @@ mod tests {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("block 1 deserializes");
-        let current_header = *block.header;
+        let current_header = block.header.as_ref().clone();
         let mut changed_header = current_header;
         changed_header.nonce.0[0] ^= 1;
 
@@ -648,7 +648,7 @@ mod tests {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("block 1 deserializes");
-        let mut standard = *block.header;
+        let mut standard = block.header.as_ref().clone();
         let limit = Network::new_default_testnet().target_difficulty_limit();
         standard.difficulty_threshold = (limit / 4_u32).to_compact();
         let mut minimum = standard;
@@ -670,7 +670,7 @@ mod tests {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("block 1 deserializes");
-        let old_header = *block.header;
+        let old_header = block.header.as_ref().clone();
         let (template_sender, template_receiver) = watch::channel(Some(block.clone()));
         let mut template_receiver = WatchReceiver::new(template_receiver);
 
@@ -934,7 +934,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let old_header = *receiver.borrow_and_update().as_ref().unwrap().header;
+        let old_header = receiver
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .header
+            .as_ref()
+            .clone();
         let mut solver_receiver = WatchReceiver::new(receiver.clone());
         let preparation = verifier
             .expect_request_that(|request| {

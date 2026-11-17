@@ -359,7 +359,7 @@ fn serving_leases_do_not_block_a_better_work_branch() {
     let mut captured_paths = Vec::new();
     for index in 0..zakura_header_chain::MAX_CANDIDATE_TIPS_V1 {
         let marker = u8::try_from(index).unwrap();
-        let mut header = *anchor.header;
+        let mut header = anchor.header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] = marker;
@@ -389,7 +389,7 @@ fn serving_leases_do_not_block_a_better_work_branch() {
         captured_paths.push((cursor, captured));
     }
 
-    let mut first = *anchor.header;
+    let mut first = anchor.header.as_ref().clone();
     first.previous_block_hash = parent.hash;
     first.time += chrono::Duration::seconds(1);
     first.nonce.0[0] = 0xff;
@@ -567,7 +567,7 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let mut nodes = Vec::new();
     let mut parent = anchor;
     for height in 1..=staged_len {
-        let mut header = *parent.header;
+        let mut header = parent.header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] = u8::try_from(height).expect("the staged test path is shorter than 256");
@@ -704,7 +704,7 @@ fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
         .zcash_deserialize_into()
         .expect("height one parses");
     let selected_header = old.header.clone();
-    let mut old_header = *old.header;
+    let mut old_header = old.header.as_ref().clone();
     old_header.nonce.0[0] ^= 1;
     old.header = Arc::new(old_header);
     // The state fixture requires a modern coinbase transaction version.
@@ -777,7 +777,7 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     let mut parent = genesis.clone();
     let mut restored = Vec::new();
     for height in 1_u32..=4_000 {
-        let mut header = *parent.header;
+        let mut header = parent.header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[..4].copy_from_slice(&height.to_le_bytes());
@@ -871,7 +871,7 @@ fn reconciled_store_with_finality(
     let mut path = Vec::new();
     let mut parent = genesis.clone();
     for marker in 1..=path_len {
-        let mut header = *parent.header;
+        let mut header = parent.header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[..4].copy_from_slice(&marker.to_le_bytes());
@@ -1842,7 +1842,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     let child_header = Arc::new(child_header);
@@ -1851,7 +1851,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         hash: child_header.hash(),
         header: child_header,
     };
-    let mut grandchild_header = *anchor.header;
+    let mut grandchild_header = anchor.header.as_ref().clone();
     grandchild_header.previous_block_hash = child.hash;
     grandchild_header.time += chrono::Duration::seconds(2);
     let grandchild_header = Arc::new(grandchild_header);
@@ -2797,7 +2797,7 @@ fn retained_path_lookup_chooses_the_nearest_locator_and_skips_other_branches() {
     let snapshot = runtime.publisher().snapshot();
     let scope = HeaderWorkAuthority::for_target(&snapshot, target.hash);
     let mut fork = runtime.store.header_node(path[3].hash).unwrap().unwrap();
-    let mut header = *fork.header;
+    let mut header = fork.header.as_ref().clone();
     header.nonce.0[0] = 0xff;
     fork.header = Arc::new(header);
     fork.hash = fork.header.hash();
@@ -3003,7 +3003,7 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
     let mut parent = path[2].clone();
     let mut fork = Vec::new();
     for _ in 0..3 {
-        let mut header = *parent.header;
+        let mut header = parent.header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(10);
         let header = Arc::new(header);
@@ -4253,7 +4253,7 @@ fn lowest_fully_retained_parent_index() -> usize {
 
 /// One child header of `parent`, distinct from any child the fixture already holds.
 fn child_header(parent: &VerifiedHeaderRef) -> VerifiedHeaderRef {
-    let mut header = *parent.header;
+    let mut header = parent.header.as_ref().clone();
     header.previous_block_hash = parent.hash;
     header.time += chrono::Duration::seconds(1);
     header.nonce.0[31] ^= 0x5a;
@@ -4719,7 +4719,7 @@ fn validation_context_fallback_rows_build_the_same_lease_and_reject_tampering() 
     ));
 
     // Different header bytes under the same key are rejected.
-    let mut altered = *target.header;
+    let mut altered = target.header.as_ref().clone();
     altered.time += chrono::Duration::seconds(1);
     replace_node_with_context_row(
         &runtime,

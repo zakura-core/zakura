@@ -927,7 +927,7 @@ impl Adversary {
                 let (id, _) = live(honest)?;
                 let mut message = honest.page_at(id, 2).ok_or(SHORT_CHAIN)?;
                 if let Message::Headers(page) = &mut message {
-                    let mut header = *page.entries[0].header;
+                    let mut header = page.entries[0].header.as_ref().clone();
                     header.previous_block_hash.0[0] ^= 1;
                     page.entries[0].header = header.into();
                 }

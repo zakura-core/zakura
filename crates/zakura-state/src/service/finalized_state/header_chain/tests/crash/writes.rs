@@ -254,7 +254,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
         let rules = HeaderRules::for_validation_lease(&lease)
             .expect("the authenticated regtest policy is valid");
         let marker = u8::try_from(index + 0x20).expect("the fault-point list fits in u8");
-        let mut child_header = *anchor.header;
+        let mut child_header = anchor.header.as_ref().clone();
         child_header.previous_block_hash = anchor.hash;
         child_header.time += chrono::Duration::seconds(1);
         child_header.nonce.0[0] = marker;

@@ -74,7 +74,7 @@ fn raw_block_payload(block: &Arc<block::Block>) -> DecodedBlockPayload {
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
     let mut fork = block.as_ref().clone();
-    let mut header = *fork.header;
+    let mut header = fork.header.as_ref().clone();
     header.nonce = HexDebug([nonce_tag; 32]);
     fork.header = Arc::new(header);
     Arc::new(fork)
@@ -129,7 +129,7 @@ pub(super) fn fake_block_at_height(
     // Rewriting the coinbase changes the merkle root, so recompute it to keep the
     // synthesized block internally consistent (its header commits to its txs).
     let merkle_root = block.transactions.iter().collect::<block::merkle::Root>();
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
     header.merkle_root = merkle_root;
     block.header = Arc::new(header);
 

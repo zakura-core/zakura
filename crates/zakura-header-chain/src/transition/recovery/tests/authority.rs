@@ -78,7 +78,7 @@ fn headers_only_recovery_rejects_an_unsettled_selected_suffix() {
     let anchor = store.metadata.frontiers.finalized;
     let child = store.metadata.frontiers.header_best;
     let child_node = store.nodes[1].clone();
-    let mut grandchild_header = *child_node.header;
+    let mut grandchild_header = child_node.header.as_ref().clone();
     grandchild_header.previous_block_hash = child.hash;
     grandchild_header.time += Duration::seconds(1);
     grandchild_header.nonce = [2; 32].into();
@@ -138,7 +138,7 @@ fn headers_only_recovery_rejects_an_unsettled_selected_suffix() {
 fn persisted_valid_flags_do_not_bypass_header_consensus_validation() {
     let (mut store, config) = fixture();
     let anchor = store.metadata.frontiers.finalized;
-    let mut invalid_header = *store.nodes[1].header;
+    let mut invalid_header = store.nodes[1].header.as_ref().clone();
     invalid_header.solution = zakura_chain::work::equihash::Solution::for_proposal();
     let invalid_header = Arc::new(invalid_header);
     let invalid_hash = invalid_header.hash();
@@ -438,7 +438,7 @@ fn disk_migration_preserves_a_rebased_work_origin_below_the_migrated_frontier() 
     let genesis_node = store.nodes[0].clone();
     let child = store.metadata.frontiers.header_best;
     let child_node = store.nodes[1].clone();
-    let mut grandchild_header = *child_node.header;
+    let mut grandchild_header = child_node.header.as_ref().clone();
     grandchild_header.previous_block_hash = child.hash;
     grandchild_header.time += Duration::seconds(1);
     grandchild_header.nonce = [2; 32].into();
@@ -834,7 +834,7 @@ fn authenticated_checkpoint_cannot_replace_the_complete_finality_history() {
 }
 
 fn extend(parent: &HeaderNode, nonce: u8) -> HeaderNode {
-    let mut header = *parent.header;
+    let mut header = parent.header.as_ref().clone();
     header.previous_block_hash = parent.hash;
     header.time += Duration::seconds(1);
     header.nonce = [nonce; 32].into();

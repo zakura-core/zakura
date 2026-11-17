@@ -1507,7 +1507,7 @@ mod tests {
     }
 
     fn two_page_headers() -> [Arc<block::Header>; 2] {
-        let mut first = *regtest_genesis_block().header;
+        let mut first = regtest_genesis_block().header.as_ref().clone();
         first.previous_block_hash = block::Hash([0; 32]);
         let first = Arc::new(first);
         let mut second = *first;

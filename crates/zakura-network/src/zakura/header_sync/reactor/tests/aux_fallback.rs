@@ -595,7 +595,7 @@ fn reopening_after_history_pruned_drops_unvalidated_pages() {
     assert_eq!(open.tree_aux_schema, AuxSchema::V1);
 
     let tip = snapshot.frontiers.header_best;
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     header.previous_block_hash = tip.hash;
     header.time += chrono::Duration::seconds(1);
     reactor.deliver_page(

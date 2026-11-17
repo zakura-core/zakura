@@ -565,7 +565,7 @@ mod tests {
             .expect("the regtest target has valid work");
         let mut graph = MemHeaderStore::new(anchor, genesis.header.clone(), work, work.as_u256())
             .expect("the anchor is coherent");
-        let mut header = *genesis.header;
+        let mut header = genesis.header.as_ref().clone();
         header.previous_block_hash = anchor.hash;
         header.nonce = [1; 32].into();
         let child = match graph

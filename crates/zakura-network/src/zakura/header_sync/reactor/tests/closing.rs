@@ -84,7 +84,7 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
     let mut parent = snapshot.frontiers.header_best;
     let mut entries = Vec::new();
     for second in 1..=2 {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(second);
         let header = Arc::new(header);

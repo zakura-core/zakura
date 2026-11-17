@@ -1607,7 +1607,7 @@ async fn scripted_history(recorder: Option<Arc<Recorder>>) -> Transcript {
         CancellationToken::new(),
     ));
     let anchor = snapshot.frontiers.finalized;
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     header.previous_block_hash = anchor.hash;
     header.time += chrono::Duration::seconds(1);
     let header = Arc::new(header);
@@ -1867,7 +1867,7 @@ fn page_off_the_locator(
         snapshot.frontiers.finalized.height,
         block::Hash([0x41; 32]),
     );
-    let mut header = *active.entries[0].header;
+    let mut header = active.entries[0].header.as_ref().clone();
     header.previous_block_hash = wrong_ancestor.hash;
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;

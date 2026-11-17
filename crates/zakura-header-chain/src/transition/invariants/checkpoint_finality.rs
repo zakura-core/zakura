@@ -266,7 +266,7 @@ mod tests {
         let (fixture, baseline) = checkpoint_fixture();
 
         let mut corrupt = baseline.clone();
-        let mut other_header = *corrupt.change_set.put_nodes[0].header;
+        let mut other_header = corrupt.change_set.put_nodes[0].header.as_ref().clone();
         other_header.nonce.0[0] ^= 1;
         corrupt.change_set.put_nodes[0].header = std::sync::Arc::new(other_header);
         assert_eq!(

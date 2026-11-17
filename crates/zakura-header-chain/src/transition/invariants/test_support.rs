@@ -46,7 +46,7 @@ pub(super) fn fixture(mode: EngineMode) -> Fixture {
     )
     .expect("the fixture configuration is coherent");
 
-    let mut child_header = *block.header;
+    let mut child_header = block.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.nonce.0[0] = 1;
     let child_header = Arc::new(child_header);

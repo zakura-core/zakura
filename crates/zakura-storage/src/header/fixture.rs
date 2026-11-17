@@ -141,7 +141,7 @@ impl HeaderFixture {
         branch: u8,
         merkle_root: block::merkle::Root,
     ) -> block::Header {
-        let mut header = *self.genesis.header;
+        let mut header = self.genesis.header.as_ref().clone();
         header.previous_block_hash = parent_hash;
         header.merkle_root = merkle_root;
         header.difficulty_threshold = self.target(branch);

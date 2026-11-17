@@ -169,7 +169,7 @@ mod tests {
     fn index_set_mismatches_choose_the_smallest_raw_hash() {
         let fixture = fixture(EngineMode::HeadersOnly);
         let mut inserted_overlay = GraphOverlay::new(fixture.engine.graph());
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = fixture.child.hash;
         header.nonce.0[0] = 0x31;
         inserted_overlay

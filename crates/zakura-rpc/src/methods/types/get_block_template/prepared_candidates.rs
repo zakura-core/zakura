@@ -772,7 +772,7 @@ mod tests {
         let block = test_block();
         let cache = PreparedCandidateResolver::default();
         insert(&cache, &block, "work", ServerTemplate);
-        let mut header = *block.header;
+        let mut header = block.header.as_ref().clone();
         header.time += chrono::Duration::seconds(1);
         header.nonce = [9; 32].into();
         header.solution = Solution::for_proposal_for_network(&Network::Mainnet);

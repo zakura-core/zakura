@@ -877,7 +877,7 @@ mod tests {
         )
         .expect("the real production activation anchor passes every direct check");
 
-        let mut bad_version = *sapling.header;
+        let mut bad_version = sapling.header.as_ref().clone();
         bad_version.version = 3;
         assert_eq!(
             make_config(
@@ -890,7 +890,7 @@ mod tests {
             ))
         );
 
-        let mut bad_commitment = *sapling.header;
+        let mut bad_commitment = sapling.header.as_ref().clone();
         bad_commitment.commitment_bytes.0 = [0xff; 32];
         assert_eq!(
             make_config(
@@ -903,7 +903,7 @@ mod tests {
             ))
         );
 
-        let mut bad_target = *sapling.header;
+        let mut bad_target = sapling.header.as_ref().clone();
         bad_target.difficulty_threshold =
             zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([0; 4]);
         assert_eq!(
@@ -919,7 +919,7 @@ mod tests {
 
         let target = crate::validate_compact_target(&sapling.header, &Network::Mainnet)
             .expect("the vector target is valid");
-        let mut bad_hash = *sapling.header;
+        let mut bad_hash = sapling.header.as_ref().clone();
         bad_hash.nonce.0[0] = bad_hash.nonce.0[0].wrapping_add(1);
         assert!(
             crate::validate_hash_filter(bad_hash.hash(), target).is_err(),
@@ -933,7 +933,7 @@ mod tests {
         );
 
         let regtest = Network::new_regtest(RegtestParameters::default());
-        let mut wrong_solution_shape = *regtest_genesis_block().header;
+        let mut wrong_solution_shape = regtest_genesis_block().header.as_ref().clone();
         wrong_solution_shape.solution = zakura_chain::work::equihash::Solution::for_proposal();
         assert_eq!(
             make_config(regtest, block::Height(0), Arc::new(wrong_solution_shape)),

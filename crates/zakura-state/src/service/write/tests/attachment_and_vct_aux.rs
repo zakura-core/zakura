@@ -477,7 +477,7 @@ fn stale_vct_auxiliary_failure_evidence_has_zero_durable_effects() {
     assert_eq!(no_boundary, None);
     assert_eq!(writer.runtime.publisher().snapshot(), before);
 
-    let mut successor_header = *anchor.header;
+    let mut successor_header = anchor.header.as_ref().clone();
     successor_header.previous_block_hash = anchor.hash();
     successor_header.nonce = [0x75; 32].into();
     let successor = VctSuccessorWitness::from_header(

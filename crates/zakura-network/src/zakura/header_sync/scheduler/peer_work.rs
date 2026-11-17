@@ -1915,7 +1915,7 @@ mod tests {
 
     /// A page entry whose header `version` sets its hash apart.
     fn versioned_entry(version: u32) -> HeaderEntry {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.version = version;
         HeaderEntry {
             header: Arc::new(header),

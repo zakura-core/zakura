@@ -83,7 +83,7 @@ fn equihash_solver_reproduces_a_historical_solution() {
     let _init_guard = zakura_test::init();
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
-    let mut template = *block.header;
+    let mut template = block.header.as_ref().clone();
 
     // The miner increments before solving, so start just before the known
     // nonce. Limit cancellation checks to one nonce to bound the test's work.

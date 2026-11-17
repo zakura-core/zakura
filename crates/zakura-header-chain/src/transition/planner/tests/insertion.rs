@@ -156,7 +156,7 @@ fn engine_rejects_context_free_batch_with_invalid_retained_time() {
         panic!("the fixture request inserts headers");
     };
     let original = &insert.batch.headers()[0];
-    let mut header = *original.header;
+    let mut header = original.header.as_ref().clone();
     header.time = store
         .graph
         .header_node(insert.parent_hash)
@@ -292,7 +292,7 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     let conflicting_child = conflicting_graph
         .header_node(child.hash)
         .expect("the conflicting checkpoint child is retained");
-    let mut descendant_header = *conflicting_child.header;
+    let mut descendant_header = conflicting_child.header.as_ref().clone();
     descendant_header.previous_block_hash = conflicting_child.hash;
     descendant_header.nonce.0[0] ^= 1;
     let descendant_header = Arc::new(descendant_header);

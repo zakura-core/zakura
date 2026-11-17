@@ -223,7 +223,7 @@ fn applying_request(
 ) -> (AdvertisedHeaderTarget, ActiveHeaderRequest) {
     let source = source_id_from_peer(&peer);
     let anchor = snapshot.frontiers.finalized;
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     header.previous_block_hash = anchor.hash;
     header.time += chrono::Duration::seconds(1);
     let header = Arc::new(header);

@@ -203,7 +203,7 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the deferred fixture validation rules are coherent");
     let preparation_clock = FixedClock(anchor.header.time);
-    let mut future_header = *anchor.header;
+    let mut future_header = anchor.header.as_ref().clone();
     future_header.previous_block_hash = anchor.hash();
     future_header.time += chrono::Duration::hours(3);
     future_header.nonce.0[0] = 0xd0;
@@ -318,7 +318,7 @@ fn assert_header_change_wakes_vct_retry(retry_cause: VctWriteRetryCause) {
         .expect("the retained anchor has validation context");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the anchor produces deterministic header rules");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash();
     child_header.time += chrono::Duration::seconds(1);
     child_header.nonce.0[0] = 0xe0;

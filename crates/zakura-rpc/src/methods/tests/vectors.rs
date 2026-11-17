@@ -5076,7 +5076,7 @@ async fn rpc_client_proposal_can_submit_solution() {
         .await;
     assert_eq!(malformed, Ok(SubmitSolutionErrorResponse::Rejected.into()));
 
-    let mut changed_header = *candidate.header;
+    let mut changed_header = candidate.header.as_ref().clone();
     changed_header.version ^= 1;
     let mismatch = rpc
         .submit_solution(SubmitSolutionParameters {

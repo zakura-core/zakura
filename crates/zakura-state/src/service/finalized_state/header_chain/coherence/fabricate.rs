@@ -78,7 +78,7 @@ fn fabricate_headers(
             .expect("the coherence fixture retains the exact height-dependent context")
             .expected_difficulty_threshold();
 
-            let mut header = *template.header;
+            let mut header = template.header.as_ref().clone();
             header.previous_block_hash = previous_hash;
             header.time = time;
             header.difficulty_threshold = difficulty;

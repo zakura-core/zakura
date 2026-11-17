@@ -61,7 +61,7 @@ fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills()
     let mut parent = snapshot.frontiers.header_best.hash;
     let mut entries = Vec::new();
     for index in 0..500 {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent;
         header.time += chrono::Duration::seconds(index + 1);
         parent = header.hash();
@@ -137,7 +137,7 @@ fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
     let staged_tip = active
         .staged_tip()
         .expect("the bounded staged fixture has an inferred tip");
-    let mut next_header = *regtest_genesis_block().header;
+    let mut next_header = regtest_genesis_block().header.as_ref().clone();
     next_header.previous_block_hash = staged_tip.hash;
     let next_entry = HeaderEntry {
         header: Arc::new(next_header),
@@ -260,7 +260,7 @@ fn requester_admits_prefix_at_durable_graph_headroom_before_chunk_budget_is_full
     let staged_tip = active
         .staged_tip()
         .expect("the staged fixture has an inferred tip");
-    let mut next_header = *regtest_genesis_block().header;
+    let mut next_header = regtest_genesis_block().header.as_ref().clone();
     next_header.previous_block_hash = staged_tip.hash;
     let next_entry = HeaderEntry {
         header: Arc::new(next_header),
@@ -548,7 +548,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     // headroom, so the requester prepares its prefix instead of granting more.
     let mut parent = snapshot.frontiers.header_best;
     for second in 1..=2 {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(second);
         let header = Arc::new(header);
@@ -730,12 +730,12 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         .expect("the peer connects");
     decode_status(outbound.recv().await.expect("initial status is sent"));
 
-    let mut first_header = *regtest_genesis_block().header;
+    let mut first_header = regtest_genesis_block().header.as_ref().clone();
     first_header.previous_block_hash = anchor.hash;
     first_header.time += chrono::Duration::seconds(1);
     let first_header = Arc::new(first_header);
     let first = zakura_header_chain::Frontier::new(block::Height(1), first_header.hash());
-    let mut second_header = *regtest_genesis_block().header;
+    let mut second_header = regtest_genesis_block().header.as_ref().clone();
     second_header.previous_block_hash = first.hash;
     second_header.time += chrono::Duration::seconds(2);
     let second_header = Arc::new(second_header);
@@ -1310,7 +1310,7 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
         );
         reactor.retire_peer_work(&other, HeaderRequestTerminal::LocalError);
 
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = snapshot.frontiers.header_best.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);

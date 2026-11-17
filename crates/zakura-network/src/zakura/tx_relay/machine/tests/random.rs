@@ -50,7 +50,8 @@ const BAD: u64 = 4;
 const SESSIONS: usize = 7;
 
 /// The coverage list: every kind the runs must reach, `;`-separated.
-const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv taken; serve;
+const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv taken;
+    inv child waited; serve;
     answer not found; close Violation(HelloTwice); close Violation(BadHello);
     close Violation(NoHelloFirst); close Violation(Unrequested); close Violation(WrongSize);
     close Violation(WrongId); close Ban; close RepeatedCooldown; close Unresponsive;
@@ -149,6 +150,14 @@ impl Run {
         let bodies: Vec<UnminedTx> = (0..IDS).map(|n| body(n, script)).collect();
         let pooled: Vec<UnminedTxId> = bodies[..2].iter().map(UnminedTx::id).collect();
         let mut bench = Bench::with(fan_out, true, &pooled);
+        // About one id in four spends outputs of an earlier one, which counts
+        // while the pool holds it.
+        for n in 1..bodies.len() {
+            if rng.one_in(4) {
+                let parent = bodies[rng.below(n)].id();
+                bench.depends(bodies[n].id(), &[parent]);
+            }
+        }
         bench.steps = trace.then(Vec::new);
         let may_stop = rng.one_in(3);
         let (peers, admitted, reset_out) = (BTreeMap::new(), Vec::new(), Vec::new());

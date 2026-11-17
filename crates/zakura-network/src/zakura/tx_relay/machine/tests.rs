@@ -257,12 +257,37 @@ impl Bench {
     }
 
     /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`.
+    /// No id goes out while one of its parents still waits to go out to
+    /// the same session, queued or held.
     pub(super) fn take_inv(&mut self, session: SessionId, max: usize) -> Vec<UnminedTxId> {
         let taken = self.machine.take_inv(session, max);
         let ids: Vec<UnminedTxId> = taken.into_iter().map(|(id, _)| id).collect();
+        if let Some(state) = self.machine.session(session) {
+            let waits = |parent: &UnminedTxId| {
+                let queued =
+                    state.announced.contains_key(parent) && !state.announced.is_sent(parent);
+                queued || state.held.contains(*parent)
+            };
+            for id in &ids {
+                let early = self.machine.parents(id).iter().any(waits);
+                assert!(!early, "relay/child-after-parent");
+            }
+            let held_back = self.pool.keys().any(|id| {
+                let queued = state.announced.contains_key(id) && !state.announced.is_sent(id);
+                queued && self.machine.parents(id).iter().any(waits)
+            });
+            if held_back {
+                self.tracker.saw("inv child waited");
+            }
+        }
         self.tracker.sent(session, &ids);
         self.machine.assert_invariants();
         ids
+    }
+
+    /// `child` spends outputs of `parents`, while the pool holds them.
+    pub(super) fn depends(&mut self, child: UnminedTxId, parents: &[UnminedTxId]) {
+        self.machine.set_parents(child, parents.to_vec());
     }
 
     /// `session`'s routine reports its round-trip time.

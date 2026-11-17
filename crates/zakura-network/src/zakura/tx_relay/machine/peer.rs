@@ -9,7 +9,7 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::ReservationId;
-use zakura_rt::collections::HashMap;
+use zakura_rt::collections::{HashMap, HashSet};
 
 use super::{
     CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
@@ -345,25 +345,39 @@ impl Announced {
     }
 
     /// Takes up to `max` queued ids that `size` gives a size for, oldest
-    /// first, and marks them sent. An id `size` skips stays queued.
+    /// first, and marks them sent. An id `size` skips stays queued, and so
+    /// does one with a parent in `parents` that still waits to go out to
+    /// this peer: queued with a size and not taken before it, or one
+    /// `held` says is held. So a child never goes out ahead of its parent.
     pub(crate) fn take(
         &mut self,
         max: usize,
         size: impl Fn(&UnminedTxId) -> Option<u32>,
+        parents: impl Fn(&UnminedTxId) -> Vec<UnminedTxId>,
+        held: impl Fn(&UnminedTxId) -> bool,
     ) -> Vec<(UnminedTxId, u32)> {
         let mut taken = Vec::new();
-        self.queued.retain(|id| {
+        let mut taken_ids: HashSet<UnminedTxId> = HashSet::default();
+        for id in &self.queued {
             if taken.len() == max {
-                return true;
+                break;
             }
-            match size(id) {
-                Some(size) => {
-                    taken.push((*id, size));
-                    false
-                }
-                None => true,
+            let Some(id_size) = size(id) else {
+                continue;
+            };
+            let waits = |parent: &UnminedTxId| {
+                held(parent)
+                    || (self.queued.contains(parent)
+                        && !taken_ids.contains(parent)
+                        && size(parent).is_some())
+            };
+            if parents(id).iter().any(waits) {
+                continue;
             }
-        });
+            taken.push((*id, id_size));
+            taken_ids.insert(*id);
+        }
+        self.queued.retain(|id| !taken_ids.contains(id));
         taken
     }
 }

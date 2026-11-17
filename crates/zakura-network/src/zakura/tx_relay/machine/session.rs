@@ -576,11 +576,17 @@ impl PeerMachine {
     /// Takes up to `max` of its queued announcements that the pool shows
     /// now, oldest first, with their sizes, for one `Inv` frame. They count
     /// as sent: the frame goes on the data stream ahead of any body it lets
-    /// the peer request.
+    /// the peer request. A child waits for a parent whose announcement has
+    /// not gone out yet, so the peer never fetches the child first and
+    /// holds it waiting for the parent.
     pub(crate) fn take_inv(&mut self, pool: &dyn PoolView, max: usize) -> Vec<(UnminedTxId, u32)> {
-        self.state
-            .announced
-            .take(max, |id| pool.holds(id).then(|| pool.size(id)).flatten())
+        let held = &self.state.held;
+        self.state.announced.take(
+            max,
+            |id| pool.holds(id).then(|| pool.size(id)).flatten(),
+            |id| pool.parents(id),
+            |parent| held.contains(*parent),
+        )
     }
 
     /// How many of its announcements wait for an `Inv`.

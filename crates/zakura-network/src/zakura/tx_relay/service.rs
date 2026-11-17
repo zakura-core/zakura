@@ -614,6 +614,18 @@ impl PoolView for SnapshotView {
             .map(|tx| tx.transaction.id())
             .collect()
     }
+
+    fn parents(&self, id: &UnminedTxId) -> Vec<UnminedTxId> {
+        let snapshot = &self.0;
+        let Some(parents) = snapshot.dependencies.dependencies().get(&id.mined_id()) else {
+            return Vec::new();
+        };
+        parents
+            .iter()
+            .filter_map(|parent| snapshot.transaction(parent))
+            .map(|parent| parent.transaction.id())
+            .collect()
+    }
 }
 
 /// What a routine is wired to: the shared state, the pool, the reactor's

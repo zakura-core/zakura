@@ -587,6 +587,8 @@ pub(crate) trait PoolView: fmt::Debug {
     fn size(&self, id: &UnminedTxId) -> Option<u32>;
     /// Every id the pool holds.
     fn ids(&self) -> Vec<UnminedTxId>;
+    /// The ids the pool holds whose outputs `id` spends.
+    fn parents(&self, id: &UnminedTxId) -> Vec<UnminedTxId>;
 }
 
 /// What one session's step does to another session, for the IO to route.
@@ -1023,6 +1025,8 @@ pub(crate) struct Mirror {
     visible_mined: HashMap<transaction::Hash, usize>,
     /// The serialized size of each visible transaction.
     sizes: HashMap<UnminedTxId, u32>,
+    /// Each transaction's parents, which count while they are visible.
+    parents: HashMap<UnminedTxId, Vec<UnminedTxId>>,
 }
 
 #[cfg(test)]
@@ -1037,7 +1041,13 @@ impl Mirror {
             visible: visible.iter().map(|(id, _)| *id).collect(),
             visible_mined: mined_counts(visible.iter().map(|(id, _)| *id)),
             sizes: visible.into_iter().collect(),
+            parents: HashMap::default(),
         }
+    }
+
+    /// Makes `parents` the transactions whose outputs `child` spends.
+    pub(crate) fn set_parents(&mut self, child: UnminedTxId, parents: Vec<UnminedTxId>) {
+        self.parents.insert(child, parents);
     }
 
     /// Applies a published batch and the snapshot after it. Returns the
@@ -1144,6 +1154,14 @@ impl PoolView for Mirror {
 
     fn ids(&self) -> Vec<UnminedTxId> {
         self.visible.iter().copied().collect()
+    }
+
+    fn parents(&self, id: &UnminedTxId) -> Vec<UnminedTxId> {
+        let parents = self.parents.get(id).into_iter().flatten();
+        parents
+            .filter(|parent| self.visible.contains(*parent))
+            .copied()
+            .collect()
     }
 }
 
@@ -1399,6 +1417,17 @@ impl RelayMachine {
     /// The node's best tip moved, perhaps ahead of the pool's.
     pub(crate) fn set_best_tip(&mut self, tip: Height) {
         self.shared.set_best_tip(tip);
+    }
+
+    /// Makes `parents` the transactions whose outputs `child` spends, in
+    /// the pool as the published changes describe it.
+    pub(crate) fn set_parents(&mut self, child: UnminedTxId, parents: Vec<UnminedTxId>) {
+        self.pool.set_parents(child, parents);
+    }
+
+    /// The parents of `id` the pool holds.
+    pub(crate) fn parents(&self, id: &UnminedTxId) -> Vec<UnminedTxId> {
+        self.pool.parents(id)
     }
 
     /// `session`'s routine reports its connection's smoothed round-trip

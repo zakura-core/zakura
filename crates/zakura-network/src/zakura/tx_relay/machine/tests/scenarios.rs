@@ -978,6 +978,41 @@ fn an_admission_is_announced_once_inside_the_window_at_once_and_the_rest_later()
     assert!(bench.adverts().is_empty(), "each session hears once");
 }
 
+/// A small child inside a session's window waits for its big parent
+/// outside it: the child's advert is queued at once, but no `Inv` carries
+/// it until the parent's has gone out to that session. So the peer never
+/// fetches the child first and holds it waiting for the parent.
+#[test]
+fn a_child_goes_out_only_after_its_parent() {
+    let fan_out = FanOut {
+        advert_delay: ADVERT_DELAY,
+        window_small: 8,
+        window_full: 1,
+    };
+    let mut bench = Bench::with(fan_out, true, &[]);
+    let sessions = [bench.join(1), bench.join(2)];
+    let (parent, child) = (bench.id(0), bench.id(1));
+    bench.pool.insert(parent, MAX_TX_BYTES);
+    bench.pool.insert(child, SIZE);
+    bench.depends(child, &[parent]);
+    bench.resync();
+    let late = sessions
+        .into_iter()
+        .find(|session| !advertised(&bench, parent).contains(session))
+        .expect("one session is outside the parent's window");
+    assert!(
+        advertised(&bench, child).contains(&late),
+        "the child is queued"
+    );
+    assert!(
+        bench.take_inv(late, 16).is_empty(),
+        "behind its held parent"
+    );
+    bench.tick(ADVERT_DELAY);
+    assert_eq!(bench.take_inv(late, 16), vec![parent], "the parent first");
+    assert_eq!(bench.take_inv(late, 16), vec![child], "then the child");
+}
+
 /// With the advert delay set to zero, a session outside the window
 /// announces in the same step as one inside it, on a pool change and on a
 /// resync, with no later input to wake the machine.

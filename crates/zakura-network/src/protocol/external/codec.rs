@@ -20,9 +20,9 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, ReadZcashExt,
-        SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto, ZcashReader,
-        ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
+        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -150,6 +150,16 @@ impl BlockChecksums {
         let (remembered_len, checksum) = checksums.shift_remove(&hash)?;
         checksums.insert(hash, (remembered_len, checksum));
         (remembered_len == body_len).then_some(checksum)
+    }
+
+    /// Returns the body length remembered for the block `hash`, without changing which block
+    /// is forgotten next.
+    fn remembered_len(&self, hash: block::Hash) -> Option<usize> {
+        self.0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic")
+            .get(&hash)
+            .map(|(body_len, _)| *body_len)
     }
 
     /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
@@ -293,10 +303,33 @@ impl Encoder<Message> for Codec {
             Mempool => b"mempool\0\0\0\0\0",
         };
 
-        // The body is serialized once, straight into `dst`. The header's length and
-        // checksum are zero until the body is written, then filled in.
+        // Reserve the whole frame before writing: growing `dst` while the body is written
+        // copies it again at each step, which costs more than measuring it first. A block
+        // that was sent before has its body length remembered with its checksum, so it is
+        // serialized only once; every other message is measured first.
+        let block_hash = match &item {
+            Message::Block(block) => Some(block.hash()),
+            _ => None,
+        };
+        // A remembered length only sizes the reservation; the size limit is checked against
+        // the bytes actually written below.
+        let remembered_len =
+            block_hash.and_then(|hash| self.builder.block_checksums.remembered_len(hash));
+        let expected_len = match remembered_len {
+            Some(len) => len.min(self.builder.max_len),
+            None => {
+                let len = self.body_length(&item)?;
+                if len > self.builder.max_len {
+                    return Err(Parse("body length exceeded maximum size"));
+                }
+                len
+            }
+        };
+
+        // The header's length and checksum are zero until the body is written, then filled
+        // in from the bytes actually written.
         let start_len = dst.len();
-        dst.reserve(HEADER_LEN);
+        dst.reserve(HEADER_LEN + expected_len);
         let written = (|| {
             let dst = &mut dst.writer();
             dst.write_all(&self.builder.network.magic().0[..])?;
@@ -323,7 +356,7 @@ impl Encoder<Message> for Codec {
 
         // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
         dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
-        let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
+        let checksum = self.body_checksum(block_hash, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -331,17 +364,28 @@ impl Encoder<Message> for Codec {
 }
 
 impl Codec {
-    /// Returns the checksum of `body`, the serialized body of `msg`.
+    /// Obtain the size of the body of a given message. This will match the
+    /// number of bytes written to the writer provided to `write_body` for the
+    /// same message.
+    ///
+    /// Returns the error `write_body` would return for a message it refuses to write.
+    fn body_length(&self, msg: &Message) -> Result<usize, Error> {
+        let mut writer = FakeWriter(0);
+        self.write_body(msg, &mut writer)?;
+        Ok(writer.0)
+    }
+
+    /// Returns the checksum of `body`, the serialized body of a message, where `block_hash`
+    /// is the hash of the block the message carries, if it carries one.
     ///
     /// A large block's checksum is taken from [`BlockChecksums`] when another send already
     /// hashed that block, and is remembered there otherwise. Every other body is hashed.
-    fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
-        let block = match msg {
-            Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
+    fn body_checksum(&self, block_hash: Option<block::Hash>, body: &[u8]) -> sha256d::Checksum {
+        let hash = match block_hash {
+            Some(hash) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => hash,
             _ => return message_checksum(body),
         };
 
-        let hash = block.hash();
         let block_checksums = &self.builder.block_checksums;
         if let Some(checksum) = block_checksums.get(hash, body.len()) {
             return checksum;

@@ -1194,6 +1194,48 @@ fn checksum_remembered_for_another_body_length_is_replaced() {
     );
 }
 
+/// A block remembered with a body length over the size limit is still sent, because only
+/// the bytes actually written are checked against the limit.
+#[test]
+fn remembered_oversized_length_does_not_reject_a_block() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+
+    let shared = BlockChecksums::default();
+    shared.insert(
+        block.hash(),
+        MAX_PROTOCOL_MESSAGE_LEN + 1,
+        sha256d::Checksum([0xAB; 4]),
+    );
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+
+    assert_eq!(encode_block(&mut codec, &block), alone);
+}
+
+/// A block sent again is written into a buffer reserved once for the whole frame, so its
+/// bytes are never copied to a larger buffer while it is written.
+#[test]
+fn block_sent_again_is_written_without_growing_the_buffer() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let mut codec = Codec::builder().finish();
+    let first = encode_block(&mut codec, &block);
+
+    let mut frame = BytesMut::new();
+    codec
+        .encode(Message::Block(block.clone().into()), &mut frame)
+        .expect("test block should encode");
+    assert_eq!(frame, first);
+    // A buffer grown while writing ends up with doubled capacity, far above the frame size.
+    assert!(
+        frame.capacity() - frame.len() < 4096,
+        "the frame was written into one reservation: capacity {} for {} bytes",
+        frame.capacity(),
+        frame.len(),
+    );
+}
+
 /// A small block is always hashed, even when a checksum is remembered for it.
 #[test]
 fn small_block_checksum_is_always_hashed() {

@@ -225,10 +225,18 @@ async fn peer_batch(
         .into_iter()
         .filter(|item| snapshot.transaction(&item.id().mined_id()).is_none())
         .collect();
-    let rejected = shared
-        .handle
-        .rejected_ids(fresh.iter().map(Gossip::id).collect())
-        .await;
+    // A core that does not answer by the deadline gets the batch dropped, as
+    // a reservation that does not come back in time would be.
+    let Ok(rejected) = tokio::time::timeout_at(
+        deadline,
+        shared
+            .handle
+            .rejected_ids(fresh.iter().map(Gossip::id).collect()),
+    )
+    .await
+    else {
+        return Ok(Response::Queued(Vec::new()));
+    };
     // The rest take their peer's slots now, in one pass, as today's pool
     // queues a batch at once: at most the peer's limit of them, and the rest
     // are dropped without asking the core. Slots that free up while the

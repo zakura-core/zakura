@@ -995,6 +995,35 @@ fn a_repeated_release_ends_the_lease_once() {
     assert!(completion.lease_ends.is_empty());
 }
 
+/// A handle whose scope isn't its lease's neither releases nor reads that
+/// lease: the release succeeds and ends nothing, the read is unavailable,
+/// and the handle with the lease's own scope still releases it.
+#[test]
+fn a_handle_with_another_scope_leaves_the_lease() {
+    let (port, chain) = chain(2);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let path = acquired(reply);
+    let mut rescoped = path.clone();
+    rescoped.scope = HeaderWorkAuthority::for_target(&port.engine().snapshot(), chain[1].hash);
+    assert_ne!(rescoped.scope, path.scope);
+    let (released, completion) = run(&port, port.release_header_path(rescoped.clone()));
+    released.expect("the release succeeds");
+    assert!(completion.lease_ends.is_empty());
+    let (read, completion) = run(&port, port.read_header_path(rescoped, first_page()));
+    assert!(matches!(read, Ok(ReadPathReply::Unavailable)), "{read:?}");
+    assert!(completion.lease_ends.is_empty());
+    assert_eq!(port.owner_state().leases.len(), 1);
+    let (released, completion) = run(&port, port.release_header_path(path.clone()));
+    released.expect("the release succeeds");
+    assert_eq!(
+        completion.lease_ends,
+        [ended(peer(1), &path, Release::LeaseReleased)]
+    );
+}
+
 /// ST3.4 and D3: an `Acquired` reply nobody takes ends its lease, whether
 /// the caller left before the completion or dropped the reply unread. The
 /// peer can then acquire again instead of waiting on itself.

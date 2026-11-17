@@ -23,10 +23,7 @@ use zakura_chain::{
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_script::solver;
 
-use self::{
-    eviction_list::EvictionList,
-    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
-};
+use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
     MempoolError,
@@ -58,97 +55,14 @@ pub(super) use verified_set::benchmarks::mempool_eviction_benchmarks;
 /// [ZIP-401]: https://zips.z.cash/zip-0401#specification
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
-/// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// lock times, or the fee per unit of cost. These rejections are only valid for the current tip.
-///
-/// Each committed block clears these rejections, because new blocks can supply missing inputs,
-/// and free mempool space.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum ExactTipRejectionError {
-    /// Skip this variant in proptest because `TransactionError` is a large enum
-    /// that causes stack overflow during arbitrary value generation.
-    #[error("transaction did not pass consensus validation: {0}")]
-    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    FailedVerification(#[from] zakura_consensus::error::TransactionError),
-    #[error("transaction did not pass standard validation: {0}")]
-    FailedStandard(#[from] NonStandardTransactionError),
+pub use zakura_mempool::{
+    NonStandardTransactionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError,
+};
 
-    /// A transaction that paid more per unit of cost evicted this transaction from the full
-    /// mempool.
-    ///
-    /// The cost depends on the transaction size, which includes the authorizing data, so the
-    /// rejection covers only the exact transaction. A smaller transaction with the same effects
-    /// pays more per unit of cost.
-    #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
-    Evicted,
-
-    /// The mempool is full, and the transaction does not pay enough to evict other
-    /// transactions.
-    ///
-    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers only the exact
-    /// transaction.
-    #[error("transaction rejected because the mempool is full and it pays too low a fee")]
-    BelowEvictionCost,
-}
-
-/// Transactions rejected based only on their effects (spends, outputs, transaction header).
-/// These rejections are only valid for the current tip.
-///
-/// Each committed block clears these rejections, because new blocks can remove other
-/// transactions from the mempool, and free mempool space.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum SameEffectsTipRejectionError {
-    #[error(
-        "transaction rejected because another transaction in the mempool has already spent some of \
-        its inputs"
-    )]
-    SpendConflict,
-
-    #[error(
-        "transaction rejected because it spends missing outputs from \
-        another transaction in the mempool"
-    )]
-    MissingOutput,
-
-    /// The transaction spends outputs of more than [`MAX_MEMPOOL_ANCESTORS`] mempool
-    /// transactions, directly or indirectly.
-    #[error(
-        "transaction rejected because it depends on more than {MAX_MEMPOOL_ANCESTORS} \
-        unconfirmed transactions in the mempool"
-    )]
-    TooManyAncestors,
-
-    /// Adding the transaction would exceed the limit for a connected group of
-    /// unconfirmed parents and children.
-    #[error(
-        "transaction rejected because its connected unconfirmed dependency group \
-        would exceed {MAX_MEMPOOL_PACKAGE_TRANSACTIONS} transactions"
-    )]
-    TooManyPackageTransactions,
-}
-
-/// Transactions rejected based only on their effects (spends, outputs, transaction header).
-/// These rejections are valid while the current chain continues to grow.
-///
-/// Rollbacks and network upgrades clear these rejections, because they can lower the tip height,
-/// or change the consensus rules.
-#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum SameEffectsChainRejectionError {
-    #[error("best chain tip has reached transaction expiry height")]
-    Expired,
-
-    #[error("transaction inputs were spent, or nullifiers were revealed, in the best chain")]
-    DuplicateSpend,
-
-    #[error("transaction was committed to the best chain")]
-    Mined,
-}
+/// Rejections of these exact bytes until the tip changes, with the consensus
+/// verifier's error for a failed verification.
+pub type ExactTipRejectionError =
+    zakura_mempool::ExactTipRejectionError<zakura_consensus::error::TransactionError>;
 
 /// Storage error that combines all other specific error types.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -163,38 +77,6 @@ pub enum RejectionError {
     SameEffectsChain(#[from] SameEffectsChainRejectionError),
     #[error(transparent)]
     NonStandardTransaction(#[from] NonStandardTransactionError),
-}
-
-/// Non-standard transaction error.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub enum NonStandardTransactionError {
-    /// Sprout is retired from the mempool, including on pre-NU7 networks.
-    #[error("Sprout JoinSplits are not accepted in the mempool")]
-    SproutJoinSplit,
-
-    #[error(
-        "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
-    )]
-    TransactionTooLarge { actual_bytes: usize, max_bytes: u64 },
-    #[error("transaction is dust")]
-    IsDust,
-    #[error("transaction scriptSig is too large")]
-    ScriptSigTooLarge,
-    #[error("transaction scriptSig is not push-only")]
-    ScriptSigNotPushOnly,
-    #[error("transaction scriptPubKey is non-standard")]
-    ScriptPubKeyNonStandard,
-    #[error("transaction has a bare multisig output")]
-    BareMultiSig,
-    #[error("transaction has multiple OP_RETURN outputs")]
-    MultiOpReturn,
-    #[error("transaction has an OP_RETURN output that exceeds the size limit")]
-    DataCarrierTooLarge,
-    #[error("transaction has too many signature operations")]
-    TooManySigops,
-    #[error("transaction has non-standard inputs")]
-    NonStandardInputs,
 }
 
 /// Represents a set of transactions that have been removed from the mempool, either because

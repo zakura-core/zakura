@@ -42,7 +42,7 @@ use zcash_script::solver;
 use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
 use crate::{config, error::MempoolError, Instant};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
 #[cfg(test)]
@@ -73,15 +73,15 @@ pub const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 /// Each committed block clears these rejections, because new blocks can supply missing inputs,
 /// and free mempool space.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(test, derive(Arbitrary))]
-#[cfg_attr(test, proptest(no_bound))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), proptest(no_bound))]
 pub enum ExactTipRejectionError<E> {
     /// The verifier rejected the transaction with error `E`.
     ///
     /// Skip this variant in proptest because the verifier's error is a large enum
     /// that causes stack overflow during arbitrary value generation.
     #[error("transaction did not pass consensus validation: {0}")]
-    #[cfg_attr(test, proptest(skip))]
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     FailedVerification(#[source] E),
     /// The transaction failed a standardness check.
     #[error("transaction did not pass standard validation: {0}")]
@@ -111,7 +111,7 @@ pub enum ExactTipRejectionError<E> {
 /// Each committed block clears these rejections, because new blocks can remove other
 /// transactions from the mempool, and free mempool space.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum SameEffectsTipRejectionError {
     /// Another mempool transaction already spends one of its inputs.
     #[error(
@@ -150,7 +150,7 @@ pub enum SameEffectsTipRejectionError {
 /// Rollbacks and network upgrades clear these rejections, because they can lower the tip height,
 /// or change the consensus rules.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum SameEffectsChainRejectionError {
     /// The best chain reached its expiry height.
     #[error("best chain tip has reached transaction expiry height")]
@@ -168,8 +168,8 @@ pub enum SameEffectsChainRejectionError {
 /// A rejection of any kind. Its kind says which id it is cached under: see
 /// [`Storage::reject`].
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(test, derive(Arbitrary))]
-#[cfg_attr(test, proptest(no_bound))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), proptest(no_bound))]
 pub enum RejectionError<E> {
     /// A rejection for these exact bytes, until the tip changes.
     #[error(transparent)]
@@ -202,7 +202,7 @@ impl<E> From<EffectsRejection> for MempoolError<E> {
 
 /// Non-standard transaction error.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NonStandardTransactionError {
     /// Sprout is retired from the mempool, including on pre-NU7 networks.
     #[error("Sprout JoinSplits are not accepted in the mempool")]

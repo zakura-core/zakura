@@ -140,6 +140,7 @@ proptest-impl = [
     "zakura-state/proptest-impl",
     "zakura-network/proptest-impl",
     "zakura-chain/proptest-impl",
+    "zakura-mempool/proptest-impl",
 ]
 
 # Criterion benchmarks for verified mempool storage, without network or crypto.
@@ -238,6 +239,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "17.0.2", features 
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "18.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "18.0.0", features = ["proptest-impl"] }
+zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false, features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "4.0.0" }

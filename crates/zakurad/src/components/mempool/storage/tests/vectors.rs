@@ -17,7 +17,7 @@ use zakura_chain::transparent;
 
 use crate::components::mempool::storage::*;
 
-use super::super::{config::Config, fixtures::TxFactory};
+use super::super::{config::Config, fixtures::TxFactory, verified_set::MAX_MEMPOOL_ANCESTORS};
 use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
 /// Eviction memory time used for tests. Most tests won't care about this

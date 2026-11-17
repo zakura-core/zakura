@@ -1009,6 +1009,7 @@ where
         let changed = admission.capacity_changed.clone();
         let spawner = self.clone();
         let wait_admission = self.admission.clone();
+        let wait_token = token.clone();
         tokio::spawn(async move {
             let wait = async move {
                 if local_submission_committed(hash, resolution, &spawner.trace).await {
@@ -1019,28 +1020,9 @@ where
                     let notified = changed.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    let task = {
-                        let mut admission = spawner.admission();
-                        if admission.closed || admission.cancel_handles.contains_key(&hash) {
-                            return Err(("download closed or already queued".into(), hash, None));
-                        }
-                        let source_available = download.advertiser.as_ref().is_none_or(|source| {
-                            admission
-                                .source_counts
-                                .get(source)
-                                .copied()
-                                .unwrap_or_default()
-                                < source.max_in_flight(spawner.full_verify_concurrency_limit)
-                        });
-                        if admission.queue_len() < spawner.full_verify_concurrency_limit
-                            && source_available
-                        {
-                            admission.local_waits.remove(&hash);
-                            Some(spawner.spawn_download_task(&mut admission, download.clone()))
-                        } else {
-                            None
-                        }
-                    };
+                    let task = spawner
+                        .try_promote_local_wait(&download, &wait_token)
+                        .map_err(|error| (error, hash, None))?;
                     if let Some(task) = task {
                         // Admission now owns cancellation of the active download. The wait's
                         // sender was removed, so do not select on its receiver after promotion.
@@ -1075,6 +1057,45 @@ where
                 Err(error) => Err(error),
             }
         })
+    }
+
+    /// Promotes this exact waiter atomically, or leaves it waiting when capacity is full.
+    /// Returns an error if the waiter was cancelled, replaced, or the downloader shut down.
+    fn try_promote_local_wait(
+        &self,
+        download: &DownloadTask,
+        token: &Arc<()>,
+    ) -> Result<Option<DownloadHandle>, BoxError> {
+        let mut admission = self.admission();
+        let hash = download.hash;
+        if admission.closed || admission.cancel_handles.contains_key(&hash) {
+            return Err("download closed or already queued".into());
+        }
+        // Cancellation can arrive after the outer select polled its receiver. Check
+        // ownership under the same lock as removal so stale work cannot remove a replacement.
+        if !admission
+            .local_waits
+            .get(&hash)
+            .is_some_and(|(_, current)| Arc::ptr_eq(current, token))
+        {
+            return Err("local submission wait cancelled or replaced".into());
+        }
+        let source_available = download.advertiser.as_ref().is_none_or(|source| {
+            admission
+                .source_counts
+                .get(source)
+                .copied()
+                .unwrap_or_default()
+                < source.max_in_flight(self.full_verify_concurrency_limit)
+        });
+        if admission.queue_len() < self.full_verify_concurrency_limit && source_available {
+            admission.local_waits.remove(&hash);
+            Ok(Some(
+                self.spawn_download_task(&mut admission, download.clone()),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Starts recovering `parent`, which an advertised child at `child_height` revealed to be
@@ -2190,6 +2211,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             BoxCloneService::new(service_fn(move |request| {
@@ -2420,6 +2442,94 @@ mod tests {
             downloads.spawner.admission().local_waits.len(),
             MAX_LOCAL_SUBMISSION_WAITS
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_local_wait_cannot_promote_after_parent_recovery() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let registry = PendingBlockRegistry::default();
+        let registration = registry.insert(block).expect("registry is empty");
+        let (mut downloads, mut requests) = downloads_reporting_requests(registry);
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+        downloads.download_and_verify(hash, Some(peer.clone()));
+        let old_token = downloads.spawner.admission().local_waits[&hash].1.clone();
+        let download = DownloadTask {
+            hash,
+            advertiser: Some(AdvertiserSource::from(peer.clone())),
+            download_source: Some(peer.clone()),
+            kind: DownloadKind::Advertised,
+            pushed: None,
+        };
+
+        assert_eq!(
+            downloads.spawner.recover_parent(hash, None),
+            ParentRecovery::Requested
+        );
+        let recovery = downloads
+            .spawned_receiver
+            .try_recv()
+            .expect("parent recovery registers its task");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv()).await?,
+            Some(zn::Request::BlocksByHash(IndexSet::from([hash])))
+        );
+        {
+            let mut admission = downloads.spawner.admission();
+            let (replacement, _) = oneshot::channel();
+            let (sender, _) = admission
+                .cancel_handles
+                .get_mut(&hash)
+                .expect("parent recovery is active");
+            let _ = std::mem::replace(sender, replacement).send(());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(1), recovery)
+            .await??
+            .is_err());
+        assert_eq!(downloads.spawner.admission().queue_len(), 0);
+
+        // Exercise the promotion boundary as if the old task resumed after cancellation.
+        assert!(downloads
+            .spawner
+            .try_promote_local_wait(&download, &old_token)
+            .is_err());
+        assert_eq!(downloads.spawner.admission().queue_len(), 0);
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        let current_token = downloads.spawner.admission().local_waits[&hash].1.clone();
+        assert!(downloads
+            .spawner
+            .try_promote_local_wait(&download, &old_token)
+            .is_err());
+        {
+            let admission = downloads.spawner.admission();
+            assert!(Arc::ptr_eq(&admission.local_waits[&hash].1, &current_token));
+            assert_eq!(admission.queue_len(), 0);
+            assert!(admission.source_counts.is_empty());
+        }
+        assert!(requests.try_recv().is_err(), "stale work sends no request");
+
+        registration.resolve(Err(()));
+        let active = downloads
+            .spawner
+            .try_promote_local_wait(&download, &current_token)?
+            .expect("the current waiter can use the free slot");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), requests.recv()).await?,
+            Some(zn::Request::BlocksByHashFrom {
+                hashes: IndexSet::from([hash]),
+                source: peer,
+            })
+        );
+        assert!(downloads.spawner.admission().local_waits.is_empty());
+        drop(downloads);
+        assert!(tokio::time::timeout(Duration::from_millis(1), active)
+            .await??
+            .is_err());
         Ok(())
     }
 

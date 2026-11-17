@@ -15,6 +15,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Arbitrary error values, for the property tests of crates that share these errors.
+proptest-impl = ["proptest", "proptest-derive"]
+
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "16.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
@@ -25,6 +28,10 @@ zcash_script = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
+
+# test feature proptest-impl
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true }

@@ -195,10 +195,13 @@ struct Seen {
     causes: HashMap<ZakuraConnId, Option<&'static str>>,
     /// `tx-relay` setups that expired before they completed.
     expired: usize,
+    /// How many `tx-relay` sessions each connection's transport saw exit.
+    exited: HashMap<ZakuraConnId, usize>,
 }
 
 impl TransportObserver for Observed {
-    /// Keeps registrations, close causes and expired `tx-relay` setups.
+    /// Keeps registrations, close causes, and expired and exited `tx-relay`
+    /// sessions.
     fn observe(&self, event: TransportEvent) {
         let mut seen = self.0.lock().expect("no test panics while holding it");
         match event {
@@ -219,6 +222,11 @@ impl TransportObserver for Observed {
                 step: SessionStep::OfferExpired { .. },
                 ..
             } => seen.expired += 1,
+            TransportEvent::SessionLifecycle {
+                conn_id,
+                kind: TX_RELAY_DATA_KIND,
+                step: SessionStep::GenerationExited { .. },
+            } => *seen.exited.entry(conn_id).or_default() += 1,
             _ => {}
         }
     }
@@ -238,6 +246,17 @@ impl Observed {
             .lock()
             .expect("no test panics while holding it")
             .expired
+    }
+
+    /// How many `tx-relay` sessions on `peer`'s connection the transport
+    /// saw exit. Until it sees one, it refuses the peer's next offer as a
+    /// duplicate.
+    fn exited(&self, peer: &RawRelay) -> usize {
+        let seen = self.0.lock().expect("no test panics while holding it");
+        let conn_id = seen.connections.get(&peer.raw.connection.shared_id());
+        conn_id
+            .and_then(|conn_id| seen.exited.get(conn_id).copied())
+            .unwrap_or(0)
     }
 }
 
@@ -538,6 +557,22 @@ impl RawRelay {
         }
         self.data_recv = None;
         self.data_rx = None;
+        Ok(())
+    }
+
+    /// Waits up to `within` until the node ends the data stream, which it
+    /// reads, so the session is over.
+    async fn data_ended(&mut self, within: Duration) -> Result<(), BoxError> {
+        let rx = self.data_rx.as_mut().ok_or("the data stream is unread")?;
+        tokio::time::timeout(within, async {
+            while let Some(got) = rx.recv().await {
+                if matches!(got, Got::Ended) {
+                    return;
+                }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for the data stream to end")?;
         Ok(())
     }
 
@@ -1290,20 +1325,19 @@ async fn requests_past_our_hello_with_their_answers_waiting_close_the_peer() -> 
 /// Unread `NotFound`s, part two: a peer that stops reading its state stream
 /// and keeps asking for ids nobody has is answered `NotFound` at once, which
 /// frees each request's place, so it never breaks our `Hello`'s limit. The
-/// answers fill the state writer's queue instead, and the peer is closed as
-/// having stopped reading.
+/// answers fill the state writer's queue instead. That is the peer's first
+/// stall, so its session is parked: it ends, and the connection stays.
 #[tokio::test]
-async fn a_peer_that_never_reads_its_not_founds_is_closed_for_not_reading() -> Result<(), BoxError>
-{
+async fn a_peer_that_never_reads_its_not_founds_is_parked() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let (victim, observed) =
         observed_node(134, TestPool::new(Held::default()), cools(), 16).await?;
-    let peer = flood_unread(&victim, 1_134).await?;
-    peer.closed().await?;
-    assert_eq!(
-        observed.cause(&peer),
-        Some("tx-relay: peer stopped reading")
-    );
+    let sessions = victim.sessions.clone().expect("the node runs tx-relay");
+    let mut peer = flood_unread(&victim, 1_134).await?;
+    peer.data_ended(NET).await?;
+    assert!(!peer.is_closed(), "the connection stays");
+    assert_eq!(observed.cause(&peer), None);
+    assert!(!sessions.is_live(&peer.id()));
 
     victim.node.shutdown().await;
     Ok(())
@@ -1336,13 +1370,15 @@ async fn flood_unread(victim: &RelayNode, seed: u64) -> Result<RawRelay, BoxErro
     Ok(peer)
 }
 
-/// Liveness closes are not violations. A peer stalled past the write
-/// deadline loses its session. One that fills a writer queue and one that
-/// leaves a request unanswered for a second deadline lose their
-/// connections. Each is closed for liveness, not for a protocol violation,
-/// and none is charged: each comes back and is asked for what it announces.
+/// A stall costs a peer its session, never its connection or a charge. Three
+/// peers stall for the first time: one past the transport's write deadline,
+/// one by filling a writer queue, and one by leaving a request unanswered
+/// for a second deadline. So their sessions are parked: they end, their
+/// connections stay, and nothing is recorded as a close. The first one's
+/// next session is refused at once. The machine's scenario follows a park
+/// to its readmission.
 #[tokio::test]
-async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
+async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let body = large(1, BLOCKED_BODY);
     let pool = TestPool::new(Held {
@@ -1351,7 +1387,7 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
     });
     let (victim, observed) = observed_node(136, pool, cools(), 16).await?;
     let sessions = victim.sessions.clone().expect("the node runs tx-relay");
-    let [stalled_tx, flood_tx, silent_tx, silent_again]: [VerifiedUnminedTx; 4] = vectors(4)
+    let [silent_tx]: [VerifiedUnminedTx; 1] = vectors(1)
         .try_into()
         .expect("vectors returns what it is asked for");
 
@@ -1378,23 +1414,27 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
             !sessions.is_live(&peer.id())
         })
         .await?;
-        peer.start().await?;
-        supply(&mut peer, &stalled_tx).await?;
-        reaches(&victim, &stalled_tx).await?;
+        // The session ran its stall step before it left the live record,
+        // so the park stands. Once the transport saw the session exit, it
+        // takes the next one, which `tx-relay` ends as it opens.
+        await_until("the transport sees the session exit", NET, || {
+            observed.exited(&peer) >= 1
+        })
+        .await?;
+        peer.open().await?;
+        peer.read_data();
+        peer.data_ended(NET).await?;
+        assert!(!peer.is_closed(), "a parked session leaves the connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };
 
     let flooding = async {
-        let peer = flooded;
-        peer.closed().await?;
-        assert_eq!(
-            observed.cause(&peer),
-            Some("tx-relay: peer stopped reading")
-        );
-        let mut peer = RawRelay::reconnect(&victim, 1_137).await?;
-        supply(&mut peer, &flood_tx).await?;
-        reaches(&victim, &flood_tx).await?;
+        let mut peer = flooded;
+        peer.data_ended(NET).await?;
+        assert!(!peer.is_closed(), "the flooding peer keeps its connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };
@@ -1406,13 +1446,9 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
             .await?;
         peer.asked(id(&silent_tx)).await?;
         // Two deadlines of about 13 seconds each.
-        tokio::time::timeout(Duration::from_secs(60), peer.raw.connection.closed())
-            .await
-            .map_err(|_| "the silent peer was not closed")?;
-        assert_eq!(observed.cause(&peer), Some("tx-relay: unanswered request"));
-        let mut peer = RawRelay::reconnect(&victim, 1_138).await?;
-        supply(&mut peer, &silent_again).await?;
-        reaches(&victim, &silent_again).await?;
+        peer.data_ended(Duration::from_secs(60)).await?;
+        assert!(!peer.is_closed(), "the silent peer keeps its connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };

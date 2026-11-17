@@ -28,9 +28,9 @@ use zakura_node_services::mempool::port::{
 
 use self::tracker::{Cause, Tracker};
 use super::{
-    peer::Hello, CallId, CloseReason, FanOut, Granted, PeerKey, RelayConfig, RelayEffect,
-    RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId, MAX_REQUESTS_PER_PEER,
-    MAX_TX_BYTES,
+    peer::Hello, CallId, CloseReason, FanOut, Granted, InvRoom, Paid, PeerKey, RelayConfig,
+    RelayEffect, RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
 };
 
 mod random;
@@ -186,8 +186,9 @@ impl Bench {
     /// A session of `peer` opens, unconditional if `exempt`.
     pub(super) fn connect(&mut self, peer: u64, exempt: bool) -> SessionId {
         let session = self.machine.connect(PeerKey(peer), exempt, self.now);
-        self.tracker.opened(session, PeerKey(peer), exempt);
-        self.took(Cause::Other);
+        self.tracker
+            .opened(session, PeerKey(peer), exempt, self.now);
+        self.took(Cause::Opened(session));
         session
     }
 
@@ -250,19 +251,94 @@ impl Bench {
         self.took(Cause::GetTxs(session, id));
     }
 
+    /// `session`'s IO starts writing its answer to the request for `id`.
+    pub(super) fn served(&mut self, session: SessionId, id: UnminedTxId) {
+        self.machine.served(session, id, self.now);
+        self.took(Cause::Served(session, id));
+    }
+
+    /// `session`'s IO finds one of its writers' queues full.
+    pub(super) fn stopped_reading(&mut self, session: SessionId) {
+        self.machine.stopped_reading(session, self.now);
+        self.took(Cause::StoppedReading(session));
+    }
+
+    /// `session`'s peer answers the request for `id` with a body of the
+    /// announced size that does not decode.
+    pub(super) fn undecodable(&mut self, session: SessionId, id: UnminedTxId) {
+        if self.arrived(session, id, SIZE) {
+            self.machine.undecodable(session, self.now);
+            self.took(Cause::Undecodable(session));
+        }
+    }
+
     /// `session` ends.
     pub(super) fn end(&mut self, session: SessionId) {
         self.machine.end(session, self.now);
         self.took(Cause::End(session));
     }
 
-    /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`.
+    /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`,
+    /// without the pacing [`Self::send_inv`] goes through.
     pub(super) fn take_inv(&mut self, session: SessionId, max: usize) -> Vec<UnminedTxId> {
         let taken = self.machine.take_inv(session, max);
+        self.inv_taken(session, taken)
+    }
+
+    /// `session`'s IO asks for the `Inv` it may send now, with `free`
+    /// places in its data writer and the byte rate answering `paid`.
+    pub(super) fn send_inv(
+        &mut self,
+        session: SessionId,
+        free: usize,
+        paid: Paid,
+    ) -> Vec<UnminedTxId> {
+        let room = InvRoom {
+            free,
+            paid: |_| paid,
+        };
+        let taken = self.machine.next_inv(session, room, self.now);
+        let short = matches!(paid, Paid::At(at) if at > self.now);
+        let blocked = free <= MAX_SERVES || paid == Paid::Unwritten || short;
+        assert!(!blocked || taken.is_empty(), "relay/inv-paced");
+        self.inv_taken(session, taken)
+    }
+
+    /// Records the `Inv` `session`'s IO took. No id goes out while one of
+    /// its parents still waits to go out to the same session, queued or
+    /// held.
+    fn inv_taken(
+        &mut self,
+        session: SessionId,
+        taken: Vec<(UnminedTxId, u32)>,
+    ) -> Vec<UnminedTxId> {
         let ids: Vec<UnminedTxId> = taken.into_iter().map(|(id, _)| id).collect();
+        if let Some(state) = self.machine.session(session) {
+            let waits = |parent: &UnminedTxId| {
+                let queued =
+                    state.announced.contains_key(parent) && !state.announced.is_sent(parent);
+                queued || state.held.contains(*parent)
+            };
+            for id in &ids {
+                let early = self.machine.parents(id).iter().any(waits);
+                assert!(!early, "relay/child-after-parent");
+            }
+            let held_back = self.pool.keys().any(|id| {
+                let queued = state.announced.contains_key(id) && !state.announced.is_sent(id);
+                queued && self.machine.parents(id).iter().any(waits)
+            });
+            if held_back {
+                self.tracker.saw("inv child waited");
+            }
+        }
         self.tracker.sent(session, &ids);
         self.machine.assert_invariants();
         ids
+    }
+
+    /// `child` spends outputs of `parents`, while the pool holds them.
+    pub(super) fn depends(&mut self, child: UnminedTxId, parents: &[UnminedTxId]) {
+        self.machine.set_parents(child, parents.to_vec());
     }
 
     /// `session`'s routine reports its round-trip time.
@@ -484,6 +560,17 @@ impl Bench {
             .iter()
             .filter_map(|effect| match effect {
                 RelayEffect::Advert { session, id } => Some((*session, *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sessions the last input parked.
+    pub(super) fn parks(&self) -> Vec<SessionId> {
+        self.effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RelayEffect::Park { session } => Some(*session),
                 _ => None,
             })
             .collect()

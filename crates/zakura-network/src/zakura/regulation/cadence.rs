@@ -39,9 +39,9 @@
 //! | A conformant sender that stalls and resumes is never cut off | `a_sender_that_stalls_and_resumes_never_overruns_the_receiver` |
 //! | Reopening sessions on one connection buys no bytes | `reopening_sessions_on_one_connection_buys_no_bytes` |
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use zakura_rt::{collections::HashMap, time::Instant};
+use zakura_rt::{collections::HashMap, sync::Mutex, time::Instant};
 
 use crate::zakura::{
     wire_codec::{encode_frame, WireMessage},
@@ -165,6 +165,71 @@ impl ByteBucket {
     #[cfg(test)]
     pub(crate) fn tokens(&self) -> u64 {
         self.tokens
+    }
+}
+
+/// When a [`MeteredSender`] may send its next frame.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MeteredReady {
+    /// Now.
+    Now,
+    /// Once the rate pays for the frame, at this time.
+    At(Instant),
+    /// Once its last frame is written, which no clock decides.
+    Unwritten,
+}
+
+/// Sends a metered row's frames no faster than its byte rate allows: the
+/// sender's half of [`MessageRole::Metered`].
+///
+/// It pays the connection's [`ByteBucket`] for each frame before handing it
+/// on, so the sessions that share a connection share its allowance and a
+/// reopened session buys no bytes. It keeps at most one of its frames
+/// unwritten, so the bytes it paid for and the transport has not written
+/// stay within the row's sender allowance.
+#[derive(Debug)]
+pub(crate) struct MeteredSender {
+    bucket: Arc<Mutex<ByteBucket>>,
+    unwritten: zakura_rt::sync::Weak<()>,
+}
+
+impl MeteredSender {
+    /// A sender that pays `bucket`, its connection's.
+    pub(crate) fn new(bucket: Arc<Mutex<ByteBucket>>) -> Self {
+        Self {
+            bucket,
+            unwritten: zakura_rt::sync::Weak::new(),
+        }
+    }
+
+    /// When a frame of `bytes` payload bytes may go. A frame past the
+    /// bucket's depth is never paid for: the row's layout check keeps every
+    /// frame within it.
+    pub(crate) fn ready(&self, bytes: u64, now: Instant) -> MeteredReady {
+        if self.unwritten.strong_count() > 0 {
+            return MeteredReady::Unwritten;
+        }
+        let mut bucket = self.bucket.lock().expect("a bucket is never poisoned");
+        match bucket.ready_at(bytes, now) {
+            Some(at) if at > now => MeteredReady::At(at),
+            _ => MeteredReady::Now,
+        }
+    }
+
+    /// Pays for a frame of `bytes` payload bytes and returns the guard the
+    /// frame holds until the transport writes it, or `None` if it may not go
+    /// now. See [`Self::ready`].
+    pub(crate) fn pay(&mut self, bytes: u64, now: Instant) -> Option<FrameGuard> {
+        if self.unwritten.strong_count() > 0 {
+            return None;
+        }
+        let mut bucket = self.bucket.lock().expect("a bucket is never poisoned");
+        if !bucket.try_pay(bytes, now) {
+            return None;
+        }
+        let written = Arc::new(());
+        self.unwritten = zakura_rt::sync::downgrade(&written);
+        Some(FrameGuard::new(written))
     }
 }
 

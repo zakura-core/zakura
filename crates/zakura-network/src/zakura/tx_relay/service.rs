@@ -1,13 +1,18 @@
 //! `tx-relay`'s service and IO: the v2 [`Service`] that takes each session's
-//! two streams, and the actor that runs the pure machine against the pool.
+//! two streams and runs one routine for it.
 //!
-//! One actor task owns the machine, the pool handle and every reservation.
-//! Each session has a reader per stream, which decodes frames and hands them
-//! to the actor, and a writer per stream, which the actor feeds. The actor
-//! performs the machine's effects: frames to send, calls to the pool, and
-//! connection closes. The pool's answers, verdicts, cancellations and
-//! publications come back to it as inputs. So all the rules live in the
-//! machine, and this file only moves data.
+//! Each session's routine owns its streams, its [`PeerMachine`], its calls
+//! to the pool and the reservations they bring, and its `Inv` pacing. It
+//! reads and decodes its own frames, so peers' bodies decode in parallel.
+//! What the routines share, the wanted table and the reactor, is a
+//! [`Shared`] behind one brief lock, which no routine holds across an await.
+//! After each step the routine wakes the others the machine's rules name:
+//! those an effect reaches, which read their mail first at their next step,
+//! and all of them once the wanted table's ring moved or claims opened up.
+//! See [`Marks`] and [`NodeEffect::reach`](super::machine::NodeEffect::reach).
+//! A session that ends hands its unanswered reserve calls and verdicts to
+//! the reactor task, which applies them to the shared state. So all the
+//! rules live in the machines, and this file only moves data.
 
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -15,38 +20,37 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rand_10::Rng;
 use zakura_chain::{
     block,
-    transaction::{Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_node_services::mempool::port::{
-    ChainTip, Change, ChangeEntry, ChangeSeq, ChangesSince, PoolHandle, PoolReader, PoolSnapshot,
-    PoolView, Reservation, ReservationId, Unreserved as PortUnreserved, Verdict as PortVerdict,
+    ChainTip, ChangeSeq, ChangesSince, PoolHandle, PoolReader, PoolSnapshot, PoolView as PortView,
+    Reservation, ReservationId, Unreserved as PortUnreserved, Verdict as PortVerdict,
 };
 use zakura_rt::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, CancellationToken, Mutex, OwnedSemaphorePermit, Semaphore,
-    },
+    sync::{mpsc, CancellationToken, Mutex, Notify},
     task,
     time::{self, Instant},
 };
 
 use super::{
     machine::{
-        peer::Hello, CallId, CloseReason, Granted, PeerKey, RelayConfig, RelayEffect, RelayMachine,
-        SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId, MAX_SERVES,
+        peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
+        PeerMachine, PoolView, RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved,
+        Verdict, Violation, WaiterId, MAX_SERVES,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
-        inv_payload_bound, tx_frame, TxRelayMessage, INV_RATE, MAX_INV_ENTRIES, MAX_TX_BYTES,
-        TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
+        tx_frame, TxRelayMessage, INV_RATE, MAX_TX_BYTES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
+        TX_RELAY_STREAMS,
     },
     ZakuraTxRelayConfig,
 };
 use crate::{
     config::UnconditionalPeers,
     zakura::{
-        regulation::ByteBucket,
+        regulation::{ByteBucket, MeteredReady, MeteredSender},
+        transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
         Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
         Stream, ZakuraConnId, ZakuraPeerId,
@@ -57,51 +61,23 @@ use crate::{
 /// current and its best tip is still there. `zakurad` supplies it.
 pub type MayCool = Arc<dyn Fn(zakura_chain::block::Height) -> bool + Send + Sync>;
 
-/// How long a session waits to look again while its last `Inv` is
-/// unwritten or its data writer has no room. A write frees both, and wakes
-/// nothing.
-const INV_RETRY: Duration = Duration::from_millis(50);
-
 /// Jobs a session's data writer queues: a serve job for every request our
 /// `Hello` lets a peer have unanswered, each only an id until the writer
 /// builds its body, and room for the one unwritten `Inv`, which goes out
 /// only while the jobs' room is free. A conformant peer never fills it.
 const DATA_QUEUE: usize = MAX_SERVES + 4;
 
+/// Frames a session's state writer queues. Requests, `NotFound` answers and
+/// our `Hello` are bounded by the machine's per-peer limits, far below this.
+const STATE_QUEUE: usize = 64;
+
 /// What a session's writer sends.
 enum Outgoing {
     /// A frame, with what it holds until the transport has written it.
     Frame(Frame, Option<FrameGuard>),
     /// A `Tx` answering the peer's request for `id`, built only when the
-    /// writer reaches it. `request` keeps the request outstanding until the
-    /// answer is queued for the transport.
-    Serve { id: UnminedTxId, request: Request },
-}
-
-/// One of the peer's requests to us, held until its answer is queued: its
-/// place among those our `Hello` serves, and the marker that keeps its id
-/// counted as outstanding.
-struct Request {
-    _place: OwnedSemaphorePermit,
-    _outstanding: Arc<()>,
-}
-
-/// Where one of the peer's outstanding requests stands.
-enum Answer {
-    /// The machine has yet to answer it.
-    Unanswered(OwnedSemaphorePermit),
-    /// Its serve job waits on the data writer while the marker lives.
-    Serving(zakura_rt::sync::Weak<()>),
-}
-
-impl Answer {
-    /// Whether the request is still outstanding.
-    fn outstanding(&self) -> bool {
-        match self {
-            Self::Unanswered(_) => true,
-            Self::Serving(marker) => marker.strong_count() > 0,
-        }
-    }
+    /// writer reaches it.
+    Serve(UnminedTxId),
 }
 
 /// Where a data writer builds the bodies it serves, and answers `NotFound`
@@ -109,39 +85,63 @@ impl Answer {
 struct Bodies {
     pool: PoolReader,
     state: mpsc::Sender<Outgoing>,
-    close: Closer,
+    /// Where the writer reports to the routine.
+    reports: mpsc::UnboundedSender<WriterReport>,
 }
 
-/// Frames a session's state writer queues. Requests, `NotFound` answers and
-/// our `Hello` are bounded by the machine's per-peer limits, far below this.
-const STATE_QUEUE: usize = 64;
-
-/// Received messages one stream's reader may hand the actor before the
-/// actor has handled them. The reader takes its next frame only once the
-/// actor drops the last one, and taking a frame is what gives the last
-/// frame's receive grant back to the transport, so a message waiting for
-/// the actor always sits inside its stream's receive share. A peer that
-/// sends faster than the actor handles its frames is held back by the
-/// transport.
-const QUEUED_PER_STREAM: usize = 1;
+/// What a data writer tells its routine.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WriterReport {
+    /// It started answering the peer's request for this id. It says so
+    /// before the answer can reach the peer, so the request's place is free
+    /// before the peer can count it free.
+    Started(UnminedTxId),
+    /// Its `NotFound` found the state writer's queue full: the peer stopped
+    /// reading.
+    Stalled,
+}
 
 /// The `tx-relay` service.
 pub struct TxRelayService {
-    inputs: mpsc::UnboundedSender<Input>,
-    next_session: AtomicU64,
+    /// What each session's routine is wired to.
+    wiring: Wiring,
     /// Keys the hash that names peers to the machine, so no peer can choose
     /// an identity that collides with another's.
     peer_key: blake2b_simd::Params,
-    /// The connections with a session, which discovery leaves open.
-    owned: Owned,
-    /// Where data writers build the bodies they serve.
-    pool: PoolReader,
     /// The addresses whose sessions are never charged for a body.
     unconditional: UnconditionalPeers,
 }
 
+/// What every routine shares, behind one lock that no routine holds across
+/// an await.
+struct Node {
+    shared: Shared,
+    /// Each live session's handle.
+    sessions: HashMap<SessionId, Handle>,
+}
+
+/// What another routine needs of a session: its peer, its closer, and its
+/// mail.
+struct Handle {
+    peer: PeerKey,
+    close: Closer,
+    /// Wakes the session's routine to look again. A wake before the routine
+    /// waits is kept, so none is lost.
+    wake: Arc<Notify>,
+    /// What other sessions' steps left for it.
+    mail: Vec<Mail>,
+}
+
+/// Pool calls in flight.
+type Calls = FuturesUnordered<PoolCall>;
+
+/// Each connection's `Inv` byte rate, which every session on it pays before
+/// it queues a frame, so overlapping or replacing sessions share one
+/// opening allowance.
+type InvBuckets = Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), ConnectionInv>>>;
+
 /// The connections tx-relay owns, until the transport removes them. The
-/// service adds a session when it takes its streams, and the actor removes
+/// service adds a session when it takes its streams, and the routine removes
 /// it when the session ends.
 type Owned = Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), Ownership>>>;
 
@@ -187,11 +187,11 @@ impl fmt::Debug for TxRelayService {
 }
 
 impl TxRelayService {
-    /// Starts the actor on `pool` with `config`'s fan-out and returns the
-    /// service to register. A session whose address is in `unconditional`
-    /// is never charged for the bodies it supplies. Each session is
-    /// published in `sessions` from when the actor holds a view of the pool
-    /// until the session ends or the pool stops.
+    /// Starts the reactor task on `pool` with `config`'s fan-out and returns
+    /// the service to register. A session whose address is in
+    /// `unconditional` is never charged for the bodies it supplies. Each
+    /// session is published in `sessions` from when its routine holds a view
+    /// of the pool until the session ends or the pool stops.
     pub fn spawn(
         pool: PoolHandle,
         may_cool: MayCool,
@@ -199,11 +199,39 @@ impl TxRelayService {
         unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
-        let (inputs, receiver) = mpsc::unbounded_channel();
-        let owned = Owned::default();
-        let reader = pool.reader();
-        let actor = Actor::new(pool, may_cool, config, sessions, owned.clone());
-        task::spawn_named("tx-relay-actor", actor.run(receiver));
+        let mut key = [0; 8];
+        zakura_rt::rand::rng().fill_bytes(&mut key);
+        let node = Node {
+            shared: Shared::new(RelayConfig {
+                fan_out: config.fan_out(),
+                short_id_key: u64::from_le_bytes(key),
+            }),
+            sessions: HashMap::default(),
+        };
+        let (handoff, handed) = mpsc::unbounded_channel();
+        let wiring = Wiring {
+            node: Arc::new(Mutex::new(node)),
+            pool,
+            may_cool,
+            handoff,
+            owned: Owned::default(),
+            record: sessions,
+            inv_buckets: InvBuckets::default(),
+            base: Instant::now(),
+        };
+        // The reactor task holds a reader, not a handle, so it does not keep
+        // the core running, and it stops once the service, every routine
+        // and its last call are gone.
+        task::spawn_named(
+            "tx-relay-reactor",
+            run_reactor(
+                wiring.node.clone(),
+                wiring.pool.reader(),
+                wiring.may_cool.clone(),
+                wiring.base,
+                handed,
+            ),
+        );
         let mut key = [0; 32];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let mut peer_key = blake2b_simd::Params::new();
@@ -212,11 +240,8 @@ impl TxRelayService {
             .key(&key)
             .personal(b"Zakura_TxPeerKey");
         Arc::new(Self {
-            inputs,
-            next_session: AtomicU64::new(0),
+            wiring,
             peer_key,
-            owned,
-            pool: reader,
             unconditional,
         })
     }
@@ -230,11 +255,6 @@ impl TxRelayService {
             .try_into()
             .expect("the hash is configured to 8 bytes");
         PeerKey(u64::from_le_bytes(bytes))
-    }
-
-    /// A fresh session key.
-    fn session_key(&self) -> u64 {
-        self.next_session.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -259,7 +279,8 @@ impl Service for TxRelayService {
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        self.owned
+        self.wiring
+            .owned
             .lock()
             .expect("the ownership map is never poisoned")
             .get(&(peer.clone(), conn_id))
@@ -276,6 +297,7 @@ impl Service for TxRelayService {
         let connection = (peer.id.clone(), peer.conn_id);
         {
             let mut owned = self
+                .wiring
                 .owned
                 .lock()
                 .expect("the ownership map is never poisoned");
@@ -283,7 +305,6 @@ impl Service for TxRelayService {
             ownership.sessions += 1;
             ownership.gap_until = None;
         }
-        let key = self.session_key();
         let peer_key = self.peer_key(&peer.id);
         let conn_cancel = peer.cancel_token();
         let session_cancel = peer.service_cancel_token();
@@ -292,44 +313,31 @@ impl Service for TxRelayService {
             .remote_ip
             .is_some_and(|ip| self.unconditional.contains(ip));
         let close = Closer {
-            conn_cancel: conn_cancel.clone(),
+            conn_cancel,
             close_cause,
         };
         let state = spawn_writer(state_send, STATE_QUEUE, session_cancel.clone(), None);
+        let (reports, reports_rx) = mpsc::unbounded_channel();
         let bodies = Bodies {
-            pool: self.pool.clone(),
+            pool: self.wiring.pool.reader(),
             state: state.clone(),
-            close: close.clone(),
+            reports,
         };
         let data = spawn_writer(data_send, DATA_QUEUE, session_cancel.clone(), Some(bodies));
-        if self
-            .inputs
-            .send(Input::Open {
-                key,
-                peer: peer_key,
-                exempt,
-                data,
-                state,
-                close: close.clone(),
-                connection: connection.clone(),
-            })
-            .is_err()
-        {
-            disown(&self.owned, &connection, Instant::now());
-            return;
-        }
-        spawn_reader(
-            key,
-            data_recv,
-            self.inputs.clone(),
-            session_cancel.clone(),
-            close.clone(),
+        let inv = MeteredSender::new(open_inv_bucket(&self.wiring.inv_buckets, &connection));
+        let routine = Routine::open(
+            self.wiring.clone(),
+            peer_key,
+            exempt,
+            SessionIo::new(data, state, close, reports_rx, inv, connection),
+            session_cancel,
         );
-        spawn_reader(key, state_recv, self.inputs.clone(), session_cancel, close);
+        task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
-        self.owned
+        self.wiring
+            .owned
             .lock()
             .expect("the ownership map is never poisoned")
             .remove(&(peer.clone(), conn_id));
@@ -386,14 +394,14 @@ fn spawn_writer(
                     // next reserve returns.
                     slot.send(frame, guard);
                 }
-                Outgoing::Serve { id, request } => {
+                Outgoing::Serve(id) => {
                     let Some(bodies) = &bodies else {
                         continue;
                     };
+                    let _ = bodies.reports.send(WriterReport::Started(id));
                     if !serve_body(&send, bodies, id).await {
                         return;
                     }
-                    drop(request);
                 }
             }
         }
@@ -428,7 +436,7 @@ async fn serve_body(send: &FramedSend, bodies: &Bodies, id: UnminedTxId) -> bool
         match bodies.state.try_send(Outgoing::Frame(frame, None)) {
             Ok(()) => count(&message, "sent"),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                bodies.close.close("tx-relay: peer stopped reading");
+                let _ = bodies.reports.send(WriterReport::Stalled);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
@@ -441,85 +449,8 @@ async fn serve_body(send: &FramedSend, bodies: &Bodies, id: UnminedTxId) -> bool
     true
 }
 
-/// Starts a reader that decodes frames and hands them to the actor. At most
-/// [`QUEUED_PER_STREAM`] of its messages wait for the actor, each holding a
-/// permit until the actor has handled it, and the reader waits for a permit
-/// before it takes the next frame. A frame that does not decode closes the
-/// connection. When the stream ends, the session ends.
-fn spawn_reader(
-    key: u64,
-    mut recv: FramedRecv,
-    inputs: mpsc::UnboundedSender<Input>,
-    cancel: CancellationToken,
-    close: Closer,
-) {
-    let queued = Arc::new(Semaphore::new(QUEUED_PER_STREAM));
-    task::spawn_named("tx-relay-reader", async move {
-        loop {
-            // The permit comes first: the next `recv` returns the last
-            // frame's receive grant, so it waits until the actor is done
-            // with that frame.
-            let permit = zakura_rt::select! {
-                () = cancel.cancelled() => break,
-                permit = queued.clone().acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-            };
-            let frame = zakura_rt::select! {
-                () = cancel.cancelled() => break,
-                frame = recv.recv() => match frame {
-                    Some(frame) => frame,
-                    None => break,
-                },
-            };
-            match decode_frame::<TxRelayMessage>(&frame) {
-                Ok(message) => {
-                    let input = Input::Message {
-                        key,
-                        message,
-                        _permit: permit,
-                    };
-                    if inputs.send(input).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    close.close("tx-relay: malformed frame");
-                    break;
-                }
-            }
-        }
-        let _ = inputs.send(Input::Ended { key });
-    });
-}
-
-/// What reaches the actor from sessions.
-enum Input {
-    /// A session's streams are taken.
-    Open {
-        key: u64,
-        peer: PeerKey,
-        /// Whether its address is an unconditional peer's.
-        exempt: bool,
-        data: mpsc::Sender<Outgoing>,
-        state: mpsc::Sender<Outgoing>,
-        close: Closer,
-        connection: (ZakuraPeerId, ZakuraConnId),
-    },
-    /// A decoded message from a session, holding its stream's queue permit
-    /// until the actor drops it, so its reader takes no next frame meanwhile.
-    /// See [`QUEUED_PER_STREAM`].
-    Message {
-        key: u64,
-        message: TxRelayMessage,
-        _permit: OwnedSemaphorePermit,
-    },
-    /// One of a session's streams ended.
-    Ended { key: u64 },
-}
-
-/// What a pool call returns to the actor.
+/// What a pool call returns to its routine, or to the reactor task once its
+/// session ended.
 enum PoolResult {
     Reserved {
         call: CallId,
@@ -538,132 +469,269 @@ enum PoolResult {
 /// A pool call in flight.
 type PoolCall = Pin<Box<dyn Future<Output = PoolResult> + Send>>;
 
-/// One session's writers and its closer.
+/// One session's streams and regulation tools: its writers, its closer, and
+/// its `Inv` sender.
 struct SessionIo {
     data: mpsc::Sender<Outgoing>,
     state: mpsc::Sender<Outgoing>,
     close: Closer,
-    /// The peer's requests to us not yet answered: at most what our `Hello`
-    /// serves, [`MAX_SERVES`]. A request past it breaks the peer's limit.
-    /// Every `GetTxs` takes a place, whatever its answer.
-    requests: Arc<Semaphore>,
-    /// The peer's outstanding requests, by id, until each answer is queued.
-    /// A peer may not have one id outstanding twice.
-    answering: HashMap<UnminedTxId, Answer>,
-    /// Alive while this session's last `Inv` waits for its transport write.
-    /// One unwritten `Inv` of at most about 70 KB, with the transport's
-    /// 64 KiB of write-ahead, stays within the row's 512 KiB sender
-    /// allowance.
-    inv_unwritten: zakura_rt::sync::Weak<()>,
-    /// When the next `Inv` may go out, if the last try had to wait.
-    inv_due: Option<Instant>,
-    /// The machine may hold announcements for this session that the pool
-    /// shows. Set by an advert, and cleared when the machine has none to
-    /// take.
-    inv_ready: bool,
+    /// What the data writer reports.
+    reports: mpsc::UnboundedReceiver<WriterReport>,
+    /// A writer's queue was full at this step: the peer stopped reading.
+    stalled: bool,
+    /// Pays the connection's `Inv` byte rate and keeps one `Inv` unwritten
+    /// at most. One unwritten `Inv` of at most about 70 KB, with the
+    /// transport's 64 KiB of write-ahead, stays within the row's 512 KiB
+    /// sender allowance.
+    inv: MeteredSender,
     /// The peer and connection the session runs on.
     connection: (ZakuraPeerId, ZakuraConnId),
-    /// The session's entry in the live-session record, once the actor holds
-    /// a view of the pool. It is removed when this drops.
+    /// The session's entry in the live-session record, once the routine
+    /// holds a view of the pool. It is removed when this drops.
     live: Option<LiveSession>,
+}
+
+impl SessionIo {
+    /// A session's IO on these writers, closing with `close`, sending `Inv`
+    /// through `inv`, running on `connection`. `reports` hears from the
+    /// data writer.
+    fn new(
+        data: mpsc::Sender<Outgoing>,
+        state: mpsc::Sender<Outgoing>,
+        close: Closer,
+        reports: mpsc::UnboundedReceiver<WriterReport>,
+        inv: MeteredSender,
+        connection: (ZakuraPeerId, ZakuraConnId),
+    ) -> Self {
+        Self {
+            data,
+            state,
+            close,
+            reports,
+            stalled: false,
+            inv,
+            connection,
+            live: None,
+        }
+    }
 }
 
 /// One connection's `Inv` byte rate, and how many of its sessions are live.
 struct ConnectionInv {
-    bucket: ByteBucket,
+    bucket: Arc<Mutex<ByteBucket>>,
     sessions: usize,
 }
 
-/// The task that owns the machine.
-struct Actor {
-    machine: RelayMachine,
-    pool: PoolHandle,
-    may_cool: MayCool,
-    base: Instant,
-    sessions: HashMap<SessionId, SessionIo>,
-    by_key: HashMap<u64, SessionId>,
-    reservations: HashMap<ReservationId, Reservation>,
-    /// Ends the wait on each held reservation's cancellation once the
-    /// reservation leaves the actor.
-    fetch_waits: HashMap<ReservationId, CancellationToken>,
-    calls: FuturesUnordered<PoolCall>,
-    snapshot: Option<Arc<PoolSnapshot>>,
-    /// Each connection's `Inv` byte rate, which every session on it pays
-    /// before it queues a frame, so overlapping or replacing sessions share
-    /// one opening allowance.
-    inv_buckets: HashMap<(ZakuraPeerId, ZakuraConnId), ConnectionInv>,
-    /// The newest change the machine has, or `None` before the first
-    /// snapshot.
-    cursor: Option<ChangeSeq>,
-    /// Whether the core behind the pool is still running.
-    pool_open: bool,
-    /// The live-session record the legacy adapter reads.
-    record: TxRelaySessions,
-    owned: Owned,
+/// Counts a new session on `connection` in its `Inv` bucket, making the
+/// bucket if the connection has none, and returns the bucket. A bucket no
+/// session uses that has refilled is the same as a new one, so it goes.
+fn open_inv_bucket(
+    buckets: &InvBuckets,
+    connection: &(ZakuraPeerId, ZakuraConnId),
+) -> Arc<Mutex<ByteBucket>> {
+    let opened = Instant::now();
+    let mut buckets = buckets.lock().expect("the bucket map is never poisoned");
+    // Widening u32 to u64 is lossless.
+    let full = u64::from(INV_RATE.opening_allowance);
+    buckets.retain(|_, inv| {
+        let mut bucket = inv.bucket.lock().expect("a bucket is never poisoned");
+        inv.sessions > 0 || bucket.ready_at(full, opened) != Some(opened)
+    });
+    let inv = buckets
+        .entry(connection.clone())
+        .or_insert_with(|| ConnectionInv {
+            bucket: Arc::new(Mutex::new(ByteBucket::sender(INV_RATE, opened))),
+            sessions: 0,
+        });
+    inv.sessions += 1;
+    inv.bucket.clone()
 }
 
-impl Actor {
-    /// A new actor on `pool`, fanning out as `config` says.
-    fn new(
-        pool: PoolHandle,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        record: TxRelaySessions,
-        owned: Owned,
-    ) -> Self {
-        let mut key = [0; 8];
-        zakura_rt::rand::rng().fill_bytes(&mut key);
-        let short_id_key = u64::from_le_bytes(key);
-        // The pool is off until the first snapshot, which brings its tip.
-        let empty = SnapshotInfo {
-            active: false,
-            tip: ChainTip {
+/// The pool as a routine read it: the snapshot it last read.
+#[derive(Clone, Debug)]
+struct SnapshotView(Arc<PoolSnapshot>);
+
+impl SnapshotView {
+    /// The view before any snapshot: a pool that is off.
+    fn empty() -> Self {
+        Self(Arc::new(PoolSnapshot::inactive(
+            ChainTip {
                 hash: block::Hash([0; 32]),
                 height: block::Height(0),
             },
-            sizes: Vec::new(),
+            ChangeSeq(0),
+        )))
+    }
+}
+
+impl PoolView for SnapshotView {
+    fn live(&self) -> bool {
+        self.0.active
+    }
+
+    fn tip(&self) -> ChainTip {
+        self.0.tip
+    }
+
+    fn last_seq(&self) -> u64 {
+        self.0.last_change.0
+    }
+
+    fn holds(&self, id: &UnminedTxId) -> bool {
+        exact(&self.0, *id).is_some()
+    }
+
+    fn holds_mined(&self, id: &transaction::Hash) -> bool {
+        self.0.transaction(id).is_some()
+    }
+
+    fn size(&self, id: &UnminedTxId) -> Option<u32> {
+        size_in(&self.0, *id)
+    }
+
+    fn ids(&self) -> Vec<UnminedTxId> {
+        self.0
+            .transactions
+            .iter()
+            .map(|tx| tx.transaction.id())
+            .collect()
+    }
+
+    fn parents(&self, id: &UnminedTxId) -> Vec<UnminedTxId> {
+        let snapshot = &self.0;
+        let Some(parents) = snapshot.dependencies.dependencies().get(&id.mined_id()) else {
+            return Vec::new();
         };
-        Self {
-            machine: RelayMachine::new(
-                RelayConfig {
-                    fan_out: config.fan_out(),
-                    short_id_key,
+        parents
+            .iter()
+            .filter_map(|parent| snapshot.transaction(parent))
+            .map(|parent| parent.transaction.id())
+            .collect()
+    }
+}
+
+/// What a routine is wired to: the shared state, the pool, the reactor's
+/// handoff, and the service's maps.
+#[derive(Clone)]
+struct Wiring {
+    node: Arc<Mutex<Node>>,
+    pool: PoolHandle,
+    may_cool: MayCool,
+    handoff: mpsc::UnboundedSender<Calls>,
+    owned: Owned,
+    record: TxRelaySessions,
+    inv_buckets: InvBuckets,
+    base: Instant,
+}
+
+/// One session's routine. See the module docs.
+struct Routine {
+    machine: PeerMachine,
+    wiring: Wiring,
+    /// Wakes this routine to look again: for its mail, a moved ring, or
+    /// claims that opened up.
+    wake: Arc<Notify>,
+    io: SessionIo,
+    /// The session's cancellation, which stops its writers too.
+    cancel: CancellationToken,
+    /// The pool as this routine last read it, and its place in the log, or
+    /// `None` before the first snapshot.
+    view: SnapshotView,
+    cursor: Option<ChangeSeq>,
+    /// Whether the core behind the pool is still running.
+    pool_open: bool,
+    calls: Calls,
+    reservations: HashMap<ReservationId, Reservation>,
+    /// Ends the wait on each held reservation's cancellation once the
+    /// reservation leaves the routine.
+    fetch_waits: HashMap<ReservationId, CancellationToken>,
+}
+
+impl Routine {
+    /// Opens a session of `peer` on `io`, sends our `Hello`, and returns its
+    /// routine, which reads the pool before its first step.
+    fn open(
+        wiring: Wiring,
+        peer: PeerKey,
+        exempt: bool,
+        io: SessionIo,
+        cancel: CancellationToken,
+    ) -> Self {
+        let wake = Arc::new(Notify::new());
+        let view = SnapshotView::empty();
+        let now = Instant::now().saturating_duration_since(wiring.base);
+        let (machine, effects, wakes) = {
+            let mut node = wiring.node.lock().expect("the node is never poisoned");
+            let node = &mut *node;
+            let marks = Marks::of(&node.shared);
+            let machine = PeerMachine::connect(&mut node.shared, &view, peer, exempt, now);
+            node.sessions.insert(
+                machine.session(),
+                Handle {
+                    peer,
+                    close: io.close.clone(),
+                    wake: wake.clone(),
+                    mail: Vec::new(),
                 },
-                empty,
-                Vec::new(),
-            ),
-            pool,
-            may_cool,
-            base: Instant::now(),
-            sessions: HashMap::new(),
-            by_key: HashMap::new(),
-            reservations: HashMap::new(),
-            fetch_waits: HashMap::new(),
-            calls: FuturesUnordered::new(),
-            snapshot: None,
-            inv_buckets: HashMap::default(),
+            );
+            count_sessions(node);
+            let effects = std::mem::take(&mut node.shared.effects);
+            let wakes = route(node, marks, Some(machine.session()));
+            (machine, effects, wakes)
+        };
+        for wake in wakes {
+            wake.notify_one();
+        }
+        let hello = TxRelayMessage::Hello {
+            // `MAX_SERVES` is a small constant that fits a `u16`.
+            serves: u16::try_from(MAX_SERVES).unwrap_or(u16::MAX),
+            max_tx_bytes: MAX_TX_BYTES,
+        };
+        if let Ok(frame) = encode_frame(&hello) {
+            let _ = io.state.try_send(Outgoing::Frame(frame, None));
+        }
+        let mut routine = Self {
+            machine,
+            wiring,
+            wake,
+            io,
+            cancel,
+            view,
             cursor: None,
             pool_open: true,
-            record,
-            owned,
+            calls: FuturesUnordered::new(),
+            reservations: HashMap::default(),
+            fetch_waits: HashMap::default(),
+        };
+        for effect in effects {
+            routine.effect(effect);
         }
+        routine
     }
 
-    /// The machine's clock: time since the actor started.
-    fn now(&self) -> Duration {
-        Instant::now().saturating_duration_since(self.base)
+    /// The machine's clock: time since the service started.
+    fn now(&self) -> Time {
+        Instant::now().saturating_duration_since(self.wiring.base)
     }
 
-    /// Runs until every session and the service are gone.
-    async fn run(mut self, mut inputs: mpsc::UnboundedReceiver<Input>) {
-        let mut reader = self.pool.reader();
+    /// Runs the session until it ends: reads its frames, the pool's answers
+    /// and publications, its wakes, and its deadlines.
+    async fn run(mut self, mut data: FramedRecv, mut state: FramedRecv) {
+        let mut reader = self.wiring.pool.reader();
         self.read_pool();
-        loop {
+        self.after_step();
+        while !self.machine.is_ended() {
+            let wake = self.wake.clone();
             let deadline = self.next_wake();
             zakura_rt::select! {
-                input = inputs.recv() => match input {
-                    Some(input) => self.input(input),
-                    None => return,
+                () = self.cancel.cancelled() => break,
+                frame = data.recv() => match frame {
+                    Some(frame) if self.frame(&frame) => {}
+                    _ => break,
+                },
+                frame = state.recv() => match frame {
+                    Some(frame) if self.frame(&frame) => {}
+                    _ => break,
                 },
                 Some(result) = self.calls.next(), if !self.calls.is_empty() => {
                     self.pool_result(result);
@@ -672,265 +740,256 @@ impl Actor {
                     if changed {
                         self.read_pool();
                     } else {
-                        // The core is gone. Its receiver stays ready, so
-                        // stop watching it, and hand every peer's
-                        // transactions back to the legacy adapter.
-                        self.pool_open = false;
-                        for io in self.sessions.values_mut() {
-                            io.live = None;
-                        }
-                        let now = self.now();
-                        self.machine.pool_stopped(now);
+                        self.pool_stopped();
                     }
                 }
-                () = time::sleep_until(deadline) => {
-                    let now = self.now();
-                    self.machine.tick(now);
-                }
+                Some(report) = self.io.reports.recv() => self.writer_report(report),
+                () = wake.notified() => self.tick(),
+                () = time::sleep_until(deadline) => self.tick(),
             }
-            self.apply_effects();
-            self.flush_adverts();
-            self.publish_live();
+            self.after_step();
+        }
+        // The transport retires a session it cannot write to by its write
+        // deadline. That peer stopped reading, a stall as a full writer
+        // queue is. The session's streams share one failure record.
+        if data.failure() == Some(OrderedStreamFailure::WriteTimeout) {
+            self.step(stopped_reading);
+        }
+        self.finish();
+    }
+
+    /// Hands what the data writer reported to the machine.
+    fn writer_report(&mut self, report: WriterReport) {
+        match report {
+            WriterReport::Started(id) => {
+                self.step(|machine, shared, pool, now| machine.served(shared, pool, id, now));
+            }
+            WriterReport::Stalled => {
+                self.step(stopped_reading);
+            }
         }
     }
 
-    /// Publishes each session that is not yet in the live-session record,
-    /// once the actor holds a view of the pool. Until then the legacy
-    /// adapter keeps the peer's transactions.
-    fn publish_live(&mut self) {
-        if !self.pool_open || self.snapshot.is_none() {
-            return;
-        }
-        for (session, io) in &mut self.sessions {
-            if io.live.is_none() {
-                let (peer, conn_id) = io.connection.clone();
-                io.live = Some(self.record.open(peer, conn_id, session.0));
+    /// Hands one input to the machine under the shared lock, after the mail
+    /// other sessions left. Routes the step's effects on other sessions,
+    /// wakes the routines that should look, and performs this session's
+    /// effects once the lock is gone.
+    fn step<R>(
+        &mut self,
+        input: impl FnOnce(&mut PeerMachine, &mut Shared, &dyn PoolView, Time) -> R,
+    ) -> R {
+        let now = self.now();
+        let view = self.view.clone();
+        let session = self.machine.session();
+        let (result, effects, closes, wakes) = {
+            let mut node = self.wiring.node.lock().expect("the node is never poisoned");
+            let node = &mut *node;
+            let marks = Marks::of(&node.shared);
+            let mail = node
+                .sessions
+                .get_mut(&session)
+                .map(|handle| std::mem::take(&mut handle.mail))
+                .unwrap_or_default();
+            for mail in mail {
+                self.machine.read_mail(&mut node.shared, &view, mail);
             }
+            let result = input(&mut self.machine, &mut node.shared, &view, now);
+            let effects = std::mem::take(&mut node.shared.effects);
+            let closes = closers(node, &effects, Some(session));
+            let wakes = route(node, marks, Some(session));
+            (result, effects, closes, wakes)
+        };
+        for wake in wakes {
+            wake.notify_one();
+        }
+        for (close, reason) in closes {
+            close.close(close_reason(reason));
+        }
+        for effect in effects {
+            self.effect(effect);
+        }
+        self.stopped_reading();
+        result
+    }
+
+    /// A writer's queue was full in the last step: the peer stopped
+    /// reading, which the machine decides on in a step of its own.
+    fn stopped_reading(&mut self) {
+        if std::mem::take(&mut self.io.stalled) {
+            self.step(stopped_reading);
         }
     }
 
-    /// When the actor next has something due: the machine's deadline or the
-    /// next `Inv` a session may send, at once unless its last try waited.
+    /// Time passed, or another step woke this one.
+    fn tick(&mut self) {
+        self.step(|machine, shared, pool, now| machine.tick(shared, pool, now));
+    }
+
+    /// What this routine does after each input: sends announcements and
+    /// joins the live-session record once it holds a view of the pool.
+    fn after_step(&mut self) {
+        self.flush_adverts();
+        let open = !self.machine.is_ended() && self.pool_open;
+        if open && self.cursor.is_some() && self.io.live.is_none() {
+            let (peer, conn_id) = self.io.connection.clone();
+            self.io.live = Some(
+                self.wiring
+                    .record
+                    .open(peer, conn_id, self.machine.session().0),
+            );
+        }
+    }
+
+    /// When this routine next has something due: the machine's deadline,
+    /// which covers its next `Inv` try.
     fn next_wake(&self) -> Instant {
         let far = Instant::now() + Duration::from_secs(3600);
-        let machine = self
-            .machine
-            .next_deadline()
-            .map(|at| self.base + at)
-            .unwrap_or(far);
-        let now = Instant::now();
-        let advert = self
-            .sessions
-            .values()
-            .filter(|session| session.inv_ready)
-            .map(|session| session.inv_due.unwrap_or(now))
-            .min()
-            .unwrap_or(far);
-        machine.min(advert)
+        let machine = {
+            let node = self.wiring.node.lock().expect("the node is never poisoned");
+            self.machine.next_deadline(&node.shared)
+        };
+        machine.map_or(far, |at| self.wiring.base + at)
     }
 
-    /// Hands one session input to the machine.
-    fn input(&mut self, input: Input) {
-        let now = self.now();
-        match input {
-            Input::Open {
-                key,
-                peer,
-                exempt,
-                data,
-                state,
-                close,
-                connection,
-            } => {
-                let session = self.machine.connect(peer, exempt, now);
-                let hello = TxRelayMessage::Hello {
-                    // `MAX_SERVES` is a small constant that fits a `u16`.
-                    serves: u16::try_from(MAX_SERVES).unwrap_or(u16::MAX),
-                    max_tx_bytes: MAX_TX_BYTES,
-                };
-                if let Ok(frame) = encode_frame(&hello) {
-                    let _ = state.try_send(Outgoing::Frame(frame, None));
-                }
-                self.by_key.insert(key, session);
-                let opened = Instant::now();
-                // A bucket no session uses that has refilled is the same as
-                // a new one, so it goes.
-                // Widening u32 to u64 is lossless.
-                let full = u64::from(INV_RATE.opening_allowance);
-                self.inv_buckets.retain(|_, inv| {
-                    inv.sessions > 0 || inv.bucket.ready_at(full, opened) != Some(opened)
-                });
-                self.inv_buckets
-                    .entry(connection.clone())
-                    .or_insert_with(|| ConnectionInv {
-                        bucket: ByteBucket::sender(INV_RATE, opened),
-                        sessions: 0,
-                    })
-                    .sessions += 1;
-                self.sessions.insert(
-                    session,
-                    SessionIo {
-                        data,
-                        state,
-                        close,
-                        requests: Arc::new(Semaphore::new(MAX_SERVES)),
-                        answering: HashMap::new(),
-                        inv_unwritten: zakura_rt::sync::Weak::new(),
-                        inv_due: None,
-                        inv_ready: false,
-                        connection,
-                        live: None,
-                    },
-                );
-                self.count_sessions();
+    /// Handles one frame from the peer. Returns `false` for a frame that
+    /// does not decode, which closes the connection and ends the session.
+    fn frame(&mut self, frame: &Frame) -> bool {
+        match decode_frame::<TxRelayMessage>(frame) {
+            Ok(message) => {
+                self.message(message);
+                true
             }
-            Input::Message { key, message, .. } => {
-                let Some(session) = self.by_key.get(&key).copied() else {
-                    return;
-                };
-                self.message(session, message, now);
-            }
-            Input::Ended { key } => {
-                // The first of the two readers to stop ends the session.
-                let Some(session) = self.by_key.remove(&key) else {
-                    return;
-                };
-                // Dropping its writers' queues stops them, and its live
-                // entry leaves the record.
-                if let Some(io) = self.sessions.remove(&session) {
-                    disown(&self.owned, &io.connection, Instant::now());
-                    if let Some(inv) = self.inv_buckets.get_mut(&io.connection) {
-                        inv.sessions = inv.sessions.saturating_sub(1);
-                    }
-                }
-                self.count_sessions();
-                self.machine.end(session, now);
+            Err(_) => {
+                // Row 3 of the close table.
+                self.io.close.close("tx-relay: malformed frame");
+                false
             }
         }
     }
 
     /// Hands one decoded message to the machine.
-    fn message(&mut self, session: SessionId, message: TxRelayMessage, now: Duration) {
+    fn message(&mut self, message: TxRelayMessage) {
         count(&message, "received");
         match message {
             TxRelayMessage::Hello {
                 serves,
                 max_tx_bytes,
-            } => self.machine.hello(
-                session,
-                Hello {
+            } => {
+                let hello = Hello {
                     serves: usize::from(serves),
                     max_tx_bytes,
-                },
-                now,
-            ),
-            TxRelayMessage::Inv(entries) => self.machine.inv(session, &entries, now),
-            TxRelayMessage::GetTxs(id) => {
-                // The place is taken before the machine picks the answer, so
-                // a request answered `NotFound` counts too.
-                let Some(io) = self.sessions.get_mut(&session) else {
-                    return;
                 };
-                // At most `MAX_SERVES` entries are outstanding, so this
-                // bounds the map.
-                io.answering.retain(|_, answer| answer.outstanding());
-                if io.answering.contains_key(&id) {
-                    io.close.close("tx-relay: id requested twice");
-                    return;
-                }
-                let Ok(request) = io.requests.clone().try_acquire_owned() else {
-                    io.close.close("tx-relay: too many requests");
-                    return;
-                };
-                io.answering.insert(id, Answer::Unanswered(request));
-                self.machine.get_txs(session, id, now);
+                self.step(|machine, shared, pool, now| machine.hello(shared, pool, hello, now));
             }
-            TxRelayMessage::NotFound(id) => self.machine.not_found(session, id, now),
+            TxRelayMessage::Inv(entries) => {
+                self.step(|machine, shared, pool, now| machine.inv(shared, pool, &entries, now));
+            }
+            TxRelayMessage::GetTxs(id) => {
+                // The writer reports an answer it started before handing it
+                // to the transport, so each answer the peer has seen is read
+                // here before the peer's next request.
+                while let Ok(report) = self.io.reports.try_recv() {
+                    self.writer_report(report);
+                }
+                self.step(|machine, shared, pool, now| machine.get_txs(shared, pool, id, now));
+            }
+            TxRelayMessage::NotFound(id) => {
+                self.step(|machine, shared, pool, now| machine.not_found(shared, pool, id, now));
+            }
             TxRelayMessage::Tx { id, body } => {
                 // A frame's body is at most the data stream's cap.
                 let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
-                if !self.machine.tx_arrived(session, id, size, now) {
+                // The body is judged at the time it arrived, before and after
+                // it decodes, so a body on time when it came is not late
+                // because its decode took time.
+                let arrived = self.now();
+                let read = self.step(|machine, shared, pool, _| {
+                    machine.tx_arrived(shared, pool, id, size, arrived)
+                });
+                if !read {
                     return;
                 }
+                // This routine decodes its own peer's bodies, outside the
+                // shared lock.
                 let mut bytes = body.as_slice();
                 match Transaction::zcash_deserialize_bounded(&mut bytes) {
                     Ok(transaction) if bytes.is_empty() => {
                         let body = UnminedTx::from(transaction);
-                        self.machine.tx(session, id, body, now);
+                        self.step(|machine, shared, pool, _| {
+                            machine.tx(shared, pool, id, body, arrived);
+                        });
                     }
                     _ => {
-                        if let Some(io) = self.sessions.get(&session) {
-                            io.close.close("tx-relay: undecodable transaction");
-                        }
+                        self.step(|machine, shared, pool, _| {
+                            machine.undecodable(shared, pool, arrived);
+                        });
                     }
                 }
             }
         }
     }
 
-    /// Hands one pool result to the machine.
+    /// Hands one of this session's pool results to the machine.
     fn pool_result(&mut self, result: PoolResult) {
-        let now = self.now();
         match result {
             PoolResult::Reserved { call, answer } => {
                 let answer = match answer {
-                    Ok(reservation) => {
-                        let id = reservation.id();
-                        let token = reservation.cancellation();
-                        let cancelled = token.is_cancelled();
-                        self.reservations.insert(id, reservation);
-                        if !cancelled {
-                            let done = CancellationToken::new();
-                            self.fetch_waits.insert(id, done.clone());
-                            self.calls.push(Box::pin(async move {
-                                zakura_rt::select! {
-                                    () = token.cancelled() => PoolResult::Cancelled { reservation: id },
-                                    () = done.cancelled() => PoolResult::Done,
-                                }
-                            }));
-                        }
-                        Ok(Granted {
-                            reservation: id,
-                            cancelled,
-                        })
-                    }
+                    Ok(reservation) => Ok(self.hold(reservation)),
                     Err(refused) => Err(unreserved(refused)),
                 };
-                self.machine.reserve_answer(call, answer, now);
+                self.step(|machine, shared, pool, now| {
+                    machine.reserve_answer(shared, pool, call, answer, now);
+                });
             }
             PoolResult::Verdict { waiter, verdict } => {
                 let verdict = verdict_of(verdict);
-                if verdict == Verdict::Admitted {
-                    metrics::counter!("zakura.p2p.tx_relay.tx.admitted").increment(1);
-                }
-                if let Verdict::Rejected { tip, .. } = verdict {
-                    // The machine starts a cooldown only when the node is
-                    // current and its best tip is the verdict's: exactly
-                    // what `may_cool` answers.
-                    let may_cool = (self.may_cool)(tip);
-                    self.machine.set_current(may_cool);
-                    if may_cool {
-                        self.machine.set_best_tip(tip);
-                    }
-                }
-                self.machine.verdict(waiter, verdict, now);
+                let may_cool = read_verdict(&self.wiring.may_cool, verdict);
+                self.step(|machine, shared, pool, now| {
+                    set_currentness(shared, verdict, may_cool);
+                    machine.verdict(shared, pool, waiter, verdict, now);
+                });
             }
             PoolResult::Cancelled { reservation } => {
                 if self.reservations.contains_key(&reservation) {
-                    self.machine.fetch_cancelled(reservation, now);
+                    self.step(|machine, shared, pool, now| {
+                        machine.fetch_cancelled(shared, pool, reservation, now);
+                    });
                 }
             }
             PoolResult::Done => {}
         }
     }
 
+    /// Holds a granted reservation, waiting on its cancellation unless its
+    /// token already fired. Returns the machine's view of the grant.
+    fn hold(&mut self, reservation: Reservation) -> Granted {
+        let id = reservation.id();
+        let token = reservation.cancellation();
+        let cancelled = token.is_cancelled();
+        self.reservations.insert(id, reservation);
+        if !cancelled {
+            let done = CancellationToken::new();
+            self.fetch_waits.insert(id, done.clone());
+            self.calls.push(Box::pin(async move {
+                zakura_rt::select! {
+                    () = token.cancelled() => PoolResult::Cancelled { reservation: id },
+                    () = done.cancelled() => PoolResult::Done,
+                }
+            }));
+        }
+        Granted {
+            reservation: id,
+            cancelled,
+        }
+    }
+
     /// Reads the pool's newest publication and hands it to the machine:
-    /// each batch after the machine's place, or the whole pool when the
-    /// machine has no place in the log.
+    /// every change after this routine's place, or the whole pool when it
+    /// has no place in the log.
     fn read_pool(&mut self) {
         let view = match self.cursor {
-            Some(cursor) => self.pool.view(cursor),
-            None => self.pool.snapshot().map(|snapshot| PoolView {
+            Some(cursor) => self.wiring.pool.view(cursor),
+            None => self.wiring.pool.snapshot().map(|snapshot| PortView {
                 snapshot,
                 changes: ChangesSince::Resync,
             }),
@@ -938,101 +997,99 @@ impl Actor {
         let Some(view) = view else {
             return;
         };
-        let now = self.now();
-        let snapshot = view.snapshot;
-        self.cursor = Some(snapshot.last_change);
+        let activated = !self.view.0.active && view.snapshot.active;
+        self.cursor = Some(view.snapshot.last_change);
+        self.view = SnapshotView(view.snapshot);
         match view.changes {
             ChangesSince::Entries(entries) => {
-                let mut batches = batches(entries);
-                // A publication with no entries still carries the pool's
-                // state, such as turning on with nothing in it.
-                if batches.is_empty() {
-                    batches.push(Vec::new());
-                }
-                for batch in batches {
-                    let sizes = batch
-                        .iter()
-                        .filter_map(|change| match change {
-                            Change::Added(id) => Some(*id),
-                            _ => None,
-                        })
-                        .filter_map(|id| size_in(&snapshot, id).map(|size| (id, size)))
-                        .collect();
-                    let info = SnapshotInfo {
-                        active: snapshot.active,
-                        tip: snapshot.tip,
-                        sizes,
-                    };
-                    self.machine.pool_changed(batch, info, now);
-                }
+                let changes: Vec<(u64, _)> = entries
+                    .into_iter()
+                    .map(|entry| (entry.seq.0, entry.change))
+                    .collect();
+                self.step(|machine, shared, pool, now| {
+                    let read = shared.log(changes, now);
+                    machine.pool_changed(shared, pool, &read, activated, now);
+                });
             }
             ChangesSince::Resync => {
-                let visible = snapshot
-                    .transactions
-                    .iter()
-                    .map(|tx| (tx.transaction.id(), transaction_size(tx.transaction.size())))
-                    .collect();
-                let info = SnapshotInfo {
-                    active: snapshot.active,
-                    tip: snapshot.tip,
-                    sizes: Vec::new(),
-                };
-                self.machine.pool_resynced(visible, info, now);
-            }
-        }
-        self.snapshot = Some(snapshot);
-    }
-
-    /// Performs every effect the machine produced.
-    fn apply_effects(&mut self) {
-        loop {
-            let effects = self.machine.take_effects();
-            if effects.is_empty() {
-                break;
-            }
-            for effect in effects {
-                self.effect(effect);
+                self.step(|machine, shared, pool, now| {
+                    machine.pool_resynced(shared, pool, activated, now);
+                });
             }
         }
     }
 
-    /// Performs one effect.
+    /// The core is gone. Its receiver stays ready, so this routine stops
+    /// watching it, and hands its peer's transactions back to the legacy
+    /// adapter.
+    fn pool_stopped(&mut self) {
+        self.pool_open = false;
+        self.io.live = None;
+        self.step(|machine, shared, pool, now| {
+            shared.stopped = true;
+            machine.tick(shared, pool, now);
+        });
+    }
+
+    /// Ends the session: hands what it held to the shared state, gives back
+    /// its reservations, and hands its unanswered pool calls to the reactor
+    /// task.
+    fn finish(mut self) {
+        self.step(|machine, shared, pool, now| machine.end(shared, pool, now));
+        {
+            let mut node = self.wiring.node.lock().expect("the node is never poisoned");
+            node.sessions.remove(&self.machine.session());
+            count_sessions(&node);
+        }
+        for (_, done) in self.fetch_waits.drain() {
+            done.cancel();
+        }
+        self.reservations.clear();
+        if !self.calls.is_empty() {
+            let calls = std::mem::take(&mut self.calls);
+            let _ = self.wiring.handoff.send(calls);
+        }
+        disown(&self.wiring.owned, &self.io.connection, Instant::now());
+        if let Some(inv) = self
+            .wiring
+            .inv_buckets
+            .lock()
+            .expect("the bucket map is never poisoned")
+            .get_mut(&self.io.connection)
+        {
+            inv.sessions = inv.sessions.saturating_sub(1);
+        }
+        self.io.live = None;
+    }
+
+    /// Performs one of this session's effects.
     fn effect(&mut self, effect: RelayEffect) {
         match effect {
-            RelayEffect::Ask { session, id } => {
-                self.send(
-                    session,
-                    TX_RELAY_STATE_KIND,
-                    &TxRelayMessage::GetTxs(id),
-                    None,
-                );
+            RelayEffect::Ask { id, .. } => {
+                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id));
             }
-            // The machine queued the id. `flush_adverts` takes it.
-            RelayEffect::Advert { session, .. } => {
-                if let Some(io) = self.sessions.get_mut(&session) {
-                    io.inv_ready = true;
-                }
-            }
-            RelayEffect::Serve { session, id } => self.serve(session, id),
-            RelayEffect::NotFound { session, id } => {
-                self.send(
-                    session,
-                    TX_RELAY_STATE_KIND,
-                    &TxRelayMessage::NotFound(id),
-                    None,
-                );
-                // The answer is queued, so the request's place is free.
-                if let Some(io) = self.sessions.get_mut(&session) {
-                    io.answering.remove(&id);
-                }
+            // The machine queued the id, and `flush_adverts` asks it for an
+            // `Inv` after every step.
+            RelayEffect::Advert { .. } => {}
+            RelayEffect::Serve { id, .. } => self.serve(id),
+            RelayEffect::NotFound { id, .. } => {
+                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::NotFound(id));
             }
             RelayEffect::Close { session, reason } => {
-                if let Some(io) = self.sessions.get(&session) {
-                    io.close.close(close_reason(reason));
+                if session == self.machine.session() {
+                    self.io.close.close(close_reason(reason));
+                }
+            }
+            // Ending the session leaves the connection, and its other
+            // services, alone.
+            RelayEffect::Park { session } => {
+                if session == self.machine.session() {
+                    metrics::counter!("zakura.p2p.tx_relay.parked").increment(1);
+                    self.cancel.cancel();
                 }
             }
             RelayEffect::Reserve { call, id } => {
-                let pool = self.pool.clone();
+                let pool = self.wiring.pool.clone();
                 self.calls.push(Box::pin(async move {
                     let answer = pool.reserve(id).await;
                     PoolResult::Reserved { call, answer }
@@ -1047,9 +1104,9 @@ impl Actor {
                     return;
                 };
                 // The body goes into the core's queue now or is dropped
-                // with a `NoRoom` verdict, so the actor never holds a decoded
-                // body while it reads the next frame.
-                let verdict = self.pool.submit_now(reservation, body);
+                // with a `NoRoom` verdict, so the routine never holds a
+                // decoded body while it reads the next frame.
+                let verdict = self.wiring.pool.submit_now(reservation, body);
                 self.calls.push(Box::pin(async move {
                     PoolResult::Verdict {
                         waiter,
@@ -1065,7 +1122,7 @@ impl Actor {
                 let Some(reservation) = self.take_reservation(reservation) else {
                     return;
                 };
-                let pool = self.pool.clone();
+                let pool = self.wiring.pool.clone();
                 self.calls.push(Box::pin(async move {
                     pool.fetch_failed(reservation).await;
                     PoolResult::Done
@@ -1074,7 +1131,7 @@ impl Actor {
         }
     }
 
-    /// Takes `id` out of the actor and ends the wait on its cancellation.
+    /// Takes `id` out of the routine and ends the wait on its cancellation.
     fn take_reservation(&mut self, id: ReservationId) -> Option<Reservation> {
         if let Some(done) = self.fetch_waits.remove(&id) {
             done.cancel();
@@ -1082,145 +1139,248 @@ impl Actor {
         self.reservations.remove(&id)
     }
 
-    /// Queues `session`'s request for `id`, which the machine found
-    /// servable, for the data writer to build when it reaches it. The job
-    /// keeps the request's place until its answer is queued. A conformant
-    /// peer counts at least as many requests outstanding as we do, so it
-    /// never runs out of places.
-    fn serve(&mut self, session: SessionId, id: UnminedTxId) {
-        let Some(io) = self.sessions.get_mut(&session) else {
-            return;
-        };
-        let Some(Answer::Unanswered(place)) = io.answering.remove(&id) else {
-            return;
-        };
-        let outstanding = Arc::new(());
-        io.answering.insert(
-            id,
-            Answer::Serving(zakura_rt::sync::downgrade(&outstanding)),
-        );
-        let request = Request {
-            _place: place,
-            _outstanding: outstanding,
-        };
-        match io.data.try_send(Outgoing::Serve { id, request }) {
+    /// Queues the request for `id`, which the machine found servable, for
+    /// the data writer to build when it reaches it. The machine counts the
+    /// request until the writer starts its answer.
+    fn serve(&mut self, id: UnminedTxId) {
+        match self.io.data.try_send(Outgoing::Serve(id)) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                io.close.close("tx-relay: peer stopped reading");
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.io.stalled = true,
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
-    /// Encodes `message` and queues it on `session`'s stream of `kind`, with
-    /// `guard` held until it is written.
-    fn send(
-        &self,
-        session: SessionId,
-        kind: u16,
-        message: &TxRelayMessage,
-        guard: Option<FrameGuard>,
-    ) {
-        let Some(io) = self.sessions.get(&session) else {
-            return;
-        };
+    /// Encodes `message` and queues it on the stream of `kind`. A full queue
+    /// says the peer stopped reading.
+    fn send(&mut self, kind: u16, message: &TxRelayMessage) {
         let Ok(frame) = encode_frame(message) else {
             return;
         };
         let writer = if kind == TX_RELAY_DATA_KIND {
-            &io.data
+            &self.io.data
         } else {
-            &io.state
+            &self.io.state
         };
-        match writer.try_send(Outgoing::Frame(frame, guard)) {
+        match writer.try_send(Outgoing::Frame(frame, None)) {
             Ok(()) => count(message, "sent"),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                io.close.close("tx-relay: peer stopped reading");
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.io.stalled = true,
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
-    /// Publishes how many sessions are live.
-    fn count_sessions(&self) {
-        // A session count is far below `f64`'s exact integer range.
-        metrics::gauge!("zakura.p2p.tx_relay.sessions").set(self.sessions.len() as f64);
-    }
-
-    /// Sends each session's queued announcements as one `Inv`, at once,
-    /// once the session's `Inv` byte rate pays for it. While it waits, new
-    /// announcements join the frame, so a session batches only under load.
+    /// Sends the `Inv` the machine lets go now, if any, and asks again until
+    /// it lets none go, so with more queued than one frame takes, it sets
+    /// its own retry for after this frame is written. The machine decides
+    /// when one may go from what the data writer and the `Inv` sender say,
+    /// so while it waits, new announcements join the frame, and a session
+    /// batches only under load.
     fn flush_adverts(&mut self) {
-        let now = Instant::now();
-        let sessions: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|(_, io)| io.inv_ready && !io.inv_due.is_some_and(|due| now < due))
-            .map(|(session, _)| *session)
-            .collect();
-        for session in sessions {
-            let queued = self.machine.queued_inv(session).min(MAX_INV_ENTRIES);
-            let Some(io) = self.sessions.get_mut(&session) else {
-                continue;
+        loop {
+            // One instant for the check, the machine's decision and the
+            // payment, so a refill between two samples cannot let the
+            // machine take ids the rate then refuses to pay for.
+            let now = Instant::now();
+            let (inv, base) = (&self.io.inv, self.wiring.base);
+            let at = now.saturating_duration_since(base);
+            let room = InvRoom {
+                free: self.io.data.capacity(),
+                paid: |bytes| match inv.ready(bytes, now) {
+                    MeteredReady::Now => Paid::Now,
+                    MeteredReady::At(paid) => Paid::At(paid.saturating_duration_since(base)),
+                    MeteredReady::Unwritten => Paid::Unwritten,
+                },
             };
-            io.inv_due = None;
-            if queued == 0 {
-                io.inv_ready = false;
-                continue;
-            }
-            // Keep room for every body the peer may have requested, and
-            // keep one `Inv` unwritten at most.
-            if io.data.capacity() <= MAX_SERVES || io.inv_unwritten.strong_count() > 0 {
-                io.inv_due = Some(now + INV_RETRY);
-                continue;
-            }
-            // Wait until the rate pays for every queued id, so the frame
-            // taken below is always paid for.
-            // Widening usize to u64 is lossless on supported targets.
-            let bound = inv_payload_bound(queued) as u64;
-            let Some(inv) = self.inv_buckets.get_mut(&io.connection) else {
-                continue;
-            };
-            match inv.bucket.ready_at(bound, now) {
-                Some(at) if at > now => {
-                    io.inv_due = Some(at);
-                    continue;
-                }
-                // The row's layout check keeps the largest frame within the
-                // bucket's depth, so it is always ready at some time.
-                _ => {}
-            }
-            let entries = self.machine.take_inv(session, MAX_INV_ENTRIES);
-            let Some(io) = self.sessions.get_mut(&session) else {
-                continue;
-            };
+            let entries = self.machine.next_inv(&self.view, room, at);
             if entries.is_empty() {
-                // An `Inv` holds at least one id.
-                io.inv_ready = false;
-                continue;
+                return;
             }
             let message = TxRelayMessage::Inv(entries);
             let Ok(frame) = encode_frame(&message) else {
-                continue;
+                return;
             };
-            let Some(inv) = self.inv_buckets.get_mut(&io.connection) else {
-                continue;
+            // The frame is within the bound the sender said the rate pays
+            // for. Widening usize to u64 is lossless on supported targets.
+            let Some(guard) = self.io.inv.pay(frame.payload.len() as u64, now) else {
+                debug_assert!(false, "the frame is within the bound the rate paid for");
+                return;
             };
-            // Widening usize to u64 is lossless on supported targets.
-            let paid = inv.bucket.try_pay(frame.payload.len() as u64, now);
-            debug_assert!(paid, "the frame is within the bound the bucket held");
-            let written = Arc::new(());
-            io.inv_unwritten = zakura_rt::sync::downgrade(&written);
-            // The capacity check leaves room, and the actor is the only
-            // sender, so the frame is queued.
-            if io
+            // The machine checked the writer had room, and the routine is the
+            // only sender besides the writer's own serve jobs, so the frame
+            // is queued.
+            if self
+                .io
                 .data
-                .try_send(Outgoing::Frame(frame, Some(FrameGuard::new(written))))
+                .try_send(Outgoing::Frame(frame, Some(guard)))
                 .is_ok()
             {
                 count(&message, "sent");
             }
         }
+    }
+}
+
+/// The machine's input for a peer that stopped reading. See
+/// [`PeerMachine::stopped_reading`].
+fn stopped_reading(machine: &mut PeerMachine, shared: &mut Shared, pool: &dyn PoolView, now: Time) {
+    machine.stopped_reading(shared, pool, now);
+}
+
+/// Counts an admission, and for a rejection returns whether `may_cool` lets
+/// it start a cooldown.
+fn read_verdict(may_cool: &MayCool, verdict: Verdict) -> Option<bool> {
+    match verdict {
+        Verdict::Admitted => {
+            metrics::counter!("zakura.p2p.tx_relay.tx.admitted").increment(1);
+            None
+        }
+        Verdict::Rejected { tip, .. } => Some(may_cool(tip)),
+        _ => None,
+    }
+}
+
+/// Sets the node's currentness for a rejection's charge: the machine starts
+/// a cooldown only when the node is current and its best tip is the
+/// verdict's, exactly what `may_cool` answers.
+fn set_currentness(shared: &mut Shared, verdict: Verdict, may_cool: Option<bool>) {
+    if let (Verdict::Rejected { tip, .. }, Some(may_cool)) = (verdict, may_cool) {
+        shared.set_current(may_cool);
+        if may_cool {
+            shared.set_best_tip(tip);
+        }
+    }
+}
+
+/// The closers of the sessions other than `stepped` that `effects` close,
+/// with why. `stepped` performs its own close.
+fn closers(
+    node: &Node,
+    effects: &[RelayEffect],
+    stepped: Option<SessionId>,
+) -> Vec<(Closer, CloseReason)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            RelayEffect::Close { session, reason } if Some(*session) != stepped => node
+                .sessions
+                .get(session)
+                .map(|handle| (handle.close.clone(), *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Leaves each effect on another session as mail for the sessions it
+/// reaches, and returns the wakes the step owes, by the machine's rules:
+/// each session an effect reaches, and every session but `stepped` once
+/// [`Marks::wake_all`] says so. `stepped` read the ring in its own step.
+fn route(node: &mut Node, marks: Marks, stepped: Option<SessionId>) -> Vec<Arc<Notify>> {
+    let mut wakes = Vec::new();
+    for effect in std::mem::take(&mut node.shared.node) {
+        let live = node.sessions.iter();
+        let (to, mail) = effect.reach(live.map(|(session, handle)| (*session, handle.peer)));
+        for session in to {
+            if let Some(handle) = node.sessions.get_mut(&session) {
+                handle.mail.extend(mail);
+                wakes.push(handle.wake.clone());
+            }
+        }
+    }
+    if marks.wake_all(&node.shared) {
+        let others = node
+            .sessions
+            .iter()
+            .filter(|(session, _)| Some(**session) != stepped);
+        wakes.extend(others.map(|(_, handle)| handle.wake.clone()));
+    }
+    wakes
+}
+
+/// Publishes how many sessions are live.
+fn count_sessions(node: &Node) {
+    // A session count is far below `f64`'s exact integer range.
+    metrics::gauge!("zakura.p2p.tx_relay.sessions").set(node.sessions.len() as f64);
+}
+
+/// The reactor task: answers the reserve calls and verdicts of sessions
+/// that ended, as they arrive. A grant goes straight back, and a verdict's
+/// charge reaches its peer's live sessions.
+async fn run_reactor(
+    node: Arc<Mutex<Node>>,
+    pool: PoolReader,
+    may_cool: MayCool,
+    base: Instant,
+    mut handed: mpsc::UnboundedReceiver<Calls>,
+) {
+    let mut calls: Calls = FuturesUnordered::new();
+    let mut open = true;
+    loop {
+        zakura_rt::select! {
+            batch = handed.recv(), if open => match batch {
+                Some(batch) => calls.extend(batch),
+                None => open = false,
+            },
+            Some(result) = calls.next(), if !calls.is_empty() => {
+                let now = Instant::now().saturating_duration_since(base);
+                ended_result(&node, &pool, &may_cool, result, now);
+            }
+            else => return,
+        }
+    }
+}
+
+/// Applies one pool result of a session that ended.
+fn ended_result(
+    node: &Arc<Mutex<Node>>,
+    pool: &PoolReader,
+    may_cool: &MayCool,
+    result: PoolResult,
+    now: Time,
+) {
+    let mut grant = None;
+    let (effects, closes, wakes) = {
+        let mut node = node.lock().expect("the node is never poisoned");
+        let node = &mut *node;
+        let marks = Marks::of(&node.shared);
+        match result {
+            PoolResult::Reserved { call, answer } => {
+                let answer = match answer {
+                    Ok(reservation) => {
+                        let granted = Granted {
+                            reservation: reservation.id(),
+                            cancelled: reservation.cancellation().is_cancelled(),
+                        };
+                        grant = Some(reservation);
+                        Ok(granted)
+                    }
+                    Err(refused) => Err(unreserved(refused)),
+                };
+                if !node.shared.ended_call_answer(call, answer) {
+                    node.shared.answer_unknown(answer);
+                }
+            }
+            PoolResult::Verdict { waiter, verdict } => {
+                let verdict = verdict_of(verdict);
+                let cools = read_verdict(may_cool, verdict);
+                set_currentness(&mut node.shared, verdict, cools);
+                let view = pool
+                    .snapshot()
+                    .map_or_else(SnapshotView::empty, SnapshotView);
+                node.shared.ended_verdict(&view, waiter, verdict, now);
+            }
+            PoolResult::Cancelled { .. } | PoolResult::Done => {}
+        }
+        let effects = std::mem::take(&mut node.shared.effects);
+        let closes = closers(node, &effects, None);
+        let wakes = route(node, marks, None);
+        (effects, closes, wakes)
+    };
+    // The only other effects here give a grant back, which dropping it does.
+    drop((grant, effects));
+    for wake in wakes {
+        wake.notify_one();
+    }
+    for (close, reason) in closes {
+        close.close(close_reason(reason));
     }
 }
 
@@ -1266,14 +1426,19 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
     }
 }
 
-/// The recorded cause for a close the machine asked for.
+/// The recorded cause for a close the machine asked for, as the close
+/// table's row for it gives.
 fn close_reason(reason: CloseReason) -> &'static str {
     match reason {
+        CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",
+        CloseReason::Violation(Violation::RequestedTwice) => "tx-relay: id requested twice",
+        CloseReason::Violation(Violation::TooManyRequests) => "tx-relay: too many requests",
         CloseReason::Violation(_) => "tx-relay: protocol violation",
         CloseReason::Ban => "tx-relay: banned transaction",
         CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",
         CloseReason::CooldownsFull => "tx-relay: cooldown table full",
         CloseReason::Unresponsive => "tx-relay: unanswered request",
+        CloseReason::StoppedReading => "tx-relay: peer stopped reading",
     }
 }
 
@@ -1293,18 +1458,6 @@ fn size_in(snapshot: &PoolSnapshot, id: UnminedTxId) -> Option<u32> {
 /// holds nothing over the protocol's 2,000,000 bytes.
 fn transaction_size(size: usize) -> u32 {
     u32::try_from(size).unwrap_or(u32::MAX)
-}
-
-/// Splits log entries into the batches they were published in, in order.
-fn batches(entries: Vec<ChangeEntry>) -> Vec<Vec<Change>> {
-    let mut batches: Vec<(u64, Vec<Change>)> = Vec::new();
-    for entry in entries {
-        match batches.last_mut() {
-            Some((batch, changes)) if *batch == entry.batch => changes.push(entry.change),
-            _ => batches.push((entry.batch, vec![entry.change])),
-        }
-    }
-    batches.into_iter().map(|(_, changes)| changes).collect()
 }
 
 #[cfg(test)]

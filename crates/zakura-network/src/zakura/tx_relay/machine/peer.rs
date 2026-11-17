@@ -3,14 +3,17 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    ops::Bound,
     time::Duration,
 };
 
 use indexmap::{IndexMap, IndexSet};
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::ReservationId;
-use zakura_rt::collections::HashMap;
+use zakura_rt::collections::{HashMap, HashSet};
 
+#[cfg(doc)]
+use super::MAX_SERVES;
 use super::{
     CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
     MAX_TX_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
@@ -91,6 +94,10 @@ pub(crate) struct PeerState {
     pub(crate) reserving: IndexMap<UnminedTxId, Reserving>,
     /// Its outstanding requests, oldest first.
     pub(crate) requests: IndexMap<UnminedTxId, Request>,
+    /// Its requests to us that we serve, until the IO starts writing each
+    /// answer: at most what our `Hello` serves, [`MAX_SERVES`]. A request
+    /// answered `NotFound` is answered in its own step, so it never stays.
+    pub(crate) serving: HashSet<UnminedTxId>,
     /// Bodies it supplied that wait for a verdict.
     pub(crate) submissions: Submissions,
     /// Ids this node announced to it and has not seen leave the pool, with
@@ -132,6 +139,7 @@ impl PeerState {
             pending: PendingSet::default(),
             reserving: IndexMap::new(),
             requests: IndexMap::new(),
+            serving: HashSet::default(),
             submissions: Submissions::default(),
             announced: Announced::default(),
             known: Known::default(),
@@ -176,12 +184,34 @@ impl PeerState {
         self.pending.drop_entry(id, generation);
     }
 
-    /// Records that it announced or supplied the id with short id `short`,
-    /// at change-log position `seq`, as the newest entry. Capped, forgetting
-    /// the one least recently recorded, which only costs one redundant
-    /// advert.
-    pub(crate) fn mark_known(&mut self, short: u64, seq: u64) {
-        self.known.mark(short, seq);
+    /// Records that it announced or supplied `id`, whose short id is
+    /// `short`, at change-log position `seq`, as the newest entry. Capped,
+    /// forgetting the one least recently recorded, which only costs one
+    /// redundant advert.
+    pub(crate) fn mark_known(&mut self, id: UnminedTxId, short: u64, seq: u64) {
+        self.mark_all_known([(id, short)], seq);
+    }
+
+    /// Records each of `ids`, given with its short id, as
+    /// [`Self::mark_known`] does one. An advert of one still queued for an
+    /// `Inv` would go back to a peer that has it, so those are withdrawn, in
+    /// one pass over the queue however many an `Inv` names. One already
+    /// sent stays, so the peer may still request the id.
+    pub(crate) fn mark_all_known(
+        &mut self,
+        ids: impl IntoIterator<Item = (UnminedTxId, u64)>,
+        seq: u64,
+    ) {
+        let mut queued: HashSet<UnminedTxId> = HashSet::default();
+        for (id, short) in ids {
+            self.known.mark(short, seq);
+            if self.announced.contains_key(&id) && !self.announced.is_sent(&id) {
+                queued.insert(id);
+            }
+        }
+        if !queued.is_empty() {
+            self.announced.retain(|id, _| !queued.contains(id));
+        }
     }
 
     /// Forgets that it announced an id with short id `short`.
@@ -345,25 +375,39 @@ impl Announced {
     }
 
     /// Takes up to `max` queued ids that `size` gives a size for, oldest
-    /// first, and marks them sent. An id `size` skips stays queued.
+    /// first, and marks them sent. An id `size` skips stays queued, and so
+    /// does one with a parent in `parents` that still waits to go out to
+    /// this peer: queued with a size and not taken before it, or one
+    /// `held` says is held. So a child never goes out ahead of its parent.
     pub(crate) fn take(
         &mut self,
         max: usize,
         size: impl Fn(&UnminedTxId) -> Option<u32>,
+        parents: impl Fn(&UnminedTxId) -> Vec<UnminedTxId>,
+        held: impl Fn(&UnminedTxId) -> bool,
     ) -> Vec<(UnminedTxId, u32)> {
         let mut taken = Vec::new();
-        self.queued.retain(|id| {
+        let mut taken_ids: HashSet<UnminedTxId> = HashSet::default();
+        for id in &self.queued {
             if taken.len() == max {
-                return true;
+                break;
             }
-            match size(id) {
-                Some(size) => {
-                    taken.push((*id, size));
-                    false
-                }
-                None => true,
+            let Some(id_size) = size(id) else {
+                continue;
+            };
+            let waits = |parent: &UnminedTxId| {
+                held(parent)
+                    || (self.queued.contains(parent)
+                        && !taken_ids.contains(parent)
+                        && size(parent).is_some())
+            };
+            if parents(id).iter().any(waits) {
+                continue;
             }
-        });
+            taken.push((*id, id_size));
+            taken_ids.insert(*id);
+        }
+        self.queued.retain(|id| !taken_ids.contains(id));
         taken
     }
 }
@@ -435,6 +479,12 @@ impl PendingSet {
             .find(|pending| pending.generation == generation)
     }
 
+    /// The oldest pending reference to `id`, in any generation.
+    pub(crate) fn of(&self, id: UnminedTxId) -> Option<Pending> {
+        let place = self.by_id.get(&id)?.first()?;
+        self.list.get(place).copied()
+    }
+
     /// Takes the oldest pending reference to `id` out.
     pub(crate) fn take(&mut self, id: UnminedTxId) -> Option<Pending> {
         let places = self.by_id.get_mut(&id)?;
@@ -502,6 +552,13 @@ impl PendingSet {
     /// The filed entries, first in line first.
     pub(crate) fn ready(&self) -> impl Iterator<Item = (&ReadyKey, &Pending)> {
         self.ready.iter()
+    }
+
+    /// When the first entry not yet ready at `now` becomes ready, found
+    /// without walking the entries that already are.
+    pub(crate) fn next_ready_after(&self, now: Time) -> Option<Time> {
+        let after = (Bound::Excluded((now, u64::MAX)), Bound::Unbounded);
+        self.ready.range(after).next().map(|((ready, _), _)| *ready)
     }
 
     /// Each filed id, its place in line, and what the line holds there.
@@ -747,7 +804,14 @@ impl Submissions {
         self.by_waiter.len()
     }
 
+    /// Whether `waiter` names one of these submissions.
+    #[cfg(test)]
+    pub(crate) fn contains_waiter(&self, waiter: WaiterId) -> bool {
+        self.by_waiter.contains_key(&waiter)
+    }
+
     /// The waiters, in order.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &WaiterId> {
         self.by_waiter.keys()
     }

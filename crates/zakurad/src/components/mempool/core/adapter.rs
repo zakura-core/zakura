@@ -53,13 +53,9 @@ use super::{
         queue_source_log_label, start_peer_cooldown,
         storage::NonStandardTransactionError,
         ExactTipRejectionError, MempoolError, Outbound, ReadState, SameEffectsChainRejectionError,
-        SameEffectsTipRejectionError,
     },
     Exempt,
 };
-
-/// The core's rejection detail, with the node's verifier error filled in.
-type CoreMempoolError = zakura_mempool::MempoolError<zakura_consensus::error::TransactionError>;
 
 /// A queued item's second answer.
 type Receiver = oneshot::Receiver<Result<(), BoxError>>;
@@ -238,10 +234,18 @@ async fn peer_batch(
     // of its refusals, whether it was queued when the advertisement arrived
     // or while the lookup waited.
     let queued_on_arrival = shared.fetching_among(&fresh);
-    let rejected = shared
-        .handle
-        .rejected_ids(fresh.iter().map(Gossip::id).collect())
-        .await;
+    // A core that does not answer by the deadline gets the batch dropped, as
+    // a reservation that does not come back in time would be.
+    let Ok(rejected) = tokio::time::timeout_at(
+        deadline,
+        shared
+            .handle
+            .rejected_ids(fresh.iter().map(Gossip::id).collect()),
+    )
+    .await
+    else {
+        return Ok(Response::Queued(Vec::new()));
+    };
     // The rest take their peer's slots now, in one pass, as today's pool
     // queues a batch at once: at most the peer's limit of them, and the rest
     // are dropped without asking the core. Slots that free up while the
@@ -617,11 +621,7 @@ fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
         Unreserved::NoRoom => MempoolError::FullQueue,
         Unreserved::Stopped => return Err("the pool core has stopped".into()),
         Unreserved::Rejected(rejection) => {
-            let Some(error) = rejection
-                .detail
-                .downcast_ref::<CoreMempoolError>()
-                .map(classic_error)
-            else {
+            let Some(error) = rejection.detail.downcast_ref::<MempoolError>().cloned() else {
                 return Err(rejection.detail.to_string().into());
             };
             // A cached policy rejection is a completed admission result, not a
@@ -808,11 +808,7 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
     match verdict {
         Verdict::Admitted => Ok(()),
         Verdict::Rejected(rejection) => {
-            let Some(error) = rejection
-                .detail
-                .downcast_ref::<CoreMempoolError>()
-                .map(classic_error)
-            else {
+            let Some(error) = rejection.detail.downcast_ref::<MempoolError>().cloned() else {
                 // A verifier answer that is not a pool rejection, such as a
                 // transaction already in the chain.
                 metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "in_state")
@@ -887,75 +883,6 @@ async fn fetch_unless_mined(
         fetch_transaction(outbound, tx_id, source).boxed();
     lookup.await?;
     download.await.map_err(BoxError::from)
-}
-
-/// Today's pool's error for the core's rejection `error`. Callers of the
-/// mempool service downcast to today's types, and the core keeps its own, so
-/// the adapter converts each one variant for variant.
-fn classic_error(error: &CoreMempoolError) -> MempoolError {
-    use zakura_mempool::{
-        ExactTipRejectionError as Exact, MempoolError as Core,
-        SameEffectsChainRejectionError as Chain, SameEffectsTipRejectionError as Tip,
-    };
-    match error {
-        Core::StorageExactTip(error) => MempoolError::StorageExactTip(match error {
-            Exact::FailedVerification(error) => {
-                ExactTipRejectionError::FailedVerification(error.clone())
-            }
-            Exact::FailedStandard(error) => {
-                ExactTipRejectionError::FailedStandard(classic_non_standard(error))
-            }
-            Exact::Evicted => ExactTipRejectionError::Evicted,
-            Exact::BelowEvictionCost => ExactTipRejectionError::BelowEvictionCost,
-        }),
-        Core::StorageEffectsTip(error) => MempoolError::StorageEffectsTip(match error {
-            Tip::SpendConflict => SameEffectsTipRejectionError::SpendConflict,
-            Tip::MissingOutput => SameEffectsTipRejectionError::MissingOutput,
-            Tip::TooManyAncestors => SameEffectsTipRejectionError::TooManyAncestors,
-            Tip::TooManyPackageTransactions => {
-                SameEffectsTipRejectionError::TooManyPackageTransactions
-            }
-        }),
-        Core::StorageEffectsChain(error) => MempoolError::StorageEffectsChain(match error {
-            Chain::Expired => SameEffectsChainRejectionError::Expired,
-            Chain::DuplicateSpend => SameEffectsChainRejectionError::DuplicateSpend,
-            Chain::Mined => SameEffectsChainRejectionError::Mined,
-        }),
-        Core::InMempool => MempoolError::InMempool,
-        Core::AlreadyQueued => MempoolError::AlreadyQueued,
-        Core::FullQueue => MempoolError::FullQueue,
-        Core::Disabled => MempoolError::Disabled,
-        Core::NonStandardTransaction(error) => {
-            MempoolError::NonStandardTransaction(classic_non_standard(error))
-        }
-    }
-}
-
-/// Today's pool's standardness error for the core's `error`. See
-/// [`classic_error`].
-fn classic_non_standard(
-    error: &zakura_mempool::NonStandardTransactionError,
-) -> NonStandardTransactionError {
-    use zakura_mempool::NonStandardTransactionError as Core;
-    match error {
-        Core::SproutJoinSplit => NonStandardTransactionError::SproutJoinSplit,
-        Core::TransactionTooLarge {
-            actual_bytes,
-            max_bytes,
-        } => NonStandardTransactionError::TransactionTooLarge {
-            actual_bytes: *actual_bytes,
-            max_bytes: *max_bytes,
-        },
-        Core::IsDust => NonStandardTransactionError::IsDust,
-        Core::ScriptSigTooLarge => NonStandardTransactionError::ScriptSigTooLarge,
-        Core::ScriptSigNotPushOnly => NonStandardTransactionError::ScriptSigNotPushOnly,
-        Core::ScriptPubKeyNonStandard => NonStandardTransactionError::ScriptPubKeyNonStandard,
-        Core::BareMultiSig => NonStandardTransactionError::BareMultiSig,
-        Core::MultiOpReturn => NonStandardTransactionError::MultiOpReturn,
-        Core::DataCarrierTooLarge => NonStandardTransactionError::DataCarrierTooLarge,
-        Core::TooManySigops => NonStandardTransactionError::TooManySigops,
-        Core::NonStandardInputs => NonStandardTransactionError::NonStandardInputs,
-    }
 }
 
 #[cfg(test)]

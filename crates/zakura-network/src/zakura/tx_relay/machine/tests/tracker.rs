@@ -19,7 +19,8 @@ use zakura_rt::collections::HashSet;
 
 use crate::zakura::tx_relay::machine::{
     CallId, CloseReason, Granted, PeerKey, RelayEffect, RelayMachine, SessionId, Unreserved,
-    Verdict, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, TRIED_PER_ENTRY,
+    Verdict, Violation, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, MAX_SERVES, PARK_COOLDOWN,
+    TRIED_PER_ENTRY,
 };
 
 /// The input a step answers, with what the record needs of it.
@@ -34,6 +35,15 @@ pub(crate) enum Cause {
     Arrived(SessionId, UnminedTxId, bool),
     /// The decoded body for the id, on the session.
     Body(SessionId, UnminedTxId),
+    /// The body the session's IO decoded did not decode.
+    Undecodable(SessionId),
+    /// The session's IO started writing its answer to the peer's request
+    /// for the id.
+    Served(SessionId, UnminedTxId),
+    /// The machine opened the session.
+    Opened(SessionId),
+    /// The session's IO found a writer's queue full.
+    StoppedReading(SessionId),
     /// The session's peer answered `NotFound`.
     NotFound(SessionId, UnminedTxId),
     /// The session's peer asked for the id.
@@ -64,6 +74,12 @@ pub(crate) struct Open {
     told: IndexSet<UnminedTxId>,
     /// Ids that went out to it in an `Inv` and still stand.
     pub(crate) sent: IndexSet<UnminedTxId>,
+    /// Its requests the node serves, until the IO starts each answer.
+    pub(crate) serving: IndexSet<UnminedTxId>,
+    /// Its peer's park ran when it opened, so it is refused at once.
+    refused: bool,
+    /// Its peer's park let it in, so its stall closes the connection.
+    readmitted: bool,
 }
 
 /// What a granted reservation is used for.
@@ -111,6 +127,8 @@ pub(crate) struct Tracker {
     /// For each peer a verdict charged, when its cooldown surely ends and
     /// when it may end at the latest. See [`Tracker::charged`].
     cooling: BTreeMap<PeerKey, (Duration, Duration)>,
+    /// For each peer whose session stalled, when its park ends.
+    parks: BTreeMap<PeerKey, Duration>,
     /// How often each kind of effect, answer and change happened.
     pub(crate) seen: BTreeMap<String, usize>,
 }
@@ -126,11 +144,25 @@ impl Tracker {
         }
     }
 
-    /// The machine opened `session` for `peer`. The peer's bodies at the
-    /// pool count as told from the start.
-    pub(crate) fn opened(&mut self, session: SessionId, peer: PeerKey, exempt: bool) {
+    /// The machine opened `session` for `peer` at `now`. The peer's bodies
+    /// at the pool count as told from the start. While the peer's park
+    /// runs, the session is refused. Once it ended, the park lets this
+    /// session in.
+    pub(crate) fn opened(
+        &mut self,
+        session: SessionId,
+        peer: PeerKey,
+        exempt: bool,
+        now: Duration,
+    ) {
         let told = self.unsettled(peer).collect();
-        let (hello, sent) = (false, IndexSet::new());
+        let (hello, sent, serving) = (false, IndexSet::new(), IndexSet::new());
+        let parked = self.parks.get(&peer).copied();
+        let refused = parked.is_some_and(|until| now < until);
+        let readmitted = parked.is_some() && !refused;
+        if readmitted {
+            self.parks.remove(&peer);
+        }
         self.open.insert(
             session,
             Open {
@@ -139,6 +171,9 @@ impl Tracker {
                 hello,
                 told,
                 sent,
+                serving,
+                refused,
+                readmitted,
             },
         );
         let peers: IndexSet<PeerKey> = self.open.values().map(|open| open.peer).collect();
@@ -150,6 +185,8 @@ impl Tracker {
         let pooled = ids.iter().all(|id| self.shown.contains(id));
         assert!(pooled, "an Inv carries only pooled ids");
         if let Some(open) = self.open.get_mut(&session) {
+            let back = ids.iter().any(|id| open.told.contains(id));
+            assert!(!back, "an Inv never carries an id back to its source");
             open.sent.extend(ids.iter().copied());
         }
         let kind = if ids.is_empty() {
@@ -203,6 +240,29 @@ impl Tracker {
         now: Duration,
         tip: Height,
     ) {
+        // What a request may get, from the state before its step: no answer
+        // and a close for a broken rule, or one answer.
+        let request = match cause {
+            Cause::GetTxs(session, id) => self.open.get(session).map(|open| {
+                if !open.hello {
+                    Some(Violation::NoHelloFirst)
+                } else if open.serving.contains(id) {
+                    Some(Violation::RequestedTwice)
+                } else if open.serving.len() >= MAX_SERVES {
+                    Some(Violation::TooManyRequests)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        // Whether the session this step opened was refused, and whether its
+        // park came.
+        let refused = match cause {
+            Cause::Opened(session) => self.open.get(session).is_some_and(|open| open.refused),
+            _ => false,
+        };
+        let mut parked = false;
         self.before(cause);
         if let Cause::Verdict(
             _,
@@ -293,6 +353,7 @@ impl Tracker {
                     if matches!(effect, RelayEffect::Serve { .. }) {
                         let served = self.shown.contains(id) && open.sent.contains(id);
                         assert!(served, "served only once sent, while pooled");
+                        open.serving.insert(*id);
                         self.saw("serve");
                     } else {
                         open.sent.shift_remove(id);
@@ -304,11 +365,50 @@ impl Tracker {
                     self.close(*session);
                     self.saw(format!("close {reason:?}"));
                 }
+                RelayEffect::Park { session } => {
+                    let open = self.open.get(session).expect("a park of a live session");
+                    if matches!(cause, Cause::Opened(of) if of == session) {
+                        assert!(open.refused, "refused only while its peer's park runs");
+                        parked = true;
+                        self.saw("park refused");
+                    } else {
+                        let first = !open.refused && !open.readmitted;
+                        assert!(first, "a park is a first stall");
+                        let peer = open.peer;
+                        self.check_stall(cause, *session);
+                        self.parks.insert(peer, now + PARK_COOLDOWN);
+                        self.saw("park");
+                    }
+                    self.close(*session);
+                }
             }
         }
+        if matches!(cause, Cause::Opened(_)) {
+            assert_eq!(
+                parked, refused,
+                "a parked peer's session is refused at once"
+            );
+        }
         if let Cause::GetTxs(session, _) = cause {
-            let live = self.open.get(session).is_some_and(|open| open.hello);
-            assert_eq!(answers, usize::from(live), "a GetTxs is answered");
+            let closed = |violation| CloseReason::Violation(violation);
+            let closes: Vec<CloseReason> = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    RelayEffect::Close {
+                        session: of,
+                        reason,
+                    } if of == session => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            match request {
+                Some(None) => assert_eq!(answers, 1, "a GetTxs is answered"),
+                Some(Some(broken)) => {
+                    assert_eq!(answers, 0, "a GetTxs that breaks a rule is not answered");
+                    assert_eq!(closes, vec![closed(broken)], "it closes for that rule");
+                }
+                None => assert_eq!(answers, 0, "a GetTxs on an ended session"),
+            }
         }
         self.after(cause, submitted);
     }
@@ -319,6 +419,11 @@ impl Tracker {
             Cause::Hello(session) => {
                 if let Some(open) = self.open.get_mut(session) {
                     open.hello = true;
+                }
+            }
+            Cause::Served(session, id) => {
+                if let Some(open) = self.open.get_mut(session) {
+                    open.serving.shift_remove(id);
                 }
             }
             Cause::Arrived(session, id, false)
@@ -443,13 +548,21 @@ impl Tracker {
                 Some(sender)
             }
             Cause::NotFound(sender, _) | Cause::GetTxs(sender, _) => Some(sender),
+            Cause::Undecodable(sender) => Some(sender),
             _ => None,
         };
         match reason {
+            CloseReason::Violation(Violation::Undecodable) => {
+                let decoded = matches!(cause, Cause::Undecodable(of) if *of == session);
+                assert!(decoded, "an undecodable body's close");
+            }
             CloseReason::Violation(_) => assert_eq!(sender, Some(&session), "a violation's sender"),
-            CloseReason::Unresponsive => {
-                let asked = self.requests.keys().any(|(asked, _)| *asked == session);
-                assert!(asked, "unresponsive with a request out");
+            CloseReason::Unresponsive | CloseReason::StoppedReading => {
+                assert!(
+                    open.readmitted,
+                    "a stall closes only the session a park let in"
+                );
+                self.check_stall(cause, session);
             }
             CloseReason::Ban | CloseReason::RepeatedCooldown | CloseReason::CooldownsFull => {
                 let Cause::Verdict(_, Verdict::Rejected { charge, .. }) = cause else {
@@ -463,6 +576,14 @@ impl Tracker {
                 assert_eq!(*charge, earned, "{reason:?} is that charge's close");
             }
         }
+    }
+
+    /// A stall of `session` in the step `cause` started: its IO found a
+    /// writer full, or it has a request out that it left unanswered.
+    fn check_stall(&self, cause: &Cause, session: SessionId) {
+        let full = matches!(cause, Cause::StoppedReading(of) if *of == session);
+        let asked = self.requests.keys().any(|(asked, _)| *asked == session);
+        assert!(full || asked, "a stall: a full writer, or a request out");
     }
 
     /// `session` ended. Its requests end with it, and its peer's other
@@ -487,10 +608,10 @@ impl Tracker {
     pub(crate) fn check(&self, machine: &RelayMachine) {
         let live = machine.session_ids().eq(self.open.keys().copied());
         assert!(live, "the machine's sessions are the open ones");
-        let made = |call: &CallId| machine.calls.contains_key(call);
-        let owed = machine.calls.len() == self.calls.len() && self.calls.keys().all(made);
+        let made = |call: &CallId| machine.has_call(*call);
+        let owed = machine.calls_in_flight() == self.calls.len() && self.calls.keys().all(made);
         assert!(owed, "the machine waits for the calls the pool owes");
-        assert_eq!(machine.waiters.len(), self.bodies.len(), "and the verdicts");
+        assert_eq!(machine.waiters_len(), self.bodies.len(), "and the verdicts");
         let (mut granted, mut asked) = (0, 0);
         for used in self.reservations.values() {
             granted += usize::from(matches!(used, Use::Granted(_)));
@@ -501,7 +622,11 @@ impl Tracker {
         assert_eq!(held, asked, "requests hold the reservations");
         // An entry's tries are at most one more than the cap or the most
         // peers connected at once.
-        let tries = machine.reactor.tries().values().map(IndexSet::len).max();
+        let tries = machine
+            .wanted()
+            .entries()
+            .map(|(_, entry)| entry.tried.len())
+            .max();
         let bound = TRIED_PER_ENTRY.max(self.peak_peers) + 1;
         assert!(tries.unwrap_or(0) <= bound, "the tries bound");
     }

@@ -677,9 +677,9 @@ where
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
             result.map_err(|e| match zakura_consensus::error::TransactionError::from(e) {
-                // The state could not answer a lookup. The rejected cache must not
-                // remember this transaction, so a later relay retries it.
-                zakura_consensus::error::TransactionError::StateUnavailable(error) => {
+                // The rejected cache must not remember a failure on this node,
+                // so a later relay retries the transaction.
+                error if super::is_local_failure(&error) => {
                     TransactionDownloadVerifyError::StateError(CloneError::from(BoxError::from(
                         error,
                     )))

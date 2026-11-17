@@ -628,9 +628,9 @@ impl<E: VerifyError> MempoolState<E> {
         // expired transaction here was not mined, and what depends on it goes
         // with it.
         self.remove_expired();
-        for hash in mined.iter() {
-            self.wake(*hash);
-        }
+        // One pass over the parked lists, which can be long: an unknown input
+        // parks a transaction on every transparent spend.
+        self.wake(|parent| mined_set.contains(parent));
         self.take_step()
     }
 
@@ -1179,7 +1179,7 @@ impl<E: VerifyError> MempoolState<E> {
                     self.unqueue(queued);
                 }
                 self.trim_queue();
-                self.wake(hash);
+                self.wake(|parent| *parent == hash);
             }
             // Found in the best chain by this job's own lookup. Today that
             // leaves the rejection lists alone. Only a block the core sees
@@ -1411,13 +1411,13 @@ impl<E: VerifyError> MempoolState<E> {
         self.step.effects.push(Effect::Cancel(job));
     }
 
-    /// Runs every admission parked on `parent` again.
-    fn wake(&mut self, parent: transaction::Hash) {
+    /// Runs again every admission parked on a parent that `arrived` accepts.
+    fn wake(&mut self, arrived: impl Fn(&transaction::Hash) -> bool) {
         let woken: Vec<u64> = self
             .admissions
             .iter()
             .filter(|(_, admission)| match &admission.stage {
-                Stage::Parked { on } => on.contains(&parent),
+                Stage::Parked { on } => on.iter().any(&arrived),
                 _ => false,
             })
             .map(|(key, _)| *key)

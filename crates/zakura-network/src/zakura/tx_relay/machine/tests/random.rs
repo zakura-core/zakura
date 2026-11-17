@@ -32,7 +32,7 @@ use zakura_node_services::mempool::port::{
 
 use super::{body, script_len, Bench, SIZE};
 use crate::zakura::tx_relay::machine::{
-    peer::Hello, FanOut, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, WaiterId,
+    peer::Hello, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, WaiterId,
     ADVERT_DELAY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
 };
 
@@ -50,10 +50,13 @@ const BAD: u64 = 4;
 const SESSIONS: usize = 7;
 
 /// The coverage list: every kind the runs must reach, `;`-separated.
-const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv taken; serve;
+const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv taken;
+    inv child waited; serve;
     answer not found; close Violation(HelloTwice); close Violation(BadHello);
     close Violation(NoHelloFirst); close Violation(Unrequested); close Violation(WrongSize);
-    close Violation(WrongId); close Ban; close RepeatedCooldown; close Unresponsive;
+    close Violation(WrongId); close Violation(Undecodable); close Violation(RequestedTwice);
+    close Ban; close RepeatedCooldown; close Unresponsive; close StoppedReading; park;
+    park refused;
     answer grant; answer cancelled grant; answer Pooled; answer Pending; answer Rejected;
     answer NoRoom; answer Inactive; answer Stopped; verdict Admitted;
     verdict Rejected cached, None; verdict Rejected uncached, None;
@@ -149,6 +152,14 @@ impl Run {
         let bodies: Vec<UnminedTx> = (0..IDS).map(|n| body(n, script)).collect();
         let pooled: Vec<UnminedTxId> = bodies[..2].iter().map(UnminedTx::id).collect();
         let mut bench = Bench::with(fan_out, true, &pooled);
+        // About one id in four spends outputs of an earlier one, which counts
+        // while the pool holds it.
+        for n in 1..bodies.len() {
+            if rng.one_in(4) {
+                let parent = bodies[rng.below(n)].id();
+                bench.depends(bodies[n].id(), &[parent]);
+            }
+        }
         bench.steps = trace.then(Vec::new);
         let may_stop = rng.one_in(3);
         let (peers, admitted, reset_out) = (BTreeMap::new(), Vec::new(), Vec::new());
@@ -193,6 +204,13 @@ impl Run {
     fn sent(&self, session: SessionId) -> Vec<UnminedTxId> {
         let open = self.bench.tracker.open.get(&session);
         open.map(|open| open.sent.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// The ids whose answers `session`'s IO has yet to start.
+    fn serving(&self, session: SessionId) -> Vec<UnminedTxId> {
+        let open = self.bench.tracker.open.get(&session);
+        open.map(|open| open.serving.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -271,6 +289,8 @@ impl Run {
             20 if self.rng.one_in(3) => self.unrequested(),
             21 | 22 => self.get_txs(),
             23 => self.end(),
+            24 | 25 => self.served(),
+            26 if self.rng.one_in(2) => self.stopped_reading(),
             29..=34 => self.answer_call(near_end),
             35..=38 => self.verdict(near_end),
             39 => self.cancel(),
@@ -392,6 +412,7 @@ impl Run {
             (Peer::Honest, 3) => {
                 self.bench.arrived(session, id, SIZE + 7);
             }
+            (Peer::Honest, 5) => self.bench.undecodable(session, id),
             (Peer::Honest, other) => {
                 let other = if other == 4 { self.any_id() } else { id };
                 let body = self.body(other);
@@ -414,19 +435,50 @@ impl Run {
         }
     }
 
-    /// A peer asks for an id: mostly one it was sent.
+    /// A peer asks for an id: mostly one it was sent and has no answer
+    /// coming for, now and then one it already has an answer coming for.
     fn get_txs(&mut self) {
         let Some(session) = self.session() else {
             return self.tick();
         };
-        let sent = self.sent(session);
-        let id = if !sent.is_empty() && !self.rng.one_in(3) {
-            self.rng.pick(&sent)
+        let serving = self.serving(session);
+        let sent: Vec<UnminedTxId> = self.sent(session);
+        let fresh: Vec<UnminedTxId> = sent
+            .into_iter()
+            .filter(|id| !serving.contains(id))
+            .collect();
+        let id = if !serving.is_empty() && self.rng.one_in(8) {
+            self.rng.pick(&serving)
+        } else if !fresh.is_empty() && !self.rng.one_in(3) {
+            self.rng.pick(&fresh)
         } else {
             self.any_id()
         };
         self.note(|run| format!("{} asks for {}", session.0, run.name(id)));
         self.bench.get_txs(session, id);
+    }
+
+    /// A session's IO finds one of its writers' queues full.
+    fn stopped_reading(&mut self) {
+        let Some(session) = self.session() else {
+            return self.tick();
+        };
+        self.note(|_| format!("{}'s peer stops reading", session.0));
+        self.bench.stopped_reading(session);
+    }
+
+    /// A session's IO starts writing one of its answers.
+    fn served(&mut self) {
+        let open = self.bench.tracker.open.iter();
+        let serving: Vec<(SessionId, UnminedTxId)> = open
+            .flat_map(|(session, open)| open.serving.iter().map(|id| (*session, *id)))
+            .collect();
+        if serving.is_empty() {
+            return self.tick();
+        }
+        let (session, id) = serving[self.rng.below(serving.len())];
+        self.note(|run| format!("{}'s IO starts answering {}", session.0, run.name(id)));
+        self.bench.served(session, id);
     }
 
     /// A session ends.
@@ -525,10 +577,10 @@ impl Run {
 
     /// The pool cancels a fetch it no longer needs.
     fn cancel(&mut self) {
-        let reservations = &self.bench.machine.reservations;
+        let machine = &self.bench.machine;
         let held = self.requests().into_iter();
         let held: Vec<_> = held
-            .filter(|(.., held)| reservations.contains_key(held))
+            .filter(|(.., held)| machine.holds_reservation(*held))
             .collect();
         if held.is_empty() {
             return self.tick();
@@ -640,7 +692,19 @@ impl Run {
         let Some(session) = self.session() else {
             return self.tick();
         };
-        let taken = self.bench.take_inv(session, 1 + self.rng.below(4));
+        let taken = if self.rng.one_in(2) {
+            self.bench.take_inv(session, 1 + self.rng.below(4))
+        } else {
+            // The IO's paced path, with a writer short of room now and then,
+            // its last `Inv` unwritten, or the byte rate short.
+            let free = MAX_SERVES + self.rng.below(3);
+            let paid = match self.rng.below(4) {
+                0 => Paid::Unwritten,
+                1 => Paid::At(self.bench.now + self.rng.millis(2_000)),
+                _ => Paid::Now,
+            };
+            self.bench.send_inv(session, free, paid)
+        };
         self.note(|run| {
             let named = taken.iter().map(|id| run.name(*id));
             format!("{} is sent {:?}", session.0, named.collect::<Vec<_>>())
@@ -687,23 +751,15 @@ impl Run {
             machine.session_ids().next().is_none(),
             "every session ended"
         );
-        assert!(machine.calls.is_empty(), "no call is left");
-        assert!(
-            machine.waiters.is_empty() && machine.submitted_at.is_empty(),
-            "no body"
-        );
+        assert_eq!(machine.calls_in_flight(), 0, "no call is left");
+        assert_eq!(machine.waiters_len(), 0, "no body");
         assert_eq!(machine.reservations_held(), 0, "no reservation is left");
         let wanted = machine.wanted();
-        assert!(
-            wanted.len() == 0 && wanted.retries_len() == 0,
-            "no wanted entry is left"
-        );
-        assert!(machine.holders.is_empty(), "no holder is left");
+        assert_eq!(wanted.len(), 0, "no wanted entry is left");
         assert_eq!(machine.timers_len(), 0, "no timer is left");
-        let reactor = &machine.reactor;
+        let reactor = machine.reactor();
         assert!(reactor.by_peer().is_empty() && reactor.go().is_empty());
         assert!(reactor.unsettled().is_empty() && reactor.ended_calls().is_empty());
-        assert!(reactor.tries().is_empty(), "no tries are left");
         assert_eq!(machine.next_deadline(), None, "nothing is due");
     }
 

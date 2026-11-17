@@ -10,9 +10,12 @@ use zakura_node_services::mempool::port::{
 
 use super::{body, hello, ids, script_len, Bench, SIZE};
 use crate::zakura::tx_relay::machine::{
-    peer::Hello, reactor::Recorded, CloseReason, FanOut, PeerKey, RelayEffect, SessionId, Timer,
-    Timers, Unreserved, Verdict, Violation, ADVERT_DELAY, BASE_COOLDOWN, MAX_COOLDOWN,
-    MAX_COOLDOWN_PEERS, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST,
+    peer::Hello,
+    reactor::Recorded,
+    session::{Timer, Timers},
+    CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
+    ADVERT_DELAY, BASE_COOLDOWN, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN,
     PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
@@ -95,19 +98,17 @@ fn a_request_goes_out_only_once_the_pool_grants_its_reservation() {
     bench.fetch(session, granted);
 }
 
-/// The id ready longest goes first, over every session: after a full pool's
-/// backoff the one probe goes to the oldest announcement, though a session
-/// looked at first holds a younger one. An attempt that ends undecided sends
-/// its id behind the work already waiting.
+/// Each session takes its own id ready longest first: after a full pool's
+/// backoff the one probe is for the oldest id it holds, and an attempt that
+/// ends undecided sends its id behind the work already waiting there.
 #[test]
-fn the_id_ready_longest_goes_first_over_every_session() {
+fn each_session_takes_its_id_ready_longest_first() {
     let mut bench = Bench::new();
-    let (young, old) = (bench.id(0), bench.id(1));
-    let first = bench.join(1);
-    let second = bench.join(2);
-    bench.inv(second, &[old]);
+    let (old, young) = (bench.id(0), bench.id(1));
+    let session = bench.join(1);
+    bench.inv(session, &[old]);
     bench.tick(Duration::from_secs(1));
-    bench.inv(first, &[young]);
+    bench.inv(session, &[young]);
     for (call, _) in bench.calls() {
         bench.answer(call, Err(Unreserved::NoRoom));
     }
@@ -323,7 +324,7 @@ fn a_deadline_moves_the_id_on_and_one_more_ends_the_session() {
             assert!(bench.reserved(next), "an answered peer stays, uncharged");
         } else {
             assert!(bench.next());
-            assert_eq!(bench.closes(), vec![(slow, CloseReason::Unresponsive)]);
+            assert_eq!(bench.parks(), vec![slow], "a first stall parks");
         }
     }
 }
@@ -367,11 +368,36 @@ fn a_cancelled_fetch_drops_its_body_but_its_deadline_still_runs() {
             assert!(bench.reserved(id), "the id is asked about again");
             continue;
         }
-        while bench.closes().is_empty() {
+        while bench.parks().is_empty() {
             assert!(bench.next(), "the deadlines run");
         }
-        assert_eq!(bench.closes(), vec![(session, CloseReason::Unresponsive)]);
+        assert_eq!(bench.parks(), vec![session]);
     }
+}
+
+/// A stall parks the session, not its connection. The first stall, a
+/// request left unanswered past one more deadline or a writer its peer
+/// stopped reading, ends the session, and the peer's next sessions are
+/// refused until the park ends. The session the park lets in then closes
+/// its connection on its own stall. Neither is a charge.
+#[test]
+fn a_stall_parks_the_session_and_a_repeat_closes_the_connection() {
+    let mut bench = Bench::new();
+    let stalled = bench.join(1);
+    bench.stopped_reading(stalled);
+    assert_eq!(bench.parks(), vec![stalled], "the first stall parks");
+    let refused = bench.connect(1, false);
+    assert_eq!(bench.parks(), vec![refused], "refused while the park runs");
+    bench.tick(PARK_COOLDOWN);
+    let readmitted = bench.connect(1, false);
+    assert!(bench.parks().is_empty(), "the ended park lets it in");
+    bench.hello(readmitted, hello());
+    let id = bench.id(0);
+    bench.inv(readmitted, &[id]);
+    assert!(bench.reserved(id), "uncharged, it is asked");
+    bench.stopped_reading(readmitted);
+    let closed = (readmitted, CloseReason::StoppedReading);
+    assert_eq!(bench.closes(), vec![closed], "its stall closes");
 }
 
 /// Honest ids get fetched despite hostile announcers: with `K` announcers
@@ -604,6 +630,26 @@ fn a_full_pool_costs_one_probe_per_backoff_until_a_slot_comes_back() {
     assert_eq!(called(&bench), ids[1..].to_vec(), "room ends the backoff");
 }
 
+/// A grant to the probe ends the backoff for every session at once, though
+/// no id changed: a session that waited behind the probe claims as soon as
+/// the probe is granted, not at its next event.
+#[test]
+fn a_granted_probe_lets_every_session_claim_at_once() {
+    let mut bench = Bench::new();
+    let (probed, waiting) = (bench.id(0), bench.id(1));
+    let prober = bench.join(1);
+    bench.inv(prober, &[probed]);
+    let waiter = bench.join(2);
+    bench.inv(waiter, &[waiting]);
+    for (call, _) in bench.calls() {
+        bench.answer(call, Err(Unreserved::NoRoom));
+    }
+    bench.tick(NO_ROOM_FIRST);
+    assert_eq!(called(&bench), vec![probed], "one probe when it ends");
+    bench.grant(bench.call(probed));
+    assert!(bench.reserved(waiting), "the grant is room for everyone");
+}
+
 /// A stopped core ends claiming for good, whichever `Stopped` answer tells
 /// the machine: one to the reserve call of a session that ended is still
 /// the core's answer.
@@ -694,12 +740,12 @@ fn a_refusal_leaves_other_retries_alone() {
     assert!(bench.calls().is_empty(), "the delay stands");
 }
 
-/// A session that announces an id and ends leaves the holders index, even
-/// while another session keeps the id pending: a peer that keeps
+/// A session that announces an id and ends gives up its hold on the entry,
+/// even while another session keeps the id pending: a peer that keeps
 /// reconnecting and announcing it during a `NoRoom` backoff can't grow the
-/// index.
+/// entry's holder count.
 #[test]
-fn ended_sessions_leave_the_holders_index_while_another_holds_the_id() {
+fn ended_sessions_give_up_their_hold_while_another_holds_the_id() {
     let mut bench = Bench::new();
     let id = bench.id(1);
     let keeper = bench.join(1);
@@ -708,15 +754,22 @@ fn ended_sessions_leave_the_holders_index_while_another_holds_the_id() {
     for (call, _) in bench.calls() {
         bench.answer(call, Err(Unreserved::NoRoom));
     }
-    assert_eq!(bench.machine.holders_of(id), 1);
+    let holders = |bench: &Bench| {
+        bench
+            .machine
+            .wanted()
+            .entry(id)
+            .map_or(0, |entry| entry.holders)
+    };
+    assert_eq!(holders(&bench), 1);
     for round in 0..50 {
         let churn = bench.join(2);
         bench.inv(churn, &[id]);
-        let named = bench.machine.holders_of(id);
-        assert!(named <= 2, "round {round}: {named} named");
+        let named = holders(&bench);
+        assert!(named <= 2, "round {round}: {named} holders");
         bench.end(churn);
     }
-    assert_eq!(bench.machine.holders_of(id), 1, "only the holder is left");
+    assert_eq!(holders(&bench), 1, "only the holder is left");
 }
 
 // Charges.
@@ -883,7 +936,7 @@ fn a_ban_after_the_session_ended_cools_the_peer_id_and_closes_its_live_sessions(
     let banned_at = bench.now;
     let cooling = bench
         .machine
-        .reactor
+        .reactor()
         .cooling_until(PeerKey(peer), banned_at);
     assert_eq!(cooling, Some(banned_at + MAX_COOLDOWN));
 
@@ -902,7 +955,7 @@ fn a_full_cooldown_table_closes_a_fresh_offender_and_keeps_every_cooldown() {
     let count = u64::try_from(MAX_COOLDOWN_PEERS).expect("20,000 fits a u64");
     let held: Vec<PeerKey> = (0..count).map(|n| PeerKey(1_000 + n)).collect();
     for peer in &held {
-        let recorded = bench.machine.reactor.record_invalid(*peer, bench.now);
+        let recorded = bench.machine.reactor_mut().record_invalid(*peer, bench.now);
         assert_eq!(recorded, Recorded::Started(BASE_COOLDOWN));
     }
 
@@ -915,7 +968,7 @@ fn a_full_cooldown_table_closes_a_fresh_offender_and_keeps_every_cooldown() {
     );
     assert_eq!(bench.closes(), vec![(session, CloseReason::CooldownsFull)]);
     let now = bench.now;
-    let reactor = &mut bench.machine.reactor;
+    let reactor = bench.machine.reactor_mut();
     assert!(!reactor.is_cooling(PeerKey(fresh), now), "not cooled");
     let kept = held.iter().all(|peer| reactor.is_cooling(*peer, now));
     assert!(kept, "no cooldown is lost");
@@ -949,6 +1002,92 @@ fn an_admission_is_announced_once_inside_the_window_at_once_and_the_rest_later()
     bench.tick(ADVERT_DELAY);
     bench.resync();
     assert!(bench.adverts().is_empty(), "each session hears once");
+}
+
+/// An `Inv` goes only while the data writer keeps room for every body the
+/// peer may have requested, once the last `Inv` is written, and once the
+/// byte rate pays for it. A session that has to wait tries again after the
+/// retry interval, or when the rate pays.
+#[test]
+fn an_inv_waits_for_room_its_last_write_and_the_byte_rate() {
+    let mut bench = Bench::new();
+    let id = bench.id(0);
+    bench.add(&[id]);
+    let session = bench.join(1);
+    let room = MAX_SERVES + 1;
+    assert!(bench.send_inv(session, MAX_SERVES, Paid::Now).is_empty());
+    assert!(
+        bench.send_inv(session, room, Paid::Now).is_empty(),
+        "it waits"
+    );
+    bench.tick(INV_RETRY);
+    assert!(bench.send_inv(session, room, Paid::Unwritten).is_empty());
+    bench.tick(INV_RETRY);
+    let paid = bench.now + Duration::from_secs(1);
+    assert!(bench.send_inv(session, room, Paid::At(paid)).is_empty());
+    bench.tick(Duration::from_secs(1) - MS);
+    assert!(
+        bench.send_inv(session, room, Paid::Now).is_empty(),
+        "until paid"
+    );
+    bench.tick(MS);
+    assert_eq!(bench.send_inv(session, room, Paid::Now), vec![id]);
+}
+
+/// An advert still queued for an `Inv` is withdrawn once the peer announces
+/// the same id, so it never goes back to its source, and the adverts it
+/// did not name stay queued. One already sent stands, and the peer may
+/// still ask for it.
+#[test]
+fn a_queued_advert_the_peer_announces_is_withdrawn() {
+    let mut bench = Bench::new();
+    let (sent, queued, kept) = (bench.id(0), bench.id(1), bench.id(2));
+    let session = bench.join(1);
+    bench.add(&[sent]);
+    assert_eq!(bench.take_inv(session, 16), vec![sent]);
+    bench.add(&[queued, kept]);
+    bench.inv(session, &[queued, sent]);
+    assert_eq!(bench.take_inv(session, 16), vec![kept], "nothing goes back");
+    bench.get_txs(session, sent);
+    assert_eq!(
+        bench.effects,
+        vec![RelayEffect::Serve { session, id: sent }]
+    );
+}
+
+/// A small child inside a session's window waits for its big parent
+/// outside it: the child's advert is queued at once, but no `Inv` carries
+/// it until the parent's has gone out to that session. So the peer never
+/// fetches the child first and holds it waiting for the parent.
+#[test]
+fn a_child_goes_out_only_after_its_parent() {
+    let fan_out = FanOut {
+        advert_delay: ADVERT_DELAY,
+        window_small: 8,
+        window_full: 1,
+    };
+    let mut bench = Bench::with(fan_out, true, &[]);
+    let sessions = [bench.join(1), bench.join(2)];
+    let (parent, child) = (bench.id(0), bench.id(1));
+    bench.pool.insert(parent, MAX_TX_BYTES);
+    bench.pool.insert(child, SIZE);
+    bench.depends(child, &[parent]);
+    bench.resync();
+    let late = sessions
+        .into_iter()
+        .find(|session| !advertised(&bench, parent).contains(session))
+        .expect("one session is outside the parent's window");
+    assert!(
+        advertised(&bench, child).contains(&late),
+        "the child is queued"
+    );
+    assert!(
+        bench.take_inv(late, 16).is_empty(),
+        "behind its held parent"
+    );
+    bench.tick(ADVERT_DELAY);
+    assert_eq!(bench.take_inv(late, 16), vec![parent], "the parent first");
+    assert_eq!(bench.take_inv(late, 16), vec![child], "then the child");
 }
 
 /// With the advert delay set to zero, a session outside the window
@@ -986,6 +1125,23 @@ fn the_first_snapshot_opens_sessions_waiting_for_the_pool() {
     bench.now = Duration::from_secs(1);
     bench.resync();
     assert_eq!(advertised(&bench, pooled), sessions);
+}
+
+/// A batch that turns the pool on again opens each session on the pool
+/// after it, as its routine reads that batch. So an addition in the batch
+/// goes to every session in that step as part of the whole pool, even with
+/// a window of one.
+#[test]
+fn an_addition_in_the_batch_that_turns_the_pool_on_goes_to_everyone_at_once() {
+    let mut bench = Bench::with(one_at_once(ADVERT_DELAY), true, &[]);
+    let sessions = vec![bench.join(1), bench.join(2)];
+    bench.turn_off();
+
+    let added = bench.id(0);
+    bench.active = true;
+    bench.now = Duration::from_secs(1);
+    bench.add(&[added]);
+    assert_eq!(advertised(&bench, added), sessions);
 }
 
 /// A resync keeps the adverts that still stand, forgets the rest, and
@@ -1162,30 +1318,78 @@ fn hello_rules_close_with_their_own_reasons() {
 
 /// A body is judged before it is decoded: one of another size than its
 /// peer announced closes the session as `WrongSize`, one that does not hash
-/// to the requested id as `WrongId`, and an answer to nothing, a body or a
-/// `NotFound`, as `Unrequested`.
+/// to the requested id as `WrongId`, one that does not decode as
+/// `Undecodable`, and an answer to nothing, a body or a `NotFound`, as
+/// `Unrequested`.
 #[test]
 fn each_bad_answer_closes_with_its_own_reason() {
-    for case in 0..4 {
+    for case in 0..5 {
         let mut bench = Bench::new();
         let (id, other) = (bench.id(0), bench.id(1));
         let session = bench.join(1);
         bench.inv(session, &[id]);
         bench.fetch(session, id);
-        // Whether the machine read the body, and why it closes the session.
+        // Whether the machine let the IO decode the body, and why it closes
+        // the session.
         let (read, violation) = match case {
             0 => (bench.arrived(session, id, SIZE + 1), Violation::WrongSize),
             1 => (bench.deliver(session, id, bench.tx(1)), Violation::WrongId),
             2 => (bench.arrived(session, other, SIZE), Violation::Unrequested),
+            3 => {
+                bench.undecodable(session, id);
+                (true, Violation::Undecodable)
+            }
             _ => {
                 bench.not_found(session, other);
                 (false, Violation::Unrequested)
             }
         };
         // Only a body of the announced size, for a request, is decoded.
-        assert_eq!(read, violation == Violation::WrongId, "{violation:?}");
+        let decoded = matches!(violation, Violation::WrongId | Violation::Undecodable);
+        assert_eq!(read, decoded, "{violation:?}");
         assert_eq!(bench.closes(), vec![broke(session, violation)]);
     }
+}
+
+/// The peer may have as many requests with answers coming as our `Hello`
+/// serves. One answered `NotFound` frees its place in its own step, and one
+/// served frees it once the IO starts writing the answer. A request past
+/// the limit, or a second request for an id whose answer is coming, closes
+/// the session.
+#[test]
+fn a_request_past_our_hello_or_twice_while_answered_closes_the_peer() {
+    let mut bench = Bench::new();
+    let ids: Vec<UnminedTxId> = (0..=16).map(|n| bench.id(n)).collect();
+    bench.add(&ids);
+    let unknown = bench.id(17);
+    let twice = bench.join(1);
+    bench.take_inv(twice, ids.len());
+    bench.get_txs(twice, ids[0]);
+    bench.get_txs(twice, ids[0]);
+    assert_eq!(
+        bench.closes(),
+        vec![broke(twice, Violation::RequestedTwice)]
+    );
+
+    let pushy = bench.join(2);
+    bench.take_inv(pushy, ids.len());
+    for _ in 0..2 * MAX_SERVES {
+        bench.get_txs(pushy, unknown);
+    }
+    for id in &ids[..MAX_SERVES] {
+        bench.get_txs(pushy, *id);
+    }
+    bench.served(pushy, ids[0]);
+    bench.get_txs(pushy, ids[MAX_SERVES]);
+    assert!(
+        bench.closes().is_empty(),
+        "a started answer frees its place"
+    );
+    bench.get_txs(pushy, unknown);
+    assert_eq!(
+        bench.closes(),
+        vec![broke(pushy, Violation::TooManyRequests)]
+    );
 }
 
 /// The IO asks the machine about a body before it decodes it: an answer to
@@ -1217,24 +1421,23 @@ fn a_body_is_judged_before_it_is_decoded() {
 // The machine's own bookkeeping.
 
 /// A timer kind with one time at once keeps one entry however often its
-/// source moves it, as a cooling peer that keeps reopening or a peer whose
-/// deadlines move on every send would push it. Held adverts keep one entry
-/// per due time, and popping the front forgets it.
+/// source moves it, as a peer whose deadlines move on every send would push
+/// it. Held adverts keep one entry per due time, and popping the front
+/// forgets it.
 #[test]
 fn a_moved_timer_replaces_its_older_entry() {
     let id = ids(0..1)[0];
     let mut timers = Timers::default();
     for n in 1..=1_000u64 {
         let at = Duration::from_secs(n);
-        timers.push(at, Timer::Cooling(PeerKey(1)));
-        timers.push(at, Timer::Deadline(SessionId(1), id));
-        timers.push(at, Timer::GiveUp(SessionId(1), id));
+        timers.push(at, Timer::Deadline(id));
+        timers.push(at, Timer::GiveUp(id));
     }
-    assert_eq!(timers.set.len(), 3);
+    assert_eq!(timers.set.len(), 2);
     for n in 1..=3u64 {
-        timers.push(Duration::from_secs(n), Timer::Held(SessionId(1)));
+        timers.push(Duration::from_secs(n), Timer::Held);
     }
-    assert_eq!(timers.set.len(), 6);
+    assert_eq!(timers.set.len(), 5);
     while timers.first().is_some() {
         timers.pop_first();
     }

@@ -702,12 +702,7 @@ impl PeerMachine {
         let holds = self.state.pending.len() > 0;
         let backoff = shared.wanted.backoff_until(now).filter(|_| holds);
         let cooling = shared.reactor.cooling_until(self.state.peer, now);
-        let ready = self
-            .state
-            .pending
-            .ready()
-            .map(|((ready, _), _)| *ready)
-            .find(|ready| *ready > now);
+        let ready = self.state.pending.next_ready_after(now);
         [timer, backoff, cooling, ready].into_iter().flatten().min()
     }
 

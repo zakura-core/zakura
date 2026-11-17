@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    ops::Bound,
     time::Duration,
 };
 
@@ -529,6 +530,13 @@ impl PendingSet {
     /// The filed entries, first in line first.
     pub(crate) fn ready(&self) -> impl Iterator<Item = (&ReadyKey, &Pending)> {
         self.ready.iter()
+    }
+
+    /// When the first entry not yet ready at `now` becomes ready, found
+    /// without walking the entries that already are.
+    pub(crate) fn next_ready_after(&self, now: Time) -> Option<Time> {
+        let after = (Bound::Excluded((now, u64::MAX)), Bound::Unbounded);
+        self.ready.range(after).next().map(|((ready, _), _)| *ready)
     }
 
     /// Each filed id, its place in line, and what the line holds there.

@@ -20,8 +20,9 @@ mod arbitrary;
 pub use config::Config;
 pub use error::MempoolError;
 pub use storage::{
-    EffectsRejection, ExactTipRejectionError, NonStandardTransactionError, RejectionError,
-    SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage, StorageStats,
+    standardness, EffectsRejection, ExactTipRejectionError, NonStandardTransactionError,
+    RejectionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage,
+    StorageStats,
 };
 
 /// The instant time is read as. In a production build this is tokio's

@@ -490,121 +490,10 @@ impl<E: Clone> Storage<E> {
         (result, evicted_ids)
     }
 
-    /// Checks `tx` against zcashd's non-consensus standardness rules, in
-    /// zcashd's order, and returns the first it breaks.
-    ///
-    /// Zcashd defines these checks in
-    /// <https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L58-L135>
-    /// and applies them before inserting a transaction in `AcceptToMemoryPool`:
-    /// <https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819>
-    ///
-    /// Currently, we implement: per-transaction sigops limit, standard input script checks,
-    /// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
-    /// limits), and dust checks.
+    /// Checks `tx` against the standardness rules with this storage's
+    /// data-carrier limit. See [`standardness`].
     pub fn standardness(&self, tx: &VerifiedUnminedTx) -> Result<(), NonStandardTransactionError> {
-        use zcash_script::script::{self, Evaluable as _};
-
-        let transaction = tx.transaction.transaction().as_ref();
-        let spent_outputs = &tx.spent_outputs;
-
-        // NU7 excludes versions 1-4. Today's pool keeps Sprout out of storage
-        // even on custom pre-NU7 networks, and so does the core.
-        if transaction.has_sprout_joinsplit_data() {
-            return Err(NonStandardTransactionError::SproutJoinSplit);
-        }
-
-        for input in transaction.inputs() {
-            let unlock_script = match input {
-                transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
-                transparent::Input::Coinbase { .. } => continue,
-            };
-
-            // Rule: scriptSig size must be within the standard limit.
-            if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
-                return Err(NonStandardTransactionError::ScriptSigTooLarge);
-            }
-
-            let code = script::Code(unlock_script.as_raw_bytes().to_vec());
-            // Rule: scriptSig must be push-only.
-            if !code.is_push_only() {
-                return Err(NonStandardTransactionError::ScriptSigNotPushOnly);
-            }
-        }
-
-        if !spent_outputs.is_empty() {
-            // Validate that spent_outputs aligns with transparent inputs.
-            if transaction.inputs().len() != spent_outputs.len() {
-                return Err(NonStandardTransactionError::NonStandardInputs);
-            }
-
-            // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
-            // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-            if !policy::are_inputs_standard(transaction, spent_outputs) {
-                return Err(NonStandardTransactionError::NonStandardInputs);
-            }
-
-            // Rule: per-transaction sigops (legacy + P2SH) must not exceed the limit.
-            // zcashd sums GetLegacySigOpCount + GetP2SHSigOpCount for AcceptToMemoryPool:
-            // https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819
-            if tx.block_sigop_count() > policy::MAX_STANDARD_TX_SIGOPS {
-                return Err(NonStandardTransactionError::TooManySigops);
-            }
-        } else {
-            // No spent outputs available (e.g. shielded-only transaction).
-            // Only check legacy sigops.
-            if tx.legacy_sigop_count > policy::MAX_STANDARD_TX_SIGOPS {
-                return Err(NonStandardTransactionError::TooManySigops);
-            }
-        }
-
-        // Rule: outputs must be standard script kinds, with special handling for OP_RETURN.
-        let mut data_out_count = 0u32;
-
-        for output in transaction.outputs() {
-            let lock_script = &output.lock_script;
-            let script_len = lock_script.as_raw_bytes().len();
-            let script_kind = policy::standard_script_kind(lock_script);
-
-            match script_kind {
-                None => {
-                    // Rule: output script must be standard (P2PKH/P2SH/P2PK/multisig/OP_RETURN).
-                    return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
-                }
-                Some(solver::ScriptKind::NullData { .. }) => {
-                    // Rule: OP_RETURN script size is limited.
-                    // Cast is safe: u32 always fits in usize on 32-bit and 64-bit platforms.
-                    if script_len > self.max_datacarrier_bytes as usize {
-                        return Err(NonStandardTransactionError::DataCarrierTooLarge);
-                    }
-                    // Rule: count OP_RETURN outputs to enforce the one-output limit.
-                    data_out_count += 1;
-                }
-                Some(solver::ScriptKind::MultiSig { pubkeys, .. }) => {
-                    // Rule: multisig must be at most 3-of-3 for standardness.
-                    // Note: This check is technically subsumed by the unconditional BareMultiSig
-                    // rejection below, but we keep it to distinguish the two error reasons
-                    // (ScriptPubKeyNonStandard for >3 keys vs BareMultiSig for valid multisig).
-                    if pubkeys.len() > policy::MAX_STANDARD_MULTISIG_PUBKEYS {
-                        return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
-                    }
-                    // Rule: bare multisig outputs are non-standard (fIsBareMultisigStd = false).
-                    return Err(NonStandardTransactionError::BareMultiSig);
-                }
-                Some(_) => {
-                    // Rule: non-OP_RETURN outputs must not be dust.
-                    if output.is_dust() {
-                        return Err(NonStandardTransactionError::IsDust);
-                    }
-                }
-            }
-        }
-
-        // Rule: only one OP_RETURN output is permitted.
-        if data_out_count > 1 {
-            return Err(NonStandardTransactionError::MultiOpReturn);
-        }
-
-        Ok(())
+        standardness(tx, self.max_datacarrier_bytes)
     }
 
     /// Evicts the packages that `tx` must replace to fit under the mempool cost limit.
@@ -928,4 +817,125 @@ impl<E: Clone> Storage<E> {
             below_eviction_cost: self.below_eviction_cost,
         }
     }
+}
+
+/// Checks `tx` against zcashd's non-consensus standardness rules, in
+/// zcashd's order, and returns the first it breaks. Both pools apply it, and each caches the
+/// rejection itself. `max_datacarrier_bytes` limits an `OP_RETURN` output.
+///
+/// Zcashd defines these checks in
+/// <https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L58-L135>
+/// and applies them before inserting a transaction in `AcceptToMemoryPool`:
+/// <https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819>
+///
+/// Currently, we implement: per-transaction sigops limit, standard input script checks,
+/// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
+/// limits), and dust checks.
+pub fn standardness(
+    tx: &VerifiedUnminedTx,
+    max_datacarrier_bytes: u32,
+) -> Result<(), NonStandardTransactionError> {
+    use zcash_script::script::{self, Evaluable as _};
+
+    let transaction = tx.transaction.transaction().as_ref();
+    let spent_outputs = &tx.spent_outputs;
+
+    // NU7 excludes versions 1-4. Both pools keep Sprout out of storage even
+    // on custom pre-NU7 networks, so conflict tracking needs no Sprout index.
+    if transaction.has_sprout_joinsplit_data() {
+        return Err(NonStandardTransactionError::SproutJoinSplit);
+    }
+
+    for input in transaction.inputs() {
+        let unlock_script = match input {
+            transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
+            transparent::Input::Coinbase { .. } => continue,
+        };
+
+        // Rule: scriptSig size must be within the standard limit.
+        if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
+            return Err(NonStandardTransactionError::ScriptSigTooLarge);
+        }
+
+        let code = script::Code(unlock_script.as_raw_bytes().to_vec());
+        // Rule: scriptSig must be push-only.
+        if !code.is_push_only() {
+            return Err(NonStandardTransactionError::ScriptSigNotPushOnly);
+        }
+    }
+
+    if !spent_outputs.is_empty() {
+        // Validate that spent_outputs aligns with transparent inputs.
+        if transaction.inputs().len() != spent_outputs.len() {
+            return Err(NonStandardTransactionError::NonStandardInputs);
+        }
+
+        // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
+        // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
+        if !policy::are_inputs_standard(transaction, spent_outputs) {
+            return Err(NonStandardTransactionError::NonStandardInputs);
+        }
+
+        // Rule: per-transaction sigops (legacy + P2SH) must not exceed the limit.
+        // zcashd sums GetLegacySigOpCount + GetP2SHSigOpCount for AcceptToMemoryPool:
+        // https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819
+        if tx.block_sigop_count() > policy::MAX_STANDARD_TX_SIGOPS {
+            return Err(NonStandardTransactionError::TooManySigops);
+        }
+    } else {
+        // No spent outputs available (e.g. shielded-only transaction).
+        // Only check legacy sigops.
+        if tx.legacy_sigop_count > policy::MAX_STANDARD_TX_SIGOPS {
+            return Err(NonStandardTransactionError::TooManySigops);
+        }
+    }
+
+    // Rule: outputs must be standard script kinds, with special handling for OP_RETURN.
+    let mut data_out_count = 0u32;
+
+    for output in transaction.outputs() {
+        let lock_script = &output.lock_script;
+        let script_len = lock_script.as_raw_bytes().len();
+        let script_kind = policy::standard_script_kind(lock_script);
+
+        match script_kind {
+            None => {
+                // Rule: output script must be standard (P2PKH/P2SH/P2PK/multisig/OP_RETURN).
+                return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
+            }
+            Some(solver::ScriptKind::NullData { .. }) => {
+                // Rule: OP_RETURN script size is limited.
+                // Cast is safe: u32 always fits in usize on 32-bit and 64-bit platforms.
+                if script_len > max_datacarrier_bytes as usize {
+                    return Err(NonStandardTransactionError::DataCarrierTooLarge);
+                }
+                // Rule: count OP_RETURN outputs to enforce the one-output limit.
+                data_out_count += 1;
+            }
+            Some(solver::ScriptKind::MultiSig { pubkeys, .. }) => {
+                // Rule: multisig must be at most 3-of-3 for standardness.
+                // Note: This check is technically subsumed by the unconditional BareMultiSig
+                // rejection below, but we keep it to distinguish the two error reasons
+                // (ScriptPubKeyNonStandard for >3 keys vs BareMultiSig for valid multisig).
+                if pubkeys.len() > policy::MAX_STANDARD_MULTISIG_PUBKEYS {
+                    return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
+                }
+                // Rule: bare multisig outputs are non-standard (fIsBareMultisigStd = false).
+                return Err(NonStandardTransactionError::BareMultiSig);
+            }
+            Some(_) => {
+                // Rule: non-OP_RETURN outputs must not be dust.
+                if output.is_dust() {
+                    return Err(NonStandardTransactionError::IsDust);
+                }
+            }
+        }
+    }
+
+    // Rule: only one OP_RETURN output is permitted.
+    if data_out_count > 1 {
+        return Err(NonStandardTransactionError::MultiOpReturn);
+    }
+
+    Ok(())
 }

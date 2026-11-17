@@ -88,7 +88,7 @@ use crate::zakura::{
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-mod model;
+mod machine;
 mod state;
 
 #[cfg(any(test, zakura_sim))]
@@ -96,7 +96,7 @@ use super::super::observe::{PublicationChange, PublisherSite};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::regulation::ServeInUse;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{
+pub use machine::{
     trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
     HeaderPublisherSubscriptionView, HeaderPublisherView,
 };
@@ -236,6 +236,18 @@ impl PublisherOwner {
             PublisherFault::Subscription(fault) => self.reporter.refused(fault).into(),
             fault => fault,
         })
+    }
+
+    /// Check state's invariants, and that the owner holds exactly the slots
+    /// state owes.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    fn assert_invariants(&self) {
+        self.state.assert_invariants();
+        assert_eq!(
+            self.slots.held(),
+            self.state.slots_owed(),
+            "one slot per live subscription and unwritten terminal outcome"
+        );
     }
 
     /// End every subscription state says is due, report each end, and return

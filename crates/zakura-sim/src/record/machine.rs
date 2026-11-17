@@ -36,7 +36,7 @@ pub enum MachineStep {
     WorkFunding(WorkFundingStep),
     /// Decoded allocations retained by block, header, and transaction owners.
     DecodedRetention(DecodedRetentionStep),
-    /// Header reactor scheduling and locator policy, with its independent model.
+    /// Header reactor scheduling and locator policy, checked by its invariants.
     HeaderReactor(HeaderReactorStep),
     /// Reactor query and view policy and its independent model.
     Reactor(ReactorStep),
@@ -44,7 +44,7 @@ pub enum MachineStep {
     DiscoveryBook(BookStep),
     /// Discovery's real session and hint owner's view.
     DiscoveryState(DiscoverySessionStep),
-    /// Header publisher credit and terminal policy, with its independent model.
+    /// Header publisher credit and terminal policy, checked by its invariants.
     HeaderPublisher(HeaderPublisherStep),
 }
 
@@ -293,7 +293,7 @@ pub struct ReactorReadView {
     pub call: CallRef,
 }
 
-/// A reactor state view, read from the machine or derived by its model.
+/// A header reactor state view, read from the machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderReactorView {
@@ -315,9 +315,7 @@ pub struct HeaderReactorView {
     pub stall: Option<ReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
-    /// Milliseconds from the run's clock origin to the next deadline. A deferred
-    /// cached pass adds a refill the model bounds rather than predicts, so
-    /// then this holds `None` on both sides.
+    /// Milliseconds from the run's clock origin to the next deadline.
     pub next_deadline_millis: Option<u64>,
 }
 
@@ -329,8 +327,6 @@ pub struct HeaderReactorStep {
     pub input: Vec<u8>,
     /// State read from the production pure owner.
     pub actual: HeaderReactorView,
-    /// State derived independently by the model.
-    pub expected: HeaderReactorView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -355,7 +351,8 @@ pub struct PublisherSubscriptionView {
     pub closing: bool,
 }
 
-/// A publisher state view, read from the owner or derived by its model.
+/// What the publisher showed after one operation: its ledger and slots, and
+/// the outputs the test holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderPublisherView {
@@ -365,8 +362,8 @@ pub struct HeaderPublisherView {
     pub tombstones: usize,
     /// The subscription of the job in progress.
     pub job: Option<u64>,
-    /// Subscriptions whose terminal outcome waits to be written, in order.
-    pub terminals: Vec<u64>,
+    /// Terminal outcomes queued and not yet taken to write.
+    pub terminals: usize,
     /// Whether a terminal outcome is being written.
     pub writing: bool,
     /// Subscription slots held.
@@ -381,10 +378,8 @@ pub struct HeaderPublisherView {
 pub struct HeaderPublisherStep {
     /// Original causal bytes, including a short final operation.
     pub input: Vec<u8>,
-    /// State read from the production owner.
+    /// What the production owner showed after the operation.
     pub actual: HeaderPublisherView,
-    /// State derived independently by the model.
-    pub expected: HeaderPublisherView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -903,7 +898,6 @@ impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -952,7 +946,6 @@ impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }

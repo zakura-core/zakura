@@ -1,10 +1,16 @@
-//! Interleaved work decisions against an independent model.
+//! The `header/work-ownership` machine target: interleaved work decisions on
+//! the production [`PeerWorkQueue`], with its real budget and leases.
 //!
-//! Each step drives the real [`PeerWorkQueue`], with its real budget and leases,
-//! and the real [`decide_offer`] and [`page_next`] decisions. The step applies to
-//! a model built from plain maps, and the test compares every observable fact.
-//! Steps for different peers and for calls that outlive their round interleave
-//! freely. The model never calls the queue or its policy.
+//! [`Harness`] plays the reactor. It records which peer holds which work, which
+//! reservations and leases it handed out, and which calls hold them, from the
+//! inputs it chose and the queue's answers. After every input it checks
+//! [`PeerWorkQueue::assert_invariants`] and compares the queue's counts and
+//! rounds with that record. It never decides what the queue admits, evicts,
+//! or decides for a page or an offer: [`decide_offer`] and [`page_next`] decide
+//! those, and named scenarios pin their rules. Steps for different peers and
+//! for calls that outlive their round interleave freely. At the end, the
+//! history ends every call and retires every peer, and the budget must have
+//! every header back.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +29,7 @@ use crate::zakura::{
     header_sync::{
         events::HeaderPortOperation, v9::Cursor, wire::AuxSchema, HeaderEntry, HeaderSyncRequestId,
     },
+    machine_test::{machine_target_tests, MAX_HISTORY_BYTES},
     ZakuraPeerId,
 };
 
@@ -106,9 +113,9 @@ impl OfferBlockers {
     }
 }
 
-/// One peer's work in the model.
+/// One peer's work, as the queue's answers showed it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ModelWork {
+enum Work {
     Awaiting {
         tip: u8,
         priority: u8,
@@ -125,17 +132,28 @@ enum ModelWork {
     },
 }
 
-impl ModelWork {
+impl Work {
     fn tip(&self) -> u8 {
         match self {
             Self::Awaiting { tip, .. } | Self::Active { tip, .. } => *tip,
         }
     }
+
+    /// What the scheduling revision covers: the target, and the round once it
+    /// started.
+    fn ownership(&self) -> (u8, Option<u64>) {
+        match self {
+            Self::Awaiting { tip, .. } => (*tip, None),
+            Self::Active {
+                tip, incarnation, ..
+            } => (*tip, Some(*incarnation)),
+        }
+    }
 }
 
-/// One owned lease in the model.
+/// One owned lease the queue handed out.
 #[derive(Debug)]
-struct ModelLease {
+struct Lease {
     count: usize,
     /// The peer whose queue slot holds a clone.
     queued_for: Option<usize>,
@@ -143,13 +161,13 @@ struct ModelLease {
     holders: BTreeSet<u64>,
 }
 
-impl ModelLease {
+impl Lease {
     fn alive(&self) -> bool {
         self.queued_for.is_some() || !self.holders.is_empty()
     }
 }
 
-/// One live call's ownership in the model and in the queue's runtime.
+/// One live call's ownership, with the real owner that keeps its leases alive.
 #[derive(Debug)]
 struct Hold {
     /// The real owner, which keeps real leases alive.
@@ -163,7 +181,7 @@ struct Hold {
     headers: usize,
 }
 
-/// Applicable transitions in one replayed work history.
+/// Transitions one history reached.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct HeaderWorkReplaySummary {
     /// Operations decoded.
@@ -196,12 +214,10 @@ struct HeaderWorkReplaySummary {
 
 struct Harness {
     queue: PeerWorkQueue,
-    work: BTreeMap<usize, ModelWork>,
+    work: BTreeMap<usize, Work>,
     reservations: BTreeMap<usize, usize>,
-    leases: Vec<ModelLease>,
+    leases: Vec<Lease>,
     holds: Vec<Hold>,
-    revision: u64,
-    last_incarnation: u64,
     last_call: u64,
     last_hold: u64,
     summary: HeaderWorkReplaySummary,
@@ -302,15 +318,14 @@ impl Harness {
             reservations: BTreeMap::new(),
             leases: Vec::new(),
             holds: Vec::new(),
-            revision: 0,
-            last_incarnation: 0,
             last_call: 0,
             last_hold: 0,
             summary: HeaderWorkReplaySummary::default(),
         }
     }
 
-    /// The model's capacity release for `peer`'s queue slot.
+    /// Release what `peer`'s queue slot holds: its reservation and the queue's
+    /// clones of its leases.
     fn release(&mut self, peer: usize) {
         self.reservations.remove(&peer);
         for lease in &mut self.leases {
@@ -318,7 +333,7 @@ impl Harness {
                 lease.queued_for = None;
             }
         }
-        self.leases.retain(ModelLease::alive);
+        self.leases.retain(Lease::alive);
     }
 
     fn claimed(&self) -> usize {
@@ -326,131 +341,78 @@ impl Harness {
             + self.leases.iter().map(|lease| lease.count).sum::<usize>()
     }
 
-    /// The model's result of staging `tip` for `peer`.
-    fn model_stage(
-        &mut self,
-        peer: usize,
-        tip: u8,
-        priority: u8,
-        generation: u8,
-    ) -> QueueWorkResult {
-        let rank = priority % 3;
-        match self.work.get(&peer) {
-            Some(ModelWork::Active { .. }) => return QueueWorkResult::AlreadyActive,
-            Some(ModelWork::Awaiting { tip: current, .. }) => {
-                if *current != tip {
-                    self.revision += 1;
-                }
-                self.work.insert(
-                    peer,
-                    ModelWork::Awaiting {
-                        tip,
-                        priority: rank,
-                        generation,
-                    },
-                );
-                self.release(peer);
-                return QueueWorkResult::NeedsLocator;
-            }
-            None => {}
+    /// End `peer`'s work if the queue no longer holds it.
+    fn forget_if_gone(&mut self, peer: usize) {
+        if self.work.contains_key(&peer) && !self.queue.has_work(&peer_id(peer)) {
+            self.work.remove(&peer);
+            self.release(peer);
         }
-        if self.work.len() >= MAX_STAGED_TARGETS_V1 {
-            // Peer bytes sort with peer indexes, so the first lowest priority wins.
-            let evicted = self
-                .work
-                .iter()
-                .filter_map(|(peer, work)| match work {
-                    ModelWork::Awaiting { priority, .. } if *priority < rank => {
-                        Some((*priority, *peer))
-                    }
-                    _ => None,
-                })
-                .min();
-            let Some((_, evicted)) = evicted else {
-                return QueueWorkResult::AtCapacity;
-            };
-            self.work.remove(&evicted);
-            self.release(evicted);
-            self.revision += 1;
+    }
+
+    /// Record the queue's answer to staging `tip` for `peer`.
+    ///
+    /// The queue decides the result and which unstarted work makes room. This
+    /// checks only what any such decision must satisfy: started work keeps its
+    /// target, only a full queue refuses or evicts, it evicts at most one peer's
+    /// unstarted work, and only work below `priority`. Replacing unstarted work
+    /// releases its peer's capacity.
+    fn record_stage(&mut self, peer: usize, tip: u8, priority: u8, result: QueueWorkResult) {
+        let rank = priority % 3;
+        let before = self.work.get(&peer).cloned();
+        let full = before.is_none() && self.work.len() >= MAX_STAGED_TARGETS_V1;
+        match result {
+            QueueWorkResult::AlreadyActive => {
+                assert!(
+                    matches!(before, Some(Work::Active { .. })),
+                    "{PROPERTY}: only started work is already active"
+                );
+                return;
+            }
+            QueueWorkResult::AtCapacity => {
+                assert!(full, "{PROPERTY}: only a full queue refuses new work");
+                return;
+            }
+            QueueWorkResult::TargetAlreadyAssigned => {
+                panic!("{PROPERTY}: plain staging ignores other owners of the target")
+            }
+            QueueWorkResult::NeedsLocator => assert!(
+                !matches!(before, Some(Work::Active { .. })),
+                "{PROPERTY}: started work never takes a new target"
+            ),
+        }
+        let evicted: Vec<usize> = self
+            .work
+            .keys()
+            .copied()
+            .filter(|other| *other != peer && !self.queue.has_work(&peer_id(*other)))
+            .collect();
+        assert_eq!(
+            evicted.len(),
+            usize::from(full),
+            "{PROPERTY}: a full queue makes room by evicting exactly one peer's work"
+        );
+        for other in evicted {
+            assert!(
+                matches!(
+                    self.work.remove(&other),
+                    Some(Work::Awaiting { priority, .. }) if priority < rank
+                ),
+                "{PROPERTY}: only unstarted work below the new priority makes room"
+            );
+            self.release(other);
             self.summary.evictions += 1;
+        }
+        if before.is_some() {
+            self.release(peer);
         }
         self.work.insert(
             peer,
-            ModelWork::Awaiting {
+            Work::Awaiting {
                 tip,
                 priority: rank,
-                generation,
+                generation: 0,
             },
         );
-        self.revision += 1;
-        QueueWorkResult::NeedsLocator
-    }
-
-    /// The decision the documented page rules give a page on `peer`'s work,
-    /// which now holds `staged` headers. The aggregate budget comes from the model.
-    fn model_page_next(
-        &self,
-        peer: usize,
-        tip: u8,
-        staged: usize,
-        reaches_target: bool,
-    ) -> PageNext {
-        let staged_some = staged != 0;
-        match (reaches_target, staged_some) {
-            (_, false) => PageNext::Malformed {
-                reached_target: false,
-            },
-            (true, true) if tip == 0 => PageNext::Prepare {
-                bounded_prefix: false,
-            },
-            (true, true) => PageNext::Malformed {
-                reached_target: true,
-            },
-            (false, true) if self.reservations.contains_key(&peer) => PageNext::WaitCredit,
-            (false, true) if self.claimed() == super::HEADER_CHUNK_BUDGET_CAPACITY_V1 => {
-                PageNext::Prepare {
-                    bounded_prefix: true,
-                }
-            }
-            (false, true) => PageNext::Continue {
-                staged_tip: staged_frontier(staged),
-            },
-        }
-    }
-
-    /// End `peer`'s unstarted work in the model.
-    fn model_remove_unstarted(&mut self, peer: usize) {
-        if matches!(self.work.get(&peer), Some(ModelWork::Awaiting { .. })) {
-            self.work.remove(&peer);
-            self.release(peer);
-            self.revision += 1;
-        }
-    }
-
-    /// The decision the documented offer rules give `peer`'s offer of `tip`.
-    /// The first rule that applies wins.
-    fn model_offer(&self, peer: usize, tip: u8, blockers: OfferBlockers) -> OfferDecision {
-        let started = match self.work.get(&peer) {
-            Some(ModelWork::Active { tip: active, .. }) => Some(*active == tip),
-            _ => None,
-        };
-        let spent = [
-            (blockers.pruned_pause, SpentOffer::PrunedPause),
-            (blockers.covered, SpentOffer::Covered),
-            (!blockers.eligible, SpentOffer::Ineligible),
-        ]
-        .into_iter()
-        .find_map(|(applies, cause)| applies.then_some(cause));
-        match (spent, started) {
-            (Some(cause), started) => OfferDecision::Spend {
-                cause,
-                close_subscription: started.is_none(),
-            },
-            (None, Some(same_target)) => OfferDecision::AlreadyActive { spend: same_target },
-            (None, None) if blockers.held_back => OfferDecision::HeldBack,
-            (None, None) if !blockers.subscription_ready => OfferDecision::AwaitSubscription,
-            (None, None) => OfferDecision::Stage,
-        }
     }
 
     /// Take the hold that `hold` selects, if any call is live.
@@ -462,35 +424,57 @@ impl Harness {
         Some(self.holds.remove(index))
     }
 
-    /// End `hold` in the model and drop its real owner.
+    /// End `hold` and drop its real owner.
     fn end_hold(&mut self, hold: Hold) {
         for lease in &mut self.leases {
             lease.holders.remove(&hold.id);
         }
-        self.leases.retain(ModelLease::alive);
+        self.leases.retain(Lease::alive);
         drop(hold);
     }
 
+    /// Each peer's target and round. The scheduling revision changes exactly
+    /// when this does.
+    fn ownership(&self) -> BTreeMap<usize, (u8, Option<u64>)> {
+        self.work
+            .iter()
+            .map(|(peer, work)| (*peer, work.ownership()))
+            .collect()
+    }
+
+    /// Apply `op`, then check the queue against the record, and check that the
+    /// scheduling revision changed exactly when some peer's target or round
+    /// did.
     fn apply(&mut self, op: Op) {
-        self.summary.transitions += 1;
+        let ownership = self.ownership();
+        let revision = self.queue.scheduling_revision();
+        self.step(op);
+        self.check();
+        assert_eq!(
+            self.queue.scheduling_revision() != revision,
+            self.ownership() != ownership,
+            "{PROPERTY}: the revision changes exactly when ownership does"
+        );
+    }
+
+    fn step(&mut self, op: Op) {
         match op {
             Op::Stage {
                 peer,
                 tip,
                 priority,
             } => {
-                let actual = self
+                let result = self
                     .queue
                     .stage(peer_id(peer), target(tip, 0), priority_of(priority));
-                let expected = self.model_stage(peer, tip, priority, 0);
-                assert_eq!(actual, expected, "{PROPERTY}: stage");
+                self.record_stage(peer, tip, priority, result);
             }
             Op::StageDistinct {
                 peer,
                 tip,
                 priority,
             } => {
-                let actual = self.queue.stage_distinct_target(
+                let result = self.queue.stage_distinct_target(
                     peer_id(peer),
                     target(tip, 0),
                     priority_of(priority),
@@ -499,13 +483,16 @@ impl Harness {
                     .work
                     .iter()
                     .any(|(owner, work)| *owner != peer && work.tip() == tip);
-                let expected = if owned_elsewhere {
-                    self.model_remove_unstarted(peer);
-                    QueueWorkResult::TargetAlreadyAssigned
+                assert_eq!(
+                    result == QueueWorkResult::TargetAlreadyAssigned,
+                    owned_elsewhere,
+                    "{PROPERTY}: a target another peer owns is already assigned"
+                );
+                if owned_elsewhere {
+                    self.forget_if_gone(peer);
                 } else {
-                    self.model_stage(peer, tip, priority, 0)
-                };
-                assert_eq!(actual, expected, "{PROPERTY}: stage distinct");
+                    self.record_stage(peer, tip, priority, result);
+                }
             }
             Op::Reserve { peer, count } => {
                 let actual = self.queue.reserve_request(&peer_id(peer), count);
@@ -525,30 +512,34 @@ impl Harness {
             }
             Op::Start { peer, tip } => {
                 let generation = match self.work.get(&peer) {
-                    Some(ModelWork::Awaiting { generation, .. }) => *generation,
+                    Some(Work::Awaiting { generation, .. }) => *generation,
                     _ => 0,
                 };
                 let actual = self.queue.start(request(peer, tip, generation));
                 let expected = matches!(
                     self.work.get(&peer),
-                    Some(ModelWork::Awaiting { tip: awaited, .. }) if *awaited == tip
+                    Some(Work::Awaiting { tip: awaited, .. }) if *awaited == tip
                 ) && self.reservations.contains_key(&peer);
+                assert_eq!(actual, expected, "{PROPERTY}: start");
                 if expected {
-                    self.last_incarnation += 1;
-                    self.revision += 1;
+                    let incarnation = self
+                        .queue
+                        .active(&peer_id(peer))
+                        .expect("the round just started")
+                        .incarnation()
+                        .get();
                     self.summary.starts += 1;
                     self.work.insert(
                         peer,
-                        ModelWork::Active {
+                        Work::Active {
                             tip,
-                            incarnation: self.last_incarnation,
+                            incarnation,
                             phase: HeaderTargetPhase::Receiving,
                             call: None,
                             staged: 0,
                         },
                     );
                 }
-                assert_eq!(actual, expected, "{PROPERTY}: start");
             }
             Op::Page {
                 peer,
@@ -569,12 +560,11 @@ impl Harness {
                     arrival(&id),
                 );
                 let receiving = match self.work.get(&peer) {
-                    Some(ModelWork::Active {
-                        tip,
+                    Some(Work::Active {
                         staged,
                         phase: HeaderTargetPhase::Receiving,
                         ..
-                    }) => Some((*tip, *staged + returned)),
+                    }) => Some(*staged + returned),
                     _ => None,
                 };
                 let staged = receiving.filter(|_| {
@@ -583,7 +573,7 @@ impl Harness {
                         .is_some_and(|reserved| returned <= *reserved)
                 });
                 assert_eq!(actual, staged.is_some(), "{PROPERTY}: page");
-                if let Some((tip, staged)) = staged {
+                if let Some(staged) = staged {
                     let reserved = self
                         .reservations
                         .get_mut(&peer)
@@ -593,14 +583,13 @@ impl Harness {
                         self.reservations.remove(&peer);
                     }
                     if returned != 0 {
-                        self.leases.push(ModelLease {
+                        self.leases.push(Lease {
                             count: returned,
                             queued_for: Some(peer),
                             holders: BTreeSet::new(),
                         });
                     }
-                    if let Some(ModelWork::Active { staged: count, .. }) = self.work.get_mut(&peer)
-                    {
+                    if let Some(Work::Active { staged: count, .. }) = self.work.get_mut(&peer) {
                         *count = staged;
                     }
                     let next = page_next(
@@ -612,11 +601,6 @@ impl Harness {
                         },
                         || self.queue.budget_is_full(),
                         || false,
-                    );
-                    assert_eq!(
-                        next,
-                        self.model_page_next(peer, tip, staged, reaches_target),
-                        "{PROPERTY}: page decision"
                     );
                     match next {
                         PageNext::WaitCredit => self.summary.credit_waits += 1,
@@ -637,12 +621,12 @@ impl Harness {
                     kind: StorageCallKind::Prepare,
                 };
                 let retained = self.queue.retain_headers(&id, storage_call);
-                let Some(ModelWork::Active {
-                    tip,
+                let Some(Work::Active {
                     incarnation,
                     phase,
                     call,
                     staged,
+                    ..
                 }) = self.work.get_mut(&peer)
                 else {
                     assert!(operation.is_none(), "{PROPERTY}: only a round prepares");
@@ -650,50 +634,29 @@ impl Harness {
                         retained.is_none(),
                         "{PROPERTY}: only a started round retains headers"
                     );
-                    return self.check();
+                    return;
                 };
                 if *phase != HeaderTargetPhase::Receiving || *staged == 0 {
                     assert!(
                         operation.is_none(),
                         "{PROPERTY}: only staged receiving work prepares"
                     );
-                    return self.check();
+                    return;
                 }
                 let Some(HeaderPortOperation::PrepareHeaderTarget {
-                    owner,
-                    target,
-                    completion,
-                    entries,
-                    ..
+                    target, entries, ..
                 }) = operation
                 else {
                     panic!("{PROPERTY}: staged receiving work prepares");
                 };
-                let tip_frontier = staged_frontier(*staged);
-                assert_eq!(target, tip_frontier, "{PROPERTY}: prepared target");
-                assert_eq!(entries.len(), *staged, "{PROPERTY}: prepared headers");
-                let expected_owner_tip = if bounded_prefix {
-                    tip_frontier.hash
-                } else {
-                    tip_hash(*tip)
-                };
                 assert_eq!(
-                    owner.header_authority().branch.target_tip_hash,
-                    expected_owner_tip,
-                    "{PROPERTY}: prepared owner"
+                    target,
+                    staged_frontier(*staged),
+                    "{PROPERTY}: prepared target"
                 );
-                let expected_completion = if bounded_prefix {
-                    zakura_header_chain::TargetCompletion::TargetPrefix {
-                        common_ancestor: ancestor(),
-                    }
-                } else {
-                    zakura_header_chain::TargetCompletion::TargetComplete {
-                        common_ancestor: ancestor(),
-                    }
-                };
-                assert_eq!(completion, expected_completion, "{PROPERTY}: completion");
+                assert_eq!(entries.len(), *staged, "{PROPERTY}: prepared headers");
                 let incarnation = *incarnation;
-                let retained = retained.expect("the queue holds the round that the model holds");
+                let retained = retained.expect("the queue holds the round the record holds");
                 self.last_call += 1;
                 self.last_hold += 1;
                 *phase = HeaderTargetPhase::Preparing;
@@ -720,17 +683,17 @@ impl Harness {
             }
             Op::Complete { hold, apply } => {
                 let Some(mut hold) = self.take_hold(hold) else {
-                    return self.check();
+                    return;
                 };
                 let work = hold.retained.work();
                 let actual = self.queue.settle_call(&peer_id(hold.peer), work);
                 let current = matches!(
                     self.work.get(&hold.peer),
-                    Some(ModelWork::Active { incarnation, call, .. })
+                    Some(Work::Active { incarnation, call, .. })
                         if *incarnation == hold.incarnation && *call == Some(hold.call)
                 );
                 assert_eq!(actual, current, "{PROPERTY}: exact settlement");
-                if let Some(ModelWork::Active { call, .. }) = self.work.get_mut(&hold.peer) {
+                if let Some(Work::Active { call, .. }) = self.work.get_mut(&hold.peer) {
                     if current {
                         *call = None;
                     }
@@ -752,9 +715,7 @@ impl Harness {
                         self.queue.begin_apply(&peer_id(hold.peer)),
                         "{PROPERTY}: a current prepare's work is preparing"
                     );
-                    if let Some(ModelWork::Active { call, phase, .. }) =
-                        self.work.get_mut(&hold.peer)
-                    {
+                    if let Some(Work::Active { call, phase, .. }) = self.work.get_mut(&hold.peer) {
                         *call = Some(hold.call);
                         *phase = HeaderTargetPhase::Applying;
                     }
@@ -767,12 +728,9 @@ impl Harness {
             Op::Retire { peer } => {
                 let removed = self.queue.remove(&peer_id(peer));
                 let existed = self.work.remove(&peer);
-                if existed.is_some() {
-                    self.revision += 1;
-                }
                 assert_eq!(
                     removed.is_some(),
-                    matches!(existed, Some(ModelWork::Active { .. })),
+                    matches!(existed, Some(Work::Active { .. })),
                     "{PROPERTY}: retire"
                 );
                 self.summary.retained_after_retirement += usize::from(
@@ -789,7 +747,7 @@ impl Harness {
                     .work
                     .iter()
                     .filter_map(|(peer, work)| match work {
-                        ModelWork::Awaiting {
+                        Work::Awaiting {
                             generation: staged, ..
                         } if *staged != generation => Some(*peer),
                         _ => None,
@@ -799,7 +757,6 @@ impl Harness {
                 for peer in obsolete {
                     self.work.remove(&peer);
                     self.release(peer);
-                    self.revision += 1;
                 }
             }
             Op::Offer {
@@ -828,22 +785,22 @@ impl Harness {
                     || blockers.held_back,
                     || blockers.subscription_ready,
                 );
-                assert_eq!(
-                    decision,
-                    self.model_offer(peer, tip, blockers),
-                    "{PROPERTY}: offer"
-                );
+                // The reactor ends unstarted work on a spent or held-back
+                // offer, and stages the offer's target once nothing blocks it.
                 match decision {
                     OfferDecision::Spend { .. } | OfferDecision::HeldBack => {
                         self.summary.offers_spent +=
                             usize::from(matches!(decision, OfferDecision::Spend { .. }));
                         self.queue.remove_unstarted(&peer_id(peer));
-                        self.model_remove_unstarted(peer);
+                        if matches!(self.work.get(&peer), Some(Work::Awaiting { .. })) {
+                            self.work.remove(&peer);
+                            self.release(peer);
+                        }
                     }
                     OfferDecision::AlreadyActive { .. } | OfferDecision::AwaitSubscription => {}
                     OfferDecision::Stage => {
                         self.summary.offers_staged += 1;
-                        return self.apply(Op::StageDistinct {
+                        self.step(Op::StageDistinct {
                             peer,
                             tip,
                             priority,
@@ -852,10 +809,10 @@ impl Harness {
                 }
             }
         }
-        self.check();
     }
 
-    /// Compare every observable fact of the queue with the model.
+    /// Check the queue's invariants, and compare its counts and rounds with
+    /// the record.
     fn check(&self) {
         let (reserved, owned) = self.queue.chunk_budget_usage();
         assert_eq!(
@@ -872,11 +829,6 @@ impl Harness {
             self.queue.claimed_header_count(),
             self.claimed(),
             "{PROPERTY}: claimed headers"
-        );
-        assert_eq!(
-            self.queue.scheduling_revision(),
-            self.revision,
-            "{PROPERTY}: revision"
         );
         assert_eq!(self.queue.len(), self.work.len(), "{PROPERTY}: work count");
         for peer in 0..PEERS {
@@ -903,7 +855,7 @@ impl Harness {
                 )
             });
             let expected = match self.work.get(&peer) {
-                Some(ModelWork::Active {
+                Some(Work::Active {
                     incarnation,
                     phase,
                     tip,
@@ -917,7 +869,7 @@ impl Harness {
                     .awaiting_target(&id)
                     .map(|target| target.status.selected_tip_hash),
                 match self.work.get(&peer) {
-                    Some(ModelWork::Awaiting { tip, .. }) => Some(tip_hash(*tip)),
+                    Some(Work::Awaiting { tip, .. }) => Some(tip_hash(*tip)),
                     _ => None,
                 },
                 "{PROPERTY}: peer {peer} awaiting target"
@@ -952,7 +904,7 @@ impl Harness {
             .phase_counts(|peer| self.queue.owned_header_count(peer));
         let mut expected = super::policy::PhaseCounts::default();
         for (peer, work) in &self.work {
-            if let ModelWork::Active { phase, .. } = work {
+            if let Work::Active { phase, .. } = work {
                 let count: usize = self
                     .leases
                     .iter()
@@ -967,10 +919,11 @@ impl Harness {
             }
         }
         assert_eq!(phases, expected, "{PROPERTY}: phase counts");
+        self.queue.assert_invariants();
     }
 
-    /// End every call, as a teardown does, and check that all capacity returned
-    /// once the queue retires its work.
+    /// End every call and retire every peer, as a teardown does, and check
+    /// that the budget has every header back.
     fn teardown(&mut self) {
         for hold in std::mem::take(&mut self.holds) {
             self.end_hold(hold);
@@ -987,62 +940,66 @@ impl Harness {
     }
 }
 
-/// Decoder-v1: four bytes per operation, at most 512 bytes.
+/// Decoder v1: four bytes per operation, at most [`MAX_HISTORY_BYTES`] bytes.
 fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        let peer = usize::from(b) % PEERS;
-        let tip = c % TIPS;
-        match a % 11 {
-            0 => Op::Stage {
-                peer,
-                tip,
-                priority: d,
-            },
-            1 => Op::StageDistinct {
-                peer,
-                tip,
-                priority: d,
-            },
-            2 => Op::Reserve {
-                peer,
-                count: u32::from(u16::from_le_bytes([c, d])) % 300,
-            },
-            3 => Op::Cancel { peer },
-            4 => Op::Start { peer, tip },
-            5 => Op::Page {
-                peer,
-                returned: usize::from(u16::from_le_bytes([c, d])) % 300,
-                reaches_target: d & 0x80 != 0,
-            },
-            6 => Op::Prepare {
-                peer,
-                bounded_prefix: d & 1 != 0,
-            },
-            7 => Op::Complete {
-                hold: usize::from(b),
-                apply: d & 1 == 0,
-            },
-            8 => Op::Retire { peer },
-            9 => Op::Commit { generation: b % 2 },
-            _ => Op::Offer {
-                peer,
-                tip,
-                priority: d >> 5,
-                blockers: OfferBlockers::from_bits(d),
-            },
-        }
-    })
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks(4)
+        .map(|chunk| {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            let d = chunk.get(3).copied().unwrap_or(0);
+            let peer = usize::from(b) % PEERS;
+            let tip = c % TIPS;
+            match a % 11 {
+                0 => Op::Stage {
+                    peer,
+                    tip,
+                    priority: d,
+                },
+                1 => Op::StageDistinct {
+                    peer,
+                    tip,
+                    priority: d,
+                },
+                2 => Op::Reserve {
+                    peer,
+                    count: u32::from(u16::from_le_bytes([c, d])) % 300,
+                },
+                3 => Op::Cancel { peer },
+                4 => Op::Start { peer, tip },
+                5 => Op::Page {
+                    peer,
+                    returned: usize::from(u16::from_le_bytes([c, d])) % 300,
+                    reaches_target: d & 0x80 != 0,
+                },
+                6 => Op::Prepare {
+                    peer,
+                    bounded_prefix: d & 1 != 0,
+                },
+                7 => Op::Complete {
+                    hold: usize::from(b),
+                    apply: d & 1 == 0,
+                },
+                8 => Op::Retire { peer },
+                9 => Op::Commit { generation: b % 2 },
+                _ => Op::Offer {
+                    peer,
+                    tip,
+                    priority: d >> 5,
+                    blockers: OfferBlockers::from_bits(d),
+                },
+            }
+        })
 }
 
-/// Replay decoder-v1 operations against the independent work model, then tear
-/// the history down and require every claim back.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the queue,
+/// checking every property after each operation, then tear the history down
+/// and require every claim back. Return the transitions reached.
 fn replay_header_work_bytes(data: &[u8]) -> HeaderWorkReplaySummary {
     let mut harness = Harness::new();
     for op in decode(data) {
+        harness.summary.transitions += 1;
         harness.apply(op);
     }
     harness.teardown();
@@ -1050,8 +1007,6 @@ fn replay_header_work_bytes(data: &[u8]) -> HeaderWorkReplaySummary {
 }
 
 mod tests {
-    use proptest::prelude::*;
-
     use super::*;
 
     fn run(ops: impl IntoIterator<Item = Op>) -> Harness {
@@ -1089,46 +1044,50 @@ mod tests {
         ]
     }
 
-    fn op() -> impl Strategy<Value = Op> {
-        let peer = 0..PEERS;
-        let tip = 0..TIPS;
-        prop_oneof![
-            4 => (peer.clone(), tip.clone(), any::<u8>())
-                .prop_map(|(peer, tip, priority)| Op::Stage { peer, tip, priority }),
-            2 => (peer.clone(), tip.clone(), any::<u8>())
-                .prop_map(|(peer, tip, priority)| Op::StageDistinct { peer, tip, priority }),
-            4 => (peer.clone(), 0..300_u32).prop_map(|(peer, count)| Op::Reserve { peer, count }),
-            1 => peer.clone().prop_map(|peer| Op::Cancel { peer }),
-            4 => (peer.clone(), tip.clone()).prop_map(|(peer, tip)| Op::Start { peer, tip }),
-            4 => (peer.clone(), 0..300_usize, prop::bool::weighted(0.1))
-                .prop_map(|(peer, returned, reaches_target)| Op::Page { peer, returned, reaches_target }),
-            3 => (peer.clone(), any::<bool>())
-                .prop_map(|(peer, bounded_prefix)| Op::Prepare { peer, bounded_prefix }),
-            4 => (any::<usize>(), any::<bool>())
-                .prop_map(|(hold, apply)| Op::Complete { hold, apply }),
-            2 => peer.clone().prop_map(|peer| Op::Retire { peer }),
-            1 => (0..2_u8).prop_map(|generation| Op::Commit { generation }),
-            4 => (peer, tip, any::<u8>()).prop_map(|(peer, tip, bits)| Op::Offer {
-                peer,
-                tip,
-                priority: bits >> 5,
-                blockers: OfferBlockers::from_bits(bits),
-            }),
-        ]
-    }
+    const OP_STAGE: u8 = 0;
+    const OP_RESERVE: u8 = 2;
+    const OP_START: u8 = 4;
+    const OP_PAGE: u8 = 5;
+    const OP_PREPARE: u8 = 6;
+    const OP_COMPLETE: u8 = 7;
+    const OP_RETIRE: u8 = 8;
+    const OP_OFFER: u8 = 10;
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+    #[rustfmt::skip]
+    const WITNESS: &[u8] = &[
+        // Peer 0 hands one prepare to its apply.
+        OP_STAGE, 0, 1, 1,    OP_RESERVE, 0, 10, 0,  OP_START, 0, 1, 0,
+        OP_PAGE, 0, 10, 0,    OP_PREPARE, 0, 0, 0,   OP_COMPLETE, 0, 0, 0,
+        // Peer 1's prepare outlives its round while peer 0's apply ends.
+        OP_STAGE, 1, 2, 1,    OP_RESERVE, 1, 20, 0,  OP_START, 1, 2, 0,
+        OP_PAGE, 1, 20, 0,    OP_PREPARE, 1, 0, 0,   OP_RETIRE, 1, 0, 0,
+        OP_COMPLETE, 1, 0, 0, OP_COMPLETE, 0, 0, 1,
+        // Peer 2's offer stages, a pruned pause then spends it, and peer 3
+        // waits for the rest of its round's credit.
+        OP_OFFER, 2, 3, 0,    OP_OFFER, 2, 3, 1,
+        OP_STAGE, 3, 4, 1,    OP_RESERVE, 3, 20, 0,  OP_START, 3, 4, 0,
+        OP_PAGE, 3, 10, 0,
+    ];
 
-        #[test]
-        fn interleaved_work_matches_the_model(ops in prop::collection::vec(op(), 1..96)) {
-            run(ops).teardown();
-        }
-
-        #[test]
-        fn work_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-            replay_header_work_bytes(&bytes);
-        }
+    machine_target_tests! {
+        replay: replay_header_work_bytes,
+        target: "header_work_ownership",
+        decoder: 1,
+        witness: WITNESS => HeaderWorkReplaySummary {
+            transitions: 20,
+            starts: 3,
+            prepares: 2,
+            handoffs: 1,
+            stale_completions: 1,
+            evictions: 0,
+            retained_after_retirement: 1,
+            credit_waits: 1,
+            continuations: 2,
+            prepare_decisions: 0,
+            malformed_pages: 0,
+            offers_staged: 1,
+            offers_spent: 1,
+        },
     }
 
     /// One peer's call outlives its round while another peer's work advances, and
@@ -1202,8 +1161,43 @@ mod tests {
         });
         let harness = run(ops);
         assert_eq!(harness.summary.evictions, 1);
+        assert!(!harness.queue.has_work(&peer_id(3)));
         assert_eq!(harness.queue.chunk_budget_usage(), (20, 0));
         assert_eq!(harness.queue.reserved_header_count(&peer_id(3)), 0);
+    }
+
+    /// Among unstarted work of equal lowest priority, a full queue evicts the
+    /// peer whose ID sorts first, and never work of equal or higher priority.
+    #[test]
+    fn a_full_queue_evicts_the_first_peer_of_the_lowest_priority() {
+        let mut ops = Vec::new();
+        for peer in 0..MAX_STAGED_TARGETS_V1 {
+            ops.push(Op::Stage {
+                peer,
+                tip: 0,
+                priority: if peer < 2 { 1 } else { 2 },
+            });
+        }
+        let new = MAX_STAGED_TARGETS_V1;
+        let mut harness = run(ops);
+        harness.apply(Op::Stage {
+            peer: new,
+            tip: 1,
+            priority: 1,
+        });
+        assert!(
+            !harness.queue.has_work(&peer_id(new)),
+            "no lower priority to evict"
+        );
+        harness.apply(Op::Stage {
+            peer: new,
+            tip: 1,
+            priority: 2,
+        });
+        let kept: Vec<bool> = (0..3)
+            .map(|peer| harness.queue.has_work(&peer_id(peer)))
+            .collect();
+        assert_eq!(kept, [false, true, true]);
     }
 
     /// Each page decision follows from the round's credit, the budget, and the target.
@@ -1236,7 +1230,8 @@ mod tests {
         assert_eq!(harness.summary.prepare_decisions, 1);
     }
 
-    /// A full budget bounds a round to its staged prefix, which narrows the owner.
+    /// A full budget bounds a round to its staged prefix, which narrows the
+    /// owner to the staged tip and prepares a prefix.
     #[test]
     fn a_full_budget_prepares_a_bounded_prefix() {
         let mut ops = Vec::new();
@@ -1246,13 +1241,18 @@ mod tests {
             ops.extend(started(peer, tip, count));
         }
         ops.push(page_op(0, MAX_HEADER_CHUNK_RESERVATION_V1));
-        ops.push(Op::Prepare {
-            peer: 0,
-            bounded_prefix: true,
-        });
-        let harness = run(ops);
+        let mut harness = run(ops);
         assert_eq!(harness.summary.prepare_decisions, 1);
-        assert_eq!(harness.summary.prepares, 1);
+        let operation = harness.queue.begin_prepare(&peer_id(0), true);
+        let Some(HeaderPortOperation::PrepareHeaderTarget { completion, .. }) = operation else {
+            panic!("the staged round prepares");
+        };
+        assert_eq!(
+            completion,
+            zakura_header_chain::TargetCompletion::TargetPrefix {
+                common_ancestor: ancestor()
+            }
+        );
         let active = harness
             .queue
             .active(&peer_id(0))
@@ -1260,6 +1260,32 @@ mod tests {
         assert_eq!(
             active.owner.header_authority().branch.target_tip_hash,
             tip_hash(0)
+        );
+    }
+
+    /// A round that reached its target prepares all of it under its owner.
+    #[test]
+    fn a_complete_round_prepares_the_whole_target() {
+        let mut harness = run(started(0, 0, 10));
+        harness.apply(Op::Page {
+            peer: 0,
+            returned: 10,
+            reaches_target: true,
+        });
+        let owner = harness.queue.active(&peer_id(0)).map(|active| active.owner);
+        let operation = harness.queue.begin_prepare(&peer_id(0), false);
+        let Some(HeaderPortOperation::PrepareHeaderTarget { completion, .. }) = operation else {
+            panic!("the staged round prepares");
+        };
+        assert_eq!(
+            completion,
+            zakura_header_chain::TargetCompletion::TargetComplete {
+                common_ancestor: ancestor()
+            }
+        );
+        assert_eq!(
+            harness.queue.active(&peer_id(0)).map(|active| active.owner),
+            owner
         );
     }
 
@@ -1292,6 +1318,127 @@ mod tests {
             ),
             "a preparing round stages no page"
         );
+    }
+
+    /// What each offer decides, in the order its checks run.
+    #[test]
+    fn offer_decisions() {
+        use OfferedPeerWork::{Idle, Other, SameOrdinaryTarget};
+        let facts = |pruned_pause, covered, eligible, work| OfferFacts {
+            pruned_pause,
+            covered,
+            eligible,
+            work,
+        };
+        let spend = |cause, close_subscription| OfferDecision::Spend {
+            cause,
+            close_subscription,
+        };
+        // (pruned pause, covered, eligible, work, held back, subscription ready) => decision
+        for (pruned_pause, covered, eligible, work, held_back, ready, decision) in [
+            (
+                true,
+                true,
+                false,
+                Idle,
+                true,
+                false,
+                spend(SpentOffer::PrunedPause, true),
+            ),
+            (
+                true,
+                false,
+                true,
+                Other,
+                false,
+                true,
+                spend(SpentOffer::PrunedPause, false),
+            ),
+            (
+                false,
+                true,
+                false,
+                Idle,
+                false,
+                true,
+                spend(SpentOffer::Covered, true),
+            ),
+            (
+                false,
+                true,
+                true,
+                SameOrdinaryTarget,
+                false,
+                true,
+                spend(SpentOffer::Covered, false),
+            ),
+            (
+                false,
+                false,
+                false,
+                Idle,
+                false,
+                true,
+                spend(SpentOffer::Ineligible, true),
+            ),
+            (
+                false,
+                false,
+                false,
+                Other,
+                false,
+                true,
+                spend(SpentOffer::Ineligible, false),
+            ),
+            (
+                false,
+                false,
+                true,
+                SameOrdinaryTarget,
+                true,
+                false,
+                OfferDecision::AlreadyActive { spend: true },
+            ),
+            (
+                false,
+                false,
+                true,
+                Other,
+                true,
+                false,
+                OfferDecision::AlreadyActive { spend: false },
+            ),
+            (
+                false,
+                false,
+                true,
+                Idle,
+                true,
+                true,
+                OfferDecision::HeldBack,
+            ),
+            (
+                false,
+                false,
+                true,
+                Idle,
+                false,
+                false,
+                OfferDecision::AwaitSubscription,
+            ),
+            (false, false, true, Idle, false, true, OfferDecision::Stage),
+        ] {
+            assert_eq!(
+                decide_offer(
+                    facts(pruned_pause, covered, eligible, work),
+                    || held_back,
+                    || ready
+                ),
+                decision,
+                "pruned={pruned_pause} covered={covered} eligible={eligible} {work:?} \
+                 held_back={held_back} ready={ready}"
+            );
+        }
     }
 
     /// A blocker keeps a held-back offer from staging, and the same offer stages
@@ -1344,62 +1491,10 @@ mod tests {
         assert_eq!(harness.queue.len(), 0);
     }
 
-    /// A fixed decoder-v1 history reaches every kind of decision, so the
-    /// property tests above are not vacuous.
-    #[test]
-    fn the_witness_reaches_every_decision() {
-        const OP_STAGE: u8 = 0;
-        const OP_RESERVE: u8 = 2;
-        const OP_START: u8 = 4;
-        const OP_PAGE: u8 = 5;
-        const OP_PREPARE: u8 = 6;
-        const OP_COMPLETE: u8 = 7;
-        const OP_RETIRE: u8 = 8;
-        const OP_OFFER: u8 = 10;
-        #[rustfmt::skip]
-        let witness = [
-            // Peer 0 hands one prepare to its apply.
-            OP_STAGE, 0, 1, 1,    OP_RESERVE, 0, 10, 0,  OP_START, 0, 1, 0,
-            OP_PAGE, 0, 10, 0,    OP_PREPARE, 0, 0, 0,   OP_COMPLETE, 0, 0, 0,
-            // Peer 1's prepare outlives its round while peer 0's apply ends.
-            OP_STAGE, 1, 2, 1,    OP_RESERVE, 1, 20, 0,  OP_START, 1, 2, 0,
-            OP_PAGE, 1, 20, 0,    OP_PREPARE, 1, 0, 0,   OP_RETIRE, 1, 0, 0,
-            OP_COMPLETE, 1, 0, 0, OP_COMPLETE, 0, 0, 1,
-            // Peer 2's offer stages, a pruned pause then spends it, and peer 3
-            // waits for the rest of its round's credit.
-            OP_OFFER, 2, 3, 0,    OP_OFFER, 2, 3, 1,
-            OP_STAGE, 3, 4, 1,    OP_RESERVE, 3, 20, 0,  OP_START, 3, 4, 0,
-            OP_PAGE, 3, 10, 0,
-        ];
-
-        let summary = replay_header_work_bytes(&witness);
-
-        assert_eq!(summary.starts, 3);
-        assert_eq!(summary.prepares, 2);
-        assert_eq!(summary.handoffs, 1);
-        assert_eq!(summary.stale_completions, 1);
-        assert_eq!(summary.retained_after_retirement, 1);
-        assert_eq!(summary.offers_staged, 1);
-        assert_eq!(summary.offers_spent, 1);
-        assert_eq!(summary.continuations, 2);
-        assert_eq!(summary.credit_waits, 1);
-    }
-
-    #[test]
-    fn empty_input_replays_nothing() {
-        assert_eq!(
-            replay_header_work_bytes(&[]),
-            HeaderWorkReplaySummary {
-                transitions: PEERS,
-                ..HeaderWorkReplaySummary::default()
-            }
-        );
-    }
-
-    /// A planted capacity leak fails the comparison.
+    /// A planted capacity leak breaks the queue's invariants.
     #[test]
     #[should_panic(expected = "header/work-ownership")]
-    fn the_model_rejects_a_lost_lease() {
+    fn the_harness_rejects_a_lost_lease() {
         let mut ops = started(0, 1, 10).to_vec();
         ops.push(page_op(0, 10));
         let mut harness = run(ops);
@@ -1407,23 +1502,18 @@ mod tests {
         harness.check();
     }
 
-    /// A settlement that ignores the round fails the comparison.
+    /// A call settled behind the harness's back no longer settles its round.
     #[test]
     #[should_panic(expected = "header/work-ownership")]
-    fn the_model_rejects_a_wrong_round_settlement() {
+    fn the_harness_rejects_a_hidden_settlement() {
         let mut ops = started(0, 1, 10).to_vec();
         ops.extend([page_op(0, 10), prepare_op(0)]);
         let mut harness = run(ops);
-        harness.holds[0].incarnation += 1;
-        harness.check();
-    }
-
-    /// A revision bump that no decision made fails the comparison.
-    #[test]
-    #[should_panic(expected = "header/work-ownership")]
-    fn the_model_rejects_a_wrong_revision() {
-        let mut harness = run(started(0, 1, 10));
-        harness.revision += 1;
-        harness.check();
+        let work = harness.holds[0].retained.work();
+        assert!(harness.queue.settle_call(&peer_id(0), work));
+        harness.apply(Op::Complete {
+            hold: 0,
+            apply: true,
+        });
     }
 }

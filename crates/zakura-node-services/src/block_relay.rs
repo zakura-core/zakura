@@ -3,9 +3,9 @@
 use std::{
     hash::{Hash, Hasher},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
-use zakura_chain::block::Block;
+use zakura_chain::{block::Block, serialization::sha256d};
 use zakura_rt::sync::watch;
 
 use crate::block_memory::BlockHandle;
@@ -25,7 +25,10 @@ pub enum PendingBlockStatus {
 ///
 /// Clones share identity, but a retry with the same header hash gets a new permission.
 #[derive(Clone, Debug)]
-pub struct PendingBlockSendPermit(Arc<watch::Sender<PendingBlockStatus>>);
+pub struct PendingBlockSendPermit {
+    status: Arc<watch::Sender<PendingBlockStatus>>,
+    checksum: AttemptChecksum,
+}
 
 impl PendingBlockSendPermit {
     /// Creates a pending permission and its resolution sender.
@@ -33,12 +36,26 @@ impl PendingBlockSendPermit {
     /// The submission owner must publish failure on cancellation or drop.
     pub fn channel() -> (watch::Sender<PendingBlockStatus>, Self) {
         let (status, _) = watch::channel(PendingBlockStatus::Waiting);
-        (status.clone(), Self(Arc::new(status)))
+        (
+            status.clone(),
+            Self {
+                status: Arc::new(status),
+                checksum: AttemptChecksum::default(),
+            },
+        )
     }
 
     /// Subscribes to the same decision used at the writer boundary.
     pub fn subscribe(&self) -> watch::Receiver<PendingBlockStatus> {
-        self.0.subscribe()
+        self.status.subscribe()
+    }
+
+    /// The network checksum shared by this attempt's body sends.
+    ///
+    /// One permit belongs to one submitted body, so its sends can share a checksum without the
+    /// cache keyed by header hash, where a different body under the same hash could poison it.
+    pub fn body_checksum(&self) -> AttemptChecksum {
+        self.checksum.clone()
     }
 
     /// Runs a synchronous write start unless this submission has been withdrawn.
@@ -48,7 +65,7 @@ impl PendingBlockSendPermit {
     /// short and synchronous, and never resolve this permit's submission inside it.
     /// Writes that started before withdrawal may finish flushing afterward.
     pub fn try_start_write<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
-        let status = self.0.borrow();
+        let status = self.status.borrow();
         if *status == PendingBlockStatus::Failed {
             return None;
         }
@@ -60,7 +77,7 @@ impl PendingBlockSendPermit {
 
 impl PartialEq for PendingBlockSendPermit {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.status, &other.status)
     }
 }
 
@@ -68,9 +85,40 @@ impl Eq for PendingBlockSendPermit {}
 
 impl Hash for PendingBlockSendPermit {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
+        Arc::as_ptr(&self.status).hash(state);
     }
 }
+
+/// The checksum of one submission attempt's exact serialized body, computed by its first send.
+#[derive(Clone, Debug, Default)]
+pub struct AttemptChecksum(Arc<OnceLock<(usize, sha256d::Checksum)>>);
+
+impl AttemptChecksum {
+    /// Returns the checksum of `body`, computing it on the attempt's first send.
+    ///
+    /// The length guards the invariant that an attempt serializes to one body: a mismatch is
+    /// computed afresh rather than trusted.
+    pub fn get_or_compute(
+        &self,
+        body: &[u8],
+        compute: impl Fn(&[u8]) -> sha256d::Checksum,
+    ) -> sha256d::Checksum {
+        let (len, checksum) = *self.0.get_or_init(|| (body.len(), compute(body)));
+        if len == body.len() {
+            checksum
+        } else {
+            compute(body)
+        }
+    }
+}
+
+impl PartialEq for AttemptChecksum {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AttemptChecksum {}
 
 /// A peer response body, retaining withdrawal permission when read from temporary storage.
 #[derive(Clone, Debug, Eq, PartialEq)]

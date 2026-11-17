@@ -26,6 +26,7 @@ use zakura_chain::{
     },
     transaction::Transaction,
 };
+use zakura_node_services::block_relay::AttemptChecksum;
 
 use zakura_node_services::block_memory::BlockHandle;
 
@@ -132,7 +133,8 @@ enum BodyDecodePanic {
 ///
 /// A checksum is found by the block's hash. Bodies using this cache come from committed
 /// state. Temporary submission bodies use [`Message::UncachedBlock`] instead, even when
-/// they later commit, and neither read nor populate this cache. Before contextual
+/// they later commit, and neither read nor populate this cache; they share a checksum
+/// only across sends of the same submission attempt. Before contextual
 /// verification checks `hashBlockCommitments`, different v5 authorization data can produce
 /// bodies with the same block hash and length, even when their proofs and signatures verify.
 /// Untrusted bodies served before that check must not use this cache: they could leave a
@@ -442,7 +444,16 @@ impl Encoder<Message> for Codec {
 
         // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
         dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
-        let checksum = self.body_checksum(block_hash, remembered, &dst[start_len + HEADER_LEN..]);
+        let attempt = match &item {
+            Message::UncachedBlock(_, attempt) => Some(attempt),
+            _ => None,
+        };
+        let checksum = self.body_checksum(
+            block_hash,
+            remembered,
+            attempt,
+            &dst[start_len + HEADER_LEN..],
+        );
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -467,13 +478,20 @@ impl Codec {
     ///
     /// A large block's remembered checksum is used when its body length matches. Otherwise
     /// the send shares any calculation already in progress, or hashes and remembers the body.
-    /// Temporary blocks bypass the shared cache and hash their exact bytes.
+    /// A temporary block bypasses the shared cache and shares a checksum only with
+    /// other sends of the same submission attempt.
     fn body_checksum(
         &self,
         block_hash: Option<block::Hash>,
         remembered: Option<(usize, sha256d::Checksum)>,
+        attempt: Option<&AttemptChecksum>,
         body: &[u8],
     ) -> sha256d::Checksum {
+        if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN {
+            if let Some(attempt) = attempt {
+                return attempt.get_or_compute(body, message_checksum);
+            }
+        }
         let hash = match block_hash {
             Some(hash) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => hash,
             _ => return message_checksum(body),
@@ -600,7 +618,7 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) | Message::UncachedBlock(block) => {
+            Message::Block(block) | Message::UncachedBlock(block, _) => {
                 block.zcash_serialize(writer)?
             }
             Message::GetBlocks { known_blocks, stop } => {

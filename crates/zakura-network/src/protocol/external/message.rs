@@ -284,9 +284,13 @@ pub enum Message {
     ///
     /// Encodes as the ordinary `block` command and decodes as [`Self::Block`]. Pending
     /// bodies can differ under the same header hash, so they must neither read nor populate
-    /// the shared checksum cache. Only outbound serving constructs this variant.
+    /// the shared checksum cache. Sends of one submission attempt share its checksum instead.
+    /// Only outbound serving constructs this variant.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    UncachedBlock(BlockHandle),
+    UncachedBlock(
+        BlockHandle,
+        zakura_node_services::block_relay::AttemptChecksum,
+    ),
 
     /// A `tx` message.
     ///
@@ -543,7 +547,7 @@ impl fmt::Display for Message {
             Message::Headers(headers) => format!("headers {{ headers: {} }}", headers.len()),
 
             Message::GetData(invs) => format!("getdata {{ invs: {} }}", invs.len()),
-            Message::Block(block) | Message::UncachedBlock(block) => format!(
+            Message::Block(block) | Message::UncachedBlock(block, _) => format!(
                 "block {{ height: {}, hash: {} }}",
                 block
                     .coinbase_height()
@@ -577,7 +581,7 @@ impl Message {
             Message::GetHeaders { .. } => "getheaders",
             Message::Headers(_) => "headers",
             Message::GetData(_) => "getdata",
-            Message::Block(_) | Message::UncachedBlock(_) => "block",
+            Message::Block(_) | Message::UncachedBlock(..) => "block",
             Message::Tx(_) => "tx",
             Message::NotFound(_) => "notfound",
             Message::Mempool => "mempool",

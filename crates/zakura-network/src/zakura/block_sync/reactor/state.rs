@@ -41,6 +41,7 @@ use super::{
     ZakuraBlockSyncConfig, ZakuraPeerId, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
     EMPTY_STATE_HEADER_QUIET_PERIOD, NEEDED_BLOCK_QUERY_RETRY_DELAY, NEEDED_BLOCK_REFILL_LIMIT,
 };
+use crate::zakura::block_sync::events::BlockSyncBlockMeta;
 use crate::zakura::block_sync::state::next_height;
 use crate::zakura::block_sync::status::StatusDelivery;
 
@@ -73,6 +74,10 @@ pub(super) struct ReactorState {
     committed_view: Option<CommittedHeaderChainView>,
     /// Body-availability requests accepted against the current committed view.
     alarm_requests: AlarmRequests,
+    /// The committed verified tip whose hash queued or submitted selected work
+    /// held when the reactor observed it. It proves the tip lies on the selected
+    /// branch after that work leaves the queue.
+    verified_on_selected: Option<Frontier>,
     pub(super) status: StatusSchedule,
 }
 
@@ -91,8 +96,15 @@ impl ReactorState {
             needed_heights: Vec::new(),
             committed_view,
             alarm_requests: AlarmRequests::default(),
+            verified_on_selected: None,
             status: StatusSchedule::default(),
         }
+    }
+
+    /// Record that selected work held `verified`'s hash when the reactor
+    /// observed `verified` as the committed verified tip.
+    pub(super) fn record_verified_on_selected(&mut self, verified: Frontier) {
+        self.verified_on_selected = Some(verified);
     }
 
     pub(super) fn committed_view(&self) -> Option<&CommittedHeaderChainView> {
@@ -164,6 +176,7 @@ impl ReactorState {
             best_header_tip: self.progress.best_header_tip,
             best_header_hash: self.progress.best_header_hash,
             scope: self.body_work_scope(),
+            verified_anchor: self.progress.verified_frontier(),
             diverged: self.verified_tip_diverged(),
             start,
         })
@@ -195,8 +208,9 @@ impl ReactorState {
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
         body_anchor: Frontier,
+        blocks: &[BlockSyncBlockMeta],
     ) -> (NeededReply, ReactorTransition) {
-        let reply = self.classify_needed_reply(query_id, scope, body_anchor);
+        let reply = self.classify_needed_reply(query_id, scope, body_anchor, blocks);
         let transition = ReactorTransition::QueryReply {
             query_id,
             scope,
@@ -210,12 +224,19 @@ impl ReactorState {
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
         body_anchor: Frontier,
+        blocks: &[BlockSyncBlockMeta],
     ) -> NeededReply {
         let Some(query) = self.queries.complete(query_id, scope) else {
             return NeededReply::Stale;
         };
-        if self.body_work_scope() != Some(scope) {
+        let Some(current) = self.body_work_scope() else {
             return NeededReply::StaleAuthority;
+        };
+        if current != scope {
+            if current.body_work_epoch != scope.body_work_epoch {
+                return NeededReply::StaleAuthority;
+            }
+            return self.classify_rebased_reply(query, current, body_anchor, blocks);
         }
         let progress = &self.progress;
         if body_anchor.height != progress.verified_block_tip
@@ -233,6 +254,62 @@ impl ReactorState {
             };
         }
         NeededReply::Accept(query)
+    }
+
+    /// Classify a reply whose authority changed within its body-work epoch.
+    ///
+    /// The epoch keeps the selected lineage, so the reply's hashes are still
+    /// selected. Commits that landed during the read can leave its anchor
+    /// behind the verified mirror. The reply becomes current work only when
+    /// the verified mirror is provably on the selected branch above that
+    /// anchor: the reply lists the mirror's hash at its height, or selected
+    /// work held that hash when the reactor observed it. Verified growth on a
+    /// retained fork proves neither, so that reply is stale, and a fresh query
+    /// takes the anchor path.
+    fn classify_rebased_reply(
+        &self,
+        query: PendingNeededQuery,
+        current: BodyWorkAuthority,
+        body_anchor: Frontier,
+        blocks: &[BlockSyncBlockMeta],
+    ) -> NeededReply {
+        let verified = self.progress.verified_frontier();
+        if body_anchor.height > verified.height {
+            // State verified the selected anchor before the Sequencer mirror
+            // caught up. The blocks above it are still selected work.
+            return NeededReply::Rebased {
+                query,
+                scope: current,
+                advance: Some(BlockSyncFrontiers {
+                    finalized_height: self.progress.finalized_height,
+                    verified_block_tip: body_anchor.height,
+                    verified_block_hash: body_anchor.hash,
+                }),
+            };
+        }
+        if body_anchor == verified {
+            return NeededReply::Rebased {
+                query,
+                scope: current,
+                advance: None,
+            };
+        }
+        let dispatched = query.verified_anchor;
+        let read_after_dispatch =
+            body_anchor.height > dispatched.height || body_anchor == dispatched;
+        let listed = blocks
+            .iter()
+            .any(|block| block.height == verified.height && block.hash == verified.hash);
+        let selected = listed || self.verified_on_selected == Some(verified);
+        if read_after_dispatch && selected {
+            NeededReply::Rebased {
+                query,
+                scope: current,
+                advance: None,
+            }
+        } else {
+            NeededReply::StaleAuthority
+        }
     }
 
     /// Update the progress mirrors from a Sequencer view.
@@ -319,14 +396,26 @@ pub struct PendingNeededQuery {
     /// The query bypassed the low-water gate. Its refusal or failure carries
     /// that bypass into the retry.
     pub forced: bool,
+    /// The verified mirror when the query was dispatched.
+    #[serde(skip)]
+    pub verified_anchor: Frontier,
 }
 
 impl PendingNeededQuery {
-    /// Whether `self` asks for the same metadata as `other`. Query IDs may differ.
+    /// Whether `self` makes `other` unnecessary. Query IDs may differ.
+    ///
+    /// A query dispatched under an older authority of the same body-work epoch
+    /// covers the new proposal: its reply is still selected work, and the
+    /// reactor queries again once it lands. Replacing it would discard every
+    /// read that a commit overtakes.
     fn covers(&self, other: &Self) -> bool {
-        self.hint_revision == other.hint_revision
-            && self.scope == other.scope
-            && self.from == other.from
+        if self.hint_revision != other.hint_revision {
+            return false;
+        }
+        if self.scope != other.scope {
+            return self.scope.body_work_epoch == other.scope.body_work_epoch;
+        }
+        self.from == other.from
             && self.limit == other.limit
             && self.best_header_tip == other.best_header_tip
             && self.best_header_hash == other.best_header_hash
@@ -414,6 +503,8 @@ pub(super) struct QueryRequest {
     pub(super) best_header_hash: block::Hash,
     /// Current body-work authority, if the reactor has one.
     pub(super) scope: Option<BodyWorkAuthority>,
+    /// The verified mirror at dispatch.
+    pub(super) verified_anchor: Frontier,
     /// The committed verified tip left the selected chain: without other work,
     /// the query asks state about the header tip.
     pub(super) diverged: bool,
@@ -598,6 +689,7 @@ impl QueryState {
             best_header_hash: request.best_header_hash,
             hint_revision,
             forced: force,
+            verified_anchor: request.verified_anchor,
         };
         if self.pending.is_some_and(|pending| pending.covers(&query)) {
             return QueryPlan::Covered;
@@ -772,6 +864,15 @@ pub(super) enum NeededReply {
     AnchorReset(BlockSyncFrontiers),
     /// The reply's blocks are current work for this completed query.
     Accept(PendingNeededQuery),
+    /// The reply's blocks are current work under `scope`, the same-epoch
+    /// authority that replaced the query's own. The reactor first forwards
+    /// `advance` when state's anchor is ahead of the verified mirror. It then
+    /// queries again, because headers or verification moved during the read.
+    Rebased {
+        query: PendingNeededQuery,
+        scope: BodyWorkAuthority,
+        advance: Option<BlockSyncFrontiers>,
+    },
 }
 
 impl NeededReply {
@@ -782,6 +883,7 @@ impl NeededReply {
             Self::AnchorAdvanced(_) => QueryReplyOutcome::AnchorAdvanced,
             Self::AnchorReset(_) => QueryReplyOutcome::AnchorReset,
             Self::Accept(_) => QueryReplyOutcome::Accepted,
+            Self::Rebased { .. } => QueryReplyOutcome::Rebased,
         }
     }
 }
@@ -832,6 +934,11 @@ impl ReactorProgress {
             last_reaction_epoch: 0,
             last_view: initial_view,
         }
+    }
+
+    /// The verified mirror as a frontier.
+    pub(super) fn verified_frontier(&self) -> Frontier {
+        Frontier::new(self.verified_block_tip, self.verified_block_hash)
     }
 
     pub(super) fn observe_header_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -1054,7 +1161,8 @@ impl CommittedViewUpdate {
 impl ReactorState {
     /// Adopt `view` as the committed view.
     ///
-    /// The state retires the pending query when authority or hints change,
+    /// The state retires the pending query when the body-work epoch or hints
+    /// change. A same-epoch authority change keeps it for rebasing. The state
     /// mirrors a changed header tip, holds an empty node for far-ahead headers
     /// until `now` plus the quiet period, and drops the accepted
     /// body-availability requests of the previous view.
@@ -1084,7 +1192,12 @@ impl ReactorState {
 
         let current_scope = BodyWorkAuthority::for_view(&view);
         let authority = (previous_scope != Some(current_scope)).then(|| {
-            self.queries.clear();
+            // A same-epoch refresh keeps the pending query: its reply is still
+            // selected work, and the reply's classification rebases it.
+            if previous.is_none() || body_work_epoch_changed {
+                self.queries.clear();
+                self.verified_on_selected = None;
+            }
             if body_work_epoch_changed {
                 AuthorityUpdate::EpochChanged {
                     authority: current_scope,

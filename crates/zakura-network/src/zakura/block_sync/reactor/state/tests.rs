@@ -68,7 +68,9 @@ fn authority_view(generation: u8) -> CommittedHeaderChainView {
             oldest_retained_height: frontier.height,
             alarms: Default::default(),
         },
-        BodyWorkEpoch::new(1),
+        // Each generation is its own epoch, so the machine model's authority
+        // change retires the pending query. Same-epoch rebasing has its own tests.
+        BodyWorkEpoch::new(1 + u64::from(generation)),
     )
 }
 
@@ -250,7 +252,7 @@ fn rejected_replacement_then_old_reply_completes_old_query() {
     let _ = refill(&mut state, false, work(Some(1), 0, 10), false, now);
 
     let reply = state
-        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .complete_needed_query(a.query_id, a.scope, anchor(0), &[])
         .0;
 
     assert_eq!(reply, NeededReply::Accept(a));
@@ -270,7 +272,7 @@ fn unrelated_stale_reply_keeps_replacement_query() {
     assert_ne!(a.query_id, b.query_id);
 
     let reply = state
-        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .complete_needed_query(a.query_id, a.scope, anchor(0), &[])
         .0;
     assert_eq!(reply, NeededReply::Stale);
     assert!(!state
@@ -282,16 +284,17 @@ fn unrelated_stale_reply_keeps_replacement_query() {
 }
 
 #[test]
-fn matching_reply_under_stale_authority_retires_query() {
+fn matching_reply_under_another_epoch_retires_query() {
     let now = Instant::now();
     let mut state = authorized_state(0, 100);
     let a = expect_accepted(refill(&mut state, false, work(Some(1), 0, 10), true, now));
 
-    // A production authority change also retires the pending query, so only a
-    // direct write reaches this defensive arm.
+    // Authority 1 starts a new body-work epoch. A production epoch change also
+    // retires the pending query, so only a direct write reaches this arm. A
+    // same-epoch change rebases the reply instead (see `tests/committed.rs`).
     state.committed_view = Some(authority_view(1));
     let reply = state
-        .complete_needed_query(a.query_id, a.scope, anchor(0))
+        .complete_needed_query(a.query_id, a.scope, anchor(0), &[])
         .0;
 
     assert_eq!(reply, NeededReply::StaleAuthority);
@@ -335,7 +338,7 @@ fn anchor_change_during_query_takes_frontier_path() {
         let a = expect_accepted(refill(&mut state, false, work(Some(6), 0, 10), true, now));
 
         let reply = state
-            .complete_needed_query(a.query_id, a.scope, body_anchor)
+            .complete_needed_query(a.query_id, a.scope, body_anchor, &[])
             .0;
 
         assert_eq!(reply, expected);
@@ -590,7 +593,7 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
         (block::Height(1), NEEDED_BLOCK_REFILL_LIMIT, Some(7))
     );
     let NeededReply::Accept(first) = state
-        .complete_needed_query(first.query_id, first.scope, anchor(0))
+        .complete_needed_query(first.query_id, first.scope, anchor(0), &[])
         .0
     else {
         panic!("the reply matches the pending query and its anchor");
@@ -600,7 +603,7 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
     let second = expect_accepted(refill(&mut state, false, work(None, 0, 0), true, now));
     assert_eq!((second.from, second.limit), (block::Height(4_001), 1_000));
     let _ = state
-        .complete_needed_query(second.query_id, second.scope, anchor(0))
+        .complete_needed_query(second.query_id, second.scope, anchor(0), &[])
         .0;
     assert!(!state.queries.advance_hint_refresh(&second));
     assert_eq!(state.queries.hint_refresh(), None);
@@ -803,6 +806,8 @@ struct ModelQuery {
     limit: u32,
     header_tip: u32,
     forced: bool,
+    /// Verified tip at dispatch.
+    anchor: u32,
 }
 
 /// The reply the model expects.
@@ -903,6 +908,7 @@ impl Model {
             limit: (self.header_tip - from + 1).min(window).min(READ_LIMIT),
             header_tip: self.header_tip,
             forced,
+            anchor: self.verified_tip,
         };
         let same_request = self.pending.is_some_and(|pending| {
             (
@@ -1032,6 +1038,7 @@ fn model_query(query: PendingNeededQuery) -> ModelQuery {
         limit: query.limit,
         header_tip: query.best_header_tip.0,
         forced: query.forced,
+        anchor: query.verified_anchor.height.0,
     }
 }
 
@@ -1048,6 +1055,9 @@ fn model_reply(reply: NeededReply) -> ModelReply {
             frontiers.verified_block_hash,
         ),
         NeededReply::Accept(query) => ModelReply::Accept(model_query(query)),
+        NeededReply::Rebased { .. } => {
+            unreachable!("the machine's authorities differ in body-work epoch")
+        }
     }
 }
 
@@ -1193,6 +1203,7 @@ impl Driver {
                         height: block::Height(body_anchor.0),
                         hash: body_anchor.1,
                     },
+                    &[],
                 );
                 self.actions.push(transition);
                 let expected = self.model.reply(id, scope, body_anchor);
@@ -1382,6 +1393,10 @@ fn expected_view(model: &Model) -> ReactorMachineView {
                 best_header_hash: header_hash(query.header_tip),
                 hint_revision: None,
                 forced: query.forced,
+                verified_anchor: Frontier {
+                    height: block::Height(query.anchor),
+                    hash: verified_hash(query.anchor),
+                },
             }),
             next_query_id: Some(query_id(model.next_id)),
             retry_armed: model.retry_until_ms.is_some(),

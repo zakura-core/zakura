@@ -38,6 +38,9 @@ pub enum QueryReplyOutcome {
     AnchorReset,
     /// The reply's blocks became current work.
     Accepted,
+    /// The reply's blocks became current work under a same-epoch authority
+    /// that replaced the query's own.
+    Rebased,
 }
 
 /// One completed view, reset, or query transition of the reactor's state.

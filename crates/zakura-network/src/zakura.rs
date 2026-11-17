@@ -26,7 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 pub(crate) mod machine_test;
 mod node_envelope;
 mod peer_memory;

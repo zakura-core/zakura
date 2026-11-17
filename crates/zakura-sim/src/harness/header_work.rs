@@ -19,12 +19,15 @@ pub const REACTOR: Machine = Machine {
 /// [`REACTOR`]'s harness entry.
 pub const REACTOR_ENTRY: HarnessEntry = crate::machine_entry!(REACTOR);
 
-/// Header publisher policy, against its independent model.
+/// Header publisher policy: the production owner's invariants and the facts that
+/// follow from the inputs.
 pub const PUBLISHER: Machine = Machine {
     name: "header/publisher-policy",
     identity: "header-publisher",
-    claim: "The header publisher's credit, jobs, terminal outcomes, and slots agree with \
-            the independent model after every input.",
+    claim: "The header publisher keeps its invariants after every input: it spends only \
+            granted credit, extends the last header sent, ends every closing subscription, \
+            writes terminal outcomes one at a time in order, and holds one slot per live \
+            subscription and unwritten outcome.",
     // Version 2 reads a `Finish` with an odd third byte as a storage reply.
     generator: 2,
     budget: 128,
@@ -57,7 +60,7 @@ fn reactor_reached(step: &MachineStep) -> bool {
     matches!(step, MachineStep::HeaderReactor(work) if !work.expected.calls.is_empty())
 }
 
-/// Whether `step`'s model holds a subscription slot.
+/// Whether the publisher holds a subscription slot after `step`.
 fn publisher_reached(step: &MachineStep) -> bool {
-    matches!(step, MachineStep::HeaderPublisher(work) if work.expected.slots > 0)
+    matches!(step, MachineStep::HeaderPublisher(work) if work.actual.slots > 0)
 }

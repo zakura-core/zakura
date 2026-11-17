@@ -35,7 +35,7 @@ use crate::zakura::{
 };
 
 mod load;
-use super::model::snapshot;
+use super::machine::snapshot;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;

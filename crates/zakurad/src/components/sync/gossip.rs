@@ -115,11 +115,14 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending, relay }) = early else {
+                let Some(event) = early else {
                     mined_block_receiver = None;
                     continue;
                 };
-                (hash, height, true, Some((pending, submitted_at, submission, relay)), Some(size))
+                {
+                    let size = event.size;
+                    (event.hash, event.height, true, Some(event), Some(size))
+                }
             }
             committed = announcements.recv(close_to_tip) => {
                 let committed = committed.ok_or(AnnouncementsClosed)?;
@@ -178,16 +181,16 @@ where
                 zn::Request::AdvertiseBlock(block, None)
             };
             let succeeded = match early {
-                Some((mut pending, submitted_at, submission, relay)) => {
-                    if !pending.is_valid() {
+                Some(mut event) => {
+                    if !event.pending.is_valid() {
                         false
                     } else {
-                        let relay_pending = pending.clone();
+                        let relay_pending = event.pending.clone();
                         let succeeded = tokio::select! {
                             biased;
-                            _ = pending.wait_for_failure() => false,
+                            _ = event.pending.wait_for_failure() => false,
                             succeeded = async {
-                                match relay {
+                                match event.relay {
                                     zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => broadcast_early_with_timeout(network, request, admission).await,
                                     zakura_rpc::EarlyBlockRelay::TrustedSubmission => broadcast_trusted_with_timeout(network, request, relay_pending).await,
                                 }
@@ -196,8 +199,8 @@ where
                         if succeeded {
                             metrics::counter!("mining.optimistic_inventory.early_inventories")
                                 .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
-                                .record(submitted_at.elapsed().as_secs_f64());
+                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => event.submission.rpc_method())
+                                .record(event.submitted_at.elapsed().as_secs_f64());
                         }
                         succeeded
                     }

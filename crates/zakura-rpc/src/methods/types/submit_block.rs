@@ -186,28 +186,31 @@ impl Default for PendingBlockRegistry {
 
 /// Reports whether an early-advertised block remains valid.
 #[derive(Clone, Debug)]
-pub struct PendingBlockSignal(watch::Receiver<PendingStatus>, Arc<AtomicBool>);
+pub struct PendingBlockSignal {
+    status: watch::Receiver<PendingStatus>,
+    dispatched: Arc<AtomicBool>,
+}
 
 impl PendingBlockSignal {
     /// Records dispatch to the peer service, without claiming peer delivery.
     pub fn mark_dispatched(&self) {
-        self.1.store(true, Ordering::Relaxed);
+        self.dispatched.store(true, Ordering::Relaxed);
     }
 
     /// Whether the peer service was called for this pending body.
     pub fn was_dispatched(&self) -> bool {
-        self.1.load(Ordering::Relaxed)
+        self.dispatched.load(Ordering::Relaxed)
     }
 
     /// Whether this submission is still awaiting verification and commit.
     pub fn is_pending(&self) -> bool {
-        matches!(*self.0.borrow(), PendingStatus::Waiting)
+        matches!(*self.status.borrow(), PendingStatus::Waiting)
     }
 
     /// Waits for commit or failure, so a queued trusted announcement can be withdrawn.
     pub async fn wait_for_resolution(&mut self) {
         while self.is_pending() {
-            if self.0.changed().await.is_err() {
+            if self.status.changed().await.is_err() {
                 return;
             }
         }
@@ -215,7 +218,7 @@ impl PendingBlockSignal {
 
     /// Returns true unless contextual verification has rejected the block.
     pub fn is_valid(&self) -> bool {
-        !matches!(*self.0.borrow(), PendingStatus::Failed)
+        !matches!(*self.status.borrow(), PendingStatus::Failed)
     }
 
     /// Returns a signal for a block that never fails, so tests in other crates can build an
@@ -224,20 +227,23 @@ impl PendingBlockSignal {
     pub fn valid_for_tests() -> Self {
         // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
         // failure future never resolves.
-        Self(watch::channel(PendingStatus::Waiting).1, Arc::default())
+        Self {
+            status: watch::channel(PendingStatus::Waiting).1,
+            dispatched: Arc::default(),
+        }
     }
 
     /// Resolves when contextual verification rejects the block.
     pub async fn wait_for_failure(&mut self) {
         loop {
-            let status = self.0.borrow_and_update().clone();
+            let status = self.status.borrow_and_update().clone();
             match status {
                 PendingStatus::Failed => return,
                 PendingStatus::Committed => std::future::pending::<()>().await,
                 PendingStatus::Waiting => {}
             }
 
-            if self.0.changed().await.is_err() {
+            if self.status.changed().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
@@ -280,7 +286,10 @@ pub struct PendingBlockRegistration {
 impl PendingBlockRegistration {
     /// Returns a signal that cancels stale early inventory after commit failure.
     pub fn signal(&self) -> PendingBlockSignal {
-        PendingBlockSignal(self.receiver.clone(), self.dispatched.clone())
+        PendingBlockSignal {
+            status: self.receiver.clone(),
+            dispatched: self.dispatched.clone(),
+        }
     }
 
     /// Resolves this registration and invalidates failed early advertisements.

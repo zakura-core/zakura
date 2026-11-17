@@ -164,11 +164,12 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
     )
     .expect("the test supplies the complete late-chain difficulty context")
     .expected_difficulty_threshold();
-    let mut candidate = *zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+    let mut candidate = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes")
         .header
-        .as_ref();
+        .as_ref()
+        .clone();
     candidate.time = candidate_time;
     candidate.difficulty_threshold = expected;
 
@@ -308,11 +309,12 @@ fn header_daa_rejects_bad_threshold_with_full_context() {
     let previous_block_height = block::Height(99);
     let candidate_time = DateTime::from_timestamp(15_000, 0).expect("test timestamp is in-range");
     let relevant_headers = daa_context(&network, previous_block_height, candidate_time);
-    let mut candidate = *zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+    let mut candidate = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes")
         .header
-        .as_ref();
+        .as_ref()
+        .clone();
     candidate.time = candidate_time;
     candidate.difficulty_threshold = network.target_difficulty_limit().to_compact();
 

@@ -63,7 +63,7 @@ fn write_synthetic_finalized_headers(
         let previous = headers
             .last()
             .expect("the synthetic chain starts at genesis");
-        let mut header = **previous;
+        let mut header = previous.as_ref().clone();
         header.previous_block_hash = previous.hash();
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] =

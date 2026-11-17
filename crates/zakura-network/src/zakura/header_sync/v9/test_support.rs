@@ -109,7 +109,7 @@ impl HeaderTree {
         let mut added = Vec::new();
         let mut parent = parent;
         for _ in 0..count {
-            let mut header = *self.nodes[&parent.hash].1;
+            let mut header = self.nodes[&parent.hash].1.as_ref().clone();
             header.previous_block_hash = parent.hash;
             self.next_nonce += 1;
             let mut nonce = [0; 32];

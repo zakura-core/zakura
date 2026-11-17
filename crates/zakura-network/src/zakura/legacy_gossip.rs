@@ -4071,7 +4071,7 @@ mod tests {
             .try_reserve(
                 zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
             )?
-            .retain(*block.header)?;
+            .retain(block.header.as_ref().clone())?;
         let response = Response::BlockHeaders(vec![HeaderHandle::from(header)]);
         assert!(pool.retained_bytes() > 0);
 

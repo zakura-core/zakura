@@ -766,7 +766,7 @@ fn wire_headers(
                 HeaderHandle::Shared(header) => header.clone(),
                 HeaderHandle::Block(_) | HeaderHandle::Standalone(_) => {
                     copied_headers = copied_headers.saturating_add(1);
-                    Arc::new(**handle)
+                    Arc::new((**handle).clone())
                 }
             };
             block::CountedHeader { header }

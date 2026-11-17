@@ -1510,7 +1510,7 @@ mod tests {
         let mut first = regtest_genesis_block().header.as_ref().clone();
         first.previous_block_hash = block::Hash([0; 32]);
         let first = Arc::new(first);
-        let mut second = *first;
+        let mut second = first.as_ref().clone();
         second.previous_block_hash = first.hash();
         [first, Arc::new(second)]
     }

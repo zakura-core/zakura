@@ -554,7 +554,7 @@ mod tests {
             let span = pow_adjustment_block_span_for_height(&network, candidate_height);
             let relevant_chain: Vec<_> = (0..span)
                 .map(|index| {
-                    let mut header = header;
+                    let mut header = header.clone();
                     let age = u32::try_from(index).unwrap() * spacing.seconds();
                     header.time = tip_time
                         .checked_sub(Duration32::from_seconds(age))

@@ -224,7 +224,7 @@ impl Sequence {
             .header;
         let mut headers = Vec::new();
         for index in 0..count {
-            let mut next = *header;
+            let mut next = header.as_ref().clone();
             next.previous_block_hash = header.hash();
             next.time += chrono::Duration::seconds(1);
             next.nonce.0[..8].copy_from_slice(&(self.serial + u64::from(index)).to_le_bytes());

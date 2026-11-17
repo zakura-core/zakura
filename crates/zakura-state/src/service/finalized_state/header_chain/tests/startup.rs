@@ -498,7 +498,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     let mut parent = anchor.hash;
     let mut parent_header = anchor.header;
     for nonce in [0x61, 0x62] {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] = nonce;
@@ -1987,7 +1987,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     let mut parent = Frontier::new(anchor.height, anchor.hash);
     let mut parent_header = anchor.header;
     for _ in 0..5 {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);
@@ -2068,7 +2068,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     let mut parent = Frontier::new(anchor.height, anchor.hash);
     let mut parent_header = anchor.header;
     for _ in 0..5 {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);

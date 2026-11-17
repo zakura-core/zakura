@@ -1045,7 +1045,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     first_header.previous_block_hash = anchor.hash;
     first_header.time += chrono::Duration::seconds(1);
     let first_header = Arc::new(first_header);
-    let mut second_header = *first_header;
+    let mut second_header = first_header.as_ref().clone();
     second_header.previous_block_hash = first_header.hash();
     second_header.time += chrono::Duration::seconds(1);
     let second_header = Arc::new(second_header);
@@ -1567,7 +1567,7 @@ fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence(
     let child_header = Arc::new(child_header);
     // Authenticating a VCT delivery reads the delivery's direct successor on the owned
     // branch, so the fixture admits one header past the checkpoint target.
-    let mut successor_header = *child_header;
+    let mut successor_header = child_header.as_ref().clone();
     successor_header.previous_block_hash = child_header.hash();
     successor_header.time += chrono::Duration::seconds(1);
     successor_header.nonce.0[0] = 0x85;

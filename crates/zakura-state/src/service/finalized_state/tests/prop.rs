@@ -75,7 +75,7 @@ type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 fn vct_successor_witness(block: impl Into<BlockHandle>) -> VctSuccessorWitness {
     let block = block.into();
     VctSuccessorWitness::from_header(
-        Arc::new(*block.view().header()),
+        Arc::new(block.view().header().clone()),
         block
             .coinbase_height()
             .expect("prepared successor blocks have a coinbase height"),
@@ -166,11 +166,11 @@ fn exact_vct_auxiliary_window(
     );
     VctAuxiliaryWindow {
         engine_snapshot: snapshot,
-        delivery_header: Arc::new(*block.header()),
+        delivery_header: Arc::new(block.header().clone()),
         delivery: current,
         successor_height: Some(successor_height),
         successor: VctSuccessorWitness::from_delivery(
-            Arc::new(*successor.header()),
+            Arc::new(successor.header().clone()),
             successor_height,
             successor_delivery,
         ),

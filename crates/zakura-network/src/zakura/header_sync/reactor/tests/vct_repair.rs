@@ -1080,7 +1080,7 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
     target_header.previous_block_hash = anchor.hash;
     target_header.time += chrono::Duration::seconds(1);
     let target_header = Arc::new(target_header);
-    let mut successor_header = *target_header;
+    let mut successor_header = target_header.as_ref().clone();
     successor_header.previous_block_hash = target_header.hash();
     successor_header.time += chrono::Duration::seconds(1);
     let successor_header = Arc::new(successor_header);

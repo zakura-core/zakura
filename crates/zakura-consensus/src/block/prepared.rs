@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::{BlockRef, Header},
+    block::{BlockRef, Header, HeaderFields},
     parameters::Network,
     serialization::ZcashSerialize,
     work::equihash::Solution,
@@ -27,11 +27,11 @@ const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 /// is exactly when a miner can turn one into the other by solving it. So a match means the stored
 /// semantic verification covers the looked-up block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct CandidateKey(Header);
+struct CandidateKey(HeaderFields);
 
 impl CandidateKey {
     fn of(header: &Header, network: &Network) -> Self {
-        let mut header: Header = *header;
+        let mut header = header.fields();
         header.time =
             DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
         header.nonce = [0; 32].into();

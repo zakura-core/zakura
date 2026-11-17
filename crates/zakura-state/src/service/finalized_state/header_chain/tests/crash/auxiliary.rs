@@ -322,7 +322,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         current_header.time += chrono::Duration::seconds(1);
         current_header.nonce.0[0] = marker;
         let current_header = Arc::new(current_header);
-        let mut boundary_header = *current_header;
+        let mut boundary_header = current_header.as_ref().clone();
         boundary_header.previous_block_hash = current_header.hash();
         boundary_header.time += chrono::Duration::seconds(1);
         boundary_header.nonce.0[0] = marker.wrapping_add(1);

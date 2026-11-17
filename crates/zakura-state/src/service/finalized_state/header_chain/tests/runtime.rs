@@ -394,7 +394,7 @@ fn serving_leases_do_not_block_a_better_work_branch() {
     first.time += chrono::Duration::seconds(1);
     first.nonce.0[0] = 0xff;
     let first = Arc::new(first);
-    let mut second = *first;
+    let mut second = first.as_ref().clone();
     second.previous_block_hash = first.hash();
     second.time += chrono::Duration::seconds(1);
     let second = Arc::new(second);
@@ -490,7 +490,7 @@ fn selected_chain_membership_spans_the_finalized_boundary_and_follows_a_reorg() 
     let mut branch = Vec::new();
     let mut previous = path[4].header.clone();
     for marker in [0xf1, 0xf2] {
-        let mut header = *previous;
+        let mut header = previous.as_ref().clone();
         header.previous_block_hash = previous.hash();
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[31] = marker;
@@ -4635,7 +4635,7 @@ fn header_evidence_from_another_row_is_not_used() {
     // Evidence for an equal header in a different allocation is not used either.
     let (mut row_copy, evidence_copy) =
         HeaderNodeDisk::decode_hashed(&raw(a)).expect("row a decodes");
-    row_copy.header = Arc::new(*row_copy.header);
+    row_copy.header = Arc::new(row_copy.header.as_ref().clone());
     assert!(!Arc::ptr_eq(evidence_copy.header(), &row_copy.header));
     assert_eq!(
         row_copy

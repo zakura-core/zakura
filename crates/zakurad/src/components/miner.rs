@@ -93,7 +93,7 @@ fn keep_validated_work(
 
 fn cancel_if_mining_template_changed(
     template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
-    old_header: block::Header,
+    old_header: &block::Header,
 ) -> Result<(), SolverCancelled> {
     match template_receiver.has_changed() {
         // Guard against `get_block_template()` providing an identical header.
@@ -106,7 +106,9 @@ fn cancel_if_mining_template_changed(
             // bound to the header. An unavailable template has no header, so it
             // also cancels current work.
             if has_changed
-                && Some(old_header) != template_receiver.cloned_watch_data().map(|b| *b.header)
+                && template_receiver
+                    .cloned_watch_data()
+                    .is_none_or(|block| old_header != block.header.as_ref())
             {
                 Err(SolverCancelled)
             } else {
@@ -446,7 +448,8 @@ where
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
         let old_header = template.header.as_ref().clone();
-        let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
+        let cancel_fn =
+            move || cancel_if_mining_template_changed(&mut cancel_receiver, &old_header);
 
         // Mine at least one block using the equihash solver.
         let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
@@ -614,7 +617,7 @@ mod tests {
             .zcash_deserialize_into::<Arc<Block>>()
             .expect("block 1 deserializes");
         let current_header = block.header.as_ref().clone();
-        let mut changed_header = current_header;
+        let mut changed_header = current_header.clone();
         changed_header.nonce.0[0] ^= 1;
 
         assert!(should_replace_mining_template(None, current_header, None));
@@ -651,7 +654,7 @@ mod tests {
         let mut standard = block.header.as_ref().clone();
         let limit = Network::new_default_testnet().target_difficulty_limit();
         standard.difficulty_threshold = (limit / 4_u32).to_compact();
-        let mut minimum = standard;
+        let mut minimum = standard.clone();
         minimum.time += chrono::Duration::seconds(1);
         minimum.difficulty_threshold = limit.to_compact();
 
@@ -677,13 +680,13 @@ mod tests {
         template_sender
             .send(Some(block))
             .expect("template receiver remains open");
-        assert!(cancel_if_mining_template_changed(&mut template_receiver, old_header).is_ok());
+        assert!(cancel_if_mining_template_changed(&mut template_receiver, &old_header).is_ok());
 
         template_sender
             .send(None)
             .expect("template receiver remains open");
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut template_receiver, old_header),
+            cancel_if_mining_template_changed(&mut template_receiver, &old_header),
             Err(SolverCancelled)
         ));
     }
@@ -965,7 +968,7 @@ mod tests {
             .unwrap();
         assert!(receiver.borrow_and_update().is_none());
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut solver_receiver, old_header),
+            cancel_if_mining_template_changed(&mut solver_receiver, &old_header),
             Err(SolverCancelled)
         ));
         let recovery = verifier

@@ -1701,7 +1701,7 @@ mod tests {
     fn aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement() {
         let local = snapshot();
         let entry = HeaderEntry {
-            header: Arc::new(*regtest_genesis_block().header),
+            header: regtest_genesis_block().header.clone(),
             body_size: 0,
             tree_aux: None,
         };

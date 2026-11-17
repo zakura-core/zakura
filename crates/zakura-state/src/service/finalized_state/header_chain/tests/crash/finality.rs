@@ -263,7 +263,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
             first_header.previous_block_hash = anchor.hash;
             first_header.time += chrono::Duration::seconds(1);
             let first_header = Arc::new(first_header);
-            let mut second_header = *first_header;
+            let mut second_header = first_header.as_ref().clone();
             second_header.nonce.0[0] ^= 1;
             let second_header = Arc::new(second_header);
             let (lower_header, higher_header) = if first_header.hash().0 < second_header.hash().0 {

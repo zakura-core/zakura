@@ -185,6 +185,8 @@ impl Tracker {
         let pooled = ids.iter().all(|id| self.shown.contains(id));
         assert!(pooled, "an Inv carries only pooled ids");
         if let Some(open) = self.open.get_mut(&session) {
+            let back = ids.iter().any(|id| open.told.contains(id));
+            assert!(!back, "an Inv never carries an id back to its source");
             open.sent.extend(ids.iter().copied());
         }
         let kind = if ids.is_empty() {

@@ -184,12 +184,18 @@ impl PeerState {
         self.pending.drop_entry(id, generation);
     }
 
-    /// Records that it announced or supplied the id with short id `short`,
-    /// at change-log position `seq`, as the newest entry. Capped, forgetting
-    /// the one least recently recorded, which only costs one redundant
-    /// advert.
-    pub(crate) fn mark_known(&mut self, short: u64, seq: u64) {
+    /// Records that it announced or supplied `id`, whose short id is
+    /// `short`, at change-log position `seq`, as the newest entry. Capped,
+    /// forgetting the one least recently recorded, which only costs one
+    /// redundant advert.
+    pub(crate) fn mark_known(&mut self, id: UnminedTxId, short: u64, seq: u64) {
         self.known.mark(short, seq);
+        // An advert of `id` still queued for an `Inv` would go back to a
+        // peer that has it. One already sent stays, so the peer may still
+        // request the id.
+        if self.announced.contains_key(&id) && !self.announced.is_sent(&id) {
+            self.announced.remove(&id);
+        }
     }
 
     /// Forgets that it announced an id with short id `short`.

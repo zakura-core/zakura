@@ -1034,6 +1034,26 @@ fn an_inv_waits_for_room_its_last_write_and_the_byte_rate() {
     assert_eq!(bench.send_inv(session, room, Paid::Now), vec![id]);
 }
 
+/// An advert still queued for an `Inv` is withdrawn once the peer announces
+/// the same id, so it never goes back to its source. One already sent
+/// stands, and the peer may still ask for it.
+#[test]
+fn a_queued_advert_the_peer_announces_is_withdrawn() {
+    let mut bench = Bench::new();
+    let (sent, queued) = (bench.id(0), bench.id(1));
+    let session = bench.join(1);
+    bench.add(&[sent]);
+    assert_eq!(bench.take_inv(session, 16), vec![sent]);
+    bench.add(&[queued]);
+    bench.inv(session, &[queued, sent]);
+    assert!(bench.take_inv(session, 16).is_empty(), "nothing goes back");
+    bench.get_txs(session, sent);
+    assert_eq!(
+        bench.effects,
+        vec![RelayEffect::Serve { session, id: sent }]
+    );
+}
+
 /// A small child inside a session's window waits for its big parent
 /// outside it: the child's advert is queued at once, but no `Inv` carries
 /// it until the parent's has gone out to that session. So the peer never

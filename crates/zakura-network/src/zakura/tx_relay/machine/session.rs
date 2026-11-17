@@ -184,7 +184,7 @@ impl PeerMachine {
             let seq = pool.last_seq();
             for (id, _) in entries {
                 let short = shared.short(*id);
-                self.state.mark_known(short, seq);
+                self.state.mark_known(*id, short, seq);
             }
             return self.settle(shared, pool);
         }
@@ -200,7 +200,7 @@ impl PeerMachine {
             for (id, size) in entries.iter().copied() {
                 let short = shared.short(id);
                 let state = &mut self.state;
-                state.mark_known(short, seq);
+                state.mark_known(id, short, seq);
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
@@ -311,7 +311,7 @@ impl PeerMachine {
             .reservation
             .expect("check_arrival passed, so the request holds a reservation");
         self.state.reannounced.remove(&id);
-        self.state.mark_known(short, seq);
+        self.state.mark_known(id, short, seq);
         // The check before submitting passed: a request keeps its
         // reservation only while it holds the current claim. From here on
         // the body goes to the pool whatever is decided.
@@ -512,7 +512,7 @@ impl PeerMachine {
         // still holds this one when the admission is read.
         let peer = self.state.peer;
         let short = shared.short(id);
-        self.state.mark_known(short, pool.last_seq());
+        self.state.mark_known(id, short, pool.last_seq());
         shared.node.push(NodeEffect::Known {
             peer,
             id,
@@ -620,7 +620,7 @@ impl PeerMachine {
             // supplier's own session does.
             Mail::Known(id) => {
                 let short = shared.short(id);
-                self.state.mark_known(short, pool.last_seq());
+                self.state.mark_known(id, short, pool.last_seq());
             }
         }
     }
@@ -1063,7 +1063,7 @@ impl PeerMachine {
         let seq = pool.last_seq();
         for id in shared.reactor.unsettled_ids(peer) {
             let short = shared.short(id);
-            self.state.mark_known(short, seq);
+            self.state.mark_known(id, short, seq);
         }
         // A session that had the go before, such as one the pool's restart
         // reopens, may not have read everything. It starts again from the
@@ -1107,7 +1107,7 @@ impl PeerMachine {
         let state = &mut self.state;
         for (id, size) in entries.iter().copied() {
             let short = shared.short(id);
-            state.mark_known(short, seq);
+            state.mark_known(id, short, seq);
             // Announcing an id while a request for it is outstanding says
             // the peer has it now. A `NotFound` for that request, which can
             // arrive later on the other stream, is still the peer's try, but

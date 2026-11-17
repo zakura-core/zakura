@@ -1217,12 +1217,14 @@ impl<E: VerifyError> MempoolState<E> {
                     );
                     return;
                 }
-                let mut on: Vec<transaction::Hash> = Vec::new();
-                for outpoint in missing {
-                    if !on.contains(&outpoint.hash) {
-                        on.push(outpoint.hash);
-                    }
-                }
+                // A set keeps this linear: a peer's transaction can list
+                // thousands of inputs.
+                let mut seen: HashSet<transaction::Hash> = HashSet::default();
+                let on: Vec<transaction::Hash> = missing
+                    .iter()
+                    .map(|outpoint| outpoint.hash)
+                    .filter(|hash| seen.insert(*hash))
+                    .collect();
                 self.admission_at(key).stage = Stage::Parked { on };
             }
             Outcome::LocalFault(fault) => self.fail_locally(key, fault),

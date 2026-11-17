@@ -17,7 +17,7 @@
 //! transaction refused at verification, or removed for any reason but a
 //! block mining it, is invalidated, as today.
 
-use std::{collections::HashSet, time::Duration};
+use std::collections::HashSet;
 
 use futures::{future::BoxFuture, FutureExt};
 
@@ -43,14 +43,6 @@ use super::super::Outbound;
 
 /// The most ids one advertisement carries.
 const MAX_ANNOUNCED: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
-
-/// The longest one read waits, in all, for the indexer to drain the change
-/// channel. A subscriber that is still behind after it lags, and its stream
-/// ends, as a slow subscriber's does today.
-const MAX_DRAIN_WAIT: Duration = Duration::from_secs(1);
-
-/// How often a read checks whether the indexer drained the channel.
-const DRAIN_POLL: Duration = Duration::from_millis(1);
 
 /// The announcer and the change stream.
 pub(crate) struct Follower {
@@ -81,7 +73,6 @@ impl Follower {
                 subscriber,
                 changes,
                 capacity,
-                drain_below: (capacity / 2).max(1),
                 cursor: ChangeSeq::default(),
             },
         }
@@ -219,9 +210,6 @@ struct ChangeStream {
     subscriber: MempoolTxSubscriber,
     changes: broadcast::Sender<MempoolChange>,
     capacity: usize,
-    /// A read sends an event only while fewer than this many are queued,
-    /// for at most [`MAX_DRAIN_WAIT`]: half the channel's capacity.
-    drain_below: usize,
     cursor: ChangeSeq,
 }
 
@@ -229,7 +217,7 @@ impl ChangeStream {
     /// Sends events until the core stops.
     async fn run(mut self) {
         loop {
-            self.read().await;
+            self.read();
             if !self.pool.snapshot_changed().await {
                 return;
             }
@@ -238,21 +226,20 @@ impl ChangeStream {
 
     /// Reads the log from the cursor to the latest snapshot, and sends its
     /// events.
-    async fn read(&mut self) {
+    fn read(&mut self) {
         let Some(view) = self.pool.view(self.cursor) else {
             return;
         };
         match view.changes {
             ChangesSince::Entries(entries) => {
-                let wait_until = tokio::time::Instant::now() + MAX_DRAIN_WAIT;
                 let mut batch = Batch::default();
                 for entry in entries {
                     if batch.would_reorder(entry.change) {
-                        self.send(std::mem::take(&mut batch), wait_until).await;
+                        self.send(std::mem::take(&mut batch));
                     }
                     batch.take(entry.change);
                 }
-                self.send(batch, wait_until).await;
+                self.send(batch);
             }
             ChangesSince::Resync => {
                 // The log moved past this reader. The snapshot cannot give back
@@ -269,16 +256,10 @@ impl ChangeStream {
         self.cursor = view.snapshot.last_change;
     }
 
-    /// Sends `batch`'s events. Before each, waits until fewer than
-    /// `drain_below` are queued or `wait_until` passes, so a subscriber that
-    /// keeps up is never overrun by one read, however long. Nobody listening
-    /// is fine.
-    async fn send(&self, batch: Batch, wait_until: tokio::time::Instant) {
+    /// Sends `batch`'s events. A subscriber that falls behind lags, and its
+    /// stream ends, as today. Nobody listening is fine.
+    fn send(&self, batch: Batch) {
         for event in batch.events() {
-            while self.changes.len() >= self.drain_below && tokio::time::Instant::now() < wait_until
-            {
-                tokio::time::sleep(DRAIN_POLL).await;
-            }
             let _ = self.changes.send(event);
         }
     }
@@ -580,12 +561,11 @@ mod tests {
     }
 
     /// One read of many add and removal cycles of the same transaction
-    /// reaches an indexer that keeps reading as every event, in order, even
-    /// though the read holds more events than the channel.
+    /// reaches the indexer as every event, in order.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn repeated_changes_to_one_transaction_reach_the_indexer_in_order() {
         let (handle, inbox) = pool_port();
-        let (changes, mut events) = broadcast::channel(16);
+        let (changes, mut events) = broadcast::channel(128);
         let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
         for _ in 0..33 {
             inbox.publish([Change::Added(id)], |last| snapshot(Vec::new(), last));
@@ -603,7 +583,7 @@ mod tests {
                 BoxCloneSyncService::new(Gate::default()),
                 MempoolTxSubscriber::new(changes.clone()),
                 changes,
-                16,
+                128,
             )
             .run(),
         );
@@ -622,8 +602,7 @@ mod tests {
         assert_eq!(kinds, expected);
     }
 
-    /// An indexer that stops reading lags once the read has waited its
-    /// bound, so the follower is not held up for good.
+    /// An indexer that stops reading lags, and the follower is not held up.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_indexer_that_stops_reading_lags_instead_of_holding_the_follower() {
         let (handle, inbox) = pool_port();
@@ -649,7 +628,7 @@ mod tests {
             )
             .run(),
         );
-        tokio::time::sleep(MAX_DRAIN_WAIT * 2).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             matches!(
                 events.try_recv(),
@@ -682,18 +661,17 @@ mod tests {
             )
             .run(),
         );
-        // More events than the channel holds, so the change stream waits for
-        // the subscriber to take some.
+        // More events than the channel holds, so the subscriber lags.
         let id = UnminedTxId::Legacy(zakura_chain::transaction::Hash([7; 32]));
         inbox.publish(std::iter::repeat_n(Change::Refused(id), 33), |last| {
             snapshot(Vec::new(), last)
         });
-        tokio::time::sleep(MAX_DRAIN_WAIT / 4).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
         inbox.publish([Change::Added(pooled.transaction.id())], |last| {
             snapshot(vec![pooled.clone()], last)
         });
-        tokio::time::sleep(MAX_DRAIN_WAIT / 4).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(
             gate.advertised.lock().expect("no panics").clone(),
             vec![[pooled.transaction.id()].into()],
@@ -727,7 +705,7 @@ mod tests {
             )
             .run(),
         );
-        tokio::time::sleep(MAX_DRAIN_WAIT).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             matches!(
                 early.try_recv(),
@@ -738,7 +716,7 @@ mod tests {
 
         let mut later = subscriber.subscribe();
         inbox.publish([Change::Refused(id)], |last| snapshot(Vec::new(), last));
-        let event = tokio::time::timeout(MAX_DRAIN_WAIT, later.recv())
+        let event = tokio::time::timeout(Duration::from_secs(1), later.recv())
             .await
             .expect("the follower goes on")
             .expect("a later subscriber gets what comes after");

@@ -1087,6 +1087,96 @@ async fn trusted_http_rejects_malformed_bytes_and_preserves_validation_after_cli
     assert!(matches!(response, zakura_state::Response::Block(Some(_))));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_block_with_unknown_parent_is_not_relayed_early() {
+    let _init = zakura_test::init();
+    // An isolated miner builds a parent and child that the relay has not seen.
+    let miner = Node::new(None).await;
+    let parent = miner.template().await;
+    assert_eq!(
+        miner
+            .submit(parent.zcash_serialize_to_vec().unwrap(), false)
+            .await,
+        "accepted"
+    );
+    let child = miner.template().await;
+    assert_eq!(child.header.previous_block_hash, parent.hash());
+    let child_bytes = child.zcash_serialize_to_vec().unwrap();
+
+    let mut relay = Node::new(None).await;
+    let mut receiver = Node::new(Some(relay.p2p)).await;
+    relay.connected().await;
+    receiver.connected().await;
+
+    relay.gate.hold();
+    let orphan = tokio::spawn(submit(
+        relay.rpc,
+        relay.auth.clone(),
+        child_bytes.clone(),
+        true,
+    ));
+    assert_eq!(relay.gate.entered().await, child.hash());
+    // Early relay would reach the receiver within milliseconds while validation is held.
+    assert!(
+        timeout(Duration::from_secs(2), receiver.advertisements.recv())
+            .await
+            .is_err(),
+        "a block whose parent is unknown is not announced before validation"
+    );
+    relay.gate.release();
+    assert_eq!(orphan.await.unwrap(), "inconclusive");
+    assert!(relay.pending.get(child.hash()).is_none());
+
+    assert_eq!(
+        relay
+            .submit(parent.zcash_serialize_to_vec().unwrap(), true)
+            .await,
+        "accepted"
+    );
+    assert_eq!(relay.gate.entered().await, parent.hash());
+    assert_eq!(
+        timeout(Duration::from_secs(20), receiver.advertisements.recv())
+            .await
+            .unwrap(),
+        Some(parent.hash())
+    );
+    // This fixture has no syncer, so the receiver must commit the parent before it can accept
+    // the child.
+    timeout(Duration::from_secs(20), async {
+        while receiver.tip.best_tip_hash() != Some(parent.hash()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the receiver fetches the parent from the relay");
+
+    // Once the parent is committed, the same child is relayed early again.
+    relay.gate.hold();
+    let retry = tokio::spawn(submit(relay.rpc, relay.auth.clone(), child_bytes, true));
+    assert_eq!(relay.gate.entered().await, child.hash());
+    // The parent can be announced twice: early, then after it commits.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match receiver.advertisements.recv().await {
+                Some(hash) if hash == child.hash() => break,
+                Some(hash) => assert_eq!(hash, parent.hash()),
+                None => panic!("the receiver's inbound service stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the child is announced while its validation is held");
+    relay.gate.release();
+    assert_eq!(retry.await.unwrap(), "accepted");
+    timeout(Duration::from_secs(20), async {
+        while receiver.tip.best_tip_hash() != Some(child.hash()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the receiver fetches the retried child from the relay");
+}
+
 #[tokio::test]
 async fn trusted_validation_timeout_withdraws_body_and_allows_retry() {
     let _init = zakura_test::init();

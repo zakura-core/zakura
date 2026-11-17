@@ -997,11 +997,9 @@ MAX_SERVES        = 16        requests this node serves at once, sent in its Hel
 
 The sender serves an id only once it has queued an `Inv` carrying it on the data stream. The body
 then follows that `Inv` on the same ordered stream, so the peer always reads the `Inv` first. It
-answers `NotFound` for an id it never announced to that peer, or one its pool no longer holds. A
-transaction the pool hides while it checks it again after a reorg is still held, so a request for
-one is served: the receiver checks the body against its own tip, and charges nothing for a failure
-that depends on the tip. Nothing new is announced while it is hidden. It never answers `NotFound`,
-and never closes a peer, because of its own load: a full queue makes it wait.
+answers `NotFound` for an id it never announced to that peer, or one its pool no longer holds. It
+never answers `NotFound`, and never closes a peer, because of its own load: a full queue makes it
+wait.
 
 A wire violation closes the connection with a recorded cause. The receiver judges a `Tx` by its id
 and length before it decodes the body. It drops a late answer, or one from a peer that started

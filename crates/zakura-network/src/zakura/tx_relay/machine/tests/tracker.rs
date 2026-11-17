@@ -3,14 +3,15 @@
 //! The tracker never decides what the machine should do. It keeps simple
 //! state that follows from what the test sent and what came back: the open
 //! sessions, the calls, reservations, requests and bodies in flight, what
-//! each peer told the node and which adverts went out to it. Each check
+//! each peer told the node, which adverts went out to it, and how long the
+//! charges it earned surely cool it. Each check
 //! compares two of those facts, or one of them with what the machine
 //! reports.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use indexmap::{IndexMap, IndexSet};
-use zakura_chain::transaction::UnminedTxId;
+use zakura_chain::{block::Height, transaction::UnminedTxId};
 use zakura_node_services::mempool::port::{
     Change, Charge, LocalFault, RejectionScope, ReservationId,
 };
@@ -18,7 +19,7 @@ use zakura_rt::collections::HashSet;
 
 use crate::zakura::tx_relay::machine::{
     CallId, CloseReason, Granted, PeerKey, RelayEffect, RelayMachine, SessionId, Unreserved,
-    Verdict, WaiterId, TRIED_PER_ENTRY,
+    Verdict, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, TRIED_PER_ENTRY,
 };
 
 /// The input a step answers, with what the record needs of it.
@@ -107,6 +108,9 @@ pub(crate) struct Tracker {
     active: bool,
     /// Whether the machine was told the core stopped.
     stopped: bool,
+    /// For each peer a verdict charged, when its cooldown surely ends and
+    /// when it may end at the latest. See [`Tracker::charged`].
+    cooling: BTreeMap<PeerKey, (Duration, Duration)>,
     /// How often each kind of effect, answer and change happened.
     pub(crate) seen: BTreeMap<String, usize>,
 }
@@ -161,6 +165,27 @@ impl Tracker {
         *self.seen.entry(kind.into()).or_default() += 1;
     }
 
+    /// A verdict charged `peer` with `charge` at `now`. A cooldown lasts from
+    /// [`BASE_COOLDOWN`] up to [`MAX_COOLDOWN`], and a ban exactly
+    /// [`MAX_COOLDOWN`]: no test fills the cooldown table and then bans. A
+    /// cooldown charged while the last may still run adds no strike, so only
+    /// one after the last surely ended starts another.
+    fn charged(&mut self, peer: PeerKey, charge: Charge, now: Duration) {
+        let (sure, latest) = self.cooling.get(&peer).copied().unwrap_or_default();
+        let ends = match charge {
+            Charge::None => return,
+            Charge::Ban => (now + MAX_COOLDOWN, now + MAX_COOLDOWN),
+            Charge::Cooldown if now >= latest => (now + BASE_COOLDOWN, now + MAX_COOLDOWN),
+            Charge::Cooldown => (sure, latest.max(now + MAX_COOLDOWN)),
+        };
+        self.cooling.insert(peer, ends);
+    }
+
+    /// Whether `peer`'s cooldown surely still runs at `now`.
+    fn cools(&self, peer: PeerKey, now: Duration) -> bool {
+        self.cooling.get(&peer).is_some_and(|(sure, _)| now < *sure)
+    }
+
     /// The ids of `peer`'s bodies awaiting their verdicts.
     fn unsettled(&self, peer: PeerKey) -> impl Iterator<Item = UnminedTxId> + '_ {
         let bodies = self.bodies.values();
@@ -169,10 +194,35 @@ impl Tracker {
             .map(|body| body.id)
     }
 
-    /// Records the step `cause` started, checking each effect against the
-    /// record so far.
-    pub(crate) fn step(&mut self, cause: &Cause, effects: &[RelayEffect]) {
+    /// Records the step `cause` started at `now`, with the machine shown
+    /// `tip`, checking each effect against the record so far.
+    pub(crate) fn step(
+        &mut self,
+        cause: &Cause,
+        effects: &[RelayEffect],
+        now: Duration,
+        tip: Height,
+    ) {
         self.before(cause);
+        if let Cause::Verdict(
+            _,
+            Verdict::Rejected {
+                charge, tip: at, ..
+            },
+        ) = cause
+        {
+            let body = self.answered.expect("the step answers a body");
+            // A cooldown counts only for a verdict decided at the tip, and a
+            // full cooldown table closes the peer and cools nothing.
+            let counts = *charge == Charge::Ban || *at == tip;
+            let full = effects.iter().any(|effect| match effect {
+                RelayEffect::Close { reason, .. } => *reason == CloseReason::CooldownsFull,
+                _ => false,
+            });
+            if counts && !body.exempt && !full {
+                self.charged(body.peer, *charge, now);
+            }
+        }
         let (mut submitted, mut answers) = (false, 0);
         for effect in effects {
             match effect {
@@ -191,6 +241,8 @@ impl Tracker {
                     let hello = self.open.get(session).is_some_and(|open| open.hello);
                     let live = hello && self.active && !granted.cancelled;
                     assert!(live, "a request after the Hello, under a live grant");
+                    let peer = self.open[session].peer;
+                    assert!(!self.cools(peer, now), "a request to a peer that cools");
                     self.requests.insert((*session, *id), granted.reservation);
                     self.saw("ask");
                 }
@@ -208,6 +260,8 @@ impl Tracker {
                     assert_eq!(used, asked, "a body under its request's reservation");
                     let open = &self.open[session];
                     let (peer, exempt) = (open.peer, open.exempt);
+                    let cools = self.cools(peer, now);
+                    assert!(!cools, "a body of a peer that cools reaches the pool");
                     self.bodies.insert(
                         *waiter,
                         Body {

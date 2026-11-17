@@ -1716,6 +1716,55 @@ async fn a_wire_violation_closes_the_connection() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Charges: a body that isn't exactly one transaction's encoding closes the
+/// connection and never reaches the pool. One peer sends bytes that don't
+/// decode, another a transaction with a byte after it.
+#[tokio::test]
+async fn an_undecodable_body_closes_the_connection() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let (victim, observed) =
+        observed_node(145, TestPool::new(Held::default()), cools(), 16).await?;
+    let pool = victim.pool.as_ref().expect("the node runs tx-relay");
+    let undecodable = "tx-relay: undecodable transaction";
+
+    let garbage = unknown(1);
+    let mut peer = RawRelay::connect(&victim, 1_145).await?;
+    peer.start().await?;
+    peer.send(&TxRelayMessage::Inv(vec![(garbage, 200)]))
+        .await?;
+    peer.asked(garbage).await?;
+    peer.send(&TxRelayMessage::Tx {
+        id: garbage,
+        body: vec![0xff; 200],
+    })
+    .await?;
+    peer.closed().await?;
+    assert_eq!(observed.cause(&peer), Some(undecodable));
+
+    let tx = transaction();
+    let mut body = tx
+        .transaction
+        .transaction()
+        .zcash_serialize_to_vec()
+        .expect("a test transaction serializes");
+    body.push(0);
+    let mut trailing = RawRelay::connect(&victim, 1_146).await?;
+    trailing.start().await?;
+    trailing
+        .send(&TxRelayMessage::Inv(vec![(id(&tx), size(&tx) + 1)]))
+        .await?;
+    trailing.asked(id(&tx)).await?;
+    trailing
+        .send(&TxRelayMessage::Tx { id: id(&tx), body })
+        .await?;
+    trailing.closed().await?;
+    assert_eq!(observed.cause(&trailing), Some(undecodable));
+    assert!(pool.received().is_empty(), "neither body reaches the pool");
+
+    victim.node.shutdown().await;
+    Ok(())
+}
+
 /// Charges: an answer the node didn't ask for closes the connection, and
 /// its body never reaches the pool. One peer answers a request with a `Tx`
 /// and then a `NotFound`, another sends the same `Tx` twice, and a third

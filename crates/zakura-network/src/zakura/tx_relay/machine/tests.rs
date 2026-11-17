@@ -175,7 +175,8 @@ impl Bench {
         if let Some(steps) = &mut self.steps {
             steps.push((self.now, self.effects.clone()));
         }
-        self.tracker.step(&cause, &self.effects);
+        self.tracker
+            .step(&cause, &self.effects, self.now, self.tip.height);
         self.machine.assert_invariants();
         self.tracker.check(&self.machine);
     }

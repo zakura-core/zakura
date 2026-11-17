@@ -1462,7 +1462,7 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
 
             let original_started = tokio::time::Instant::now();
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let response = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+            let mut response = tokio::spawn(network.clone().oneshot(Request::BlockByHashHedge {
                 hash,
                 first_request_started: original_pending.then_some(original_started),
             }));
@@ -1479,10 +1479,13 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
             discover_tx
                 .unbounded_send(Ok::<_, BoxError>(Change::Insert(addr, client)))
                 .unwrap();
-            assert_eq!(
-                StoragePeers::next_message(&mut peer).await,
-                Message::GetData(vec![hash.into()]),
-            );
+            tokio::select! {
+                biased;
+                result = &mut response => panic!("hedge completed before the peer received it: {result:?}"),
+                message = StoragePeers::next_message(&mut peer) => {
+                    assert_eq!(message, Message::GetData(vec![hash.into()]));
+                }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
             peer.peer_inbound
                 .send(Ok(Message::Block(block.into())))

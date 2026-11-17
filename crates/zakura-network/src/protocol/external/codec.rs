@@ -69,9 +69,12 @@ const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 
 /// The smallest `block` message body whose checksum is shared between connections.
 ///
-/// Looking a checksum up hashes the block's header, which is about 1.5 kB. Hashing a body
-/// smaller than this costs too little for the lookup to save time.
-pub(crate) const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 64 * 1024;
+/// Looking a checksum up hashes the block's header, which is about 1.5 kB, so it costs about
+/// as much as hashing a 1.6 KiB body. Sharing saves time once a body costs more than twice a
+/// lookup, which the `block_checksum_threshold` benchmark puts at about 3.3 KiB. Both costs are
+/// SHA-256 over bytes, so that size barely depends on the CPU. This threshold leaves a margin
+/// of more than twice that.
+pub(crate) const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 8 * 1024;
 
 /// The number of blocks whose checksums are remembered.
 ///
@@ -1161,5 +1164,53 @@ impl Codec {
         });
 
         result.expect("scope has already finished")
+    }
+}
+
+/// Benchmark access to the two ways a `block` message body's checksum is obtained, used to
+/// choose [`MIN_SHARED_CHECKSUM_BODY_LEN`]. Not part of the production API.
+#[cfg(feature = "internal-bench")]
+pub mod checksum_bench {
+    use super::*;
+
+    /// The smallest `block` message body whose checksum is shared between connections.
+    pub const MIN_SHARED_BODY_LEN: usize = MIN_SHARED_CHECKSUM_BODY_LEN;
+
+    /// Hashes `body` the way every unshared message body is hashed.
+    pub fn hash_body(body: &[u8]) -> sha256d::Checksum {
+        message_checksum(body)
+    }
+
+    /// A full shared checksum cache that remembers `block`'s checksum.
+    pub struct CachedBlock {
+        checksums: BlockChecksums,
+        body_len: usize,
+    }
+
+    impl CachedBlock {
+        /// Fills a cache to capacity with other blocks, then remembers `block`'s checksum.
+        pub fn new(block: &Block, body_len: usize) -> Self {
+            let checksums = BlockChecksums::default();
+            for i in 0..SHARED_CHECKSUM_BLOCKS {
+                let mut other = [0; 32];
+                // Widening usize to u64 is lossless on supported targets.
+                other[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                checksums.checksum_with(block::Hash(other), body_len, || sha256d::Checksum([0; 4]));
+            }
+            checksums.checksum_with(block.hash(), body_len, || sha256d::Checksum([1; 4]));
+            Self {
+                checksums,
+                body_len,
+            }
+        }
+
+        /// Does what sending `block` does when its checksum is remembered: hashes its header
+        /// and finds the checksum.
+        pub fn lookup(&self, block: &Block) -> sha256d::Checksum {
+            self.checksums
+                .checksum_with(block.hash(), self.body_len, || {
+                    unreachable!("the benchmark block's checksum is remembered")
+                })
+        }
     }
 }

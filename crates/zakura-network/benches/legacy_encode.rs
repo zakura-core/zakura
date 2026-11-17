@@ -7,6 +7,9 @@
 //! so its checksum and length come from the block-checksum cache, as when a node serves
 //! the same block to many peers. `first_send` uses a new codec each time, as when a peer
 //! downloads blocks nobody has asked for recently. Every send starts from an empty buffer.
+//! A block is sent the way a connection serves one, including hashing it to record the
+//! upload, so a change that moves hashing between the connection and the encoder is timed
+//! in full.
 #![allow(missing_docs)]
 
 use std::{hint::black_box, io::Cursor, sync::Arc};
@@ -64,9 +67,49 @@ fn block_targets() -> Vec<usize> {
         .collect()
 }
 
+/// A message to send: a block, sent the way a connection serves one, or any other message.
+enum Payload {
+    Block(Arc<Block>),
+    Other(Message),
+}
+
+/// Frames `message` into an empty buffer, the worst case for a connection whose buffer has
+/// no room left: the whole frame needs new memory.
+fn encode(codec: &mut Codec, message: Message) -> BytesMut {
+    let mut dst = BytesMut::new();
+    codec
+        .encode(black_box(message), &mut dst)
+        .expect("message fits in a protocol message");
+    dst
+}
+
+/// What a connection does to serve one requested block: make the block message, record the
+/// upload by the block's hash, then frame the message.
+fn serve_block(codec: &mut Codec, block: &Arc<Block>) -> BytesMut {
+    let message = Message::Block(block.clone().into());
+    let Message::Block(sent) = &message else {
+        unreachable!("the message was made from a block");
+    };
+    black_box(sent.hash());
+    encode(codec, message)
+}
+
+fn send(codec: &mut Codec, payload: &Payload) -> BytesMut {
+    match payload {
+        Payload::Block(block) => serve_block(codec, block),
+        Payload::Other(message) => encode(codec, message.clone()),
+    }
+}
+
+fn new_codec() -> Codec {
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    codec
+}
+
 fn bench_encode(c: &mut Criterion) {
     let pool = shielded_era_transactions();
-    let mut cases: Vec<(String, Message)> = block_targets()
+    let mut cases: Vec<(String, Payload)> = block_targets()
         .into_iter()
         .map(|target| {
             let block = synthetic_block(target, &pool);
@@ -75,62 +118,44 @@ fn bench_encode(c: &mut Criterion) {
                 block.zcash_serialized_size() / 1000,
                 block.transactions.len()
             );
-            (label, Message::Block(Arc::new(block).into()))
+            (label, Payload::Block(Arc::new(block)))
         })
         .collect();
     cases.push((
         "block_mainnet_1687118_small".to_string(),
-        Message::Block(
-            Arc::new(
-                zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
-                    .zcash_deserialize_into::<Block>()
-                    .expect("test vector is a valid block"),
-            )
-            .into(),
-        ),
+        Payload::Block(Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("test vector is a valid block"),
+        )),
     ));
     cases.push((
         "tx_small".to_string(),
-        Message::Tx(
+        Payload::Other(Message::Tx(
             zakura_test::vectors::DUMMY_TX1
                 .zcash_deserialize_into::<Transaction>()
                 .expect("test vector is a valid transaction")
                 .into(),
-        ),
+        )),
     ));
 
     let mut group = c.benchmark_group("legacy_encode");
     group.sample_size(30);
-    for (label, message) in cases {
-        let codec = || {
-            let mut codec = Codec::builder().finish();
-            codec.reconfigure_full_body_len();
-            codec
-        };
-        let encode = |codec: &mut Codec, message: &Message| {
-            // Each send starts from an empty buffer, the worst case for a connection whose
-            // buffer has no room left: the whole frame needs new memory.
-            let mut dst = BytesMut::new();
-            codec
-                .encode(black_box(message.clone()), &mut dst)
-                .expect("message fits in a protocol message");
-            dst
-        };
-
-        let mut warm = codec();
-        group.throughput(Throughput::Bytes(encode(&mut warm, &message).len() as u64));
+    for (label, payload) in cases {
+        let mut warm = new_codec();
+        group.throughput(Throughput::Bytes(send(&mut warm, &payload).len() as u64));
 
         // The same block sent again, as to many peers: its checksum and length are known.
         group.bench_with_input(
             BenchmarkId::new("repeat_send", &label),
-            &message,
-            |b, message| b.iter(|| black_box(encode(&mut warm, message))),
+            &payload,
+            |b, payload| b.iter(|| black_box(send(&mut warm, payload))),
         );
         // A block nobody has been sent yet, as when a peer downloads old blocks.
         group.bench_with_input(
             BenchmarkId::new("first_send", &label),
-            &message,
-            |b, message| b.iter(|| black_box(encode(&mut codec(), message))),
+            &payload,
+            |b, payload| b.iter(|| black_box(send(&mut new_codec(), payload))),
         );
     }
     group.finish();

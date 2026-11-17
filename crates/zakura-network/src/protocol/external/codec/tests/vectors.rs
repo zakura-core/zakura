@@ -1194,6 +1194,31 @@ fn checksum_remembered_for_another_body_length_is_replaced() {
     );
 }
 
+/// A block message carries the hash of its block, and a block message that is sent and
+/// received again carries the same hash.
+#[test]
+fn block_message_carries_its_block_hash() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let message = Message::Block(block.clone().into());
+    let Message::Block(sent) = &message else {
+        unreachable!("the message was made from a block");
+    };
+    assert_eq!(sent.hash(), block.hash());
+
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    let mut frame = BytesMut::new();
+    codec
+        .encode(message, &mut frame)
+        .expect("test block should encode");
+    let Some(Message::Block(received)) = codec.decode(&mut frame).expect("frame should decode")
+    else {
+        panic!("a block frame decodes to a block message");
+    };
+    assert_eq!(received.hash(), block.hash());
+}
+
 /// A block remembered with a body length over the size limit is still sent, because only
 /// the bytes actually written are checked against the limit.
 #[test]

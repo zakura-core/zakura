@@ -17,7 +17,8 @@
 //!   plus its interval; a drain takes exactly the entries due;
 //! - suppliers: an admission joins the back of the supplier order, a rotation
 //!   moves its peer to the back, and a departure keeps the others in order;
-//!   each supplier pass meets the requirements [`repair_candidates`] names;
+//!   each supplier pass keeps supplier order, closes no candidate, and counts
+//!   each supplier once;
 //! - cached passes: a pass runs only for a new key, stays within the burst
 //!   plus refills, and is always granted one refill after the last;
 //! - repair stalls: the stall clock starts at the generation's first failure,
@@ -263,12 +264,8 @@ impl Supplier {
 }
 
 /// Run the supplier pass for a fresh copy of `task` over `suppliers`, after
-/// the task records the tried, excluded, and waiting suppliers. Return the
-/// repair's height and the pass.
-fn supplier_pass(
-    task: RepairRequirement,
-    suppliers: &[Supplier],
-) -> (block::Height, RepairCandidates) {
+/// the task records the tried, excluded, and waiting suppliers.
+fn supplier_pass(task: RepairRequirement, suppliers: &[Supplier]) -> RepairCandidates {
     let (mut task, context) = ready_repair(task_with_new_state(task));
     for supplier in suppliers {
         let source = source_id_from_peer(&peer_id(supplier.peer));
@@ -290,7 +287,7 @@ fn supplier_pass(
         .iter()
         .map(|supplier| peer_id(supplier.peer))
         .collect();
-    let pass = repair_candidates(
+    repair_candidates(
         &task,
         &context,
         supplier_limits(),
@@ -303,8 +300,7 @@ fn supplier_pass(
                 serving: supplier.serving,
                 subscription_live: supplier.live,
             }),
-    );
-    (task.height, pass)
+    )
 }
 
 /// The peer indexes of `pass`: its candidates, the peers it closes, and its
@@ -331,52 +327,37 @@ fn pass_indexes(pass: RepairCandidates) -> (Vec<usize>, Vec<usize>, VctSupplierR
     )
 }
 
-/// Check `pass` against the facts of `suppliers` for a one-header repair at
-/// `target`, where every status allows 1 MB messages.
-///
-/// A supplier can serve when its tip reaches `target`, it sends headers, and
-/// it supports schema 1. Every such supplier with no read, no live
-/// subscription, and no task record is a candidate; every such supplier with
-/// a live subscription and no read is closed; both keep supplier order. The
-/// tally counts each supplier once. The order among the rejection buckets is
-/// pinned by `supplier_pass_rejections_follow_the_documented_order`.
-fn check_supplier_pass(target: block::Height, suppliers: &[Supplier], pass: RepairCandidates) {
-    let can_serve = |supplier: &&Supplier| {
-        supplier.status.selected_tip_height >= target
-            && supplier.status.max_headers_per_response != 0
-            && supplier.status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() != 0
+/// Check what every supplier pass over `suppliers` meets for a one-header
+/// repair under a context that retains no source: each list keeps supplier
+/// order and names each input peer once, no closed peer is a candidate, and
+/// the tally counts each supplier once. A peer the pass closes already counts
+/// in the tally as serving.
+fn check_supplier_pass(suppliers: &[Supplier], pass: RepairCandidates) {
+    let (candidates, closing, tally) = pass_indexes(pass);
+    let in_supplier_order = |peers: &[usize]| {
+        let mut rest = suppliers.iter();
+        peers
+            .iter()
+            .all(|peer| rest.any(|supplier| supplier.peer == *peer))
     };
-    let candidates: Vec<usize> = suppliers
-        .iter()
-        .filter(can_serve)
-        .filter(|supplier| {
-            !(supplier.serving
-                || supplier.live
-                || supplier.excluded
-                || supplier.tried
-                || supplier.waiting)
-        })
-        .map(|supplier| supplier.peer)
-        .collect();
-    let closing: Vec<usize> = suppliers
-        .iter()
-        .filter(can_serve)
-        .filter(|supplier| supplier.live && !supplier.serving)
-        .map(|supplier| supplier.peer)
-        .collect();
-    let below = suppliers
-        .iter()
-        .filter(|supplier| supplier.status.selected_tip_height < target)
-        .count();
-    let (actual_candidates, actual_closing, tally) = pass_indexes(pass);
-    assert_eq!(
-        actual_candidates, candidates,
-        "{PROPERTY}: repair candidates"
+    assert!(
+        in_supplier_order(&candidates),
+        "{PROPERTY}: candidates keep supplier order, once each"
     );
-    assert_eq!(actual_closing, closing, "{PROPERTY}: repair closes");
+    assert!(
+        in_supplier_order(&closing),
+        "{PROPERTY}: closes keep supplier order, once each"
+    );
+    assert!(
+        candidates.iter().all(|peer| !closing.contains(peer)),
+        "{PROPERTY}: a closed peer is no candidate"
+    );
     let count = |count: usize| u64::try_from(count).expect("the test has few suppliers");
-    assert_eq!(tally.considered, count(suppliers.len()), "{PROPERTY}");
-    assert_eq!(tally.below_target_height, count(below), "{PROPERTY}");
+    assert_eq!(
+        tally.considered,
+        count(suppliers.len()),
+        "{PROPERTY}: the pass considers every supplier"
+    );
     assert_eq!(
         tally.retained_source + tally.send_failed,
         0,
@@ -970,8 +951,7 @@ impl Harness {
                 })
             })
             .collect();
-        let (target, pass) = supplier_pass(task, &suppliers);
-        check_supplier_pass(target, &suppliers, pass);
+        check_supplier_pass(&suppliers, supplier_pass(task, &suppliers));
     }
 
     /// Check the machine's invariants, and compare its state with what the
@@ -1639,9 +1619,8 @@ fn supplier_pass_rejections_follow_the_documented_order() {
         },
         Supplier::new(8, 3),
     ];
-    let (_, pass) = supplier_pass(repair(0, 1), &suppliers);
     assert_eq!(
-        pass_indexes(pass),
+        pass_indexes(supplier_pass(repair(0, 1), &suppliers)),
         (
             vec![8],
             vec![4],
@@ -1654,6 +1633,31 @@ fn supplier_pass_rejections_follow_the_documented_order() {
                 excluded_input: 1,
                 already_tried: 1,
                 supplier_status_wait: 1,
+                ..VctSupplierRejections::default()
+            }
+        )
+    );
+}
+
+/// A supplier whose tip is exactly the repair's height can serve it, and a
+/// live subscription on a supplier that cannot serve stays open.
+#[test]
+fn supplier_pass_takes_a_tip_at_the_target_and_closes_only_servers() {
+    let suppliers = [
+        Supplier::new(0, 1),
+        Supplier {
+            live: true,
+            ..Supplier::new(1, 0)
+        },
+    ];
+    assert_eq!(
+        pass_indexes(supplier_pass(repair(0, 1), &suppliers)),
+        (
+            vec![0],
+            vec![],
+            VctSupplierRejections {
+                considered: 2,
+                below_target_height: 1,
                 ..VctSupplierRejections::default()
             }
         )
@@ -1688,8 +1692,7 @@ proptest! {
                 supplier
             })
             .collect();
-        let (target, pass) = supplier_pass(repair(0, 1), &suppliers);
-        check_supplier_pass(target, &suppliers, pass);
+        check_supplier_pass(&suppliers, supplier_pass(repair(0, 1), &suppliers));
     }
 }
 

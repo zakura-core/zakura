@@ -853,6 +853,7 @@ impl Routine {
                 true
             }
             Err(_) => {
+                // Row 3 of the close table.
                 self.io.close.close("tx-relay: malformed frame");
                 false
             }
@@ -1410,7 +1411,8 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
     }
 }
 
-/// The recorded cause for a close the machine asked for.
+/// The recorded cause for a close the machine asked for, as the close
+/// table's row for it gives.
 fn close_reason(reason: CloseReason) -> &'static str {
     match reason {
         CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",

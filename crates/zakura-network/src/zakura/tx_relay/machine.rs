@@ -11,27 +11,28 @@
 //! - [`wanted::WantedIds`]: the ids this node wants, each with its claim,
 //!   holder count, timing and the peers that tried it, and a ring of the ids
 //!   whose entry changed, which each routine reads from its own cursor.
-//! - [`reactor::Reactor`]: cooldowns, which session of a peer may fetch, the
-//!   submissions and reserve calls of ended sessions, and the ranking.
+//! - [`reactor::Reactor`]: cooldowns and parks, which session of a peer may
+//!   fetch, the submissions and reserve calls of ended sessions, and the
+//!   ranking.
 //!
 //! The machines do no IO and call nothing. The IO hands each one its peer's
 //! messages, the pool's answers and the clock as inputs, with the pool as
 //! the snapshot its routine last read, and carries out the
 //! [`RelayEffect`]s. A step's effect on another session, a close or the go,
-//! is a [`NodeEffect`] the IO routes to that session. [`RelayMachine`]
-//! composes every session's machine in one place, as the routines together
-//! behave.
+//! is a [`NodeEffect`] the IO routes to that session, and [`Marks`] says
+//! when every session looks again. The tests compose every session's
+//! machine as one `RelayMachine`, which wakes sessions by those rules.
 //!
 //! The pool is behind effects. A reserve call goes out as
 //! [`RelayEffect::Reserve`] and its answer comes back through
-//! [`RelayMachine::reserve_answer`]. A body goes out as
+//! [`PeerMachine::reserve_answer`]. A body goes out as
 //! [`RelayEffect::Submit`] and its verdict comes back through
-//! [`RelayMachine::verdict`]. A reservation given back goes out as
+//! [`PeerMachine::verdict`]. A reservation given back goes out as
 //! [`RelayEffect::Release`], which the IO carries out by dropping the
 //! [`Reservation`](zakura_node_services::mempool::port::Reservation), or as
 //! [`RelayEffect::FetchFailed`]. The pool's change log and snapshot come in
-//! through [`RelayMachine::pool_changed`], and a fetch the pool cancelled
-//! through [`RelayMachine::fetch_cancelled`].
+//! through [`PeerMachine::pool_changed`], and a fetch the pool cancelled
+//! through [`PeerMachine::fetch_cancelled`].
 //!
 //! Reserve answers, verdicts and pool changes are separate inputs, in
 //! whatever order the IO receives them. A body that passes its check goes to
@@ -63,7 +64,7 @@
 //!   attach another core. A stopped core publishes nothing more, so the
 //!   last snapshot still shows an active pool and no fetch token fires. The
 //!   machine learns of the stop from a `Stopped` answer or verdict, or from
-//!   [`RelayMachine::pool_stopped`], and from then on claims nothing. Its
+//!   the IO seeing the core go, and from then on claims nothing. Its
 //!   outstanding requests end by their deadlines or bodies, and nothing goes
 //!   back to the core. An `Inactive` answer while the snapshot shows an
 //!   active pool waits a retry delay, so a missed restart costs one delay.
@@ -109,14 +110,17 @@
 //!   since that peer is not asked for the entry again.
 //! - **A peer that leaves a request unanswered loses the session.** From
 //!   its deadline on, a request keeps its peer's slot and its answer is
-//!   dropped unread. Freeing only the relay's slot would leak the
-//!   transport's reservation, which `regulation::reservations` keeps, from
-//!   a node-wide pool, until the peer answers or the session ends, so
-//!   ending the session is the only thing that frees it, as block sync
-//!   disconnects a peer that stops reading. If one more deadline passes
-//!   without an answer, the session ends as unresponsive, so a peer that
-//!   never answers cannot hold its slots for ever. That time is fixed when
-//!   the request misses its deadline, and later requests never move it.
+//!   dropped unread. If one more deadline passes without an answer, the
+//!   peer stalled, so a peer that never answers cannot hold its slots for
+//!   ever. That time is fixed when the request misses its deadline, and
+//!   later requests never move it.
+//! - **A stall parks the session first.** A peer stalls when it leaves a
+//!   request unanswered as above, or stops reading until one of this node's
+//!   writers is full. The first stall ends only the session, so the peer's
+//!   other services keep going, and the peer's next sessions are refused
+//!   for [`PARK_COOLDOWN`]. A stall in the session the park lets in
+//!   afterwards closes the connection, as block sync does. Neither is a
+//!   charge.
 //!   The deadline runs whether or not the pool still holds the
 //!   reservation: a fetch the pool cancelled is no try, but left unanswered
 //!   it still ends the session. Arrival is when the machine handles the
@@ -198,12 +202,20 @@
 //! - **Announce what the pool admits, once, and never back to its source.**
 //!   A session announces an added id the pool holds, unless it already did
 //!   or its peer announced or supplied it. Sessions inside the id's window
-//!   announce at once, the rest after [`FanOut::advert_delay`].
-//! - **Serve only what was announced.** A `GetTxs` gets the body only for an
-//!   exact id this session announced and the pool still holds.
+//!   announce at once, the rest after [`FanOut::advert_delay`]. An `Inv`
+//!   carries an id only once none of its in-pool parents still waits to go
+//!   out to that session.
+//! - **An `Inv` waits for room.** One goes only while the data writer keeps
+//!   room for every body the peer may have requested, once the session's
+//!   last `Inv` is written, and once the byte rate pays for it.
+//! - **Serve only what was announced, within our `Hello`.** A `GetTxs` gets
+//!   the body only for an exact id this session announced and the pool
+//!   still holds. A peer has at most [`MAX_SERVES`] requests whose answers
+//!   the IO has not started, and never two for one id.
 //!
-//! Left out, because the IO owns them: the byte rate on `Inv`, the places a
-//! peer's requests to this node take and the close for one past them, and
+//! Every close is a row of the spec's `tx-relay` close table, which names
+//! its owner. Left out, because the IO and the transport own them: paying
+//! the `Inv` byte rate and charging it on receipt, and decoding and writing
 //! frames.
 
 pub(crate) mod peer;
@@ -479,46 +491,47 @@ pub(crate) enum Verdict {
     LocalFault(LocalFault),
 }
 
-/// Why the node closes a peer's connection.
+/// Why the node closes a peer's connection. Each names its row of the
+/// spec's `tx-relay` close table, in `docs/specs/peer-message-regulation.md`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CloseReason {
     /// The peer broke a wire rule.
     Violation(Violation),
-    /// A body it supplied earned a ban.
+    /// A body it supplied earned a ban. Row 13.
     Ban,
-    /// A body it supplied earned a second cooldown.
+    /// A body it supplied earned a second cooldown. Row 14.
     RepeatedCooldown,
     /// A body it supplied earned a cooldown, and the full cooldown table had
-    /// no room for the peer.
+    /// no room for the peer. Row 15.
     CooldownsFull,
     /// It left a request unanswered for one more deadline after missing it,
-    /// in the session its park let in.
+    /// in the session its park let in. Row 16.
     Unresponsive,
     /// It stopped reading what this node writes, in the session its park
-    /// let in.
+    /// let in. Row 16.
     StoppedReading,
 }
 
-/// A broken wire rule.
+/// A broken wire rule, with its row of the close table. See [`CloseReason`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Violation {
-    /// A second `Hello`.
+    /// A second `Hello`. Row 4.
     HelloTwice,
-    /// A `Hello` outside the protocol's limits.
+    /// A `Hello` outside the protocol's limits. Row 5.
     BadHello,
-    /// A state message before the peer's `Hello`.
+    /// A `GetTxs` before the peer's `Hello`. Row 6.
     NoHelloFirst,
-    /// An answer to nothing outstanding.
+    /// An answer to nothing outstanding. Row 9.
     Unrequested,
-    /// A body of another size than the peer announced.
+    /// A body of another size than the peer announced. Row 10.
     WrongSize,
-    /// A body that does not hash to the requested id.
+    /// A body that does not hash to the requested id. Row 11.
     WrongId,
-    /// A body that does not decode as one transaction.
+    /// A body that does not decode as one transaction. Row 12.
     Undecodable,
-    /// A request for an id the peer already has outstanding with us.
+    /// A request for an id the peer already has outstanding with us. Row 7.
     RequestedTwice,
-    /// A request past the [`MAX_SERVES`] our `Hello` serves at once.
+    /// A request past the [`MAX_SERVES`] our `Hello` serves at once. Row 8.
     TooManyRequests,
 }
 
@@ -567,7 +580,7 @@ pub(crate) enum RelayEffect {
         session: SessionId,
     },
     /// Reserve a slot at the pool to fetch `id`, and answer through
-    /// [`RelayMachine::reserve_answer`] with `call`.
+    /// [`PeerMachine::reserve_answer`] with `call`.
     Reserve {
         /// The call.
         call: CallId,
@@ -575,7 +588,7 @@ pub(crate) enum RelayEffect {
         id: UnminedTxId,
     },
     /// Submit `body` under `reservation`, and answer its verdict through
-    /// [`RelayMachine::verdict`] with `waiter`.
+    /// [`PeerMachine::verdict`] with `waiter`.
     Submit {
         /// The submission.
         waiter: WaiterId,

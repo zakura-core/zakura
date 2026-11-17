@@ -1311,11 +1311,12 @@ impl PeerMachine {
         }
     }
 
-    /// Its peer stalled. The first stall parks the session: it ends, its
-    /// connection stays, so the peer's other services keep going, and the
-    /// peer's next sessions are refused for [`PARK_COOLDOWN`]. A stall in
-    /// the session the park lets in afterwards closes the connection for
-    /// `reason`, as block sync does. Neither is a charge.
+    /// Its peer stalled, row 16 of the close table. The first stall parks
+    /// the session: it ends, its connection stays, so the peer's other
+    /// services keep going, and the peer's next sessions are refused for
+    /// [`PARK_COOLDOWN`]. A stall in the session the park lets in afterwards
+    /// closes the connection for `reason`, as block sync does. Neither is a
+    /// charge.
     fn stalled(&mut self, shared: &mut Shared, reason: CloseReason) {
         let session = self.session;
         let until = self.now.saturating_add(PARK_COOLDOWN);

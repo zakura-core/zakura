@@ -992,11 +992,11 @@ MAX_SERVES        = 16        requests this node serves at once, sent in its Hel
 
 | Message | Stream | Payload | Rule | Breach |
 |---------|--------|---------|------|--------|
-| `Hello` | State | requests served at once (`u16`), largest transaction accepted (`u32`) | First on the state stream, once. Served requests 1 to the table's maximum. Size at most `MAX_TX_BYTES`. | Violation |
-| `Inv` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Inv` byte rate. | Violation |
-| `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests it allows, counted until each answer is queued. No id outstanding twice. | Violation |
-| `Tx` | Data | the requested id, then the body | Answers a request outstanding to that peer, once. Exactly the announced size, at most the requester's limit, and hashes to the id. | Violation |
-| `NotFound` | State | the requested id | Answers a request outstanding to that peer | Violation if unrequested |
+| `Hello` | State | requests served at once (`u16`), largest transaction accepted (`u32`) | First on the state stream, once. Served requests 1 to the table's maximum. Size at most `MAX_TX_BYTES`. | Close rows 4 and 5 |
+| `Inv` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Inv` byte rate. | Close rows 2 and 3 |
+| `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests it allows, counted until the sender starts writing each answer. No id outstanding twice. | Close rows 6 to 8 |
+| `Tx` | Data | the requested id, then the body | Answers a request outstanding to that peer, once. Exactly the announced size, at most the requester's limit, hashes to the id, and decodes as one transaction. | Close rows 9 to 12 |
+| `NotFound` | State | the requested id | Answers a request outstanding to that peer | Close row 9 |
 
 The sender serves an id only once it has queued an `Inv` carrying it on the data stream. The body
 then follows that `Inv` on the same ordered stream, so the peer always reads the `Inv` first. It
@@ -1004,9 +1004,39 @@ answers `NotFound` for an id it never announced to that peer, or one its pool no
 never answers `NotFound`, and never closes a peer, because of its own load: a full queue makes it
 wait.
 
-A wire violation closes the connection with a recorded cause. The receiver judges a `Tx` by its id
-and length before it decodes the body. It drops a late answer, or one from a peer that started
-cooling, unread and without penalty.
+The receiver judges a `Tx` by its id and length before it decodes the body. It drops a late answer,
+or one from a peer that started cooling, unread and without penalty.
+
+#### Closes
+
+Each way `tx-relay` ends a peer's connection or session has one row and one owner, and the code
+that closes names its row. A stall is the one breach that ends the session before the connection.
+
+| Row | Breach | Owner | Ends | Recorded cause |
+|-----|--------|-------|------|----------------|
+| 1 | A frame the stream's table rejects: a message type the stream does not carry, reserved flags, or a payload outside its row's sizes or past the frame cap | Transport frame filter | Connection | `ordered_read_rejected`, or `ordered_oversize` past the cap |
+| 2 | `Inv` bytes past the connection's byte rate | Transport byte bucket | Connection | `ordered_byte_rate_overrun` |
+| 3 | A payload that does not decode as its message | Session routine | Connection | `tx-relay: malformed frame` |
+| 4 | A second `Hello` in a session | Machine, `HelloTwice` | Connection | `tx-relay: protocol violation` |
+| 5 | A `Hello` outside the table's limits | Machine, `BadHello` | Connection | `tx-relay: protocol violation` |
+| 6 | A `GetTxs` before the peer's `Hello` | Machine, `NoHelloFirst` | Connection | `tx-relay: protocol violation` |
+| 7 | A `GetTxs` for an id whose answer is still coming | Machine, `RequestedTwice` | Connection | `tx-relay: id requested twice` |
+| 8 | A `GetTxs` past the requests this node's `Hello` serves | Machine, `TooManyRequests` | Connection | `tx-relay: too many requests` |
+| 9 | A `Tx` or `NotFound` that answers no outstanding request | Machine, `Unrequested` | Connection | `tx-relay: protocol violation` |
+| 10 | A `Tx` of another size than announced | Machine, `WrongSize` | Connection | `tx-relay: protocol violation` |
+| 11 | A `Tx` that does not hash to the requested id | Machine, `WrongId` | Connection | `tx-relay: protocol violation` |
+| 12 | A `Tx` body that does not decode as one transaction | Machine, `Undecodable` | Connection | `tx-relay: undecodable transaction` |
+| 13 | A body that earned a ban | Machine, `Ban` | Every session of the supplier | `tx-relay: banned transaction` |
+| 14 | A body that earned a second cooldown | Machine, `RepeatedCooldown` | Every session of the supplier | `tx-relay: repeated cooldown` |
+| 15 | A body that earned a cooldown while the cooldown table is full | Machine, `CooldownsFull` | Every session of the supplier | `tx-relay: cooldown table full` |
+| 16 | A stall: a request left unanswered for a deadline past the one it missed, or a peer that stopped reading until one of this node's writer queues filled | Machine | The session, and the peer's next sessions are refused for 180 seconds, block sync's no-progress cooldown. The connection, in the session that park lets in afterwards or when the park table is full. | None for the session. `tx-relay: unanswered request` or `tx-relay: peer stopped reading` for the connection. |
+
+Three rules are also stated where they bound without closing. The `Hello` row's cadence records an
+overrun and forwards the frame, so row 4 alone closes a second `Hello`. The `GetTxs` row's
+`max_in_flight` of 16 sizes the stream's budget, and no transport check counts the requests, so
+row 8 alone closes one past it. No response precheck runs on these streams, so the transport admits
+every `Tx` and `NotFound` header, and row 9 alone closes an answer to nothing. A stall and the
+transport's write deadline, which retires a session it cannot write to, are not charges.
 
 - **Cadence**
   - `Hello`: capacity = 3, refill = 1 message / 300 seconds
@@ -1018,14 +1048,14 @@ cooling, unread and without penalty.
   - The sender sends new ids at once and folds new ones into the frame it holds only while it
     waits for the rate, so it batches only under load. It keeps one `Inv` unwritten at most,
     about 70 KB, which with 64 KiB of write-ahead keeps it within the allowance.
-  - on_empty = close the connection (`ordered_byte_rate_overrun`)
+  - on_empty = close the connection (`ordered_byte_rate_overrun`), row 2
 - **Capacity**
   - requester: at most 5 ids requested or awaiting a verdict per peer, and the node-wide 500
     undecided transactions the pool core holds
-  - receiver: at most the requests its `Hello` serves, and one more is a violation. Each request
-    waits on its data writer as an id, and the writer builds the body from the pool as it is when
-    it reaches it, so the data stream's output share bounds the bytes queued to the peer, plus
-    one body being built.
+  - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each
+    request waits on its data writer as an id, and the writer builds the body from the pool as it
+    is when it reaches it, so the data stream's output share bounds the bytes queued to the peer,
+    plus one body being built.
   - per-connection receive and output shares: 4 MiB for the data stream and 64 KiB for the state
     stream, both provisional
 

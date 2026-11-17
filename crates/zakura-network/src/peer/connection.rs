@@ -1303,7 +1303,7 @@ where
         )
         .increment(1);
 
-        let BlockAdvert { hash, push, result } = advert;
+        let BlockAdvert { hash, push, result, pending_send } = advert;
         let mut result = Some(result);
 
         if push {
@@ -1314,6 +1314,7 @@ where
                             Message::Block(HashedBlock::from(block)),
                             hash,
                             &mut result,
+                            pending_send.clone(),
                         )
                         .await
                     {
@@ -1333,7 +1334,7 @@ where
         }
 
         let inv = Message::Inv(vec![InventoryHash::Block(hash)]);
-        if self.send_advert_message(inv, hash, &mut result).await {
+        if self.send_advert_message(inv, hash, &mut result, pending_send).await {
             // Mark the write before reading the peer's next message, which can be its getdata.
             self.block_uploads.advertised(hash);
             self.gossip_trace.block_inv_sent(hash);
@@ -1365,6 +1366,7 @@ where
         msg: Message,
         hash: block::Hash,
         result: &mut Option<tokio::sync::oneshot::Sender<Result<(), BlockAdvertError>>>,
+        pending_send: Option<zakura_node_services::block_relay::PendingBlockSendPermit>,
     ) -> bool {
         let address = self.connection_info.connected_addr.get_transient_addr();
         let version = self.connection_info.remote.version;
@@ -1377,7 +1379,7 @@ where
                 result.as_ref().is_some_and(|result| !result.is_closed())
                     && version >= minimum.current()
                     && !address.is_some_and(|addr| bans.contains(addr.ip()))
-            })
+            }, pending_send.clone())
             .await;
         match delivery {
             Ok(true) => true,
@@ -1387,7 +1389,15 @@ where
                     "not advertising block: cancelled or peer authorization revoked"
                 );
                 if let Some(result) = result.take() {
-                    let _ = result.send(Err(BlockAdvertError::AuthorizationRevoked));
+                    let error = if pending_send
+                        .as_ref()
+                        .is_some_and(|permit| permit.try_start_write(|| ()).is_none())
+                    {
+                        BlockAdvertError::SubmissionWithdrawn
+                    } else {
+                        BlockAdvertError::AuthorizationRevoked
+                    };
+                    let _ = result.send(Err(error));
                 }
                 false
             }
@@ -2147,12 +2157,29 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
+                            let zakura_node_services::block_relay::ServedBlock {
+                                block,
+                                pending_send,
+                            } = block.into_served();
                             // The message hashes the block once, for the encoder and for us.
-                            let block = HashedBlock::from(block.into_block());
+                            let block = HashedBlock::from(block);
                             let hash = block.hash();
-                            if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
-                                self.fail_with(e).await;
-                                return;
+                            match self
+                                .peer_tx
+                                .send_authorized(Message::Block(block), || true, pending_send)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.block_uploads.unavailable(hash);
+                                    self.gossip_trace.block_unavailable(hash);
+                                    missing_hashes.push(hash.into());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.fail_with(error).await;
+                                    return;
+                                }
                             }
                             self.block_uploads.written(hash);
                             self.gossip_trace.block_sent(hash);

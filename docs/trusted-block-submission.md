@@ -103,8 +103,12 @@ block commits before early dispatch, only the committed path announces it.
 Calling the trusted endpoint before upstream validation succeeds can distribute
 invalid bytes before any full validator approves them. The relay still validates
 afterward, but peers may already have disconnected or banned its IP. A local
-rejection removes its pending body and cancels announcements not yet dispatched;
-it cannot recall bytes already sent.
+rejection or timeout removes its pending body and withdraws queued legacy TCP
+announcements and body responses, including responses that fetched the body
+before withdrawal. The final permission check is ordered against withdrawal at
+the start of each local write. Writes already started may finish; bytes already
+sent cannot be recalled. A corrected-body retry has independent permission even
+when its header hash matches the rejected submission.
 
 An invalid submission does not disable early relay for later submissions.
 

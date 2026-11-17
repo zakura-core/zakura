@@ -64,16 +64,21 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
     });
     let state = Buffer::new(BoxService::new(state), 1);
     let pending_blocks = PendingBlockRegistry::default();
-    let _registration = pending_blocks
+    let registration = pending_blocks
         .insert(block.clone())
         .expect("the registry accepts the admitted block");
 
-    assert_eq!(
-        block_by_hash_or_pending(state, pending_blocks, hash)
-            .await
-            .expect("the pending lookup succeeds"),
-        Some(block.into()),
-    );
+    let retained = block_by_hash_or_pending(state, pending_blocks, hash)
+        .await
+        .expect("the pending lookup succeeds")
+        .unwrap();
+    assert_eq!(retained.block, block.into());
+    let permit = retained.pending_send.unwrap();
+    assert!(permit.try_start_write(|| ()).is_some());
+    registration.resolve(Err(()));
+    assert!(permit
+        .try_start_write(|| panic!("withdrawal survives the peer lookup"))
+        .is_none());
     assert!(!state_called.load(Ordering::SeqCst));
 }
 

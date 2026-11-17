@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
+use zakura_node_services::{block_memory::is_read_capacity_refusal, block_relay::ServedBlock};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -227,9 +227,9 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<BlockHandle>, zn::BoxError> {
-    if let Some(block) = pending_blocks.get(hash) {
-        return Ok(Some(block.into()));
+) -> Result<Option<ServedBlock>, zn::BoxError> {
+    if let Some(block) = pending_blocks.get_for_peer(hash) {
+        return Ok(Some(block));
     }
 
     let response = state
@@ -239,7 +239,7 @@ async fn block_by_hash_or_pending(
         .await?;
 
     match response {
-        zs::Response::Block(Some(block)) => Ok(Some(block)),
+        zs::Response::Block(Some(block)) => Ok(Some(block.into())),
         zs::Response::Block(None) => Ok(None),
         _ => unreachable!("wrong response from state"),
     }

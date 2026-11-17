@@ -2,8 +2,8 @@
 //!
 //! The tracker never decides what the machine should do. It keeps simple
 //! state that follows from what the test sent and what came back: the names
-//! the machine handed out, the jobs it started, and the pool as the change
-//! log describes it. Each check compares two of those facts with each other,
+//! the machine handed out, the jobs it started, the rejections its verdicts
+//! say it remembers, and the pool as the change log describes it. Each check compares two of those facts with each other,
 //! or one of them with what the machine reports.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,7 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
-    Change, ChangeSeq, Charge, RemovalReason, ReservationId, Verdict,
+    Change, ChangeSeq, Charge, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -24,6 +24,9 @@ use crate::machine::{Effect, JobId, Step, WaiterId};
 struct Answering {
     job: u64,
     tx: UnminedTxId,
+    /// Whether the answer is a pass, and the tip has not changed since the
+    /// job started.
+    passed: bool,
     /// The charge a failing answer carries, when the tip has not changed
     /// since the job started.
     charge: Option<Charge>,
@@ -59,6 +62,10 @@ pub(crate) struct Tracker {
     answering: Option<Answering>,
     /// The charges the failed verifications of each transaction carried.
     charges: HashMap<UnminedTxId, Vec<Charge>>,
+    /// The transactions, by exact id, and the effects, by mined id, that a
+    /// verification's verdict says the pool rejects until the tip changes.
+    refused_exact: HashSet<UnminedTxId>,
+    refused_effects: HashSet<transaction::Hash>,
     /// How often each kind of effect, change and answer happened.
     seen: BTreeMap<String, usize>,
 }
@@ -66,12 +73,29 @@ pub(crate) struct Tracker {
 impl Tracker {
     // What the test tells the tracker.
 
-    /// The machine granted `reservation`.
-    pub(crate) fn reserved(&mut self, reservation: ReservationId) {
-        assert!(
-            self.reservations.insert(reservation.0),
-            "{reservation:?} was granted twice"
-        );
+    /// The machine answered a reservation of `tx`. A rejection the pool
+    /// remembers for the tip keeps `tx` from being fetched and verified again.
+    pub(crate) fn reserve_answered(
+        &mut self,
+        tx: UnminedTxId,
+        answer: &Result<ReservationId, Unreserved>,
+    ) {
+        let remembered =
+            self.refused_exact.contains(&tx) || self.refused_effects.contains(&tx.mined_id());
+        match answer {
+            Ok(reservation) => {
+                assert!(
+                    !remembered,
+                    "{tx:?} was reserved while its rejection is remembered for the tip"
+                );
+                assert!(
+                    self.reservations.insert(reservation.0),
+                    "{reservation:?} was granted twice"
+                );
+            }
+            Err(_) if remembered => self.saw("a remembered rejection held"),
+            Err(_) => {}
+        }
     }
 
     /// A submission of `tx` waits for its verdict as `waiter`.
@@ -86,11 +110,19 @@ impl Tracker {
     /// one.
     pub(crate) fn tip_changed(&mut self) {
         self.stale.extend(self.jobs.keys().copied());
+        self.forget_rejections();
     }
 
-    /// The test is about to answer `job`. `charge` is the charge a failing
-    /// answer carries.
-    pub(crate) fn answers(&mut self, job: JobId, charge: Option<Charge>) {
+    /// The pool forgot every rejection it remembered for the tip: the tip
+    /// changed, or the pool turned off.
+    pub(crate) fn forget_rejections(&mut self) {
+        self.refused_exact.clear();
+        self.refused_effects.clear();
+    }
+
+    /// The test is about to answer `job`, with a pass if `passed`. `charge`
+    /// is the charge a failing answer carries.
+    pub(crate) fn answers(&mut self, job: JobId, passed: bool, charge: Option<Charge>) {
         self.cancelled.retain(|(cancelled, _)| *cancelled != job.0);
         let stale = self.stale.remove(&job.0);
         if stale && self.jobs.contains_key(&job.0) {
@@ -99,6 +131,7 @@ impl Tracker {
         self.answering = self.jobs.remove(&job.0).map(|tx| Answering {
             job: job.0,
             tx,
+            passed: passed && !stale,
             charge: charge.filter(|_| !stale),
         });
     }
@@ -147,6 +180,10 @@ impl Tracker {
     /// so far.
     pub(crate) fn step(&mut self, step: &Step) {
         let answering = self.answering.take();
+        // The transaction the answered job verified, and whether it passed.
+        let decided = answering
+            .as_ref()
+            .map(|answering| (answering.tx, answering.passed));
         // Whether a submission waits for the answer. Nobody waits for a
         // pooled transaction that is verified again after a reset.
         let awaited = answering.as_ref().is_some_and(|answering| {
@@ -228,6 +265,19 @@ impl Tracker {
                     "{tx:?} was charged {:?}, which no failed verification of it carried",
                     rejection.charge
                 );
+                // The answered job's rejection is the tip's. A verdict kept
+                // for a body that came late may name an older tip.
+                if decided.is_some_and(|(decided, _)| decided == *tx) {
+                    match rejection.scope {
+                        RejectionScope::ExactTip => {
+                            self.refused_exact.insert(*tx);
+                        }
+                        RejectionScope::EffectsTip => {
+                            self.refused_effects.insert(tx.mined_id());
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         if let Some((tx, charge)) = failed {
@@ -271,9 +321,16 @@ impl Tracker {
                 Change::Refused(_) => self.saw("refused"),
             }
         }
-        // A transaction enters the log in the step that admits its
-        // submission, or comes back after a reset took it out.
+        // A transaction enters the pool only in the step that answered a
+        // passing verification of it for the tip, re-admissions after a reset
+        // too. The log adds it there for the submission that step admits, or
+        // because a reset took it out.
         for id in added {
+            assert_eq!(
+                decided,
+                Some((id, true)),
+                "the log adds {id:?}, and no verification of it passed for this tip"
+            );
             let admitted = verdicts
                 .iter()
                 .any(|(tx, verdict)| *tx == id && matches!(verdict, Verdict::Admitted));

@@ -612,6 +612,7 @@ fn random_runs_keep_the_invariants_and_drain() {
             "unreserved Pending",
             "unreserved Pooled",
             "unreserved Rejected",
+            "a remembered rejection held",
             "unreserved Inactive",
             "unreserved NoRoom",
         ] {

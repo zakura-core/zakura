@@ -50,6 +50,7 @@ use crate::{
     config::UnconditionalPeers,
     zakura::{
         regulation::{ByteBucket, MeteredReady, MeteredSender},
+        resume_task_panic,
         transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
         Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
@@ -725,14 +726,18 @@ impl Routine {
             let deadline = self.next_wake();
             zakura_rt::select! {
                 () = self.cancel.cancelled() => break,
-                frame = data.recv() => match frame {
-                    Some(frame) if self.frame(&frame) => {}
-                    _ => break,
-                },
-                frame = state.recv() => match frame {
-                    Some(frame) if self.frame(&frame) => {}
-                    _ => break,
-                },
+                frame = data.recv() => {
+                    let Some(frame) = frame else { break };
+                    if !self.frame(&frame).await {
+                        break;
+                    }
+                }
+                frame = state.recv() => {
+                    let Some(frame) = frame else { break };
+                    if !self.frame(&frame).await {
+                        break;
+                    }
+                }
                 Some(result) = self.calls.next(), if !self.calls.is_empty() => {
                     self.pool_result(result);
                 }
@@ -853,10 +858,10 @@ impl Routine {
 
     /// Handles one frame from the peer. Returns `false` for a frame that
     /// does not decode, which closes the connection and ends the session.
-    fn frame(&mut self, frame: &Frame) -> bool {
+    async fn frame(&mut self, frame: &Frame) -> bool {
         match decode_frame::<TxRelayMessage>(frame) {
             Ok(message) => {
-                self.message(message);
+                self.message(message).await;
                 true
             }
             Err(_) => {
@@ -867,8 +872,9 @@ impl Routine {
         }
     }
 
-    /// Hands one decoded message to the machine.
-    fn message(&mut self, message: TxRelayMessage) {
+    /// Hands one decoded message to the machine. A `Tx` body waits for its
+    /// decode on the blocking pool first.
+    async fn message(&mut self, message: TxRelayMessage) {
         count(&message, "received");
         match message {
             TxRelayMessage::Hello {
@@ -909,17 +915,28 @@ impl Routine {
                 if !read {
                     return;
                 }
-                // This routine decodes its own peer's bodies, outside the
-                // shared lock.
-                let mut bytes = body.as_slice();
-                match Transaction::zcash_deserialize_bounded(&mut bytes) {
-                    Ok(transaction) if bytes.is_empty() => {
-                        let body = UnminedTx::from(transaction);
+                // Decoding checks the body's curve points and `UnminedTx`
+                // hashes it, so both run on the blocking pool, outside the
+                // shared lock, and this routine waits for its peer's one body.
+                let decoded = task::spawn_blocking_named("tx-relay-decode", move || {
+                    let mut bytes = body.as_slice();
+                    match Transaction::zcash_deserialize_bounded(&mut bytes) {
+                        Ok(transaction) if bytes.is_empty() => Some(UnminedTx::from(transaction)),
+                        _ => None,
+                    }
+                })
+                .await;
+                // A decode is cancelled only when the runtime shuts down.
+                let Ok(decoded) = resume_task_panic(decoded) else {
+                    return;
+                };
+                match decoded {
+                    Some(body) => {
                         self.step(|machine, shared, pool, _| {
                             machine.tx(shared, pool, id, body, arrived);
                         });
                     }
-                    _ => {
+                    None => {
                         self.step(|machine, shared, pool, _| {
                             machine.undecodable(shared, pool, arrived);
                         });

@@ -67,7 +67,8 @@ fn message(outgoing: Outgoing) -> TxRelayMessage {
 
 /// A job that waits behind a peer that stopped reading, for an id the pool
 /// evicts meanwhile, holds no body. When the writer reaches it, it answers
-/// `NotFound` on the state stream, and the request's place comes back.
+/// `NotFound` on the state stream. The writer reports each answer it
+/// starts, which frees the request's place.
 #[tokio::test]
 async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
     let transaction = transactions(1).remove(0);
@@ -78,26 +79,20 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
     let (send, mut recv) = framed_channel(1);
     let (state, mut answers) = mpsc::channel(STATE_QUEUE);
     let (close, _cause, _cancel) = closer();
+    let (started, mut started_rx) = mpsc::unbounded_channel();
     let bodies = Bodies {
         pool: handle.reader(),
         state,
         close,
+        started,
     };
     let writer = spawn_writer(send, DATA_QUEUE, CancellationToken::new(), Some(bodies));
-    let requests = Arc::new(Semaphore::new(MAX_SERVES));
-    let serve = || Outgoing::Serve {
-        id,
-        request: Request {
-            _place: requests
-                .clone()
-                .try_acquire_owned()
-                .expect("the test stays within the limit"),
-            _outstanding: Arc::new(()),
-        },
-    };
 
     // While the pool holds it, the job gets the body.
-    writer.send(serve()).await.expect("the writer runs");
+    writer
+        .send(Outgoing::Serve(id))
+        .await
+        .expect("the writer runs");
     let frame = recv.recv().await.expect("the writer sends the body");
     assert!(matches!(
         decode_frame::<TxRelayMessage>(&frame),
@@ -114,7 +109,10 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
     };
     writer.send(filler()).await.expect("the writer runs");
     writer.send(filler()).await.expect("the writer runs");
-    writer.send(serve()).await.expect("the writer runs");
+    writer
+        .send(Outgoing::Serve(id))
+        .await
+        .expect("the writer runs");
 
     // The pool evicts the id, then the peer reads again.
     publish(
@@ -139,12 +137,10 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
             .is_err(),
         "no body goes out"
     );
-    // The writer lets the request go once its answer is queued.
-    let every_place = u32::try_from(MAX_SERVES).expect("MAX_SERVES is 16, which fits a u32");
-    let _places = tokio::time::timeout(Duration::from_secs(5), requests.acquire_many(every_place))
-        .await
-        .expect("the request's place comes back")
-        .expect("the semaphore stays open");
+    for _ in 0..2 {
+        let started = started_rx.try_recv().expect("each answer is reported");
+        assert_eq!(started, id);
+    }
 }
 
 /// The connection every test session runs on.
@@ -177,7 +173,7 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
 }
 
 /// One session's routine, driven step by step, whose writers' queues the
-/// test holds.
+/// test holds. No writer runs, so no answer starts.
 struct Session {
     routine: Routine,
     cause: CloseCause,
@@ -185,6 +181,7 @@ struct Session {
     data: mpsc::Receiver<Outgoing>,
     /// Held unread, so the state writer's queue stays open.
     _state: mpsc::Receiver<Outgoing>,
+    _started: mpsc::UnboundedSender<UnminedTxId>,
 }
 
 impl Session {
@@ -193,9 +190,10 @@ impl Session {
     fn open(wiring: &Wiring) -> Self {
         let (data, data_recv) = mpsc::channel(DATA_QUEUE);
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
+        let (started, started_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
         open_inv_bucket(&wiring.inv_buckets, &connection());
-        let io = SessionIo::new(data, state, close, connection());
+        let io = SessionIo::new(data, state, close, started_rx, connection());
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
@@ -211,6 +209,7 @@ impl Session {
             cancel,
             data: data_recv,
             _state: state_recv,
+            _started: started,
         }
     }
 
@@ -268,43 +267,6 @@ impl Serving {
             _handed: handed,
         }
     }
-}
-
-/// A peer may have as many requests unanswered as our `Hello` serves. One
-/// more breaks its limit, however slowly it reads, and closes it.
-#[tokio::test]
-async fn a_request_past_our_hello_closes_the_peer() {
-    let mut serving = Serving::new(MAX_SERVES + 1);
-    let ids = serving.ids.clone();
-    let session = &mut serving.session;
-    for id in &ids[..MAX_SERVES] {
-        session.deliver(TxRelayMessage::GetTxs(*id));
-    }
-    assert!(
-        !session.cancel.is_cancelled(),
-        "requests within the limit wait"
-    );
-    session.deliver(TxRelayMessage::GetTxs(ids[MAX_SERVES]));
-    assert!(session.cancel.is_cancelled());
-    assert_eq!(session.cause.get(), Some("tx-relay: too many requests"));
-}
-
-/// A request we would answer `NotFound` still needs a place, so with every
-/// place taken it closes the peer instead of slipping past our `Hello`.
-#[tokio::test]
-async fn a_request_answered_not_found_counts_toward_the_limit() {
-    let mut serving = Serving::new(MAX_SERVES);
-    let ids = serving.ids.clone();
-    let session = &mut serving.session;
-    for id in &ids {
-        session.deliver(TxRelayMessage::GetTxs(*id));
-    }
-    let unknown = transactions(MAX_SERVES + 1)
-        .remove(MAX_SERVES)
-        .transaction
-        .id();
-    session.deliver(TxRelayMessage::GetTxs(unknown));
-    assert_eq!(session.cause.get(), Some("tx-relay: too many requests"));
 }
 
 /// A session that replaces another on the same connection, even before the

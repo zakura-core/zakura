@@ -250,6 +250,21 @@ impl Bench {
         self.took(Cause::GetTxs(session, id));
     }
 
+    /// `session`'s IO starts writing its answer to the request for `id`.
+    pub(super) fn served(&mut self, session: SessionId, id: UnminedTxId) {
+        self.machine.served(session, id, self.now);
+        self.took(Cause::Served(session, id));
+    }
+
+    /// `session`'s peer answers the request for `id` with a body of the
+    /// announced size that does not decode.
+    pub(super) fn undecodable(&mut self, session: SessionId, id: UnminedTxId) {
+        if self.arrived(session, id, SIZE) {
+            self.machine.undecodable(session, self.now);
+            self.took(Cause::Undecodable(session));
+        }
+    }
+
     /// `session` ends.
     pub(super) fn end(&mut self, session: SessionId) {
         self.machine.end(session, self.now);

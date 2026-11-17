@@ -11,6 +11,8 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::ReservationId;
 use zakura_rt::collections::{HashMap, HashSet};
 
+#[cfg(doc)]
+use super::MAX_SERVES;
 use super::{
     CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
     MAX_TX_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
@@ -91,6 +93,10 @@ pub(crate) struct PeerState {
     pub(crate) reserving: IndexMap<UnminedTxId, Reserving>,
     /// Its outstanding requests, oldest first.
     pub(crate) requests: IndexMap<UnminedTxId, Request>,
+    /// Its requests to us that we serve, until the IO starts writing each
+    /// answer: at most what our `Hello` serves, [`MAX_SERVES`]. A request
+    /// answered `NotFound` is answered in its own step, so it never stays.
+    pub(crate) serving: HashSet<UnminedTxId>,
     /// Bodies it supplied that wait for a verdict.
     pub(crate) submissions: Submissions,
     /// Ids this node announced to it and has not seen leave the pool, with
@@ -132,6 +138,7 @@ impl PeerState {
             pending: PendingSet::default(),
             reserving: IndexMap::new(),
             requests: IndexMap::new(),
+            serving: HashSet::default(),
             submissions: Submissions::default(),
             announced: Announced::default(),
             known: Known::default(),

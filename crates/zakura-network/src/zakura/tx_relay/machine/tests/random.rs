@@ -54,7 +54,8 @@ const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv 
     inv child waited; serve;
     answer not found; close Violation(HelloTwice); close Violation(BadHello);
     close Violation(NoHelloFirst); close Violation(Unrequested); close Violation(WrongSize);
-    close Violation(WrongId); close Ban; close RepeatedCooldown; close Unresponsive;
+    close Violation(WrongId); close Violation(Undecodable); close Violation(RequestedTwice);
+    close Ban; close RepeatedCooldown; close Unresponsive;
     answer grant; answer cancelled grant; answer Pooled; answer Pending; answer Rejected;
     answer NoRoom; answer Inactive; answer Stopped; verdict Admitted;
     verdict Rejected cached, None; verdict Rejected uncached, None;
@@ -205,6 +206,13 @@ impl Run {
             .unwrap_or_default()
     }
 
+    /// The ids whose answers `session`'s IO has yet to start.
+    fn serving(&self, session: SessionId) -> Vec<UnminedTxId> {
+        let open = self.bench.tracker.open.get(&session);
+        open.map(|open| open.serving.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// The requests on the wire, with their reservations.
     fn requests(&self) -> Vec<(SessionId, UnminedTxId, ReservationId)> {
         let requests = self.bench.tracker.requests.iter();
@@ -280,6 +288,7 @@ impl Run {
             20 if self.rng.one_in(3) => self.unrequested(),
             21 | 22 => self.get_txs(),
             23 => self.end(),
+            24 | 25 => self.served(),
             29..=34 => self.answer_call(near_end),
             35..=38 => self.verdict(near_end),
             39 => self.cancel(),
@@ -401,6 +410,7 @@ impl Run {
             (Peer::Honest, 3) => {
                 self.bench.arrived(session, id, SIZE + 7);
             }
+            (Peer::Honest, 5) => self.bench.undecodable(session, id),
             (Peer::Honest, other) => {
                 let other = if other == 4 { self.any_id() } else { id };
                 let body = self.body(other);
@@ -423,19 +433,41 @@ impl Run {
         }
     }
 
-    /// A peer asks for an id: mostly one it was sent.
+    /// A peer asks for an id: mostly one it was sent and has no answer
+    /// coming for, now and then one it already has an answer coming for.
     fn get_txs(&mut self) {
         let Some(session) = self.session() else {
             return self.tick();
         };
-        let sent = self.sent(session);
-        let id = if !sent.is_empty() && !self.rng.one_in(3) {
-            self.rng.pick(&sent)
+        let serving = self.serving(session);
+        let sent: Vec<UnminedTxId> = self.sent(session);
+        let fresh: Vec<UnminedTxId> = sent
+            .into_iter()
+            .filter(|id| !serving.contains(id))
+            .collect();
+        let id = if !serving.is_empty() && self.rng.one_in(8) {
+            self.rng.pick(&serving)
+        } else if !fresh.is_empty() && !self.rng.one_in(3) {
+            self.rng.pick(&fresh)
         } else {
             self.any_id()
         };
         self.note(|run| format!("{} asks for {}", session.0, run.name(id)));
         self.bench.get_txs(session, id);
+    }
+
+    /// A session's IO starts writing one of its answers.
+    fn served(&mut self) {
+        let open = self.bench.tracker.open.iter();
+        let serving: Vec<(SessionId, UnminedTxId)> = open
+            .flat_map(|(session, open)| open.serving.iter().map(|id| (*session, *id)))
+            .collect();
+        if serving.is_empty() {
+            return self.tick();
+        }
+        let (session, id) = serving[self.rng.below(serving.len())];
+        self.note(|run| format!("{}'s IO starts answering {}", session.0, run.name(id)));
+        self.bench.served(session, id);
     }
 
     /// A session ends.

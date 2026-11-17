@@ -501,6 +501,12 @@ pub(crate) enum Violation {
     WrongSize,
     /// A body that does not hash to the requested id.
     WrongId,
+    /// A body that does not decode as one transaction.
+    Undecodable,
+    /// A request for an id the peer already has outstanding with us.
+    RequestedTwice,
+    /// A request past the [`MAX_SERVES`] our `Hello` serves at once.
+    TooManyRequests,
 }
 
 /// What `tx-relay` does, on the wire and at the pool.
@@ -1257,6 +1263,21 @@ impl RelayMachine {
     pub(crate) fn get_txs(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
         self.on(session, now, |machine, shared, pool, now| {
             machine.get_txs(shared, pool, id, now);
+        });
+    }
+
+    /// The IO started writing its answer to `session`'s request for `id`.
+    /// See [`PeerMachine::served`].
+    pub(crate) fn served(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
+        self.on(session, now, |machine, shared, pool, now| {
+            machine.served(shared, pool, id, now);
+        });
+    }
+
+    /// A body `tx_arrived` let the IO decode does not decode.
+    pub(crate) fn undecodable(&mut self, session: SessionId, now: Time) {
+        self.on(session, now, |machine, shared, pool, now| {
+            machine.undecodable(shared, pool, now);
         });
     }
 

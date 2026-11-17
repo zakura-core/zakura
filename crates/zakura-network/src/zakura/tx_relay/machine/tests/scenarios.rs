@@ -1224,30 +1224,78 @@ fn hello_rules_close_with_their_own_reasons() {
 
 /// A body is judged before it is decoded: one of another size than its
 /// peer announced closes the session as `WrongSize`, one that does not hash
-/// to the requested id as `WrongId`, and an answer to nothing, a body or a
-/// `NotFound`, as `Unrequested`.
+/// to the requested id as `WrongId`, one that does not decode as
+/// `Undecodable`, and an answer to nothing, a body or a `NotFound`, as
+/// `Unrequested`.
 #[test]
 fn each_bad_answer_closes_with_its_own_reason() {
-    for case in 0..4 {
+    for case in 0..5 {
         let mut bench = Bench::new();
         let (id, other) = (bench.id(0), bench.id(1));
         let session = bench.join(1);
         bench.inv(session, &[id]);
         bench.fetch(session, id);
-        // Whether the machine read the body, and why it closes the session.
+        // Whether the machine let the IO decode the body, and why it closes
+        // the session.
         let (read, violation) = match case {
             0 => (bench.arrived(session, id, SIZE + 1), Violation::WrongSize),
             1 => (bench.deliver(session, id, bench.tx(1)), Violation::WrongId),
             2 => (bench.arrived(session, other, SIZE), Violation::Unrequested),
+            3 => {
+                bench.undecodable(session, id);
+                (true, Violation::Undecodable)
+            }
             _ => {
                 bench.not_found(session, other);
                 (false, Violation::Unrequested)
             }
         };
         // Only a body of the announced size, for a request, is decoded.
-        assert_eq!(read, violation == Violation::WrongId, "{violation:?}");
+        let decoded = matches!(violation, Violation::WrongId | Violation::Undecodable);
+        assert_eq!(read, decoded, "{violation:?}");
         assert_eq!(bench.closes(), vec![broke(session, violation)]);
     }
+}
+
+/// The peer may have as many requests with answers coming as our `Hello`
+/// serves. One answered `NotFound` frees its place in its own step, and one
+/// served frees it once the IO starts writing the answer. A request past
+/// the limit, or a second request for an id whose answer is coming, closes
+/// the session.
+#[test]
+fn a_request_past_our_hello_or_twice_while_answered_closes_the_peer() {
+    let mut bench = Bench::new();
+    let ids: Vec<UnminedTxId> = (0..=16).map(|n| bench.id(n)).collect();
+    bench.add(&ids);
+    let unknown = bench.id(17);
+    let twice = bench.join(1);
+    bench.take_inv(twice, ids.len());
+    bench.get_txs(twice, ids[0]);
+    bench.get_txs(twice, ids[0]);
+    assert_eq!(
+        bench.closes(),
+        vec![broke(twice, Violation::RequestedTwice)]
+    );
+
+    let pushy = bench.join(2);
+    bench.take_inv(pushy, ids.len());
+    for _ in 0..2 * MAX_SERVES {
+        bench.get_txs(pushy, unknown);
+    }
+    for id in &ids[..MAX_SERVES] {
+        bench.get_txs(pushy, *id);
+    }
+    bench.served(pushy, ids[0]);
+    bench.get_txs(pushy, ids[MAX_SERVES]);
+    assert!(
+        bench.closes().is_empty(),
+        "a started answer frees its place"
+    );
+    bench.get_txs(pushy, unknown);
+    assert_eq!(
+        bench.closes(),
+        vec![broke(pushy, Violation::TooManyRequests)]
+    );
 }
 
 /// The IO asks the machine about a body before it decodes it: an answer to

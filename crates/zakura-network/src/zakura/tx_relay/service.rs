@@ -28,7 +28,7 @@ use zakura_node_services::mempool::port::{
 };
 use zakura_rt::{
     collections::HashMap,
-    sync::{mpsc, CancellationToken, Mutex, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, CancellationToken, Mutex, Notify},
     task,
     time::{self, Instant},
 };
@@ -36,8 +36,8 @@ use zakura_rt::{
 use super::{
     machine::{
         peer::Hello, CallId, CloseReason, Granted, Mail, Marks, PeerKey, PeerMachine, PoolView,
-        RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, WaiterId,
-        MAX_SERVES,
+        RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation,
+        WaiterId, MAX_SERVES,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
@@ -80,35 +80,8 @@ enum Outgoing {
     /// A frame, with what it holds until the transport has written it.
     Frame(Frame, Option<FrameGuard>),
     /// A `Tx` answering the peer's request for `id`, built only when the
-    /// writer reaches it. `request` keeps the request outstanding until the
-    /// answer is queued for the transport.
-    Serve { id: UnminedTxId, request: Request },
-}
-
-/// One of the peer's requests to us, held until its answer is queued: its
-/// place among those our `Hello` serves, and the marker that keeps its id
-/// counted as outstanding.
-struct Request {
-    _place: OwnedSemaphorePermit,
-    _outstanding: Arc<()>,
-}
-
-/// Where one of the peer's outstanding requests stands.
-enum Answer {
-    /// The machine has yet to answer it.
-    Unanswered(OwnedSemaphorePermit),
-    /// Its serve job waits on the data writer while the marker lives.
-    Serving(zakura_rt::sync::Weak<()>),
-}
-
-impl Answer {
-    /// Whether the request is still outstanding.
-    fn outstanding(&self) -> bool {
-        match self {
-            Self::Unanswered(_) => true,
-            Self::Serving(marker) => marker.strong_count() > 0,
-        }
-    }
+    /// writer reaches it.
+    Serve(UnminedTxId),
 }
 
 /// Where a data writer builds the bodies it serves, and answers `NotFound`
@@ -117,6 +90,10 @@ struct Bodies {
     pool: PoolReader,
     state: mpsc::Sender<Outgoing>,
     close: Closer,
+    /// Tells the routine the writer started answering a request, before
+    /// the answer can reach the peer, so the request's place is free before
+    /// the peer can count it free.
+    started: mpsc::UnboundedSender<UnminedTxId>,
 }
 
 /// The `tx-relay` service.
@@ -335,10 +312,12 @@ impl Service for TxRelayService {
             close_cause,
         };
         let state = spawn_writer(state_send, STATE_QUEUE, session_cancel.clone(), None);
+        let (started, started_rx) = mpsc::unbounded_channel();
         let bodies = Bodies {
             pool: self.wiring.pool.reader(),
             state: state.clone(),
             close: close.clone(),
+            started,
         };
         let data = spawn_writer(data_send, DATA_QUEUE, session_cancel.clone(), Some(bodies));
         open_inv_bucket(&self.wiring.inv_buckets, &connection);
@@ -346,7 +325,7 @@ impl Service for TxRelayService {
             self.wiring.clone(),
             peer_key,
             exempt,
-            SessionIo::new(data, state, close, connection),
+            SessionIo::new(data, state, close, started_rx, connection),
             session_cancel,
         );
         task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
@@ -411,14 +390,14 @@ fn spawn_writer(
                     // next reserve returns.
                     slot.send(frame, guard);
                 }
-                Outgoing::Serve { id, request } => {
+                Outgoing::Serve(id) => {
                     let Some(bodies) = &bodies else {
                         continue;
                     };
+                    let _ = bodies.started.send(id);
                     if !serve_body(&send, bodies, id).await {
                         return;
                     }
-                    drop(request);
                 }
             }
         }
@@ -486,19 +465,13 @@ enum PoolResult {
 /// A pool call in flight.
 type PoolCall = Pin<Box<dyn Future<Output = PoolResult> + Send>>;
 
-/// One session's writers, its closer, the peer's requests to us, and its
-/// `Inv` pacing.
+/// One session's writers, its closer, and its `Inv` pacing.
 struct SessionIo {
     data: mpsc::Sender<Outgoing>,
     state: mpsc::Sender<Outgoing>,
     close: Closer,
-    /// The peer's requests to us not yet answered: at most what our `Hello`
-    /// serves, [`MAX_SERVES`]. A request past it breaks the peer's limit.
-    /// Every `GetTxs` takes a place, whatever its answer.
-    requests: Arc<Semaphore>,
-    /// The peer's outstanding requests, by id, until each answer is queued.
-    /// A peer may not have one id outstanding twice.
-    answering: HashMap<UnminedTxId, Answer>,
+    /// The ids whose answers the data writer started writing.
+    started: mpsc::UnboundedReceiver<UnminedTxId>,
     /// Alive while this session's last `Inv` waits for its transport write.
     /// One unwritten `Inv` of at most about 70 KB, with the transport's
     /// 64 KiB of write-ahead, stays within the row's 512 KiB sender
@@ -519,19 +492,19 @@ struct SessionIo {
 
 impl SessionIo {
     /// A session's IO on these writers, closing with `close`, running on
-    /// `connection`.
+    /// `connection`. `started` hears from the data writer.
     fn new(
         data: mpsc::Sender<Outgoing>,
         state: mpsc::Sender<Outgoing>,
         close: Closer,
+        started: mpsc::UnboundedReceiver<UnminedTxId>,
         connection: (ZakuraPeerId, ZakuraConnId),
     ) -> Self {
         Self {
             data,
             state,
             close,
-            requests: Arc::new(Semaphore::new(MAX_SERVES)),
-            answering: HashMap::default(),
+            started,
             inv_unwritten: zakura_rt::sync::Weak::new(),
             inv_due: None,
             inv_ready: false,
@@ -880,20 +853,14 @@ impl Routine {
                 self.step(|machine, shared, pool, now| machine.inv(shared, pool, &entries, now));
             }
             TxRelayMessage::GetTxs(id) => {
-                // The place is taken before the machine picks the answer, so
-                // a request answered `NotFound` counts too. At most
-                // `MAX_SERVES` entries are outstanding, so this bounds the
-                // map.
-                self.io.answering.retain(|_, answer| answer.outstanding());
-                if self.io.answering.contains_key(&id) {
-                    self.io.close.close("tx-relay: id requested twice");
-                    return;
+                // The writer reports an answer it started before handing it
+                // to the transport, so each answer the peer has seen is read
+                // here before the peer's next request.
+                while let Ok(started) = self.io.started.try_recv() {
+                    self.step(|machine, shared, pool, now| {
+                        machine.served(shared, pool, started, now);
+                    });
                 }
-                let Ok(request) = self.io.requests.clone().try_acquire_owned() else {
-                    self.io.close.close("tx-relay: too many requests");
-                    return;
-                };
-                self.io.answering.insert(id, Answer::Unanswered(request));
                 self.step(|machine, shared, pool, now| machine.get_txs(shared, pool, id, now));
             }
             TxRelayMessage::NotFound(id) => {
@@ -918,7 +885,11 @@ impl Routine {
                             machine.tx(shared, pool, id, body, now);
                         });
                     }
-                    _ => self.io.close.close("tx-relay: undecodable transaction"),
+                    _ => {
+                        self.step(|machine, shared, pool, now| {
+                            machine.undecodable(shared, pool, now);
+                        });
+                    }
                 }
             }
         }
@@ -1068,8 +1039,6 @@ impl Routine {
             RelayEffect::Serve { id, .. } => self.serve(id),
             RelayEffect::NotFound { id, .. } => {
                 self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::NotFound(id), None);
-                // The answer is queued, so the request's place is free.
-                self.io.answering.remove(&id);
             }
             RelayEffect::Close { session, reason } => {
                 if session == self.machine.session() {
@@ -1128,28 +1097,13 @@ impl Routine {
     }
 
     /// Queues the request for `id`, which the machine found servable, for
-    /// the data writer to build when it reaches it. The job keeps the
-    /// request's place until its answer is queued. A conformant peer counts
-    /// at least as many requests outstanding as we do, so it never runs out
-    /// of places.
+    /// the data writer to build when it reaches it. The machine counts the
+    /// request until the writer starts its answer.
     fn serve(&mut self, id: UnminedTxId) {
-        let io = &mut self.io;
-        let Some(Answer::Unanswered(place)) = io.answering.remove(&id) else {
-            return;
-        };
-        let outstanding = Arc::new(());
-        io.answering.insert(
-            id,
-            Answer::Serving(zakura_rt::sync::downgrade(&outstanding)),
-        );
-        let request = Request {
-            _place: place,
-            _outstanding: outstanding,
-        };
-        match io.data.try_send(Outgoing::Serve { id, request }) {
+        match self.io.data.try_send(Outgoing::Serve(id)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                io.close.close("tx-relay: peer stopped reading");
+                self.io.close.close("tx-relay: peer stopped reading");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
@@ -1450,6 +1404,9 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
 /// The recorded cause for a close the machine asked for.
 fn close_reason(reason: CloseReason) -> &'static str {
     match reason {
+        CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",
+        CloseReason::Violation(Violation::RequestedTwice) => "tx-relay: id requested twice",
+        CloseReason::Violation(Violation::TooManyRequests) => "tx-relay: too many requests",
         CloseReason::Violation(_) => "tx-relay: protocol violation",
         CloseReason::Ban => "tx-relay: banned transaction",
         CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",

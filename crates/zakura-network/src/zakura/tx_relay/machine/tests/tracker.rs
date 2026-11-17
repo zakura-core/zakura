@@ -19,7 +19,7 @@ use zakura_rt::collections::HashSet;
 
 use crate::zakura::tx_relay::machine::{
     CallId, CloseReason, Granted, PeerKey, RelayEffect, RelayMachine, SessionId, Unreserved,
-    Verdict, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, TRIED_PER_ENTRY,
+    Verdict, Violation, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, MAX_SERVES, TRIED_PER_ENTRY,
 };
 
 /// The input a step answers, with what the record needs of it.
@@ -34,6 +34,11 @@ pub(crate) enum Cause {
     Arrived(SessionId, UnminedTxId, bool),
     /// The decoded body for the id, on the session.
     Body(SessionId, UnminedTxId),
+    /// The body the session's IO decoded did not decode.
+    Undecodable(SessionId),
+    /// The session's IO started writing its answer to the peer's request
+    /// for the id.
+    Served(SessionId, UnminedTxId),
     /// The session's peer answered `NotFound`.
     NotFound(SessionId, UnminedTxId),
     /// The session's peer asked for the id.
@@ -64,6 +69,8 @@ pub(crate) struct Open {
     told: IndexSet<UnminedTxId>,
     /// Ids that went out to it in an `Inv` and still stand.
     pub(crate) sent: IndexSet<UnminedTxId>,
+    /// Its requests the node serves, until the IO starts each answer.
+    pub(crate) serving: IndexSet<UnminedTxId>,
 }
 
 /// What a granted reservation is used for.
@@ -130,7 +137,7 @@ impl Tracker {
     /// pool count as told from the start.
     pub(crate) fn opened(&mut self, session: SessionId, peer: PeerKey, exempt: bool) {
         let told = self.unsettled(peer).collect();
-        let (hello, sent) = (false, IndexSet::new());
+        let (hello, sent, serving) = (false, IndexSet::new(), IndexSet::new());
         self.open.insert(
             session,
             Open {
@@ -139,6 +146,7 @@ impl Tracker {
                 hello,
                 told,
                 sent,
+                serving,
             },
         );
         let peers: IndexSet<PeerKey> = self.open.values().map(|open| open.peer).collect();
@@ -203,6 +211,22 @@ impl Tracker {
         now: Duration,
         tip: Height,
     ) {
+        // What a request may get, from the state before its step: no answer
+        // and a close for a broken rule, or one answer.
+        let request = match cause {
+            Cause::GetTxs(session, id) => self.open.get(session).map(|open| {
+                if !open.hello {
+                    Some(Violation::NoHelloFirst)
+                } else if open.serving.contains(id) {
+                    Some(Violation::RequestedTwice)
+                } else if open.serving.len() >= MAX_SERVES {
+                    Some(Violation::TooManyRequests)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
         self.before(cause);
         if let Cause::Verdict(
             _,
@@ -293,6 +317,7 @@ impl Tracker {
                     if matches!(effect, RelayEffect::Serve { .. }) {
                         let served = self.shown.contains(id) && open.sent.contains(id);
                         assert!(served, "served only once sent, while pooled");
+                        open.serving.insert(*id);
                         self.saw("serve");
                     } else {
                         open.sent.shift_remove(id);
@@ -307,8 +332,25 @@ impl Tracker {
             }
         }
         if let Cause::GetTxs(session, _) = cause {
-            let live = self.open.get(session).is_some_and(|open| open.hello);
-            assert_eq!(answers, usize::from(live), "a GetTxs is answered");
+            let closed = |violation| CloseReason::Violation(violation);
+            let closes: Vec<CloseReason> = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    RelayEffect::Close {
+                        session: of,
+                        reason,
+                    } if of == session => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            match request {
+                Some(None) => assert_eq!(answers, 1, "a GetTxs is answered"),
+                Some(Some(broken)) => {
+                    assert_eq!(answers, 0, "a GetTxs that breaks a rule is not answered");
+                    assert_eq!(closes, vec![closed(broken)], "it closes for that rule");
+                }
+                None => assert_eq!(answers, 0, "a GetTxs on an ended session"),
+            }
         }
         self.after(cause, submitted);
     }
@@ -319,6 +361,11 @@ impl Tracker {
             Cause::Hello(session) => {
                 if let Some(open) = self.open.get_mut(session) {
                     open.hello = true;
+                }
+            }
+            Cause::Served(session, id) => {
+                if let Some(open) = self.open.get_mut(session) {
+                    open.serving.shift_remove(id);
                 }
             }
             Cause::Arrived(session, id, false)
@@ -443,9 +490,14 @@ impl Tracker {
                 Some(sender)
             }
             Cause::NotFound(sender, _) | Cause::GetTxs(sender, _) => Some(sender),
+            Cause::Undecodable(sender) => Some(sender),
             _ => None,
         };
         match reason {
+            CloseReason::Violation(Violation::Undecodable) => {
+                let decoded = matches!(cause, Cause::Undecodable(of) if *of == session);
+                assert!(decoded, "an undecodable body's close");
+            }
             CloseReason::Violation(_) => assert_eq!(sender, Some(&session), "a violation's sender"),
             CloseReason::Unresponsive => {
                 let asked = self.requests.keys().any(|(asked, _)| *asked == session);

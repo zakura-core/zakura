@@ -370,6 +370,17 @@ impl PeerMachine {
             self.violation(shared, Violation::NoHelloFirst);
             return self.settle(shared, pool);
         };
+        // A conformant peer counts a request outstanding at least as long
+        // as we do: until its answer arrives, and we count it only until
+        // the IO starts writing the answer.
+        if self.state.serving.contains(&id) {
+            self.violation(shared, Violation::RequestedTwice);
+            return self.settle(shared, pool);
+        }
+        if self.state.serving.len() >= MAX_SERVES {
+            self.violation(shared, Violation::TooManyRequests);
+            return self.settle(shared, pool);
+        }
         // Exact ids: this compares the authorizing data too. A body above the
         // requester's limit is never sent.
         let announced = self.state.announced.is_sent(&id);
@@ -382,11 +393,37 @@ impl PeerMachine {
             self.state.announced.remove(&id);
         }
         let session = self.session;
-        shared.effects.push(if servable {
-            RelayEffect::Serve { session, id }
+        if servable {
+            self.state.serving.insert(id);
+            shared.effects.push(RelayEffect::Serve { session, id });
         } else {
-            RelayEffect::NotFound { session, id }
-        });
+            shared.effects.push(RelayEffect::NotFound { session, id });
+        }
+        self.settle(shared, pool);
+    }
+
+    /// The IO started writing its answer to the peer's request for `id`,
+    /// the body or, if the pool let it go meanwhile, a `NotFound`. The
+    /// request no longer counts against what our `Hello` serves.
+    pub(crate) fn served(
+        &mut self,
+        shared: &mut Shared,
+        pool: &dyn PoolView,
+        id: UnminedTxId,
+        now: Time,
+    ) {
+        self.enter(shared, pool, now);
+        self.state.serving.remove(&id);
+        self.settle(shared, pool);
+    }
+
+    /// A body [`Self::tx_arrived`] let the IO decode does not decode as one
+    /// transaction: a broken wire rule.
+    pub(crate) fn undecodable(&mut self, shared: &mut Shared, pool: &dyn PoolView, now: Time) {
+        self.enter(shared, pool, now);
+        if !self.ended {
+            self.violation(shared, Violation::Undecodable);
+        }
         self.settle(shared, pool);
     }
 

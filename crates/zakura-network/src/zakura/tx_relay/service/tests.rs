@@ -213,8 +213,8 @@ impl Session {
 
     /// Hands the peer's `message` to the routine, and runs what follows a
     /// step.
-    fn deliver(&mut self, message: TxRelayMessage) {
-        self.routine.message(message);
+    async fn deliver(&mut self, message: TxRelayMessage) {
+        self.routine.message(message).await;
         self.routine.after_step();
     }
 }
@@ -233,7 +233,7 @@ struct Serving {
 }
 
 impl Serving {
-    fn new(count: usize) -> Self {
+    async fn new(count: usize) -> Self {
         let pool = transactions(count);
         let ids: Vec<UnminedTxId> = pool.iter().map(|tx| tx.transaction.id()).collect();
         let (handle, inbox) = pool_port();
@@ -244,10 +244,12 @@ impl Serving {
         );
         let (wiring, handed) = wiring(handle);
         let mut session = Session::open(&wiring);
-        session.deliver(TxRelayMessage::Hello {
-            serves: 16,
-            max_tx_bytes: MAX_TX_BYTES,
-        });
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
         match message(
             session
                 .data
@@ -271,7 +273,7 @@ impl Serving {
 /// old one has ended, pays the same `Inv` bucket.
 #[tokio::test]
 async fn sessions_on_one_connection_share_one_inv_bucket() {
-    let serving = Serving::new(1);
+    let serving = Serving::new(1).await;
     let sessions = |wiring: &Wiring| {
         let buckets = wiring.inv_buckets.lock().expect("never poisoned");
         assert_eq!(buckets.len(), 1);
@@ -287,12 +289,12 @@ async fn sessions_on_one_connection_share_one_inv_bucket() {
 /// request's serve job waits on the writer.
 #[tokio::test]
 async fn an_id_requested_again_while_its_job_waits_closes_the_peer() {
-    let mut serving = Serving::new(1);
+    let mut serving = Serving::new(1).await;
     let id = serving.ids[0];
     let session = &mut serving.session;
-    session.deliver(TxRelayMessage::GetTxs(id));
+    session.deliver(TxRelayMessage::GetTxs(id)).await;
     assert!(!session.cancel.is_cancelled());
-    session.deliver(TxRelayMessage::GetTxs(id));
+    session.deliver(TxRelayMessage::GetTxs(id)).await;
     assert_eq!(session.cause.get(), Some("tx-relay: id requested twice"));
 }
 

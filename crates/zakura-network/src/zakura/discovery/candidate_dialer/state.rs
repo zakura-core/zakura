@@ -371,8 +371,10 @@ impl CandidateDialerState {
                 self.next_sequence
             );
         }
-        assert_eq!(
-            self.in_flight_by_ip, reserved,
+        // Not `assert_eq!`: a map's `Debug` order varies between runs, and the
+        // simulator's replay compares failure messages exactly.
+        assert!(
+            self.in_flight_by_ip == reserved,
             "discovery/dial-attempts: reservations disagree with the attempts in flight"
         );
         assert!(

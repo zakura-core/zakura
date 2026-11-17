@@ -2299,8 +2299,10 @@ impl ZakuraDiscoveryBook {
                 "{PROPERTY}: a dialed address that is not confirmed"
             );
         }
-        assert_eq!(
-            self.relayed, relayed,
+        // Not `assert_eq!`: a map's `Debug` order varies between runs, and the
+        // simulator's replay compares failure messages exactly.
+        assert!(
+            self.relayed == relayed,
             "{PROPERTY}: relay attribution disagrees with the entries"
         );
         assert!(

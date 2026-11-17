@@ -178,6 +178,20 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
     failure_bans(error, *transaction_version).then_some(*advertiser_addr)
 }
 
+/// Whether `error` is a failure on this node that says nothing about the
+/// transaction: a failed state lookup, or an internal error. The lock-time
+/// check turns a failed median-time lookup into its own error. Neither pool
+/// caches these as rejections, so the same transaction can be tried again at
+/// the same tip.
+pub(crate) fn is_local_failure(error: &TransactionError) -> bool {
+    matches!(
+        error,
+        TransactionError::StateUnavailable(_)
+            | TransactionError::ValidateMempoolLockTimeError(_)
+            | TransactionError::InternalDowncastError(_)
+    )
+}
+
 /// Whether a verification failure with `error` bans the peer that relayed a
 /// transaction of `transaction_version`. Both pools use this. See
 /// [`peer_action`].

@@ -338,6 +338,15 @@ fn max_msg_size_round_trip() {
     // i know the above msg has a body of 85 bytes
     let size = 85;
 
+    // A rejected encode leaves nothing behind in the output buffer.
+    let mut dst = BytesMut::new();
+    Codec::builder()
+        .with_max_body_len(size - 1)
+        .finish()
+        .encode(msg.clone(), &mut dst)
+        .expect_err("message is one byte over the max allowed body size");
+    assert!(dst.is_empty());
+
     // reducing the max size to body size - 1
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
         let mut bytes = Vec::new();

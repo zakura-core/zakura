@@ -20,9 +20,9 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
-        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, ReadZcashExt,
+        SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto, ZcashReader,
+        ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -267,17 +267,6 @@ impl Encoder<Message> for Codec {
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
-
-        let body_length = self.body_length(&item);
-
-        if body_length > self.builder.max_len {
-            return Err(Parse("body length exceeded maximum size"));
-        }
-
-        // Aggregate totals only: per-addr labels are never pruned by the Prometheus
-        // exporter and grow without bound on public listeners.
-        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
-
         use Message::*;
         // Note: because all match arms must have
         // the same type, and the array length is
@@ -303,22 +292,37 @@ impl Encoder<Message> for Codec {
             Tx { .. } => b"tx\0\0\0\0\0\0\0\0\0\0",
             Mempool => b"mempool\0\0\0\0\0",
         };
-        trace!(?item, len = body_length);
 
-        dst.reserve(HEADER_LEN + body_length);
+        // The body is serialized once, straight into `dst`. The header's length and
+        // checksum are zero until the body is written, then filled in.
         let start_len = dst.len();
-        {
+        dst.reserve(HEADER_LEN);
+        let written = (|| {
             let dst = &mut dst.writer();
             dst.write_all(&self.builder.network.magic().0[..])?;
             dst.write_all(command)?;
-            dst.write_u32::<LittleEndian>(body_length as u32)?;
-
-            // We zero the checksum at first, and compute it later
-            // after the body has been written.
             dst.write_u32::<LittleEndian>(0)?;
+            dst.write_u32::<LittleEndian>(0)?;
+            self.write_body(&item, dst)
+        })();
 
-            self.write_body(&item, dst)?;
+        let body_length = dst.len() - start_len - HEADER_LEN;
+        if let Err(error) = written {
+            dst.truncate(start_len);
+            return Err(error);
         }
+        if body_length > self.builder.max_len {
+            dst.truncate(start_len);
+            return Err(Parse("body length exceeded maximum size"));
+        }
+
+        trace!(?item, len = body_length);
+        // Aggregate totals only: per-addr labels are never pruned by the Prometheus
+        // exporter and grow without bound on public listeners.
+        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
+
+        // `max_len` is at most `MAX_PROTOCOL_MESSAGE_LEN`, so the length fits in a u32.
+        dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
         let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
@@ -327,21 +331,6 @@ impl Encoder<Message> for Codec {
 }
 
 impl Codec {
-    /// Obtain the size of the body of a given message. This will match the
-    /// number of bytes written to the writer provided to `write_body` for the
-    /// same message.
-    // # Performance TODO
-    //
-    // If this code shows up in profiles, replace with a size estimate or cached size,
-    // to avoid multiple serializations for large data structures like lists, blocks, and transactions.
-    fn body_length(&self, msg: &Message) -> usize {
-        let mut writer = FakeWriter(0);
-
-        self.write_body(msg, &mut writer)
-            .expect("writer should never fail");
-        writer.0
-    }
-
     /// Returns the checksum of `body`, the serialized body of `msg`.
     ///
     /// A large block's checksum is taken from [`BlockChecksums`] when another send already

@@ -176,6 +176,22 @@ enum SessionFailure {
 }
 
 impl DiscoverySessionStates {
+    /// Checks the records' invariant: a record counts fewer failures than the
+    /// bound while active, and exactly the bound or fewer once retired.
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        for record in self.records.values() {
+            assert!(
+                record.failed_attempts < MAX_DISCOVERY_SESSION_FAILURES
+                    || (record.failed_attempts == MAX_DISCOVERY_SESSION_FAILURES
+                        && record.state == DiscoverySessionState::Retired),
+                "discovery/session-records: {} failures on a {:?} record",
+                record.failed_attempts,
+                record.state
+            );
+        }
+    }
+
     /// Whether the record for `peer` on `conn_id` is retired.
     fn is_retired(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
         self.records
@@ -2681,21 +2697,24 @@ mod tests {
         ]
     }
 
-    /// The model's view of one connection's record.
+    /// What the test sent one connection's record and what the record
+    /// reported.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct SessionModel {
+    struct Opened {
         session_id: u64,
         retired: bool,
+        /// Failures the record counted since the last success its session
+        /// reported.
         failures: u32,
     }
 
     proptest::proptest! {
-        /// After every step the session records match an independent model: a
-        /// session acts only on the record it owns, a retired record never
+        /// After every step each record holds the session that opened it last,
+        /// a session acts only on the record it owns, a retired record never
         /// reopens before its connection ends, and the failure count survives
         /// reopens until a success resets it or the bound retires the record.
         #[test]
-        fn session_records_match_independent_model(
+        fn session_records_keep_their_owner_and_failures(
             ops in proptest::collection::vec(session_op(), 1..96),
         ) {
             let peers = [
@@ -2703,16 +2722,20 @@ mod tests {
                 ZakuraPeerId::new(vec![81; 32]).expect("test peer id is within bounds"),
             ];
             let mut states = DiscoverySessionStates::default();
-            let mut model: HashMap<(usize, ZakuraConnId), SessionModel> = HashMap::new();
+            let mut opened: HashMap<(usize, ZakuraConnId), Opened> = HashMap::new();
             for op in ops {
                 match op {
                     SessionOp::Open(peer, conn_id, session_id) => {
                         let key = DiscoverySessionKey::new(peers[peer].clone(), conn_id, session_id);
-                        let previous = model.get(&(peer, conn_id)).copied();
-                        let expected = !previous.is_some_and(|record| record.retired);
-                        proptest::prop_assert_eq!(states.open(&key), expected);
-                        if expected {
-                            model.insert((peer, conn_id), SessionModel {
+                        let previous = opened.get(&(peer, conn_id)).copied();
+                        let reopened = states.open(&key);
+                        // Only a retired record refuses a session.
+                        proptest::prop_assert_eq!(
+                            reopened,
+                            !previous.is_some_and(|record| record.retired)
+                        );
+                        if reopened {
+                            opened.insert((peer, conn_id), Opened {
                                 session_id,
                                 retired: false,
                                 failures: previous.map_or(0, |record| record.failures),
@@ -2721,24 +2744,27 @@ mod tests {
                     }
                     SessionOp::Fail(peer, conn_id, session_id) => {
                         let key = DiscoverySessionKey::new(peers[peer].clone(), conn_id, session_id);
-                        let expected = match model.get_mut(&(peer, conn_id)) {
-                            Some(record) if record.session_id == session_id && !record.retired => {
+                        let owned = opened
+                            .get_mut(&(peer, conn_id))
+                            .filter(|record| record.session_id == session_id && !record.retired);
+                        match (states.record_failure(&key), owned) {
+                            (SessionFailure::Stale, None) => {}
+                            (SessionFailure::Counted, Some(record)) => record.failures += 1,
+                            (SessionFailure::Retired { attempts }, Some(record)) => {
                                 record.failures += 1;
-                                if record.failures >= MAX_DISCOVERY_SESSION_FAILURES {
-                                    record.retired = true;
-                                    SessionFailure::Retired { attempts: record.failures }
-                                } else {
-                                    SessionFailure::Counted
-                                }
+                                record.retired = true;
+                                proptest::prop_assert_eq!(attempts, record.failures);
                             }
-                            _ => SessionFailure::Stale,
-                        };
-                        proptest::prop_assert_eq!(states.record_failure(&key), expected);
+                            (failure, owned) => proptest::prop_assert!(
+                                false,
+                                "{failure:?} for a session that owns {owned:?}"
+                            ),
+                        }
                     }
                     SessionOp::Succeed(peer, conn_id, session_id) => {
                         let key = DiscoverySessionKey::new(peers[peer].clone(), conn_id, session_id);
                         states.record_success(&key);
-                        if let Some(record) = model
+                        if let Some(record) = opened
                             .get_mut(&(peer, conn_id))
                             .filter(|record| record.session_id == session_id)
                         {
@@ -2747,37 +2773,58 @@ mod tests {
                     }
                     SessionOp::Retire(peer, conn_id, session_id) => {
                         let key = DiscoverySessionKey::new(peers[peer].clone(), conn_id, session_id);
-                        let owned = model
+                        let owned = opened
                             .get_mut(&(peer, conn_id))
                             .filter(|record| record.session_id == session_id);
-                        let expected = owned.is_some();
+                        proptest::prop_assert_eq!(states.retire(&key), owned.is_some());
                         if let Some(record) = owned {
                             record.retired = true;
                         }
-                        proptest::prop_assert_eq!(states.retire(&key), expected);
                     }
                     SessionOp::RemoveConnection(peer, conn_id) => {
                         states.remove_connection(&peers[peer], conn_id);
-                        model.remove(&(peer, conn_id));
+                        opened.remove(&(peer, conn_id));
                     }
                 }
 
-                proptest::prop_assert_eq!(states.records.len(), model.len());
-                for ((peer, conn_id), expected) in &model {
+                states.assert_invariants();
+                proptest::prop_assert_eq!(states.records.len(), opened.len());
+                for ((peer, conn_id), opened) in &opened {
                     let record = record_for(&states, &peers[*peer], *conn_id);
-                    proptest::prop_assert_eq!(record.session_id, expected.session_id);
+                    proptest::prop_assert_eq!(record.session_id, opened.session_id);
                     proptest::prop_assert_eq!(
                         record.state == DiscoverySessionState::Retired,
-                        expected.retired
+                        opened.retired
                     );
-                    proptest::prop_assert_eq!(record.failed_attempts, expected.failures);
+                    proptest::prop_assert_eq!(record.failed_attempts, opened.failures);
                     proptest::prop_assert_eq!(
                         states.is_retired(&peers[*peer], *conn_id),
-                        expected.retired
+                        opened.retired
                     );
                 }
             }
         }
+    }
+
+    /// A record retires at its third failure, and only its connection's end
+    /// lets the peer open a session there again.
+    #[test]
+    fn the_bound_failure_retires_a_record_until_its_connection_ends() {
+        let peer = ZakuraPeerId::new(vec![82; 32]).expect("test peer id is within bounds");
+        let mut states = DiscoverySessionStates::default();
+        let key = |session_id| DiscoverySessionKey::new(peer.clone(), 4, session_id);
+        assert!(states.open(&key(1)));
+        assert_eq!(states.record_failure(&key(1)), SessionFailure::Counted);
+        assert!(states.open(&key(2)));
+        assert_eq!(states.record_failure(&key(2)), SessionFailure::Counted);
+        assert_eq!(
+            states.record_failure(&key(2)),
+            SessionFailure::Retired { attempts: 3 }
+        );
+        assert!(!states.open(&key(3)));
+        states.remove_connection(&peer, 4);
+        assert!(states.open(&key(3)));
+        assert_eq!(record_for(&states, &peer, 4).failed_attempts, 0);
     }
 
     #[tokio::test]

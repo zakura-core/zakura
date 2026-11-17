@@ -40,9 +40,9 @@ pub enum MachineStep {
     HeaderReactor(HeaderReactorStep),
     /// Reactor query and view policy and its independent model.
     Reactor(ReactorStep),
-    /// The real discovery book, its independent model, and its signed samples.
+    /// The real discovery book's view and its signed samples.
     DiscoveryBook(BookStep),
-    /// Discovery's real session and hint owner and its independent model.
+    /// Discovery's real session and hint owner's view.
     DiscoveryState(DiscoverySessionStep),
     /// Header publisher credit and terminal policy, with its independent model.
     HeaderPublisher(HeaderPublisherStep),

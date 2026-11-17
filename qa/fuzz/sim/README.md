@@ -116,8 +116,9 @@ action channel, reply routes, and shutdown have witnesses in `zakura-network`.
 `discovery_record_book` and `discovery_session_installation` use the shared trace
 and replay pipeline without starting QUIC. Each consumes at most 512 causal
 bytes, the record book under decoder v3 with two bytes per operation and the
-session owner under decoder v2 with four. They compare the real owner with its
-independent model after each completed operation. The tests
+session owner under decoder v2 with four. After each completed operation they
+check the real owner's invariants, and compare its results and reported changes
+with what the driver sent. The tests
 `book_trace_reports_exact_install_replacement_and_eviction` and
 `session_trace_separates_stale_results_and_retained_hints` show that each witness
 input reaches its rules, and that an empty input reaches none. They do not

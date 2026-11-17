@@ -23,7 +23,7 @@ use crate::zakura::{
         sequencer_task::initial_view,
         work_queue::{WorkOwnershipFailure, WorkOwnershipPhase},
     },
-    machine_test::MAX_HISTORY_BYTES,
+    machine_test::{with_property, MAX_HISTORY_BYTES},
 };
 
 fn hash(domain: u8, raw: u32) -> block::Hash {
@@ -1274,7 +1274,7 @@ impl Driver {
     /// Check the state's invariants, and compare it with what the test sent
     /// and what the machine reported.
     fn check(&self) {
-        self.state.assert_invariants();
+        with_property(PROPERTY, || self.state.assert_invariants());
         let snapshot = self.state.snapshot();
         let sent = &self.sent;
         assert_eq!(snapshot.pending, sent.pending, "{PROPERTY}: pending query");
@@ -1574,6 +1574,23 @@ fn reactor_history_retires_the_pending_query_on_an_authority_change() {
     assert!(history.summary.is_some());
     assert!(history.steps[0].actual.state.pending.is_some());
     assert_eq!(history.steps[1].actual.state.pending, None);
+}
+
+/// The simulator judges only a step's failure, so a broken owner invariant
+/// must become a property failure.
+#[test]
+fn a_broken_owner_invariant_is_a_property_failure() {
+    let mut driver = Driver::new();
+    for input in decode(WITNESS) {
+        driver.apply(input);
+    }
+    let progress = &mut driver.state.progress;
+    progress.servable_high = block::Height(progress.verified_block_tip.0 + 1);
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.check()))
+        .expect_err("the advertised tip left the verified tip");
+    let failure =
+        WorkOwnershipFailure::from_panic(payload.as_ref(), WorkOwnershipPhase::Invariant, PROPERTY);
+    assert!(failure.property_failure, "{}", failure.message);
 }
 
 #[test]

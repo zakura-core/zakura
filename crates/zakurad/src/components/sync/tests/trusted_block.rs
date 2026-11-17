@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 mod native;
+mod pow;
 
 use futures::FutureExt;
 use http_body_util::{BodyExt, Full};
@@ -23,7 +24,7 @@ use tower::{
 use zakura_chain::{
     block::{Block, Height},
     chain_tip::ChainTip,
-    parameters::{testnet::ConfiguredActivationHeights, Network, NetworkKind},
+    parameters::{testnet::ConfiguredActivationHeights, Network},
     serialization::ZcashSerialize,
     transparent::Address,
 };
@@ -66,6 +67,7 @@ struct ValidationGate {
     held: watch::Sender<bool>,
     entered: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
     finished: mpsc::UnboundedReceiver<(zakura_chain::block::Hash, bool)>,
+    failures: mpsc::UnboundedReceiver<(zakura_chain::block::Hash, pow::ValidationFailure)>,
 }
 
 impl ValidationGate {
@@ -129,6 +131,22 @@ impl Node {
             }
             .into(),
         );
+        Self::with_network(
+            seed,
+            stack,
+            network,
+            zakura_chain::block::genesis::regtest_genesis_block(),
+        )
+        .await
+    }
+
+    async fn with_network(
+        seed: Option<SocketAddr>,
+        stack: P2pStack,
+        network: Network,
+        genesis: Arc<Block>,
+    ) -> Self {
+        assert_eq!(network.genesis_hash(), genesis.hash());
         let (
             zakura_state::InitializedState {
                 state,
@@ -150,7 +168,6 @@ impl Node {
         .await
         .unwrap();
         let state = Buffer::new(state, 16);
-        let genesis = zakura_chain::block::genesis::regtest_genesis_block();
         state
             .clone()
             .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
@@ -248,6 +265,7 @@ impl Node {
         let (held, _) = watch::channel(false);
         let (entered, entered_rx) = mpsc::unbounded_channel();
         let (finished, finished_rx) = mpsc::unbounded_channel();
+        let (failures, failures_rx) = mpsc::unbounded_channel();
         let gate_sender = held.clone();
         let real_verifier: Verifier = verifier.clone();
         let gated = tower::service_fn(move |request: VerifyRequest| {
@@ -255,6 +273,7 @@ impl Node {
             let mut held = gate_sender.subscribe();
             let entered = entered.clone();
             let finished = finished.clone();
+            let failures = failures.clone();
             let commit = matches!(
                 request,
                 VerifyRequest::Commit(_) | VerifyRequest::CommitMined { .. }
@@ -274,6 +293,9 @@ impl Node {
                         .expect("real router returns RouterError")
                 });
                 if commit {
+                    if let Err(error) = &result {
+                        let _ = failures.send((hash, pow::ValidationFailure::from(error)));
+                    }
                     let _ = finished.send((hash, result.is_ok()));
                 }
                 result
@@ -340,9 +362,7 @@ impl Node {
         let (rpc, queue) = RpcImpl::new(
             network.clone(),
             zakura_rpc::config::mining::Config {
-                miner_address: Some(
-                    Address::from_pub_key_hash(NetworkKind::Regtest, [7; 20]).into(),
-                ),
+                miner_address: Some(Address::from_pub_key_hash(network.kind(), [7; 20]).into()),
                 ..Default::default()
             },
             false,
@@ -437,6 +457,7 @@ impl Node {
                 held,
                 entered: entered_rx,
                 finished: finished_rx,
+                failures: failures_rx,
             },
             hold_relay,
             held_relays,

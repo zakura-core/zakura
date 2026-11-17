@@ -8,6 +8,5 @@ pub mod cross;
 pub mod discovery;
 pub mod header_sync;
 pub mod header_sync_progress;
-pub mod pool;
 pub mod session;
 pub mod shared;

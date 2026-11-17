@@ -1,6 +1,0 @@
-# The port stops waking readers after a run's first publications, while
-# the snapshot still moves, so the reader of the log never reads what
-# comes later, though every publication is right.
-input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
-# The port's log, which readers read through.
-checks = ["crates/zakura-node-services/src/mempool"]

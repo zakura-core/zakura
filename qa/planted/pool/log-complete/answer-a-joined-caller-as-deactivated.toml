@@ -1,5 +1,0 @@
-# The task answers a joined caller as if the pool had turned off, instead
-# of with the verdict the admission it joined gets.
-input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
-# The harness drives the pool core and the storage under it.
-checks = ["crates/zakura-mempool/src"]

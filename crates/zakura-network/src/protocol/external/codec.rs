@@ -139,27 +139,17 @@ enum BodyDecodePanic {
 pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, sha256d::Checksum)>>>);
 
 impl BlockChecksums {
-    /// Returns the remembered checksum of the block `hash`, if its body was `body_len` bytes.
+    /// Returns the body length and checksum remembered for the block `hash`.
     ///
     /// A block that is found becomes the last one to be forgotten.
-    fn get(&self, hash: block::Hash, body_len: usize) -> Option<sha256d::Checksum> {
+    fn get(&self, hash: block::Hash) -> Option<(usize, sha256d::Checksum)> {
         let mut checksums = self
             .0
             .lock()
             .expect("the lock is only held for map operations, which do not panic");
-        let (remembered_len, checksum) = checksums.shift_remove(&hash)?;
-        checksums.insert(hash, (remembered_len, checksum));
-        (remembered_len == body_len).then_some(checksum)
-    }
-
-    /// Returns the body length remembered for the block `hash`, without changing which block
-    /// is forgotten next.
-    fn remembered_len(&self, hash: block::Hash) -> Option<usize> {
-        self.0
-            .lock()
-            .expect("the lock is only held for map operations, which do not panic")
-            .get(&hash)
-            .map(|(body_len, _)| *body_len)
+        let remembered = checksums.shift_remove(&hash)?;
+        checksums.insert(hash, remembered);
+        Some(remembered)
     }
 
     /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
@@ -311,12 +301,12 @@ impl Encoder<Message> for Codec {
             Message::Block(block) => Some(block.hash()),
             _ => None,
         };
-        // A remembered length only sizes the reservation; the size limit is checked against
-        // the bytes actually written below.
-        let remembered_len =
-            block_hash.and_then(|hash| self.builder.block_checksums.remembered_len(hash));
-        let expected_len = match remembered_len {
-            Some(len) => len.min(self.builder.max_len),
+        // One lookup gives both the length to reserve and, once the body is written, its
+        // checksum. A remembered length only sizes the reservation; the size limit is checked
+        // against the bytes actually written below.
+        let remembered = block_hash.and_then(|hash| self.builder.block_checksums.get(hash));
+        let expected_len = match remembered {
+            Some((len, _)) => len.min(self.builder.max_len),
             None => {
                 let len = self.body_length(&item)?;
                 if len > self.builder.max_len {
@@ -356,7 +346,7 @@ impl Encoder<Message> for Codec {
 
         // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
         dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
-        let checksum = self.body_checksum(block_hash, &dst[start_len + HEADER_LEN..]);
+        let checksum = self.body_checksum(block_hash, remembered, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -376,24 +366,32 @@ impl Codec {
     }
 
     /// Returns the checksum of `body`, the serialized body of a message, where `block_hash`
-    /// is the hash of the block the message carries, if it carries one.
+    /// is the hash of the block the message carries, if it carries one, and `remembered` is
+    /// what [`BlockChecksums`] held for that block before the body was written.
     ///
-    /// A large block's checksum is taken from [`BlockChecksums`] when another send already
-    /// hashed that block, and is remembered there otherwise. Every other body is hashed.
-    fn body_checksum(&self, block_hash: Option<block::Hash>, body: &[u8]) -> sha256d::Checksum {
+    /// A large block's remembered checksum is used when it was remembered for a body of the
+    /// same length. Otherwise the body is hashed, and a large block's checksum is remembered.
+    fn body_checksum(
+        &self,
+        block_hash: Option<block::Hash>,
+        remembered: Option<(usize, sha256d::Checksum)>,
+        body: &[u8],
+    ) -> sha256d::Checksum {
         let hash = match block_hash {
             Some(hash) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => hash,
             _ => return message_checksum(body),
         };
 
-        let block_checksums = &self.builder.block_checksums;
-        if let Some(checksum) = block_checksums.get(hash, body.len()) {
-            return checksum;
+        match remembered {
+            Some((remembered_len, checksum)) if remembered_len == body.len() => checksum,
+            _ => {
+                let checksum = message_checksum(body);
+                self.builder
+                    .block_checksums
+                    .insert(hash, body.len(), checksum);
+                checksum
+            }
         }
-
-        let checksum = message_checksum(body);
-        block_checksums.insert(hash, body.len(), checksum);
-        checksum
     }
 
     /// Write the body of the message into the given writer. This allows writing

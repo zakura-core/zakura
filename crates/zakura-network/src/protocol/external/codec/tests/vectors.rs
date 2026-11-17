@@ -1189,8 +1189,8 @@ fn checksum_remembered_for_another_body_length_is_replaced() {
 
     assert_eq!(encode_block(&mut codec, &block), alone);
     assert_eq!(
-        shared.get(block.hash(), body_len),
-        Some(sha256d::Checksum::from(&alone[HEADER_LEN..])),
+        shared.get(block.hash()),
+        Some((body_len, sha256d::Checksum::from(&alone[HEADER_LEN..]))),
     );
 }
 
@@ -1299,13 +1299,13 @@ fn block_checksums_forget_the_block_sent_least_recently() {
     }
 
     // Sending the oldest block again makes the second-oldest the next to be forgotten.
-    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
+    assert_eq!(checksums.get(hash(0)), Some((100_000, checksum)));
     checksums.insert(hash(SHARED_CHECKSUM_BLOCKS), 100_000, checksum);
 
-    assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
-    assert_eq!(checksums.get(hash(1), 100_000), None);
+    assert_eq!(checksums.get(hash(0)), Some((100_000, checksum)));
+    assert_eq!(checksums.get(hash(1)), None);
     assert_eq!(
-        checksums.get(hash(SHARED_CHECKSUM_BLOCKS), 100_000),
-        Some(checksum)
+        checksums.get(hash(SHARED_CHECKSUM_BLOCKS)),
+        Some((100_000, checksum))
     );
 }

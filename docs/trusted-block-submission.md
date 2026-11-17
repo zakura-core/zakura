@@ -90,6 +90,11 @@ credentials when cookie authentication is enabled, 403 for browser requests,
 413 for oversized bodies, 415 for the wrong content type, and 429 when submission
 capacity is exhausted.
 
+A commit preserves announcements already dispatched to peers. The normal committed
+broadcast shares their per-connection delivery tracking, avoiding a second inventory
+on healthy connections while still reaching peers that missed early relay. If the
+block commits before early dispatch, only the committed path announces it.
+
 ## Invalid blocks and peer penalties
 
 Calling the trusted endpoint before upstream validation succeeds can distribute

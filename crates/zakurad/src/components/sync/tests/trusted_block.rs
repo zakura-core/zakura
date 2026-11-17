@@ -4,6 +4,7 @@
 
 mod native;
 mod pow;
+mod wire;
 
 use futures::FutureExt;
 use http_body_util::{BodyExt, Full};
@@ -104,6 +105,8 @@ struct Node {
     gate: ValidationGate,
     hold_relay: watch::Sender<bool>,
     held_relays: mpsc::UnboundedReceiver<HeldRelay>,
+    hold_body: watch::Sender<bool>,
+    body_requests: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
     tasks: Vec<AbortHandle>,
     _recent: RecentSyncLengths,
     _directory: tempfile::TempDir,
@@ -206,6 +209,8 @@ impl Node {
             16,
         );
         let (advertisement_tx, advertisements) = mpsc::unbounded_channel();
+        let (hold_body, body_held) = watch::channel(false);
+        let (body_requested, body_requests) = mpsc::unbounded_channel();
         let genesis_hash = network.genesis_hash();
         let inbound = tower::service_fn(move |request: Request| {
             if let Request::AdvertiseBlock(block, _) = &request {
@@ -214,7 +219,23 @@ impl Node {
                     let _ = advertisement_tx.send(block.hash);
                 }
             }
-            inbound.clone().oneshot(request)
+            let body = matches!(&request, Request::BlocksByHash(_));
+            if let Request::BlocksByHash(hashes) = &request {
+                for hash in hashes {
+                    let _ = body_requested.send(*hash);
+                }
+            }
+            let mut held = body_held.clone();
+            let response = inbound.clone().oneshot(request).boxed();
+            async move {
+                if body {
+                    while *held.borrow_and_update() {
+                        held.changed().await.unwrap();
+                    }
+                }
+                response.await
+            }
+            .boxed()
         });
         let directory = tempfile::tempdir().unwrap();
         let config = zakura_network::Config {
@@ -461,6 +482,8 @@ impl Node {
             },
             hold_relay,
             held_relays,
+            hold_body,
+            body_requests,
             tasks: tasks.into_iter().chain(native_tasks).collect(),
             _recent: recent,
             _directory: directory,

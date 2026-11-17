@@ -46,13 +46,15 @@ use crate::{
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
-        self, address_is_valid_for_inbound_listeners, HandshakeRequest, MinimumPeerVersion,
-        OutboundConnectorRequest,
+        self, address_is_valid_for_inbound_listeners, block_checksum_warmup::BlockChecksumWarmup,
+        HandshakeRequest, MinimumPeerVersion, OutboundConnectorRequest,
     },
     peer_cache_updater::peer_cache_updater,
     peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
-    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
+    protocol::external::{
+        canonical_peer_addr, canonical_socket_addr, types::PeerServices, BlockChecksums,
+    },
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, MisbehaviorReporter, PeerSocketAddr, Request,
     Response,
@@ -224,6 +226,10 @@ where
     // TCP and compatibility ingress reach the backend through clones of this one
     // service, so its load-shedding buffer is their shared admission.
     let inbound_for_zakura_sink = inbound_service.clone();
+    // Block advertisement looks up advertised blocks through the same service that answers
+    // peers' `getdata`, so it precomputes checksums of the bodies connections will send.
+    let inbound_for_checksum_warmup = inbound_service.clone();
+    let block_checksums = BlockChecksums::default();
     let peer_registry = PeerRegistry::default();
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
         &config,
@@ -301,6 +307,7 @@ where
             .with_peer_registry(peer_registry.clone())
             .with_protected_peer_ips(protected_peer_ips)
             .with_misbehavior(misbehavior.clone())
+            .with_block_checksums(block_checksums.clone())
             .with_tcp_warmup(peer::TcpWarmup::spawn(
                 config.tcp_warmup.clone(),
                 latest_chain_tip.clone(),
@@ -358,6 +365,11 @@ where
         .map(ZakuraEndpoint::background_shutdown_token)
         .unwrap_or_default();
     let (peer_set, block_advertiser) = super::driver::spawn(peer_set, shutdown);
+    let block_advertiser = BlockChecksumWarmup::new(
+        block_advertiser,
+        inbound_for_checksum_warmup,
+        block_checksums,
+    );
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());

@@ -375,7 +375,9 @@ jobs:
             139.59.64.115 \
             168.144.173.250 \
             159.203.113.196 \
-            104.131.174.28; do
+            104.131.174.28 \
+            68.183.178.89 \
+            206.189.45.15; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -512,6 +514,32 @@ jobs:
           # failed` and the header chain ran ~6,000 blocks ahead of the verified
           # tip. Switching the node to `legacy` cleared it immediately. Do not flip
           # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
+
+          # Two legacy-only nodes in Singapore that each measure one experimental
+          # setting from an open PR. Each is pinned to the build it runs, because
+          # its hand-written config enables a setting that main does not have yet:
+          # a main build would refuse that config and fail to start. A fleet deploy
+          # therefore reinstalls the pinned build and restarts the node; to change
+          # the build, update the pin. Remove the pin (use "${REF}") once the PR
+          # merges, or remove the entry when the experiment ends.
+          #
+          # asia-hedged measures `[network.block_hedge]` (#2548).
+          [[nodes]]
+          name       = "asia-hedged"
+          ssh_string = "root@68.183.178.89"
+          monitor    = { profiler_url = "http://127.0.0.1:8107" }
+          commit     = "120535dbbb74e65f4a8c57ae3f19f9a10d77afc3"
+          rpc_listen_addr = "127.0.0.1:8232"
+          p2p_stack  = "legacy"
+
+          # asia-scored measures `[network.block_source_score]` (#2558).
+          [[nodes]]
+          name       = "asia-scored"
+          ssh_string = "root@206.189.45.15"
+          monitor    = { profiler_url = "http://127.0.0.1:8108" }
+          commit     = "7506d44aefc479e3994a43368b40e4dc8b2497bf"
+          rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF
 

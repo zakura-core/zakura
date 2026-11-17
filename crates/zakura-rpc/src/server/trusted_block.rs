@@ -1,4 +1,4 @@
-//! Binary block submission on the authenticated primary HTTP listener.
+//! Binary block submission using the primary HTTP listener's authentication policy.
 
 use std::{
     future::Future,
@@ -43,8 +43,6 @@ pub(super) struct TrustedBlockHttpService<S> {
 
 impl<S> TrustedBlockHttpService<S> {
     pub(super) fn new(json: S, cookie: Option<Cookie>, submit: Option<Submit>) -> Self {
-        // Fail closed even if a future listener bypasses configuration validation.
-        let submit = cookie.as_ref().and(submit);
         Self {
             json,
             submit,

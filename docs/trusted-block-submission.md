@@ -20,11 +20,16 @@ enable_cookie_auth = true
 enable_trusted_block_submission = true
 ```
 
-The endpoint is disabled by default and requires cookie authentication on the
-primary listener, including on Regtest. The separate admin listener does not
-expose it. Browser-origin requests are rejected. Use the existing RPC TLS
-configuration or a protected transport when connecting across hosts; possession
-of the RPC cookie authorizes early relay.
+The endpoint is disabled by default and follows the primary listener's
+`enable_cookie_auth` setting, just like `submitblock`, including on Regtest.
+When `true`, a valid RPC cookie is required. When `false`, requests need no
+credentials: restrict the listener to trusted clients using a firewall or private
+network. Anyone who can reach an unauthenticated listener can authorize early
+relay and cause peer bans by submitting invalid blocks.
+
+The separate admin listener does not expose this endpoint. Browser-origin
+requests are rejected with either authentication setting. Use the existing RPC
+TLS configuration or a protected transport when connecting across hosts.
 
 ## Recommended sequence
 
@@ -53,8 +58,8 @@ Stop fan-out on rejection, timeout, or an inconclusive upstream result. A duplic
 response alone does not prove that the exact submitted body was validated.
 
 This sequence is an operator recommendation, not an endpoint prerequisite.
-Authentication establishes authorization, not prior validation; the endpoint
-does not accept or verify a validation certificate.
+Access to the endpoint authorizes relay; it does not establish prior validation.
+The endpoint does not accept or verify a validation certificate.
 
 ## Request and response
 
@@ -80,9 +85,10 @@ relay storage; it does not roll back a state operation already handed off. An
 HTTP disconnect does not abandon local validation.
 
 Transport errors use HTTP 400 for malformed blocks, 401 for missing or invalid
-credentials, 403 for browser requests, 404 when disabled, 405 for a method other
-than POST, 408 for body receipt timeout, 413 for oversized bodies, 415 for the
-wrong content type, and 429 when submission capacity is exhausted.
+credentials when cookie authentication is enabled, 403 for browser requests,
+404 when disabled, 405 for a method other than POST, 408 for body receipt timeout,
+413 for oversized bodies, 415 for the wrong content type, and 429 when submission
+capacity is exhausted.
 
 ## Invalid blocks and peer penalties
 

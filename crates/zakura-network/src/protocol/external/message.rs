@@ -288,7 +288,7 @@ pub enum Message {
     /// Only outbound serving constructs this variant.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     UncachedBlock(
-        BlockHandle,
+        HashedBlock,
         zakura_node_services::block_relay::AttemptChecksum,
     ),
 

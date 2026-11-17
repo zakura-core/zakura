@@ -1168,7 +1168,7 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         frame[20..HEADER_LEN],
         sha256d::Checksum::from(&frame[HEADER_LEN..]).0,
     );
-    assert!(shared.get(valid.hash(), frame.len() - HEADER_LEN).is_none());
+    assert!(shared.get(valid.hash()).is_none());
 
     // The corrected body uses the same shared cache through a different connection.
     let expected = encode_block(&mut Codec::builder().finish(), &valid);
@@ -1176,9 +1176,8 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         .with_block_checksums(shared.clone())
         .finish();
     assert_eq!(encode_block(&mut committed, &valid), expected);
-    let remembered = shared
-        .get(valid.hash(), expected.len() - HEADER_LEN)
-        .unwrap();
+    let (remembered_len, remembered) = shared.get(valid.hash()).unwrap();
+    assert_eq!(remembered_len, expected.len() - HEADER_LEN);
 
     // A temporary body also ignores a cached checksum belonging to the corrected body.
     frame.clear();
@@ -1193,10 +1192,7 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         sha256d::Checksum::from(&frame[HEADER_LEN..]).0,
     );
     assert_ne!(frame[20..HEADER_LEN], remembered.0);
-    assert_eq!(
-        shared.get(valid.hash(), expected.len() - HEADER_LEN),
-        Some(remembered)
-    );
+    assert_eq!(shared.get(valid.hash()), Some((remembered_len, remembered)));
 
     // Later sends of the same attempt reuse its checksum instead of hashing again.
     assert_eq!(

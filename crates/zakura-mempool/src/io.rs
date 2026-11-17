@@ -405,6 +405,10 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                 }
             }
         }
+        // Today's gauge of the transactions being brought in. A count this
+        // small converts to `f64` exactly.
+        metrics::gauge!("mempool.currently.queued.transactions")
+            .set(self.machine.undecided_count() as f64);
         self.emit_storage_metrics();
     }
 

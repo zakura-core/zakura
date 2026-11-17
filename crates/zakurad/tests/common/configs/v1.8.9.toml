@@ -111,6 +111,13 @@ max_concurrent = 16
 peer_cooldown = "1day"
 tip_quiet = "2s"
 
+# When a block a legacy peer announced has not arrived `delay` after it was
+# requested, also request it from the idle announcing peer with the fastest
+# heartbeat ping, and use whichever copy arrives first.
+[network.block_hedge]
+delay = "50ms"
+enabled = false
+
 [network.zakura]
 bootstrap_peers = [
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",

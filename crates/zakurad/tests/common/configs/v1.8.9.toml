@@ -113,6 +113,12 @@ max_concurrent = 16
 peer_cooldown = "1day"
 tip_quiet = "2s"
 
+# When several idle legacy peers announced a block, ask the one expected to
+# answer sooner, from its recent ping, transaction and block answer times,
+# instead of the less loaded one.
+[network.block_source_score]
+enabled = false
+
 [network.zakura]
 bootstrap_peers = [
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",

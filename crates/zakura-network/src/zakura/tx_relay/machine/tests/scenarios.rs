@@ -604,6 +604,26 @@ fn a_full_pool_costs_one_probe_per_backoff_until_a_slot_comes_back() {
     assert_eq!(called(&bench), ids[1..].to_vec(), "room ends the backoff");
 }
 
+/// A stopped core ends claiming for good, whichever `Stopped` answer tells
+/// the machine: one to the reserve call of a session that ended is still
+/// the core's answer.
+#[test]
+fn a_stopped_answer_to_an_ended_sessions_call_ends_claiming() {
+    let mut bench = Bench::new();
+    let (first, second) = (bench.id(0), bench.id(1));
+    let ended = bench.join(1);
+    bench.inv(ended, &[first]);
+    let call = bench.call(first);
+    bench.end(ended);
+    bench.answer(call, Err(Unreserved::Stopped));
+    let session = bench.join(2);
+    bench.inv(session, &[second]);
+    assert!(
+        bench.calls().is_empty(),
+        "nothing is reserved after the core stopped"
+    );
+}
+
 /// A stopped core ends claiming for good: after a `Stopped` answer nothing
 /// is reserved again, however much is announced or however long passes, and
 /// a body already asked for goes back unsubmitted. An `Inactive` answer

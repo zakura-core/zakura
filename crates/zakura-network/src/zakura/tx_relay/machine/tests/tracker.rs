@@ -39,10 +39,8 @@ pub(crate) enum Cause {
     GetTxs(SessionId, UnminedTxId),
     /// The test ended the session.
     End(SessionId),
-    /// The pool answered the call, which a live session made or not: the
-    /// machine drops the answer to a call whose session ended, even a
-    /// `Stopped` one.
-    Answer(CallId, Result<Granted, Unreserved>, bool),
+    /// The pool answered the call.
+    Answer(CallId, Result<Granted, Unreserved>),
     /// The pool's verdict on the submission.
     Verdict(WaiterId, Verdict),
     /// The pool published these changes, and is on or off.
@@ -184,7 +182,7 @@ impl Tracker {
                     self.saw("reserve");
                 }
                 RelayEffect::Ask { session, id } => {
-                    let Cause::Answer(_, Ok(granted), _) = cause else {
+                    let Cause::Answer(_, Ok(granted)) = cause else {
                         panic!("a request goes out only in the step granting it");
                     };
                     let asked = Use::Asked(*session, *id);
@@ -288,7 +286,7 @@ impl Tracker {
                 }
             }
             Cause::End(session) => self.close(*session),
-            Cause::Answer(call, answer, live) => {
+            Cause::Answer(call, answer) => {
                 let id = self.calls.remove(call).expect("an answer to a call made");
                 if let Ok(granted) = answer {
                     let used = self
@@ -296,7 +294,7 @@ impl Tracker {
                         .insert(granted.reservation, Use::Granted(id));
                     assert!(used.is_none(), "the test grants each reservation once");
                 }
-                self.stopped |= *live && *answer == Err(Unreserved::Stopped);
+                self.stopped |= *answer == Err(Unreserved::Stopped);
                 let kind = match answer {
                     Ok(granted) if granted.cancelled => "cancelled grant".to_owned(),
                     Ok(_) => "grant".to_owned(),

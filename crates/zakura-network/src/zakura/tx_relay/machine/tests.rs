@@ -302,10 +302,8 @@ impl Bench {
 
     /// The pool answers `call`.
     pub(super) fn answer(&mut self, call: CallId, answer: Result<Granted, Unreserved>) {
-        let made = self.machine.calls.get(&call);
-        let live = made.is_some_and(|made| self.machine.sessions.contains_key(&made.session));
         self.machine.reserve_answer(call, answer, self.now);
-        self.took(Cause::Answer(call, answer, live));
+        self.took(Cause::Answer(call, answer));
     }
 
     /// A fresh reservation.

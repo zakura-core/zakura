@@ -991,12 +991,13 @@ impl RelayMachine {
                 }
                 self.deliver(call, answer)
             }
-            // Not a call this machine made. A grant still goes back.
-            None => {
-                if let Ok(granted) = answer {
-                    self.give_back(granted.reservation);
-                }
-            }
+            // Not a call this machine made. A grant still goes back, and a
+            // `Stopped` answer still says the core stopped.
+            None => match answer {
+                Ok(granted) => self.give_back(granted.reservation),
+                Err(Unreserved::Stopped) => self.stopped = true,
+                Err(_) => {}
+            },
         }
         self.settle();
     }
@@ -2440,9 +2441,11 @@ impl RelayMachine {
             .and_then(|state| state.reserving.shift_remove(&id))
         else {
             // The caller gave up the call or ended. A granted slot goes
-            // straight back.
-            if let Ok(granted) = answer {
-                self.give_back(granted.reservation);
+            // straight back, and a `Stopped` answer is still the core's.
+            match answer {
+                Ok(granted) => self.give_back(granted.reservation),
+                Err(Unreserved::Stopped) => self.stopped = true,
+                Err(_) => {}
             }
             return;
         };

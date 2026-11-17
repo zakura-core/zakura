@@ -25,6 +25,10 @@ pub(super) enum RelayPolicy {
     },
     TrustedSubmission {
         registration: PendingBlockRegistration,
+        /// Early relay is limited to blocks whose parent is committed. A block withdrawn for an
+        /// unknown parent can later become valid under the same hash, and peers that requested
+        /// it in between ignore this node's announcements of that hash for up to two minutes.
+        parent_known: bool,
     },
 }
 
@@ -49,7 +53,7 @@ impl RelayPolicy {
                     .record(started.elapsed().as_secs_f64());
                 admitted && admission.optimistic_relay_authorized() && *optimistic_block_inventory
             }
-            Self::TrustedSubmission { .. } => true,
+            Self::TrustedSubmission { parent_known, .. } => *parent_known,
         }
     }
 }
@@ -139,7 +143,7 @@ impl Submission {
                                 admitted_registration = pending_blocks.insert(self.block.clone());
                                 (EarlyBlockRelay::StateAdmission(admission), admitted_registration.as_ref())
                             }
-                            RelayPolicy::TrustedSubmission { registration } => {
+                            RelayPolicy::TrustedSubmission { registration, .. } => {
                                 (EarlyBlockRelay::TrustedSubmission, Some(registration))
                             }
                         };
@@ -167,7 +171,7 @@ impl Submission {
             };
             let registration = match policy {
                 RelayPolicy::AfterStateAdmission { .. } => admitted_registration,
-                RelayPolicy::TrustedSubmission { registration } => Some(registration),
+                RelayPolicy::TrustedSubmission { registration, .. } => Some(registration),
             };
             if let Some(registration) = registration {
                 registration.resolve(match &result {

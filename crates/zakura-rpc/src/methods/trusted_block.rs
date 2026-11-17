@@ -33,6 +33,15 @@ where
             .ok_or(TrustedSubmissionError::Malformed)?;
         let block = Arc::new(block);
         let hash = block.hash();
+        let parent_known = self.parent_is_known(block.header.previous_block_hash).await;
+        if !parent_known {
+            metrics::counter!("rpc.trusted_submission.early_relay_skipped", "reason" => "unknown_parent")
+                .increment(1);
+            tracing::info!(
+                ?hash,
+                "parent is unknown: validating the trusted submission without early relay"
+            );
+        }
         let submission = match self.gbt.reserve_mined_submission(hash) {
             Ok(guard) => guard,
             Err(SubmitBlockErrorResponse::Inconclusive) => {
@@ -57,7 +66,10 @@ where
         let lifecycle = submission.spawn(
             self.gbt.block_verifier_router(),
             self.gbt.mined_block_sender(),
-            RelayPolicy::TrustedSubmission { registration },
+            RelayPolicy::TrustedSubmission {
+                registration,
+                parent_known,
+            },
             move |outcome| {
                 metrics::histogram!("rpc.trusted_submission.validation.duration_seconds")
                     .record(submitted_at.elapsed().as_secs_f64());
@@ -98,5 +110,17 @@ where
         Ok(lifecycle
             .await
             .unwrap_or_else(|_| SubmitBlockErrorResponse::Inconclusive.into()))
+    }
+
+    /// Returns whether `parent` is committed to any chain. A failed lookup returns `false`, which
+    /// only skips early relay: the block is still validated and announced after it commits.
+    async fn parent_is_known(&self, parent: block::Hash) -> bool {
+        matches!(
+            self.read_state
+                .clone()
+                .oneshot(ReadRequest::BlockInfo(parent.into()))
+                .await,
+            Ok(ReadResponse::BlockInfo(Some(_)))
+        )
     }
 }

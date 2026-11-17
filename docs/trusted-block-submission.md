@@ -68,8 +68,11 @@ Zcash binary serialization. Do not hex-encode it or wrap it in JSON. The maximum
 body size is the network block-size limit; trailing bytes are rejected. Body
 receipt has a 30-second deadline. Pending bodies and submissions are bounded.
 
-Relay starts without waiting for validation, but the HTTP response waits for the
-local result. HTTP 200 has a plain-text body:
+When the relay already has the block's parent, relay starts without waiting for
+validation. Otherwise the block is validated without early relay and is announced
+only after it commits; a block whose parent is still missing returns
+`inconclusive`. In both cases the HTTP response waits for the local result.
+HTTP 200 has a plain-text body:
 
 | Result | Meaning |
 | --- | --- |
@@ -104,6 +107,16 @@ rejection removes its pending body and cancels announcements not yet dispatched;
 it cannot recall bytes already sent.
 
 An invalid submission does not disable early relay for later submissions.
+
+A block that was relayed early but not accepted, because it was `rejected` or
+its validation timed out, has a known side effect. Peers that request it after
+the relay withdraws it get "not found" and treat the relay as missing that block
+hash for up to about two minutes. If the same header hash is later submitted with
+corrected bytes, those peers ignore this relay's new announcement until the mark
+expires; they can still fetch the block from other peers that announce it. This
+only happens when the bytes sent to the relay differ from the bytes validated
+upstream, which the recommended sequence prevents.
+
 Monitor `rpc.trusted_submission.*` metrics and rejection logs. Upstream
 validation reduces ban risk but cannot eliminate validator bugs or consensus
 disagreements. Legacy peer penalties, v2 compatibility gossip, and native v2

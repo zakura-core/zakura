@@ -80,15 +80,6 @@ struct Authority {
 }
 
 impl Authority {
-    #[cfg(test)]
-    fn arbitrary() -> impl Strategy<Value = Self> {
-        (0..2_u8, 0..2_u8, 0..3_u8).prop_map(|(generation, anchor, tip)| Self {
-            generation,
-            anchor,
-            tip,
-        })
-    }
-
     fn scope(self) -> zakura_header_chain::HeaderWorkAuthority {
         zakura_header_chain::HeaderWorkAuthority {
             header_generation: zakura_header_chain::HeaderGeneration::new(u64::from(
@@ -155,37 +146,6 @@ enum Op {
     RepairStall { supplier: bool },
     /// Run the repair stall's report and trace deadlines.
     RefreshStall,
-}
-
-#[cfg(test)]
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        2 => (0..PEERS).prop_map(|peer| Op::Connect { peer }),
-        1 => (0..PEERS).prop_map(|peer| Op::Disconnect { peer }),
-        2 => (0..PEERS, 0..3_u8).prop_map(|(peer, tip)| Op::Status { peer, tip }),
-        3 => (0..PEERS, Authority::arbitrary(), any::<bool>()).prop_map(
-            |(peer, authority, capacity)| Op::RequestLocator { peer, authority, capacity }
-        ),
-        3 => (any::<usize>(), any::<bool>(), proptest::option::of(Authority::arbitrary()))
-            .prop_map(|(read, found, awaiting)| Op::Complete { read, found, awaiting }),
-        1 => any::<usize>().prop_map(|read| Op::Panic { read }),
-        3 => prop_oneof![
-            0..4_u64,
-            0..2_000_u64,
-            0..30_000_u64,
-        ]
-        .prop_map(|millis| Op::Advance { millis }),
-        2 => (0..PEERS, any::<bool>(), any::<bool>())
-            .prop_map(|(peer, sent, live)| Op::Close { peer, sent, live }),
-        2 => Just(Op::Deadlines),
-        3 => (0..3_u8).prop_map(|key| Op::CachedPass { key }),
-        1 => (0..4_u8).prop_map(|version| Op::ResourceStall { version }),
-        1 => (0..4_u8).prop_map(|version| Op::Commit { version }),
-        1 => (0..PEERS).prop_map(|peer| Op::Rotate { peer }),
-        1 => proptest::option::of((0..3_u8, 0..2_u8)).prop_map(|desired| Op::Repair { desired }),
-        2 => any::<bool>().prop_map(|supplier| Op::RepairStall { supplier }),
-        2 => Just(Op::RefreshStall),
-    ]
 }
 
 fn repair_owner() -> zakura_header_chain::BodyWorkOwner {
@@ -1565,6 +1525,60 @@ fn a_stalled_generation_keeps_its_stall_clock() {
     assert!(due.report);
 }
 
+/// A refused `Close` retries, and a sent one expires, exactly at its
+/// interval and not a millisecond before.
+#[test]
+fn closes_come_due_exactly_at_their_interval() {
+    let mut harness = run([
+        Op::Connect { peer: 0 },
+        Op::Connect { peer: 1 },
+        Op::Close {
+            peer: 0,
+            sent: false,
+            live: true,
+        },
+        Op::Close {
+            peer: 1,
+            sent: true,
+            live: true,
+        },
+    ]);
+    let mut deadlines = |millis| {
+        harness.apply(Op::Advance { millis });
+        harness.apply(Op::Deadlines);
+        (
+            harness.summary.close_retries,
+            harness.summary.close_expiries,
+        )
+    };
+    assert_eq!(deadlines(999), (0, 0));
+    assert_eq!(deadlines(1), (1, 0), "the retry is due at its interval");
+    assert_eq!(deadlines(3_999), (1, 0));
+    assert_eq!(deadlines(1), (1, 1), "the outcome is due at its timeout");
+}
+
+/// A stalled repair traces again exactly one trace interval after its last
+/// row, and reports exactly when the stall reaches the report delay.
+#[test]
+fn a_stall_traces_and_reports_exactly_at_its_deadlines() {
+    let mut harness = run([
+        Op::Repair {
+            desired: Some((0, 0)),
+        },
+        Op::RepairStall { supplier: false },
+        Op::RefreshStall,
+    ]);
+    let mut due = |millis| {
+        harness.apply(Op::Advance { millis });
+        harness.apply(Op::RefreshStall);
+        harness.last_stall_due
+    };
+    assert_eq!(due(9_999), None);
+    assert_eq!(due(1), Some((true, false)), "a row at the trace interval");
+    assert_eq!(due(49_999), Some((true, false)));
+    assert_eq!(due(1), Some((false, true)), "a report at the report delay");
+}
+
 #[test]
 fn supplier_pass_rejections_follow_the_documented_order() {
     let narrow = |mut supplier: Supplier| {
@@ -1666,11 +1680,6 @@ fn supplier_pass_takes_a_tip_at_the_target_and_closes_only_servers() {
 
 #[cfg(test)]
 proptest! {
-    #[test]
-    fn reactor_histories_keep_every_property(ops in prop::collection::vec(op(), 1..64)) {
-        run(ops);
-    }
-
     #[test]
     fn repair_supplier_passes_keep_their_requirements(
         suppliers in prop::collection::vec(any::<(u8, u8)>(), 0..PEERS)

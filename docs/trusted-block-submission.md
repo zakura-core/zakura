@@ -68,9 +68,10 @@ Zcash binary serialization. Do not hex-encode it or wrap it in JSON. The maximum
 body size is the network block-size limit; trailing bytes are rejected. Body
 receipt has a 30-second deadline. Pending bodies and submissions are bounded.
 
-When the relay already has the block's parent, relay starts without waiting for
-validation. Otherwise the block is validated without early relay and is announced
-only after it commits; a block whose parent is still missing returns
+When the relay confirms the block's parent within a 100-millisecond state lookup,
+relay starts without waiting for validation. A failed or timed-out lookup skips
+early relay; the block still goes through normal validation and is announced
+only after it commits. A block whose parent is still missing returns
 `inconclusive`. In both cases the HTTP response waits for the local result.
 HTTP 200 has a plain-text body:
 

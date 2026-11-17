@@ -5,6 +5,9 @@ use crate::server::trusted_block::TrustedSubmissionError;
 
 use super::submission_lifecycle::{RelayPolicy, Submission, VerificationOutcome};
 
+/// Parent discovery only enables early relay; busy state readers must not delay validation.
+const PARENT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(100);
+
 impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
     RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
 where
@@ -39,7 +42,7 @@ where
                 .increment(1);
             tracing::info!(
                 ?hash,
-                "parent is unknown: validating the trusted submission without early relay"
+                "parent is not confirmed: validating the trusted submission without early relay"
             );
         }
         let submission = match self.gbt.reserve_mined_submission(hash) {
@@ -112,15 +115,19 @@ where
             .unwrap_or_else(|_| SubmitBlockErrorResponse::Inconclusive.into()))
     }
 
-    /// Returns whether `parent` is committed to any chain. A failed lookup returns `false`, which
-    /// only skips early relay: the block is still validated and announced after it commits.
+    /// Returns whether `parent` is confirmed committed within the short lookup deadline.
+    /// Failure or timeout, including service readiness, only skips early relay: the block
+    /// is still validated and announced after it commits.
     async fn parent_is_known(&self, parent: block::Hash) -> bool {
         matches!(
-            self.read_state
-                .clone()
-                .oneshot(ReadRequest::BlockInfo(parent.into()))
-                .await,
-            Ok(ReadResponse::BlockInfo(Some(_)))
+            tokio::time::timeout(
+                PARENT_LOOKUP_TIMEOUT,
+                self.read_state
+                    .clone()
+                    .oneshot(ReadRequest::BlockInfo(parent.into())),
+            )
+            .await,
+            Ok(Ok(ReadResponse::BlockInfo(Some(_))))
         )
     }
 }

@@ -107,6 +107,8 @@ struct Node {
     held_relays: mpsc::UnboundedReceiver<HeldRelay>,
     hold_body: watch::Sender<bool>,
     body_requests: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
+    hold_parent_lookup: watch::Sender<bool>,
+    parent_lookups: mpsc::UnboundedReceiver<()>,
     tasks: Vec<AbortHandle>,
     _recent: RecentSyncLengths,
     _directory: tempfile::TempDir,
@@ -380,6 +382,22 @@ impl Node {
             .is_ok());
         let early = EarlyMinedBlockChannel::new();
         let (_logs, log_rx) = watch::channel(None);
+        let (hold_parent_lookup, parent_held) = watch::channel(false);
+        let (parent_lookup, parent_lookups) = mpsc::unbounded_channel();
+        let rpc_read_state = read_state.clone();
+        let rpc_read_state = tower::service_fn(move |request: zakura_state::ReadRequest| {
+            let held = *parent_held.borrow()
+                && matches!(&request, zakura_state::ReadRequest::BlockInfo(_));
+            let parent_lookup = parent_lookup.clone();
+            let read_state = rpc_read_state.clone();
+            async move {
+                if held {
+                    let _ = parent_lookup.send(());
+                    std::future::pending::<()>().await;
+                }
+                read_state.oneshot(request).await
+            }
+        });
         let (rpc, queue) = RpcImpl::new(
             network.clone(),
             zakura_rpc::config::mining::Config {
@@ -391,7 +409,7 @@ impl Node {
             "trusted submission test",
             pool,
             state.clone(),
-            read_state.clone(),
+            rpc_read_state,
             gated.clone(),
             sync.clone(),
             tip.clone(),
@@ -484,6 +502,8 @@ impl Node {
             held_relays,
             hold_body,
             body_requests,
+            hold_parent_lookup,
+            parent_lookups,
             tasks: tasks.into_iter().chain(native_tasks).collect(),
             _recent: recent,
             _directory: directory,
@@ -1175,6 +1195,66 @@ async fn trusted_block_with_unknown_parent_is_not_relayed_early() {
     })
     .await
     .expect("the receiver fetches the retried child from the relay");
+}
+
+#[tokio::test]
+async fn stalled_parent_lookup_still_starts_validation_and_releases_submission_capacity() {
+    let _init = zakura_test::init();
+    let mut node = Node::new(None).await;
+    let block = faulty_body(&node.template().await);
+    let bytes = block.zcash_serialize_to_vec().unwrap();
+    node.gate.hold();
+    node.hold_relay.send_replace(true);
+    node.hold_parent_lookup.send_replace(true);
+    let submission = tokio::spawn(submit(node.rpc, node.auth.clone(), bytes.clone(), true));
+    timeout(Duration::from_secs(2), node.parent_lookups.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_eq!(
+        timeout(Duration::from_secs(2), node.gate.entered.recv())
+            .await
+            .expect("a stalled optional parent lookup cannot prevent validation")
+            .unwrap(),
+        block.hash()
+    );
+    assert!(node.pending.get(block.hash()).is_some());
+    assert!(node.held_relays.try_recv().is_err());
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(8 * 60 + 1)).await;
+    tokio::time::resume();
+    assert_eq!(submission.await.unwrap(), "inconclusive");
+    assert!(node.pending.get(block.hash()).is_none());
+    assert_eq!(node.tip.best_tip_height(), Some(Height(0)));
+
+    node.hold_parent_lookup.send_replace(false);
+    node.gate.release();
+    node.hold_relay.send_replace(false);
+    assert_eq!(node.submit(bytes, true).await, "rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_parent_lookup_does_not_prevent_valid_commit() {
+    let _init = zakura_test::init();
+    let node = Node::new(None).await;
+    let block = node.template().await;
+    node.hold_parent_lookup.send_replace(true);
+    assert_eq!(
+        timeout(
+            Duration::from_secs(10),
+            node.submit(block.zcash_serialize_to_vec().unwrap(), true),
+        )
+        .await
+        .expect("a stalled parent lookup cannot prevent a valid block from committing"),
+        "accepted"
+    );
+    assert!(node.pending.get(block.hash()).is_none());
+    assert_eq!(node.tip.best_tip_hash(), Some(block.hash()));
 }
 
 #[tokio::test]

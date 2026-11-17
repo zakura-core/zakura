@@ -2273,7 +2273,11 @@ fn block_advert(
 ) {
     let (result, delivery) = tokio::sync::oneshot::channel();
     (
-        crate::peer::block_gossip::BlockAdvert { hash, result },
+        crate::peer::block_gossip::BlockAdvert {
+            hash,
+            result,
+            pending_send: None,
+        },
         delivery,
     )
 }

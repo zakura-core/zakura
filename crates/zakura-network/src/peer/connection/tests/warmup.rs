@@ -115,7 +115,11 @@ async fn block_advert_is_written_before_a_queued_warmup_ping() {
     let hash = block::Hash([7; 32]);
     let (result, _delivery) = tokio::sync::oneshot::channel();
     advert_tx
-        .try_send(crate::peer::block_gossip::BlockAdvert { hash, result })
+        .try_send(crate::peer::block_gossip::BlockAdvert {
+            hash,
+            result,
+            pending_send: None,
+        })
         .unwrap();
 
     let connection = tokio::spawn(connection.run(peer_rx));

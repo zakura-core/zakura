@@ -8,7 +8,11 @@ use std::{
     },
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use zakura_node_services::block_relay::{
+    PendingBlockSendPermit, PendingBlockStatus as PendingStatus, ServedBlock,
+};
+use zakura_rt::sync::watch;
 
 use zakura_chain::block;
 
@@ -125,8 +129,8 @@ impl MinedBlockSubmission {
 /// The authority for relaying a local submission before commit.
 ///
 /// State-authorized relay stops waiting for readiness at commitment, but a dispatched broadcast
-/// may finish; contextual failure cancels it. Trusted relay stops on either commitment or failure,
-/// including after dispatch. Both policies retain the gossip deadline and committed fallback.
+/// may finish; contextual failure cancels it. Trusted relay preserves dispatched work on commitment,
+/// but failure withdraws both announcements and queued bodies. Both policies retain the gossip deadline and committed fallback.
 #[derive(Debug)]
 pub enum EarlyBlockRelay {
     /// Consensus authorized relay and state admitted the candidate.
@@ -154,18 +158,12 @@ pub struct EarlyMinedBlock {
     pub pending: PendingBlockSignal,
 }
 
-#[derive(Clone, Debug)]
-enum PendingStatus {
-    Waiting,
-    Committed,
-    Failed,
-}
-
 #[derive(Debug)]
 struct PendingBlock {
     owner_id: u64,
     block: Arc<block::Block>,
     status: watch::Sender<PendingStatus>,
+    permit: PendingBlockSendPermit,
 }
 
 /// Stores pending block bodies with their registration owners.
@@ -193,9 +191,15 @@ impl Default for PendingBlockRegistry {
 pub struct PendingBlockSignal {
     status: watch::Receiver<PendingStatus>,
     dispatched: Arc<AtomicBool>,
+    permit: PendingBlockSendPermit,
 }
 
 impl PendingBlockSignal {
+    /// Retains this attempt's permission through the peer write boundary.
+    pub fn send_permit(&self) -> PendingBlockSendPermit {
+        self.permit.clone()
+    }
+
     /// Records dispatch to the peer service, without claiming peer delivery.
     pub fn mark_dispatched(&self) {
         self.dispatched.store(true, Ordering::Relaxed);
@@ -231,9 +235,11 @@ impl PendingBlockSignal {
     pub fn valid_for_tests() -> Self {
         // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
         // failure future never resolves.
+        let (_, permit) = PendingBlockSendPermit::channel();
         Self {
-            status: watch::channel(PendingStatus::Waiting).1,
+            status: permit.subscribe(),
             dispatched: Arc::default(),
+            permit,
         }
     }
 
@@ -263,6 +269,7 @@ pub struct PendingBlockRegistration {
     /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
     receiver: watch::Receiver<PendingStatus>,
     dispatched: Arc<AtomicBool>,
+    permit: PendingBlockSendPermit,
     resolved: bool,
 }
 
@@ -272,6 +279,7 @@ impl PendingBlockRegistration {
         PendingBlockSignal {
             status: self.receiver.clone(),
             dispatched: self.dispatched.clone(),
+            permit: self.permit.clone(),
         }
     }
 
@@ -310,13 +318,15 @@ impl PendingBlockRegistry {
         }
 
         let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
-        let (status, receiver) = watch::channel(PendingStatus::Waiting);
+        let (status, permit) = PendingBlockSendPermit::channel();
+        let receiver = permit.subscribe();
         entries.insert(
             hash,
             PendingBlock {
                 owner_id,
                 block,
                 status,
+                permit: permit.clone(),
             },
         );
         Some(PendingBlockRegistration {
@@ -325,6 +335,7 @@ impl PendingBlockRegistry {
             owner_id,
             receiver,
             dispatched: Arc::default(),
+            permit,
             resolved: false,
         })
     }
@@ -341,19 +352,40 @@ impl PendingBlockRegistry {
         {
             return;
         }
-        let entry = entries
-            .remove(&hash)
-            .expect("entry exists because its owner matched under the same lock");
-        drop(entries);
-
         let status = match result {
             Ok(_) => PendingStatus::Committed,
             Err(()) => PendingStatus::Failed,
         };
-        entry.status.send_replace(status);
+        // Publish under the registry lock before removing the body. Escaped send permits
+        // order their synchronous write starts against this same status update.
+        entries
+            .get(&hash)
+            .expect("entry exists because its owner matched under the same lock")
+            .status
+            .send_replace(status);
+        entries.remove(&hash);
     }
 
-    /// Returns a pending body, which may still be awaiting consensus validation.
+    /// Returns a temporary peer response with its attempt-specific write permission.
+    pub fn get_for_peer(&self, hash: block::Hash) -> Option<ServedBlock> {
+        let block = self
+            .0
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .map(|entry| ServedBlock {
+                block: entry.block.clone().into(),
+                pending_send: Some(entry.permit.clone()),
+            });
+        if block.is_some() {
+            metrics::counter!("mining.pending_registry.served").increment(1);
+        }
+        block
+    }
+
+    /// Inspects a pending body, which may still be awaiting consensus validation.
+    /// Peer serving must use [`Self::get_for_peer`] to retain its withdrawal permission.
     pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
         let block = self
             .0
@@ -502,6 +534,53 @@ mod tests {
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis test vector is valid")
+    }
+
+    #[test]
+    fn retained_peer_body_is_withdrawn_on_rejection_or_owner_drop() {
+        for drop_owner in [false, true] {
+            let registry = PendingBlockRegistry::default();
+            let block = test_block();
+            let hash = block.hash();
+            let owner = registry.insert(block.clone()).unwrap();
+            let retained = registry.get_for_peer(hash).unwrap();
+            let permit = retained.pending_send.unwrap();
+            assert!(permit.try_start_write(|| ()).is_some());
+            if drop_owner {
+                drop(owner);
+            } else {
+                owner.resolve(Err(()));
+            }
+            assert!(registry.get_for_peer(hash).is_none());
+            assert!(permit
+                .try_start_write(|| panic!("a retained rejected body cannot be sent"))
+                .is_none());
+            let retry = registry.insert(block.clone()).unwrap();
+            let current = registry.get_for_peer(hash).unwrap();
+            assert!(current
+                .pending_send
+                .unwrap()
+                .try_start_write(|| ())
+                .is_some());
+            assert!(permit.try_start_write(|| ()).is_none());
+            retry.resolve(Ok(block));
+        }
+    }
+
+    #[test]
+    fn retained_peer_body_remains_sendable_after_commit() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let owner = registry.insert(block.clone()).unwrap();
+        let retained = registry.get_for_peer(hash).unwrap();
+        owner.resolve(Ok(block));
+        assert!(registry.get_for_peer(hash).is_none());
+        assert!(retained
+            .pending_send
+            .unwrap()
+            .try_start_write(|| ())
+            .is_some());
     }
 
     #[test]

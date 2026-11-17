@@ -240,6 +240,9 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
 async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     let (mut sender, mut gossip) = setup().await;
     let local = block(2);
+    let pending = PendingBlockSignal::valid_for_tests();
+    let mut early = with_size(&local);
+    early.pending_send = Some(pending.send_permit());
     gossip
         .early_sender
         .send(EarlyMinedBlock {
@@ -251,12 +254,12 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
             size: local.zcash_serialized_size(),
             submitted_at: std::time::Instant::now(),
             submission: MinedBlockSubmission::FullBlock,
-            pending: PendingBlockSignal::valid_for_tests(),
+            pending,
         })
         .unwrap();
     gossip
         .peer_set
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .expect_request(Request::AdvertiseMinedBlock(early))
         .await
         .respond(Response::Nil);
     local_commit(&mut sender, local.clone());
@@ -298,6 +301,8 @@ async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable
         gossip.peer_set.expect_no_requests().await;
     }
     let registration = registry.insert(local.clone()).unwrap();
+    let mut early = with_size(&local);
+    early.pending_send = Some(registration.signal().send_permit());
     gossip
         .early_sender
         .send(EarlyMinedBlock {
@@ -312,7 +317,7 @@ async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable
         .unwrap();
     gossip
         .peer_set
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .expect_request(Request::AdvertiseMinedBlock(early))
         .await
         .respond_error("relay failed".into());
     registration.resolve(Ok(local.clone()));

@@ -1589,6 +1589,7 @@ where
             block.hash,
             self.block_gossip_fanout.window(block.size),
             tokio::time::Instant::now() + self.block_gossip_fanout.delay(),
+            block.pending_send,
         )
     }
 

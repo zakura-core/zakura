@@ -5,6 +5,7 @@ use zakura_chain::{
     block,
     transaction::{UnminedTx, UnminedTxId},
 };
+use zakura_node_services::block_relay::PendingBlockSendPermit;
 
 use super::super::types::Nonce;
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
@@ -40,7 +41,7 @@ impl From<PeerSocketAddr> for PeerSource {
 ///
 /// Local callers that hold the block fill in `size`. An `inv` received from a peer carries only
 /// the hash, so it is `None` there.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct AdvertisedBlock {
     /// The block hash.
@@ -48,6 +49,9 @@ pub struct AdvertisedBlock {
     /// The block's serialized size in bytes, if known. Legacy gossip sizes the broadcast's
     /// advert window from it.
     pub size: Option<u32>,
+    /// Attempt-specific authorization, retained until the local inventory write starts.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+    pub pending_send: Option<PendingBlockSendPermit>,
 }
 
 impl AdvertisedBlock {
@@ -57,6 +61,7 @@ impl AdvertisedBlock {
             hash,
             // A size that does not fit is unknown, rather than a misleadingly small block.
             size: u32::try_from(size).ok(),
+            pending_send: None,
         }
     }
 }
@@ -64,7 +69,11 @@ impl AdvertisedBlock {
 impl From<block::Hash> for AdvertisedBlock {
     /// Returns an advertisement of the block with `hash` and unknown size.
     fn from(hash: block::Hash) -> Self {
-        Self { hash, size: None }
+        Self {
+            hash,
+            size: None,
+            pending_send: None,
+        }
     }
 }
 

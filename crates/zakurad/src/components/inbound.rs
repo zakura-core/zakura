@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
+use zakura_node_services::{block_memory::is_read_capacity_refusal, block_relay::ServedBlock};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -227,8 +227,8 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<BlockHandle>, zn::BoxError> {
-    if let Some(block) = pending_blocks.get(hash) {
+) -> Result<Option<ServedBlock>, zn::BoxError> {
+    if let Some(block) = pending_blocks.get_for_peer(hash) {
         return Ok(Some(block.into()));
     }
 
@@ -239,7 +239,7 @@ async fn block_by_hash_or_pending(
         .await?;
 
     match response {
-        zs::Response::Block(Some(block)) => Ok(Some(block)),
+        zs::Response::Block(Some(block)) => Ok(Some(block.into())),
         zs::Response::Block(None) => Ok(None),
         _ => unreachable!("wrong response from state"),
     }
@@ -673,7 +673,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(ServedBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();

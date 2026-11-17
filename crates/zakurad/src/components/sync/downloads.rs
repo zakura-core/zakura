@@ -712,6 +712,8 @@ where
                     unreachable!("wrong response to block request");
                 };
 
+                let block = block.block;
+
                 // Bind the delivered block to the requested hash. Legacy-gossip
                 // block responses are correlated only by request id and kind, so
                 // a peer could otherwise substitute a different valid block for

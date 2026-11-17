@@ -14,6 +14,7 @@ use tokio::{
 };
 use tokio_util::codec::Framed;
 use zakura_chain::{block, serialization::SerializationError};
+use zakura_node_services::block_relay::{PendingBlockSendPermit, PendingBlockStatus, ServedBlock};
 use zakura_test::mock_service::PanicAssertion;
 
 use crate::{
@@ -26,12 +27,16 @@ use crate::{
 struct HeldWriter<S> {
     inner: S,
     release: Option<oneshot::Receiver<()>>,
+    entered: Option<oneshot::Sender<()>>,
 }
 
 impl<S: Sink<Message, Error = SerializationError> + Unpin> Sink<Message> for HeldWriter<S> {
     type Error = SerializationError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
         if let Some(release) = self.release.as_mut() {
             std::task::ready!(Pin::new(release).poll(cx)).expect("the test releases the writer");
             self.release = None;
@@ -56,6 +61,21 @@ impl<S: Sink<Message, Error = SerializationError> + Unpin> Sink<Message> for Hel
 /// including when the next submission has the same header hash. It must leave the peer usable.
 #[tokio::test]
 async fn cancelled_block_advert_is_not_written_after_writer_readiness() {
+    queued_advert(None).await;
+}
+
+/// Rejection must reach the writer without waiting for the gossip owner to drop its receiver.
+#[tokio::test]
+async fn rejected_block_advert_is_not_written_while_owner_is_still_waiting() {
+    queued_advert(Some(PendingBlockStatus::Failed)).await;
+}
+
+#[tokio::test]
+async fn committed_block_advert_still_writes_after_writer_readiness() {
+    queued_advert(Some(PendingBlockStatus::Committed)).await;
+}
+
+async fn queued_advert(resolution: Option<PendingBlockStatus>) {
     let _init = zakura_test::init();
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -68,6 +88,7 @@ async fn cancelled_block_advert_is_not_written_after_writer_readiness() {
         let writer = HeldWriter {
             inner: Framed::new(local, Codec::builder().finish()),
             release: Some(held),
+            entered: None,
         };
         let (template, _client, inbound, _outbound, _) =
             super::new_test_connection::<PanicAssertion>();
@@ -86,23 +107,55 @@ async fn cancelled_block_advert_is_not_written_after_writer_readiness() {
             crate::inbound_resources::InboundBudget::new(1 << 30),
         );
         let hash = block::Hash([42; 32]);
+        let (status, permit) = PendingBlockSendPermit::channel();
         let (result, delivery) = oneshot::channel();
-        let mut write = Box::pin(connection.send_block_advert(BlockAdvert { hash, result }, None));
+        let mut delivery = Some(delivery);
+        let mut write = Box::pin(connection.send_block_advert(
+            BlockAdvert {
+                hash,
+                result,
+                pending_send: Some(permit),
+            },
+            None,
+        ));
         assert!(
             write.as_mut().now_or_never().is_none(),
             "the live advert reaches the held writer"
         );
 
-        // This receiver is dropped by the broadcast owner when local validation resolves.
-        drop(delivery);
+        if let Some(resolution) = resolution {
+            status.send_replace(resolution);
+        } else {
+            drop(delivery.take());
+        }
         release.send(()).unwrap();
         write.await;
+        if let Some(delivery) = delivery {
+            let result = delivery.await.unwrap();
+            assert_eq!(
+                result.is_ok(),
+                resolution == Some(PendingBlockStatus::Committed)
+            );
+        }
 
         let (result, delivery) = oneshot::channel();
         connection
-            .send_block_advert(BlockAdvert { hash, result }, None)
+            .send_block_advert(
+                BlockAdvert {
+                    hash,
+                    result,
+                    pending_send: None,
+                },
+                None,
+            )
             .await;
         delivery.await.unwrap().unwrap();
+        if resolution == Some(PendingBlockStatus::Committed) {
+            assert_eq!(
+                received.next().await.unwrap().unwrap(),
+                Message::Inv(vec![InventoryHash::Block(hash)])
+            );
+        }
         let marker = Message::Ping(crate::types::Nonce(123));
         connection.peer_tx.send(marker.clone()).await.unwrap();
         assert_eq!(
@@ -121,4 +174,107 @@ async fn cancelled_block_advert_is_not_written_after_writer_readiness() {
     })
     .await
     .expect("writer cancellation and live retry complete without stalling");
+}
+
+/// A body retained in a response remains revocable while its TCP writer is blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_body_rechecks_rejection_and_preserves_committed_delivery() {
+    use crate::{InventoryResponse, Request, Response};
+    use zakura_chain::serialization::ZcashDeserializeInto;
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        for outcome in [PendingBlockStatus::Failed, PendingBlockStatus::Committed] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (remote, _) = listener.accept().await.unwrap();
+            let mut received = Framed::new(remote, post_handshake_codec());
+            let (release, held) = oneshot::channel();
+            let (entered, writing) = oneshot::channel();
+            let writer = HeldWriter {
+                inner: Framed::new(local, post_handshake_codec()),
+                release: Some(held),
+                entered: Some(entered),
+            };
+            let (template, _client, mut inbound, _outbound, _) =
+                super::new_test_connection::<PanicAssertion>();
+            let (_client_tx, client_rx) = futures::channel::mpsc::channel(0);
+            let errors = ErrorSlot::default();
+            let info = template.connection_info.clone();
+            let mut connection = Connection::new(
+                inbound.clone(),
+                super::test_connection_channels(client_rx),
+                errors.clone(),
+                writer,
+                ActiveConnectionCounter::new_counter().track_connection(),
+                info.clone(),
+                info.connected_addr.get_transient_addr_label(),
+                Vec::new(),
+                crate::inbound_resources::InboundBudget::new(1 << 30),
+            );
+            let block: std::sync::Arc<block::Block> =
+                zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                    .zcash_deserialize_into()
+                    .unwrap();
+            let hash = block.hash();
+            let (status, permit) = PendingBlockSendPermit::channel();
+            let request = Request::BlocksByHash([hash].into_iter().collect());
+            let drive = async {
+                connection.drive_peer_request(request).await;
+                connection
+                    .peer_tx
+                    .send(Message::Ping(crate::types::Nonce(456)))
+                    .await
+                    .unwrap();
+            };
+            let resolve = async {
+                inbound
+                    .expect_request_that(|request| matches!(request, Request::BlocksByHash(_)))
+                    .await
+                    .respond(Response::Blocks(vec![InventoryResponse::Available((
+                        ServedBlock {
+                            block: block.clone().into(),
+                            pending_send: Some(permit),
+                        },
+                        None,
+                    ))]));
+                writing.await.unwrap();
+                status.send_replace(outcome);
+                release.send(()).unwrap();
+            };
+            tokio::join!(drive, resolve);
+            let expected = if outcome == PendingBlockStatus::Failed {
+                Message::NotFound(vec![InventoryHash::Block(hash)])
+            } else {
+                Message::Block(block.clone().into())
+            };
+            assert_eq!(received.next().await.unwrap().unwrap(), expected);
+            assert_eq!(
+                received.next().await.unwrap().unwrap(),
+                Message::Ping(crate::types::Nonce(456))
+            );
+            assert!(errors.try_get_error().is_none());
+            // A fresh attempt with the same header is independent of the rejected body.
+            let (_, retry) = PendingBlockSendPermit::channel();
+            assert!(connection
+                .peer_tx
+                .send_authorized(Message::Block(block.clone().into()), || true, Some(retry))
+                .await
+                .unwrap());
+            assert_eq!(
+                received.next().await.unwrap().unwrap(),
+                Message::Block(block.into())
+            );
+        }
+    })
+    .await
+    .expect("withdrawal, commitment, and retry keep the connection usable");
+}
+
+/// The fixture represents an established connection, whose codec accepts full block bodies.
+fn post_handshake_codec() -> Codec {
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    codec
 }

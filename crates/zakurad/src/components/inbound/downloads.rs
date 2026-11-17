@@ -966,6 +966,8 @@ where
                 unreachable!("wrong response to block request");
             };
 
+            let block = block.block;
+
             // Bind the delivered block to the hash we requested. A peer that
             // substitutes a different (even valid) block must not be able to
             // corrupt our hash/source accounting: the verifier returns the

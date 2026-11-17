@@ -26,7 +26,7 @@ pub(super) use zn::constants::BLOCK_GOSSIP_TIMEOUT;
 const BLOCK_SIZE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A spawned committed mined-block broadcast finished.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MinedBlockBroadcastCompleted {
     block: zn::AdvertisedBlock,
     succeeded: bool,
@@ -166,19 +166,22 @@ where
             mined_block_completion_sender.clone()
         });
         tokio::spawn(async move {
-            let block = match size {
+            let mut block = match size {
                 Some(size) => zn::AdvertisedBlock::new(hash, size),
                 None => zn::AdvertisedBlock {
                     size: committed_block_size(read_state, hash).await,
                     ..hash.into()
                 },
             };
+            if let Some(event) = &early {
+                block.pending_send = Some(event.pending.send_permit());
+            }
             // block broadcasts inform other nodes about new blocks,
             // so our internal Grow or Reset state doesn't matter to them
             let request = if is_block_submission {
-                zn::Request::AdvertiseMinedBlock(block)
+                zn::Request::AdvertiseMinedBlock(block.clone())
             } else {
-                zn::Request::AdvertiseBlock(block, None)
+                zn::Request::AdvertiseBlock(block.clone(), None)
             };
             let succeeded = match early {
                 Some(event) => broadcast_submission(network, request, event).await,
@@ -356,7 +359,7 @@ fn finish_mined_block_broadcast<ZN>(
     ZN::Future: Send,
 {
     let hash = completed.block.hash;
-    let needs_fallback = mined_block_broadcasts.finish(completed);
+    let needs_fallback = mined_block_broadcasts.finish(&completed);
 
     if completed.succeeded {
         return;
@@ -401,7 +404,7 @@ impl MinedBlockBroadcasts {
     ///
     /// Returns `true` if the hash now needs the committed-tip fallback: this broadcast failed, no
     /// other broadcast of the hash is in flight, and none has succeeded.
-    fn finish(&mut self, completed: MinedBlockBroadcastCompleted) -> bool {
+    fn finish(&mut self, completed: &MinedBlockBroadcastCompleted) -> bool {
         let MinedBlockBroadcastCompleted { block, succeeded } = completed;
         let hash = block.hash;
 
@@ -412,7 +415,7 @@ impl MinedBlockBroadcasts {
             }
         }
 
-        if succeeded {
+        if *succeeded {
             self.delivered = Some(hash);
             return false;
         }
@@ -440,12 +443,12 @@ mod tests {
         assert!(broadcasts.is_in_flight(&hash));
 
         assert!(
-            !broadcasts.finish(failed),
+            !broadcasts.finish(&failed),
             "another broadcast of the hash can still succeed",
         );
         assert!(broadcasts.is_in_flight(&hash));
 
-        assert!(broadcasts.finish(failed));
+        assert!(broadcasts.finish(&failed));
         assert!(!broadcasts.is_in_flight(&hash));
     }
 
@@ -457,11 +460,11 @@ mod tests {
         broadcasts.start(hash);
         broadcasts.start(hash);
 
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
+        assert!(!broadcasts.finish(&MinedBlockBroadcastCompleted {
             block: hash.into(),
             succeeded: true,
         }));
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
+        assert!(!broadcasts.finish(&MinedBlockBroadcastCompleted {
             block: hash.into(),
             succeeded: false,
         }));

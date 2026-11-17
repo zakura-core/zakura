@@ -363,7 +363,7 @@ impl Handler {
                     // If we got everything we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     Handler::Finished(Ok(Response::Blocks(available.collect())))
                 } else {
                     // Keep on waiting for all the blocks we wanted, until we get them or time out.
@@ -409,7 +409,7 @@ impl Handler {
                     // If we got some of what we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     let missing = pending_hashes.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Blocks(available.chain(missing).collect())))
@@ -1274,6 +1274,7 @@ where
                         && version >= minimum.current()
                         && !address.is_some_and(|addr| bans.contains(addr.ip()))
                 },
+                advert.pending_send.clone(),
             )
             .await;
         match delivery {
@@ -1285,9 +1286,17 @@ where
             }
             Ok(false) => {
                 debug!(hash = ?advert.hash, "not advertising block: cancelled or peer authorization revoked");
-                let _ = advert
-                    .result
-                    .send(Err(BlockAdvertError::AuthorizationRevoked));
+                let _ = advert.result.send(Err(
+                    if advert
+                        .pending_send
+                        .as_ref()
+                        .is_some_and(|permit| permit.try_start_write(|| ()).is_none())
+                    {
+                        BlockAdvertError::SubmissionWithdrawn
+                    } else {
+                        BlockAdvertError::AuthorizationRevoked
+                    },
+                ));
             }
             Err(error) => {
                 let error = SharedPeerError::from(error);
@@ -1996,9 +2005,26 @@ where
                     match block {
                         Available((block, _)) => {
                             let hash = block.hash();
-                            if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
-                                self.fail_with(e).await;
-                                return;
+                            let zakura_node_services::block_relay::ServedBlock {
+                                block,
+                                pending_send,
+                            } = block;
+                            match self
+                                .peer_tx
+                                .send_authorized(Message::Block(block), || true, pending_send)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.block_uploads.unavailable(hash);
+                                    self.gossip_trace.block_unavailable(hash);
+                                    missing_hashes.push(hash.into());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.fail_with(error).await;
+                                    return;
+                                }
                             }
                             self.block_uploads.written(hash);
                             self.gossip_trace.block_sent(hash);

@@ -47,7 +47,7 @@ use crate::{
     },
     peer_set::ConnectionTracker,
     protocol::{
-        external::{types::Nonce, InventoryHash, Message},
+        external::{types::Nonce, HashedBlock, InventoryHash, Message},
         internal::{InventoryResponse, Request, Response},
     },
     BannedIps, BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -326,7 +326,7 @@ impl Handler {
                 //     (there is no `notfound` message at the end of the batch)
                 if pending_hashes.remove(&block.hash()) {
                     // we are in the middle of the continuous block messages
-                    blocks.push(block);
+                    blocks.push(block.into_block());
                 } else {
                     // We got a block we didn't ask for.
                     //
@@ -1993,6 +1993,8 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
+                            // The message hashes the block once, for the encoder and for us.
+                            let block = HashedBlock::from(block);
                             let hash = block.hash();
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;

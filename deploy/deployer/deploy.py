@@ -74,6 +74,12 @@ DEFAULTS = {
     "storage_mode": "archive",
     # One of: default | legacy | zakura | dual.
     "p2p_stack": "dual",
+    # Which pool the node runs: default | classic | core, rendered as
+    # [mempool] implementation. "" omits the section, so zakurad's default holds.
+    "mempool_implementation": "",
+    # Renders [network.zakura.tx_relay] enabled = true. It needs the core pool
+    # and a v2 stack, or zakurad leaves tx-relay off without saying so.
+    "tx_relay": False,
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
@@ -143,6 +149,8 @@ class Node:
     rpc_enable_cookie_auth: object
     storage_mode: str
     p2p_stack: str
+    mempool_implementation: str
+    tx_relay: bool
     metrics_endpoint: str
     health_listen_addr: str
     miner_address: str
@@ -210,6 +218,23 @@ def normalize_p2p_stack(value: object, *, where: str) -> str:
     return stack
 
 
+# Canonical names accepted by zakurad's mempool.implementation.
+MEMPOOL_IMPLEMENTATION_VALUES = {"default", "classic", "core"}
+
+
+def normalize_mempool_implementation(value: object, *, where: str) -> str:
+    """Return a node's pool setting, lowercased, or "" to leave it unset."""
+    if not isinstance(value, str):
+        raise DeployError(f"{where}: mempool_implementation must be a string")
+    implementation = value.strip().lower()
+    if implementation and implementation not in MEMPOOL_IMPLEMENTATION_VALUES:
+        raise DeployError(
+            f"{where}: unknown mempool_implementation {value!r}; "
+            f"expected one of: default, classic, core"
+        )
+    return implementation
+
+
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     if not config_path.is_file():
         raise DeployError(f"config not found: {config_path}")
@@ -262,6 +287,18 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
                            for f in build_features)):
             raise DeployError(f"{name}: build_features must be a list of cargo feature names")
         build_features = sorted(set(build_features))
+        if not isinstance(merged["tx_relay"], bool):
+            raise DeployError(f"{name}: tx_relay must be a boolean")
+        if merged["tx_relay"]:
+            pool = normalize_mempool_implementation(
+                merged["mempool_implementation"], where=f"[[nodes]] {name}"
+            )
+            stack = normalize_p2p_stack(merged["p2p_stack"], where=f"[[nodes]] {name}")
+            if pool != "core" or stack not in ("dual", "zakura"):
+                raise DeployError(
+                    f"{name}: tx_relay needs mempool_implementation = \"core\" "
+                    f"and p2p_stack = \"dual\" or \"zakura\""
+                )
         if not isinstance(merged["internal_miner"], bool):
             raise DeployError(f"{name}: internal_miner must be a boolean")
         if merged["internal_miner"] and (not merged["miner_address"]
@@ -297,6 +334,10 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             p2p_stack=normalize_p2p_stack(
                 merged["p2p_stack"], where=f"[[nodes]] {name}"
             ),
+            mempool_implementation=normalize_mempool_implementation(
+                merged["mempool_implementation"], where=f"[[nodes]] {name}"
+            ),
+            tx_relay=merged["tx_relay"],
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
             miner_address=merged["miner_address"],
@@ -608,6 +649,11 @@ def render_node_config(node: Node) -> str:
     if node.internal_miner:
         mining_lines.append("internal_miner = true")
     mining_block = "[mining]\n" + "\n".join(mining_lines) + "\n" if mining_lines else ""
+    mempool_block = (
+        f'[mempool]\nimplementation = "{node.mempool_implementation}"\n'
+        if node.mempool_implementation
+        else ""
+    )
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -629,10 +675,12 @@ def render_node_config(node: Node) -> str:
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
-        "ZAKURA_BLOCK": render_zakura_block(node.zakura),
+        "ZAKURA_BLOCK": render_zakura_block(node.zakura)
+        + ("[network.zakura.tx_relay]\nenabled = true\n" if node.tx_relay else ""),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
         "MINING_BLOCK": mining_block,
+        "MEMPOOL_BLOCK": mempool_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,

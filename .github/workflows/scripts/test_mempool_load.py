@@ -739,6 +739,13 @@ class Verdict(unittest.TestCase):
         result.update(overrides)
         return result
 
+    def test_a_thin_loaded_leg_is_degraded(self):
+        result = self.healthy_result()
+        result["throughput"]["submitted"] = 12
+        verdict, reasons = monitor.grade_run(result, self.make_args())
+        self.assertEqual(verdict, "degraded")
+        self.assertTrue(any("12 submissions" in r for r in reasons))
+
     def test_a_frozen_chain_fails_the_run(self):
         # The headline "green run that measured nothing" case.
         result = self.healthy_result()
@@ -1162,6 +1169,31 @@ class Comparison(unittest.TestCase):
         del target["propagation"]["spread_p95_secs"]
         rows = compare.build_rows(self.leg(), target)
         self.assertIsNone(self.row_for(rows, "Propagation p95 (s)")["delta_pct"])
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "MISSING")
+        self.assertEqual(compare.gate(self.leg(), target, rows)[0], "fail")
+
+    def test_gate_passes_clean_legs_and_fails_a_regression(self):
+        rows = compare.build_rows(self.leg(), self.leg())
+        self.assertEqual(compare.gate(self.leg(), self.leg(), rows), ("pass", []))
+        target = self.leg(throughput={"submitted": 400})
+        rows = compare.build_rows(self.leg(), target)
+        self.assertEqual(compare.gate(self.leg(), target, rows)[0], "fail")
+
+    def test_gate_fails_a_failed_baseline_and_holds_a_thin_leg(self):
+        rows = compare.build_rows(self.leg(), self.leg())
+        failed = self.leg(verdict="failed")
+        self.assertEqual(compare.gate(failed, self.leg(), rows)[0], "fail")
+        thin = self.leg(verdict="degraded")
+        self.assertEqual(compare.gate(self.leg(), thin, rows)[0], "inconclusive")
+
+    def test_main_fails_without_a_summary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "summary.md")
+            status = compare.main(["--baseline", os.path.join(tmp, "missing.json"),
+                                   "--target", os.path.join(tmp, "missing.json"),
+                                   "--out", out])
+        self.assertEqual(status, 1)
 
     def test_report_names_the_regressed_metrics(self):
         target = self.leg(throughput={"submitted": 400})

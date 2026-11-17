@@ -7,8 +7,10 @@ change: throughput, propagation latency, rejects, and backpressure.
 
 Stdlib only, mirroring deploy/deployer/deploy.py.
 
-Exit status is always 0: this script reports, it does not gate. The per-leg
-verdict from mempool-load-monitor.py is what fails a run.
+Exit status gates the run: 0 when both legs passed and no graded metric got
+worse or went missing, 1 when a leg failed, a graded metric is missing from
+either leg or one regressed, and 3 when neither failed but a leg was too thin
+to grade (`degraded` or `inconclusive`).
 """
 
 from __future__ import annotations
@@ -82,7 +84,8 @@ def classify(delta_pct: float | None, lower_is_better: bool, baseline=None, targ
         return "info"
     if delta_pct is None:
         if not isinstance(baseline, (int, float)) or not isinstance(target, (int, float)):
-            return "="
+            # A graded number absent from either leg is no comparison at all.
+            return "MISSING"
         if baseline == 0 and target != 0:
             # Moving off a clean baseline in the bad direction.
             return "WORSE" if lower_is_better else "better"
@@ -124,6 +127,24 @@ def build_rows(baseline: dict, target: dict) -> list[dict]:
     return rows
 
 
+def gate(baseline: dict, target: dict, rows: list[dict]) -> tuple[str, list[str]]:
+    """Return the comparison's status, `pass`, `fail` or `inconclusive`, and why."""
+    reasons = []
+    verdicts = {"baseline": baseline.get("verdict"), "target": target.get("verdict")}
+    for leg, verdict in verdicts.items():
+        if verdict not in ("ok", "degraded", "inconclusive"):
+            reasons.append(f"the {leg} leg's verdict is {verdict or 'missing'}")
+    for row in rows:
+        if row["verdict"] in ("WORSE", "MISSING"):
+            reasons.append(f"{row['metric']}: {row['verdict']}")
+    if reasons:
+        return "fail", reasons
+    thin = [leg for leg, verdict in verdicts.items() if verdict != "ok"]
+    if thin:
+        return "inconclusive", [f"the {leg} leg is {verdicts[leg]}" for leg in thin]
+    return "pass", []
+
+
 def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     regressions = [r for r in rows if r["verdict"] == "WORSE"]
     base_meta = baseline.get("meta", {})
@@ -162,31 +183,38 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+EXIT_STATUS = {"pass": 0, "fail": 1, "inconclusive": 3}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Compare two legs' summaries, write the report, and return the gate's status."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--out", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         baseline = json.loads(Path(args.baseline).read_text())
         target = json.loads(Path(args.target).read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        # A missing leg is not a comparison failure to hard-stop the run on;
-        # the per-leg verdict already covers it.
+        # A leg with no summary measured nothing, so the comparison fails.
         Path(args.out).write_text(
             f"## Zakura mempool load\n\nComparison unavailable: {exc}\n"
         )
         print(f"comparison unavailable: {exc}", file=sys.stderr)
-        return 0
+        return EXIT_STATUS["fail"]
 
     rows = build_rows(baseline, target)
+    status, reasons = gate(baseline, target, rows)
     report = render(baseline, target, rows)
+    report += f"\n**Comparison: {status}**" + "".join(f"\n- {r}" for r in reasons) + "\n"
     Path(args.out).write_text(report)
-    Path(args.out).with_suffix(".json").write_text(json.dumps(rows, indent=2) + "\n")
+    Path(args.out).with_suffix(".json").write_text(
+        json.dumps({"status": status, "reasons": reasons, "rows": rows}, indent=2) + "\n"
+    )
     print(report)
-    return 0
+    return EXIT_STATUS[status]
 
 
 if __name__ == "__main__":

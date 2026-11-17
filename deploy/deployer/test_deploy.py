@@ -239,6 +239,8 @@ class NodeBuilder:
             "rpc_enable_cookie_auth": None,
             "storage_mode": "archive",
             "p2p_stack": "dual",
+            "mempool_implementation": "",
+            "tx_relay": False,
             "metrics_endpoint": "",
             "health_listen_addr": "",
             "miner_address": "",
@@ -366,6 +368,35 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
         config = tomllib.loads(deploy.render_node_config(self.node()))
 
         self.assertNotIn("mining", config)
+
+    def test_mempool_section_renders_the_pool_choice(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            mempool_implementation="core",
+        )))
+
+        self.assertEqual(config["mempool"], {"implementation": "core"})
+
+    def test_tx_relay_renders_under_network_zakura(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            mempool_implementation="core",
+            tx_relay=True,
+            zakura={"listen_addr": "0.0.0.0:8234"},
+        )))
+
+        self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
+        self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": True})
+
+    def test_tx_relay_omitted_when_off(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("zakura", config["network"])
+
+    def test_mempool_section_omitted_when_unset(self):
+        # Unset leaves zakurad's own default in charge, so a later release
+        # that changes the default reaches the node.
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("mempool", config)
 
     def test_health_renders_independently_of_metrics(self):
         config = tomllib.loads(deploy.render_node_config(self.node(
@@ -560,6 +591,58 @@ class ConfigKeyTests(unittest.TestCase):
             nodes = deploy.load_nodes(path, None)
 
             self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
+
+    def test_mempool_implementation_is_a_known_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                mempool_implementation = "Core"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(nodes[0].mempool_implementation, "core")
+
+    def test_unknown_mempool_implementation_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+                mempool_implementation = "tx-relay"
+            """.replace("                ", ""))
+
+            with self.assertRaises(deploy.DeployError):
+                deploy.load_nodes(path, None)
+
+    def test_tx_relay_needs_the_core_pool_and_a_v2_stack(self):
+        for extra in ('mempool_implementation = "classic"\np2p_stack = "dual"',
+                      'mempool_implementation = "core"\np2p_stack = "legacy"',
+                      'p2p_stack = "dual"'):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, (
+                    '[[nodes]]\nname = "node-a"\nssh_string = "root@example"\n'
+                    'commit = "main"\ntx_relay = true\n' + extra + "\n"
+                ))
+
+                with self.assertRaises(deploy.DeployError):
+                    deploy.load_nodes(path, None)
+
+    def test_tx_relay_on_a_core_dual_node_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, (
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@example"\n'
+                'commit = "main"\ntx_relay = true\nmempool_implementation = "core"\n'
+                'p2p_stack = "dual"\n'
+            ))
+
+            self.assertTrue(deploy.load_nodes(path, None)[0].tx_relay)
 
     def test_testnet_parameters_is_a_known_key(self):
         with tempfile.TemporaryDirectory() as tmp:

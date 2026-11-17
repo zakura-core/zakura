@@ -99,11 +99,17 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `mempool_implementation` — optionally put the selected node on `default`,
+  `classic` or `core`. The default `auto` leaves it on zakurad's default.
+- `tx_relay` — turn on `[network.zakura.tx_relay]` for the selected node. The
+  deployer refuses it unless the node runs the `core` pool on a `dual` or
+  `zakura` stack, since zakurad would otherwise leave it off without saying so.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
-Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
+Explicit `p2p_stack` and `mempool_implementation` overrides, `tx_relay = true`
+and `header_sync_trace = true` require an
 explicit `node`, preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and

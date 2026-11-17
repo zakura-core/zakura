@@ -354,6 +354,11 @@ def grade_run(result: dict, args) -> tuple[str, list[str]]:
     if reasons:
         return "failed", reasons
     # A run can be clean but thin -- flag it rather than calling it a pass.
+    if throughput["submitted"] < args.min_graded_submissions:
+        return "degraded", [
+            f"only {throughput['submitted']} submissions, below the "
+            f"{args.min_graded_submissions} needed to grade rejects"
+        ]
     if result["propagation"]["txids_observed"] < args.min_txids_observed:
         return "degraded", [
             f"only {result['propagation']['txids_observed']} txids observed "
@@ -545,7 +550,8 @@ def build_nodes(args) -> list[dict]:
     return nodes
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Sample the lab for the window, write the summaries, and return the verdict's status."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lab-dir", default="/root/mempool-lab")
     parser.add_argument("--node-count", type=int, default=4)
@@ -563,7 +569,7 @@ def main() -> int:
         default=50,
         help="below this many submissions the reject rate is reported but not graded",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     lab = Path(args.lab_dir)
     out_dir = Path(args.out)

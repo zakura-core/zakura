@@ -46,6 +46,9 @@ use crate::{
     BoxError,
 };
 
+/// Just past the RPC's 60-second trusted validation deadline, which this crate cannot name.
+const PAST_TRUSTED_VERIFY_DEADLINE: Duration = Duration::from_secs(61);
+
 type State = Buffer<
     zakura_state::Request,
     futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
@@ -1226,7 +1229,7 @@ async fn stalled_parent_lookup_still_starts_validation_and_releases_submission_c
     assert!(node.held_relays.try_recv().is_err());
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(8 * 60 + 1)).await;
+    tokio::time::advance(PAST_TRUSTED_VERIFY_DEADLINE).await;
     tokio::time::resume();
     assert_eq!(submission.await.unwrap(), "inconclusive");
     assert!(node.pending.get(block.hash()).is_none());
@@ -1271,10 +1274,21 @@ async fn trusted_validation_timeout_withdraws_body_and_allows_retry() {
         true,
     ));
     assert_eq!(node.gate.entered().await, invalid.hash());
+    // Half the deadline leaves the submission and its pending body in place.
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(8 * 60 + 1)).await;
+    tokio::time::advance(PAST_TRUSTED_VERIFY_DEADLINE / 2).await;
     tokio::time::resume();
-    assert_eq!(submission.await.unwrap(), "inconclusive");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!submission.is_finished());
+    assert!(node.pending.get(invalid.hash()).is_some());
+    tokio::time::pause();
+    tokio::time::advance(PAST_TRUSTED_VERIFY_DEADLINE / 2).await;
+    tokio::time::resume();
+    let outcome = timeout(Duration::from_secs(10), submission)
+        .await
+        .expect("the validation deadline has passed")
+        .unwrap();
+    assert_eq!(outcome, "inconclusive");
     assert!(node.pending.get(invalid.hash()).is_none());
     assert_eq!(node.tip.best_tip_height(), Some(Height(0)));
     node.gate.release();

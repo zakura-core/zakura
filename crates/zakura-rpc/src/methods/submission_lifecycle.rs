@@ -17,7 +17,14 @@ use super::types::submit_block::{
     PendingBlockRegistration, PendingBlockRegistry, PendingBlockSignal,
 };
 
-const TRUSTED_VERIFY_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+/// How long a trusted submission waits for verifier readiness and its verdict.
+///
+/// A trusted block's parent is already committed, so nothing on this path waits for other
+/// blocks to arrive, unlike the syncer's much longer verify timeout. The deadline only guards
+/// against a stalled verifier or state service. It stays under the 75-second target block
+/// spacing: a block that validates more slowly has lost its relay value, and until then its
+/// body keeps a pending-registry entry, a receipt slot, and the HTTP response.
+const TRUSTED_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a duplicate verdict waits for the committed copy of its block to become readable.
 ///

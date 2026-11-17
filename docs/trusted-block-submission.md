@@ -94,9 +94,11 @@ HTTP 200 has a plain-text body:
 | `duplicate-inconclusive` | A submission with this header hash is still in flight. |
 | `inconclusive` | Acceptance could not be established; the caller may retry. |
 
-Acceptance does not certify best-chain selection or delivery to any peer. The
-eight-minute validation deadline returns `inconclusive` and withdraws temporary
-relay storage; it does not roll back a state operation already handed off.
+Acceptance does not certify best-chain selection or delivery to any peer.
+Validation has a 60-second deadline, which is under the target block spacing. A
+submission that misses it returns `inconclusive` and has its temporary relay
+storage withdrawn. The deadline does not roll back a state operation already
+handed off, so the block can still commit and be announced afterward.
 
 Once an authenticated request passes its header checks and takes a receipt slot,
 which happens as soon as the HTTP server parses the request head, its body is

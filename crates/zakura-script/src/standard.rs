@@ -8,6 +8,9 @@
 use zakura_chain::{transaction::Transaction, transparent};
 use zcash_script::{opcode::PossiblyBad, script, solver, Opcode};
 
+#[cfg(test)]
+mod tests;
+
 /// The maximum number of signature operations in the redeem script of a standard P2SH input.
 ///
 /// This is zcashd's `MAX_P2SH_SIGOPS` standardness (policy) constant:

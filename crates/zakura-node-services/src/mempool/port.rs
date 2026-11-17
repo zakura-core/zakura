@@ -789,14 +789,16 @@ impl PoolInbox {
 
     /// The next command, or `None` once every handle is gone. This does not
     /// wake for a dropped reservation. The core's task uses [`Self::next`].
-    pub async fn command(&mut self) -> Option<PoolCommand> {
+    #[cfg(test)]
+    pub(crate) async fn command(&mut self) -> Option<PoolCommand> {
         self.commands.recv().await
     }
 
     /// A reservation that was dropped before the core accepted it, if one is
     /// waiting. The core drains these before it answers a command, so a
     /// freed slot is seen by the next reservation.
-    pub fn released(&mut self) -> Option<ReservationId> {
+    #[cfg(test)]
+    pub(crate) fn released(&mut self) -> Option<ReservationId> {
         self.releases.try_recv().ok()
     }
 

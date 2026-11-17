@@ -7,7 +7,6 @@ use super::{verified_set::VerifiedSet, SameEffectsChainRejectionError};
 
 mod eviction;
 mod known_ids;
-mod mutation_benchmarks;
 mod prop;
 mod standardness;
 mod vectors;

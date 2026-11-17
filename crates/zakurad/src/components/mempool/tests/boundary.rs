@@ -1680,6 +1680,7 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
 /// leaves part of the core's slots free. A reorg is the same reset to both
 /// pools as this upgrade.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "times the two pools against each other on a real clock, so it runs with the ignored tests, not on every pull request"]
 async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
     let classic = recover(Mode::Classic, true).await;
     let core = recover(Mode::Core, true).await;

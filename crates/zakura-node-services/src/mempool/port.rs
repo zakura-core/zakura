@@ -23,8 +23,8 @@
 //! the body, and charges nobody for a body that came from this node.
 //!
 //! A slot is held until the caller that reserved it submits its body or drops
-//! the reservation, and at least until the verdict. So if another caller's
-//! body decides the id while the first caller's fetch is still out, that
+//! the reservation, and at least until the verdict. So if a block mines the
+//! id, or the pool turns off, while the caller's fetch is still out, that
 //! fetch still holds its slot.
 //!
 //! A caller drops a reservation when it stops waiting for the body. If its
@@ -32,9 +32,8 @@
 //! bodies, and drops each one before it reaches the core. Holding the slot
 //! instead would let peers that never answer fill the core.
 //!
-//! A caller whose reservation outlives its admission, because another
-//! caller's body decided the id first, gets that admission's verdict when it
-//! submits, as if it had come in time.
+//! A caller whose reservation outlives its admission gets that admission's
+//! verdict when it submits, as if it had come in time.
 //!
 //! Readers follow the pool without asking the core for work: the latest
 //! [`PoolSnapshot`] and the numbered [`ChangeEntry`] log.
@@ -69,9 +68,6 @@ mod tests;
 /// Undecided transactions the core holds at once, node-wide. Today's
 /// `MAX_INBOUND_CONCURRENCY`.
 pub const MAX_PENDING: usize = 500;
-
-/// Submissions that can wait on one undecided transaction. Provisional.
-pub const MAX_WAITERS: usize = 8;
 
 /// Slots that revalidation after a reorg can hold. The rest of
 /// [`MAX_PENDING`] stays free for new admissions. Provisional.
@@ -125,24 +121,11 @@ pub const REVALIDATE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// [`PoolHandle::reserve`] and [`PoolHandle::submit`] wait.
 pub const COMMAND_QUEUE: usize = 1_024;
 
-/// Why the caller is reserving.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Intent {
-    /// The caller will fetch the body. An id that another caller is already
-    /// bringing in answers [`Unreserved::Pending`], so it is not fetched
-    /// twice.
-    Fetch,
-    /// The caller holds the body. An id that is already undecided is joined:
-    /// the submission waits for that verdict and takes no slot.
-    Deliver,
-}
-
 /// Names one reservation to the core.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReservationId(pub u64);
 
-/// A slot in the core for one transaction id, or a place among the waiters
-/// of an id that is already undecided.
+/// A slot in the core for one transaction id.
 ///
 /// Dropping it frees the slot, unless the core has accepted it. That holds
 /// while it waits inside a [`PoolCommand`] too, so a caller that is cancelled
@@ -157,8 +140,6 @@ pub struct ReservationId(pub u64);
 pub struct Reservation {
     id: ReservationId,
     tx_id: UnminedTxId,
-    joined: bool,
-    wants_body: bool,
     release: Option<mpsc::UnboundedSender<ReservationId>>,
     /// Cancelled when the core no longer needs this reservation's body.
     cancel: CancellationToken,
@@ -170,16 +151,12 @@ impl Reservation {
     pub fn granted(
         id: ReservationId,
         tx_id: UnminedTxId,
-        joined: bool,
-        wants_body: bool,
         release: mpsc::UnboundedSender<ReservationId>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             id,
             tx_id,
-            joined,
-            wants_body,
             release: Some(release),
             cancel,
         }
@@ -201,19 +178,6 @@ impl Reservation {
     /// The transaction id it was reserved for.
     pub fn tx_id(&self) -> UnminedTxId {
         self.tx_id
-    }
-
-    /// Whether it joined an id that was already undecided. A joined
-    /// reservation holds no slot.
-    pub fn joined(&self) -> bool {
-        self.joined
-    }
-
-    /// Whether the core needs the body from this caller. False for a joined
-    /// reservation when the core already holds the body or another caller
-    /// is bringing it. [`PoolHandle::submit`] then sends no body.
-    pub fn wants_body(&self) -> bool {
-        self.wants_body
     }
 
     /// The core takes over: the outcome is now the core's to deliver, and
@@ -238,8 +202,6 @@ impl fmt::Debug for Reservation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reservation")
             .field("id", &self.id)
-            .field("joined", &self.joined)
-            .field("wants_body", &self.wants_body)
             .finish_non_exhaustive()
     }
 }
@@ -251,9 +213,8 @@ pub enum Unreserved {
     Inactive,
     /// The transaction is in the pool.
     Pooled,
-    /// The id is undecided and this reservation cannot join it: the intent
-    /// was [`Intent::Fetch`], or [`MAX_WAITERS`] is reached. Today's
-    /// `AlreadyQueued`.
+    /// The id is already undecided: another caller reserved it and is
+    /// bringing its body in. Today's `AlreadyQueued`.
     Pending,
     /// A cached rejection covers the id.
     Rejected(Rejection),
@@ -338,8 +299,6 @@ pub enum LocalFault {
     Deactivated,
     /// The reservation was no longer valid when the body arrived.
     StaleReservation,
-    /// Every caller that could have brought the body gave up.
-    NoBody,
     /// The transaction conflicts with a pooled one that is hidden while it
     /// is verified again. Which of the two is valid is not known yet.
     PoolUnsettled,
@@ -765,26 +724,16 @@ pub enum PoolCommand {
     Reserve {
         /// The transaction id.
         tx_id: UnminedTxId,
-        /// Whether the caller will fetch or already holds the body.
-        intent: Intent,
         /// Where the answer goes.
         reply: oneshot::Sender<Result<Reservation, Unreserved>>,
     },
-    /// [`PoolHandle::submit`] with a body.
+    /// [`PoolHandle::submit`].
     Submit {
         /// The reservation the body arrives under. Still armed: if this
         /// command is dropped before the core takes it, the slot is freed.
         reservation: Reservation,
         /// The body.
         transaction: UnminedTx,
-        /// Where the verdict goes.
-        reply: oneshot::Sender<Verdict>,
-    },
-    /// [`PoolHandle::submit`] under a joined reservation that needs no body.
-    /// The caller waits for the verdict of the body the core already has.
-    Join {
-        /// The joined reservation. Still armed.
-        reservation: Reservation,
         /// Where the verdict goes.
         reply: oneshot::Sender<Verdict>,
     },
@@ -925,17 +874,9 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
 impl PoolHandle {
     /// Reserve one of the node's slots for `tx_id` before fetching or
     /// delivering its body.
-    pub async fn reserve(
-        &self,
-        tx_id: UnminedTxId,
-        intent: Intent,
-    ) -> Result<Reservation, Unreserved> {
+    pub async fn reserve(&self, tx_id: UnminedTxId) -> Result<Reservation, Unreserved> {
         let (reply, answer) = oneshot::channel();
-        let command = PoolCommand::Reserve {
-            tx_id,
-            intent,
-            reply,
-        };
+        let command = PoolCommand::Reserve { tx_id, reply };
         if self.commands.send(command).await.is_err() {
             return Err(Unreserved::Stopped);
         }
@@ -944,11 +885,6 @@ impl PoolHandle {
 
     /// Submit the body `reservation` was taken for, and wait for its verdict.
     ///
-    /// A joined reservation that does not want the body sends none. The
-    /// body is dropped here. This keeps copies of one transaction from
-    /// queuing for the core. It is not a bound on bodies callers hold: a
-    /// caller that had the body before it reserved holds it either way.
-    ///
     /// Cancelling this before the core takes the command frees the slot.
     pub async fn submit(&self, reservation: Reservation, transaction: UnminedTx) -> Verdict {
         if transaction.id() != reservation.tx_id() {
@@ -956,15 +892,10 @@ impl PoolHandle {
             return Verdict::LocalFault(LocalFault::WrongTransaction);
         }
         let (reply, verdict) = oneshot::channel();
-        let command = if reservation.wants_body() {
-            PoolCommand::Submit {
-                reservation,
-                transaction,
-                reply,
-            }
-        } else {
-            drop(transaction);
-            PoolCommand::Join { reservation, reply }
+        let command = PoolCommand::Submit {
+            reservation,
+            transaction,
+            reply,
         };
         if self.commands.send(command).await.is_err() {
             return Verdict::LocalFault(LocalFault::Stopped);
@@ -1088,18 +1019,9 @@ impl PoolInbox {
         &self,
         id: ReservationId,
         tx_id: UnminedTxId,
-        joined: bool,
-        wants_body: bool,
         cancel: CancellationToken,
     ) -> Reservation {
-        Reservation::granted(
-            id,
-            tx_id,
-            joined,
-            wants_body,
-            self.release_handle.clone(),
-            cancel,
-        )
+        Reservation::granted(id, tx_id, self.release_handle.clone(), cancel)
     }
 
     /// Publish one batch: append `changes` to the log, then publish the

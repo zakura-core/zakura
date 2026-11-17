@@ -29,14 +29,14 @@ use zakura_chain::{
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        ChainTip, ChainTransition, Charge, ConnectedBlock, Generation, GenerationRead, Intent,
+        ChainTip, ChainTransition, Charge, ConnectedBlock, Generation, GenerationRead,
         ReservationId, Unreserved, Verdict,
     },
 };
 use zakura_rt::collections::HashSet;
 
 use self::tracker::Tracker;
-use super::{Effect, Grant, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, WaiterId};
+use super::{Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, WaiterId};
 use crate::{config::Config, storage::RejectionError, Instant};
 
 mod random;
@@ -276,19 +276,19 @@ impl Bench {
     }
 
     /// Reserves `tx`. Returns the answer, and what else the input caused.
-    fn reserve(&mut self, tx: &Tx, intent: Intent) -> (Result<Grant, Unreserved>, Step) {
-        let answer = self.machine.reserve(tx.id(), intent, self.at());
-        if let Ok(grant) = &answer {
-            self.tracker.reserved(grant.id);
+    fn reserve(&mut self, tx: &Tx) -> (Result<ReservationId, Unreserved>, Step) {
+        let answer = self.machine.reserve(tx.id(), self.at());
+        if let Ok(reservation) = &answer {
+            self.tracker.reserved(*reservation);
         }
         let step = self.machine.effects();
         (answer, self.took(step))
     }
 
-    /// Reserves `tx` as a caller that holds its body, and expects a grant.
+    /// Reserves `tx`, and expects a grant.
     fn reserved(&mut self, tx: &Tx) -> ReservationId {
-        match self.reserve(tx, Intent::Deliver).0 {
-            Ok(grant) => grant.id,
+        match self.reserve(tx).0 {
+            Ok(reservation) => reservation,
             Err(refused) => panic!("the reservation was refused: {refused:?}"),
         }
     }
@@ -298,14 +298,6 @@ impl Bench {
         let (waiter, step) =
             self.machine
                 .submit(reservation, tx.real.transaction.clone(), self.at());
-        self.tracker.waits(waiter, tx.id());
-        (waiter, self.took(step))
-    }
-
-    /// Waits for the verdict of `tx` under a joined `reservation` that was
-    /// not asked for the body.
-    fn wait(&mut self, reservation: ReservationId, tx: &Tx) -> (WaiterId, Step) {
-        let (waiter, step) = self.machine.wait(reservation, tx.id(), self.at());
         self.tracker.waits(waiter, tx.id());
         (waiter, self.took(step))
     }

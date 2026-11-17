@@ -39,9 +39,9 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, ChainTransition, Change, ChangeSeq, Charge, Generation, GenerationRead,
-    Intent, LocalFault, PoolSnapshot, Rejection, RejectionDetail, RejectionScope, RemovalReason,
+    LocalFault, PoolSnapshot, Rejection, RejectionDetail, RejectionScope, RemovalReason,
     ReservationId, Unreserved, Verdict, MAX_OUTPUT_WAITS, MAX_PENDING, MAX_REVALIDATING,
-    MAX_UNDECIDED, MAX_WAITERS, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+    MAX_UNDECIDED, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -106,18 +106,6 @@ pub enum Outcome<E> {
     },
     /// The verification failed on this node.
     LocalFault(LocalFault),
-}
-
-/// A granted reservation. The core's task turns it into a
-/// `zakura_node_services::mempool::port::Reservation`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Grant {
-    /// Its name.
-    pub id: ReservationId,
-    /// Whether it joined an id that was already undecided.
-    pub joined: bool,
-    /// Whether the core needs the body from this caller.
-    pub wants_body: bool,
 }
 
 /// One thing the core does because of an input.
@@ -221,12 +209,6 @@ impl Default for Limits {
     }
 }
 
-/// One submission waiting for a verdict.
-#[derive(Clone, Debug)]
-struct Waiter {
-    id: WaiterId,
-}
-
 /// Where an undecided transaction is.
 #[derive(Clone, Debug)]
 enum Stage {
@@ -241,16 +223,16 @@ enum Stage {
     Parked { on: Vec<transaction::Hash> },
 }
 
-/// An undecided transaction and everyone waiting on it.
+/// An undecided transaction and the submission waiting on it.
 #[derive(Clone, Debug)]
 struct Admission<E> {
     tx_id: UnminedTxId,
+    /// The reservation it was granted under. Its caller is fetching the body
+    /// until `body` is set.
     owner: ReservationId,
-    /// Whether the owner can still submit. False once it has submitted or
-    /// released.
-    owner_waiting: bool,
     body: Option<UnminedTx>,
-    waiters: Vec<Waiter>,
+    /// The submission that brought the body, which gets the verdict.
+    waiter: Option<WaiterId>,
     stage: Stage,
     /// When one of its inputs was first found missing. Its wait for a parent
     /// runs from here and is never restarted.
@@ -331,16 +313,6 @@ enum JobTarget {
     Revalidation(transaction::Hash),
 }
 
-/// A reservation that joined an undecided id.
-#[derive(Clone, Debug)]
-struct JoinTicket {
-    /// The admission it joined. A later admission of the same id is another
-    /// one, and this ticket does not reach it.
-    admission: u64,
-    /// Whether the core asked this caller for the body.
-    brings: bool,
-}
-
 /// A slot kept for a fetch that is still out after its id was decided.
 #[derive(Clone, Debug)]
 struct Lease {
@@ -417,12 +389,6 @@ pub struct MempoolState<E> {
     /// submits or drops it, so a source cannot have more fetches out than
     /// slots.
     leases: HashMap<ReservationId, Lease>,
-    tickets: BTreeMap<ReservationId, JoinTicket>,
-    /// Joined reservations whose admission ended before their caller came
-    /// back, with the verdict the admission got, which the caller gets when
-    /// it comes back. Each keeps its id too, so a wrong body under it is
-    /// still told apart.
-    ended_joins: HashMap<ReservationId, (UnminedTxId, Verdict)>,
     /// Every pooled transaction, visible or hidden, oldest first.
     pool: BTreeMap<u64, Pooled<E>>,
     pooled: HashMap<transaction::Hash, u64>,
@@ -474,8 +440,6 @@ impl<E: VerifyError> MempoolState<E> {
             admission_of: HashMap::default(),
             owners: HashMap::default(),
             leases: HashMap::default(),
-            tickets: BTreeMap::new(),
-            ended_joins: HashMap::default(),
             pool: BTreeMap::new(),
             pooled: HashMap::default(),
             hidden: BTreeSet::new(),
@@ -505,9 +469,8 @@ impl<E: VerifyError> MempoolState<E> {
     pub fn reserve(
         &mut self,
         tx_id: UnminedTxId,
-        intent: Intent,
         now: Instant,
-    ) -> Result<Grant, Unreserved> {
+    ) -> Result<ReservationId, Unreserved> {
         self.enter(now);
         if !self.active {
             return Err(Unreserved::Inactive);
@@ -526,8 +489,9 @@ impl<E: VerifyError> MempoolState<E> {
                 error,
             )));
         }
-        if let Some(key) = self.admission_of.get(&tx_id).copied() {
-            return self.join(key, intent);
+        // Today's `AlreadyQueued`: an undecided id is brought in once.
+        if self.admission_of.contains_key(&tx_id) {
+            return Err(Unreserved::Pending);
         }
         if self.slots_in_use() >= self.limits.pending {
             return Err(Unreserved::NoRoom);
@@ -539,9 +503,8 @@ impl<E: VerifyError> MempoolState<E> {
             Admission {
                 tx_id,
                 owner,
-                owner_waiting: true,
                 body: None,
-                waiters: Vec::new(),
+                waiter: None,
                 stage: Stage::Reserved,
                 missing_since: None,
                 missing_error: None,
@@ -552,11 +515,7 @@ impl<E: VerifyError> MempoolState<E> {
         );
         self.admission_of.insert(tx_id, key);
         self.owners.insert(owner, key);
-        Ok(Grant {
-            id: owner,
-            joined: false,
-            wants_body: true,
-        })
+        Ok(owner)
     }
 
     /// A reservation dropped before the core accepted it.
@@ -570,13 +529,9 @@ impl<E: VerifyError> MempoolState<E> {
     /// logged, because today's change stream reports a download that failed.
     pub fn fetch_failed(&mut self, reservation: ReservationId, now: Instant) -> Step {
         self.enter(now);
-        // An id that another caller's body already decided has its outcome
-        // in the log. A late failure of this fetch adds nothing to it. Only
-        // the reserving caller's failure ends the admission, so only it is
-        // logged: a joined caller that leaves while the admission goes on
-        // changes nothing a reader sees.
-        let owner = self.owners.contains_key(&reservation);
-        if let Some(tx_id) = self.undecided_for(reservation).filter(|_| owner) {
+        // An admission that ended while this fetch was out has its outcome
+        // in the log. A late failure of the fetch adds nothing to it.
+        if let Some(tx_id) = self.undecided_for(reservation) {
             self.step.changes.push(Change::Refused(tx_id));
         }
         self.drop_reservation(reservation);
@@ -591,19 +546,40 @@ impl<E: VerifyError> MempoolState<E> {
         tx: UnminedTx,
         now: Instant,
     ) -> (WaiterId, Step) {
+        self.enter(now);
+        let now = self.now;
         let tx_id = tx.id();
-        self.arrive(reservation, tx_id, Some(tx), now)
-    }
-
-    /// A joined reservation that does not want the body: the caller waits for
-    /// the verdict of the body the core has or is being brought.
-    pub fn wait(
-        &mut self,
-        reservation: ReservationId,
-        tx_id: UnminedTxId,
-        now: Instant,
-    ) -> (WaiterId, Step) {
-        self.arrive(reservation, tx_id, None, now)
+        let waiter = WaiterId(self.fresh());
+        // The handle checks the body against the reservation before it sends
+        // anything. A wrong body drops the reservation.
+        if self
+            .reserved_for(reservation)
+            .is_some_and(|reserved| reserved != tx_id)
+        {
+            self.drop_reservation(reservation);
+            self.step.effects.push(Effect::Verdict {
+                waiter,
+                verdict: Verdict::LocalFault(LocalFault::WrongTransaction),
+            });
+            return (waiter, self.take_step());
+        }
+        let Some(key) = self.owners.remove(&reservation) else {
+            // The admission this reservation was granted for ended while
+            // its fetch was out. The caller gets that admission's verdict,
+            // as if it had come in time.
+            let verdict = match self.leases.remove(&reservation) {
+                Some(lease) => lease.verdict,
+                None => self.stale_verdict(tx_id),
+            };
+            self.step.effects.push(Effect::Verdict { waiter, verdict });
+            return (waiter, self.take_step());
+        };
+        let admission = self.admission_at(key);
+        admission.waiter = Some(waiter);
+        admission.body = Some(tx);
+        admission.body_at = Some(now);
+        self.start_admission(key);
+        (waiter, self.take_step())
     }
 
     /// The outcome of `job`, with the generation read before its first state
@@ -728,7 +704,7 @@ impl<E: VerifyError> MempoolState<E> {
             .collect();
         for key in ended {
             let admission = self.admission_at(key);
-            if admission.owner_waiting {
+            if admission.body.is_none() {
                 let owner = admission.owner;
                 self.step.effects.push(Effect::CancelFetch(owner));
             }
@@ -863,7 +839,6 @@ impl<E: VerifyError> MempoolState<E> {
         self.step
             .effects
             .extend(fetching.into_iter().map(Effect::CancelFetch));
-        self.tickets.clear();
         self.owners.clear();
         let keys: Vec<u64> = self.pool.keys().copied().collect();
         for key in keys {
@@ -985,11 +960,7 @@ impl<E: VerifyError> MempoolState<E> {
     /// Reservations callers still hold, of every kind.
     #[cfg(test)]
     pub(crate) fn caller_held(&self) -> usize {
-        self.owners
-            .len()
-            .saturating_add(self.tickets.len())
-            .saturating_add(self.leases.len())
-            .saturating_add(self.ended_joins.len())
+        self.owners.len().saturating_add(self.leases.len())
     }
 
     /// The visible pool, oldest first.
@@ -1082,14 +1053,15 @@ impl<E: VerifyError> MempoolState<E> {
             "pool/admissions-within-limits: the node's limit"
         );
         for admission in self.admissions.values() {
-            assert!(
-                admission.waiters.len() <= MAX_WAITERS,
-                "the waiter limit of one admission"
-            );
             assert_eq!(
                 admission.body.is_none(),
                 matches!(admission.stage, Stage::Reserved),
                 "an admission has a body exactly when it has left the reserved stage"
+            );
+            assert_eq!(
+                admission.body.is_some(),
+                admission.waiter.is_some(),
+                "the submission that brought the body waits for its verdict"
             );
         }
         assert!(
@@ -1254,12 +1226,6 @@ impl<E: VerifyError> MempoolState<E> {
                 );
             }
         }
-        for ticket in self.tickets.values() {
-            assert!(
-                self.admissions.contains_key(&ticket.admission),
-                "a joined reservation names a live admission"
-            );
-        }
     }
 
     // Rules.
@@ -1388,94 +1354,11 @@ impl<E: VerifyError> MempoolState<E> {
         step
     }
 
-    /// A body, or a wait for one, under `reservation`.
-    fn arrive(
-        &mut self,
-        reservation: ReservationId,
-        tx_id: UnminedTxId,
-        body: Option<UnminedTx>,
-        now: Instant,
-    ) -> (WaiterId, Step) {
-        self.enter(now);
-        let now = self.now;
-        let waiter = WaiterId(self.fresh());
-        // The handle checks the body against the reservation before it sends
-        // anything. A wrong body drops the reservation.
-        if self
-            .reserved_for(reservation)
-            .is_some_and(|reserved| reserved != tx_id)
-        {
-            self.drop_reservation(reservation);
-            self.step.effects.push(Effect::Verdict {
-                waiter,
-                verdict: Verdict::LocalFault(LocalFault::WrongTransaction),
-            });
-            return (waiter, self.take_step());
-        }
-        let (key, body) = match self.tickets.remove(&reservation) {
-            // A joined caller that was not asked for the body sends none, as
-            // the handle drops it.
-            Some(ticket) => (Some(ticket.admission), body.filter(|_| ticket.brings)),
-            None => (self.owners.remove(&reservation), body),
-        };
-        // The admission the reservation was granted for, if it is still
-        // undecided. A later admission of the same id has another key.
-        let key = key.filter(|key| {
-            self.admissions
-                .get(key)
-                .is_some_and(|admission| admission.tx_id == tx_id)
-        });
-        let Some(key) = key else {
-            // The admission this reservation was granted for ended before
-            // its caller came back. The caller gets that admission's verdict,
-            // as if it had come in time.
-            let ended = self
-                .leases
-                .remove(&reservation)
-                .map(|lease| lease.verdict)
-                .or_else(|| {
-                    self.ended_joins
-                        .remove(&reservation)
-                        .map(|(_, verdict)| verdict)
-                });
-            let verdict = ended.unwrap_or_else(|| self.stale_verdict(tx_id));
-            self.step.effects.push(Effect::Verdict { waiter, verdict });
-            return (waiter, self.take_step());
-        };
-        let start = {
-            let admission = self.admission_at(key);
-            if admission.owner == reservation {
-                admission.owner_waiting = false;
-            }
-            admission.waiters.push(Waiter { id: waiter });
-            match body {
-                Some(tx) if admission.body.is_none() => {
-                    admission.body = Some(tx);
-                    admission.body_at = Some(now);
-                    true
-                }
-                // The core already holds these bytes, or the caller was not
-                // asked for them.
-                _ => false,
-            }
-        };
-        if start {
-            self.start_admission(key);
-        } else {
-            self.settle_bodyless(key);
-        }
-        (waiter, self.take_step())
-    }
-
     /// The id a reservation was granted for, while its admission is
     /// undecided.
     fn undecided_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
-        let key = self
-            .tickets
-            .get(&reservation)
-            .map(|ticket| ticket.admission)
-            .or_else(|| self.owners.get(&reservation).copied())?;
-        self.admissions.get(&key).map(|admission| admission.tx_id)
+        let key = self.owners.get(&reservation)?;
+        self.admissions.get(key).map(|admission| admission.tx_id)
     }
 
     /// The id a reservation was granted for, for as long as the machine knows
@@ -1483,72 +1366,20 @@ impl<E: VerifyError> MempoolState<E> {
     fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
         self.undecided_for(reservation)
             .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
-            .or_else(|| self.ended_joins.get(&reservation).map(|(id, _)| *id))
     }
 
-    /// Ends a reservation that brought no body: frees its lease, or its place
-    /// in an admission, and ends that admission if nobody can still bring its
-    /// body.
+    /// Ends a reservation that brought no body: frees its lease, or ends its
+    /// admission. Nobody else can bring that body, and no submission waits
+    /// on it.
     fn drop_reservation(&mut self, reservation: ReservationId) {
-        let key = match self.tickets.remove(&reservation) {
-            Some(ticket) => Some(ticket.admission),
-            None => self.owners.remove(&reservation).inspect(|key| {
-                if let Some(admission) = self.admissions.get_mut(key) {
-                    admission.owner_waiting = false;
-                }
-            }),
-        };
-        if let Some(key) = key {
-            self.settle_bodyless(key);
+        if let Some(key) = self.owners.remove(&reservation) {
+            let admission = self
+                .admissions
+                .remove(&key)
+                .expect("a reservation that can still submit names a live admission");
+            self.admission_of.remove(&admission.tx_id);
         }
         self.leases.remove(&reservation);
-        self.ended_joins.remove(&reservation);
-    }
-
-    /// Joins an id that is already undecided, if there is a place among its
-    /// waiters. Whether one peer may wait on an id twice is its caller's
-    /// rule.
-    fn join(&mut self, key: u64, intent: Intent) -> Result<Grant, Unreserved> {
-        if intent == Intent::Fetch {
-            return Err(Unreserved::Pending);
-        }
-        let tickets: Vec<&JoinTicket> = self
-            .tickets
-            .values()
-            .filter(|ticket| ticket.admission == key)
-            .collect();
-        let admission = &self.admissions[&key];
-        let waiting = admission
-            .waiters
-            .len()
-            .saturating_add(tickets.len())
-            .saturating_add(usize::from(admission.owner_waiting));
-        if waiting >= MAX_WAITERS {
-            return Err(Unreserved::Pending);
-        }
-        // A joined caller is asked for the body only when nobody else can
-        // bring it: the core has none, the reserving caller is not still
-        // fetching or delivering it, and no other joined caller was asked.
-        // Otherwise a second decoded body would wait under the same slot.
-        // So a delivery
-        // that joins while the fetch is out waits for the fetch's verdict,
-        // and its own copy is dropped, as today drops it.
-        let brings = admission.body.is_none()
-            && !admission.owner_waiting
-            && !tickets.iter().any(|ticket| ticket.brings);
-        let id = ReservationId(self.fresh());
-        self.tickets.insert(
-            id,
-            JoinTicket {
-                admission: key,
-                brings,
-            },
-        );
-        Ok(Grant {
-            id,
-            joined: true,
-            wants_body: brings,
-        })
     }
 
     /// Applies a fresh outcome to an undecided transaction.
@@ -1919,7 +1750,7 @@ impl<E: VerifyError> MempoolState<E> {
             .expect("the caller names a live admission");
         self.admission_of.remove(&admission.tx_id);
         self.owners.remove(&admission.owner);
-        if admission.owner_waiting {
+        if admission.body.is_none() {
             // The reserving caller's fetch is still out. Its body will arrive
             // decoded, so its slot is not free yet.
             self.leases.insert(
@@ -1930,25 +1761,8 @@ impl<E: VerifyError> MempoolState<E> {
                 },
             );
         }
-        // A reservation that joined this admission dies with it. Its caller may
-        // still come back with a body.
-        let tx_id = admission.tx_id;
-        let ended: Vec<ReservationId> = self
-            .tickets
-            .iter()
-            .filter(|(_, ticket)| ticket.admission == key)
-            .map(|(reservation, _)| *reservation)
-            .collect();
-        for reservation in ended {
-            self.tickets.remove(&reservation);
-            self.ended_joins
-                .insert(reservation, (tx_id, verdict.clone()));
-        }
-        for waiter in admission.waiters {
-            self.step.effects.push(Effect::Verdict {
-                waiter: waiter.id,
-                verdict: verdict.clone(),
-            });
+        if let Some(waiter) = admission.waiter {
+            self.step.effects.push(Effect::Verdict { waiter, verdict });
         }
     }
 
@@ -2379,23 +2193,6 @@ impl<E: VerifyError> MempoolState<E> {
                 id: pooled.id,
                 reason: RemovalReason::Evicted,
             });
-        }
-    }
-
-    /// Ends an admission that holds no body once nobody can still bring one.
-    /// Callers already waiting on it get a local fault.
-    fn settle_bodyless(&mut self, key: u64) {
-        let Some(admission) = self.admissions.get(&key) else {
-            return;
-        };
-        let body_coming = admission.body.is_some()
-            || admission.owner_waiting
-            || self
-                .tickets
-                .values()
-                .any(|ticket| ticket.admission == key && ticket.brings);
-        if !body_coming {
-            self.decide(key, Verdict::LocalFault(LocalFault::NoBody));
         }
     }
 

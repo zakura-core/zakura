@@ -23,8 +23,8 @@ use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
         chain_transitions, pool_port, AwaitOutputError, ChainReason, ChainTip, ChainTransition,
-        ChainTransitionSender, ConnectedBlock, Intent, LocalFault, PoolHandle, PoolReader,
-        RejectionScope, Unreserved, Verdict,
+        ChainTransitionSender, ConnectedBlock, LocalFault, PoolHandle, PoolReader, RejectionScope,
+        Unreserved, Verdict,
     },
 };
 use zakura_rt::{
@@ -283,7 +283,7 @@ impl Harness {
     async fn submit(&self, tx: &Tx) -> Verdict {
         let reservation = self
             .handle
-            .reserve(tx.id(), Intent::Deliver)
+            .reserve(tx.id())
             .await
             .expect("the core grants a reservation");
         tokio::time::timeout(
@@ -419,7 +419,7 @@ impl Harness {
     async fn submit_in_background(&self, tx: &Tx) -> tokio::task::JoinHandle<Verdict> {
         let reservation = self
             .handle
-            .reserve(tx.id(), Intent::Deliver)
+            .reserve(tx.id())
             .await
             .expect("the core grants a reservation");
         let handle = self.handle.clone();
@@ -499,7 +499,7 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
     // The child first: its parent is missing, so it parks.
     let reservation = harness
         .handle
-        .reserve(child.id(), Intent::Deliver)
+        .reserve(child.id())
         .await
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
@@ -650,7 +650,7 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
 
     let reservation = harness
         .handle
-        .reserve(parent.id(), Intent::Deliver)
+        .reserve(parent.id())
         .await
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
@@ -686,7 +686,7 @@ async fn turning_the_pool_off_cancels_a_fetch_still_out() {
     let harness = Harness::start(std::slice::from_ref(&parent));
     let fetch = harness
         .handle
-        .reserve(parent.id(), Intent::Fetch)
+        .reserve(parent.id())
         .await
         .expect("the node has room");
     let cancel = fetch.cancellation();
@@ -727,20 +727,20 @@ async fn a_dropped_reservation_frees_its_slot() {
         held.push(
             harness
                 .handle
-                .reserve(tx.id(), Intent::Fetch)
+                .reserve(tx.id())
                 .await
                 .expect("the node has room"),
         );
     }
     assert!(matches!(
-        harness.handle.reserve(txs[5].id(), Intent::Fetch).await,
+        harness.handle.reserve(txs[5].id()).await,
         Err(Unreserved::NoRoom)
     ));
 
     drop(held.pop());
     let _granted = harness
         .handle
-        .reserve(txs[5].id(), Intent::Fetch)
+        .reserve(txs[5].id())
         .await
         .expect("the dropped reservation's slot is free again");
 }
@@ -780,7 +780,7 @@ async fn a_block_with_a_conflicting_transaction_removes_the_pooled_one() {
     assert!(matches!(
         harness
             .handle
-            .reserve(pooled.id(), Intent::Deliver)
+            .reserve(pooled.id())
             .await,
         Err(Unreserved::Rejected(rejection))
             if rejection.scope == RejectionScope::EffectsChain(ChainReason::DuplicateSpend)
@@ -934,7 +934,7 @@ async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
         held.push(
             harness
                 .handle
-                .reserve(tx.id(), Intent::Fetch)
+                .reserve(tx.id())
                 .await
                 .expect("the node has room"),
         );
@@ -949,7 +949,7 @@ async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
 
     let _granted = harness
         .handle
-        .reserve(txs[5].id(), Intent::Fetch)
+        .reserve(txs[5].id())
         .await
         .expect("the cancelled submission's slot is free again");
 }
@@ -996,7 +996,7 @@ async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
     let mut harness = Harness::start_at(std::slice::from_ref(&parent), None);
     harness.snapshot_until(|snapshot| !snapshot.active).await;
     assert!(matches!(
-        harness.handle.reserve(parent.id(), Intent::Deliver).await,
+        harness.handle.reserve(parent.id()).await,
         Err(Unreserved::Inactive)
     ));
 

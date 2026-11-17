@@ -10,8 +10,8 @@ use zakura_chain::{
 
 use super::{
     pool_port, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Generation, GenerationCell,
-    GenerationRead, Intent, LocalFault, PoolCommand, PoolSnapshot, ReservationId, Unreserved,
-    Verdict, CHANGE_LOG_CAPACITY, COMMAND_QUEUE,
+    GenerationRead, LocalFault, PoolCommand, PoolSnapshot, ReservationId, Unreserved, Verdict,
+    CHANGE_LOG_CAPACITY, COMMAND_QUEUE,
 };
 use crate::mempool::TransactionDependencies;
 
@@ -145,18 +145,12 @@ async fn a_dropped_reservation_reaches_the_core() {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.command().await else {
             panic!("the first command is the reservation");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(7),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(7), tx_id, Default::default())));
         inbox
     });
 
     let reservation = handle
-        .reserve(id(1), Intent::Fetch)
+        .reserve(id(1))
         .await
         .expect("the test core grants it");
     let mut inbox = core.await.expect("the test core does not panic");
@@ -171,7 +165,7 @@ async fn a_stopped_core_answers_every_call() {
     let (handle, inbox) = pool_port();
     drop(inbox);
     assert!(matches!(
-        handle.reserve(id(1), Intent::Fetch).await,
+        handle.reserve(id(1)).await,
         Err(Unreserved::Stopped)
     ));
     assert!(handle.snapshot().is_none());
@@ -182,12 +176,12 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
     let (handle, mut inbox) = pool_port();
     let transaction = body(1);
     let tx_id = transaction.id();
-    let reservation = inbox.grant(ReservationId(7), tx_id, false, true, Default::default());
+    let reservation = inbox.grant(ReservationId(7), tx_id, Default::default());
 
     // The command queue is full, so the submission waits to be sent.
     for _ in 0..COMMAND_QUEUE {
         handle
-            .fetch_failed(inbox.grant(ReservationId(9), tx_id, false, true, Default::default()))
+            .fetch_failed(inbox.grant(ReservationId(9), tx_id, Default::default()))
             .await;
     }
     let caller = {
@@ -211,13 +205,7 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
 async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
     let (handle, mut inbox) = pool_port();
     let transaction = body(1);
-    let reservation = inbox.grant(
-        ReservationId(7),
-        transaction.id(),
-        false,
-        true,
-        Default::default(),
-    );
+    let reservation = inbox.grant(ReservationId(7), transaction.id(), Default::default());
     let caller = {
         let handle = handle.clone();
         tokio::spawn(async move { handle.submit(reservation, transaction).await })
@@ -240,41 +228,9 @@ async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
 }
 
 #[tokio::test]
-async fn a_joined_reservation_that_needs_no_body_sends_none() {
-    let (handle, mut inbox) = pool_port();
-    let transaction = body(1);
-    let reservation = inbox.grant(
-        ReservationId(8),
-        transaction.id(),
-        true,
-        false,
-        Default::default(),
-    );
-    let caller = {
-        let handle = handle.clone();
-        tokio::spawn(async move { handle.submit(reservation, transaction).await })
-    };
-
-    let Some(PoolCommand::Join { reply, .. }) = inbox.command().await else {
-        panic!("the body stays with the caller");
-    };
-    let _ = reply.send(Verdict::Admitted);
-    assert!(matches!(
-        caller.await.expect("the caller is not cancelled"),
-        Verdict::Admitted
-    ));
-}
-
-#[tokio::test]
 async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
     let (handle, mut inbox) = pool_port();
-    let reservation = inbox.grant(
-        ReservationId(9),
-        body(1).id(),
-        false,
-        true,
-        Default::default(),
-    );
+    let reservation = inbox.grant(ReservationId(9), body(1).id(), Default::default());
     assert!(matches!(
         handle.submit(reservation, body(2)).await,
         Verdict::LocalFault(LocalFault::WrongTransaction)
@@ -319,7 +275,7 @@ fn a_reader_is_never_handed_changes_newer_than_its_snapshot() {
 #[tokio::test]
 async fn a_dropped_reservation_wakes_an_idle_core() {
     let (handle, mut inbox) = pool_port();
-    let reservation = inbox.grant(ReservationId(7), id(1), false, true, Default::default());
+    let reservation = inbox.grant(ReservationId(7), id(1), Default::default());
     // The core has nothing to do and waits.
     let core = tokio::spawn(async move { inbox.next().await });
     tokio::task::yield_now().await;

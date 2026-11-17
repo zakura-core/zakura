@@ -306,18 +306,11 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     fn command(&mut self, command: PoolCommand) {
         let now = time::Instant::now();
         match command {
-            PoolCommand::Reserve {
-                tx_id,
-                intent,
-                reply,
-            } => {
-                let answer = self.machine.reserve(tx_id, intent, now).map(|grant| {
+            PoolCommand::Reserve { tx_id, reply } => {
+                let answer = self.machine.reserve(tx_id, now).map(|id| {
                     let cancel = CancellationToken::new();
-                    if !grant.joined {
-                        self.fetches.insert(grant.id, cancel.clone());
-                    }
-                    self.inbox
-                        .grant(grant.id, tx_id, grant.joined, grant.wants_body, cancel)
+                    self.fetches.insert(id, cancel.clone());
+                    self.inbox.grant(id, tx_id, cancel)
                 });
                 // A caller that left drops the reservation with the reply,
                 // which frees the slot.
@@ -341,17 +334,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 let id = reservation.accept();
                 self.fetches.remove(&id);
                 let (waiter, step) = self.machine.submit(id, transaction, now);
-                self.verdicts.insert(waiter, reply);
-                self.finish(step);
-            }
-            PoolCommand::Join { reservation, reply } => {
-                if reply.is_closed() {
-                    drop(reservation);
-                    return;
-                }
-                let tx_id = reservation.tx_id();
-                let id = reservation.accept();
-                let (waiter, step) = self.machine.wait(id, tx_id, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
             }

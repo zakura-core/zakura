@@ -1103,18 +1103,9 @@ async fn same_id_twice_is_already_queued_at_the_first_stage(mode: Mode) {
         harness.queue_one(id).await.unbox_mempool_error(),
         MempoolError::AlreadyQueued
     );
-    // Today's pool refuses a body of an id it is fetching. The core joins the
-    // body to that id instead, and answers it with the same verdict at the
-    // second stage: the one difference the adapter makes on purpose.
+    // A body of an id that is being fetched is refused too.
     let body = harness.queue_one(sample.transaction.clone()).await;
-    match mode {
-        Mode::Classic => {
-            assert_eq!(body.unbox_mempool_error(), MempoolError::AlreadyQueued)
-        }
-        Mode::Core => {
-            body.expect("a body of an undecided id joins it");
-        }
-    }
+    assert_eq!(body.unbox_mempool_error(), MempoolError::AlreadyQueued);
 }
 
 async fn full_queue_is_refused_at_the_first_stage(mode: Mode) {
@@ -1446,48 +1437,6 @@ async fn change_stream_reports_admissions_and_refusals(mode: Mode) {
             ),
         ]
     );
-}
-
-/// The core only: a peer's pushes that join an undecided body still count
-/// against its limit of five until that body's verdict. Five joins leave no
-/// room for the peer's sixth push, which is dropped unverified, and the
-/// verdict frees the room again. Today's pool refuses the joins as already
-/// queued, so nothing joins there.
-#[tokio::test(flavor = "multi_thread")]
-async fn joined_pushes_count_against_their_peer_until_the_verdict() {
-    let mut harness = active_pool(Mode::Core).await;
-    let mut bodies = samples(2);
-    let (held, other) = (bodies.remove(0), bodies.remove(0));
-
-    let receiver = harness
-        .queue_one(held.transaction.clone())
-        .await
-        .expect("a new body passes the first stage");
-    let verification = harness
-        .verifier
-        .expect_request_that(|request| matches!(request, tx::Request::Mempool { .. }))
-        .await;
-
-    let push = |tx: &VerifiedUnminedTx, copies: usize| Request::QueueFromPeer {
-        transactions: (0..copies).map(|_| tx.transaction.clone().into()).collect(),
-        source: legacy_peer(1),
-    };
-    harness
-        .ask(push(&held, MAX_INBOUND_CONCURRENCY_PER_PEER))
-        .await;
-    harness.ask(push(&other, 1)).await;
-    harness.verifier.expect_no_requests().await;
-
-    verification.respond(Ok::<_, TransactionError>(passed(&held, Vec::new())));
-    harness
-        .outcome(receiver)
-        .await
-        .expect("the held body is admitted");
-    // The joined pushes get the same verdict, and their tasks free the
-    // room as they finish.
-    time::sleep(Duration::from_millis(200)).await;
-    harness.ask(push(&other, 1)).await;
-    harness.verify(Ok(passed(&other, Vec::new()))).await;
 }
 
 /// Transactions in the recovery gate.
@@ -1915,35 +1864,6 @@ async fn core_mode_emits_todays_metrics() {
     ] {
         assert_eq!(readings.get(key), Some(value), "{key}");
     }
-}
-
-/// The core only: a body whose id is already being verified joins that
-/// verification, and both submissions get its verdict at the second stage.
-/// Today's pool refuses the second one as already queued.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_body_joins_an_undecided_id_and_gets_its_verdict() {
-    let mut harness = active_pool(Mode::Core).await;
-    let sample = samples(1).remove(0);
-
-    let first = harness
-        .queue_one(sample.transaction.clone())
-        .await
-        .expect("a new body passes the first stage");
-    let second = harness
-        .queue_one(sample.transaction.clone())
-        .await
-        .expect("a second body joins the first");
-    harness.verify(Ok(passed(&sample, Vec::new()))).await;
-    harness
-        .outcome(first)
-        .await
-        .expect("the transaction is admitted");
-    harness
-        .outcome(second)
-        .await
-        .expect("the joined body gets the same verdict");
-    // One verification served both.
-    harness.verifier.expect_no_requests().await;
 }
 
 /// The core only: the transaction verifier's pool handle answers an output

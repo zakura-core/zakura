@@ -32,8 +32,8 @@ use zakura_node_services::{
     mempool::port::{
         chain_transitions, pool_port, AwaitOutputError, ChainTip, ChainTransition,
         ChainTransitionSender, Change, ChangeSeq, ChangesSince, Charge, ConnectedBlock, Generation,
-        GenerationCell, GenerationRead, Intent, PoolHandle, PoolSnapshot, Reservation,
-        ReservationId, Verdict,
+        GenerationCell, GenerationRead, PoolHandle, PoolSnapshot, Reservation, ReservationId,
+        Verdict,
     },
 };
 use zakura_rt::{
@@ -451,13 +451,11 @@ impl Mirror {
             );
         }
         for (_, reservation) in &self.held {
-            if !reservation.joined() {
-                assert_eq!(
-                    reservation.cancellation().is_cancelled(),
-                    self.cancelled_fetches.contains(&reservation.id()),
-                    "{what}: a fetch is cancelled when the machine cancels it"
-                );
-            }
+            assert_eq!(
+                reservation.cancellation().is_cancelled(),
+                self.cancelled_fetches.contains(&reservation.id()),
+                "{what}: a fetch is cancelled when the machine cancels it"
+            );
         }
 
         // The snapshot is the machine's, but for the insertion times, which
@@ -530,21 +528,16 @@ impl Mirror {
     }
 
     /// Reserves `tx`, and holds the reservation if one is granted.
-    async fn reserve(&mut self, tx: usize, intent: Intent) {
+    async fn reserve(&mut self, tx: usize) {
         let id = self.txs[tx].id();
-        let expected = self.reference.reserve(id, intent, Instant::now());
+        let expected = self.reference.reserve(id, Instant::now());
         let step = self.reference.effects();
         self.absorb(step);
-        match (expected, answered(self.handle.reserve(id, intent)).await) {
-            (Ok(grant), Ok(reservation)) => {
+        match (expected, answered(self.handle.reserve(id)).await) {
+            (Ok(granted), Ok(reservation)) => {
                 assert_eq!(
-                    (
-                        reservation.id(),
-                        reservation.tx_id(),
-                        reservation.joined(),
-                        reservation.wants_body()
-                    ),
-                    (grant.id, id, grant.joined, grant.wants_body),
+                    (reservation.id(), reservation.tx_id()),
+                    (granted, id),
                     "{}: a grant reaches its caller as the machine made it",
                     self.at
                 );
@@ -565,18 +558,13 @@ impl Mirror {
         }
     }
 
-    /// Submits under a held reservation: the body if the core wants it, or a
-    /// wait for the verdict if it joined.
+    /// Submits the body under a held reservation.
     fn submit(&mut self, held: usize) {
         let (tx, reservation) = self.held.remove(held);
         let body = self.txs[tx].real.transaction.clone();
-        let (waiter, step) = if reservation.wants_body() {
-            self.reference
-                .submit(reservation.id(), body.clone(), Instant::now())
-        } else {
-            self.reference
-                .wait(reservation.id(), reservation.tx_id(), Instant::now())
-        };
+        let (waiter, step) = self
+            .reference
+            .submit(reservation.id(), body.clone(), Instant::now());
         let handle = self.handle.clone();
         let task = tokio::spawn(async move { handle.submit(reservation, body).await });
         self.verdicts.insert(waiter, task);
@@ -749,12 +737,7 @@ impl Mirror {
         let any_tx = dice.below(self.txs.len());
         match dice.below(100) {
             0..=24 => {
-                let intent = if dice.below(2) == 0 {
-                    Intent::Fetch
-                } else {
-                    Intent::Deliver
-                };
-                self.reserve(any_tx, intent).await;
+                self.reserve(any_tx).await;
                 self.compare("a reservation").await;
             }
             25..=44 if !self.held.is_empty() => {

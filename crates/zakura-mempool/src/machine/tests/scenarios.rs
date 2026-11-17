@@ -10,8 +10,8 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
-    ChainReason, Change, Charge, Generation, GenerationRead, Intent, LocalFault, Rejection,
-    RejectionScope, RemovalReason, Unreserved, Verdict, MAX_UNDECIDED, T_PARK, T_VERIFY,
+    ChainReason, Change, Charge, Generation, GenerationRead, LocalFault, Rejection, RejectionScope,
+    RemovalReason, Unreserved, Verdict, MAX_UNDECIDED, T_PARK, T_VERIFY,
 };
 
 use super::{build, paying, started, twin, verified, Bench, TestVerifyError, Tx, START};
@@ -121,17 +121,11 @@ fn a_rejection_holds_at_exactly_its_memory_and_ends_after() {
     bench.grow(&[&mined]);
     bench.now = memory;
     assert!(
-        matches!(
-            bench.reserve(&mined, Intent::Deliver).0,
-            Err(Unreserved::Rejected(_))
-        ),
+        matches!(bench.reserve(&mined).0, Err(Unreserved::Rejected(_))),
         "still remembered at its memory"
     );
     bench.now = memory + Duration::from_millis(1);
-    assert!(
-        bench.reserve(&mined, Intent::Deliver).0.is_ok(),
-        "forgotten after it"
-    );
+    assert!(bench.reserve(&mined).0.is_ok(), "forgotten after it");
 }
 
 /// A verified body that both conflicts with a pooled one and has a dust
@@ -299,7 +293,7 @@ fn hidden_transactions_count_against_the_cost_limit() {
 
     // The same bytes are checked again, against the pool as it is now.
     assert!(
-        bench.reserve(&txs[2], Intent::Deliver).0.is_ok(),
+        bench.reserve(&txs[2]).0.is_ok(),
         "the earlier refusal does not stand in the way"
     );
 }
@@ -435,21 +429,10 @@ fn a_slot_is_held_from_the_reservation() {
     let mut runner = TestRunner::deterministic();
     let txs = unrelated(&mut runner, 6);
     let mut bench = five_slots();
-    let reservations: Vec<_> = txs[..5]
-        .iter()
-        .map(|tx| match bench.reserve(tx, Intent::Fetch).0 {
-            Ok(grant) => grant.id,
-            Err(refused) => panic!("five fit: {refused:?}"),
-        })
-        .collect();
+    let reservations: Vec<_> = txs[..5].iter().map(|tx| bench.reserved(tx)).collect();
 
     // The node is full before one body has been fetched.
-    for intent in [Intent::Fetch, Intent::Deliver] {
-        assert!(matches!(
-            bench.reserve(&txs[5], intent).0,
-            Err(Unreserved::NoRoom)
-        ));
-    }
+    assert!(matches!(bench.reserve(&txs[5]).0, Err(Unreserved::NoRoom)));
 
     // Every fetch completes. No body exists outside a reservation.
     for (reservation, tx) in reservations.into_iter().zip(&txs) {
@@ -466,13 +449,10 @@ fn a_released_reservation_frees_its_slot() {
     let txs = unrelated(&mut runner, 6);
     let mut bench = five_slots();
     let held: Vec<_> = txs[..5].iter().map(|tx| bench.reserved(tx)).collect();
-    assert!(matches!(
-        bench.reserve(&txs[5], Intent::Fetch).0,
-        Err(Unreserved::NoRoom)
-    ));
+    assert!(matches!(bench.reserve(&txs[5]).0, Err(Unreserved::NoRoom)));
 
     assert!(bench.release(held[0]).is_empty());
-    assert!(bench.reserve(&txs[5], Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&txs[5]).0.is_ok());
     assert_eq!(bench.machine.slots_in_use(), 5);
 }
 
@@ -482,11 +462,8 @@ fn an_undecided_id_is_not_fetched_twice() {
     let mut runner = TestRunner::deterministic();
     let tx = build(&mut runner, &[], 1, None);
     let mut bench = Bench::new();
-    assert!(bench.reserve(&tx, Intent::Fetch).0.is_ok());
-    assert!(matches!(
-        bench.reserve(&tx, Intent::Fetch).0,
-        Err(Unreserved::Pending)
-    ));
+    assert!(bench.reserve(&tx).0.is_ok());
+    assert!(matches!(bench.reserve(&tx).0, Err(Unreserved::Pending)));
 }
 
 /// A fetch that is still out when its admission ends keeps its slot: a
@@ -497,13 +474,7 @@ fn a_fetch_that_is_still_out_keeps_its_slot_after_its_admission_ends() {
     let mut runner = TestRunner::deterministic();
     let txs = unrelated(&mut runner, 6);
     let mut bench = five_slots();
-    let fetching: Vec<_> = txs[..5]
-        .iter()
-        .map(|tx| match bench.reserve(tx, Intent::Fetch).0 {
-            Ok(grant) => grant.id,
-            Err(refused) => panic!("five fit: {refused:?}"),
-        })
-        .collect();
+    let fetching: Vec<_> = txs[..5].iter().map(|tx| bench.reserved(tx)).collect();
 
     // The pool turns off, which ends every admission and tells every fetch
     // to stop, and on again before the fetches come back.
@@ -518,10 +489,7 @@ fn a_fetch_that_is_still_out_keeps_its_slot_after_its_admission_ends() {
     }
     assert!(bench.activate().is_empty());
     assert_eq!(bench.machine.slots_in_use(), 5);
-    assert!(matches!(
-        bench.reserve(&txs[5], Intent::Fetch).0,
-        Err(Unreserved::NoRoom)
-    ));
+    assert!(matches!(bench.reserve(&txs[5]).0, Err(Unreserved::NoRoom)));
 
     // One fetch comes back and gets its admission's verdict. One brings a
     // body for another id, which is still a wrong body. One fails, which
@@ -538,7 +506,7 @@ fn a_fetch_that_is_still_out_keeps_its_slot_after_its_admission_ends() {
     ));
     assert!(bench.fetch_failed(fetching[2]).is_empty());
     assert_eq!(bench.machine.slots_in_use(), 2);
-    assert!(bench.reserve(&txs[5], Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&txs[5]).0.is_ok());
 }
 
 /// A block that mines an id while it is being fetched tells the fetch to
@@ -548,10 +516,7 @@ fn a_block_that_mines_an_id_being_fetched_cancels_the_fetch() {
     let mut runner = TestRunner::deterministic();
     let tx = build(&mut runner, &[], 1, None);
     let mut bench = Bench::new();
-    let fetch = match bench.reserve(&tx, Intent::Fetch).0 {
-        Ok(grant) => grant.id,
-        Err(refused) => panic!("room: {refused:?}"),
-    };
+    let fetch = bench.reserved(&tx);
 
     let step = bench.grow(&[&tx]);
     assert!(
@@ -633,7 +598,7 @@ fn a_local_fault_is_logged_and_not_cached() {
     let (_, job) = bench.start(&txs[0]);
     let step = bench.outcome(job, Outcome::LocalFault(LocalFault::VerifyPanicked));
     assert_eq!(step.changes, vec![Change::Refused(txs[0].id())]);
-    assert!(bench.reserve(&txs[0], Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&txs[0]).0.is_ok());
 
     bench.start(&txs[1]);
     assert_eq!(
@@ -803,12 +768,12 @@ fn a_parent_that_never_arrives_is_remembered_until_the_tip_changes() {
     assert_eq!(rejection.charge, Charge::None);
 
     assert!(matches!(
-        bench.reserve(&child, Intent::Fetch).0,
+        bench.reserve(&child).0,
         Err(Unreserved::Rejected(_))
     ));
     assert!(bench.rejected(&[&child]).contains(&child.id()));
     bench.grow(&[]);
-    assert!(bench.reserve(&child, Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&child).0.is_ok());
 }
 
 /// A child that spends an output its visible parent does not have is not
@@ -869,7 +834,7 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait() {
         Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
     ));
     assert!(started(&step).is_empty());
-    assert!(bench.reserve(&child, Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&child).0.is_ok());
 }
 
 // Deadlines.
@@ -916,7 +881,7 @@ fn the_deadline_that_was_due_first_decides() {
         let step = bench.tick(late);
         assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
         assert!(matches!(
-            bench.reserve(&child, Intent::Fetch).0,
+            bench.reserve(&child).0,
             Err(Unreserved::Rejected(_))
         ));
     }
@@ -933,7 +898,7 @@ fn an_older_time_from_a_caller_does_not_turn_the_clock_back() {
     // Another input moves time far past this job's deadline, and is the one
     // that finds it due.
     bench.now = MAX_UNDECIDED + Duration::from_secs(1);
-    let (answer, step) = bench.reserve(&txs[1], Intent::Fetch);
+    let (answer, step) = bench.reserve(&txs[1]);
     assert!(answer.is_ok());
     assert!(matches!(
         step.verdict(waiter),
@@ -1036,10 +1001,10 @@ fn a_block_expires_transactions_by_height() {
 /// The scope a rejection of `tx` is cached under, as its next reservation
 /// reports it.
 fn cached_scope(bench: &mut Bench, tx: &Tx) -> Option<RejectionScope> {
-    match bench.reserve(tx, Intent::Fetch).0 {
+    match bench.reserve(tx).0 {
         Err(Unreserved::Rejected(rejection)) => Some(rejection.scope),
-        Ok(grant) => {
-            bench.release(grant.id);
+        Ok(reservation) => {
+            bench.release(reservation);
             None
         }
         Err(refused) => {
@@ -1197,13 +1162,13 @@ fn turning_the_pool_off_answers_every_waiter() {
         }]
     );
     assert!(matches!(
-        bench.reserve(&txs[2], Intent::Fetch).0,
+        bench.reserve(&txs[2]).0,
         Err(Unreserved::Inactive)
     ));
 
     bench.activate();
     assert!(bench.machine.visible().is_empty());
-    assert!(bench.reserve(&txs[2], Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&txs[2]).0.is_ok());
 }
 
 // Reorgs and missed events: more of the pool being verified again.
@@ -1252,9 +1217,9 @@ fn revalidation_leaves_room_for_new_transactions() {
     let revalidations = started(&bench.reorg(&[]));
     assert_eq!(revalidations.len(), 4, "the revalidation share");
     assert_eq!(bench.machine.slots_in_use(), 4);
-    assert!(bench.reserve(&fresh[0], Intent::Fetch).0.is_ok());
+    assert!(bench.reserve(&fresh[0]).0.is_ok());
     assert!(matches!(
-        bench.reserve(&fresh[1], Intent::Fetch).0,
+        bench.reserve(&fresh[1]).0,
         Err(Unreserved::NoRoom)
     ));
 

@@ -25,7 +25,7 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
-    Charge, Generation, GenerationRead, Intent, LocalFault, ReservationId, Unreserved,
+    Charge, Generation, GenerationRead, LocalFault, ReservationId, Unreserved,
 };
 use zakura_rt::collections::HashSet;
 
@@ -109,7 +109,6 @@ fn universe(rng: &mut TestRng, runner: &mut TestRunner, size: usize) -> Vec<Tx> 
 struct Held {
     id: ReservationId,
     tx: usize,
-    wants_body: bool,
 }
 
 /// One run: the machine, the callers' side of it, and the chain.
@@ -256,28 +255,20 @@ impl Run {
         } else {
             pick(&mut self.rng, self.txs.len())
         };
-        let intent = if chance(&mut self.rng, 2) {
-            Intent::Fetch
-        } else {
-            Intent::Deliver
-        };
         let body = self.txs[tx].clone();
-        let (answer, step) = self.bench.reserve(&body, intent);
+        let (answer, step) = self.bench.reserve(&body);
         self.took("reserve", &step);
         // The answer was made after the step's deadlines were applied, so
         // the log as it stands now is the pool the answer saw.
         let pooled = self.bench.tracker.pooled(&body.id());
         match &answer {
-            Ok(grant) => {
+            Ok(reservation) => {
                 assert!(self.active, "a reservation from a pool that is off");
                 assert!(!pooled, "a reservation for a pooled transaction");
-                self.bench
-                    .tracker
-                    .saw(if grant.joined { "joined" } else { "reserved" });
+                self.bench.tracker.saw("reserved");
                 self.held.push(Held {
-                    id: grant.id,
+                    id: *reservation,
                     tx,
-                    wants_body: grant.wants_body,
                 });
             }
             Err(refused) => {
@@ -341,11 +332,7 @@ impl Run {
             held.tx
         };
         let body = self.txs[tx].clone();
-        let (_, step) = if held.wants_body {
-            self.bench.submit(held.id, &body)
-        } else {
-            self.bench.wait(held.id, &body)
-        };
+        let (_, step) = self.bench.submit(held.id, &body);
         self.took("submit", &step);
     }
 
@@ -702,7 +689,6 @@ fn random_runs_keep_the_invariants_and_drain() {
             "refused",
             "parked",
             "reserved",
-            "joined",
             "start",
             "start revalidation",
             "cancel",
@@ -716,7 +702,6 @@ fn random_runs_keep_the_invariants_and_drain() {
             "removed Deactivated",
             "verdict Admitted",
             "verdict Rejected",
-            "verdict LocalFault(NoBody)",
             "verdict LocalFault(PoolUnsettled)",
             "verdict LocalFault(VerifyTimeout)",
             "verdict LocalFault(WrongTransaction)",

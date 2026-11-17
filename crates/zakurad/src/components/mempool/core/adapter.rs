@@ -14,11 +14,6 @@
 //! body waiting for a slow core's reservation still counts against it. A verdict says what its body earned, and this applies it to the
 //! legacy peer that served the body. A v2 peer reaching the pool through here
 //! is counted and never charged, as today.
-//!
-//! One answer changes on purpose. A body whose id is already being verified
-//! joins that verification and gets its verdict at the second stage, up to
-//! the core's waiter limit, where today's pool refuses it at the first stage
-//! as already queued.
 
 use std::{
     collections::HashMap,
@@ -40,8 +35,8 @@ use zakura_chain::{
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
     port::{
-        AwaitOutputError, Charge, Intent, LocalFault, PoolHandle, PoolSnapshot, Reservation,
-        Unreserved, Verdict,
+        AwaitOutputError, Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved,
+        Verdict,
     },
     CreatedOrSpent, Gossip, MempoolDisabledError, QueueSource, Request, Response,
 };
@@ -614,7 +609,6 @@ enum Staged {
     /// it had one, is already dropped.
     Over {
         id: UnminedTxId,
-        intent: Intent,
         peer_full: bool,
         /// When its request's deadline ends the probe, if that comes before
         /// the probe's own [`MAX_LOOKUP_WAIT`].
@@ -627,7 +621,6 @@ impl Staged {
     fn new(shared: &Arc<Shared>, item: Gossip, from: &Option<QueueSource>) -> Self {
         let over = |item: Gossip, peer_full| Self::Over {
             id: item.id(),
-            intent: intent_of(&item),
             peer_full,
             by: None,
         };
@@ -664,14 +657,8 @@ impl Staged {
                 peer_slot,
                 deadline: own.min(deadline),
             },
-            Self::Over {
+            Self::Over { id, peer_full, by } => Self::Over {
                 id,
-                intent,
-                peer_full,
-                by,
-            } => Self::Over {
-                id,
-                intent,
                 peer_full,
                 by: Some(by.map_or(deadline, |own| own.min(deadline))),
             },
@@ -693,12 +680,7 @@ impl Staged {
                 peer_slot,
                 deadline,
             } => queue_held(shared, item, queue_slot, peer_slot, from, deadline).await,
-            Self::Over {
-                id,
-                intent,
-                peer_full,
-                by,
-            } => known_or_full(&shared, id, intent, peer_full, by).await,
+            Self::Over { id, peer_full, by } => known_or_full(&shared, id, peer_full, by).await,
         }
     }
 }
@@ -748,14 +730,6 @@ fn timed_out() -> BoxError {
     "timeout waiting for verification result".into()
 }
 
-/// What a reservation for `item` asks of the core.
-fn intent_of(item: &Gossip) -> Intent {
-    match item {
-        Gossip::Tx(_) => Intent::Deliver,
-        Gossip::Id(_) => Intent::Fetch,
-    }
-}
-
 /// Queues `item` under its slots: reserves its core slot and answers the
 /// first stage, and leaves a task that brings the body in and answers the
 /// second, all by `deadline`, which started when the item took its slots.
@@ -783,9 +757,9 @@ async fn queue_held(
     let (granted, grant) = oneshot::channel();
     tokio::spawn({
         let shared = shared.clone();
-        let (id, intent) = (item.id(), intent_of(&item));
+        let id = item.id();
         async move {
-            let answer = match shared.handle.reserve(id, intent).await {
+            let answer = match shared.handle.reserve(id).await {
                 Ok(reservation) => Ok(Handoff {
                     reservation: Some(reservation),
                     queue_slot: Some(queue_slot),
@@ -808,9 +782,6 @@ async fn queue_held(
         Ok(Err(_lost)) => return Err("the pool core's reservation task failed".into()),
         Err(_elapsed) => return Err(timed_out()),
     };
-    // A joined submission takes no core slot, but it still counts against
-    // its peer until its verdict, so one peer cannot hold more than its
-    // share of waiters.
     metrics::counter!("mempool.queued.transactions.total").increment(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
@@ -868,7 +839,6 @@ impl Drop for Handoff {
 async fn known_or_full(
     shared: &Shared,
     id: UnminedTxId,
-    intent: Intent,
     peer_full: bool,
     by: Option<tokio::time::Instant>,
 ) -> Result<Receiver, BoxError> {
@@ -881,13 +851,10 @@ async fn known_or_full(
     // A lookup, bounded as one, so a stalled core cannot gather these.
     let lookup_deadline = tokio::time::Instant::now() + MAX_LOOKUP_WAIT;
     let deadline = by.map_or(lookup_deadline, |by| by.min(lookup_deadline));
-    let Ok(reserved) = tokio::time::timeout_at(deadline, shared.handle.reserve(id, intent)).await
-    else {
+    let Ok(reserved) = tokio::time::timeout_at(deadline, shared.handle.reserve(id)).await else {
         return full();
     };
     match reserved {
-        // A body for an id another caller is bringing in would join it.
-        Ok(reservation) if reservation.joined() => Err(MempoolError::AlreadyQueued.into()),
         // A slot the core grants here is given back at once.
         Ok(_) | Err(Unreserved::NoRoom) => full(),
         Err(refused) => first_stage_refusal(refused),
@@ -1124,13 +1091,10 @@ async fn bring_in(
         .into());
     }
     // A v2 peer's body is not charged, as today, and nor is an exempt peer's.
-    // A joined caller whose copy the core did not need is not charged
-    // either: the verdict is about another caller's body.
     let supplier = match &from {
         Some(QueueSource::Zakura(_)) => None,
         _ => sender.and_then(|addr| shared.supplier(addr)),
-    }
-    .filter(|_| !reservation.joined() || reservation.wants_body());
+    };
     // The body goes to the core from a task of its own, which the deadline
     // does not cancel: a caller that times out first gets its answer and
     // frees its peer's slot, and the core still takes the body when it can,
@@ -1503,13 +1467,7 @@ mod tests {
         let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
             panic!("the fetch reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -1555,13 +1513,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -1620,13 +1572,7 @@ mod tests {
         core.shared
             .cooldowns
             .record_invalid_transaction(peer.ip(), Instant::now());
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
 
         let receiver = queued
             .await
@@ -1644,13 +1590,10 @@ mod tests {
     }
 
     /// What one push from [`peer`] costs that peer, when the core answers
-    /// its reservation with `joined` and `wants_body` and its submission
-    /// with a cooldown charge earned at `tip`, and `may_cool` says whether a
-    /// cooldown earned at a height may start. Returns whether the peer is
-    /// cooling down afterward.
+    /// its submission with a cooldown charge earned at `tip`, and `may_cool`
+    /// says whether a cooldown earned at a height may start. Returns whether
+    /// the peer is cooling down afterward.
     async fn cooled_by_one_push(
-        joined: bool,
-        wants_body: bool,
         tip: Height,
         may_cool: impl Fn(Height) -> bool + Send + Sync + 'static,
     ) -> bool {
@@ -1669,13 +1612,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            joined,
-            wants_body,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -1683,9 +1620,8 @@ mod tests {
         let (reservation, reply) = match inbox.next().await {
             Some(PoolCommand::Submit {
                 reservation, reply, ..
-            })
-            | Some(PoolCommand::Join { reservation, reply }) => (reservation, reply),
-            other => panic!("the push is submitted or joined: {other:?}"),
+            }) => (reservation, reply),
+            other => panic!("the push is submitted: {other:?}"),
         };
         let _accepted = reservation.accept();
         let _ = reply.send(Verdict::Rejected(Rejection {
@@ -1747,13 +1683,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -1909,23 +1839,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_cooldown_charge_cools_its_peer_only_at_the_tip_it_was_earned_at() {
         let still_at_100 = |height| height == Height(100);
-        assert!(cooled_by_one_push(false, true, Height(100), still_at_100).await);
+        assert!(cooled_by_one_push(Height(100), still_at_100).await);
         assert!(
-            !cooled_by_one_push(false, true, Height(99), still_at_100).await,
+            !cooled_by_one_push(Height(99), still_at_100).await,
             "the tip moved on after the failure was verified"
         );
         assert!(
-            !cooled_by_one_push(false, true, Height(100), |_| false).await,
+            !cooled_by_one_push(Height(100), |_| false).await,
             "the node is not current"
         );
-    }
-
-    /// A joined push whose copy the core did not need is not charged for the
-    /// verdict on another caller's body. One the core asked for its body is.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_joined_push_is_charged_only_for_its_own_body() {
-        assert!(!cooled_by_one_push(true, false, Height(100), |_| true).await);
-        assert!(cooled_by_one_push(true, true, Height(100), |_| true).await);
     }
 
     /// An oversized body from a cooling peer still reaches the core, which
@@ -1952,13 +1874,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let _receiver = queued
             .await
             .expect("the task does not panic")
@@ -2065,7 +1981,7 @@ mod tests {
             let answer = if within.contains(&tx_id) {
                 granted += 1;
                 let id = ReservationId(granted);
-                Ok(inbox.grant(id, tx_id, false, true, Default::default()))
+                Ok(inbox.grant(id, tx_id, Default::default()))
             } else {
                 Err(Unreserved::NoRoom)
             };
@@ -2471,7 +2387,7 @@ mod tests {
             };
             assert_ne!(tx_id, rejected_id, "a rejected id is not reserved");
             let id = ReservationId(u64::try_from(granted).expect("few"));
-            let _ = reply.send(Ok(inbox.grant(id, tx_id, false, true, Default::default())));
+            let _ = reply.send(Ok(inbox.grant(id, tx_id, Default::default())));
         }
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), call)
             .await
@@ -2720,7 +2636,7 @@ mod tests {
             let answer = if answered < MAX_INBOUND_CONCURRENCY {
                 Err(Unreserved::Pooled)
             } else {
-                Ok(inbox.grant(ReservationId(1), tx_id, false, true, Default::default()))
+                Ok(inbox.grant(ReservationId(1), tx_id, Default::default()))
             };
             let _ = reply.send(answer);
         }
@@ -2811,13 +2727,7 @@ mod tests {
         let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
             panic!("the fetch reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -2922,13 +2832,7 @@ mod tests {
         };
         // The first id's grant comes a second before the request's deadline.
         tokio::time::sleep(RATE_LIMIT_DELAY - std::time::Duration::from_secs(1)).await;
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            true,
-            false,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
             panic!("the second id reserves");
         };
@@ -3004,13 +2908,7 @@ mod tests {
             panic!("the body reserves first");
         };
         tokio::time::sleep(RATE_LIMIT_DELAY - MAX_LOOKUP_WAIT / 2).await;
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            true,
-            false,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         // The core never answers the ids' lookup.
         let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
             panic!("the ids are looked up");
@@ -3056,13 +2954,7 @@ mod tests {
         };
         // The first id's grant comes half a second before the deadline.
         tokio::time::sleep(RATE_LIMIT_DELAY - MAX_LOOKUP_WAIT / 2).await;
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            true,
-            false,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         // The core never answers the second id's probe.
         let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
             panic!("the second id is probed");
@@ -3126,13 +3018,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -3174,13 +3060,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -3233,13 +3113,7 @@ mod tests {
             1,
             "the outstanding reservation keeps its node-wide slot"
         );
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let Some(PoolCommand::FetchFailed(reservation)) = inbox.next().await else {
             panic!("the late grant is reported as failed");
         };
@@ -3290,13 +3164,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the push reserves first");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let receiver = queued
             .await
             .expect("the task does not panic")
@@ -3488,13 +3356,7 @@ mod tests {
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
             panic!("the advert reserves");
         };
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let Some(PoolCommand::Submit {
             reservation, reply, ..
         }) = inbox.next().await
@@ -3559,13 +3421,7 @@ mod tests {
             1,
             "the reservation keeps the item's node-wide slot"
         );
-        let _ = reply.send(Ok(inbox.grant(
-            ReservationId(1),
-            tx_id,
-            false,
-            true,
-            Default::default(),
-        )));
+        let _ = reply.send(Ok(inbox.grant(ReservationId(1), tx_id, Default::default())));
         let Some(PoolCommand::Submit {
             reservation, reply, ..
         }) = inbox.next().await

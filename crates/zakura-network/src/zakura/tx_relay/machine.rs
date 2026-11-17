@@ -1264,7 +1264,8 @@ impl RelayMachine {
         let machine = PeerMachine::connect(&mut self.shared, &self.pool, peer, exempt, self.now);
         let session = machine.session();
         self.machines.insert(session, machine);
-        self.wake(marks, BTreeSet::new());
+        let woken = self.owe(marks, Some(session));
+        self.wake(woken);
         session
     }
 
@@ -1356,7 +1357,6 @@ impl RelayMachine {
     /// routine's timer does.
     pub(crate) fn tick(&mut self, now: Time) {
         self.now = self.now.max(now);
-        let marks = Marks::of(&self.shared);
         let due = self
             .machines
             .iter()
@@ -1367,7 +1367,7 @@ impl RelayMachine {
             })
             .map(|(session, _)| *session)
             .collect();
-        self.wake(marks, due);
+        self.wake(due);
     }
 
     /// The pool answered the reserve call `call`.
@@ -1395,7 +1395,8 @@ impl RelayMachine {
                 }
             }
         }
-        self.wake(marks, BTreeSet::new());
+        let woken = self.owe(marks, owner);
+        self.wake(woken);
     }
 
     /// The pool's verdict on the submission `waiter`.
@@ -1417,7 +1418,8 @@ impl RelayMachine {
                     .ended_verdict(&self.pool, waiter, verdict, self.now);
             }
         }
-        self.wake(marks, BTreeSet::new());
+        let woken = self.owe(marks, owner);
+        self.wake(woken);
     }
 
     /// The pool cancelled the fetch under `reservation`: its token fired.
@@ -1440,30 +1442,33 @@ impl RelayMachine {
     /// restart does. Then every session with the go reads the batch.
     pub(crate) fn pool_changed(&mut self, changes: Vec<Change>, snapshot: SnapshotInfo, now: Time) {
         self.now = self.now.max(now);
-        let marks = Marks::of(&self.shared);
         let activated = !self.pool.live && snapshot.active;
+        let sessions: Vec<SessionId> = self.machines.keys().copied().collect();
         let mut woken = BTreeSet::new();
         if activated {
             self.pool.live = true;
             self.pool.tip = snapshot.tip;
-            for machine in self.machines.values_mut() {
-                if self
-                    .shared
-                    .reactor
-                    .has_go(machine.state.peer, machine.session())
-                {
+            for &session in &sessions {
+                let marks = Marks::of(&self.shared);
+                let machine = self.machines.get_mut(&session).expect("listed above");
+                if self.shared.reactor.has_go(machine.state.peer, session) {
                     machine.open(&mut self.shared, &self.pool);
                 }
+                woken.extend(self.owe(marks, Some(session)));
             }
-            woken = self.route();
         }
+        // The first routine to read the batch logs it, in its own step.
+        let mut marks = Marks::of(&self.shared);
         let batch = self
             .pool
             .publish(&mut self.shared, changes, snapshot, self.now);
-        for machine in self.machines.values_mut() {
+        for session in sessions {
+            let machine = self.machines.get_mut(&session).expect("listed above");
             machine.pool_changed(&mut self.shared, &self.pool, &batch, false, self.now);
+            woken.extend(self.owe(marks, Some(session)));
+            marks = Marks::of(&self.shared);
         }
-        self.wake(marks, woken);
+        self.wake(woken);
     }
 
     /// The IO lost its place in the pool's change log, so it hands over the
@@ -1476,13 +1481,16 @@ impl RelayMachine {
         now: Time,
     ) {
         self.now = self.now.max(now);
-        let marks = Marks::of(&self.shared);
         let activated = !self.pool.live && snapshot.active;
         self.pool.resync(visible, snapshot);
-        for machine in self.machines.values_mut() {
+        let mut woken = BTreeSet::new();
+        for session in self.machines.keys().copied().collect::<Vec<_>>() {
+            let marks = Marks::of(&self.shared);
+            let machine = self.machines.get_mut(&session).expect("listed above");
             machine.pool_resynced(&mut self.shared, &self.pool, activated, self.now);
+            woken.extend(self.owe(marks, Some(session)));
         }
-        self.wake(marks, BTreeSet::new());
+        self.wake(woken);
     }
 
     /// The core behind the port stopped for good, which the IO saw some
@@ -1490,10 +1498,9 @@ impl RelayMachine {
     /// nothing more. Every routine sees it.
     pub(crate) fn pool_stopped(&mut self, now: Time) {
         self.now = self.now.max(now);
-        let marks = Marks::of(&self.shared);
         self.shared.stopped = true;
         let every = self.machines.keys().copied().collect();
-        self.wake(marks, every);
+        self.wake(every);
     }
 
     /// The node's best tip moved, perhaps ahead of the pool's.
@@ -1582,36 +1589,47 @@ impl RelayMachine {
         if let Some(machine) = self.machines.get_mut(&session) {
             input(machine, &mut self.shared, &self.pool, self.now);
         }
-        self.wake(marks, BTreeSet::new());
+        let woken = self.owe(marks, Some(session));
+        self.wake(woken);
     }
 
-    /// Ticks the sessions owed a look, as their routines wake, until a pass
-    /// owes none: those in `woken`, each one an effect names, and every
-    /// session once the ring moved or claims opened up since `marks`. Then
+    /// Ticks the sessions in `woken` one at a time, as their routines wake,
+    /// adding the sessions each tick owes a look, until none is owed. Then
     /// forgets the sessions that ended. A session nothing woke does not
     /// step, so a missing wake shows up as work left undone.
-    fn wake(&mut self, mut marks: Marks, mut woken: BTreeSet<SessionId>) {
-        loop {
-            woken.extend(self.route());
-            if marks.wake_all(&self.shared) {
-                woken.extend(self.machines.keys().copied());
+    fn wake(&mut self, mut woken: BTreeSet<SessionId>) {
+        while let Some(session) = woken.pop_first() {
+            let marks = Marks::of(&self.shared);
+            if let Some(machine) = self.machines.get_mut(&session) {
+                machine.tick(&mut self.shared, &self.pool, self.now);
             }
-            marks = Marks::of(&self.shared);
-            if woken.is_empty() {
-                break;
-            }
-            for session in std::mem::take(&mut woken) {
-                if let Some(machine) = self.machines.get_mut(&session) {
-                    machine.tick(&mut self.shared, &self.pool, self.now);
-                }
-            }
+            woken.extend(self.owe(marks, Some(session)));
         }
         self.machines.retain(|_, machine| !machine.is_ended());
     }
 
-    /// Hands each effect on other sessions to the sessions it reaches, which
-    /// read their mail at once, as at their next step, until none is left.
-    /// Returns the sessions reached.
+    /// The sessions a step of `stepped` owes a look, as the service's
+    /// `route` wakes them: every session but `stepped` once the ring moved
+    /// or claims opened up since `marks`, since `stepped` saw that in its
+    /// own step, and each session an effect reaches.
+    fn owe(&mut self, marks: Marks, stepped: Option<SessionId>) -> BTreeSet<SessionId> {
+        let mut woken = BTreeSet::new();
+        if marks.wake_all(&self.shared) {
+            let others = self
+                .machines
+                .keys()
+                .filter(|session| Some(**session) != stepped);
+            woken.extend(others.copied());
+        }
+        woken.extend(self.route());
+        woken
+    }
+
+    /// Hands each effect on other sessions to the sessions it reaches, until
+    /// none is left. Each reads its mail at once, as at the start of its
+    /// next step. Returns the sessions reached, and every session once a
+    /// mail read moved the ring or opened up claims, as that step wakes
+    /// them.
     fn route(&mut self) -> BTreeSet<SessionId> {
         let mut reached = BTreeSet::new();
         while !self.shared.node.is_empty() {
@@ -1623,7 +1641,11 @@ impl RelayMachine {
                         continue;
                     };
                     if let Some(mail) = mail {
+                        let marks = Marks::of(&self.shared);
                         machine.read_mail(&mut self.shared, &self.pool, mail);
+                        if marks.wake_all(&self.shared) {
+                            reached.extend(self.machines.keys().copied());
+                        }
                     }
                     reached.insert(session);
                 }

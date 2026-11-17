@@ -54,6 +54,13 @@ type Verifier = Buffer<
 >;
 type Peers = BoxCloneSyncService<Request, Response, BoxError>;
 
+/// A relay request held before entering the real peer set.
+struct HeldRelay {
+    hash: zakura_chain::block::Hash,
+    release: oneshot::Sender<()>,
+    cancelled: oneshot::Receiver<()>,
+}
+
 /// Delays commit requests before passing them to the real consensus router.
 struct ValidationGate {
     held: watch::Sender<bool>,
@@ -93,6 +100,8 @@ struct Node {
     pending: PendingBlockRegistry,
     bans: zakura_network::MisbehaviorReporter,
     gate: ValidationGate,
+    hold_relay: watch::Sender<bool>,
+    held_relays: mpsc::UnboundedReceiver<HeldRelay>,
     tasks: Vec<AbortHandle>,
     _recent: RecentSyncLengths,
     _directory: tempfile::TempDir,
@@ -367,11 +376,39 @@ impl Node {
         .unwrap();
         let credentials = std::fs::read(directory.path().join(".cookie")).unwrap();
         let auth = basic_auth(&credentials);
+        let (hold_relay, relay_held) = watch::channel(false);
+        let (relay_tx, held_relays) = mpsc::unbounded_channel();
+        let relay_peers = peers.clone();
+        let relay_service = tower::service_fn(move |request: Request| {
+            let held = *relay_held.borrow();
+            let relay_tx = relay_tx.clone();
+            let peers = relay_peers.clone();
+            async move {
+                if let Request::AdvertiseMinedBlock(block) = &request {
+                    if held {
+                        let (release, released) = oneshot::channel();
+                        let (finished, cancelled) = oneshot::channel();
+                        relay_tx
+                            .send(HeldRelay {
+                                hash: block.hash,
+                                release,
+                                cancelled,
+                            })
+                            .unwrap();
+                        released.await?;
+                        let result = peers.oneshot(request).await;
+                        let _ = finished.send(());
+                        return result;
+                    }
+                }
+                peers.oneshot(request).await
+            }
+        });
         let gossip = tokio::spawn(gossip_best_tip_block_hashes(
             sync,
             tip.clone(),
             block_announcements,
-            peers.clone(),
+            relay_service,
             read_state,
             Some(early.receiver()),
         ));
@@ -401,6 +438,8 @@ impl Node {
                 entered: entered_rx,
                 finished: finished_rx,
             },
+            hold_relay,
+            held_relays,
             tasks: tasks.into_iter().chain(native_tasks).collect(),
             _recent: recent,
             _directory: directory,
@@ -451,6 +490,117 @@ fn faulty_body(block: &Block) -> Block {
         faulty.header.merkle_root
     );
     faulty
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_rejection_cancels_held_relay_and_withdraws_body_before_peer_delivery() {
+    let _init = zakura_test::init();
+    let mut relay = Node::new(None).await;
+    let mut receiver = Node::new(Some(relay.p2p)).await;
+    relay.connected().await;
+    receiver.connected().await;
+    let valid = relay.template().await;
+    let invalid = faulty_body(&valid);
+    relay.hold_relay.send_replace(true);
+    relay.gate.hold();
+    let submission = tokio::spawn(submit(
+        relay.rpc,
+        relay.auth.clone(),
+        invalid.zcash_serialize_to_vec().unwrap(),
+        true,
+    ));
+    assert_eq!(relay.gate.entered().await, invalid.hash());
+    let held = timeout(Duration::from_secs(20), relay.held_relays.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.hash, invalid.hash());
+    assert!(relay.pending.get(invalid.hash()).is_some());
+    assert!(!submission.is_finished());
+    relay.gate.release();
+    assert_eq!(submission.await.unwrap(), "rejected");
+    timeout(Duration::from_secs(20), held.cancelled)
+        .await
+        .unwrap()
+        .expect_err("rejection drops the relay future before the peer set receives it");
+    assert!(
+        held.release.send(()).is_err(),
+        "releasing the barrier cannot revive cancelled relay"
+    );
+    assert!(relay.pending.get(invalid.hash()).is_none());
+    let observer = zakura_network::connect_isolated_with_inbound(
+        &relay.network,
+        tokio::net::TcpStream::connect(relay.p2p).await.unwrap(),
+        "withdrawal observer".into(),
+        tower::service_fn(|_| async { Ok::<_, BoxError>(Response::Nil) }),
+    )
+    .await
+    .unwrap();
+    let observer = Buffer::new(observer, 4);
+    let missing = timeout(
+        Duration::from_secs(20),
+        observer.clone().oneshot(Request::BlocksByHash(
+            [invalid.hash()].into_iter().collect(),
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        missing
+            .downcast_ref::<zakura_network::SharedPeerError>()
+            .unwrap()
+            .not_found_class(),
+        Some(zakura_network::NotFoundClass::Response)
+    );
+    assert!(receiver.advertisements.try_recv().is_err());
+    assert_eq!(receiver.tip.best_tip_height(), Some(Height(0)));
+    assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
+    assert!(!receiver.bans.is_banned(relay.p2p.ip()));
+    timeout(
+        Duration::from_secs(20),
+        receiver.peers.clone().oneshot(Request::Peers),
+    )
+    .await
+    .unwrap()
+    .expect("withdrawing an unsent invalid block leaves the peer connected");
+
+    // Withdrawal must not suppress a corrected submission with the same header hash.
+    relay.hold_relay.send_replace(false);
+    relay.gate.hold();
+    let bytes = valid.zcash_serialize_to_vec().unwrap();
+    let retry = tokio::spawn(submit(relay.rpc, relay.auth.clone(), bytes.clone(), true));
+    assert_eq!(relay.gate.entered().await, valid.hash());
+    assert_eq!(
+        timeout(Duration::from_secs(20), receiver.advertisements.recv())
+            .await
+            .unwrap(),
+        Some(valid.hash())
+    );
+    timeout(Duration::from_secs(20), async {
+        while receiver.tip.best_tip_hash() != Some(valid.hash()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let zakura_state::Response::Block(Some(fetched)) = receiver
+        .state
+        .clone()
+        .oneshot(zakura_state::Request::Block(valid.hash().into()))
+        .await
+        .unwrap()
+    else {
+        panic!("the corrected body is fetched and committed by the receiver")
+    };
+    assert_eq!(fetched.zcash_serialize_to_vec().unwrap(), bytes);
+    assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
+    assert!(!retry.is_finished());
+    relay.gate.release();
+    assert_eq!(retry.await.unwrap(), "accepted");
+    assert_eq!(relay.tip.best_tip_hash(), Some(valid.hash()));
+    assert!(relay.pending.get(valid.hash()).is_none());
+    assert!(!receiver.bans.is_banned(relay.p2p.ip()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -540,7 +690,7 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
         Some(zakura_network::NotFoundClass::Response)
     );
     // A separate receiver has no previous notfound routing record for this hash.
-    let fresh_receiver = Node::new(Some(relay.p2p)).await;
+    let mut fresh_receiver = Node::new(Some(relay.p2p)).await;
     fresh_receiver.connected().await;
     relay.gate.hold();
     let retry = tokio::spawn(submit(
@@ -549,7 +699,16 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
         valid.zcash_serialize_to_vec().unwrap(),
         true,
     ));
-    relay.gate.entered().await;
+    assert_eq!(relay.gate.entered().await, valid.hash());
+    assert_eq!(
+        timeout(
+            Duration::from_secs(20),
+            fresh_receiver.advertisements.recv()
+        )
+        .await
+        .unwrap(),
+        Some(valid.hash())
+    );
     let progress_peer = zakura_network::connect_isolated_with_inbound(
         &fresh_receiver.network,
         tokio::net::TcpStream::connect(fresh_receiver.p2p)
@@ -575,15 +734,55 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     relay.gate.release();
     assert_eq!(retry.await.unwrap(), "accepted");
     assert_eq!(relay.tip.best_tip_hash(), Some(valid.hash()));
+    assert!(relay.pending.get(valid.hash()).is_none());
     let child = relay.template().await;
-    assert_eq!(
-        relay
-            .submit(child.zcash_serialize_to_vec().unwrap(), true)
-            .await,
-        "accepted"
-    );
+    assert_eq!(child.header.previous_block_hash, valid.hash());
+    let child_bytes = child.zcash_serialize_to_vec().unwrap();
+    relay.gate.hold();
+    let descendant = tokio::spawn(submit(
+        relay.rpc,
+        relay.auth.clone(),
+        child_bytes.clone(),
+        true,
+    ));
+    assert_eq!(relay.gate.entered().await, child.hash());
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let announced = fresh_receiver.advertisements.recv().await.unwrap();
+            if announced == child.hash() {
+                break;
+            }
+            // Committing the corrected parent can also publish its committed announcement.
+            assert_eq!(announced, valid.hash());
+        }
+    })
+    .await
+    .expect("the descendant is announced while its local validation is held");
+    timeout(Duration::from_secs(20), async {
+        while fresh_receiver.tip.best_tip_hash() != Some(child.hash()) {
+            progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let zakura_state::Response::Block(Some(fetched)) = fresh_receiver
+        .state
+        .clone()
+        .oneshot(zakura_state::Request::Block(child.hash().into()))
+        .await
+        .unwrap()
+    else {
+        panic!("the receiver committed the descendant fetched before relay validation")
+    };
+    assert_eq!(fetched.zcash_serialize_to_vec().unwrap(), child_bytes);
+    assert_eq!(relay.tip.best_tip_hash(), Some(valid.hash()));
+    assert!(!descendant.is_finished());
+    relay.gate.release();
+    assert_eq!(descendant.await.unwrap(), "accepted");
     assert_eq!(relay.tip.best_tip_height(), Some(Height(2)));
+    assert!(relay.pending.get(child.hash()).is_none());
     assert!(!fresh_receiver.bans.is_banned(relay.p2p.ip()));
+    progress_peer.clone().oneshot(Request::Peers).await.unwrap();
 }
 
 /// The documented pool workflow forwards the original byte buffer only on acceptance.

@@ -1373,7 +1373,9 @@ where
         let delivery = self
             .peer_tx
             .send_authorized(msg, || {
-                version >= minimum.current()
+                // Validation can withdraw the advert while writer readiness is pending.
+                result.as_ref().is_some_and(|result| !result.is_closed())
+                    && version >= minimum.current()
                     && !address.is_some_and(|addr| bans.contains(addr.ip()))
             })
             .await;
@@ -1382,7 +1384,7 @@ where
             Ok(false) => {
                 debug!(
                     ?hash,
-                    "not advertising block: peer authorization was revoked"
+                    "not advertising block: cancelled or peer authorization revoked"
                 );
                 if let Some(result) = result.take() {
                     let _ = result.send(Err(BlockAdvertError::AuthorizationRevoked));

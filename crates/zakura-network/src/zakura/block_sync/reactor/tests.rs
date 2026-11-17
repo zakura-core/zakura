@@ -2,8 +2,9 @@
 //!
 //! The proptest runs [`cancel_expired_floor_claims`] on a real registry, work
 //! queue, and queue-owned funding while sessions take work, get replaced, and tear
-//! down. An independent model tracks each height's holder, each peer's
-//! published claim, and the reserved bytes. It never calls the code it checks.
+//! down. A ledger tracks each height's holder, each peer's published claim,
+//! and the reserved bytes, and it picks the expired floor claims by scanning
+//! every claim. It never calls the code it checks.
 
 use std::{collections::BTreeMap, time::Duration};
 

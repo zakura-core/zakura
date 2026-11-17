@@ -755,7 +755,7 @@ mod tests {
         .expect("the parent history tree builds");
         let witness_roots =
             roots_from_block(&witness_block, empty_sapling_root, empty_orchard_root);
-        let mut witness_header = *witness_block.header;
+        let mut witness_header = witness_block.header.as_ref().clone();
         witness_header.commitment_bytes =
             <[u8; 32]>::from(ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &parent_tree.hash().expect("the parent tree has a root"),

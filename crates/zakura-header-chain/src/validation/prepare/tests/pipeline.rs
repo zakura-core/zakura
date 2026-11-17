@@ -50,12 +50,12 @@ fn fixture() -> (HeaderRules, ValidationLease, Arc<block::Header>) {
 }
 
 fn child(parent: Frontier, template: &block::Header, seconds: i64) -> Arc<block::Header> {
-    Arc::new(block::Header {
+    Arc::new(block::Header::new(zakura_chain::block::HeaderFields {
         previous_block_hash: parent.hash,
         time: template.time + Duration::seconds(seconds),
         nonce: [u8::try_from(seconds).unwrap_or(u8::MAX); 32].into(),
-        ..*template
-    })
+        ..(template).fields()
+    }))
 }
 
 #[test]

@@ -212,7 +212,7 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
         let time =
             chrono::DateTime::from_timestamp(1_700_000_000_i64 + i64::from(height.0) * 150, 0)
                 .expect("the deterministic timestamp is in range");
-        let header = block::Header {
+        let header = block::Header::new(zakura_chain::block::HeaderFields {
             version: 4,
             previous_block_hash: previous_hash,
             merkle_root,
@@ -221,7 +221,7 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
             difficulty_threshold: network.target_difficulty_limit().to_compact(),
             nonce: HexDebug([0; 32]),
             solution: equihash::Solution::for_proposal(),
-        };
+        });
         let mut block = Arc::new(Block {
             header: Arc::new(header),
             transactions,

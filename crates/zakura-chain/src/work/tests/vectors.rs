@@ -204,7 +204,7 @@ fn regtest_solution_is_rejected_off_regtest() {
 
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
 
     // A short Regtest-shaped solution, as a malicious peer would send it.
     header.solution = Solution::Regtest([0; REGTEST_SOLUTION_SIZE]);

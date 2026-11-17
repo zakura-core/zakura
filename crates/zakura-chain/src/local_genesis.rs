@@ -305,7 +305,7 @@ fn build_block(
 
     let time = chrono::DateTime::from_timestamp(timestamp, 0).ok_or("invalid genesis timestamp")?;
 
-    let header = Header {
+    let header = Header::new(crate::block::HeaderFields {
         version: 4,
         previous_block_hash: previous_hash,
         merkle_root,
@@ -314,7 +314,7 @@ fn build_block(
         difficulty_threshold: difficulty,
         nonce: HexDebug([0; 32]),
         solution: crate::work::equihash::Solution::for_proposal(),
-    };
+    });
 
     let header = if disable_pow {
         header

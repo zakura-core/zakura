@@ -1135,10 +1135,10 @@ fn audits_each_normative_invariant() {
     let mut store = base.clone();
     let missing = block::Hash([9; 32]);
     store.nodes[1].parent_hash = missing;
-    store.nodes[1].header = Arc::new(block::Header {
+    store.nodes[1].header = Arc::new(block::Header::new(zakura_chain::block::HeaderFields {
         previous_block_hash: missing,
-        ..*store.nodes[1].header
-    });
+        ..(store.nodes[1].header).fields()
+    }));
     store.nodes[1].hash = store.nodes[1].header.hash();
     assert!(violations(&store, &config)
         .iter()

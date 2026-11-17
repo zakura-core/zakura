@@ -5,8 +5,7 @@ use hex::{FromHex, ToHex};
 use serde::{Deserialize, Serialize};
 
 use crate::serialization::{
-    sha256d, BytesInDisplayOrder, ReadZcashExt, SerializationError, ZcashDeserialize,
-    ZcashSerialize,
+    BytesInDisplayOrder, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
 };
 
 use super::Header;
@@ -88,11 +87,7 @@ impl From<[u8; 32]> for Hash {
 
 impl<'a> From<&'a Header> for Hash {
     fn from(block_header: &'a Header) -> Self {
-        let mut hash_writer = sha256d::Writer::default();
-        block_header
-            .zcash_serialize(&mut hash_writer)
-            .expect("Sha256dWriter is infallible");
-        Self(hash_writer.finish())
+        block_header.hash()
     }
 }
 

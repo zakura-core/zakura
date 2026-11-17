@@ -220,17 +220,18 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns an admitted block or a committed block from any active chain.
+/// Returns a committed block from any active chain, or else a pending block.
 ///
 /// Peers can request a hash on any active chain, even when this node does not consider it best.
+/// A pending body can be unvalidated and differ from a committed block with the same header
+/// hash, so committed state wins. A registration is removed only after its block commits, so
+/// a pending miss followed by state is never a gap.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
 ) -> Result<Option<ServedBlock>, zn::BoxError> {
-    if let Some(block) = pending_blocks.get_for_peer(hash) {
-        return Ok(Some(block));
-    }
+    let pending = pending_blocks.get_for_peer(hash);
 
     let response = state
         .ready()
@@ -240,7 +241,7 @@ async fn block_by_hash_or_pending(
 
     match response {
         zs::Response::Block(Some(block)) => Ok(Some(block.into())),
-        zs::Response::Block(None) => Ok(None),
+        zs::Response::Block(None) => Ok(pending),
         _ => unreachable!("wrong response from state"),
     }
 }

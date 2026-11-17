@@ -1535,3 +1535,192 @@ async fn trusted_block_is_relayed_before_real_validation_and_commits_afterward()
     .unwrap()
     .expect("the downstream peer connection remains usable");
 }
+
+/// Writes a complete trusted submission and returns the open socket without reading a response.
+async fn raw_post(address: SocketAddr, auth: &str, bytes: &[u8]) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let head = format!(
+        "POST /submittrustedblock HTTP/1.1\r\nHost: {address}\r\nAuthorization: {auth}\r\n\
+         Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        bytes.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(bytes).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+}
+
+/// Requests `hash` from `node` over a fresh legacy peer connection and returns the served bytes.
+async fn fetch_from_peer(node: &Node, hash: zakura_chain::block::Hash) -> Option<Vec<u8>> {
+    let peer = zakura_network::connect_isolated_with_inbound(
+        &node.network,
+        tokio::net::TcpStream::connect(node.p2p).await.unwrap(),
+        "block fetch observer".into(),
+        tower::service_fn(|_| async { Ok::<_, BoxError>(Response::Nil) }),
+    )
+    .await
+    .unwrap();
+    // The last buffer handle owns the connection, so it must outlive the response.
+    let peer = Buffer::new(peer, 4);
+    let response = timeout(
+        Duration::from_secs(20),
+        peer.clone()
+            .oneshot(Request::BlocksByHash([hash].into_iter().collect())),
+    )
+    .await
+    .unwrap();
+    match response {
+        Ok(Response::Blocks(blocks)) => match blocks.into_iter().next() {
+            Some(zakura_network::InventoryResponse::Available((block, _))) => {
+                Some(block.zcash_serialize_to_vec().unwrap())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Hyper drops a connection's future when its client disconnects. The node had already received
+/// the whole body here, so the parent lookup, validation and commit must continue without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_submission_survives_client_disconnect_during_parent_lookup() {
+    let _init = zakura_test::init();
+    let mut relay = Node::new(None).await;
+    let block = relay.template().await;
+    let bytes = block.zcash_serialize_to_vec().unwrap();
+
+    relay.hold_parent_lookup.send_replace(true);
+    let client = raw_post(relay.rpc, &relay.auth, &bytes).await;
+    timeout(Duration::from_secs(20), relay.parent_lookups.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(client);
+
+    assert_eq!(relay.gate.entered().await, block.hash());
+    timeout(Duration::from_secs(20), async {
+        while relay.tip.best_tip_hash() != Some(block.hash()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a fully received submission commits after its client disconnects");
+    timeout(Duration::from_secs(20), async {
+        while relay.pending.get(block.hash()).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the committed submission releases its pending body");
+}
+
+/// A committed hash is answered before registration. Holding validation proves that no
+/// lifecycle started, so no body was registered and no early relay could be requested.
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_resubmission_of_committed_hash_returns_duplicate_before_registration() {
+    let _init = zakura_test::init();
+    let mut relay = Node::new(None).await;
+    let valid = relay.template().await;
+    let valid_bytes = valid.zcash_serialize_to_vec().unwrap();
+    assert_eq!(relay.submit(valid_bytes.clone(), false).await, "accepted");
+    assert_eq!(relay.gate.entered().await, valid.hash());
+
+    relay.gate.hold();
+    for bytes in [
+        valid_bytes.clone(),
+        faulty_body(&valid).zcash_serialize_to_vec().unwrap(),
+    ] {
+        let outcome = tokio::select! {
+            outcome = submit(relay.rpc, relay.auth.clone(), bytes, true) => outcome,
+            hash = relay.gate.entered() => {
+                panic!("validation, registration and early relay started for committed {hash:?}")
+            }
+        };
+        assert_eq!(outcome, "duplicate");
+        assert!(relay.pending.get(valid.hash()).is_none());
+        assert!(relay.gate.entered.try_recv().is_err());
+    }
+    relay.gate.release();
+    assert_eq!(
+        fetch_from_peer(&relay, valid.hash()).await,
+        Some(valid_bytes)
+    );
+}
+
+/// The block commits through another path after a trusted submission of the same hash passed
+/// the duplicate pre-check and registered its body. Peers must receive the committed block, and
+/// the duplicate verdict withdraws only a body that differs from it.
+async fn duplicate_after_registration(faulty: bool) {
+    let _init = zakura_test::init();
+    let mut relay = Node::new(None).await;
+    let valid = relay.template().await;
+    let valid_bytes = valid.zcash_serialize_to_vec().unwrap();
+    let submitted = if faulty {
+        faulty_body(&valid)
+    } else {
+        valid.clone()
+    };
+    relay.hold_relay.send_replace(true);
+    relay.gate.hold();
+    let submission = tokio::spawn(submit(
+        relay.rpc,
+        relay.auth.clone(),
+        submitted.zcash_serialize_to_vec().unwrap(),
+        true,
+    ));
+    assert_eq!(relay.gate.entered().await, valid.hash());
+    let early = timeout(Duration::from_secs(20), relay.held_relays.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(early.hash, valid.hash());
+    // A peer response that fetched the temporary body before the block committed.
+    let retained = relay
+        .pending
+        .get_for_peer(valid.hash())
+        .unwrap()
+        .pending_send
+        .unwrap();
+
+    // Commit the valid block as gossip would, bypassing the held verifier.
+    relay
+        .state
+        .clone()
+        .oneshot(zakura_state::Request::CommitSemanticallyVerifiedBlock(
+            Arc::new(valid.clone()).into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(relay.tip.best_tip_hash(), Some(valid.hash()));
+    assert!(relay.pending.get(valid.hash()).is_some());
+    assert_eq!(
+        fetch_from_peer(&relay, valid.hash()).await,
+        Some(valid_bytes.clone()),
+        "a committed block is served in place of the pending body"
+    );
+
+    relay.gate.release();
+    assert_eq!(submission.await.unwrap(), "duplicate");
+    assert!(relay.pending.get(valid.hash()).is_none());
+    assert_eq!(
+        retained.try_start_write(|| ()).is_none(),
+        faulty,
+        "only a body that differs from the committed block is withdrawn"
+    );
+    let _ = early.release.send(());
+    assert_eq!(
+        fetch_from_peer(&relay, valid.hash()).await,
+        Some(valid_bytes)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn faulty_duplicate_is_withdrawn_and_never_shadows_the_committed_block() {
+    duplicate_after_registration(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_duplicate_keeps_in_flight_peer_responses() {
+    duplicate_after_registration(false).await;
+}

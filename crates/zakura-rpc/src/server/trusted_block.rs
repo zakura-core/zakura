@@ -1,17 +1,11 @@
 //! Binary block submission using the primary HTTP listener's authentication policy.
 
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use http_body_util::{BodyExt, Limited};
 use hyper::{body::Bytes, header, Method, StatusCode};
-use tokio::sync::Semaphore;
-use tower::{BoxError, Service};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower::{BoxError, Service, ServiceExt};
 
 use super::{
     cookie::Cookie,
@@ -33,6 +27,12 @@ pub(super) type SubmissionFuture =
 pub(super) type Submit = Arc<dyn Fn(Bytes) -> SubmissionFuture + Send + Sync>;
 
 /// Routes only the binary endpoint; all other traffic retains its JSON middleware.
+///
+/// This is the hyper-level service of both RPC listeners, not a tower service, because hyper
+/// calls it synchronously when it parses a request head. Hyper may read the whole body and fail
+/// the connection on the client's close before it first polls the returned future, so the
+/// trusted route must take ownership of the body inside `call`. JSON requests keep tower's lazy
+/// readiness and call, exactly as `hyper_util::service::TowerToHyperService` does.
 #[derive(Clone)]
 pub(super) struct TrustedBlockHttpService<S> {
     json: S,
@@ -52,7 +52,7 @@ impl<S> TrustedBlockHttpService<S> {
     }
 }
 
-impl<S, B> Service<HttpRequest<B>> for TrustedBlockHttpService<S>
+impl<S, B> hyper::service::Service<HttpRequest<B>> for TrustedBlockHttpService<S>
 where
     S: Service<HttpRequest<B>, Response = HttpResponse> + Clone + Send + 'static,
     S::Error: Into<BoxError>,
@@ -64,37 +64,49 @@ where
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, BoxError>> + Send>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
-        self.json.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+    fn call(&self, request: HttpRequest<B>) -> Self::Future {
         if request.uri().path() != "/submittrustedblock" {
-            let future = self.json.call(request);
-            return Box::pin(async move { future.await.map_err(Into::into) });
+            let json = self.json.clone().oneshot(request);
+            return Box::pin(async move { json.await.map_err(Into::into) });
         }
-        let this = self.clone();
-        Box::pin(async move { Ok(this.answer(request).await) })
+        let (submit, slot) = match self.admit(&request) {
+            Ok(admitted) => admitted,
+            Err(rejection) => return Box::pin(async move { Ok(rejection) }),
+        };
+        // From here the body belongs to a task the connection cannot cancel. That task can still
+        // read every frame hyper queued before it failed the connection on the client's close.
+        // A body that ends abnormally reports an error, so it is never mistaken for a complete
+        // one. The task keeps the slot until the submission finishes.
+        let submission = tokio::spawn(receive_and_submit(submit, slot, request.into_body()));
+        // The task is never aborted, so a join error is a panic or runtime shutdown.
+        Box::pin(async move {
+            Ok(submission
+                .await
+                .unwrap_or_else(|_| response(StatusCode::OK, "inconclusive")))
+        })
     }
 }
 
 impl<S> TrustedBlockHttpService<S> {
-    async fn answer<B>(self, request: HttpRequest<B>) -> HttpResponse
-    where
-        B: hyper::body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<BoxError>,
-    {
+    /// Applies every check that needs no body, then reserves a body slot.
+    fn admit<B>(
+        &self,
+        request: &HttpRequest<B>,
+    ) -> Result<(Submit, OwnedSemaphorePermit), HttpResponse> {
         let Some(submit) = &self.submit else {
-            return response(StatusCode::NOT_FOUND, "disabled");
+            return Err(response(StatusCode::NOT_FOUND, "disabled"));
         };
         if request.headers().contains_key(header::ORIGIN) {
-            return response(StatusCode::FORBIDDEN, "browser requests are not accepted");
+            return Err(response(
+                StatusCode::FORBIDDEN,
+                "browser requests are not accepted",
+            ));
         }
         if !self.credentials.check_credentials(request.headers()) {
-            return response(StatusCode::UNAUTHORIZED, "unauthenticated");
+            return Err(response(StatusCode::UNAUTHORIZED, "unauthenticated"));
         }
         if request.method() != Method::POST {
-            return response(StatusCode::METHOD_NOT_ALLOWED, "POST required");
+            return Err(response(StatusCode::METHOD_NOT_ALLOWED, "POST required"));
         }
         if request
             .headers()
@@ -102,16 +114,17 @@ impl<S> TrustedBlockHttpService<S> {
             .and_then(|v| v.to_str().ok())
             != Some("application/octet-stream")
         {
-            return response(
+            return Err(response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "application/octet-stream required",
-            );
+            ));
         }
-        let Ok(_slot) = self.body_slots.clone().try_acquire_owned() else {
-            return response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted");
+        let Ok(slot) = self.body_slots.clone().try_acquire_owned() else {
+            return Err(response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity exhausted",
+            ));
         };
-        let limit = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
-            .expect("block limit fits supported platforms");
         if request
             .headers()
             .get(header::CONTENT_LENGTH)
@@ -119,14 +132,25 @@ impl<S> TrustedBlockHttpService<S> {
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|length| length > zakura_chain::block::MAX_BLOCK_BYTES)
         {
-            return response(StatusCode::PAYLOAD_TOO_LARGE, "block too large");
+            return Err(response(StatusCode::PAYLOAD_TOO_LARGE, "block too large"));
         }
-        let received_at = std::time::Instant::now();
-        let body = match tokio::time::timeout(
-            Duration::from_secs(30),
-            Limited::new(request.into_body(), limit).collect(),
-        )
-        .await
+        Ok((submit.clone(), slot))
+    }
+}
+
+/// Receives the body within its deadline and size limit, then submits it. `_slot` bounds the
+/// buffered body for the whole submission.
+async fn receive_and_submit<B>(submit: Submit, _slot: OwnedSemaphorePermit, body: B) -> HttpResponse
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    let limit = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
+        .expect("block limit fits supported platforms");
+    let received_at = std::time::Instant::now();
+    let body =
+        match tokio::time::timeout(Duration::from_secs(30), Limited::new(body, limit).collect())
+            .await
         {
             Err(_) => return response(StatusCode::REQUEST_TIMEOUT, "body receipt timed out"),
             Ok(Err(error)) => {
@@ -138,19 +162,17 @@ impl<S> TrustedBlockHttpService<S> {
             }
             Ok(Ok(body)) => body.to_bytes(),
         };
-        metrics::histogram!("rpc.trusted_submission.receipt.duration_seconds")
-            .record(received_at.elapsed().as_secs_f64());
-        metrics::counter!("rpc.trusted_submission.received").increment(1);
-        let result = match submit(body).await {
-            Err(TrustedSubmissionError::Malformed) => {
-                return response(StatusCode::BAD_REQUEST, "malformed block")
-            }
-            Err(TrustedSubmissionError::Capacity) => {
-                return response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted")
-            }
-            Ok(result) => result,
-        };
-        response(StatusCode::OK, outcome(&result))
+    metrics::histogram!("rpc.trusted_submission.receipt.duration_seconds")
+        .record(received_at.elapsed().as_secs_f64());
+    metrics::counter!("rpc.trusted_submission.received").increment(1);
+    match submit(body).await {
+        Err(TrustedSubmissionError::Malformed) => {
+            response(StatusCode::BAD_REQUEST, "malformed block")
+        }
+        Err(TrustedSubmissionError::Capacity) => {
+            response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted")
+        }
+        Ok(result) => response(StatusCode::OK, outcome(&result)),
     }
 }
 

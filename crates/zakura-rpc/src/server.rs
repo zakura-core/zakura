@@ -22,7 +22,6 @@ use hyper::{
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
-    service::TowerToHyperService,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -460,8 +459,11 @@ fn stop_channel() -> (StopHandle, ServerHandle) {
 /// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
 async fn run_listener<S>(listener: TcpListener, service: S)
 where
-    S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
-        + Clone
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<HttpBody>,
+            Error = tower::BoxError,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
@@ -483,23 +485,22 @@ where
             continue;
         }
 
+        // Hyper calls this when it parses a request head, so the first request counts as
+        // received at that point rather than when its response future is first polled.
         let request_received = Arc::new(Notify::new());
         let service = {
             let request_received = request_received.clone();
             let service = service.clone();
-            tower::service_fn(move |request| {
+            hyper::service::service_fn(move |request| {
                 request_received.notify_one();
-                tower::ServiceExt::oneshot(service.clone(), request)
+                hyper::service::Service::call(&service, request)
             })
         };
 
         let stopped = stop_handle.clone().shutdown();
         tokio::spawn(async move {
             let builder = auto::Builder::new(TokioExecutor::new());
-            let connection = builder.serve_connection_with_upgrades(
-                TokioIo::new(socket),
-                TowerToHyperService::new(service),
-            );
+            let connection = builder.serve_connection_with_upgrades(TokioIo::new(socket), service);
             tokio::pin!(connection, stopped);
 
             let result = tokio::select! {
@@ -643,7 +644,7 @@ async fn serve_tls_connection<S, B>(
     header_read_timeout: Duration,
 ) -> Result<(), tower::BoxError>
 where
-    S: tower::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
     S::Future: Send,
     S::Error: Into<tower::BoxError>,
     B: Body<Data = Bytes> + Send + 'static,
@@ -652,7 +653,7 @@ where
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
-        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+        .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection, stopped);
 
     tokio::select! {

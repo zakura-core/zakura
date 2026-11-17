@@ -68,25 +68,47 @@ Zcash binary serialization. Do not hex-encode it or wrap it in JSON. The maximum
 body size is the network block-size limit; trailing bytes are rejected. Body
 receipt has a 30-second deadline. Pending bodies and submissions are bounded.
 
-When the relay confirms the block's parent within a 100-millisecond state lookup,
-relay starts without waiting for validation. A failed or timed-out lookup skips
-early relay; the block still goes through normal validation and is announced
-only after it commits. A block whose parent is still missing returns
-`inconclusive`. In both cases the HTTP response waits for the local result.
+Before registering the block, the relay runs two state lookups concurrently,
+sharing one 100-millisecond deadline: one for the block's parent and one for the
+block's own header hash. The hash lookup is the same one the verifier uses for its
+duplicate check.
+
+- If the hash is already committed to any active chain, the endpoint returns
+  `duplicate` at once. It does not register the body, relay it, or validate it.
+- If the parent is confirmed and the hash is confirmed new, relay starts without
+  waiting for validation.
+- Otherwise the block is validated without early relay and is announced only
+  after it commits. This covers an unconfirmed parent, a hash that another path
+  is already committing, and a lookup that fails or misses the deadline. The
+  verifier still runs its own duplicate check.
+
+A block whose parent is still missing returns `inconclusive`. In every case
+except an already committed hash, the HTTP response waits for the local result.
 HTTP 200 has a plain-text body:
 
 | Result | Meaning |
 | --- | --- |
 | `accepted` | Locally validated and committed, possibly to a side chain. |
 | `rejected` | Local validation rejected the block. |
-| `duplicate` | The node already committed the block identified by this header. |
+| `duplicate` | The node already committed a block with this header hash. This does not say whether the submitted body matches it. |
 | `duplicate-inconclusive` | A submission with this header hash is still in flight. |
 | `inconclusive` | Acceptance could not be established; the caller may retry. |
 
 Acceptance does not certify best-chain selection or delivery to any peer. The
 eight-minute validation deadline returns `inconclusive` and withdraws temporary
-relay storage; it does not roll back a state operation already handed off. An
-HTTP disconnect does not abandon local validation.
+relay storage; it does not roll back a state operation already handed off.
+
+Once an authenticated request passes its header checks and takes a receipt slot,
+which happens as soon as the HTTP server parses the request head, its body is
+received and submitted by a task that the HTTP connection does not own. A client
+disconnect from then on does not abandon the submission: receipt, decoding, the
+state lookups, validation and relay continue without the client. This includes a
+client that writes the whole request and closes the connection at once. The task
+keeps its slot until the submission finishes, so at most 16 bodies are buffered
+whether or not their clients stay connected. A body that ends early, because the
+client disconnected mid-body or the 30-second receipt deadline passed, is never
+submitted and frees its slot. A client that disconnects gets no response, so it
+cannot learn the outcome.
 
 Transport errors use HTTP 400 for malformed blocks, 401 for missing or invalid
 credentials when cookie authentication is enabled, 403 for browser requests,
@@ -121,16 +143,47 @@ validation fails.
 
 An invalid submission does not disable early relay for later submissions.
 
-A block that was relayed early but not accepted, because it was `rejected` or
-its validation timed out, has a known side effect. Peers that request it after
-the relay withdraws it get "not found" and treat the relay as missing that block
-hash for up to about two minutes. If the same header hash is later submitted with
-corrected bytes, those peers ignore this relay's new announcement until the mark
-expires; they can still fetch the block from other peers that announce it. This
-only happens when the bytes sent to the relay differ from the bytes validated
-upstream, which the recommended sequence prevents.
+A pending body is never served in place of a committed block. When a peer asks for
+a hash, the relay serves the committed block if state has one, and the pending body
+only otherwise.
 
-Monitor `rpc.trusted_submission.*` metrics and rejection logs. Upstream
+The duplicate lookup cannot close every race: the same block can commit through
+another path, for example gossip from the GBT node, after the lookup and before the
+trusted submission's own validation. Its validation then reports a duplicate. A
+header hash does not authenticate the transactions, so the relay compares the
+submitted block with the committed one:
+
+- If they are equal, peers receive the same bytes from either, so queued
+  announcements and in-flight body responses continue.
+- If they differ, the pending body is withdrawn like a rejected one.
+- State reports the duplicate as soon as the other copy is in its write
+  channel, usually before that write finishes. The relay therefore keeps
+  reading the committed block every 50 milliseconds for up to five seconds. If
+  it does not appear by then, for example because the other copy was rejected,
+  the bodies cannot be compared and the pending body is withdrawn too. If it did
+  match, peers whose body responses were withdrawn get "not found" for a block
+  the relay may later commit, with the side effect described below.
+
+Until that comparison finishes, which can take up to five seconds, the HTTP
+response and one pending-body slot are held, and body responses that fetched the
+pending body can still start writing it, as they could before any rejection.
+
+A block that was relayed early but not accepted, because it was `rejected`, its
+validation timed out, or its duplicate body was withdrawn, has a known side
+effect. Peers that request it after the relay withdraws it get "not found" and
+treat the relay as missing that block hash for up to about two minutes. If the
+same header hash is later submitted with corrected bytes, those peers ignore this
+relay's new announcement until the mark expires; they can still fetch the block
+from other peers that announce it. The recommended sequence avoids this except
+when the committed block cannot be read to settle a duplicate.
+
+Monitor `rpc.trusted_submission.*` metrics and rejection logs.
+`rpc.trusted_submission.relay_requested_without_commit`, labelled by outcome,
+counts every submission whose early relay was requested but that this submission
+did not commit, with a warning log. `rpc.trusted_submission.duplicate_body`
+counts duplicate verdicts by whether the body was `identical`, `differs` or
+`unconfirmed`, and `rpc.trusted_submission.early_relay_skipped` counts skipped
+early relay by reason. Upstream
 validation reduces ban risk but cannot eliminate validator bugs or consensus
 disagreements. Legacy peer penalties, v2 compatibility gossip, and native v2
 block-sync policies are distinct; the endpoint does not change any of them.

@@ -42,11 +42,8 @@ async fn peer_block_lookup_queries_all_active_chains() {
 }
 
 #[tokio::test]
-async fn peer_block_lookup_serves_admitted_block_before_state() {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+async fn peer_block_lookup_serves_pending_block_only_when_state_lacks_it() {
+    use std::sync::Arc;
 
     use tower::{buffer::Buffer, util::BoxService};
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
@@ -56,11 +53,9 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
         .zcash_deserialize_into()
         .expect("the genesis block is valid");
     let hash = block.hash();
-    let state_called = Arc::new(AtomicBool::new(false));
-    let state_called_for_service = state_called.clone();
-    let state = tower::service_fn(move |_request: zakura_state::Request| {
-        state_called_for_service.store(true, Ordering::SeqCst);
-        async { Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(None)) }
+    let state = tower::service_fn(move |request: zakura_state::Request| async move {
+        assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
+        Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(None))
     });
     let state = Buffer::new(BoxService::new(state), 1);
     let pending_blocks = PendingBlockRegistry::default();
@@ -79,7 +74,48 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
     assert!(permit
         .try_start_write(|| panic!("withdrawal survives the peer lookup"))
         .is_none());
-    assert!(!state_called.load(Ordering::SeqCst));
+}
+
+/// A pending body is unvalidated and can carry different transactions under a committed header
+/// hash, so peers always receive the committed block when state has one.
+#[tokio::test]
+async fn peer_block_lookup_prefers_a_committed_block_over_a_pending_body() {
+    use std::sync::Arc;
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_rpc::PendingBlockRegistry;
+
+    let committed: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = committed.hash();
+    let mut pending_body = (*committed).clone();
+    pending_body.transactions.clear();
+    assert_eq!(pending_body.hash(), hash);
+    let state_block = committed.clone();
+    let state = tower::service_fn(move |request: zakura_state::Request| {
+        let state_block = state_block.clone();
+        async move {
+            assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(state_block.into())))
+        }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+    let pending_blocks = PendingBlockRegistry::default();
+    let _registration = pending_blocks
+        .insert(Arc::new(pending_body))
+        .expect("the registry accepts the pending body");
+
+    let served = block_by_hash_or_pending(state, pending_blocks, hash)
+        .await
+        .expect("the state lookup succeeds")
+        .unwrap();
+    assert_eq!(served, committed.into());
+    assert!(
+        served.pending_send.is_none(),
+        "a committed block is served from state"
+    );
 }
 
 /// Checks that a zcashd-compat sidecar gets every block it requests, while other peers'

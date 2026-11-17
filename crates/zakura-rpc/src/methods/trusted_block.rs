@@ -3,10 +3,26 @@
 use super::*;
 use crate::server::trusted_block::TrustedSubmissionError;
 
-use super::submission_lifecycle::{RelayPolicy, Submission, VerificationOutcome};
+use super::submission_lifecycle::{
+    committed_block_lookup, DuplicateBody, RelayPolicy, Submission, VerificationOutcome,
+};
 
-/// Parent discovery only enables early relay; busy state readers must not delay validation.
-const PARENT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(100);
+/// The shared deadline of the concurrent parent and duplicate lookups. Both only gate early
+/// relay or short-circuit a known duplicate; busy state services must not delay validation.
+const STATE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// What state reported for the submitted header hash before registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmittedHash {
+    /// Not known to state.
+    New,
+    /// Committed to the finalized state or a non-finalized chain.
+    Committed,
+    /// Sent for commit by another path, but not committed yet.
+    InFlight,
+    /// The lookup failed or missed its deadline.
+    Unconfirmed,
+}
 
 impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
     RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
@@ -36,14 +52,41 @@ where
             .ok_or(TrustedSubmissionError::Malformed)?;
         let block = Arc::new(block);
         let hash = block.hash();
-        let parent_known = self.parent_is_known(block.header.previous_block_hash).await;
-        if !parent_known {
-            metrics::counter!("rpc.trusted_submission.early_relay_skipped", "reason" => "unknown_parent")
+        let deadline = tokio::time::Instant::now() + STATE_LOOKUP_TIMEOUT;
+        let (parent_known, submitted) = tokio::join!(
+            self.parent_is_known(block.header.previous_block_hash, deadline),
+            self.submitted_hash_status(hash, deadline),
+        );
+        // A committed hash never reaches the pending registry: peers and the verifier already
+        // treat it as known, so a temporary body could only shadow the committed block.
+        if submitted == SubmittedHash::Committed {
+            metrics::counter!("rpc.trusted_submission.outcomes", "outcome" => "duplicate")
                 .increment(1);
             tracing::info!(
                 ?hash,
-                "parent is not confirmed: validating the trusted submission without early relay"
+                "trusted submission is already committed: skipping registration and relay"
             );
+            return Ok(SubmitBlockErrorResponse::Duplicate.into());
+        }
+        let skipped = match (parent_known, submitted) {
+            (false, _) => Some((
+                "unknown_parent",
+                "parent is not confirmed: validating the trusted submission without early relay",
+            )),
+            (true, SubmittedHash::InFlight) => Some((
+                "in_flight",
+                "block is already being committed: validating the trusted submission without early relay",
+            )),
+            (true, SubmittedHash::Unconfirmed) => Some((
+                "unconfirmed_new",
+                "block is not confirmed new: validating the trusted submission without early relay",
+            )),
+            (true, SubmittedHash::New | SubmittedHash::Committed) => None,
+        };
+        if let Some((reason, message)) = skipped {
+            metrics::counter!("rpc.trusted_submission.early_relay_skipped", "reason" => reason)
+                .increment(1);
+            tracing::info!(?hash, "{message}");
         }
         let submission = match self.gbt.reserve_mined_submission(hash) {
             Ok(guard) => guard,
@@ -71,7 +114,8 @@ where
             self.gbt.mined_block_sender(),
             RelayPolicy::TrustedSubmission {
                 registration,
-                parent_known,
+                early_relay: skipped.is_none(),
+                committed_block: committed_block_lookup(self.read_state.clone()),
             },
             move |outcome| {
                 metrics::histogram!("rpc.trusted_submission.validation.duration_seconds")
@@ -89,24 +133,47 @@ where
                         SubmitBlockErrorResponse::Inconclusive.into()
                     }
                 };
-                if outcome.relay.requested
-                    && matches!(
-                        response,
-                        SubmitBlockResponse::ErrorResponse(SubmitBlockErrorResponse::Rejected)
-                    )
-                {
-                    metrics::counter!("rpc.trusted_submission.rejected_after_relay_requested")
+                let label = crate::server::trusted_block::outcome(&response);
+                if let Some(body) = outcome.duplicate_body {
+                    metrics::counter!("rpc.trusted_submission.duplicate_body", "body" => body.label())
                         .increment(1);
-                    tracing::warn!(
-                        ?hash,
-                        "trusted submission rejected after early relay was requested"
-                    );
-                    if outcome.relay.was_dispatched() {
-                        metrics::counter!("rpc.trusted_submission.rejected_after_dispatch")
-                            .increment(1);
+                    if body != DuplicateBody::Identical {
+                        tracing::warn!(
+                            ?hash,
+                            body = body.label(),
+                            "trusted submission's hash committed with a body not confirmed equal to it: withdrawing the submitted body"
+                        );
                     }
                 }
-                metrics::counter!("rpc.trusted_submission.outcomes", "outcome" => crate::server::trusted_block::outcome(&response)).increment(1);
+                if outcome.relay.requested && response != SubmitBlockResponse::Accepted {
+                    let dispatched = outcome.relay.was_dispatched();
+                    metrics::counter!("rpc.trusted_submission.relay_requested_without_commit", "outcome" => label)
+                        .increment(1);
+                    if outcome.duplicate_body == Some(DuplicateBody::Identical) {
+                        // Another path committed these exact bytes; nothing for an operator to do.
+                        tracing::info!(
+                            ?hash,
+                            dispatched,
+                            "trusted submission was committed by another path after early relay was requested"
+                        );
+                    } else {
+                        tracing::warn!(
+                            ?hash,
+                            outcome = label,
+                            dispatched,
+                            "trusted submission was not committed after early relay was requested"
+                        );
+                    }
+                    if response == SubmitBlockErrorResponse::Rejected.into() {
+                        metrics::counter!("rpc.trusted_submission.rejected_after_relay_requested")
+                            .increment(1);
+                        if dispatched {
+                            metrics::counter!("rpc.trusted_submission.rejected_after_dispatch")
+                                .increment(1);
+                        }
+                    }
+                }
+                metrics::counter!("rpc.trusted_submission.outcomes", "outcome" => label).increment(1);
                 response
             },
         );
@@ -115,13 +182,13 @@ where
             .unwrap_or_else(|_| SubmitBlockErrorResponse::Inconclusive.into()))
     }
 
-    /// Returns whether `parent` is confirmed committed within the short lookup deadline.
+    /// Returns whether `parent` is confirmed committed before `deadline`.
     /// Failure or timeout, including service readiness, only skips early relay: the block
     /// is still validated and announced after it commits.
-    async fn parent_is_known(&self, parent: block::Hash) -> bool {
+    async fn parent_is_known(&self, parent: block::Hash, deadline: tokio::time::Instant) -> bool {
         matches!(
-            tokio::time::timeout(
-                PARENT_LOOKUP_TIMEOUT,
+            tokio::time::timeout_at(
+                deadline,
                 self.read_state
                     .clone()
                     .oneshot(ReadRequest::BlockInfo(parent.into())),
@@ -129,5 +196,33 @@ where
             .await,
             Ok(Ok(ReadResponse::BlockInfo(Some(_))))
         )
+    }
+
+    /// Classifies `hash` with the same state request the verifier's duplicate check uses.
+    /// Failure or timeout only skips early relay, like the parent lookup: the verifier still
+    /// performs its own duplicate check.
+    async fn submitted_hash_status(
+        &self,
+        hash: block::Hash,
+        deadline: tokio::time::Instant,
+    ) -> SubmittedHash {
+        use zakura_state::KnownBlock;
+        match tokio::time::timeout_at(
+            deadline,
+            self.state
+                .clone()
+                .oneshot(zakura_state::Request::KnownBlock(hash)),
+        )
+        .await
+        {
+            Ok(Ok(zakura_state::Response::KnownBlock(None))) => SubmittedHash::New,
+            Ok(Ok(zakura_state::Response::KnownBlock(Some(
+                KnownBlock::Finalized | KnownBlock::BestChain | KnownBlock::SideChain,
+            )))) => SubmittedHash::Committed,
+            Ok(Ok(zakura_state::Response::KnownBlock(Some(
+                KnownBlock::WriteChannel | KnownBlock::Queue,
+            )))) => SubmittedHash::InFlight,
+            _ => SubmittedHash::Unconfirmed,
+        }
     }
 }

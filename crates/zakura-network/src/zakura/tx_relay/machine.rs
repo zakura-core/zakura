@@ -217,9 +217,10 @@ mod budget_tests;
 mod tests;
 
 #[cfg(test)]
-use std::collections::BTreeSet;
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::collections::{BTreeMap, BTreeSet};
+use std::{fmt, time::Duration};
 
+#[cfg(test)]
 use indexmap::IndexSet;
 use zakura_chain::{
     block::Height,
@@ -230,9 +231,11 @@ use zakura_node_services::mempool::port::{
 };
 use zakura_rt::collections::HashMap;
 
+#[cfg(test)]
+use self::peer::Hello;
 pub(crate) use self::session::PeerMachine;
 use self::{
-    peer::{Hello, PeerState, ReadyKey},
+    peer::{PeerState, ReadyKey},
     reactor::{Reactor, Recorded},
     session::Submitted,
     wanted::{Entry, WantedIds},
@@ -399,7 +402,9 @@ pub(crate) struct RelayConfig {
     pub(crate) short_id_key: u64,
 }
 
-/// What the pool's snapshot says alongside a batch of changes.
+/// What the pool's snapshot says alongside a batch of changes, for the
+/// composed machine.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SnapshotInfo {
     /// Whether the pool is on.
@@ -602,6 +607,71 @@ pub(crate) enum NodeEffect {
         /// The session that marked it already.
         except: Option<SessionId>,
     },
+    /// The reactor got the answer to a reserve call an ended session of
+    /// `peer` made, which frees one of the peer's requests: its sessions
+    /// look again.
+    Look(PeerKey),
+}
+
+impl NodeEffect {
+    /// The sessions this effect reaches, of the live `sessions` with their
+    /// peers, and the mail each reads at its next step, if any. Each one it
+    /// reaches looks again.
+    pub(crate) fn reach(
+        self,
+        sessions: impl IntoIterator<Item = (SessionId, PeerKey)>,
+    ) -> (Vec<SessionId>, Option<Mail>) {
+        let of_peer = |peer: PeerKey, except: Option<SessionId>| -> Vec<SessionId> {
+            sessions
+                .into_iter()
+                .filter(|(session, of)| *of == peer && Some(*session) != except)
+                .map(|(session, _)| session)
+                .collect()
+        };
+        match self {
+            Self::Closed(session) => (vec![session], Some(Mail::Closed)),
+            Self::Go(session) => (vec![session], Some(Mail::Go)),
+            Self::Known { peer, id, except } => (of_peer(peer, except), Some(Mail::Known(id))),
+            Self::Look(peer) => (of_peer(peer, None), None),
+        }
+    }
+}
+
+/// What one session's step leaves another to read at its next step. See
+/// [`PeerMachine::read_mail`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Mail {
+    /// A charge closed it.
+    Closed,
+    /// It got the go.
+    Go,
+    /// A verdict on a body its peer supplied arrived.
+    Known(UnminedTxId),
+}
+
+/// Where the shared state stood before a step. Once the ring moved or
+/// claims opened up, every session looks again: any of them may hold a
+/// changed id, or may claim now.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Marks {
+    ring_end: u64,
+    openings: u64,
+}
+
+impl Marks {
+    /// The marks of `shared` now.
+    pub(crate) fn of(shared: &Shared) -> Self {
+        Self {
+            ring_end: shared.wanted.ring_end(),
+            openings: shared.wanted.openings(),
+        }
+    }
+
+    /// Whether every session looks again after the step these marks came
+    /// before.
+    pub(crate) fn wake_all(self, shared: &Shared) -> bool {
+        self != Self::of(shared)
+    }
 }
 
 /// What every session's routine shares: the wanted table, the reactor, the
@@ -624,6 +694,9 @@ pub(crate) struct Shared {
     pub(crate) fan_out: FanOut,
     /// The parameters of the keyed short-id hash.
     short_id: blake2b_simd::Params,
+    /// The newest log position whose refusals were applied. Every routine
+    /// reads the log, and the first to read a refusal applies it.
+    log_read: u64,
     next_session: u64,
     next_call: u64,
     next_waiter: u64,
@@ -654,6 +727,7 @@ impl Shared {
             stopped: false,
             fan_out: config.fan_out,
             short_id,
+            log_read: 0,
             next_session: 0,
             next_call: 0,
             next_waiter: 0,
@@ -742,6 +816,7 @@ impl Shared {
             return false;
         };
         self.reactor.call_answered(peer);
+        self.node.push(NodeEffect::Look(peer));
         self.answer_unknown(answer);
         true
     }
@@ -836,6 +911,42 @@ impl Shared {
         }
     }
 
+    /// The changes a read of the pool's log found, as each session reads
+    /// them: each with its log position, its id's short id, and whether no
+    /// later change in the read names the same id. A refusal ends a retry
+    /// that waited for another caller, such as the legacy adapter.
+    pub(crate) fn log(
+        &mut self,
+        changes: impl IntoIterator<Item = (u64, Change)>,
+        now: Time,
+    ) -> Vec<Logged> {
+        let mut read: Vec<Logged> = Vec::new();
+        let mut last: HashMap<UnminedTxId, usize> = HashMap::default();
+        for (seq, change) in changes {
+            if let Change::Refused(id) = change {
+                if seq > self.log_read {
+                    self.wanted.other_ended(id, now);
+                }
+            }
+            self.log_read = self.log_read.max(seq);
+            let id = change_id(&change);
+            if let Some(earlier) = last.insert(id, read.len()) {
+                read[earlier].last = false;
+            }
+            let short = match change {
+                Change::Added(_) | Change::Removed { .. } => self.short(id),
+                Change::Refused(_) => 0,
+            };
+            read.push(Logged {
+                seq,
+                change,
+                short,
+                last: true,
+            });
+        }
+        read
+    }
+
     /// `peer` tried `id` in `generation`. Its sessions drop their references
     /// when they read the ring.
     pub(crate) fn tried(&mut self, peer: PeerKey, id: UnminedTxId, generation: EntryGen) {
@@ -898,7 +1009,8 @@ pub(crate) struct Logged {
 }
 
 /// The pool as the published changes describe it, with the sizes the
-/// snapshots gave.
+/// snapshots gave, for the composed machine.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Mirror {
     live: bool,
@@ -913,6 +1025,7 @@ pub(crate) struct Mirror {
     sizes: HashMap<UnminedTxId, u32>,
 }
 
+#[cfg(test)]
 impl Mirror {
     /// The pool `snapshot` shows, whose visible transactions are `visible`
     /// with their sizes, oldest first.
@@ -928,8 +1041,7 @@ impl Mirror {
     }
 
     /// Applies a published batch and the snapshot after it. Returns the
-    /// batch as each session reads it, and whether it turned the pool on.
-    /// A refusal ends a retry that waited for another caller.
+    /// batch as each session reads it.
     pub(crate) fn publish(
         &mut self,
         shared: &mut Shared,
@@ -939,11 +1051,7 @@ impl Mirror {
     ) -> Vec<Logged> {
         self.live = snapshot.active;
         self.tip = snapshot.tip;
-        // What each read needs of a change but every session shares: the
-        // id's short id and whether this is the id's last change in the
-        // batch, worked out once here rather than once per session.
-        let mut batch: Vec<Logged> = Vec::with_capacity(changes.len());
-        let mut last: HashMap<UnminedTxId, usize> = HashMap::default();
+        let mut read = Vec::with_capacity(changes.len());
         for change in changes {
             match change {
                 Change::Added(id) => self.show(id),
@@ -951,32 +1059,17 @@ impl Mirror {
                     self.unshow(id);
                     self.sizes.remove(&id);
                 }
-                // Another caller's attempt at it ended undecided, so a retry
-                // that waited for that caller need not wait any longer.
-                Change::Refused(id) => shared.wanted.other_ended(id, now),
+                Change::Refused(_) => {}
             }
             self.last_seq = self.last_seq.saturating_add(1);
-            let id = change_id(&change);
-            if let Some(earlier) = last.insert(id, batch.len()) {
-                batch[earlier].last = false;
-            }
-            let short = match change {
-                Change::Added(_) | Change::Removed { .. } => shared.short(id),
-                Change::Refused(_) => 0,
-            };
-            batch.push(Logged {
-                seq: self.last_seq,
-                change,
-                short,
-                last: true,
-            });
+            read.push((self.last_seq, change));
         }
         for (id, size) in snapshot.sizes {
             if self.visible.contains(&id) {
                 self.sizes.insert(id, size);
             }
         }
-        batch
+        shared.log(read, now)
     }
 
     /// Takes the whole pool from a resync: `visible`, oldest first, with the
@@ -991,7 +1084,6 @@ impl Mirror {
     }
 
     /// The pool, oldest first.
-    #[cfg(test)]
     pub(crate) fn visible(&self) -> &IndexSet<UnminedTxId> {
         &self.visible
     }
@@ -1016,7 +1108,6 @@ impl Mirror {
     }
 
     /// Checks the mirror's own indexes.
-    #[cfg(test)]
     fn assert_invariants(&self) {
         let mined = mined_counts(self.visible.iter().copied());
         assert_eq!(self.visible_mined, mined, "relay/mined-id-counts");
@@ -1025,6 +1116,7 @@ impl Mirror {
     }
 }
 
+#[cfg(test)]
 impl PoolView for Mirror {
     fn live(&self) -> bool {
         self.live
@@ -1055,10 +1147,12 @@ impl PoolView for Mirror {
     }
 }
 
-/// `tx-relay` as one machine: every session's [`PeerMachine`], the
-/// [`Shared`] state, and the pool as the published changes describe it.
-/// An input goes to its session, then each session reads the ring and
-/// claims what it can, in session order, as the routines do when they wake.
+/// `tx-relay` as one machine, for the tests: every session's
+/// [`PeerMachine`], the [`Shared`] state, and the pool as the published
+/// changes describe it. An input goes to its session, and then only the
+/// sessions the step woke tick, by the rules the routines wake by. See
+/// [`Self::wake`].
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct RelayMachine {
     now: Time,
@@ -1067,6 +1161,7 @@ pub(crate) struct RelayMachine {
     machines: BTreeMap<SessionId, PeerMachine>,
 }
 
+#[cfg(test)]
 impl RelayMachine {
     /// `tx-relay` on the pool `snapshot` shows, whose visible transactions
     /// are `visible` with their sizes, oldest first.
@@ -1087,11 +1182,12 @@ impl RelayMachine {
 
     /// A session of `peer` opened. See [`PeerMachine::connect`].
     pub(crate) fn connect(&mut self, peer: PeerKey, exempt: bool, now: Time) -> SessionId {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         let machine = PeerMachine::connect(&mut self.shared, &self.pool, peer, exempt, self.now);
         let session = machine.session();
         self.machines.insert(session, machine);
-        self.settle();
+        self.wake(marks, BTreeSet::new());
         session
     }
 
@@ -1156,13 +1252,22 @@ impl RelayMachine {
 
     // Inputs from the node and the pool.
 
-    /// Time passed.
+    /// Time passed: each session with something due by now wakes, as its
+    /// routine's timer does.
     pub(crate) fn tick(&mut self, now: Time) {
         self.now = self.now.max(now);
-        for machine in self.machines.values_mut() {
-            machine.tick(&mut self.shared, &self.pool, self.now);
-        }
-        self.settle();
+        let marks = Marks::of(&self.shared);
+        let due = self
+            .machines
+            .iter()
+            .filter(|(_, machine)| {
+                machine
+                    .next_deadline(&self.shared)
+                    .is_some_and(|at| at <= self.now)
+            })
+            .map(|(session, _)| *session)
+            .collect();
+        self.wake(marks, due);
     }
 
     /// The pool answered the reserve call `call`.
@@ -1172,7 +1277,8 @@ impl RelayMachine {
         answer: Result<Granted, Unreserved>,
         now: Time,
     ) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         let owner = self
             .machines
             .iter()
@@ -1189,12 +1295,13 @@ impl RelayMachine {
                 }
             }
         }
-        self.settle();
+        self.wake(marks, BTreeSet::new());
     }
 
     /// The pool's verdict on the submission `waiter`.
     pub(crate) fn verdict(&mut self, waiter: WaiterId, verdict: Verdict, now: Time) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         let owner = self
             .machines
             .iter()
@@ -1210,22 +1317,21 @@ impl RelayMachine {
                     .ended_verdict(&self.pool, waiter, verdict, self.now);
             }
         }
-        self.settle();
+        self.wake(marks, BTreeSet::new());
     }
 
     /// The pool cancelled the fetch under `reservation`: its token fired.
     pub(crate) fn fetch_cancelled(&mut self, reservation: ReservationId, now: Time) {
-        self.enter(now);
         let owner = self
             .machines
             .iter()
             .find(|(_, machine)| machine.reservations.contains_key(&reservation))
             .map(|(session, _)| *session);
         if let Some(session) = owner {
-            let machine = self.machines.get_mut(&session).expect("found above");
-            machine.fetch_cancelled(&mut self.shared, &self.pool, reservation, self.now);
+            self.on(session, now, |machine, shared, pool, now| {
+                machine.fetch_cancelled(shared, pool, reservation, now);
+            });
         }
-        self.settle();
     }
 
     /// The pool published `changes`, one batch, and `snapshot` is the pool
@@ -1233,8 +1339,10 @@ impl RelayMachine {
     /// session with the go first, on the pool before the batch, as a
     /// restart does. Then every session with the go reads the batch.
     pub(crate) fn pool_changed(&mut self, changes: Vec<Change>, snapshot: SnapshotInfo, now: Time) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         let activated = !self.pool.live && snapshot.active;
+        let mut woken = BTreeSet::new();
         if activated {
             self.pool.live = true;
             self.pool.tip = snapshot.tip;
@@ -1247,7 +1355,7 @@ impl RelayMachine {
                     machine.open(&mut self.shared, &self.pool);
                 }
             }
-            self.route();
+            woken = self.route();
         }
         let batch = self
             .pool
@@ -1255,7 +1363,7 @@ impl RelayMachine {
         for machine in self.machines.values_mut() {
             machine.pool_changed(&mut self.shared, &self.pool, &batch, false, self.now);
         }
-        self.settle();
+        self.wake(marks, woken);
     }
 
     /// The IO lost its place in the pool's change log, so it hands over the
@@ -1267,27 +1375,25 @@ impl RelayMachine {
         snapshot: SnapshotInfo,
         now: Time,
     ) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         let activated = !self.pool.live && snapshot.active;
         self.pool.resync(visible, snapshot);
         for machine in self.machines.values_mut() {
             machine.pool_resynced(&mut self.shared, &self.pool, activated, self.now);
         }
-        self.settle();
+        self.wake(marks, BTreeSet::new());
     }
 
     /// The core behind the port stopped for good, which the IO saw some
     /// other way than through an answer or a verdict. `tx-relay` claims
-    /// nothing more.
+    /// nothing more. Every routine sees it.
     pub(crate) fn pool_stopped(&mut self, now: Time) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         self.shared.stopped = true;
-        self.settle();
-    }
-
-    /// Whether the node is close to the network's tip.
-    pub(crate) fn set_current(&mut self, current: bool) {
-        self.shared.set_current(current);
+        let every = self.machines.keys().copied().collect();
+        self.wake(marks, every);
     }
 
     /// The node's best tip moved, perhaps ahead of the pool's.
@@ -1297,8 +1403,6 @@ impl RelayMachine {
 
     /// `session`'s routine reports its connection's smoothed round-trip
     /// time.
-    // Unused until the IO reports round-trip times, which a later change wires in.
-    #[allow(dead_code)]
     pub(crate) fn observe_rtt(&mut self, session: SessionId, rtt: Duration, now: Time) {
         self.on(session, now, |machine, shared, pool, now| {
             machine.observe_rtt(shared, pool, rtt, now);
@@ -1329,101 +1433,78 @@ impl RelayMachine {
         std::mem::take(&mut self.shared.effects)
     }
 
-    /// The earliest time after now that something becomes due with no other
-    /// input: a timed id, a deadline, an advert, the end of the backoff, or a
-    /// cooldown.
+    /// The earliest time after now that some session has something due with
+    /// no other input, which is when its routine's timer fires.
     pub(crate) fn next_deadline(&self) -> Option<Time> {
-        let now = self.now;
-        let sessions = self
-            .machines
+        self.machines
             .values()
-            .filter_map(|machine| machine.next_deadline(&self.shared));
-        [
-            self.shared.wanted.backoff_until(now),
-            self.shared.wanted.next_wake(now),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(sessions)
-        .min()
+            .filter_map(|machine| machine.next_deadline(&self.shared))
+            .min()
     }
 
     // The step loop.
 
-    /// Hands an input to `session`'s machine, routes what it did to the
-    /// other sessions, and settles every session.
+    /// Hands an input to `session`'s machine, then wakes the sessions the
+    /// step owes a look.
     fn on(
         &mut self,
         session: SessionId,
         now: Time,
         input: impl FnOnce(&mut PeerMachine, &mut Shared, &Mirror, Time),
     ) {
-        self.enter(now);
+        self.now = self.now.max(now);
+        let marks = Marks::of(&self.shared);
         if let Some(machine) = self.machines.get_mut(&session) {
             input(machine, &mut self.shared, &self.pool, self.now);
         }
-        self.settle();
+        self.wake(marks, BTreeSet::new());
     }
 
-    /// Moves time to `now` and applies what is due before the input, in
-    /// every session.
-    fn enter(&mut self, now: Time) {
-        self.now = self.now.max(now);
-        for machine in self.machines.values_mut() {
-            machine.enter(&mut self.shared, &self.pool, self.now);
-        }
-        self.route();
-        self.shared.wanted.drop_stale(self.now);
-    }
-
-    /// Lets every session read the ring and claim what it can, until a
-    /// pass leaves the ring as it found it, so each session has read every
-    /// change the others made.
-    fn settle(&mut self) {
+    /// Ticks the sessions owed a look, as their routines wake, until a pass
+    /// owes none: those in `woken`, each one an effect names, and every
+    /// session once the ring moved or claims opened up since `marks`. Then
+    /// forgets the sessions that ended. A session nothing woke does not
+    /// step, so a missing wake shows up as work left undone.
+    fn wake(&mut self, mut marks: Marks, mut woken: BTreeSet<SessionId>) {
         loop {
-            self.route();
-            let before = self.shared.wanted.ring_end();
-            for machine in self.machines.values_mut() {
-                machine.settle(&mut self.shared, &self.pool);
+            woken.extend(self.route());
+            if marks.wake_all(&self.shared) {
+                woken.extend(self.machines.keys().copied());
             }
-            self.route();
-            if self.shared.wanted.ring_end() == before {
+            marks = Marks::of(&self.shared);
+            if woken.is_empty() {
                 break;
             }
-        }
-        self.shared.wanted.drop_stale(self.now);
-    }
-
-    /// Routes effects on other sessions until none is left, and forgets the
-    /// sessions that ended.
-    fn route(&mut self) {
-        while !self.shared.node.is_empty() {
-            let node = std::mem::take(&mut self.shared.node);
-            for effect in node {
-                match effect {
-                    NodeEffect::Closed(session) => {
-                        if let Some(machine) = self.machines.get_mut(&session) {
-                            machine.end_session(&mut self.shared);
-                        }
-                    }
-                    NodeEffect::Go(session) => {
-                        if let Some(machine) = self.machines.get_mut(&session) {
-                            machine.open(&mut self.shared, &self.pool);
-                        }
-                    }
-                    NodeEffect::Known { peer, id, except } => {
-                        for machine in self.machines.values_mut().filter(|machine| {
-                            machine.state.peer == peer
-                                && Some(machine.session()) != except
-                                && !machine.is_ended()
-                        }) {
-                            machine.mark_known(&self.shared, &self.pool, id);
-                        }
-                    }
+            for session in std::mem::take(&mut woken) {
+                if let Some(machine) = self.machines.get_mut(&session) {
+                    machine.tick(&mut self.shared, &self.pool, self.now);
                 }
             }
         }
         self.machines.retain(|_, machine| !machine.is_ended());
+    }
+
+    /// Hands each effect on other sessions to the sessions it reaches, which
+    /// read their mail at once, as at their next step, until none is left.
+    /// Returns the sessions reached.
+    fn route(&mut self) -> BTreeSet<SessionId> {
+        let mut reached = BTreeSet::new();
+        while !self.shared.node.is_empty() {
+            for effect in std::mem::take(&mut self.shared.node) {
+                let live = self.machines.iter();
+                let (to, mail) = effect.reach(live.map(|(id, machine)| (*id, machine.state.peer)));
+                for session in to {
+                    let Some(machine) = self.machines.get_mut(&session) else {
+                        continue;
+                    };
+                    if let Some(mail) = mail {
+                        machine.read_mail(&mut self.shared, &self.pool, mail);
+                    }
+                    reached.insert(session);
+                }
+            }
+        }
+        reached
     }
 }
 
@@ -1627,8 +1708,6 @@ impl RelayMachine {
             assert_eq!(entry.holders, counted.unwrap_or(0), "relay/holder-count");
             let alive = entry.holders > 0 || entry.claim.is_some();
             assert!(alive, "relay/entry-held-or-claimed");
-            let woken = entry.retry_at <= now || wanted.retry_indexed(*id, entry.retry_at);
-            assert!(woken, "relay/retry-index");
         }
 
         // One attempt at a time: each attempt holds its entry's claim, and
@@ -1744,6 +1823,7 @@ impl RelayMachine {
 }
 
 /// How many of `ids` share each mined id.
+#[cfg(test)]
 fn mined_counts(ids: impl IntoIterator<Item = UnminedTxId>) -> HashMap<transaction::Hash, usize> {
     let mut counts: HashMap<transaction::Hash, usize> = HashMap::default();
     for id in ids {

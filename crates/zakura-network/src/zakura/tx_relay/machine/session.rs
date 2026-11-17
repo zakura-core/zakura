@@ -18,9 +18,9 @@ use super::{
     file,
     peer::{Hello, PeerState, Pending, Reserving},
     wanted::{Admission, Changes},
-    CallId, CloseReason, EntryGen, Granted, Logged, NodeEffect, PeerKey, PoolView, RelayEffect,
-    SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId, MAX_REQUESTS_PER_PEER,
-    MAX_SERVES, MAX_TX_BYTES, PENDING_PER_PEER,
+    CallId, CloseReason, EntryGen, Granted, Logged, Mail, NodeEffect, PeerKey, PoolView,
+    RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PENDING_PER_PEER,
 };
 
 /// A reserve call on its way to the pool.
@@ -405,7 +405,8 @@ impl PeerMachine {
         self.settle(shared, pool);
     }
 
-    /// The pool answered this session's reserve call `call`.
+    /// The pool answered this session's reserve call `call`. Once the
+    /// session ended, the answer goes to the reactor, which holds its calls.
     pub(crate) fn reserve_answer(
         &mut self,
         shared: &mut Shared,
@@ -417,14 +418,21 @@ impl PeerMachine {
         self.enter(shared, pool, now);
         match self.calls.remove(&call) {
             Some(made) if !self.ended => self.deliver(shared, pool, call, made, answer),
-            // Not a call this session has open. A grant still goes back,
-            // and a `Stopped` answer still says the core stopped.
-            _ => shared.answer_unknown(answer),
+            // Otherwise it is not a call this session has open. A grant
+            // still goes back, and a `Stopped` answer still says the core
+            // stopped.
+            _ => {
+                if !(self.ended && shared.ended_call_answer(call, answer)) {
+                    shared.answer_unknown(answer);
+                }
+            }
         }
         self.settle(shared, pool);
     }
 
-    /// The pool's verdict on this session's submission `waiter`.
+    /// The pool's verdict on this session's submission `waiter`. Once the
+    /// session ended, the verdict goes to the reactor, which holds its
+    /// submissions.
     pub(crate) fn verdict(
         &mut self,
         shared: &mut Shared,
@@ -434,6 +442,10 @@ impl PeerMachine {
         now: Time,
     ) {
         self.enter(shared, pool, now);
+        if self.ended {
+            shared.ended_verdict(pool, waiter, verdict, self.now);
+            return;
+        }
         let Some((id, generation)) = self.state.submissions.remove(&waiter) else {
             return self.settle(shared, pool);
         };
@@ -526,6 +538,8 @@ impl PeerMachine {
 
     /// This session's routine reports its connection's smoothed round-trip
     /// time. It counts at the next ranking.
+    // Unused until the IO reports round-trip times, which a later change wires in.
+    #[allow(dead_code)]
     pub(crate) fn observe_rtt(
         &mut self,
         shared: &mut Shared,
@@ -542,12 +556,19 @@ impl PeerMachine {
         self.settle(shared, pool);
     }
 
-    /// Another session's verdict on a body this session's peer supplied:
-    /// the skip set marks it known again, as the supplier's own session
-    /// does.
-    pub(crate) fn mark_known(&mut self, shared: &Shared, pool: &dyn PoolView, id: UnminedTxId) {
-        let short = shared.short(id);
-        self.state.mark_known(short, pool.last_seq());
+    /// Reads what another session's step left it, before its own next input.
+    pub(crate) fn read_mail(&mut self, shared: &mut Shared, pool: &dyn PoolView, mail: Mail) {
+        match mail {
+            Mail::Closed => self.end_session(shared),
+            Mail::Go => self.open(shared, pool),
+            // Another session's verdict on a body this session's peer
+            // supplied: the skip set marks it known again, as the
+            // supplier's own session does.
+            Mail::Known(id) => {
+                let short = shared.short(id);
+                self.state.mark_known(short, pool.last_seq());
+            }
+        }
     }
 
     // Outputs and observations.

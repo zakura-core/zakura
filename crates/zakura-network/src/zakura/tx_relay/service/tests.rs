@@ -58,59 +58,11 @@ fn closer() -> (Closer, CloseCause, CancellationToken) {
 /// The message in a frame a writer was given.
 fn message(outgoing: Outgoing) -> TxRelayMessage {
     match outgoing {
-        Outgoing::Frame(frame, _) => decode_frame(&frame).expect("the actor encodes valid frames"),
+        Outgoing::Frame(frame, _) => {
+            decode_frame(&frame).expect("the routine encodes valid frames")
+        }
         Outgoing::Serve { .. } => panic!("a serve job, not a frame"),
     }
-}
-
-/// A reader takes no next frame while the actor holds its last message, so
-/// that frame's receive grant stays with the transport. In a stream one
-/// frame deep, a third frame finds no room until the actor drops the first.
-#[tokio::test]
-async fn a_reader_waits_for_the_actor_before_it_takes_the_next_frame() {
-    let (send, recv) = framed_channel(1);
-    let (inputs, mut received) = mpsc::unbounded_channel();
-    let (close, _cause, cancel) = closer();
-    spawn_reader(7, recv, inputs, cancel.clone(), close);
-    let frame = |n: u8| {
-        encode_frame(&TxRelayMessage::NotFound(UnminedTxId::from_legacy_id(
-            zakura_chain::transaction::Hash([n; 32]),
-        )))
-        .expect("a NotFound encodes")
-    };
-
-    send.try_send(frame(1)).expect("the stream has room");
-    let first = tokio::time::timeout(Duration::from_secs(5), received.recv())
-        .await
-        .expect("the reader hands over the first frame")
-        .expect("the reader is running");
-    send.try_send(frame(2))
-        .expect("taking the first frame made room");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        send.try_send(frame(3)).is_err(),
-        "the reader left the second frame in the stream"
-    );
-    assert!(
-        received.try_recv().is_err(),
-        "only one message waits for the actor"
-    );
-
-    drop(first);
-    let second = tokio::time::timeout(Duration::from_secs(5), received.recv())
-        .await
-        .expect("the reader takes the second frame once the first is handled")
-        .expect("the reader is running");
-    assert!(matches!(
-        second,
-        Input::Message {
-            message: TxRelayMessage::NotFound(_),
-            ..
-        }
-    ));
-    send.try_send(frame(3))
-        .expect("taking the second frame made room");
-    cancel.cancel();
 }
 
 /// A job that waits behind a peer that stopped reading, for an id the pool
@@ -195,21 +147,92 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
         .expect("the semaphore stays open");
 }
 
-/// An actor with a pool of `count` transactions, and one session on
+/// The connection every test session runs on.
+fn connection() -> (ZakuraPeerId, ZakuraConnId) {
+    (ZakuraPeerId::new(vec![1; 32]).expect("a valid id"), 1)
+}
+
+/// A routine's wiring on `pool`, with no reactor task: the test holds what
+/// ended sessions hand off.
+fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
+    let (handoff, handed) = mpsc::unbounded_channel();
+    let node = Node {
+        shared: Shared::new(RelayConfig {
+            fan_out: ZakuraTxRelayConfig::default().fan_out(),
+            short_id_key: 7,
+        }),
+        sessions: HashMap::default(),
+    };
+    let wiring = Wiring {
+        node: Arc::new(Mutex::new(node)),
+        pool,
+        may_cool: Arc::new(|_| true),
+        handoff,
+        owned: Owned::default(),
+        record: TxRelaySessions::default(),
+        inv_buckets: InvBuckets::default(),
+        base: Instant::now(),
+    };
+    (wiring, handed)
+}
+
+/// One session's routine, driven step by step, whose writers' queues the
+/// test holds.
+struct Session {
+    routine: Routine,
+    cause: CloseCause,
+    cancel: CancellationToken,
+    data: mpsc::Receiver<Outgoing>,
+    /// Held unread, so the state writer's queue stays open.
+    _state: mpsc::Receiver<Outgoing>,
+}
+
+impl Session {
+    /// Opens a session of peer 1 on [`connection`], as `add_peer` does, and
+    /// lets it read the pool.
+    fn open(wiring: &Wiring) -> Self {
+        let (data, data_recv) = mpsc::channel(DATA_QUEUE);
+        let (state, state_recv) = mpsc::channel(STATE_QUEUE);
+        let (close, cause, cancel) = closer();
+        open_inv_bucket(&wiring.inv_buckets, &connection());
+        let io = SessionIo::new(data, state, close, connection());
+        let mut routine = Routine::open(
+            wiring.clone(),
+            PeerKey(1),
+            false,
+            io,
+            CancellationToken::new(),
+        );
+        routine.read_pool();
+        routine.after_step();
+        Self {
+            routine,
+            cause,
+            cancel,
+            data: data_recv,
+            _state: state_recv,
+        }
+    }
+
+    /// Hands the peer's `message` to the routine, and runs what follows a
+    /// step.
+    fn deliver(&mut self, message: TxRelayMessage) {
+        self.routine.message(message);
+        self.routine.after_step();
+    }
+}
+
+/// A routine with a pool of `count` transactions, and one session on
 /// connection 1 whose writers the test holds and never reads, as a peer
 /// that stopped reading. The session's peer has sent its `Hello`, and every
 /// id has gone out to it in one `Inv`.
 struct Serving {
-    actor: Actor,
+    session: Session,
+    wiring: Wiring,
     ids: Vec<UnminedTxId>,
-    cause: CloseCause,
-    cancel: CancellationToken,
-    budget: Arc<Semaphore>,
-    /// Held unread, so the core's side of the port and the state writer's
-    /// queue stay open.
+    /// Held unread, so the core's side of the port stays open.
     _inbox: PoolInbox,
-    data: mpsc::Receiver<Outgoing>,
-    _state: mpsc::Receiver<Outgoing>,
+    _handed: mpsc::UnboundedReceiver<Calls>,
 }
 
 impl Serving {
@@ -222,81 +245,29 @@ impl Serving {
             ids.iter().map(|id| Change::Added(*id)).collect(),
             pool,
         );
-        let mut actor = Actor::new(
-            handle,
-            Arc::new(|_| true),
-            &ZakuraTxRelayConfig::default(),
-            TxRelaySessions::default(),
-            Owned::default(),
-        );
-        actor.read_pool();
-        let (cause, cancel, data, state) = open(&mut actor, 1);
-        let mut serving = Self {
-            actor,
-            ids,
-            cause,
-            cancel,
-            budget: Arc::new(Semaphore::new(1 << 20)),
-            _inbox: inbox,
-            data,
-            _state: state,
-        };
-        serving.deliver(TxRelayMessage::Hello {
+        let (wiring, handed) = wiring(handle);
+        let mut session = Session::open(&wiring);
+        session.deliver(TxRelayMessage::Hello {
             serves: 16,
             max_tx_bytes: MAX_TX_BYTES,
         });
         match message(
-            serving
+            session
                 .data
                 .try_recv()
                 .expect("the session announces the pool"),
         ) {
-            TxRelayMessage::Inv(entries) => assert_eq!(entries.len(), serving.ids.len()),
+            TxRelayMessage::Inv(entries) => assert_eq!(entries.len(), ids.len()),
             other => panic!("expected an Inv, got {other:?}"),
         }
-        serving
+        Self {
+            session,
+            wiring,
+            ids,
+            _inbox: inbox,
+            _handed: handed,
+        }
     }
-
-    /// Hands the session's peer's `message` to the actor, and runs a step.
-    fn deliver(&mut self, message: TxRelayMessage) {
-        self.actor.input(Input::Message {
-            key: 1,
-            message,
-            _permit: self
-                .budget
-                .clone()
-                .try_acquire_owned()
-                .expect("the budget is large"),
-        });
-        self.actor.apply_effects();
-        self.actor.flush_adverts();
-    }
-}
-
-/// Opens session `key` on connection 1 and returns its closer's cause and
-/// token, and its writers' queues.
-fn open(
-    actor: &mut Actor,
-    key: u64,
-) -> (
-    CloseCause,
-    CancellationToken,
-    mpsc::Receiver<Outgoing>,
-    mpsc::Receiver<Outgoing>,
-) {
-    let (data, data_recv) = mpsc::channel(DATA_QUEUE);
-    let (state, state_recv) = mpsc::channel(STATE_QUEUE);
-    let (close, cause, cancel) = closer();
-    actor.input(Input::Open {
-        key,
-        peer: PeerKey(1),
-        exempt: false,
-        data,
-        state,
-        close,
-        connection: (ZakuraPeerId::new(vec![1; 32]).expect("a valid id"), 1),
-    });
-    (cause, cancel, data_recv, state_recv)
 }
 
 /// A peer may have as many requests unanswered as our `Hello` serves. One
@@ -305,16 +276,17 @@ fn open(
 async fn a_request_past_our_hello_closes_the_peer() {
     let mut serving = Serving::new(MAX_SERVES + 1);
     let ids = serving.ids.clone();
+    let session = &mut serving.session;
     for id in &ids[..MAX_SERVES] {
-        serving.deliver(TxRelayMessage::GetTxs(*id));
+        session.deliver(TxRelayMessage::GetTxs(*id));
     }
     assert!(
-        !serving.cancel.is_cancelled(),
+        !session.cancel.is_cancelled(),
         "requests within the limit wait"
     );
-    serving.deliver(TxRelayMessage::GetTxs(ids[MAX_SERVES]));
-    assert!(serving.cancel.is_cancelled());
-    assert_eq!(serving.cause.get(), Some("tx-relay: too many requests"));
+    session.deliver(TxRelayMessage::GetTxs(ids[MAX_SERVES]));
+    assert!(session.cancel.is_cancelled());
+    assert_eq!(session.cause.get(), Some("tx-relay: too many requests"));
 }
 
 /// A request we would answer `NotFound` still needs a place, so with every
@@ -323,28 +295,32 @@ async fn a_request_past_our_hello_closes_the_peer() {
 async fn a_request_answered_not_found_counts_toward_the_limit() {
     let mut serving = Serving::new(MAX_SERVES);
     let ids = serving.ids.clone();
+    let session = &mut serving.session;
     for id in &ids {
-        serving.deliver(TxRelayMessage::GetTxs(*id));
+        session.deliver(TxRelayMessage::GetTxs(*id));
     }
     let unknown = transactions(MAX_SERVES + 1)
         .remove(MAX_SERVES)
         .transaction
         .id();
-    serving.deliver(TxRelayMessage::GetTxs(unknown));
-    assert_eq!(serving.cause.get(), Some("tx-relay: too many requests"));
+    session.deliver(TxRelayMessage::GetTxs(unknown));
+    assert_eq!(session.cause.get(), Some("tx-relay: too many requests"));
 }
 
 /// A session that replaces another on the same connection, even before the
 /// old one has ended, pays the same `Inv` bucket.
 #[tokio::test]
 async fn sessions_on_one_connection_share_one_inv_bucket() {
-    let mut serving = Serving::new(1);
-    let connection = (ZakuraPeerId::new(vec![1; 32]).expect("a valid id"), 1);
-    let _second = open(&mut serving.actor, 2);
-    assert_eq!(serving.actor.inv_buckets.len(), 1);
-    assert_eq!(serving.actor.inv_buckets[&connection].sessions, 2);
-    serving.actor.input(Input::Ended { key: 1 });
-    assert_eq!(serving.actor.inv_buckets[&connection].sessions, 1);
+    let serving = Serving::new(1);
+    let sessions = |wiring: &Wiring| {
+        let buckets = wiring.inv_buckets.lock().expect("never poisoned");
+        assert_eq!(buckets.len(), 1);
+        buckets[&connection()].sessions
+    };
+    let _second = Session::open(&serving.wiring);
+    assert_eq!(sessions(&serving.wiring), 2);
+    serving.session.routine.finish();
+    assert_eq!(sessions(&serving.wiring), 1);
 }
 
 /// A peer may not have one id outstanding twice, including while its first
@@ -353,10 +329,11 @@ async fn sessions_on_one_connection_share_one_inv_bucket() {
 async fn an_id_requested_again_while_its_job_waits_closes_the_peer() {
     let mut serving = Serving::new(1);
     let id = serving.ids[0];
-    serving.deliver(TxRelayMessage::GetTxs(id));
-    assert!(!serving.cancel.is_cancelled());
-    serving.deliver(TxRelayMessage::GetTxs(id));
-    assert_eq!(serving.cause.get(), Some("tx-relay: id requested twice"));
+    let session = &mut serving.session;
+    session.deliver(TxRelayMessage::GetTxs(id));
+    assert!(!session.cancel.is_cancelled());
+    session.deliver(TxRelayMessage::GetTxs(id));
+    assert_eq!(session.cause.get(), Some("tx-relay: id requested twice"));
 }
 
 /// A connection whose last session ended stays owned through the

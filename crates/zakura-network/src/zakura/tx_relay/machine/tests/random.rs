@@ -691,10 +691,7 @@ impl Run {
         assert_eq!(machine.waiters_len(), 0, "no body");
         assert_eq!(machine.reservations_held(), 0, "no reservation is left");
         let wanted = machine.wanted();
-        assert!(
-            wanted.len() == 0 && wanted.retries_len() == 0,
-            "no wanted entry is left"
-        );
+        assert_eq!(wanted.len(), 0, "no wanted entry is left");
         assert_eq!(machine.timers_len(), 0, "no timer is left");
         let reactor = machine.reactor();
         assert!(reactor.by_peer().is_empty() && reactor.go().is_empty());

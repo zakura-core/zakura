@@ -11,10 +11,7 @@
 //! the ids it holds again. A routine that fell behind the ring files every
 //! id it holds again.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
 use indexmap::IndexSet;
 use zakura_chain::transaction::UnminedTxId;
@@ -107,10 +104,10 @@ pub(crate) struct WantedIds {
     ring: VecDeque<UnminedTxId>,
     /// The ring position after its newest id.
     ring_end: u64,
-    /// Every retry time set, in order, for [`Self::next_wake`]. A later
-    /// change to the entry leaves the old time here, and readers check it.
-    retries: BTreeMap<(Time, u64), UnminedTxId>,
-    next_retry: u64,
+    /// Counts the times claims opened up: a backoff cleared, or its probe
+    /// permit came free. Any holder may claim again after one, and no id
+    /// goes on the ring for it, so the IO wakes every routine.
+    openings: u64,
 }
 
 /// What a routine reads from the ring.
@@ -296,8 +293,6 @@ impl WantedIds {
                 .map_or(RETRY_FIRST, |delay| delay.saturating_mul(2).min(RETRY_MAX));
             entry.retry_delay = Some(delay);
             entry.retry_at = now.saturating_add(delay);
-            self.next_retry = self.next_retry.saturating_add(1);
-            self.retries.insert((entry.retry_at, self.next_retry), id);
         }
         self.note(id);
         self.collect(id);
@@ -351,7 +346,9 @@ impl WantedIds {
             .as_mut()
             .filter(|backoff| backoff.generation == generation)
         {
-            backoff.probe = None;
+            if backoff.probe.take().is_some() {
+                self.openings = self.openings.wrapping_add(1);
+            }
         }
     }
 
@@ -386,7 +383,14 @@ impl WantedIds {
     /// The pool showed room: it granted a reservation, or a verdict freed a
     /// slot.
     pub(crate) fn room(&mut self) {
-        self.backoff = None;
+        if self.backoff.take().is_some() {
+            self.openings = self.openings.wrapping_add(1);
+        }
+    }
+
+    /// How many times claims opened up. See the field.
+    pub(crate) fn openings(&self) -> u64 {
+        self.openings
     }
 
     /// Starts a backoff of `delay` from `now`, with a fresh name and a free
@@ -476,32 +480,6 @@ impl WantedIds {
         self.current(id, generation)
             .is_some_and(|entry| entry.tried.contains(&peer))
     }
-
-    /// The earliest time after `now` that an entry's retry delay ends, over
-    /// every wanted entry.
-    pub(crate) fn next_wake(&self, now: Time) -> Option<Time> {
-        self.retries
-            .iter()
-            .find(|((at, _), id)| *at > now && self.retries_at(**id, *at))
-            .map(|((at, _), _)| *at)
-    }
-
-    /// Drops retry times that passed or no longer stand from the front.
-    pub(crate) fn drop_stale(&mut self, now: Time) {
-        while let Some(((at, _), id)) = self.retries.first_key_value() {
-            if *at > now && self.retries_at(*id, *at) {
-                break;
-            }
-            self.retries.pop_first();
-        }
-    }
-
-    /// Whether `id`'s entry still waits until `at` to retry.
-    fn retries_at(&self, id: UnminedTxId, at: Time) -> bool {
-        self.entries
-            .get(&id)
-            .is_some_and(|entry| entry.retry_at == at)
-    }
 }
 
 /// Read-only views for the machine's invariants.
@@ -516,17 +494,5 @@ impl WantedIds {
     pub(crate) fn probe(&self) -> Option<(SessionId, u64)> {
         let backoff = self.backoff?;
         Some((backoff.probe?, backoff.generation))
-    }
-
-    /// Whether [`Self::next_wake`] knows that `id` retries at `at`.
-    pub(crate) fn retry_indexed(&self, id: UnminedTxId, at: Time) -> bool {
-        self.retries
-            .range((at, 0)..=(at, u64::MAX))
-            .any(|(_, indexed)| *indexed == id)
-    }
-
-    /// How many retry times the wake-up index keeps, standing or not.
-    pub(crate) fn retries_len(&self) -> usize {
-        self.retries.len()
     }
 }

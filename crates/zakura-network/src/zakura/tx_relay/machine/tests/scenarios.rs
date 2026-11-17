@@ -604,6 +604,26 @@ fn a_full_pool_costs_one_probe_per_backoff_until_a_slot_comes_back() {
     assert_eq!(called(&bench), ids[1..].to_vec(), "room ends the backoff");
 }
 
+/// A grant to the probe ends the backoff for every session at once, though
+/// no id changed: a session that waited behind the probe claims as soon as
+/// the probe is granted, not at its next event.
+#[test]
+fn a_granted_probe_lets_every_session_claim_at_once() {
+    let mut bench = Bench::new();
+    let (probed, waiting) = (bench.id(0), bench.id(1));
+    let prober = bench.join(1);
+    bench.inv(prober, &[probed]);
+    let waiter = bench.join(2);
+    bench.inv(waiter, &[waiting]);
+    for (call, _) in bench.calls() {
+        bench.answer(call, Err(Unreserved::NoRoom));
+    }
+    bench.tick(NO_ROOM_FIRST);
+    assert_eq!(called(&bench), vec![probed], "one probe when it ends");
+    bench.grant(bench.call(probed));
+    assert!(bench.reserved(waiting), "the grant is room for everyone");
+}
+
 /// A stopped core ends claiming for good, whichever `Stopped` answer tells
 /// the machine: one to the reserve call of a session that ended is still
 /// the core's answer.

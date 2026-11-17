@@ -754,6 +754,7 @@ impl Submissions {
     }
 
     /// Whether `waiter` names one of these submissions.
+    #[cfg(test)]
     pub(crate) fn contains_waiter(&self, waiter: WaiterId) -> bool {
         self.by_waiter.contains_key(&waiter)
     }

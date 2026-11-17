@@ -22,7 +22,7 @@ use zakura_chain::{
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        chain_transitions, pool_port, AwaitOutputError, ChainReason, ChainTip, ChainTransition,
+        chain_transitions, pool_port, ChainReason, ChainTip, ChainTransition,
         ChainTransitionSender, ConnectedBlock, LocalFault, PoolHandle, PoolReader, RejectionScope,
         Unreserved, Verdict,
     },
@@ -518,51 +518,6 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
 }
 
 #[tokio::test]
-async fn an_output_wait_registered_first_is_answered_at_admission() {
-    let (parent, _) = parent_and_child();
-    let harness = Harness::start(std::slice::from_ref(&parent));
-    let outpoint = OutPoint {
-        hash: parent.id().mined_id(),
-        index: 1,
-    };
-
-    let wait = harness.handle.await_output(outpoint);
-    tokio::pin!(wait);
-    assert!(poll!(&mut wait).is_pending(), "nothing creates it yet");
-    harness.round_trip().await;
-
-    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
-    let output = tokio::time::timeout(ANSWER, wait)
-        .await
-        .expect("the wait is answered in time")
-        .expect("the admission answers it");
-    assert_eq!(
-        Some(&output),
-        parent.real.transaction.transaction().outputs().get(1)
-    );
-}
-
-#[tokio::test]
-async fn an_output_wait_after_admission_is_answered_at_once() {
-    let (parent, _) = parent_and_child();
-    let harness = Harness::start(std::slice::from_ref(&parent));
-    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
-
-    let output = harness
-        .handle
-        .await_output(OutPoint {
-            hash: parent.id().mined_id(),
-            index: 0,
-        })
-        .await
-        .expect("the pool holds the output");
-    assert_eq!(
-        Some(&output),
-        parent.real.transaction.transaction().outputs().first()
-    );
-}
-
-#[tokio::test]
 async fn a_block_that_mines_a_pooled_transaction_removes_it() {
     let (parent, child) = parent_and_child();
     let mut harness = Harness::start(&[parent.clone(), child.clone()]);
@@ -668,16 +623,6 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
         "{verdict:?}"
     );
     harness.snapshot_until(|snapshot| !snapshot.active).await;
-    assert!(matches!(
-        harness
-            .handle
-            .await_output(OutPoint {
-                hash: parent.id().mined_id(),
-                index: 0
-            })
-            .await,
-        Err(AwaitOutputError::Inactive)
-    ));
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@
 //! 2. It sends the answers to the commands it took, so no caller hears of a
 //!    change before readers can see it.
 //! 3. It does each step's effects in order: starts and cancels
-//!    verifications, sends verdicts, and answers output waiters.
+//!    verifications, and sends verdicts.
 //!
 //! The pool stays off until the chain names a real tip, whatever the
 //! activity signal says. A verifier the core owns reads the pool through a
@@ -37,11 +37,10 @@ use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, Height},
     transaction::UnminedTx,
-    transparent,
 };
 use zakura_node_services::mempool::port::{
-    AwaitOutputError, ChainEvent, ChainEvents, ChainStart, ChainTip, Generation, GenerationCell,
-    GenerationRead, LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
+    ChainEvent, ChainEvents, ChainStart, ChainTip, Generation, GenerationCell, GenerationRead,
+    LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
 };
 use zakura_rt::{
     collections::HashMap,
@@ -52,9 +51,7 @@ use zakura_rt::{
 
 use crate::{
     config::Config,
-    machine::{
-        Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, VerifyError, WaiterId,
-    },
+    machine::{Effect, JobId, Limits, MempoolState, Outcome, Step, VerifyError, WaiterId},
     storage::{SameEffectsTipRejectionError, StorageStats},
 };
 
@@ -138,8 +135,6 @@ pub struct PoolCore<E, V> {
     fetches: HashMap<ReservationId, CancellationToken>,
     /// Callers waiting for a verdict.
     verdicts: HashMap<WaiterId, oneshot::Sender<Verdict>>,
-    /// Callers waiting for an output.
-    outputs: HashMap<WaiterId, oneshot::Sender<Result<transparent::Output, AwaitOutputError>>>,
     published: Option<Published>,
     /// Steps taken and not yet carried out.
     steps: Vec<Step>,
@@ -237,7 +232,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             jobs: HashMap::default(),
             fetches: HashMap::default(),
             verdicts: HashMap::default(),
-            outputs: HashMap::default(),
             published: None,
             steps: Vec::new(),
             replies: Vec::new(),
@@ -346,35 +340,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             PoolCommand::Released(id) => {
                 self.fetches.remove(&id);
                 let step = self.machine.release(id, now);
-                self.finish(step);
-            }
-            PoolCommand::AwaitOutput { outpoint, reply } => {
-                let outputs = &self.outputs;
-                let mut closed = Vec::new();
-                let answer = self.machine.await_output(outpoint, now, |waiter| {
-                    let gone = outputs.get(&waiter).is_none_or(oneshot::Sender::is_closed);
-                    if gone {
-                        closed.push(waiter);
-                    }
-                    gone
-                });
-                for waiter in closed {
-                    self.outputs.remove(&waiter);
-                }
-                let answer = match answer {
-                    OutputAnswer::Ready(output) => Ok(output),
-                    OutputAnswer::Waiting(waiter) => {
-                        self.outputs.insert(waiter, reply);
-                        let step = self.machine.effects();
-                        return self.finish(step);
-                    }
-                    OutputAnswer::TooManyWaiters => Err(AwaitOutputError::TooManyWaiters),
-                    OutputAnswer::Inactive => Err(AwaitOutputError::Inactive),
-                };
-                self.reply(move || {
-                    let _ = reply.send(answer);
-                });
-                let step = self.machine.effects();
                 self.finish(step);
             }
             PoolCommand::RejectedIds { ids, reply } => {
@@ -511,16 +476,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 Effect::Verdict { waiter, verdict } => {
                     if let Some(reply) = self.verdicts.remove(&waiter) {
                         let _ = reply.send(verdict);
-                    }
-                }
-                Effect::OutputReady { waiter, output, .. } => {
-                    if let Some(reply) = self.outputs.remove(&waiter) {
-                        let _ = reply.send(Ok(output));
-                    }
-                }
-                Effect::OutputWaitEnded(waiter) => {
-                    if let Some(reply) = self.outputs.remove(&waiter) {
-                        let _ = reply.send(Err(AwaitOutputError::Inactive));
                     }
                 }
             }

@@ -36,7 +36,7 @@ use zakura_node_services::{
 use zakura_rt::collections::HashSet;
 
 use self::tracker::Tracker;
-use super::{Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, WaiterId};
+use super::{Effect, JobId, Limits, MempoolState, Outcome, Step, WaiterId};
 use crate::{config::Config, storage::RejectionError, Instant};
 
 mod random;
@@ -82,15 +82,6 @@ impl Tx {
             .transaction()
             .spent_outpoints()
             .collect()
-    }
-
-    /// Its output at `index`.
-    pub(crate) fn output(&self, index: u32) -> Option<&transparent::Output> {
-        self.real
-            .transaction
-            .transaction()
-            .outputs()
-            .get(usize::try_from(index).expect("a small index"))
     }
 
     /// The outpoint of its output at `index`.
@@ -500,17 +491,6 @@ impl Bench {
             .activate(self.tip(), Generation(self.generation), self.at());
         let step = self.machine.effects();
         self.took(step)
-    }
-
-    /// Waits for `outpoint`. Returns the answer, and what else the input
-    /// caused.
-    fn await_output(&mut self, outpoint: OutPoint) -> (OutputAnswer, Step) {
-        let answer = self.machine.await_output(outpoint, self.at(), |_| false);
-        if let OutputAnswer::Waiting(waiter) = &answer {
-            self.tracker.waits_for_output(*waiter);
-        }
-        let step = self.machine.effects();
-        (answer, self.took(step))
     }
 
     /// The members of `txs` a cached rejection covers.

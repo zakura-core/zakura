@@ -25,15 +25,14 @@ use tokio::task::JoinHandle;
 use zakura_chain::{
     block::Height,
     transaction::{self, UnminedTx, UnminedTxId},
-    transparent::{self, OutPoint},
+    transparent::OutPoint,
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        chain_transitions, pool_port, AwaitOutputError, ChainTip, ChainTransition,
-        ChainTransitionSender, Change, ChangeSeq, ChangesSince, Charge, ConnectedBlock, Generation,
-        GenerationCell, GenerationRead, PoolHandle, PoolSnapshot, Reservation, ReservationId,
-        Verdict,
+        chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
+        ChangeSeq, ChangesSince, Charge, ConnectedBlock, Generation, GenerationCell,
+        GenerationRead, PoolHandle, PoolSnapshot, Reservation, ReservationId, Verdict,
     },
 };
 use zakura_rt::{
@@ -47,7 +46,7 @@ use crate::{
     io::{PoolCore, Verifier},
     machine::{
         tests::{build, tip, TestVerifyError, Tx},
-        Effect, JobId, Limits, MempoolState, Outcome, OutputAnswer, Step, WaiterId,
+        Effect, JobId, Limits, MempoolState, Outcome, Step, WaiterId,
     },
     storage::{ExactTipRejectionError, RejectionError},
 };
@@ -155,12 +154,6 @@ struct Mirror {
     at: String,
     verdicts: HashMap<WaiterId, JoinHandle<Verdict>>,
     due_verdicts: Vec<(WaiterId, Verdict)>,
-    outputs: HashMap<WaiterId, JoinHandle<Result<transparent::Output, AwaitOutputError>>>,
-    #[allow(clippy::type_complexity)]
-    due_outputs: Vec<(
-        JoinHandle<Result<transparent::Output, AwaitOutputError>>,
-        Result<transparent::Output, AwaitOutputError>,
-    )>,
 }
 
 impl Mirror {
@@ -250,8 +243,6 @@ impl Mirror {
             at: String::new(),
             verdicts: HashMap::default(),
             due_verdicts: Vec::new(),
-            outputs: HashMap::default(),
-            due_outputs: Vec::new(),
         }
     }
 
@@ -274,21 +265,6 @@ impl Mirror {
                     self.cancelled_fetches.insert(reservation);
                 }
                 Effect::Verdict { waiter, verdict } => self.due_verdicts.push((waiter, verdict)),
-                Effect::OutputReady { waiter, output, .. } => {
-                    let task = self
-                        .outputs
-                        .remove(&waiter)
-                        .expect("the machine answers an output wait the test made");
-                    self.due_outputs.push((task, Ok(output)));
-                }
-                Effect::OutputWaitEnded(waiter) => {
-                    let task = self
-                        .outputs
-                        .remove(&waiter)
-                        .expect("the machine ends an output wait the test made");
-                    self.due_outputs
-                        .push((task, Err(AwaitOutputError::Inactive)));
-                }
             }
         }
     }
@@ -344,7 +320,6 @@ impl Mirror {
                 .get(waiter)
                 .is_some_and(JoinHandle::is_finished)
         });
-        let outputs = self.due_outputs.iter().all(|(task, _)| task.is_finished());
         let logged: usize = self.log.iter().map(Vec::len).sum();
         let published = self.handle.snapshot().is_some_and(|snapshot| {
             (
@@ -359,7 +334,7 @@ impl Mirror {
                 Some(logged),
             )
         });
-        started && cancelled && verdicts && outputs && published
+        started && cancelled && verdicts && published
     }
 
     /// Ends one input: gives the machine any deadline already due, as the
@@ -431,24 +406,6 @@ impl Mirror {
         }
         for task in self.verdicts.values() {
             assert!(!task.is_finished(), "{what}: an undecided submission waits");
-        }
-        for (task, answer) in std::mem::take(&mut self.due_outputs) {
-            assert!(
-                task.is_finished(),
-                "{what}: an output answer reaches its caller"
-            );
-            let got = task.await.expect("the output wait does not panic");
-            assert_eq!(
-                format!("{got:?}"),
-                format!("{answer:?}"),
-                "{what}: an output"
-            );
-        }
-        for task in self.outputs.values() {
-            assert!(
-                !task.is_finished(),
-                "{what}: an unanswered output wait waits"
-            );
         }
         for (_, reservation) in &self.held {
             assert_eq!(
@@ -568,29 +525,6 @@ impl Mirror {
         let handle = self.handle.clone();
         let task = tokio::spawn(async move { handle.submit(reservation, body).await });
         self.verdicts.insert(waiter, task);
-        self.absorb(step);
-    }
-
-    /// Waits for `outpoint` to be created.
-    fn await_output(&mut self, outpoint: OutPoint) {
-        let answer = self
-            .reference
-            .await_output(outpoint, Instant::now(), |_| false);
-        let handle = self.handle.clone();
-        let task = tokio::spawn(async move { handle.await_output(outpoint).await });
-        match answer {
-            OutputAnswer::Waiting(waiter) => {
-                self.outputs.insert(waiter, task);
-            }
-            OutputAnswer::Ready(output) => self.due_outputs.push((task, Ok(output))),
-            OutputAnswer::TooManyWaiters => self
-                .due_outputs
-                .push((task, Err(AwaitOutputError::TooManyWaiters))),
-            OutputAnswer::Inactive => self
-                .due_outputs
-                .push((task, Err(AwaitOutputError::Inactive))),
-        }
-        let step = self.reference.effects();
         self.absorb(step);
     }
 
@@ -810,20 +744,7 @@ impl Mirror {
                 self.resync();
                 self.compare("a resync").await;
             }
-            84..=87 => {
-                let outputs = self.txs[any_tx]
-                    .real
-                    .transaction
-                    .transaction()
-                    .outputs()
-                    .len();
-                self.await_output(OutPoint {
-                    hash: self.txs[any_tx].id().mined_id(),
-                    index: u32::try_from(dice.below(outputs.max(1))).expect("few outputs"),
-                });
-                self.compare("an output wait").await;
-            }
-            88..=91 => {
+            84..=91 => {
                 let ids: HashSet<UnminedTxId> = (0..3)
                     .map(|_| self.txs[dice.below(self.txs.len())].id())
                     .collect();

@@ -34,11 +34,8 @@ use zakura_chain::{
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    port::{
-        AwaitOutputError, Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved,
-        Verdict,
-    },
-    CreatedOrSpent, Gossip, MempoolDisabledError, QueueSource, Request, Response,
+    port::{Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved, Verdict},
+    CreatedOrSpent, Gossip, MempoolDisabledError, OutputNotInPool, QueueSource, Request, Response,
 };
 
 use crate::BoxError;
@@ -52,7 +49,6 @@ use super::{
             MAX_INBOUND_CONCURRENCY_PER_PEER,
         },
         peer_cooldown::PeerCooldowns,
-        pending_outputs::PendingOutputsFull,
         queue_source_log_label, start_peer_cooldown,
         storage::NonStandardTransactionError,
         ExactTipRejectionError, MempoolError, Outbound, ReadState, SameEffectsChainRejectionError,
@@ -540,11 +536,12 @@ async fn answer(
                     .unwrap_or_default(),
             }
         }
-        Request::AwaitOutput(outpoint) => match shared.handle.await_output(outpoint).await {
-            Ok(output) => Response::UnspentOutput(output),
-            Err(AwaitOutputError::TooManyWaiters) => return Err(PendingOutputsFull.into()),
-            Err(AwaitOutputError::Inactive) => return Err(MempoolDisabledError.into()),
-            Err(AwaitOutputError::Stopped) => return Err("the pool core has stopped".into()),
+        // Nothing waits for an output here. The transaction verifier is the
+        // one caller of this request, and it has a handle of its own that
+        // answers at once, as this does.
+        Request::AwaitOutput(outpoint) => match snapshot.created_output(&outpoint) {
+            Some(output) => Response::UnspentOutput(output.clone()),
+            None => return Err(OutputNotInPool.into()),
         },
         Request::FullTransactions => Response::FullTransactions {
             transactions: snapshot.transactions.clone(),

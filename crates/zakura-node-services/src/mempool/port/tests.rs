@@ -5,7 +5,6 @@ use std::time::Duration;
 use zakura_chain::{
     block::Height,
     transaction::{self, UnminedTxId},
-    transparent::OutPoint,
 };
 
 use super::{
@@ -63,13 +62,6 @@ fn snapshot_at(last_change: ChangeSeq) -> PoolSnapshot {
         Vec::new(),
         TransactionDependencies::default(),
     )
-}
-
-fn output(parent: u16, index: u32) -> OutPoint {
-    OutPoint {
-        hash: hash(parent),
-        index,
-    }
 }
 
 #[test]
@@ -303,21 +295,4 @@ fn a_snapshot_says_whether_the_pool_is_on() {
     let off = PoolSnapshot::inactive(tip, Generation(0), ChangeSeq(0));
     assert!(!off.active);
     assert!(off.transactions.is_empty());
-}
-
-#[tokio::test]
-async fn a_caller_that_stops_waiting_for_an_output_closes_its_reply() {
-    let (handle, mut inbox) = pool_port();
-    let caller = tokio::spawn(async move { handle.await_output(output(1, 0)).await });
-    let Some(PoolCommand::AwaitOutput { reply, .. }) = inbox.next().await else {
-        panic!("the wait reaches the core");
-    };
-    assert!(!reply.is_closed());
-
-    // The caller is cancelled. The core can see that on the reply it
-    // holds, which is how it drops the waiter before the limit refuses
-    // someone who is still there.
-    caller.abort();
-    assert!(caller.await.expect_err("aborted").is_cancelled());
-    assert!(reply.is_closed());
 }

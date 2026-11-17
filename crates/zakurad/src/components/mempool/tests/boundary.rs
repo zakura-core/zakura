@@ -696,9 +696,27 @@ async fn empty_active_pool_answers_each_query_as_today(mode: Mode) {
         Response::CheckedForVerifiedTransactions
     ));
 
-    // A wait for an output nobody created stays open.
-    let wait = harness.start_call(Request::AwaitOutput(outpoint)).await;
-    assert!(timeout(SILENCE, wait).await.is_err());
+    match mode {
+        // A wait for an output nobody created stays open.
+        Mode::Classic => {
+            let wait = harness.start_call(Request::AwaitOutput(outpoint)).await;
+            assert!(timeout(SILENCE, wait).await.is_err());
+        }
+        // The core does not wait. Its one caller, the transaction verifier,
+        // is answered at once, as its own pool handle answers it.
+        Mode::Core => {
+            let error = harness
+                .call(Request::AwaitOutput(outpoint))
+                .await
+                .expect_err("nothing in the pool creates the output");
+            assert!(
+                error
+                    .downcast_ref::<zakura_node_services::mempool::OutputNotInPool>()
+                    .is_some(),
+                "{error:?}"
+            );
+        }
+    }
 }
 
 async fn admitted_body_is_served_by_every_query(mode: Mode) {
@@ -708,15 +726,23 @@ async fn admitted_body_is_served_by_every_query(mode: Mode) {
     let outpoint = first_output(&sample);
     let output = sample.transaction.transaction().outputs()[0].clone();
 
-    // A waiter registered before the admission is answered by it.
-    let waiter = tokio::spawn(harness.start_call(Request::AwaitOutput(outpoint)).await);
+    // Today's pool answers a waiter registered before the admission when the
+    // transaction is admitted. The core does not hold waiters.
+    let waiter = match mode {
+        Mode::Classic => Some(tokio::spawn(
+            harness.start_call(Request::AwaitOutput(outpoint)).await,
+        )),
+        Mode::Core => None,
+    };
     harness.admit(&sample).await;
-    let answer = timeout(ANSWER_WAIT, waiter)
-        .await
-        .expect("the waiter is answered at admission")
-        .expect("the waiter task does not panic")
-        .expect("the waiter gets the output");
-    assert!(matches!(answer, Response::UnspentOutput(answered) if answered == output));
+    if let Some(waiter) = waiter {
+        let answer = timeout(ANSWER_WAIT, waiter)
+            .await
+            .expect("the waiter is answered at admission")
+            .expect("the waiter task does not panic")
+            .expect("the waiter gets the output");
+        assert!(matches!(answer, Response::UnspentOutput(answered) if answered == output));
+    }
 
     // A wait for an output already in the pool is answered at once.
     let answer = timeout(ANSWER_WAIT, harness.call(Request::AwaitOutput(outpoint)))
@@ -1350,10 +1376,8 @@ async fn a_body_mined_while_it_is_verified_is_answered_as_cancelled(mode: Mode) 
 }
 
 /// Today's pool only. Its waits register when the request is called, so the
-/// test can hold 65,536 of them without polling. The core's register when
-/// the call is first polled, and the core drops abandoned waits before it
-/// refuses a new outpoint, which is a difference made on purpose: see the
-/// port's `PoolCommand::AwaitOutput`.
+/// test can hold 65,536 of them without polling. The core holds no waits: it
+/// answers an output lookup at once, from its snapshot.
 async fn output_waits_are_limited_to_distinct_outpoints(mode: Mode) {
     if mode == Mode::Core {
         return;

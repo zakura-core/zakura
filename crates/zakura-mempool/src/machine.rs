@@ -35,13 +35,13 @@ use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
     transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
-    transparent::{self, OutPoint},
+    transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, ChainTransition, Change, ChangeSeq, Charge, Generation, GenerationRead,
     LocalFault, PoolSnapshot, Rejection, RejectionDetail, RejectionScope, RemovalReason,
-    ReservationId, Unreserved, Verdict, MAX_OUTPUT_WAITS, MAX_PENDING, MAX_REVALIDATING,
-    MAX_UNDECIDED, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+    ReservationId, Unreserved, Verdict, MAX_PENDING, MAX_REVALIDATING, MAX_UNDECIDED,
+    REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -138,18 +138,6 @@ pub enum Effect {
         /// Its verdict.
         verdict: Verdict,
     },
-    /// Answer a caller waiting for an output, with the output a transaction
-    /// that just became visible creates.
-    OutputReady {
-        /// The waiting caller.
-        waiter: WaiterId,
-        /// The outpoint it waited for.
-        outpoint: OutPoint,
-        /// The output.
-        output: transparent::Output,
-    },
-    /// Tell a caller waiting for an output that the pool turned off.
-    OutputWaitEnded(WaiterId),
 }
 
 /// What one input caused, in order.
@@ -175,19 +163,6 @@ impl Step {
             _ => None,
         })
     }
-}
-
-/// The answer to [`MempoolState::await_output`].
-#[derive(Clone, Debug)]
-pub enum OutputAnswer {
-    /// A visible pooled transaction creates the output.
-    Ready(transparent::Output),
-    /// Nothing visible creates it. The caller waits under this name.
-    Waiting(WaiterId),
-    /// Too many distinct outpoints are being waited on.
-    TooManyWaiters,
-    /// The pool is off.
-    Inactive,
 }
 
 /// The machine's limits. Production uses the port's constants. Tests use
@@ -417,8 +392,6 @@ pub struct MempoolState<E> {
     children: HashMap<transaction::Hash, BTreeMap<u64, transaction::Hash>>,
     /// Each job, with the event count when it started.
     jobs: HashMap<JobId, (JobTarget, u64)>,
-    /// Callers waiting for an output, by outpoint, in the order they came.
-    output_waiters: HashMap<OutPoint, Vec<WaiterId>>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
     /// so this is the log position of the last one.
     logged: u64,
@@ -450,7 +423,6 @@ impl<E: VerifyError> MempoolState<E> {
             hidden_cost: 0,
             children: HashMap::default(),
             jobs: HashMap::default(),
-            output_waiters: HashMap::default(),
             logged: 0,
             step: Step::default(),
         }
@@ -770,58 +742,6 @@ impl<E: VerifyError> MempoolState<E> {
         self.take_step()
     }
 
-    /// Wait for a visible pooled transaction to create `outpoint`. The lookup
-    /// and the registration are one input, so no admission can fall between
-    /// them. What else this caused is in [`Self::effects`].
-    ///
-    /// `closed` says which earlier waiters have stopped waiting. Those for
-    /// `outpoint` are dropped before this one registers, and all of them are
-    /// dropped before a new outpoint is refused for the limit.
-    pub fn await_output(
-        &mut self,
-        outpoint: OutPoint,
-        now: Instant,
-        mut closed: impl FnMut(WaiterId) -> bool,
-    ) -> OutputAnswer {
-        self.enter(now);
-        self.start_revalidations();
-        if !self.active {
-            return OutputAnswer::Inactive;
-        }
-        if let Some(output) = self.storage.created_output(&outpoint) {
-            return OutputAnswer::Ready(output);
-        }
-        if let Some(waiters) = self.output_waiters.get_mut(&outpoint) {
-            waiters.retain(|waiter| !closed(*waiter));
-        }
-        if !self.output_waiters.contains_key(&outpoint)
-            && self.output_waiters.len() >= MAX_OUTPUT_WAITS
-        {
-            self.output_waiters.retain(|_, waiters| {
-                waiters.retain(|waiter| !closed(*waiter));
-                !waiters.is_empty()
-            });
-            if self.output_waiters.len() >= MAX_OUTPUT_WAITS {
-                return OutputAnswer::TooManyWaiters;
-            }
-        }
-        let waiter = WaiterId(self.fresh());
-        self.output_waiters
-            .entry(outpoint)
-            .or_default()
-            .push(waiter);
-        OutputAnswer::Waiting(waiter)
-    }
-
-    /// A caller stopped waiting for an output. Its place no longer counts
-    /// toward the limit.
-    pub fn cancel_output_wait(&mut self, waiter: WaiterId) {
-        self.output_waiters.retain(|_, waiters| {
-            waiters.retain(|waiting| *waiting != waiter);
-            !waiters.is_empty()
-        });
-    }
-
     /// The node fell far behind the tip. Every undecided submission gets a
     /// verdict, and the pool empties.
     pub fn deactivate(&mut self, now: Instant) -> Step {
@@ -853,16 +773,6 @@ impl<E: VerifyError> MempoolState<E> {
             "storage held only the pool"
         );
         debug_assert_eq!(self.hidden_cost, 0, "every hidden transaction was removed");
-        // Nobody is left waiting on a pool that is off.
-        let mut waiting: Vec<WaiterId> = self
-            .output_waiters
-            .drain()
-            .flat_map(|(_, waiters)| waiters)
-            .collect();
-        waiting.sort();
-        self.step
-            .effects
-            .extend(waiting.into_iter().map(Effect::OutputWaitEnded));
         self.active = false;
         self.take_step()
     }
@@ -892,8 +802,8 @@ impl<E: VerifyError> MempoolState<E> {
     /// What the last input that answers its caller caused beside its answer:
     /// the verdicts of deadlines it found due, and the jobs it started. The
     /// caller takes this straight after [`Self::reserve`],
-    /// [`Self::await_output`], [`Self::rejected_ids`] and
-    /// [`Self::activate`]. The next input panics if it was not taken.
+    /// [`Self::rejected_ids`] and [`Self::activate`]. The next input panics
+    /// if it was not taken.
     pub fn effects(&mut self) -> Step {
         self.take_step()
     }
@@ -1503,7 +1413,6 @@ impl<E: VerifyError> MempoolState<E> {
                     },
                 );
                 self.pooled.insert(hash, pool_key);
-                self.offer_outputs(tx.transaction.transaction(), hash);
                 self.decide(key, Verdict::Admitted);
                 self.wake(hash);
             }
@@ -1656,8 +1565,6 @@ impl<E: VerifyError> MempoolState<E> {
                     id: tx_id,
                     hidden_at,
                 });
-                // Its outputs are available again, to waiters as well.
-                self.offer_outputs(tx.transaction.transaction(), hash);
                 self.wake(hash);
             }
             // A block the core never saw mined it. Its dependents stay and are
@@ -1848,22 +1755,6 @@ impl<E: VerifyError> MempoolState<E> {
             .unwrap_or_default();
         for key in parked {
             self.set_hidden(key, Some(Hidden::Queued));
-        }
-    }
-
-    /// The outputs of `tx`, which just became visible, are available. Every
-    /// caller waiting for one of them is answered, in the order the callers
-    /// came, in this step.
-    fn offer_outputs(&mut self, tx: &Transaction, hash: transaction::Hash) {
-        for (index, output) in tx.outputs().iter().enumerate() {
-            let outpoint = OutPoint::from_usize(hash, index);
-            for waiter in self.output_waiters.remove(&outpoint).unwrap_or_default() {
-                self.step.effects.push(Effect::OutputReady {
-                    waiter,
-                    outpoint,
-                    output: output.clone(),
-                });
-            }
         }
     }
 

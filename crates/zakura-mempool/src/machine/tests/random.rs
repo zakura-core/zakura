@@ -32,7 +32,7 @@ use zakura_rt::collections::HashSet;
 use super::{build, twin, Bench, TestVerifyError, Tx, START};
 use crate::{
     config::Config,
-    machine::{Effect, JobId, Limits, Outcome, OutputAnswer, Step},
+    machine::{Effect, JobId, Limits, Outcome, Step},
     storage::{
         ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
         SameEffectsTipRejectionError,
@@ -206,22 +206,6 @@ impl Run {
                         self.to_drop.push(held.id);
                     }
                 }
-                // A waiter gets the output it asked for.
-                Effect::OutputReady {
-                    outpoint, output, ..
-                } => {
-                    let creator = self
-                        .txs
-                        .iter()
-                        .find(|tx| tx.id().mined_id() == outpoint.hash)
-                        .expect("an output comes from a transaction of the universe");
-                    assert_eq!(
-                        Some(output),
-                        creator.output(outpoint.index),
-                        "step {}: the output a waiter gets",
-                        self.steps
-                    );
-                }
                 _ => {}
             }
         }
@@ -240,8 +224,7 @@ impl Run {
             9 => self.drop_held(),
             10..=13 => self.outcome(),
             14 => self.transition(),
-            15 => self.tick(),
-            16 => self.await_output(),
+            15..=16 => self.tick(),
             17..=18 => self.rejected_ids(),
             _ => self.toggle(),
         }
@@ -518,45 +501,6 @@ impl Run {
         self.took("tick", &step);
     }
 
-    fn await_output(&mut self) {
-        // Sometimes a caller stops waiting.
-        let waiting = self.bench.tracker.output_waiters();
-        if !waiting.is_empty() && chance(&mut self.rng, 3) {
-            let waiter = waiting[pick(&mut self.rng, waiting.len())];
-            self.bench.machine.cancel_output_wait(waiter);
-            self.bench.tracker.left_output_wait(waiter);
-        }
-        let tx = self.txs[pick(&mut self.rng, self.txs.len())].clone();
-        let outpoint = tx.outpoint(u32::try_from(pick(&mut self.rng, 2)).expect("a small index"));
-        let (answer, step) = self.bench.await_output(outpoint);
-        self.took("await_output", &step);
-        match &answer {
-            OutputAnswer::Ready(output) => {
-                assert_eq!(
-                    Some(output),
-                    tx.output(outpoint.index),
-                    "step {}: the output a caller gets",
-                    self.steps
-                );
-                assert!(
-                    self.bench
-                        .tracker
-                        .visible_effects()
-                        .contains(&outpoint.hash),
-                    "an output of a transaction that is not visible"
-                );
-            }
-            OutputAnswer::Inactive => {
-                assert!(!self.active, "the pool is on and answered that it is off")
-            }
-            OutputAnswer::Waiting(_) | OutputAnswer::TooManyWaiters => {}
-        }
-        assert!(
-            self.active || matches!(answer, OutputAnswer::Inactive),
-            "a pool that is off answered {answer:?}"
-        );
-    }
-
     fn rejected_ids(&mut self) {
         let txs: Vec<Tx> = self.txs.clone();
         let all: Vec<&Tx> = txs.iter().collect();
@@ -693,8 +637,6 @@ fn random_runs_keep_the_invariants_and_drain() {
             "start revalidation",
             "cancel",
             "cancel fetch",
-            "output ready",
-            "output wait ended",
             "removed Mined",
             "removed Conflicted",
             "removed Expired",

@@ -36,8 +36,6 @@ pub(crate) struct Tracker {
     /// Every waiter a submission was given, with its transaction, and
     /// whether it has its verdict.
     waiters: BTreeMap<u64, (UnminedTxId, bool)>,
-    /// Callers waiting for an output.
-    output_waiters: BTreeSet<u64>,
     /// Every job the machine ever started.
     started: HashSet<u64>,
     /// The running jobs, with their transaction and whether each is a
@@ -81,19 +79,6 @@ impl Tracker {
         );
     }
 
-    /// A caller waits for an output as `waiter`.
-    pub(crate) fn waits_for_output(&mut self, waiter: WaiterId) {
-        assert!(
-            !self.waiters.contains_key(&waiter.0) && self.output_waiters.insert(waiter.0),
-            "{waiter:?} names two callers"
-        );
-    }
-
-    /// The caller waiting for an output as `waiter` stopped waiting.
-    pub(crate) fn left_output_wait(&mut self, waiter: WaiterId) {
-        self.output_waiters.remove(&waiter.0);
-    }
-
     /// The test is about to answer `job`. `charge` is the charge a failing
     /// answer carries, given only when the test knows the answer is not
     /// stale.
@@ -128,11 +113,6 @@ impl Tracker {
     /// Jobs the machine cancelled and the test has not answered since.
     pub(crate) fn cancelled(&self) -> &[(u64, UnminedTxId)] {
         &self.cancelled
-    }
-
-    /// Callers still waiting for an output, oldest first.
-    pub(crate) fn output_waiters(&self) -> Vec<WaiterId> {
-        self.output_waiters.iter().copied().map(WaiterId).collect()
     }
 
     /// The effects of the visible pool, as the log describes it.
@@ -213,20 +193,6 @@ impl Tracker {
                         Verdict::LocalFault(fault) => format!("verdict LocalFault({fault:?})"),
                     };
                     self.saw(kind);
-                }
-                Effect::OutputReady { waiter, .. } => {
-                    assert!(
-                        self.output_waiters.remove(&waiter.0),
-                        "an output for {waiter:?}, who is not waiting for one"
-                    );
-                    self.saw("output ready");
-                }
-                Effect::OutputWaitEnded(waiter) => {
-                    assert!(
-                        self.output_waiters.remove(&waiter.0),
-                        "{waiter:?} was told to stop waiting but is not waiting"
-                    );
-                    self.saw("output wait ended");
                 }
             }
         }

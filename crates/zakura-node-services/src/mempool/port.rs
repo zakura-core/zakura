@@ -106,10 +106,6 @@ pub const T_PARK: Duration = Duration::from_secs(60);
 /// fetch's caller submits or drops, and is that caller's to bound.
 pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
 
-/// The most distinct outpoints callers can wait for at once. Today's
-/// `MAX_PENDING_OUTPUTS`.
-pub const MAX_OUTPUT_WAITS: usize = 65_536;
-
 /// The first wait before a revalidation that hit a local fault is tried
 /// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
 pub const REVALIDATE_RETRY: Duration = Duration::from_secs(1);
@@ -320,17 +316,6 @@ pub enum Verdict {
     NoRoom,
     /// A failure on this node.
     LocalFault(LocalFault),
-}
-
-/// Why [`PoolHandle::await_output`] cannot wait.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AwaitOutputError {
-    /// Too many outpoints are being waited on.
-    TooManyWaiters,
-    /// The pool is off.
-    Inactive,
-    /// The core has stopped.
-    Stopped,
 }
 
 /// A stable number for the best chain as state readers see it.
@@ -739,25 +724,6 @@ pub enum PoolCommand {
     },
     /// [`PoolHandle::fetch_failed`]. The reservation is still armed.
     FetchFailed(Reservation),
-    /// [`PoolHandle::await_output`]. The core looks the output up and, if it
-    /// is missing, registers the waiter, in one step of its task. So an
-    /// admission cannot fall between the lookup and the registration.
-    ///
-    /// A caller that stops waiting drops its end, which closes `reply`. The
-    /// core does not keep closed replies without bound. It drops the closed
-    /// ones for an outpoint whenever it registers another waiter for that
-    /// outpoint, and all of them before it refuses a new outpoint for the
-    /// limit. Today's pool drops them only on its prune cadence, so it can
-    /// refuse while every entry is abandoned. Here callers that left cannot
-    /// fill the limit, and one outpoint waited for and abandoned many times
-    /// holds one entry.
-    AwaitOutput {
-        /// The outpoint.
-        outpoint: transparent::OutPoint,
-        /// Where the output goes when a transaction that creates it is
-        /// admitted, or the reason the core will not wait.
-        reply: oneshot::Sender<Result<transparent::Output, AwaitOutputError>>,
-    },
     /// A reservation was dropped before the core accepted it. No caller
     /// sends this. [`PoolInbox::next`] yields it.
     Released(ReservationId),
@@ -917,20 +883,6 @@ impl PoolHandle {
             .commands
             .send(PoolCommand::FetchFailed(reservation))
             .await;
-    }
-
-    /// Wait for a pool transaction to create `outpoint`. Answers at once if
-    /// one already has.
-    pub async fn await_output(
-        &self,
-        outpoint: transparent::OutPoint,
-    ) -> Result<transparent::Output, AwaitOutputError> {
-        let (reply, answer) = oneshot::channel();
-        let command = PoolCommand::AwaitOutput { outpoint, reply };
-        if self.commands.send(command).await.is_err() {
-            return Err(AwaitOutputError::Stopped);
-        }
-        answer.await.unwrap_or(Err(AwaitOutputError::Stopped))
     }
 
     /// The members of `ids` that a cached rejection covers. Takes no slot

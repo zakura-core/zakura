@@ -762,6 +762,56 @@ fn a_cooldown_stops_its_supplier_only_and_a_second_one_closes_it() {
     assert_eq!(bench.closes(), vec![(supplier, repeated)]);
 }
 
+/// A peer whose bodies earn cooldowns gets no more of them verified per
+/// cooldown than it had out, at most five: the first cooldown stops new asks
+/// of the peer id, the bodies still on the wire are dropped unread, a body
+/// already at the pool adds no strike, and a reconnect is asked nothing until
+/// the cooldown ends.
+#[test]
+fn a_cooling_peer_gets_no_more_bodies_verified_than_it_had_out() {
+    let mut bench = Bench::new();
+    let cooldown = bench.rejection(RejectionScope::ExactTip, Charge::Cooldown);
+    let session = bench.join(1);
+    let ids: Vec<UnminedTxId> = (0..10).map(|n| bench.id(n)).collect();
+    bench.inv(session, &ids);
+    let out = called(&bench);
+    assert_eq!(out.len(), MAX_REQUESTS_PER_PEER, "its limit is out");
+    for id in &out {
+        bench.fetch(session, *id);
+    }
+    let body = |bench: &Bench, id: UnminedTxId| {
+        let n = ids
+            .iter()
+            .position(|of| *of == id)
+            .expect("an announced id");
+        bench.tx(u32::try_from(n).expect("a small index"))
+    };
+    let mut waiters = Vec::new();
+    for id in &out[..2] {
+        assert!(bench.deliver(session, *id, body(&bench, *id)));
+        waiters.push(bench.submitted().expect("a read body goes to the pool"));
+    }
+    bench.verdict(waiters[0], cooldown);
+    for id in &out[2..] {
+        let read = bench.deliver(session, *id, body(&bench, *id));
+        assert!(!read, "a body still on the wire is dropped unread");
+    }
+    bench.verdict(waiters[1], cooldown);
+    assert!(
+        bench.closes().is_empty(),
+        "a body at the pool adds no strike"
+    );
+
+    bench.end(session);
+    let session = bench.join(1);
+    bench.tick(BASE_COOLDOWN - MS);
+    bench.inv(session, &ids);
+    assert!(bench.calls().is_empty(), "the peer id still cools");
+    bench.tick(MS);
+    bench.inv(session, &ids);
+    assert_eq!(called(&bench).len(), MAX_REQUESTS_PER_PEER, "its next five");
+}
+
 /// A body from an unconditional peer's session is never charged: a `Ban`
 /// closes nothing and a `Cooldown` leaves the peer heard. That holds when
 /// the verdict comes after the supplying session ended, and the peer's next

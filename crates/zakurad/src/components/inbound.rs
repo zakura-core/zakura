@@ -229,7 +229,7 @@ async fn block_by_hash_or_pending(
     hash: block::Hash,
 ) -> Result<Option<ServedBlock>, zn::BoxError> {
     if let Some(block) = pending_blocks.get_for_peer(hash) {
-        return Ok(Some(block.into()));
+        return Ok(Some(block));
     }
 
     let response = state

@@ -38,7 +38,7 @@ pub enum MachineStep {
     DecodedRetention(DecodedRetentionStep),
     /// Header reactor scheduling and locator policy, checked by its invariants.
     HeaderReactor(HeaderReactorStep),
-    /// Reactor query and view policy and its independent model.
+    /// Reactor query and view policy, checked against the inputs it was sent.
     Reactor(ReactorStep),
     /// The real discovery book's view and its signed samples.
     DiscoveryBook(BookStep),
@@ -705,7 +705,7 @@ pub enum ReactorAction {
     },
 }
 
-/// Reactor state, read from production or derived by the model.
+/// Reactor state, read from production.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReactorView {
@@ -725,8 +725,6 @@ pub struct ReactorStep {
     pub actions: Vec<ReactorAction>,
     /// State read from the production pure owner.
     pub actual: ReactorView,
-    /// State derived independently by the model.
-    pub expected: ReactorView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -909,7 +907,6 @@ impl From<zakura_network::zakura::BlockReactorStep> for ReactorStep {
             input: value.input,
             actions: value.actions.into_iter().map(Into::into).collect(),
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }

@@ -35,7 +35,7 @@ const OWNERSHIP: Machine = Machine {
 const REACTOR: Machine = Machine {
     name: "block/reactor-policy",
     identity: "block-reactor",
-    claim: "After every input, the reactor's pending query, next query ID, retry gate, owed force, closed dispatch, authority, epochs, and progress mirrors agree with the independent model, and every accepted or refused query carries the model's exact identity.",
+    claim: "After every input, the reactor keeps its invariants, its pending query, next query ID, retry gate, authority, epochs, and progress mirrors agree with the inputs it was sent, and every accepted or refused query carries the next query ID and the request it answers.",
     // Version 3 delivers an authority byte as a committed view, which retires the
     // pending query, and reads bit 4 of a refill's byte as the first view's arrival.
     generator: 3,

@@ -143,9 +143,11 @@ correction remains intact. Decoder 1 keeps the original byte interpretation.
 `block_query` and `block_reactor` preserve the query portion of PR #1677 and the
 reactor model from PR #1683. `block_query` generates accepted and refused
 proposals, exact and stale replies, resets, authority changes, and retry expiry.
-Its identity ledger calls no production policy helper. `block_reactor` shares the
-reactor policy model with proptest and covers view mirrors, reaction epochs, reset
-refills, query refusal, retry expiry, and authority changes. Decoder 2 of
+Its identity ledger calls no production policy helper. `block_reactor` shares its
+byte decoder with proptest, checks the reactor's invariants after every input,
+and compares each query and mirror with the inputs it sent. It covers view
+mirrors, reaction epochs, reset refills, query refusal, retry expiry, and
+authority changes. Decoder 2 of
 `block_reactor` added a closed-channel refusal to bit 16 of the refill byte. Decoder
 3 delivers an authority byte as a committed view, which retires the pending query,
 and reads bit 4 of a refill's byte as the first view's arrival. No committed corpus
@@ -156,8 +158,9 @@ the action channel and storage waits.
 `7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and
 its funding check now runs through queue admission. The driver takes up to 30
 items, which the one-block production cap does not reach.
-`block_request_lifecycle` comes from PR #1679 and tracks requests,
-transport-start facts, and no-progress charges. Its witness expires one written
+`block_request_lifecycle` comes from PR #1679. Its ledger tracks the requests
+it issued, the writes it started, and the requests sent since the last body,
+and it checks the request state's invariants after every input. Its witness expires one written
 request and one unwritten request, matches a replacement request, and resets the
 remaining window. Other machine
 targets follow their owning delivery packets.

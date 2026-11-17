@@ -184,7 +184,7 @@ pub use crate::{
 };
 
 #[cfg(feature = "internal-bench")]
-pub use crate::protocol::external::{Codec, Message};
+pub use crate::protocol::external::{Codec, HashedBlock, Message};
 
 pub use crate::{
     address_book::{AddressBook, BannedIps, MisbehaviorReporter},

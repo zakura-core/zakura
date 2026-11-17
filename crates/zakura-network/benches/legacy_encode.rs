@@ -15,7 +15,7 @@
 use std::{hint::black_box, io::Cursor, sync::Arc};
 
 use bytes::BytesMut;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use tokio_util::codec::Encoder;
 
 use zakura_chain::{
@@ -23,7 +23,7 @@ use zakura_chain::{
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,
 };
-use zakura_network::{Codec, Message};
+use zakura_network::{Codec, HashedBlock, Message};
 
 /// Non-coinbase Sapling-era and NU5 mainnet transactions, in vector order.
 fn shielded_era_transactions() -> Vec<Arc<Transaction>> {
@@ -83,15 +83,12 @@ fn encode(codec: &mut Codec, message: Message) -> BytesMut {
     dst
 }
 
-/// What a connection does to serve one requested block: make the block message, record the
-/// upload by the block's hash, then frame the message.
+/// What a connection does to serve one requested block: hash the block, record the upload by
+/// that hash, then frame the block message.
 fn serve_block(codec: &mut Codec, block: &Arc<Block>) -> BytesMut {
-    let message = Message::Block(block.clone().into());
-    let Message::Block(sent) = &message else {
-        unreachable!("the message was made from a block");
-    };
-    black_box(sent.hash());
-    encode(codec, message)
+    let block = HashedBlock::from(block.clone());
+    black_box(block.hash());
+    encode(codec, Message::Block(block))
 }
 
 fn send(codec: &mut Codec, payload: &Payload) -> BytesMut {
@@ -143,7 +140,10 @@ fn bench_encode(c: &mut Criterion) {
     group.sample_size(30);
     for (label, payload) in cases {
         let mut warm = new_codec();
-        group.throughput(Throughput::Bytes(send(&mut warm, &payload).len() as u64));
+        let frame_len = send(&mut warm, &payload).len();
+        group.throughput(Throughput::Bytes(
+            u64::try_from(frame_len).expect("a frame of at most a few MB fits in a u64"),
+        ));
 
         // The same block sent again, as to many peers: its checksum and length are known.
         group.bench_with_input(
@@ -151,11 +151,18 @@ fn bench_encode(c: &mut Criterion) {
             &payload,
             |b, payload| b.iter(|| black_box(send(&mut warm, payload))),
         );
-        // A block nobody has been sent yet, as when a peer downloads old blocks.
+        // A block nobody has been sent yet, as when a peer downloads old blocks. The new codec
+        // is built outside the timed part; the frame is dropped inside it, as in `repeat_send`.
         group.bench_with_input(
             BenchmarkId::new("first_send", &label),
             &payload,
-            |b, payload| b.iter(|| black_box(send(&mut new_codec(), payload))),
+            |b, payload| {
+                b.iter_batched_ref(
+                    new_codec,
+                    |codec| drop(black_box(send(codec, payload))),
+                    BatchSize::SmallInput,
+                )
+            },
         );
     }
     group.finish();

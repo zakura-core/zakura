@@ -844,7 +844,6 @@ impl StartCmd {
             "implementation" => pool_implementation.as_str(),
         )
         .set(1.0);
-        mempool::peer_metrics::register();
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
                 let parts = mempool::core::start(

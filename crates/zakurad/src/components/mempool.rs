@@ -66,7 +66,6 @@ pub mod downloads;
 mod error;
 pub mod gossip;
 mod peer_cooldown;
-pub(crate) mod peer_metrics;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
@@ -515,7 +514,6 @@ fn start_peer_cooldown(
         "ignoring peer transaction advertisements after an invalid transaction"
     );
     metrics::counter!("mempool.peer_cooldown.started.total").increment(1);
-    peer_metrics::count_legacy_peer_penalty(peer_metrics::Penalty::Cooldown);
 
     if cooldown > peer_cooldown::BASE_COOLDOWN {
         // Boxing works around a compiler limitation: without it, `tokio::spawn`
@@ -526,9 +524,7 @@ fn start_peer_cooldown(
             .boxed();
         spawn_erased(async move {
             let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
-            if matches!(result, Ok(Ok(_))) {
-                peer_metrics::count_legacy_peer_penalty(peer_metrics::Penalty::Disconnect);
-            } else {
+            if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!("could not disconnect a peer after repeated transaction failures");
             }
         });
@@ -1070,7 +1066,6 @@ impl Service<Request> for Mempool {
                         if let Some(peer) = ban_peer {
                             self.misbehavior
                                 .report(peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
-                            peer_metrics::count_legacy_peer_penalty(peer_metrics::Penalty::Ban);
                         }
 
                         // Only start cooldowns while this node's validation context is

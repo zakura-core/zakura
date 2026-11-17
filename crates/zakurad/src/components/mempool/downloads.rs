@@ -590,7 +590,7 @@ where
                     ?MAX_INBOUND_CONCURRENCY_PER_PEER,
                     "too many transactions queued for this peer: ignored transaction"
                 );
-                super::peer_metrics::count_peer_limit_refusal(source);
+                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
                 return Err(MempoolError::FullQueue);
             }
         }

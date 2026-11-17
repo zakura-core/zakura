@@ -1793,62 +1793,6 @@ async fn the_verifiers_pool_handle_answers_at_once() {
     );
 }
 
-/// A peer's refusal is counted only when its limit is the one reason. A
-/// peer at its limit that offers an id the pool holds, has rejected, or is
-/// already bringing in is not counted, whichever order each pool checks in.
-/// A fresh id is counted, under the advertiser's transport.
-async fn peer_limit_refusals_are_counted_by_cause(mode: Mode) {
-    let readings = Readings::default();
-    let _recording = metrics::set_default_local_recorder(&readings);
-    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
-    harness.activate().await;
-    let mut bodies = samples(2);
-    let (pooled, rejected) = (bodies.remove(0), bodies.remove(0));
-    harness.admit(&pooled).await;
-    let receiver = harness
-        .queue_one(rejected.transaction.clone())
-        .await
-        .expect("a new body passes the first stage");
-    harness.verify(Err(TransactionError::BadBalance)).await;
-    harness
-        .outcome(receiver)
-        .await
-        .expect_err("an invalid transaction is refused");
-
-    let offer = |ids: Vec<UnminedTxId>, source: &QueueSource| Request::QueueFromPeer {
-        transactions: ids.into_iter().map(Gossip::from).collect(),
-        source: source.clone(),
-    };
-    let refused = |source: &str| {
-        readings
-            .get(&format!(
-                "mempool.full_queue.per_peer.total{{source={source}}}"
-            ))
-            .unwrap_or(0.0)
-    };
-    let peer = legacy_peer(1);
-    let held: Vec<_> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
-        .map(unknown_id)
-        .collect();
-    harness.ask(offer(held.clone(), &peer)).await;
-    assert_eq!(refused("legacy"), 0.0, "the peer's share is not a refusal");
-
-    let known = vec![held[0], pooled.transaction.id(), rejected.transaction.id()];
-    harness.ask(offer(known, &peer)).await;
-    assert_eq!(refused("legacy"), 0.0, "known ids are not refusals");
-
-    harness.ask(offer(vec![unknown_id(50)], &peer)).await;
-    assert_eq!(refused("legacy"), 1.0, "a fresh id over the limit is");
-
-    let v2 = QueueSource::Zakura(vec![7; 32]);
-    let offered = (100..=100 + MAX_INBOUND_CONCURRENCY_PER_PEER)
-        .map(unknown_id)
-        .collect();
-    harness.ask(offer(offered, &v2)).await;
-    assert_eq!(refused("v2"), 1.0, "a v2 advertiser's refusal is its own");
-    assert_eq!(refused("legacy"), 1.0);
-}
-
 /// The core only: its size gauges are exported from the start, as zeros
 /// while it is empty, then follow what it holds.
 #[tokio::test(flavor = "current_thread")]
@@ -1901,7 +1845,7 @@ async fn a_queued_id_takes_no_peer_slot(mode: Mode) {
 
     assert_eq!(
         readings
-            .get("mempool.full_queue.per_peer.total{source=legacy}")
+            .get("mempool.full_queue.per_peer.total")
             .unwrap_or(0.0),
         0.0,
         "nothing was refused"
@@ -1928,22 +1872,6 @@ mod a_queued_id_takes_no_peer_slot {
     #[tokio::test(flavor = "current_thread")]
     async fn core() {
         super::a_queued_id_takes_no_peer_slot(Mode::Core).await;
-    }
-}
-
-/// [`peer_limit_refusals_are_counted_by_cause`] against both pools, each on
-/// one thread so the test's recorder sees every task's metrics.
-mod peer_limit_refusals_are_counted_by_cause {
-    use super::Mode;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn classic() {
-        super::peer_limit_refusals_are_counted_by_cause(Mode::Classic).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn core() {
-        super::peer_limit_refusals_are_counted_by_cause(Mode::Core).await;
     }
 }
 

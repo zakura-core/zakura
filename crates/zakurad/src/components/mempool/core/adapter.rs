@@ -50,7 +50,6 @@ use super::{
             TransactionDownloadVerifyError, MAX_INBOUND_CONCURRENCY_PER_PEER,
         },
         peer_cooldown::PeerCooldowns,
-        peer_metrics::{count_legacy_peer_penalty, count_peer_limit_refusal, Penalty},
         queue_source_log_label, start_peer_cooldown,
         storage::NonStandardTransactionError,
         ExactTipRejectionError, MempoolError, Outbound, ReadState, SameEffectsChainRejectionError,
@@ -243,9 +242,6 @@ async fn peer_batch(
         .handle
         .rejected_ids(fresh.iter().map(Gossip::id).collect())
         .await;
-    // A stopped core answers the lookup empty without asking, so none of the
-    // batch's ids is known not to be a cached rejection.
-    let looked_up = !shared.handle.is_stopped();
     // The rest take their peer's slots now, in one pass, as today's pool
     // queues a batch at once: at most the peer's limit of them, and the rest
     // are dropped without asking the core. Slots that free up while the
@@ -262,10 +258,7 @@ async fn peer_batch(
         }
         match PeerSlot::take(&shared, &source) {
             Some(slot) => held.push((item, slot, fetching)),
-            // One the core admitted while the lookup waited is pooled, and no
-            // refusal, as today's pool would find it.
-            None if looked_up && !shared.is_pooled_now(&id) => count_peer_limit_refusal(&source),
-            None => {}
+            None => metrics::counter!("mempool.full_queue.per_peer.total").increment(1),
         }
     }
     for (item, slot, fetching) in held {
@@ -481,7 +474,6 @@ fn charge(
             shared
                 .misbehavior
                 .report(peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
-            count_legacy_peer_penalty(Penalty::Ban);
         }
     }
 }
@@ -800,15 +792,6 @@ impl Shared {
             .filter(|id| held.contains(id))
             .collect()
     }
-
-    /// Whether the core's latest snapshot holds `id`. A refusal counted
-    /// after the lookup reads this rather than the snapshot the batch began
-    /// with, since the core may have admitted the id meanwhile.
-    fn is_pooled_now(&self, id: &UnminedTxId) -> bool {
-        self.handle
-            .snapshot()
-            .is_some_and(|snapshot| snapshot.transaction(&id.mined_id()).is_some())
-    }
 }
 
 /// Today's second-stage answer for a fetch or verification a block ended by
@@ -1090,113 +1073,11 @@ mod tests {
             .collect()
     }
 
-    /// A fresh id from a peer at its limit is counted as that peer's refusal,
-    /// under its transport.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_fresh_id_over_its_peers_limit_is_a_refusal() {
-        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
-
-        let readings = super::super::super::tests::Readings::default();
-        let _recording = metrics::set_default_local_recorder(&readings);
-        let (handle, mut inbox) = pool_port();
-        let mut core = adapter_on(handle);
-        publish_empty(&inbox);
-        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
-        let _share = fill_share(&core, &peer);
-        let request = tokio::spawn(core.call(Request::QueueFromPeer {
-            transactions: vec![Gossip::Id(filler_id(1))],
-            source: peer,
-        }));
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch looks its id up");
-        };
-        let _ = reply.send(Default::default());
-        let answer = request.await.expect("the task does not panic");
-        assert!(matches!(answer, Ok(Response::Queued(_))));
-        assert_eq!(
-            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
-            Some(1.0)
-        );
-    }
-
-    /// A stopped core answers a batch's lookup empty without asking it, so
-    /// none of the batch's refusals is counted: none of its ids is known not
-    /// to be a cached rejection.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_stopped_cores_lookup_counts_no_refusal() {
-        use zakura_node_services::mempool::port::pool_port;
-
-        let readings = super::super::super::tests::Readings::default();
-        let _recording = metrics::set_default_local_recorder(&readings);
-        let (handle, inbox) = pool_port();
-        let mut core = adapter_on(handle);
-        publish_empty(&inbox);
-        drop(inbox);
-        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
-        let _share = fill_share(&core, &peer);
-        let _ = core
-            .call(Request::QueueFromPeer {
-                transactions: vec![Gossip::Id(filler_id(1))],
-                source: peer,
-            })
-            .await;
-        assert_eq!(
-            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
-            None
-        );
-    }
-
-    /// An id the core admits while a peer's batch waits on its rejection
-    /// lookup is not counted as that peer's refusal: today's pool would find
-    /// it pooled. The batch began with an empty snapshot, so the count reads
-    /// the core's latest one.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_id_admitted_during_the_lookup_is_not_a_refusal() {
-        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
-
-        let readings = super::super::super::tests::Readings::default();
-        let _recording = metrics::set_default_local_recorder(&readings);
-        let (handle, mut inbox) = pool_port();
-        let mut core = adapter_on(handle);
-        publish_empty(&inbox);
-        let admitted = Network::Mainnet
-            .unmined_transactions_in_blocks(1..=1)
-            .next()
-            .expect("a vector transaction");
-        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
-        let _share = fill_share(&core, &peer);
-        let request = tokio::spawn(core.call(Request::QueueFromPeer {
-            transactions: vec![Gossip::Id(admitted.transaction.id())],
-            source: peer,
-        }));
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch looks its id up");
-        };
-        inbox.publish([], |last| {
-            PoolSnapshot::new(
-                ChainTip {
-                    hash: block::Hash([1; 32]),
-                    height: Height(1),
-                },
-                last,
-                vec![admitted.clone()],
-                Default::default(),
-            )
-        });
-        let _ = reply.send(Default::default());
-        let answer = request.await.expect("the task does not panic");
-        assert!(matches!(answer, Ok(Response::Queued(_))));
-        assert_eq!(
-            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
-            None
-        );
-    }
-
     /// An id this adapter is already bringing in takes no slot of a peer
-    /// that advertises it too, and is not its refusal, as today's pool
-    /// answers it as queued before its limits.
+    /// that advertises it too and counts no full-queue refusal, as today's
+    /// pool answers it as queued before its limits.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_id_being_brought_in_is_no_refusal_and_takes_no_slot() {
+    async fn an_id_being_brought_in_takes_no_slot() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand};
 
         let readings = super::super::super::tests::Readings::default();
@@ -1217,10 +1098,7 @@ mod tests {
         let _ = reply.send(Default::default());
         let answer = request.await.expect("the task does not panic");
         assert!(matches!(answer, Ok(Response::Queued(_))));
-        assert_eq!(
-            readings.get("mempool.full_queue.per_peer.total{source=legacy}"),
-            None
-        );
+        assert_eq!(readings.get("mempool.full_queue.per_peer.total"), None);
         assert_eq!(
             core.shared
                 .per_peer
@@ -1231,34 +1109,6 @@ mod tests {
             Some(MAX_INBOUND_CONCURRENCY_PER_PEER),
             "only the test's own share is taken"
         );
-    }
-
-    /// The core's charges are counted under today's penalty names when they
-    /// are applied, and an exempt peer's are not, since nothing was done to
-    /// it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn applied_charges_are_counted_as_penalties() {
-        let readings = super::super::super::tests::Readings::default();
-        let _recording = metrics::set_default_local_recorder(&readings);
-        let charged = std::net::SocketAddr::from(([203, 0, 113, 9], 8233));
-        let exempt_peer = std::net::SocketAddr::from(([192, 0, 2, 1], 8233));
-        let exempt = || Exempt {
-            zcashd_compat: [exempt_peer.ip()].into_iter().collect(),
-            unconditional: Default::default(),
-        };
-        let penalties = |penalty: &str| {
-            readings.get(&format!(
-                "mempool.peer_penalty.total{{penalty={penalty},transport=legacy}}"
-            ))
-        };
-        for peer in [charged, exempt_peer] {
-            charged_by_one_push(peer, Charge::Ban, exempt(), true).await;
-            charged_by_one_push(peer, Charge::Cooldown, exempt(), true).await;
-            charged_by_one_push(peer, Charge::None, exempt(), true).await;
-        }
-        assert_eq!(penalties("ban"), Some(1.0));
-        assert_eq!(penalties("cooldown"), Some(1.0));
-        assert_eq!(penalties("disconnect"), None, "a first cooldown");
     }
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.

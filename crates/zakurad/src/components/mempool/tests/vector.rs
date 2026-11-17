@@ -629,9 +629,6 @@ fn unrun_scripts_start_no_cooldown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn transaction_data_failure_bans_peer_without_a_current_tip() {
-    // The pool is polled on the test's own thread, so this sees its metrics.
-    let readings = super::Readings::default();
-    let _recording = metrics::set_default_local_recorder(&readings);
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
@@ -656,21 +653,10 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
         .peer_cooldowns
         .is_cooling_down(test_peer().ip(), Instant::now()));
     peer_set.expect_no_requests().await;
-    assert_eq!(
-        readings.get("mempool.peer_penalty.total{penalty=ban,transport=legacy}"),
-        Some(1.0)
-    );
-    assert_eq!(
-        readings.get("mempool.peer_penalty.total{penalty=cooldown,transport=legacy}"),
-        None
-    );
 }
 
-// One thread, so the recorder sees the disconnect task's metrics too.
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread")]
 async fn repeated_cooldown_disconnects_peer_without_banning() {
-    let readings = super::Readings::default();
-    let _recording = metrics::set_default_local_recorder(&readings);
     let network = Network::Mainnet;
     let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
         setup(&network, u64::MAX, true).await;
@@ -700,28 +686,10 @@ async fn repeated_cooldown_disconnects_peer_without_banning() {
         )
         .await
         .respond(zn::Response::Nil);
-    // Let the disconnect task see the peer set's answer.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
     assert!(mempool
         .peer_cooldowns
         .is_cooling_down(test_peer().ip(), Instant::now()));
     assert_eq!(reported_score(&misbehavior, test_peer()), 0);
-    // Recording the earlier cooldown by hand counted nothing.
-    for (penalty, count) in [
-        ("cooldown", Some(1.0)),
-        ("disconnect", Some(1.0)),
-        ("ban", None),
-    ] {
-        assert_eq!(
-            readings.get(&format!(
-                "mempool.peer_penalty.total{{penalty={penalty},transport=legacy}}"
-            )),
-            count,
-            "{penalty}"
-        );
-    }
 }
 
 /// Pushes an early Mainnet transaction from [`test_peer`], fails its

@@ -51,7 +51,8 @@
 
 mod cadence;
 pub(crate) use cadence::{
-    ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend,
+    ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, MeteredReady,
+    MeteredSender, RowSend,
 };
 
 mod serve;

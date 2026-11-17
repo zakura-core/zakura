@@ -290,6 +290,11 @@ pub(crate) const RANDOM_EVERY: usize = 4;
 /// How long a session outside an id's window waits to announce it.
 pub(crate) const ADVERT_DELAY: Duration = Duration::from_secs(2);
 
+/// How long a session waits to try its next `Inv` again while its last one
+/// is unwritten or its data writer has no room. A write frees both, and
+/// wakes nothing.
+pub(crate) const INV_RETRY: Duration = Duration::from_millis(50);
+
 /// The window for the smallest transactions.
 pub(crate) const WINDOW_SMALL: usize = 16;
 
@@ -575,6 +580,27 @@ pub(crate) enum RelayEffect {
         /// The reservation.
         reservation: ReservationId,
     },
+}
+
+/// When the connection's `Inv` byte rate lets a frame go, as the IO's
+/// metered sender answers.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Paid {
+    /// Now.
+    Now,
+    /// Once the rate pays for the frame, at this time.
+    At(Time),
+    /// Once this session's last `Inv` is written.
+    Unwritten,
+}
+
+/// What the IO knows when the machine decides whether an `Inv` goes now.
+/// See [`PeerMachine::next_inv`].
+pub(crate) struct InvRoom<F> {
+    /// Places free in the data writer's queue.
+    pub(crate) free: usize,
+    /// When the byte rate pays for a frame of so many payload bytes.
+    pub(crate) paid: F,
 }
 
 /// The pool as a routine sees it: the snapshot it last read.
@@ -1460,6 +1486,20 @@ impl RelayMachine {
     }
 
     // Outputs and observations.
+
+    /// The `Inv` `session` may send now. See [`PeerMachine::next_inv`].
+    pub(crate) fn next_inv(
+        &mut self,
+        session: SessionId,
+        room: InvRoom<impl FnOnce(u64) -> Paid>,
+        now: Time,
+    ) -> Vec<(UnminedTxId, u32)> {
+        let (pool, now) = (&self.pool, self.now.max(now));
+        self.machines
+            .get_mut(&session)
+            .map(|machine| machine.next_inv(pool, room, now))
+            .unwrap_or_default()
+    }
 
     /// Takes up to `max` of `session`'s queued announcements. See
     /// [`PeerMachine::take_inv`].

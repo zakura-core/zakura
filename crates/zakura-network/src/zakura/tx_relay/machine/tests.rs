@@ -28,9 +28,9 @@ use zakura_node_services::mempool::port::{
 
 use self::tracker::{Cause, Tracker};
 use super::{
-    peer::Hello, CallId, CloseReason, FanOut, Granted, PeerKey, RelayConfig, RelayEffect,
-    RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId, MAX_REQUESTS_PER_PEER,
-    MAX_TX_BYTES,
+    peer::Hello, CallId, CloseReason, FanOut, Granted, InvRoom, Paid, PeerKey, RelayConfig,
+    RelayEffect, RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
 };
 
 mod random;
@@ -271,11 +271,40 @@ impl Bench {
         self.took(Cause::End(session));
     }
 
-    /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`.
-    /// No id goes out while one of its parents still waits to go out to
-    /// the same session, queued or held.
+    /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`,
+    /// without the pacing [`Self::send_inv`] goes through.
     pub(super) fn take_inv(&mut self, session: SessionId, max: usize) -> Vec<UnminedTxId> {
         let taken = self.machine.take_inv(session, max);
+        self.inv_taken(session, taken)
+    }
+
+    /// `session`'s IO asks for the `Inv` it may send now, with `free`
+    /// places in its data writer and the byte rate answering `paid`.
+    pub(super) fn send_inv(
+        &mut self,
+        session: SessionId,
+        free: usize,
+        paid: Paid,
+    ) -> Vec<UnminedTxId> {
+        let room = InvRoom {
+            free,
+            paid: |_| paid,
+        };
+        let taken = self.machine.next_inv(session, room, self.now);
+        let short = matches!(paid, Paid::At(at) if at > self.now);
+        let blocked = free <= MAX_SERVES || paid == Paid::Unwritten || short;
+        assert!(!blocked || taken.is_empty(), "relay/inv-paced");
+        self.inv_taken(session, taken)
+    }
+
+    /// Records the `Inv` `session`'s IO took. No id goes out while one of
+    /// its parents still waits to go out to the same session, queued or
+    /// held.
+    fn inv_taken(
+        &mut self,
+        session: SessionId,
+        taken: Vec<(UnminedTxId, u32)>,
+    ) -> Vec<UnminedTxId> {
         let ids: Vec<UnminedTxId> = taken.into_iter().map(|(id, _)| id).collect();
         if let Some(state) = self.machine.session(session) {
             let waits = |parent: &UnminedTxId| {

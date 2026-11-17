@@ -517,6 +517,33 @@ fn a_byte_bucket_pays_its_depth_then_refills_at_its_rate() {
     assert!(bucket.try_pay(50_000, start + secs(60)));
 }
 
+/// A metered sender pays its connection's bucket before a frame goes, so
+/// two senders on one connection share its allowance, and each keeps at
+/// most one of its frames unwritten.
+#[test]
+fn a_metered_sender_pays_first_and_keeps_one_frame_unwritten() {
+    let start = Instant::now();
+    let bucket = Arc::new(Mutex::new(ByteBucket::sender(METERED_RATE, start)));
+    let (mut first, mut second) = (
+        MeteredSender::new(bucket.clone()),
+        MeteredSender::new(bucket),
+    );
+    assert_eq!(first.ready(30_000, start), MeteredReady::Now);
+    let written = first.pay(30_000, start).expect("the bucket holds it");
+    assert_eq!(first.ready(1, start), MeteredReady::Unwritten);
+    assert!(first.pay(1, start).is_none(), "one frame unwritten at most");
+
+    // The other sender finds what the first left.
+    let at = start + secs(1);
+    assert_eq!(second.ready(30_000, start), MeteredReady::At(at));
+    assert!(second.pay(30_000, start).is_none());
+    assert!(second.pay(30_000, at).is_some());
+
+    // Once the transport writes the first frame, the next may go.
+    drop(written);
+    assert_eq!(first.ready(1, at), MeteredReady::At(at + secs(1) / 10_000));
+}
+
 #[test]
 fn a_metered_row_overruns_only_past_the_receivers_depth() {
     let (buckets, clock) = buckets();

@@ -13,9 +13,10 @@ use crate::zakura::tx_relay::machine::{
     peer::Hello,
     reactor::Recorded,
     session::{Timer, Timers},
-    CloseReason, FanOut, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
-    ADVERT_DELAY, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS, MAX_REQUESTS_PER_PEER,
-    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
+    CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
+    ADVERT_DELAY, BASE_COOLDOWN, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST,
+    TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -976,6 +977,36 @@ fn an_admission_is_announced_once_inside_the_window_at_once_and_the_rest_later()
     bench.tick(ADVERT_DELAY);
     bench.resync();
     assert!(bench.adverts().is_empty(), "each session hears once");
+}
+
+/// An `Inv` goes only while the data writer keeps room for every body the
+/// peer may have requested, once the last `Inv` is written, and once the
+/// byte rate pays for it. A session that has to wait tries again after the
+/// retry interval, or when the rate pays.
+#[test]
+fn an_inv_waits_for_room_its_last_write_and_the_byte_rate() {
+    let mut bench = Bench::new();
+    let id = bench.id(0);
+    bench.add(&[id]);
+    let session = bench.join(1);
+    let room = MAX_SERVES + 1;
+    assert!(bench.send_inv(session, MAX_SERVES, Paid::Now).is_empty());
+    assert!(
+        bench.send_inv(session, room, Paid::Now).is_empty(),
+        "it waits"
+    );
+    bench.tick(INV_RETRY);
+    assert!(bench.send_inv(session, room, Paid::Unwritten).is_empty());
+    bench.tick(INV_RETRY);
+    let paid = bench.now + Duration::from_secs(1);
+    assert!(bench.send_inv(session, room, Paid::At(paid)).is_empty());
+    bench.tick(Duration::from_secs(1) - MS);
+    assert!(
+        bench.send_inv(session, room, Paid::Now).is_empty(),
+        "until paid"
+    );
+    bench.tick(MS);
+    assert_eq!(bench.send_inv(session, room, Paid::Now), vec![id]);
 }
 
 /// A small child inside a session's window waits for its big parent

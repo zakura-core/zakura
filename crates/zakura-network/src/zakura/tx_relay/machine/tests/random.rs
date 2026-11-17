@@ -32,7 +32,7 @@ use zakura_node_services::mempool::port::{
 
 use super::{body, script_len, Bench, SIZE};
 use crate::zakura::tx_relay::machine::{
-    peer::Hello, FanOut, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, WaiterId,
+    peer::Hello, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, WaiterId,
     ADVERT_DELAY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
 };
 
@@ -681,7 +681,19 @@ impl Run {
         let Some(session) = self.session() else {
             return self.tick();
         };
-        let taken = self.bench.take_inv(session, 1 + self.rng.below(4));
+        let taken = if self.rng.one_in(2) {
+            self.bench.take_inv(session, 1 + self.rng.below(4))
+        } else {
+            // The IO's paced path, with a writer short of room now and then,
+            // its last `Inv` unwritten, or the byte rate short.
+            let free = MAX_SERVES + self.rng.below(3);
+            let paid = match self.rng.below(4) {
+                0 => Paid::Unwritten,
+                1 => Paid::At(self.bench.now + self.rng.millis(2_000)),
+                _ => Paid::Now,
+            };
+            self.bench.send_inv(session, free, paid)
+        };
         self.note(|run| {
             let named = taken.iter().map(|id| run.name(*id));
             format!("{} is sent {:?}", session.0, named.collect::<Vec<_>>())

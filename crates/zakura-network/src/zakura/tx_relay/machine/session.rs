@@ -18,10 +18,11 @@ use super::{
     file,
     peer::{Hello, PeerState, Pending, Reserving},
     wanted::{Admission, Changes},
-    CallId, CloseReason, EntryGen, Granted, Logged, Mail, NodeEffect, PeerKey, PoolView,
-    RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
-    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PENDING_PER_PEER,
+    CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
+    PoolView, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
+    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PENDING_PER_PEER,
 };
+use crate::zakura::tx_relay::wire::{inv_payload_bound, MAX_INV_ENTRIES};
 
 /// A reserve call on its way to the pool.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -65,6 +66,9 @@ pub(crate) struct PeerMachine {
     /// What comes due with no input, apart from the wanted table's own
     /// times, the backoff and its peer's cooldown. See [`Timers`].
     timers: Timers,
+    /// No `Inv` goes before this: the last try found no room for every
+    /// requested body, its last `Inv` unwritten, or the byte rate short.
+    inv_due: Option<Time>,
     /// Where it reads the wanted table's ring from.
     ring_cursor: u64,
     /// It ended, and handed what it held to the table and the reactor.
@@ -92,6 +96,7 @@ impl PeerMachine {
             calls: HashMap::default(),
             held_due: None,
             timers: Timers::default(),
+            inv_due: None,
             ring_cursor: shared.wanted.ring_end(),
             ended: false,
         };
@@ -610,6 +615,42 @@ impl PeerMachine {
 
     // Outputs and observations.
 
+    /// The `Inv` to send now, if one may go: as [`Self::take_inv`] takes
+    /// them, up to [`MAX_INV_ENTRIES`] of its queued announcements. One goes
+    /// only while the data writer keeps room for every body the peer may
+    /// have requested, and once `room` says the byte rate pays for the
+    /// frame and the last `Inv` is written. Otherwise the session tries
+    /// again when the rate pays, or after [`INV_RETRY`], since a write
+    /// wakes nothing.
+    pub(crate) fn next_inv(
+        &mut self,
+        pool: &dyn PoolView,
+        room: InvRoom<impl FnOnce(u64) -> Paid>,
+        now: Time,
+    ) -> Vec<(UnminedTxId, u32)> {
+        let queued = self.state.announced.queued().min(MAX_INV_ENTRIES);
+        if self.ended || queued == 0 || self.inv_due.is_some_and(|due| now < due) {
+            return Vec::new();
+        }
+        self.inv_due = None;
+        let wait = if room.free <= MAX_SERVES {
+            Some(now.saturating_add(INV_RETRY))
+        } else {
+            // Widening usize to u64 is lossless on supported targets.
+            match (room.paid)(inv_payload_bound(queued) as u64) {
+                Paid::Now => None,
+                Paid::At(at) => Some(at).filter(|at| *at > now),
+                Paid::Unwritten => Some(now.saturating_add(INV_RETRY)),
+            }
+        };
+        if let Some(at) = wait {
+            self.inv_due = Some(at);
+            self.timers.push(at, Timer::Inv);
+            return Vec::new();
+        }
+        self.take_inv(pool, MAX_INV_ENTRIES)
+    }
+
     /// Takes up to `max` of its queued announcements that the pool shows
     /// now, oldest first, with their sizes, for one `Inv` frame. They count
     /// as sent: the frame goes on the data stream ahead of any body it lets
@@ -627,6 +668,7 @@ impl PeerMachine {
     }
 
     /// How many of its announcements wait for an `Inv`.
+    #[cfg(test)]
     pub(crate) fn queued_inv(&self) -> usize {
         self.state.announced.queued()
     }
@@ -695,6 +737,9 @@ impl PeerMachine {
             let early = self.held_due.is_some_and(|due| due <= at);
             assert!(at > now && timed && early, "relay/held-advert-timer");
         }
+        if let Some(at) = self.inv_due.filter(|at| *at > now) {
+            assert_eq!(due(Timer::Inv), Some(at), "relay/inv-retry-timer");
+        }
     }
 
     // The step loop.
@@ -749,6 +794,7 @@ impl PeerMachine {
                 .get(&id)
                 .is_some_and(|request| request.gives_up_at == Some(at)),
             Timer::Held => self.state.held.has_due(at),
+            Timer::Inv => self.inv_due == Some(at),
         }
     }
 
@@ -1208,7 +1254,8 @@ impl PeerMachine {
             match timer {
                 Timer::Deadline(id) => missed.push(id),
                 Timer::GiveUp(_) => unresponsive = true,
-                Timer::Held => {}
+                // The IO looks at the adverts after every step.
+                Timer::Held | Timer::Inv => {}
             }
         }
         // In the order of a walk over the session's requests, so the effects
@@ -1535,6 +1582,8 @@ pub(crate) enum Timer {
     GiveUp(UnminedTxId),
     /// One of the held adverts comes due.
     Held,
+    /// The session may try its next `Inv` again.
+    Inv,
 }
 
 /// Timers in the order they come due, so the next is at the front. A timer

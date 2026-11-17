@@ -192,8 +192,8 @@ impl Session {
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
         let (started, started_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
-        open_inv_bucket(&wiring.inv_buckets, &connection());
-        let io = SessionIo::new(data, state, close, started_rx, connection());
+        let inv = MeteredSender::new(open_inv_bucket(&wiring.inv_buckets, &connection()));
+        let io = SessionIo::new(data, state, close, started_rx, inv, connection());
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),

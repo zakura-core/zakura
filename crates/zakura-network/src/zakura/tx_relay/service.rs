@@ -35,21 +35,21 @@ use zakura_rt::{
 
 use super::{
     machine::{
-        peer::Hello, CallId, CloseReason, Granted, Mail, Marks, PeerKey, PeerMachine, PoolView,
-        RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation,
-        WaiterId, MAX_SERVES,
+        peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
+        PeerMachine, PoolView, RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved,
+        Verdict, Violation, WaiterId, MAX_SERVES,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
-        inv_payload_bound, tx_frame, TxRelayMessage, INV_RATE, MAX_INV_ENTRIES, MAX_TX_BYTES,
-        TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
+        tx_frame, TxRelayMessage, INV_RATE, MAX_TX_BYTES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
+        TX_RELAY_STREAMS,
     },
     ZakuraTxRelayConfig,
 };
 use crate::{
     config::UnconditionalPeers,
     zakura::{
-        regulation::ByteBucket,
+        regulation::{ByteBucket, MeteredReady, MeteredSender},
         wire_codec::{decode_frame, encode_frame},
         Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
         Stream, ZakuraConnId, ZakuraPeerId,
@@ -59,11 +59,6 @@ use crate::{
 /// Whether a verdict decided at a height may start a cooldown: the node is
 /// current and its best tip is still there. `zakurad` supplies it.
 pub type MayCool = Arc<dyn Fn(zakura_chain::block::Height) -> bool + Send + Sync>;
-
-/// How long a session waits to look again while its last `Inv` is
-/// unwritten or its data writer has no room. A write frees both, and wakes
-/// nothing.
-const INV_RETRY: Duration = Duration::from_millis(50);
 
 /// Jobs a session's data writer queues: a serve job for every request our
 /// `Hello` lets a peer have unanswered, each only an id until the writer
@@ -320,12 +315,12 @@ impl Service for TxRelayService {
             started,
         };
         let data = spawn_writer(data_send, DATA_QUEUE, session_cancel.clone(), Some(bodies));
-        open_inv_bucket(&self.wiring.inv_buckets, &connection);
+        let inv = MeteredSender::new(open_inv_bucket(&self.wiring.inv_buckets, &connection));
         let routine = Routine::open(
             self.wiring.clone(),
             peer_key,
             exempt,
-            SessionIo::new(data, state, close, started_rx, connection),
+            SessionIo::new(data, state, close, started_rx, inv, connection),
             session_cancel,
         );
         task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
@@ -465,24 +460,19 @@ enum PoolResult {
 /// A pool call in flight.
 type PoolCall = Pin<Box<dyn Future<Output = PoolResult> + Send>>;
 
-/// One session's writers, its closer, and its `Inv` pacing.
+/// One session's streams and regulation tools: its writers, its closer, and
+/// its `Inv` sender.
 struct SessionIo {
     data: mpsc::Sender<Outgoing>,
     state: mpsc::Sender<Outgoing>,
     close: Closer,
     /// The ids whose answers the data writer started writing.
     started: mpsc::UnboundedReceiver<UnminedTxId>,
-    /// Alive while this session's last `Inv` waits for its transport write.
-    /// One unwritten `Inv` of at most about 70 KB, with the transport's
-    /// 64 KiB of write-ahead, stays within the row's 512 KiB sender
-    /// allowance.
-    inv_unwritten: zakura_rt::sync::Weak<()>,
-    /// When the next `Inv` may go out, if the last try had to wait.
-    inv_due: Option<Instant>,
-    /// The machine may hold announcements for this session that the pool
-    /// shows. Set by an advert, and cleared when the machine has none to
-    /// take.
-    inv_ready: bool,
+    /// Pays the connection's `Inv` byte rate and keeps one `Inv` unwritten
+    /// at most. One unwritten `Inv` of at most about 70 KB, with the
+    /// transport's 64 KiB of write-ahead, stays within the row's 512 KiB
+    /// sender allowance.
+    inv: MeteredSender,
     /// The peer and connection the session runs on.
     connection: (ZakuraPeerId, ZakuraConnId),
     /// The session's entry in the live-session record, once the routine
@@ -491,13 +481,15 @@ struct SessionIo {
 }
 
 impl SessionIo {
-    /// A session's IO on these writers, closing with `close`, running on
-    /// `connection`. `started` hears from the data writer.
+    /// A session's IO on these writers, closing with `close`, sending `Inv`
+    /// through `inv`, running on `connection`. `started` hears from the
+    /// data writer.
     fn new(
         data: mpsc::Sender<Outgoing>,
         state: mpsc::Sender<Outgoing>,
         close: Closer,
         started: mpsc::UnboundedReceiver<UnminedTxId>,
+        inv: MeteredSender,
         connection: (ZakuraPeerId, ZakuraConnId),
     ) -> Self {
         Self {
@@ -505,9 +497,7 @@ impl SessionIo {
             state,
             close,
             started,
-            inv_unwritten: zakura_rt::sync::Weak::new(),
-            inv_due: None,
-            inv_ready: false,
+            inv,
             connection,
             live: None,
         }
@@ -516,26 +506,33 @@ impl SessionIo {
 
 /// One connection's `Inv` byte rate, and how many of its sessions are live.
 struct ConnectionInv {
-    bucket: ByteBucket,
+    bucket: Arc<Mutex<ByteBucket>>,
     sessions: usize,
 }
 
 /// Counts a new session on `connection` in its `Inv` bucket, making the
-/// bucket if the connection has none. A bucket no session uses that has
-/// refilled is the same as a new one, so it goes.
-fn open_inv_bucket(buckets: &InvBuckets, connection: &(ZakuraPeerId, ZakuraConnId)) {
+/// bucket if the connection has none, and returns the bucket. A bucket no
+/// session uses that has refilled is the same as a new one, so it goes.
+fn open_inv_bucket(
+    buckets: &InvBuckets,
+    connection: &(ZakuraPeerId, ZakuraConnId),
+) -> Arc<Mutex<ByteBucket>> {
     let opened = Instant::now();
     let mut buckets = buckets.lock().expect("the bucket map is never poisoned");
     // Widening u32 to u64 is lossless.
     let full = u64::from(INV_RATE.opening_allowance);
-    buckets.retain(|_, inv| inv.sessions > 0 || inv.bucket.ready_at(full, opened) != Some(opened));
-    buckets
+    buckets.retain(|_, inv| {
+        let mut bucket = inv.bucket.lock().expect("a bucket is never poisoned");
+        inv.sessions > 0 || bucket.ready_at(full, opened) != Some(opened)
+    });
+    let inv = buckets
         .entry(connection.clone())
         .or_insert_with(|| ConnectionInv {
-            bucket: ByteBucket::sender(INV_RATE, opened),
+            bucket: Arc::new(Mutex::new(ByteBucket::sender(INV_RATE, opened))),
             sessions: 0,
-        })
-        .sessions += 1;
+        });
+    inv.sessions += 1;
+    inv.bucket.clone()
 }
 
 /// The pool as a routine read it: the snapshot it last read.
@@ -802,22 +799,15 @@ impl Routine {
         }
     }
 
-    /// When this routine next has something due: the machine's deadline or
-    /// the next `Inv` it may send, at once unless its last try waited.
+    /// When this routine next has something due: the machine's deadline,
+    /// which covers its next `Inv` try.
     fn next_wake(&self) -> Instant {
-        let now = Instant::now();
-        let far = now + Duration::from_secs(3600);
+        let far = Instant::now() + Duration::from_secs(3600);
         let machine = {
             let node = self.wiring.node.lock().expect("the node is never poisoned");
             self.machine.next_deadline(&node.shared)
         };
-        let machine = machine.map(|at| self.wiring.base + at).unwrap_or(far);
-        let advert = if self.io.inv_ready {
-            self.io.inv_due.unwrap_or(now)
-        } else {
-            far
-        };
-        machine.min(advert)
+        machine.map_or(far, |at| self.wiring.base + at)
     }
 
     /// Handles one frame from the peer. Returns `false` for a frame that
@@ -1034,8 +1024,9 @@ impl Routine {
             RelayEffect::Ask { id, .. } => {
                 self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id), None);
             }
-            // The machine queued the id. `flush_adverts` takes it.
-            RelayEffect::Advert { .. } => self.io.inv_ready = true,
+            // The machine queued the id, and `flush_adverts` asks it for an
+            // `Inv` after every step.
+            RelayEffect::Advert { .. } => {}
             RelayEffect::Serve { id, .. } => self.serve(id),
             RelayEffect::NotFound { id, .. } => {
                 self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::NotFound(id), None);
@@ -1129,73 +1120,49 @@ impl Routine {
         }
     }
 
-    /// Sends the session's queued announcements as one `Inv`, at once, once
-    /// the connection's `Inv` byte rate pays for it. While it waits, new
-    /// announcements join the frame, so a session batches only under load.
+    /// Sends the `Inv` the machine lets go now, if any, and asks again until
+    /// it lets none go, so with more queued than one frame takes, it sets
+    /// its own retry for after this frame is written. The machine decides
+    /// when one may go from what the data writer and the `Inv` sender say,
+    /// so while it waits, new announcements join the frame, and a session
+    /// batches only under load.
     fn flush_adverts(&mut self) {
-        let now = Instant::now();
-        if !self.io.inv_ready || self.io.inv_due.is_some_and(|due| now < due) {
-            return;
-        }
-        let queued = self.machine.queued_inv().min(MAX_INV_ENTRIES);
-        self.io.inv_due = None;
-        if queued == 0 {
-            self.io.inv_ready = false;
-            return;
-        }
-        // Keep room for every body the peer may have requested, and keep
-        // one `Inv` unwritten at most.
-        if self.io.data.capacity() <= MAX_SERVES || self.io.inv_unwritten.strong_count() > 0 {
-            self.io.inv_due = Some(now + INV_RETRY);
-            return;
-        }
-        // Wait until the rate pays for every queued id, so the frame taken
-        // below is always paid for.
-        // Widening usize to u64 is lossless on supported targets.
-        let bound = inv_payload_bound(queued) as u64;
-        let mut buckets = self
-            .wiring
-            .inv_buckets
-            .lock()
-            .expect("the bucket map is never poisoned");
-        let Some(inv) = buckets.get_mut(&self.io.connection) else {
-            return;
-        };
-        match inv.bucket.ready_at(bound, now) {
-            Some(at) if at > now => {
-                self.io.inv_due = Some(at);
+        loop {
+            let (now, at) = (Instant::now(), self.now());
+            let (inv, base) = (&self.io.inv, self.wiring.base);
+            let room = InvRoom {
+                free: self.io.data.capacity(),
+                paid: |bytes| match inv.ready(bytes, now) {
+                    MeteredReady::Now => Paid::Now,
+                    MeteredReady::At(paid) => Paid::At(paid.saturating_duration_since(base)),
+                    MeteredReady::Unwritten => Paid::Unwritten,
+                },
+            };
+            let entries = self.machine.next_inv(&self.view, room, at);
+            if entries.is_empty() {
                 return;
             }
-            // The row's layout check keeps the largest frame within the
-            // bucket's depth, so it is always ready at some time.
-            _ => {}
-        }
-        let entries = self.machine.take_inv(&self.view, MAX_INV_ENTRIES);
-        if entries.is_empty() {
-            // An `Inv` holds at least one id.
-            self.io.inv_ready = false;
-            return;
-        }
-        let message = TxRelayMessage::Inv(entries);
-        let Ok(frame) = encode_frame(&message) else {
-            return;
-        };
-        // Widening usize to u64 is lossless on supported targets.
-        let paid = inv.bucket.try_pay(frame.payload.len() as u64, now);
-        debug_assert!(paid, "the frame is within the bound the bucket held");
-        drop(buckets);
-        let written = Arc::new(());
-        self.io.inv_unwritten = zakura_rt::sync::downgrade(&written);
-        // The capacity check leaves room, and the routine is the only
-        // sender besides the writer's own serve jobs, so the frame is
-        // queued.
-        if self
-            .io
-            .data
-            .try_send(Outgoing::Frame(frame, Some(FrameGuard::new(written))))
-            .is_ok()
-        {
-            count(&message, "sent");
+            let message = TxRelayMessage::Inv(entries);
+            let Ok(frame) = encode_frame(&message) else {
+                return;
+            };
+            // The frame is within the bound the sender said the rate pays
+            // for. Widening usize to u64 is lossless on supported targets.
+            let Some(guard) = self.io.inv.pay(frame.payload.len() as u64, now) else {
+                debug_assert!(false, "the frame is within the bound the rate paid for");
+                return;
+            };
+            // The machine checked the writer had room, and the routine is the
+            // only sender besides the writer's own serve jobs, so the frame
+            // is queued.
+            if self
+                .io
+                .data
+                .try_send(Outgoing::Frame(frame, Some(guard)))
+                .is_ok()
+            {
+                count(&message, "sent");
+            }
         }
     }
 }

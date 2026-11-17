@@ -89,7 +89,6 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
         &self,
         tx: UnminedTx,
         _tip: ChainTip,
-        _revalidation: bool,
         _after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TestVerifyError>> + Send>> {
         let id = tx.id();
@@ -205,7 +204,7 @@ impl Harness {
             Some(tip(100, 0)),
             Limits {
                 pending: 5,
-                revalidating: 4,
+                readmitting: 4,
             },
         )
     }
@@ -495,8 +494,8 @@ async fn a_block_that_mines_a_pooled_transaction_removes_it() {
 }
 
 /// Each chain event the core applies is reported for the node's trace: a
-/// one-block growth with what stays visible, and a reset with what waits
-/// hidden to be verified again.
+/// one-block growth with what stays pooled, and a reset with what it sent
+/// back to be verified again.
 #[tokio::test]
 async fn each_applied_chain_event_is_reported_for_the_trace() {
     let (parent, child) = parent_and_child();
@@ -508,16 +507,12 @@ async fn each_applied_chain_event_is_reported_for_the_trace() {
     let grew = harness.next_tip().await;
     assert!(!grew.reset, "{grew:?}");
     assert_eq!(grew.tip.height.0, harness.height);
-    assert_eq!((grew.visible, grew.hidden), (1, 0), "the child stays");
+    assert_eq!(grew.pooled, 1, "the child stays");
 
     harness.reorg(1, &[]);
     let reorged = harness.next_tip().await;
     assert!(reorged.reset, "{reorged:?}");
-    assert_eq!(
-        (reorged.visible, reorged.hidden),
-        (0, 1),
-        "the child is checked again"
-    );
+    assert_eq!(reorged.pooled, 0, "the child is checked again");
 
     // A reset counts what the pool held before it, as today's counts its
     // retries before it clears.
@@ -733,8 +728,11 @@ async fn a_child_submitted_before_its_parent_is_mined_is_decided_after_the_block
     assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_revalidation_that_panics_is_tried_again_later() {
+/// A pooled transaction whose check panics after a reset is dropped, like
+/// any transaction whose check fails on this node, and nothing is
+/// remembered against it.
+#[tokio::test]
+async fn a_pooled_transaction_whose_check_panics_after_a_reset_is_dropped() {
     let (parent, _) = parent_and_child();
     let mut harness = Harness::start(std::slice::from_ref(&parent));
     assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
@@ -745,7 +743,6 @@ async fn a_revalidation_that_panics_is_tried_again_later() {
         .expect("no test panics holding it")
         .insert(parent.id());
 
-    // A reorg hides the pool, and its revalidation panics.
     harness.reorg(1, &[]);
     harness.calls_reach(&parent, 2).await;
     harness
@@ -758,11 +755,16 @@ async fn a_revalidation_that_panics_is_tried_again_later() {
         .lock()
         .expect("no test panics holding it")
         .clear();
-    // The retry comes after its backoff, and then it passes.
-    harness
-        .snapshot_until(|snapshot| snapshot.transaction(&parent.id().mined_id()).is_some())
-        .await;
-    assert!(harness.calls(&parent) >= 3);
+    // The slot is free once the fault is handled, and the same bytes get in
+    // when someone brings them again.
+    tokio::time::timeout(ANSWER, async {
+        while harness.handle.reserve(parent.id()).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the fault frees the id");
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
 }
 
 #[tokio::test]
@@ -851,11 +853,11 @@ async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
 }
 
 /// After a reset the core gets every pooled transaction back, and runs no
-/// more verifications at once than the revalidation share.
+/// more verifications at once than the pool's share of the slots.
 #[tokio::test(start_paused = true)]
-async fn a_reset_gets_the_pool_back_within_the_revalidation_share() {
+async fn a_reset_gets_the_pool_back_within_its_share_of_the_slots() {
     use std::sync::atomic::Ordering;
-    use zakura_node_services::mempool::port::MAX_REVALIDATING;
+    use zakura_node_services::mempool::port::MAX_READMITTING;
 
     const POOLED: usize = 1_500;
     const DELAY: Duration = Duration::from_millis(40);
@@ -875,8 +877,15 @@ async fn a_reset_gets_the_pool_back_within_the_revalidation_share() {
         .expect("no test panics holding it") = Some(DELAY);
     harness.reorg(1, &[]);
     let applied = harness.next_tip().await;
-    assert!(applied.reset, "the reset hides the pool to verify it again");
-    assert_eq!(applied.hidden, POOLED, "every pooled transaction is hidden");
+    assert!(
+        applied.reset,
+        "the reset empties the pool to verify it again"
+    );
+    assert_eq!(
+        (applied.pooled, applied.held_before),
+        (0, POOLED),
+        "every pooled transaction is verified again"
+    );
     // The tip is reported before the core publishes the step, so a snapshot
     // counts only once it is of the new tip.
     let new_tip = applied.tip;
@@ -892,7 +901,7 @@ async fn a_reset_gets_the_pool_back_within_the_revalidation_share() {
     .await
     .expect("the core gets the transactions back");
     assert!(
-        harness.verifier.peak.load(Ordering::SeqCst) <= MAX_REVALIDATING,
+        harness.verifier.peak.load(Ordering::SeqCst) <= MAX_READMITTING,
         "within the share"
     );
 }

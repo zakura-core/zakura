@@ -80,7 +80,6 @@ impl ConsensusVerifier {
         self,
         tx: UnminedTx,
         tip: ChainTip,
-        revalidation: bool,
         after_reset: bool,
     ) -> Outcome<TransactionError> {
         if usize::try_from(self.max_transaction_bytes)
@@ -164,8 +163,8 @@ impl ConsensusVerifier {
             // have left before the lookup, and has to stay in the list so its
             // return wakes this transaction. Spends of chain outputs only
             // park it on parents that never arrive. The machine tells a
-            // parent that arrived while the job ran by when it became
-            // visible.
+            // parent that arrived while the job ran by when it entered the
+            // pool.
             TransactionError::TransparentInputNotFound => Outcome::MissingInputs {
                 missing: spends,
                 error: TransactionError::TransparentInputNotFound,
@@ -175,11 +174,7 @@ impl ConsensusVerifier {
                 Outcome::LocalFault(LocalFault::StateUnavailable)
             }
             error => {
-                let charge = if revalidation {
-                    // The machine charges nobody for a transaction that
-                    // passed once.
-                    Charge::None
-                } else if failure_bans(&error, transaction_version) {
+                let charge = if failure_bans(&error, transaction_version) {
                     Charge::Ban
                 } else if !after_reset
                     && failure_cools_down(
@@ -210,10 +205,9 @@ impl Verifier<TransactionError> for ConsensusVerifier {
         &self,
         tx: UnminedTx,
         tip: ChainTip,
-        revalidation: bool,
         after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TransactionError>> + Send>> {
-        Box::pin(self.clone().check(tx, tip, revalidation, after_reset))
+        Box::pin(self.clone().check(tx, tip, after_reset))
     }
 }
 

@@ -293,7 +293,7 @@ pub(crate) fn assemble(
 }
 
 /// Writes today's `mempool_tip_processed` row for a tip the core applied:
-/// a reset or a grow, the tip, the visible pool after it, and what a reset
+/// a reset or a grow, the tip, the pool after it, and what a reset
 /// requeued. Today's pool counts as requeued its pool and its pending
 /// downloads and verifications from before the tip, and writes zero for a
 /// tip that grew by one block.
@@ -305,7 +305,7 @@ fn record_tip(trace: &MempoolTrace, applied: &zakura_mempool::io::TipApplied) {
             TipProcessing::Grow
         },
         (applied.tip.hash, applied.tip.height),
-        applied.visible,
+        applied.pooled,
         if applied.reset {
             applied.held_before
         } else {
@@ -338,8 +338,7 @@ mod trace_tests {
                         height: Height(u32::from(byte)),
                     },
                     reset,
-                    visible: 2,
-                    hidden: 1,
+                    pooled: 2,
                     held_before,
                     took: std::time::Duration::from_millis(1),
                 },

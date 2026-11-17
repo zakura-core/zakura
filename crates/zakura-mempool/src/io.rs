@@ -75,8 +75,7 @@ pub trait ChainFeed: Send + 'static {
 /// What the core asks of the node to verify one transaction: the
 /// already-mined lookup, then the verifier, without the fetch.
 pub trait Verifier<E>: Clone + Send + Sync + 'static {
-    /// Verifies `tx` for the block after `tip`. `revalidation` says it is a
-    /// pooled transaction being checked again.
+    /// Verifies `tx` for the block after `tip`.
     ///
     /// The core calls this in the step that starts the job, after that
     /// step's snapshot is published. A panic here, or in the future, is a
@@ -88,7 +87,6 @@ pub trait Verifier<E>: Clone + Send + Sync + 'static {
         &self,
         tx: UnminedTx,
         tip: ChainTip,
-        revalidation: bool,
         after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<E>> + Send>>;
 }
@@ -152,17 +150,16 @@ type TipObserver = Box<dyn FnMut(&TipApplied) + Send>;
 pub struct TipApplied {
     /// The tip after it.
     pub tip: ChainTip,
-    /// Whether the pool was hidden to be verified again: a reorg, a rules
-    /// change, or a missed event. Otherwise the tip only grew, and only the
-    /// new blocks' transactions and what they conflict with left the pool.
+    /// Whether the pool was emptied to be verified again: a reorg, skipped
+    /// blocks or a rules change. Otherwise the tip grew by one block, and
+    /// only its transactions and what they conflict with left the pool.
     pub reset: bool,
-    /// Visible transactions after it.
-    pub visible: usize,
-    /// Hidden transactions waiting to be verified again after it.
-    pub hidden: usize,
+    /// Pooled transactions after it.
+    pub pooled: usize,
     /// What the pool held or was bringing in before it: pooled
-    /// transactions, visible or hidden, and undecided ones. A reset verifies
-    /// all of these again, and today's trace counts them as requeued.
+    /// transactions, undecided ones, and those an earlier reset left
+    /// waiting. A reset verifies all of these again, and today's trace
+    /// counts them as requeued.
     pub held_before: usize,
     /// How long the machine took to apply it.
     pub took: std::time::Duration,
@@ -345,7 +342,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         let held_before = self
             .machine
             .pooled_count()
-            .saturating_add(self.machine.undecided_count());
+            .saturating_add(self.machine.undecided_count())
+            .saturating_add(self.machine.queued_count());
         let (step, reset) = match event {
             ChainEvent::Grow(block) => {
                 self.chain_tip = ChainTip {
@@ -365,8 +363,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
             tips(&TipApplied {
                 tip: self.chain_tip,
                 reset,
-                visible: self.machine.storage_stats().transactions,
-                hidden: self.machine.hidden_count(),
+                pooled: self.machine.pooled_count(),
                 held_before,
                 took: time::Instant::now().saturating_duration_since(now),
             });
@@ -431,9 +428,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 Effect::Start {
                     job,
                     tx,
-                    revalidation,
                     after_reset,
-                } => self.start(job, tx, revalidation, after_reset),
+                } => self.start(job, tx, after_reset),
                 Effect::Cancel(job) => {
                     self.jobs.remove(&job);
                 }
@@ -513,7 +509,7 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
 
     /// Publishes the batches, and one snapshot after them, when a batch
     /// changed anything or the snapshot's tip or state would differ. A
-    /// snapshot copies the visible pool, so steps that changed
+    /// snapshot copies the pool, so steps that changed
     /// nothing a reader sees publish nothing.
     ///
     /// Batches with no changes are published too when anything is, so the
@@ -533,15 +529,11 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     }
 
     /// Starts a verification task for `job`.
-    fn start(&mut self, job: JobId, tx: UnminedTx, revalidation: bool, after_reset: bool) {
-        // The flag in the effect is as of the step that made it. A reset the
-        // core took later in the same flush counts too.
-        let after_reset = after_reset || self.machine.job_after_reset(job);
+    fn start(&mut self, job: JobId, tx: UnminedTx, after_reset: bool) {
         // A panic while the verifier builds its future is a local fault too,
         // not the end of the core.
         let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.verifier
-                .verify(tx, self.machine.tip(), revalidation, after_reset)
+            self.verifier.verify(tx, self.machine.tip(), after_reset)
         }))
         .unwrap_or_else(|_| {
             Box::pin(std::future::ready(Outcome::LocalFault(

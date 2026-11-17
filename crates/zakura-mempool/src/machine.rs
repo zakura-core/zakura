@@ -12,23 +12,18 @@
 //! callers that see the peer. A verdict says what its body earned, and the
 //! caller applies that to whoever sent it.
 //!
-//! [`Storage`] holds exactly the visible pool. A transaction hidden while it is
-//! verified again leaves storage and waits here with its body. So the
-//! dependency limits, the conflicts storage checks and the snapshot are about
-//! the visible pool only.
+//! [`Storage`] holds the pool. After a reset, every pooled transaction
+//! leaves it and comes back through admission, like a new one, a share of
+//! the slots at a time.
 //!
 //! Every input enters the same way. It panics if the last input's effects were
 //! not taken, moves the clock, and applies every deadline that is due. Every
 //! input leaves the same way too, through [`MempoolState::take_step`], which
-//! starts the revalidations that can start. An input that answers its caller,
+//! starts the queued re-admissions that can start. An input that answers its caller,
 //! such as [`MempoolState::reserve`], leaves its other effects for
 //! [`MempoolState::effects`], which the caller takes straight after.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
@@ -40,7 +35,7 @@ use zakura_chain::{
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, Change, ChangeSeq, Charge, ConnectedBlock, LocalFault, PoolSnapshot,
     Rejection, RejectionDetail, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
-    MAX_PENDING, MAX_REVALIDATING, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+    MAX_PENDING, MAX_READMITTING, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -94,8 +89,8 @@ pub enum Outcome<E> {
         /// What it costs a peer supplier.
         charge: Charge,
     },
-    /// These transparent inputs are in neither the chain nor the visible
-    /// pool. `error` is the verifier's error, cached for these exact bytes if
+    /// These transparent inputs are in neither the chain nor the pool.
+    /// `error` is the verifier's error, cached for these exact bytes if
     /// the wait for a parent ends.
     MissingInputs {
         /// The missing inputs.
@@ -116,8 +111,6 @@ pub enum Effect {
         job: JobId,
         /// The transaction.
         tx: UnminedTx,
-        /// Whether it is a pooled transaction being verified again.
-        revalidation: bool,
         /// Whether the chain was reset since its body arrived, by a reorg,
         /// skipped blocks or a rules change. Today's pool charges no cooldown
         /// for a transaction it retries after a tip reset, and neither does
@@ -170,15 +163,16 @@ impl Step {
 pub struct Limits {
     /// Undecided transactions node-wide, [`MAX_PENDING`].
     pub pending: usize,
-    /// Running revalidations, [`MAX_REVALIDATING`].
-    pub revalidating: usize,
+    /// Slots for pooled transactions verified again after a reset,
+    /// [`MAX_READMITTING`].
+    pub readmitting: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             pending: MAX_PENDING,
-            revalidating: MAX_REVALIDATING,
+            readmitting: MAX_READMITTING,
         }
     }
 }
@@ -198,9 +192,10 @@ enum Stage {
 #[derive(Clone, Debug)]
 struct Admission<E> {
     tx_id: UnminedTxId,
-    /// The reservation it was granted under. Its caller is fetching the body
-    /// until `body` is set.
-    owner: ReservationId,
+    /// The reservation it was granted under, whose caller is fetching the
+    /// body until `body` is set. `None` for a pooled transaction that a
+    /// reset sent back through admission: nobody waits for its verdict.
+    owner: Option<ReservationId>,
     body: Option<UnminedTx>,
     /// The submission that brought the body, which gets the verdict.
     waiter: Option<WaiterId>,
@@ -217,67 +212,25 @@ struct Admission<E> {
     after_reset: bool,
 }
 
-/// Where a hidden pooled transaction is.
+/// What the machine keeps about a pooled transaction, whose body is in
+/// storage.
 #[derive(Clone, Debug)]
-enum Hidden {
-    /// Waiting for a slot, or for a hidden parent to pass first.
-    Queued,
-    Running {
-        job: JobId,
-        deadline: Instant,
-    },
-    Retry {
-        at: Instant,
-    },
-    /// Parents are missing.
-    Parked {
-        on: Vec<transaction::Hash>,
-    },
-}
-
-/// When an input next acts on a hidden transaction in state `hidden`, if
-/// ever: a running check's deadline, a retry's time, or the end of a parked
-/// transaction's wait for its parents. A parked transaction's
-/// `missing_since` is set before it parks and does not change while it is
-/// parked, so this stays the same for as long as the state does.
-fn hidden_deadline(hidden: Option<&Hidden>, missing_since: Option<Instant>) -> Option<Instant> {
-    match hidden? {
-        Hidden::Running { deadline, .. } => Some(*deadline),
-        Hidden::Retry { at } => Some(*at),
-        Hidden::Parked { .. } => missing_since.map(|since| since + T_PARK),
-        Hidden::Queued => None,
-    }
-}
-
-/// What the machine keeps about a pooled transaction. A visible one's body is
-/// in storage. A hidden one's body is here.
-#[derive(Clone, Debug)]
-struct Pooled<E> {
+struct Pooled {
     id: UnminedTxId,
     /// The transactions whose outputs it spends.
     parents: Vec<transaction::Hash>,
     expiry: Option<Height>,
-    hidden: Option<Hidden>,
-    /// The body while it is hidden.
-    body: Option<VerifiedUnminedTx>,
-    /// The wait before the next try after a local fault.
-    backoff: Duration,
-    /// The machine's event count when it last became visible.
-    visible_at: u64,
-    /// The log position of its latest `Hidden` entry.
-    hidden_at: ChangeSeq,
-    /// When one of its inputs was first found missing since it was last
-    /// visible. Its wait for a parent runs from here.
-    missing_since: Option<Instant>,
-    /// The verifier's error for its missing inputs.
-    missing_error: Option<E>,
+    /// The machine's event count when it entered the pool.
+    added_at: u64,
 }
 
-/// What a job verifies.
-#[derive(Copy, Clone, Debug)]
-enum JobTarget {
-    Admission(UnminedTxId),
-    Revalidation(transaction::Hash),
+/// A pooled transaction that a reset took out of the pool, waiting for a
+/// slot to be verified again.
+#[derive(Clone, Debug)]
+struct Queued {
+    tx: UnminedTx,
+    /// What its body counted for in the pool.
+    cost: u64,
 }
 
 /// A slot kept for a fetch that is still out after its id was decided.
@@ -347,7 +300,7 @@ pub struct MempoolState<E> {
     tip_at: u64,
     next_id: u64,
     limits: Limits,
-    /// The visible pool, and the rejection lists.
+    /// The pool, and the rejection lists.
     storage: Storage<E>,
     /// Undecided transactions, oldest first.
     admissions: BTreeMap<u64, Admission<E>>,
@@ -358,34 +311,28 @@ pub struct MempoolState<E> {
     /// submits or drops it, so a source cannot have more fetches out than
     /// slots.
     leases: HashMap<ReservationId, Lease>,
-    /// Every pooled transaction, visible or hidden, oldest first.
-    pool: BTreeMap<u64, Pooled<E>>,
+    /// What a reset took out of the pool and no slot has verified again
+    /// yet, oldest first, so a parent is verified before the children that
+    /// came after it.
+    queue: BTreeMap<u64, Queued>,
+    /// The queue by mined id.
+    queued: HashMap<transaction::Hash, u64>,
+    /// What the queued bodies cost. They count against the pool's cost limit
+    /// with what storage holds, so emptying the pool and refilling it cannot
+    /// grow memory past the limit.
+    queued_cost: u64,
+    /// The re-admissions under way. Each holds a slot.
+    readmitting: usize,
+    /// Every pooled transaction, oldest first.
+    pool: BTreeMap<u64, Pooled>,
     pooled: HashMap<transaction::Hash, u64>,
-    /// The hidden pooled transactions, which are the only ones with
-    /// deadlines. Empty in steady state.
-    hidden: BTreeSet<u64>,
-    /// The hidden pooled transactions queued for a revalidation.
-    queued: BTreeSet<u64>,
-    /// Each hidden pooled transaction with a deadline, by deadline, so an
-    /// input finds the due ones without walking the hidden pool. See
-    /// [`hidden_deadline`].
-    hidden_due: BTreeSet<(Instant, u64)>,
-    /// The parked hidden transactions, by each parent they wait for, so a
-    /// parent's return finds them without walking the hidden pool.
-    parked_on: HashMap<transaction::Hash, BTreeSet<u64>>,
-    /// Running revalidations.
-    running: usize,
-    /// The cost of the hidden transactions' bodies. They count against the
-    /// pool's cost limit with what storage holds, so hiding the pool and
-    /// refilling it cannot grow memory past the limit.
-    hidden_cost: u64,
-    /// The pooled transactions that spend each transaction's outputs,
-    /// visible or hidden, so a removal finds its dependents without a scan.
-    /// Keyed by pool key, so a removal is logarithmic however many children
-    /// one confirmed parent has, and dependents are found oldest first.
+    /// The pooled transactions that spend each transaction's outputs, so a
+    /// removal finds its dependents without a scan. Keyed by pool key, so a
+    /// removal is logarithmic however many children one confirmed parent
+    /// has, and dependents are found oldest first.
     children: HashMap<transaction::Hash, BTreeMap<u64, transaction::Hash>>,
-    /// Each job, with the event count when it started.
-    jobs: HashMap<JobId, (JobTarget, u64)>,
+    /// Each job's transaction, with the event count when it started.
+    jobs: HashMap<JobId, (UnminedTxId, u64)>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
     /// so this is the log position of the last one.
     logged: u64,
@@ -407,14 +354,12 @@ impl<E: VerifyError> MempoolState<E> {
             admission_of: HashMap::default(),
             owners: HashMap::default(),
             leases: HashMap::default(),
+            queue: BTreeMap::new(),
+            queued: HashMap::default(),
+            queued_cost: 0,
+            readmitting: 0,
             pool: BTreeMap::new(),
             pooled: HashMap::default(),
-            hidden: BTreeSet::new(),
-            queued: BTreeSet::new(),
-            hidden_due: BTreeSet::new(),
-            parked_on: HashMap::default(),
-            running: 0,
-            hidden_cost: 0,
             children: HashMap::default(),
             jobs: HashMap::default(),
             logged: 0,
@@ -441,9 +386,9 @@ impl<E: VerifyError> MempoolState<E> {
         if !self.active {
             return Err(Unreserved::Inactive);
         }
-        // A slot a deadline just freed goes to a revalidation that was
+        // A slot a deadline just freed goes to a re-admission that was
         // already waiting for one, before this reservation counts slots.
-        self.start_revalidations();
+        self.start_queued();
         if self.pooled.contains_key(&tx_id.mined_id()) {
             return Err(Unreserved::Pooled);
         }
@@ -455,8 +400,10 @@ impl<E: VerifyError> MempoolState<E> {
                 error,
             )));
         }
-        // Today's `AlreadyQueued`: an undecided id is brought in once.
-        if self.admission_of.contains_key(&tx_id) {
+        // Today's `AlreadyQueued`: an undecided id is brought in once. That
+        // covers a pooled transaction waiting to be verified again after a
+        // reset, so nobody fetches a body the node holds.
+        if self.admission_of.contains_key(&tx_id) || self.queued.contains_key(&tx_id.mined_id()) {
             return Err(Unreserved::Pending);
         }
         if self.slots_in_use() >= self.limits.pending {
@@ -468,7 +415,7 @@ impl<E: VerifyError> MempoolState<E> {
             key,
             Admission {
                 tx_id,
-                owner,
+                owner: Some(owner),
                 body: None,
                 waiter: None,
                 stage: Stage::Reserved,
@@ -559,28 +506,15 @@ impl<E: VerifyError> MempoolState<E> {
         wall: DateTime<Utc>,
     ) -> Step {
         self.enter(now);
-        let Some((target, started_at)) = self.jobs.remove(&job) else {
+        let Some((tx_id, started_at)) = self.jobs.remove(&job) else {
             // Cancelled, or timed out.
             return self.take_step();
         };
-        let stale = started_at < self.tip_at;
-        match target {
-            JobTarget::Admission(tx_id) => {
-                let key = self.admission_of[&tx_id];
-                if stale {
-                    self.start_admission(key);
-                } else {
-                    self.admission_outcome(key, outcome, started_at, wall);
-                }
-            }
-            JobTarget::Revalidation(hash) => {
-                let key = self.pooled[&hash];
-                if stale {
-                    self.set_hidden(key, Some(Hidden::Queued));
-                } else {
-                    self.revalidation_outcome(key, hash, outcome, started_at, wall);
-                }
-            }
+        let key = self.admission_of[&tx_id];
+        if started_at < self.tip_at {
+            self.start_admission(key);
+        } else {
+            self.admission_outcome(key, outcome, started_at, wall);
         }
         self.take_step()
     }
@@ -608,16 +542,17 @@ impl<E: VerifyError> MempoolState<E> {
             .pool
             .values()
             .filter(|pooled| !mined_set.contains(&pooled.id.mined_id()))
-            .filter(|pooled| {
-                self.pooled_transaction(pooled)
-                    .is_some_and(|tx| spends.conflict_with(tx))
-            })
+            .filter(|pooled| spends.conflict_with(self.transaction_of(pooled)))
             .map(|pooled| pooled.id)
             .collect();
         for hash in mined.iter() {
             if let Some(key) = self.pooled.get(hash).copied() {
                 // Its dependents stay. Their parent is on the chain now.
                 self.remove_one(key, RemovalReason::Mined);
+            }
+            // Its removal at the reset is logged already.
+            if let Some(key) = self.queued.get(hash).copied() {
+                self.unqueue(key);
             }
             self.storage
                 .reject_effects_chain(*hash, SameEffectsChainRejectionError::Mined, now);
@@ -633,8 +568,7 @@ impl<E: VerifyError> MempoolState<E> {
             .collect();
         for key in ended {
             let admission = self.admission_at(key);
-            if admission.body.is_none() {
-                let owner = admission.owner;
+            if let (None, Some(owner)) = (&admission.body, admission.owner) {
                 self.step.effects.push(Effect::CancelFetch(owner));
             }
             self.cancel_admission_job(key);
@@ -655,7 +589,7 @@ impl<E: VerifyError> MempoolState<E> {
         // The block was seen, and what it mined is gone already. So an
         // expired transaction here was not mined, and what depends on it goes
         // with it.
-        self.remove_expired(true);
+        self.remove_expired();
         for hash in mined.iter() {
             self.wake(*hash);
         }
@@ -667,6 +601,10 @@ impl<E: VerifyError> MempoolState<E> {
     /// know which blocks changed, so every pooled and parked transaction is
     /// checked again at `tip`. A rejection made on the old chain or under the
     /// old rules says nothing, so today's reset drops every list too.
+    ///
+    /// Each pooled transaction leaves the pool and waits to come back
+    /// through admission, as today's reset queues the pool to be verified
+    /// again.
     pub fn reset(&mut self, tip: ChainTip, now: Instant) -> Step {
         self.enter(now);
         if !self.active {
@@ -675,12 +613,48 @@ impl<E: VerifyError> MempoolState<E> {
         self.set_tip(tip);
         self.mark_reset();
         self.storage.clear_rejections();
-        // Expiry needs no verifier, only the new tip. Only the expired
-        // transaction goes. A block the core missed may have mined it first,
-        // and then what spends its outputs is still valid, so its dependents
-        // are checked again like everything else.
-        self.remove_expired(false);
-        self.hide_all();
+        let mut bodies: HashMap<transaction::Hash, VerifiedUnminedTx> = self
+            .storage
+            .take_all()
+            .into_iter()
+            .map(|tx| (tx.transaction.id().mined_id(), tx))
+            .collect();
+        self.pooled.clear();
+        self.children.clear();
+        for pooled in std::mem::take(&mut self.pool).into_values() {
+            let hash = pooled.id.mined_id();
+            let body = bodies
+                .remove(&hash)
+                .expect("storage holds every pooled transaction");
+            // Expiry needs no verifier, only the new tip.
+            if self.reached(pooled.expiry) {
+                self.step.changes.push(Change::Removed {
+                    id: pooled.id,
+                    reason: RemovalReason::Expired,
+                });
+                self.storage.reject_effects_chain(
+                    hash,
+                    SameEffectsChainRejectionError::Expired,
+                    self.now,
+                );
+                continue;
+            }
+            self.step.changes.push(Change::Removed {
+                id: pooled.id,
+                reason: RemovalReason::Reset,
+            });
+            let key = self.fresh();
+            let cost = body.cost();
+            self.queue.insert(
+                key,
+                Queued {
+                    tx: body.transaction,
+                    cost,
+                },
+            );
+            self.queued.insert(hash, key);
+            self.queued_cost = self.queued_cost.saturating_add(cost);
+        }
         // A block that left the chain may have spent an output a parked
         // transaction is waiting for. Nothing names which, so each one looks
         // again.
@@ -716,6 +690,10 @@ impl<E: VerifyError> MempoolState<E> {
         for key in keys {
             self.remove_one(key, RemovalReason::Deactivated);
         }
+        // What a reset took out left the pool then, and that is logged.
+        self.queue.clear();
+        self.queued.clear();
+        self.queued_cost = 0;
         // Every pooled transaction was removed, so storage is empty and only
         // its rejection lists are left.
         self.storage.clear_rejections();
@@ -724,7 +702,6 @@ impl<E: VerifyError> MempoolState<E> {
             0,
             "storage held only the pool"
         );
-        debug_assert_eq!(self.hidden_cost, 0, "every hidden transaction was removed");
         self.active = false;
         self.take_step()
     }
@@ -735,7 +712,6 @@ impl<E: VerifyError> MempoolState<E> {
         self.enter(now);
         self.active = true;
         self.set_tip(tip);
-        self.start_revalidations();
     }
 
     /// The members of `ids` a cached rejection covers. Takes no slot. What
@@ -746,7 +722,7 @@ impl<E: VerifyError> MempoolState<E> {
         now: Instant,
     ) -> HashSet<UnminedTxId> {
         self.enter(now);
-        self.start_revalidations();
+        self.start_queued();
         self.storage.rejected_transactions(ids, self.now).collect()
     }
 
@@ -771,8 +747,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.tip
     }
 
-    /// The visible pool as a snapshot, for the change log position
-    /// `last_change`.
+    /// The pool as a snapshot, for the change log position `last_change`.
     pub fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
         if !self.active {
             return PoolSnapshot::inactive(self.tip, last_change);
@@ -792,24 +767,19 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The earliest time an input would apply a deadline, if any is set.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let admissions = self
-            .admissions
+        self.admissions
             .values()
             .filter_map(|admission| match &admission.stage {
                 Stage::Verifying { deadline, .. } => Some(*deadline),
                 Stage::Parked { .. } => admission.missing_since.map(|since| since + T_PARK),
                 Stage::Reserved => None,
-            });
-        let hidden = self.hidden_due.first().map(|(due, _)| *due);
-        admissions.chain(hidden).min()
+            })
+            .min()
     }
 
-    /// Undecided transactions, plus leases, plus running revalidations.
+    /// Undecided transactions, plus leases.
     fn slots_in_use(&self) -> usize {
-        self.admissions
-            .len()
-            .saturating_add(self.leases.len())
-            .saturating_add(self.running)
+        self.admissions.len().saturating_add(self.leases.len())
     }
 
     /// Reservations callers still hold, of every kind.
@@ -818,52 +788,34 @@ impl<E: VerifyError> MempoolState<E> {
         self.owners.len().saturating_add(self.leases.len())
     }
 
-    /// The visible pool, oldest first.
+    /// The pool, oldest first.
     #[cfg(test)]
-    pub(crate) fn visible(&self) -> Vec<UnminedTxId> {
-        self.pool
-            .values()
-            .filter(|pooled| pooled.hidden.is_none())
-            .map(|pooled| pooled.id)
-            .collect()
+    pub(crate) fn pooled_ids(&self) -> Vec<UnminedTxId> {
+        self.pool.values().map(|pooled| pooled.id).collect()
     }
 
-    /// How many transactions are pooled, visible or hidden.
+    /// How many transactions are pooled.
     pub fn pooled_count(&self) -> usize {
         self.pool.len()
     }
 
     /// How many transactions are undecided: reserved, fetched or being
-    /// verified for the first time.
+    /// verified.
     pub fn undecided_count(&self) -> usize {
         self.admissions.len()
     }
 
-    /// How many pooled transactions are hidden while they are verified
-    /// again.
-    pub fn hidden_count(&self) -> usize {
-        self.hidden.len()
+    /// How many transactions wait for a slot to be verified again after a
+    /// reset.
+    pub fn queued_count(&self) -> usize {
+        self.queue.len()
     }
 
-    /// The pooled transactions hidden while they are verified again.
+    /// The transactions waiting for a slot to be verified again after a
+    /// reset, oldest first.
     #[cfg(test)]
-    pub(crate) fn hidden(&self) -> Vec<UnminedTxId> {
-        self.hidden.iter().map(|key| self.pool[key].id).collect()
-    }
-
-    /// Whether the chain was reset since the body of `job`'s transaction
-    /// arrived, as of now. The core asks this when it starts the job, since
-    /// a reset can land after the job's start effect was made and before the
-    /// core carries it out. False for a revalidation or a job that is gone.
-    pub fn job_after_reset(&self, job: JobId) -> bool {
-        match self.jobs.get(&job) {
-            Some((JobTarget::Admission(tx_id), _)) => self
-                .admission_of
-                .get(tx_id)
-                .and_then(|key| self.admissions.get(key))
-                .is_some_and(|admission| admission.after_reset),
-            _ => false,
-        }
+    pub(crate) fn queued_ids(&self) -> Vec<UnminedTxId> {
+        self.queue.values().map(|queued| queued.tx.id()).collect()
     }
 
     /// Whether any undecided transaction is parked on a missing parent.
@@ -903,55 +855,71 @@ impl<E: VerifyError> MempoolState<E> {
             self.slots_in_use() <= self.limits.pending,
             "pool/admissions-within-limits: the node's limit"
         );
-        for admission in self.admissions.values() {
+        assert_eq!(
+            self.admission_of.len(),
+            self.admissions.len(),
+            "each admission is indexed by its id"
+        );
+        for (key, admission) in &self.admissions {
+            assert_eq!(
+                self.admission_of.get(&admission.tx_id),
+                Some(key),
+                "each admission is indexed by its id"
+            );
             assert_eq!(
                 admission.body.is_none(),
                 matches!(admission.stage, Stage::Reserved),
                 "an admission has a body exactly when it has left the reserved stage"
             );
+            match admission.owner {
+                Some(_) => assert_eq!(
+                    admission.body.is_some(),
+                    admission.waiter.is_some(),
+                    "the submission that brought the body waits for its verdict"
+                ),
+                None => assert!(
+                    admission.body.is_some() && admission.waiter.is_none(),
+                    "a re-admission holds its body, and nobody waits for it"
+                ),
+            }
+        }
+        assert_eq!(
+            self.queued.len(),
+            self.queue.len(),
+            "the queue is indexed by mined id"
+        );
+        for (key, queued) in &self.queue {
             assert_eq!(
-                admission.body.is_some(),
-                admission.waiter.is_some(),
-                "the submission that brought the body waits for its verdict"
+                self.queued.get(&queued.tx.id().mined_id()),
+                Some(key),
+                "the queue is indexed by mined id"
+            );
+            assert!(
+                !self.pooled.contains_key(&queued.tx.id().mined_id()),
+                "nothing pooled also waits to be verified again"
             );
         }
-        assert!(
-            self.running <= self.limits.revalidating,
-            "the revalidation share"
-        );
-        let hidden: BTreeSet<u64> = self
-            .pool
-            .iter()
-            .filter(|(_, pooled)| pooled.hidden.is_some())
-            .map(|(key, _)| *key)
-            .collect();
-        assert_eq!(hidden, self.hidden, "the hidden index matches the pool");
-        let queued: BTreeSet<u64> = self
-            .pool
-            .iter()
-            .filter(|(_, pooled)| matches!(pooled.hidden, Some(Hidden::Queued)))
-            .map(|(key, _)| *key)
-            .collect();
-        assert_eq!(queued, self.queued, "the queue index matches the pool");
-        let running = self
-            .pool
-            .values()
-            .filter(|pooled| matches!(pooled.hidden, Some(Hidden::Running { .. })))
-            .count();
-        assert_eq!(running, self.running, "the running count matches the pool");
-        let hidden_cost: u64 = self
-            .pool
-            .values()
-            .filter_map(|pooled| pooled.body.as_ref())
-            .map(VerifiedUnminedTx::cost)
-            .sum();
         assert_eq!(
-            hidden_cost, self.hidden_cost,
-            "the hidden cost matches the pool"
+            self.queue.values().map(|queued| queued.cost).sum::<u64>(),
+            self.queued_cost,
+            "the queued cost matches the queue"
+        );
+        let readmitting = self
+            .admissions
+            .values()
+            .filter(|admission| admission.owner.is_none())
+            .count();
+        assert_eq!(
+            readmitting, self.readmitting,
+            "the re-admission count matches the admissions"
         );
         assert!(
-            self.storage.total_cost().saturating_add(self.hidden_cost) <= self.storage.cost_limit(),
-            "the visible and hidden pool together stay within the cost limit"
+            self.readmitting <= self.limits.readmitting,
+            "pool/readmission-within-limit: the re-admission share"
+        );
+        assert!(
+            self.storage.total_cost().saturating_add(self.queued_cost) <= self.storage.cost_limit(),
+            "pool/cost-within-limit: the pool and the queue together stay within the cost limit"
         );
         for (key, pooled) in &self.pool {
             let hash = pooled.id.mined_id();
@@ -966,37 +934,10 @@ impl<E: VerifyError> MempoolState<E> {
                 indexed, expected,
                 "the children index matches the pool at {key}"
             );
-        }
-        let due: BTreeSet<(Instant, u64)> = self
-            .pool
-            .iter()
-            .filter_map(|(key, pooled)| {
-                hidden_deadline(pooled.hidden.as_ref(), pooled.missing_since).map(|due| (due, *key))
-            })
-            .collect();
-        assert_eq!(due, self.hidden_due, "the deadline index matches the pool");
-        let mut parked_on: HashMap<transaction::Hash, BTreeSet<u64>> = HashMap::default();
-        for (key, pooled) in &self.pool {
-            if let Some(Hidden::Parked { on }) = &pooled.hidden {
-                for parent in on {
-                    parked_on.entry(*parent).or_default().insert(*key);
-                }
-            }
-        }
-        assert_eq!(
-            parked_on, self.parked_on,
-            "the parked index matches the pool"
-        );
-        for pooled in self.pool.values() {
             assert_eq!(
-                pooled.body.is_some(),
-                pooled.hidden.is_some(),
-                "a hidden transaction holds its body, and a visible one is in storage"
-            );
-            assert_eq!(
-                self.storage.contains(&pooled.id.mined_id()),
-                pooled.hidden.is_none(),
-                "storage holds exactly the visible pool"
+                self.pooled.get(&hash),
+                Some(key),
+                "the pool is indexed by id"
             );
             assert!(
                 pooled.expiry.is_none_or(|expiry| self.tip.height < expiry),
@@ -1005,14 +946,12 @@ impl<E: VerifyError> MempoolState<E> {
         }
         assert_eq!(
             self.storage.transaction_count(),
-            self.pool.len() - self.hidden.len(),
-            "storage holds exactly the visible pool"
+            self.pool.len(),
+            "storage holds exactly the pool"
         );
         let mut spends = Spends::default();
         for pooled in self.pool.values() {
-            let tx = self
-                .pooled_transaction(pooled)
-                .expect("a pooled transaction's body is in storage or beside it");
+            let tx = self.transaction_of(pooled);
             assert!(
                 !spends.conflict_with(tx),
                 "pool/consistent: no two pooled transactions conflict"
@@ -1021,39 +960,16 @@ impl<E: VerifyError> MempoolState<E> {
         }
         self.storage.assert_invariants();
         // Nothing that can start is left waiting, and nothing past its
-        // deadline is left as it was. The input that made a revalidation
-        // startable started it, and the first input to see a time applied
-        // every deadline due by then.
+        // deadline is left as it was. The input that freed a slot started
+        // the next queued re-admission, and the first input to see a time
+        // applied every deadline due by then.
         if self.active {
-            let room = self.running < self.limits.revalidating
+            let room = self.readmitting < self.limits.readmitting
                 && self.slots_in_use() < self.limits.pending;
-            for pooled in self.pool.values() {
-                let parent_hidden = pooled.parents.iter().any(|parent| {
-                    self.pooled
-                        .get(parent)
-                        .is_some_and(|parent| self.pool[parent].hidden.is_some())
-                });
-                match &pooled.hidden {
-                    Some(Hidden::Queued) => assert!(
-                        !room || parent_hidden,
-                        "a revalidation that could start was left queued"
-                    ),
-                    Some(Hidden::Retry { at }) => {
-                        assert!(*at > self.now, "a retry that is due was left waiting")
-                    }
-                    Some(Hidden::Running { deadline, .. }) => assert!(
-                        *deadline > self.now,
-                        "a revalidation past its deadline was left running"
-                    ),
-                    Some(Hidden::Parked { .. }) => assert!(
-                        pooled
-                            .missing_since
-                            .is_some_and(|since| since + T_PARK > self.now),
-                        "a hidden transaction was left parked past its wait for a parent"
-                    ),
-                    _ => {}
-                }
-            }
+            assert!(
+                !room || self.queue.is_empty(),
+                "a re-admission that could start was left queued"
+            );
             for admission in self.admissions.values() {
                 if let Stage::Verifying { deadline, .. } = admission.stage {
                     assert!(
@@ -1125,59 +1041,14 @@ impl<E: VerifyError> MempoolState<E> {
                 Charge::None,
             );
         }
-        // Oldest first, as the pool is ordered.
-        let mut keys: Vec<u64> = self
-            .hidden_due
-            .range(..=(now, u64::MAX))
-            .map(|(_, key)| *key)
-            .collect();
-        keys.sort_unstable();
-        for key in keys {
-            // An earlier removal in this loop can have taken this one with it,
-            // as a dependent.
-            let Some((hidden, parked_out)) = self.pool.get(&key).map(|pooled| {
-                (
-                    pooled.hidden.clone(),
-                    pooled
-                        .missing_since
-                        .is_some_and(|since| since + T_PARK <= now),
-                )
-            }) else {
-                continue;
-            };
-            match hidden {
-                Some(Hidden::Running { job, deadline }) if deadline <= now => {
-                    self.jobs.remove(&job);
-                    self.step.effects.push(Effect::Cancel(job));
-                    self.retry_later(key);
-                }
-                Some(Hidden::Retry { at }) if at <= now => {
-                    self.set_hidden(key, Some(Hidden::Queued));
-                }
-                // Its parent never came back.
-                Some(Hidden::Parked { .. }) if parked_out => {
-                    let pooled = self.pooled_at(key);
-                    let tx_id = pooled.id;
-                    let error = pooled
-                        .missing_error
-                        .clone()
-                        .expect("a parked transaction holds the verifier's missing-input error");
-                    self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Invalidated);
-                    // Remembered like a new transaction's missing parent.
-                    self.storage
-                        .reject_exact(tx_id, ExactTipRejectionError::FailedVerification(error));
-                }
-                _ => {}
-            }
-        }
     }
 
-    /// The one way out of an input that returns a step. Queued revalidations
-    /// that can start are started first, so no input can free a slot, or
-    /// bring a retry due, and leave it unused until something else happens.
+    /// The one way out of an input that returns a step. Queued re-admissions
+    /// that can start are started first, so no input can free a slot and
+    /// leave it unused until something else happens.
     fn take_step(&mut self) -> Step {
         if self.active {
-            self.start_revalidations();
+            self.start_queued();
         }
         let step = std::mem::take(&mut self.step);
         let changes = u64::try_from(step.changes.len()).expect("a batch fits in u64");
@@ -1204,11 +1075,7 @@ impl<E: VerifyError> MempoolState<E> {
     /// on it.
     fn drop_reservation(&mut self, reservation: ReservationId) {
         if let Some(key) = self.owners.remove(&reservation) {
-            let admission = self
-                .admissions
-                .remove(&key)
-                .expect("a reservation that can still submit names a live admission");
-            self.admission_of.remove(&admission.tx_id);
+            self.end(key);
         }
         self.leases.remove(&reservation);
     }
@@ -1271,13 +1138,6 @@ impl<E: VerifyError> MempoolState<E> {
                     );
                     return;
                 }
-                if self.conflicts_with_hidden(tx.transaction.transaction()) {
-                    // It conflicts with a transaction that is hidden because
-                    // nobody knows yet whether it is still valid. If that one
-                    // fails, this one was fine. So nothing is remembered.
-                    self.fail_locally(key, LocalFault::PoolUnsettled);
-                    return;
-                }
                 // The verifier used a pool output that the pool no longer
                 // offers. The parent may have been mined, and the child is then
                 // valid against the chain, so the job runs again.
@@ -1294,17 +1154,6 @@ impl<E: VerifyError> MempoolState<E> {
                 );
                 self.forget_evicted(evicted);
                 if let Err(error) = result {
-                    // A refusal for room while hidden bodies take room says
-                    // nothing final, as with a conflict with a hidden
-                    // transaction, and storage has not cached it.
-                    if matches!(
-                        error,
-                        MempoolError::StorageExactTip(ExactTipRejectionError::BelowEvictionCost)
-                    ) && self.storage.room_is_unsettled()
-                    {
-                        self.fail_locally(key, LocalFault::PoolUnsettled);
-                        return;
-                    }
                     // Storage has cached what it refused.
                     self.refuse(key, error);
                     return;
@@ -1324,17 +1173,17 @@ impl<E: VerifyError> MempoolState<E> {
                         id: tx.transaction.id(),
                         parents,
                         expiry: tx.transaction.transaction().expiry_height(),
-                        hidden: None,
-                        body: None,
-                        backoff: REVALIDATE_RETRY,
-                        visible_at: pool_key,
-                        hidden_at: ChangeSeq(0),
-                        missing_since: None,
-                        missing_error: None,
+                        added_at: pool_key,
                     },
                 );
                 self.pooled.insert(hash, pool_key);
                 self.decide(key, Verdict::Admitted);
+                // Another authorization of these effects that a reset left
+                // waiting has nothing to come back to.
+                if let Some(queued) = self.queued.get(&hash).copied() {
+                    self.unqueue(queued);
+                }
+                self.trim_queue();
                 self.wake(hash);
             }
             // Found in the best chain by this job's own lookup. Today that
@@ -1404,147 +1253,6 @@ impl<E: VerifyError> MempoolState<E> {
         }
     }
 
-    /// Applies a fresh outcome to a hidden pooled transaction.
-    fn revalidation_outcome(
-        &mut self,
-        key: u64,
-        hash: transaction::Hash,
-        outcome: Outcome<E>,
-        started_at: u64,
-        wall: DateTime<Utc>,
-    ) {
-        let now = self.now;
-        match outcome {
-            Outcome::Pass { tx, pool_inputs } => {
-                if !pool_inputs.iter().all(|input| self.offers(input)) {
-                    // Verified against a pool that has since lost that output.
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    return;
-                }
-                let pooled = self.pooled_at(key);
-                let (tx_id, expiry) = (pooled.id, pooled.expiry);
-                // Keep the time it first entered the pool, for mining order.
-                let time = pooled
-                    .body
-                    .as_ref()
-                    .and_then(|body| body.time)
-                    .unwrap_or(wall);
-                // Nothing expired becomes visible.
-                if self.reached(expiry) {
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    self.remove_with_dependents(hash, RemovalReason::Expired);
-                    self.storage.reject_effects_chain(
-                        hash,
-                        SameEffectsChainRejectionError::Expired,
-                        now,
-                    );
-                    return;
-                }
-                // Today's insertion limits, as for a new transaction. A parent
-                // that was mined, then put back by a reorg, can have gained
-                // more pooled children than one group holds.
-                // While storage decides, this body is not also counted as
-                // held outside it. Its cost moves to storage only if storage
-                // takes it, and a removal below takes it off once otherwise.
-                let cost = self
-                    .pooled_at(key)
-                    .body
-                    .as_ref()
-                    .map_or(0, VerifiedUnminedTx::cost);
-                self.storage
-                    .set_outside_cost(self.hidden_cost.saturating_sub(cost));
-                // A rejection cached for another authorization of these
-                // effects while this one was pooled says nothing about it, so
-                // the lists are not checked.
-                let (result, evicted) = self.storage.reinsert_with_evicted_ids(
-                    tx.clone(),
-                    pool_inputs,
-                    Some(self.tip.height),
-                    now,
-                    time,
-                );
-                self.forget_evicted(evicted);
-                if result.is_err() {
-                    self.storage.set_outside_cost(self.hidden_cost);
-                    // Storage has cached what it refused.
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
-                    return;
-                }
-                self.add_hidden_cost(cost, false);
-                let visible_at = self.fresh();
-                self.set_hidden(key, None);
-                let pooled = self.pooled_at(key);
-                // Storage holds it now, and counts its cost.
-                pooled.body = None;
-                pooled.backoff = REVALIDATE_RETRY;
-                pooled.visible_at = visible_at;
-                pooled.missing_since = None;
-                pooled.missing_error = None;
-                let hidden_at = pooled.hidden_at;
-                self.step.changes.push(Change::Revealed {
-                    id: tx_id,
-                    hidden_at,
-                });
-                self.wake(hash);
-            }
-            // A block the core never saw mined it. Its dependents stay and are
-            // checked against the chain when their turn comes.
-            Outcome::AlreadyMined(_) => {
-                // Its job has reported, so there is nothing to cancel.
-                self.set_hidden(key, Some(Hidden::Queued));
-                self.remove_one(key, RemovalReason::Mined);
-                // Found by a lookup, not in a block the core saw connect, so it
-                // is not cached.
-                self.wake(hash);
-            }
-            // Its parent is in neither the chain nor the visible pool. After a
-            // reorg that can be a mined parent that is on its way back, so it
-            // waits as a new transaction would, still hidden.
-            Outcome::MissingInputs { missing, error } => {
-                let arrived = missing
-                    .iter()
-                    .any(|outpoint| self.arrived_since(outpoint, started_at));
-                let pooled = self.pooled_at(key);
-                pooled.missing_error = Some(error.clone());
-                let since = *pooled.missing_since.get_or_insert(now);
-                let wait_over = since + T_PARK <= now;
-                let tx_id = pooled.id;
-                // An input arrived during this check, so its answer is out of
-                // date. A hidden transaction holds no slot, so it is checked
-                // again, however late.
-                if arrived {
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    return;
-                }
-                if wait_over {
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
-                    self.storage
-                        .reject_exact(tx_id, ExactTipRejectionError::FailedVerification(error));
-                    return;
-                }
-                let mut on: Vec<transaction::Hash> = Vec::new();
-                for outpoint in missing {
-                    if !on.contains(&outpoint.hash) {
-                        on.push(outpoint.hash);
-                    }
-                }
-                self.set_hidden(key, Some(Hidden::Parked { on }));
-            }
-            Outcome::Fail { error, .. } => {
-                let tx_id = self.pooled_at(key).id;
-                self.set_hidden(key, Some(Hidden::Queued));
-                self.remove_with_dependents(hash, RemovalReason::Invalidated);
-                // Nobody is charged for a transaction that passed once. The
-                // rejection is still remembered, so it is not fetched again at
-                // once.
-                self.storage.reject(tx_id, error, now);
-            }
-            Outcome::LocalFault(_) => self.retry_later(key),
-        }
-    }
-
     /// Rejects an admission: caches the rejection, logs it, and answers every
     /// waiter.
     fn reject(&mut self, key: u64, error: RejectionError<E>, charge: Charge) {
@@ -1569,28 +1277,95 @@ impl<E: VerifyError> MempoolState<E> {
         );
     }
 
-    /// Ends an admission: every waiter gets the verdict, and the slot is free.
-    /// A charge reaches only a waiter with a peer supplier.
+    /// Ends an admission: its submission gets the verdict, and its slot is
+    /// free. A charge reaches only a submission with a peer supplier.
     fn decide(&mut self, key: u64, verdict: Verdict) {
+        let admission = self.end(key);
+        if let Some(owner) = admission.owner {
+            self.owners.remove(&owner);
+            if admission.body.is_none() {
+                // The reserving caller's fetch is still out. Its body will
+                // arrive decoded, so its slot is not free yet.
+                self.leases.insert(
+                    owner,
+                    Lease {
+                        tx_id: admission.tx_id,
+                        verdict: verdict.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(waiter) = admission.waiter {
+            self.step.effects.push(Effect::Verdict { waiter, verdict });
+        }
+    }
+
+    /// Takes an admission out of the machine.
+    fn end(&mut self, key: u64) -> Admission<E> {
         let admission = self
             .admissions
             .remove(&key)
             .expect("the caller names a live admission");
         self.admission_of.remove(&admission.tx_id);
-        self.owners.remove(&admission.owner);
-        if admission.body.is_none() {
-            // The reserving caller's fetch is still out. Its body will arrive
-            // decoded, so its slot is not free yet.
-            self.leases.insert(
-                admission.owner,
-                Lease {
-                    tx_id: admission.tx_id,
-                    verdict: verdict.clone(),
+        if admission.owner.is_none() {
+            self.readmitting = self.readmitting.saturating_sub(1);
+        }
+        admission
+    }
+
+    /// Starts queued re-admissions, oldest first, while their share of the
+    /// slots and the node's limit allow. Each goes through admission like a
+    /// new transaction, with nobody waiting for its verdict.
+    fn start_queued(&mut self) {
+        while self.readmitting < self.limits.readmitting
+            && self.slots_in_use() < self.limits.pending
+        {
+            let Some((&key, _)) = self.queue.first_key_value() else {
+                break;
+            };
+            let tx = self.unqueue(key);
+            let tx_id = tx.id();
+            self.admissions.insert(
+                key,
+                Admission {
+                    tx_id,
+                    owner: None,
+                    body: Some(tx),
+                    waiter: None,
+                    stage: Stage::Reserved,
+                    missing_since: None,
+                    missing_error: None,
+                    last_check_used: false,
+                    after_reset: true,
                 },
             );
+            self.admission_of.insert(tx_id, key);
+            self.readmitting = self.readmitting.saturating_add(1);
+            self.start_admission(key);
         }
-        if let Some(waiter) = admission.waiter {
-            self.step.effects.push(Effect::Verdict { waiter, verdict });
+    }
+
+    /// Takes the body at `key` out of the queue.
+    fn unqueue(&mut self, key: u64) -> UnminedTx {
+        let queued = self
+            .queue
+            .remove(&key)
+            .expect("the caller names a queued transaction");
+        self.queued.remove(&queued.tx.id().mined_id());
+        self.queued_cost = self.queued_cost.saturating_sub(queued.cost);
+        queued.tx
+    }
+
+    /// Drops the newest queued bodies until the pool and the queue are
+    /// within the cost limit together. Each left the pool at the reset, and
+    /// the log says so.
+    fn trim_queue(&mut self) {
+        while self.storage.total_cost().saturating_add(self.queued_cost) > self.storage.cost_limit()
+        {
+            let Some((&key, _)) = self.queue.last_key_value() else {
+                break;
+            };
+            self.unqueue(key);
         }
     }
 
@@ -1622,11 +1397,10 @@ impl<E: VerifyError> MempoolState<E> {
             .body
             .clone()
             .expect("an admission is verified only once it holds its body");
-        self.jobs.insert(job, (JobTarget::Admission(tx_id), job.0));
+        self.jobs.insert(job, (tx_id, job.0));
         self.step.effects.push(Effect::Start {
             job,
             tx,
-            revalidation: false,
             after_reset,
         });
     }
@@ -1641,8 +1415,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.step.effects.push(Effect::Cancel(job));
     }
 
-    /// Runs every admission parked on `parent` again, and queues every hidden
-    /// transaction parked on it.
+    /// Runs every admission parked on `parent` again.
     fn wake(&mut self, parent: transaction::Hash) {
         let woken: Vec<u64> = self
             .admissions
@@ -1656,38 +1429,21 @@ impl<E: VerifyError> MempoolState<E> {
         for key in woken {
             self.start_admission(key);
         }
-        let parked: Vec<u64> = self
-            .parked_on
-            .get(&parent)
-            .map(|keys| keys.iter().copied().collect())
-            .unwrap_or_default();
-        for key in parked {
-            self.set_hidden(key, Some(Hidden::Queued));
-        }
     }
 
     /// Removes every pooled transaction whose expiry height the tip has
-    /// reached, and remembers each as expired. With `with_dependents`, what
-    /// depends on a visible one goes too.
-    fn remove_expired(&mut self, with_dependents: bool) {
-        let expired: Vec<(UnminedTxId, bool)> = self
+    /// reached, with what depends on it, and remembers each as expired.
+    fn remove_expired(&mut self) {
+        let expired: Vec<transaction::Hash> = self
             .pool
             .values()
             .filter(|pooled| self.reached(pooled.expiry))
-            .map(|pooled| (pooled.id, pooled.hidden.is_none()))
+            .map(|pooled| pooled.id.mined_id())
             .collect();
-        for (tx_id, visible) in expired {
-            // A hidden transaction has not been checked against the chain since
-            // a reorg or a missed event. It may have been mined in a block the
-            // core did not see, and then what spends its outputs is still
-            // valid. So only a visible one takes its dependents with it.
-            if with_dependents && visible {
-                self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
-            } else if let Some(key) = self.pooled.get(&tx_id.mined_id()).copied() {
-                self.remove_one(key, RemovalReason::Expired);
-            }
+        for hash in expired {
+            self.remove_with_dependents(hash, RemovalReason::Expired);
             self.storage.reject_effects_chain(
-                tx_id.mined_id(),
+                hash,
                 SameEffectsChainRejectionError::Expired,
                 self.now,
             );
@@ -1723,167 +1479,6 @@ impl<E: VerifyError> MempoolState<E> {
         self.decide(key, Verdict::LocalFault(fault));
     }
 
-    /// Hides every visible pooled transaction, to be verified again. Each one
-    /// leaves storage and keeps its body here.
-    fn hide_all(&mut self) {
-        let mut bodies: HashMap<transaction::Hash, VerifiedUnminedTx> = self
-            .storage
-            .take_all()
-            .into_iter()
-            .map(|tx| (tx.transaction.id().mined_id(), tx))
-            .collect();
-        let keys: Vec<u64> = self.pool.keys().copied().collect();
-        for key in keys {
-            match self.pool[&key].hidden {
-                None => {
-                    let pending =
-                        u64::try_from(self.step.changes.len()).expect("a batch fits in u64");
-                    let hidden_at =
-                        ChangeSeq(self.logged.saturating_add(pending).saturating_add(1));
-                    let pooled = self.pooled_at(key);
-                    let id = pooled.id;
-                    let body = bodies
-                        .remove(&id.mined_id())
-                        .expect("storage holds every visible pooled transaction");
-                    let cost = body.cost();
-                    pooled.body = Some(body);
-                    pooled.hidden_at = hidden_at;
-                    self.add_hidden_cost(cost, true);
-                    self.set_hidden(key, Some(Hidden::Queued));
-                    self.step.changes.push(Change::Hidden(id));
-                }
-                // A running job read the old chain, so its outcome will be
-                // stale and it will run again.
-                Some(Hidden::Running { .. }) => {}
-                Some(_) => self.set_hidden(key, Some(Hidden::Queued)),
-            }
-        }
-        debug_assert!(bodies.is_empty(), "storage held only pooled transactions");
-    }
-
-    /// Starts queued revalidations, parents first, while the revalidation
-    /// share and the node's limit allow.
-    fn start_revalidations(&mut self) {
-        // Walk the queue lazily, so a full share costs nothing and a start
-        // costs only the keys it passes.
-        let mut after = None;
-        loop {
-            if self.running >= self.limits.revalidating
-                || self.slots_in_use() >= self.limits.pending
-            {
-                break;
-            }
-            let next = match after {
-                None => self.queued.iter().next(),
-                Some(previous) => self
-                    .queued
-                    .range((
-                        std::ops::Bound::Excluded(previous),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next(),
-            };
-            let Some(&key) = next else {
-                break;
-            };
-            after = Some(key);
-            let pooled = &self.pool[&key];
-            let parent_hidden = pooled.parents.iter().any(|parent| {
-                self.pooled
-                    .get(parent)
-                    .is_some_and(|parent| self.pool[parent].hidden.is_some())
-            });
-            if parent_hidden {
-                continue;
-            }
-            let tx = pooled
-                .body
-                .as_ref()
-                .expect("a hidden transaction holds its body")
-                .transaction
-                .clone();
-            let hash = pooled.id.mined_id();
-            let job = JobId(self.fresh());
-            let deadline = self.now + T_VERIFY;
-            self.set_hidden(key, Some(Hidden::Running { job, deadline }));
-            self.jobs
-                .insert(job, (JobTarget::Revalidation(hash), job.0));
-            self.step.effects.push(Effect::Start {
-                job,
-                tx,
-                revalidation: true,
-                // A revalidation is never charged.
-                after_reset: false,
-            });
-        }
-    }
-
-    /// A revalidation hit a local fault. The transaction stays hidden and is
-    /// tried again later.
-    fn retry_later(&mut self, key: u64) {
-        let at = self.now;
-        let pooled = self.pooled_at(key);
-        let backoff = pooled.backoff;
-        pooled.backoff = backoff.saturating_mul(2).min(REVALIDATE_RETRY_MAX);
-        self.set_hidden(key, Some(Hidden::Retry { at: at + backoff }));
-    }
-
-    /// Sets a pooled transaction's hidden state, keeping the indexes in step.
-    fn set_hidden(&mut self, key: u64, hidden: Option<Hidden>) {
-        let pooled = self
-            .pool
-            .get_mut(&key)
-            .expect("the caller names a pooled transaction");
-        if let Some(due) = hidden_deadline(pooled.hidden.as_ref(), pooled.missing_since) {
-            self.hidden_due.remove(&(due, key));
-        }
-        if let Some(Hidden::Parked { on }) = &pooled.hidden {
-            for parent in on {
-                if let Some(keys) = self.parked_on.get_mut(parent) {
-                    keys.remove(&key);
-                    if keys.is_empty() {
-                        self.parked_on.remove(parent);
-                    }
-                }
-            }
-        }
-        if let Some(due) = hidden_deadline(hidden.as_ref(), pooled.missing_since) {
-            self.hidden_due.insert((due, key));
-        }
-        if let Some(Hidden::Parked { on }) = &hidden {
-            for parent in on {
-                self.parked_on.entry(*parent).or_default().insert(key);
-            }
-        }
-        if matches!(pooled.hidden, Some(Hidden::Running { .. })) {
-            self.running -= 1;
-        }
-        if matches!(hidden, Some(Hidden::Running { .. })) {
-            self.running += 1;
-        }
-        if matches!(hidden, Some(Hidden::Queued)) {
-            self.queued.insert(key);
-        } else {
-            self.queued.remove(&key);
-        }
-        if hidden.is_some() {
-            self.hidden.insert(key);
-        } else {
-            self.hidden.remove(&key);
-        }
-        pooled.hidden = hidden;
-    }
-
-    /// Adds or takes away `cost` from the hidden cost, and tells storage.
-    fn add_hidden_cost(&mut self, cost: u64, add: bool) {
-        self.hidden_cost = if add {
-            self.hidden_cost.saturating_add(cost)
-        } else {
-            self.hidden_cost.saturating_sub(cost)
-        };
-        self.storage.set_outside_cost(self.hidden_cost);
-    }
-
     /// Takes the pooled transaction at `key` off its parents' lists of
     /// children.
     fn forget_parents(&mut self, key: u64, parents: &[transaction::Hash]) {
@@ -1899,32 +1494,13 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// Removes one pooled transaction and logs it. What depends on it stays.
     fn remove_one(&mut self, key: u64, reason: RemovalReason) {
-        if !self.pool.contains_key(&key) {
+        let Some(pooled) = self.pool.remove(&key) else {
             return;
-        }
-        // Clear the indexes, and cancel a running job.
-        let running = match self.pool[&key].hidden {
-            Some(Hidden::Running { job, .. }) => Some(job),
-            _ => None,
         };
-        let visible = self.pool[&key].hidden.is_none();
-        self.set_hidden(key, None);
-        let pooled = self
-            .pool
-            .remove(&key)
-            .expect("the transaction was pooled a moment ago");
         let hash = pooled.id.mined_id();
         self.pooled.remove(&hash);
         self.forget_parents(key, &pooled.parents);
-        if visible {
-            self.storage.remove_one(&hash);
-        } else if let Some(body) = &pooled.body {
-            self.add_hidden_cost(body.cost(), false);
-        }
-        if let Some(job) = running {
-            self.jobs.remove(&job);
-            self.step.effects.push(Effect::Cancel(job));
-        }
+        self.storage.remove_one(&hash);
         self.step.changes.push(Change::Removed {
             id: pooled.id,
             reason,
@@ -1960,7 +1536,7 @@ impl<E: VerifyError> MempoolState<E> {
             let pooled = self
                 .pool
                 .remove(&key)
-                .expect("an evicted transaction was pooled and visible");
+                .expect("storage evicts only what the pool holds");
             let hash = pooled.id.mined_id();
             self.pooled.remove(&hash);
             self.forget_parents(key, &pooled.parents);
@@ -1982,57 +1558,35 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Whether `outpoint` became available after the event count
-    /// `started_at`: its transaction is visible now, creates that output, and
-    /// became visible after that count.
+    /// `started_at`: its transaction is pooled now, creates that output, and
+    /// entered the pool after that count.
     fn arrived_since(&self, outpoint: &OutPoint, started_at: u64) -> bool {
         self.offers(outpoint)
             && self
                 .pooled
                 .get(&outpoint.hash)
-                .is_some_and(|key| self.pool[key].visible_at > started_at)
+                .is_some_and(|key| self.pool[key].added_at > started_at)
     }
 
-    /// Whether the visible pool offers `outpoint`.
+    /// Whether the pool offers `outpoint`.
     fn offers(&self, outpoint: &OutPoint) -> bool {
         self.storage.created_output(outpoint).is_some()
     }
 
-    /// Whether `tx` spends what a hidden pooled transaction spends.
-    fn conflicts_with_hidden(&self, tx: &Transaction) -> bool {
-        if self.hidden.is_empty() {
-            return false;
-        }
-        let spends = Spends::of([tx]);
-        self.hidden.iter().any(|key| {
-            self.pool[key]
-                .body
-                .as_ref()
-                .is_some_and(|body| spends.conflict_with(body.transaction.transaction()))
-        })
-    }
-
-    /// A pooled transaction's body, from storage if it is visible.
-    fn pooled_transaction<'a>(&'a self, pooled: &'a Pooled<E>) -> Option<&'a Transaction> {
-        match &pooled.body {
-            Some(body) => Some(body.transaction.transaction().as_ref()),
-            None => self
-                .storage
-                .transactions()
-                .get(&pooled.id.mined_id())
-                .map(|tx| tx.transaction.transaction().as_ref()),
-        }
+    /// A pooled transaction's body, which storage holds.
+    fn transaction_of(&self, pooled: &Pooled) -> &Transaction {
+        self.storage
+            .transactions()
+            .get(&pooled.id.mined_id())
+            .expect("storage holds every pooled transaction")
+            .transaction
+            .transaction()
     }
 
     fn admission_at(&mut self, key: u64) -> &mut Admission<E> {
         self.admissions
             .get_mut(&key)
             .expect("the caller names a live admission")
-    }
-
-    fn pooled_at(&mut self, key: u64) -> &mut Pooled<E> {
-        self.pool
-            .get_mut(&key)
-            .expect("the caller names a pooled transaction")
     }
 
     /// Moves the tip. Every running job verified for the old one.

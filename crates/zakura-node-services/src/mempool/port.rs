@@ -60,9 +60,10 @@ mod tests;
 /// `MAX_INBOUND_CONCURRENCY`.
 pub const MAX_PENDING: usize = 500;
 
-/// Slots that revalidation after a reorg can hold. The rest of
-/// [`MAX_PENDING`] stays free for new admissions. Provisional.
-pub const MAX_REVALIDATING: usize = 400;
+/// Slots that pooled transactions can hold while they are verified again
+/// after a reset. The rest of [`MAX_PENDING`] stays free for new admissions.
+/// Provisional.
+pub const MAX_READMITTING: usize = 400;
 
 /// Entries the change log keeps. A reader that falls further behind
 /// resynchronizes from the snapshot. The pool's 8,000 transactions plus a
@@ -81,13 +82,6 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// ends, a parked transaction is rejected, and one whose inputs keep
 /// arriving during its checks gets one more check and no more.
 pub const T_PARK: Duration = Duration::from_secs(60);
-
-/// The first wait before a revalidation that hit a local fault is tried
-/// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
-pub const REVALIDATE_RETRY: Duration = Duration::from_secs(1);
-
-/// The longest wait between revalidation tries. Provisional.
-pub const REVALIDATE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Commands that can wait for the core. A full queue makes
 /// [`PoolHandle::reserve`] and [`PoolHandle::submit`] wait.
@@ -271,9 +265,6 @@ pub enum LocalFault {
     Deactivated,
     /// The reservation was no longer valid when the body arrived.
     StaleReservation,
-    /// The transaction conflicts with a pooled one that is hidden while it
-    /// is verified again. Which of the two is valid is not known yet.
-    PoolUnsettled,
     /// The body is not the transaction the reservation names.
     WrongTransaction,
     /// The core has stopped.
@@ -349,9 +340,11 @@ pub enum RemovalReason {
     Expired,
     /// The pool was full and it had the lowest fee rate.
     Evicted,
-    /// It failed when it was verified again, or a transaction it depends on
-    /// left the pool.
+    /// A transaction it depends on left the pool without being mined.
     Invalidated,
+    /// The tip was reset. The core verifies it again, and adds it again if
+    /// it passes.
+    Reset,
     /// The pool turned off.
     Deactivated,
 }
@@ -359,7 +352,7 @@ pub enum RemovalReason {
 /// One change, in the order the core made it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Change {
-    /// The transaction entered the pool and is visible.
+    /// The transaction entered the pool.
     Added(UnminedTxId),
     /// The transaction left the pool.
     Removed {
@@ -367,19 +360,6 @@ pub enum Change {
         id: UnminedTxId,
         /// Why it left.
         reason: RemovalReason,
-    },
-    /// The transaction is still in the pool but hidden from snapshots while
-    /// it is verified again after a reorg.
-    Hidden(UnminedTxId),
-    /// A hidden transaction passed and is visible again.
-    ///
-    /// A reader announces it unless it has already announced the
-    /// transaction.
-    Revealed {
-        /// The transaction.
-        id: UnminedTxId,
-        /// The position of the [`Change::Hidden`] entry this one ends.
-        hidden_at: ChangeSeq,
     },
     /// A submitted transaction was rejected and never entered the pool.
     /// Today's change stream reports this as `Invalidated`.
@@ -475,7 +455,7 @@ impl ChangeLog {
     }
 }
 
-/// The visible pool at one moment. Immutable once published.
+/// The pool at one moment. Immutable once published.
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
     /// Whether the pool is on. An inactive pool is empty, and a reader
@@ -486,7 +466,7 @@ pub struct PoolSnapshot {
     pub tip: ChainTip,
     /// The newest change this snapshot includes.
     pub last_change: ChangeSeq,
-    /// The visible transactions, in mining order.
+    /// The transactions, in mining order.
     pub transactions: Vec<VerifiedUnminedTx>,
     /// The dependencies between them.
     pub dependencies: TransactionDependencies,
@@ -534,14 +514,14 @@ impl PoolSnapshot {
         }
     }
 
-    /// The visible transaction with this mined id.
+    /// The pooled transaction with this mined id.
     pub fn transaction(&self, id: &transaction::Hash) -> Option<&VerifiedUnminedTx> {
         self.by_mined_id
             .get(id)
             .and_then(|index| self.transactions.get(*index))
     }
 
-    /// The output a visible transaction creates at `outpoint`.
+    /// The output a pooled transaction creates at `outpoint`.
     pub fn created_output(&self, outpoint: &transparent::OutPoint) -> Option<&transparent::Output> {
         let index = usize::try_from(outpoint.index).ok()?;
         self.transaction(&outpoint.hash)?
@@ -551,7 +531,7 @@ impl PoolSnapshot {
             .get(index)
     }
 
-    /// Whether a visible transaction spends `outpoint`.
+    /// Whether a pooled transaction spends `outpoint`.
     pub fn spends(&self, outpoint: &transparent::OutPoint) -> bool {
         self.spent.contains(outpoint)
     }

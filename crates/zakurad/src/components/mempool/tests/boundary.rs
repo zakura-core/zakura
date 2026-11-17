@@ -1676,9 +1676,9 @@ async fn recover(mode: Mode, reannounce: bool) -> Recovery {
 /// does with every transaction announced again. Without the announcements,
 /// the core alone gets every still-valid transaction back as soon. A new
 /// transaction submitted just after the reset is admitted within a few
-/// verifications of its submission, because revalidation leaves part of the
-/// core's slots free. The core's own tests show a reorg recovers as this
-/// upgrade does, and today's pool resets the same way on both.
+/// verifications of its submission, because the pool being verified again
+/// leaves part of the core's slots free. A reorg is the same reset to both
+/// pools as this upgrade.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
     let classic = recover(Mode::Classic, true).await;
@@ -1717,7 +1717,7 @@ async fn the_core_recovers_from_a_reset_no_later_than_todays_pool() {
     for run in [&core, &core_alone] {
         assert!(
             // The share, plus the new transaction's own verification.
-            run.peak <= zakura_node_services::mempool::port::MAX_REVALIDATING + 1,
+            run.peak <= zakura_node_services::mempool::port::MAX_READMITTING + 1,
             "the core verifies again within its share: {run:?}"
         );
     }

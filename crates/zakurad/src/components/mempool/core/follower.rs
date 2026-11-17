@@ -8,8 +8,8 @@
 //!
 //! The announcer advertises new transactions to legacy peers, at most every
 //! [`TRANSACTION_GOSSIP_DELAY`], as today's gossip task does. A transaction
-//! that is visible again after a reorg is announced again, as today's reset
-//! re-inserts and re-announces it.
+//! that is back in the pool after a reset is announced again, as today's
+//! reset re-inserts and re-announces it.
 //!
 //! The change stream sends the log's batches in order, at most one event of
 //! each kind for each, in today's order: added, invalidated, mined. Batches
@@ -106,7 +106,7 @@ struct Announcer {
     pool: PoolReader,
     outbound: Timeout<Outbound>,
     cursor: ChangeSeq,
-    /// Visible transactions not yet announced.
+    /// Pooled transactions not yet announced.
     pending: HashSet<UnminedTxId>,
 }
 
@@ -178,10 +178,10 @@ impl Announcer {
             ChangesSince::Entries(entries) => {
                 for entry in entries {
                     match entry.change {
-                        Change::Added(id) | Change::Revealed { id, .. } => {
+                        Change::Added(id) => {
                             self.pending.insert(id);
                         }
-                        Change::Removed { id, .. } | Change::Hidden(id) => {
+                        Change::Removed { id, .. } => {
                             self.pending.remove(&id);
                         }
                         Change::Refused(_) => {}
@@ -190,7 +190,7 @@ impl Announcer {
             }
             ChangesSince::Resync => {
                 // The log moved past this reader, which cannot know what was
-                // added meanwhile. Every visible transaction is announced
+                // added meanwhile. Every pooled transaction is announced
                 // again.
                 tracing::warn!("the pool's change log moved past the announcer, resynchronizing");
                 metrics::counter!("mempool.gossip.lagged.events.total").increment(1);
@@ -201,7 +201,7 @@ impl Announcer {
                     .collect();
             }
         }
-        // Only what is still visible is announced.
+        // Only what is still pooled is announced.
         self.pending.retain(|id| {
             snapshot
                 .transaction(&id.mined_id())
@@ -312,7 +312,7 @@ impl Batch {
     /// would merge.
     fn would_reorder(&self, change: Change) -> bool {
         match change {
-            Change::Added(id) | Change::Revealed { id, .. } => {
+            Change::Added(id) => {
                 self.added.contains(&id)
                     || self.invalidated.contains(&id)
                     || self.mined.contains(&id)
@@ -321,7 +321,6 @@ impl Batch {
                 id,
                 reason: RemovalReason::Mined,
             } => self.mined.contains(&id),
-            Change::Hidden(_) => false,
             Change::Removed { id, .. } | Change::Refused(id) => {
                 self.invalidated.contains(&id) || self.mined.contains(&id)
             }
@@ -331,7 +330,7 @@ impl Batch {
     /// Adds one change.
     fn take(&mut self, change: Change) {
         match change {
-            Change::Added(id) | Change::Revealed { id, .. } => {
+            Change::Added(id) => {
                 self.added.insert(id);
             }
             Change::Removed {
@@ -343,7 +342,6 @@ impl Batch {
             Change::Removed { id, .. } | Change::Refused(id) => {
                 self.invalidated.insert(id);
             }
-            Change::Hidden(_) => {}
         }
     }
 

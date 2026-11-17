@@ -48,7 +48,7 @@ const RUN_TIME: Duration = Duration::from_secs(9 * 60);
 /// The limits of a run: small, so full states are reached.
 const LIMITS: Limits = Limits {
     pending: 6,
-    revalidating: 3,
+    readmitting: 3,
 };
 
 /// A number below `n`.
@@ -117,7 +117,7 @@ struct Run {
     /// Whether the run has the pool turned on.
     active: bool,
     held: Vec<Held>,
-    /// The effects of the visible pool when each job started, which is what
+    /// The effects of the pool when each job started, which is what
     /// its verifier read.
     views: BTreeMap<u64, HashSet<transaction::Hash>>,
     steps: usize,
@@ -175,13 +175,13 @@ impl Run {
     fn took(&mut self, what: &str, step: &Step) {
         if std::env::var_os("POOL_TRACE").is_some() {
             eprintln!(
-                "{} {what}: {:?} {:?} visible {:?}",
+                "{} {what}: {:?} {:?} pooled {:?}",
                 self.steps,
                 step.effects,
                 step.changes,
                 self.bench
                     .machine
-                    .visible()
+                    .pooled_ids()
                     .iter()
                     .map(|id| self.name(id))
                     .collect::<Vec<_>>()
@@ -190,11 +190,11 @@ impl Run {
         if self.bench.machine.is_parked_any() {
             self.bench.tracker.saw("parked");
         }
-        let visible_now = self.bench.tracker.visible_effects();
+        let pooled_now = self.bench.tracker.pooled_effects();
         for effect in &step.effects {
             match effect {
                 Effect::Start { job, .. } => {
-                    self.views.insert(job.0, visible_now.clone());
+                    self.views.insert(job.0, pooled_now.clone());
                 }
                 // The caller stops its fetch and drops the reservation, as
                 // the adapter does, on a later input.
@@ -353,27 +353,26 @@ impl Run {
             .clone();
         // Usually the pool now, sometimes the pool the job started with,
         // which may have changed since.
-        let visible: HashSet<transaction::Hash> = match view {
+        let pooled: HashSet<transaction::Hash> = match view {
             Some(view) if chance(&mut self.rng, 3) => view,
-            _ => self.bench.tracker.visible_effects(),
+            _ => self.bench.tracker.pooled_effects(),
         };
         // Transactions of the universe that the chain has not mined. A spend
-        // of one is found only in the visible pool.
+        // of one is found only in the pool.
         let unmined: HashSet<transaction::Hash> = self
             .txs
             .iter()
             .map(|tx| tx.id().mined_id())
             .filter(|hash| !self.mined.contains(hash))
             .collect();
-        // The verifier finds a spend in the visible pool, or in the chain if
-        // it spends a chain output or a mined transaction. A spend of an
-        // unmined transaction of the universe that is not visible is
-        // missing.
+        // The verifier finds a spend in the pool, or in the chain if it
+        // spends a chain output or a mined transaction. A spend of an
+        // unmined transaction of the universe that is not pooled is missing.
         let (from_pool, missing): (Vec<OutPoint>, Vec<OutPoint>) = tx
             .spends()
             .into_iter()
             .filter(|spend| unmined.contains(&spend.hash))
-            .partition(|spend| visible.contains(&spend.hash));
+            .partition(|spend| pooled.contains(&spend.hash));
         // The verifier's lookup finds a transaction the chain mined. Its
         // children may already be pooled, spending its outputs from the
         // chain, so passing it would join them in a group no real input
@@ -524,14 +523,13 @@ impl Run {
         assert_eq!(
             machine.slots_in_use(),
             0,
-            "the drain frees every slot: hidden {}, held {}",
-            machine.hidden().len(),
+            "the drain frees every slot: held {}",
             machine.caller_held()
         );
         assert_eq!(machine.caller_held(), 0, "the drain ends every reservation");
         assert!(
-            machine.hidden().is_empty(),
-            "the drain decides every hidden transaction"
+            machine.queued_ids().is_empty(),
+            "the drain verifies again everything a reset took out"
         );
         self.bench.tracker.every_submission_is_answered();
     }
@@ -591,13 +589,13 @@ fn random_runs_keep_the_invariants_and_drain() {
     if runs >= 400 {
         for kind in [
             "added",
-            "hidden",
-            "revealed",
             "refused",
             "parked",
             "reserved",
             "start",
-            "start revalidation",
+            "start again after a reset",
+            "added again after a reset",
+            "removed Reset",
             "cancel",
             "cancel fetch",
             "answer for another tip",
@@ -608,7 +606,6 @@ fn random_runs_keep_the_invariants_and_drain() {
             "removed Deactivated",
             "verdict Admitted",
             "verdict Rejected",
-            "verdict LocalFault(PoolUnsettled)",
             "verdict LocalFault(VerifyTimeout)",
             "verdict LocalFault(WrongTransaction)",
             "verdict LocalFault(Deactivated)",

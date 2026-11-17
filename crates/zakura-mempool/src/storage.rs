@@ -1,4 +1,4 @@
-//! The pool core's storage: the visible pool and the rejection lists.
+//! The pool core's storage: the pool and the rejection lists.
 //!
 //! [`Storage`] is plain data owned by the machine. It emits no metrics and no
 //! logs. What a metric needs is in [`Storage::stats`], which the core's task
@@ -251,7 +251,7 @@ pub enum NonStandardTransactionError {
 /// the names today's pool uses.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StorageStats {
-    /// Transactions in the visible pool.
+    /// Transactions in the pool.
     pub transactions: usize,
     /// Their total serialized size, in bytes.
     pub serialized_size: usize,
@@ -316,11 +316,6 @@ pub struct Storage<E> {
     /// Maximum allowed size of OP_RETURN scripts, in bytes.
     max_datacarrier_bytes: u32,
 
-    /// Cost the pool holds outside this storage, which counts against
-    /// `tx_cost_limit` too. The pool core keeps transactions hidden while it
-    /// verifies them again, and their bodies still take memory.
-    outside_cost: u64,
-
     /// See [`StorageStats::eviction_cost_floor`].
     eviction_cost_floor: f64,
 
@@ -357,7 +352,6 @@ impl<E: Clone> Storage<E> {
             rejection_list_capacity,
             max_datacarrier_bytes: config.max_datacarrier_bytes,
             verified: Default::default(),
-            outside_cost: 0,
             tip_rejected_exact: Default::default(),
             tip_rejected_same_effects: Default::default(),
             chain_rejected_same_effects: Default::default(),
@@ -429,49 +423,6 @@ impl<E: Clone> Storage<E> {
         now: Instant,
         time: DateTime<Utc>,
     ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
-        self.insert_checked(tx, spent_mempool_outpoints, height, now, time, true)
-    }
-
-    /// [`Self::insert_with_evicted_ids`] for a transaction that was pooled
-    /// already and has passed again. The rejection lists are not checked:
-    /// another authorization of the same effects may have been refused while
-    /// this one was pooled, and that says nothing about this one.
-    pub fn reinsert_with_evicted_ids(
-        &mut self,
-        tx: VerifiedUnminedTx,
-        spent_mempool_outpoints: Vec<transparent::OutPoint>,
-        height: Option<Height>,
-        now: Instant,
-        time: DateTime<Utc>,
-    ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
-        self.insert_checked(tx, spent_mempool_outpoints, height, now, time, false)
-    }
-
-    /// Whether bodies held outside storage take room that storage can't
-    /// free. A refusal for room is then not final: once they are back in
-    /// storage, the same bytes may pay enough to evict one. So such a
-    /// refusal is not cached.
-    pub fn room_is_unsettled(&self) -> bool {
-        self.outside_cost > 0
-    }
-
-    /// Sets the cost the pool holds outside this storage, which counts
-    /// against the cost limit.
-    pub fn set_outside_cost(&mut self, cost: u64) {
-        self.outside_cost = cost;
-    }
-
-    /// Inserts `tx`, checking the rejection lists first if
-    /// `check_rejections`. See [`Self::insert_with_evicted_ids`].
-    fn insert_checked(
-        &mut self,
-        tx: VerifiedUnminedTx,
-        spent_mempool_outpoints: Vec<transparent::OutPoint>,
-        height: Option<Height>,
-        now: Instant,
-        time: DateTime<Utc>,
-        check_rejections: bool,
-    ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
         // # Security
         //
         // Every refusal below is cached through `reject_exact` or
@@ -480,10 +431,7 @@ impl<E: Clone> Storage<E> {
         let tx_id = unmined_tx_id.mined_id();
 
         // First, check if we have a cached rejection for this transaction.
-        if let Some(error) = check_rejections
-            .then(|| self.rejection(&unmined_tx_id, now))
-            .flatten()
-        {
+        if let Some(error) = self.rejection(&unmined_tx_id, now) {
             return (Err(error), HashSet::new());
         }
 
@@ -521,13 +469,7 @@ impl<E: Clone> Storage<E> {
         let evicted_ids = match self.make_room(&tx, &ancestors) {
             Ok(evicted_ids) => evicted_ids,
             Err(error) => {
-                // Bodies held outside storage, hidden while they are checked
-                // again, take room but can't be evicted. So while there are
-                // any, this refusal is not remembered: once they are back, the
-                // same bytes may pay enough to evict one.
-                if !self.room_is_unsettled() {
-                    self.reject_exact(unmined_tx_id, error.clone());
-                }
+                self.reject_exact(unmined_tx_id, error.clone());
                 return (Err(error.into()), HashSet::new());
             }
         };
@@ -676,15 +618,14 @@ impl<E: Clone> Storage<E> {
         tx: &VerifiedUnminedTx,
         ancestors: &HashSet<transaction::Hash>,
     ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError<E>> {
-        // What the pool holds outside storage can't be evicted, so it leaves
-        // that much less room for what storage holds.
-        let limit = self.tx_cost_limit.saturating_sub(self.outside_cost);
-        if self.verified.total_cost().saturating_add(tx.cost()) <= limit {
+        if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
             self.eviction_cost_floor = 0.0;
             return Ok(HashSet::new());
         }
 
-        let victims = self.verified.select_eviction_victims(tx, ancestors, limit);
+        let victims = self
+            .verified
+            .select_eviction_victims(tx, ancestors, self.tx_cost_limit);
 
         if let Some(cheapest) = victims.cheapest {
             // In zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of cost, the increment is

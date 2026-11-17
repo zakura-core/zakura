@@ -58,7 +58,6 @@ const START: u32 = 100;
 struct Call {
     tx: UnminedTxId,
     tip: ChainTip,
-    revalidation: bool,
     after_reset: bool,
     /// The pool the core had published when it asked.
     snapshot: Arc<PoolSnapshot>,
@@ -77,7 +76,6 @@ impl Verifier<TestVerifyError> for HeldVerifier {
         &self,
         tx: UnminedTx,
         tip: ChainTip,
-        revalidation: bool,
         after_reset: bool,
     ) -> Pin<Box<dyn Future<Output = Outcome<TestVerifyError>> + Send>> {
         let (answer, held) = oneshot::channel();
@@ -87,7 +85,6 @@ impl Verifier<TestVerifyError> for HeldVerifier {
             .push(Call {
                 tx: tx.id(),
                 tip,
-                revalidation,
                 after_reset,
                 snapshot: self
                     .pool
@@ -142,7 +139,7 @@ struct Mirror {
     read: Vec<(u64, Vec<Change>)>,
     cursor: ChangeSeq,
     /// The verifications the machine started in this step.
-    started: Vec<(JobId, UnminedTxId, bool, bool)>,
+    started: Vec<(JobId, UnminedTxId, bool)>,
     /// The verifications running.
     running: Vec<(JobId, Call)>,
     cancelled: Vec<JobId>,
@@ -195,7 +192,7 @@ impl Mirror {
         };
         let limits = Limits {
             pending: 4,
-            revalidating: 2,
+            readmitting: 2,
         };
         // The core is off until its chain names a tip, and so is the
         // machine it is compared with.
@@ -253,9 +250,8 @@ impl Mirror {
                 Effect::Start {
                     job,
                     tx,
-                    revalidation,
                     after_reset,
-                } => self.started.push((job, tx.id(), revalidation, after_reset)),
+                } => self.started.push((job, tx.id(), after_reset)),
                 Effect::Cancel(job) => self.cancelled.push(job),
                 Effect::CancelFetch(reservation) => {
                     self.cancelled_fetches.insert(reservation);
@@ -350,11 +346,10 @@ impl Mirror {
         let calls: Vec<Call> = std::mem::take(&mut *self.calls.lock().expect("not poisoned"));
         let started = std::mem::take(&mut self.started);
         assert_eq!(calls.len(), started.len(), "{what}: verifications started");
-        for (call, (job, tx, revalidation, after_reset)) in calls.into_iter().zip(started) {
-            let after_reset = after_reset || self.reference.job_after_reset(job);
+        for (call, (job, tx, after_reset)) in calls.into_iter().zip(started) {
             assert_eq!(
-                (call.tx, call.tip, call.revalidation, call.after_reset),
-                (tx, self.reference.tip(), revalidation, after_reset),
+                (call.tx, call.tip, call.after_reset),
+                (tx, self.reference.tip(), after_reset),
                 "{what}: a verification's transaction, tip and flags"
             );
             self.running.push((job, call));

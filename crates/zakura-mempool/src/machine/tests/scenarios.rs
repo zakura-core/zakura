@@ -76,7 +76,7 @@ fn a_body_refused_for_a_spend_conflict_charges_nothing() {
     let rejection = rejection(&step, waiter);
     assert_eq!(rejection.charge, Charge::None);
     assert_eq!(rejection.scope, RejectionScope::EffectsTip);
-    assert_eq!(bench.machine.visible(), vec![pooled.id()]);
+    assert_eq!(bench.machine.pooled_ids(), vec![pooled.id()]);
 }
 
 /// A body the pool refuses for its own policy, not for its verification,
@@ -208,152 +208,181 @@ fn an_admission_that_evicts_logs_both_changes() {
     assert!(step.changes.contains(&Change::Added(txs[2].id())));
     // The bench has already checked that the log leads to the pool and to
     // the snapshot.
-    assert_eq!(bench.machine.visible().len(), 2);
+    assert_eq!(bench.machine.pooled_ids().len(), 2);
 }
 
-// Reorgs: the pool is hidden and verified again.
+// Resets: the pool leaves and comes back through admission.
 
-/// While a pooled transaction is hidden, another authorization of the same
-/// effects is refused for its effects. The pooled one's revalidation then
-/// passes, and it is revealed: the other authorization's rejection does not
-/// stand in its way.
-#[test]
-fn a_passing_revalidation_ignores_a_rejection_of_another_authorization() {
-    let mut runner = TestRunner::deterministic();
-    let pooled = build(&mut runner, &[], 1, None);
-    let other = twin(&pooled);
-    let mut bench = Bench::new();
-    let (_, first_job) = bench.start(&pooled);
-    let (_, second_job) = bench.start(&other);
-    bench.pass(first_job, &pooled);
-
-    // A reorg hides the pooled one and starts its revalidation.
-    let revalidation = started(&bench.reset());
-    assert_eq!(
-        revalidation.len(),
-        1,
-        "the hidden transaction is checked again"
-    );
-
-    // The other authorization's job reports on the new chain and is refused
-    // for its effects, which caches a rejection of its mined id.
-    bench.fail(
-        second_job,
-        SameEffectsTipRejectionError::SpendConflict,
-        Charge::None,
-    );
-
-    bench.pass(revalidation[0], &pooled);
-    assert_eq!(bench.machine.visible(), vec![pooled.id()], "it is revealed");
-}
-
-/// Hidden transactions keep counting against the cost limit, so a reorg
-/// followed by new admissions cannot hold more than the limit.
-#[test]
-fn hidden_transactions_count_against_the_cost_limit() {
-    let mut runner = TestRunner::deterministic();
-    let txs: Vec<Tx> = (0..3).map(|_| build(&mut runner, &[], 1, None)).collect();
-    let limit = txs[0].real.cost() + txs[1].real.cost();
-    let mut bench = Bench::with(
-        Config {
-            tx_cost_limit: limit,
-            ..Config::default()
-        },
-        Limits::default(),
-    );
-    bench.admit(&txs[0]);
-    bench.admit(&txs[1]);
-
-    // A reorg hides both. Their bodies are still held.
-    let revalidations = started(&bench.reset());
-    assert_eq!(bench.machine.hidden().len(), 2);
-
-    // A new transaction finds no room: the hidden ones can't be evicted.
-    // That is not remembered, since the hidden ones were never weighed
-    // against it.
-    let (waiter, job) = bench.start(&txs[2]);
-    let step = bench.pass(job, &txs[2]);
-    assert!(
-        matches!(
-            step.verdict(waiter),
-            Some(Verdict::LocalFault(LocalFault::PoolUnsettled))
-        ),
-        "the pool is full of hidden transactions, so nothing is decided: {step:?}"
-    );
-    assert!(
-        bench.rejected(&[&txs[2]]).is_empty(),
-        "a refusal while hidden transactions take room is not cached"
-    );
-
-    // Both pass again and are revealed.
-    for (job, tx) in revalidations.into_iter().zip(&txs) {
-        bench.pass(job, tx);
-    }
-    assert_eq!(bench.machine.visible().len(), 2);
-
-    // The same bytes are checked again, against the pool as it is now.
-    assert!(
-        bench.reserve(&txs[2]).0.is_ok(),
-        "the earlier refusal does not stand in the way"
-    );
-}
-
-/// A reveal that storage refuses takes its body's cost off the hidden cost
-/// once, while another hidden body still counts. Three children of a mined
-/// parent come back after a reorg, the parent is pooled again, and the third
-/// child's reveal breaks the package limit.
-#[test]
-fn a_refused_reveal_takes_its_cost_off_once() {
-    let mut runner = TestRunner::deterministic();
-    let parent = build(&mut runner, &[], 3, None);
-    let children: Vec<Tx> = (0..3)
-        .map(|index| build(&mut runner, &[parent.outpoint(index)], 1, None))
-        .collect();
-    let other = build(&mut runner, &[], 1, None);
-    let mut bench = Bench::new();
-
-    // The parent is on the chain, so its children spend it from there.
-    for child in children.iter().chain([&other]) {
-        bench.admit(child);
-    }
-
-    // A reorg takes the parent off the chain and hides the pool.
-    let step = bench.reset();
-    let revalidations: Vec<(JobId, UnminedTxId)> = step
-        .effects
+/// The jobs `step` started, with their transactions.
+fn started_for(step: &Step) -> Vec<(JobId, UnminedTxId)> {
+    step.effects
         .iter()
         .filter_map(|effect| match effect {
             Effect::Start { job, tx, .. } => Some((*job, tx.id())),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// A reset takes every pooled transaction out of the pool, oldest first,
+/// and verifies each again like a new one. The node holds their bodies, so
+/// nobody fetches them. One that passes is added again, with nobody waiting
+/// for a verdict.
+#[test]
+fn a_reset_sends_the_pool_back_through_admission() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let mut bench = Bench::new();
+    bench.admit(&txs[0]);
+    bench.admit(&txs[1]);
+
+    let step = bench.reset();
+    let removed = |tx: &Tx| Change::Removed {
+        id: tx.id(),
+        reason: RemovalReason::Reset,
+    };
+    assert_eq!(step.changes, vec![removed(&txs[0]), removed(&txs[1])]);
+    assert!(bench.machine.pooled_ids().is_empty());
+    let jobs = started_for(&step);
     assert_eq!(
-        revalidations.len(),
-        4,
-        "every hidden transaction is checked again"
+        jobs.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+        vec![txs[0].id(), txs[1].id()]
     );
+    assert!(matches!(bench.reserve(&txs[0]).0, Err(Unreserved::Pending)));
 
-    // The parent comes back into the pool.
-    bench.admit(&parent);
-
-    // Each child now spends the pooled parent. The third breaks the package
-    // limit, and the other transaction stays hidden throughout. The bench
-    // checks the hidden cost after each one.
-    for (index, child) in children.iter().enumerate() {
-        let job = revalidations
-            .iter()
-            .find(|(_, id)| *id == child.id())
-            .expect("each child has a revalidation")
-            .0;
-        let index = u32::try_from(index).expect("a small index");
-        bench.pass_using(job, child, vec![parent.outpoint(index)]);
+    for ((job, _), tx) in jobs.into_iter().zip(&txs) {
+        let step = bench.pass(job, tx);
+        assert_eq!(step.changes, vec![Change::Added(tx.id())]);
+        assert!(step.effects.is_empty(), "nobody waits for it: {step:?}");
     }
-    assert_eq!(bench.machine.hidden(), vec![other.id()]);
-    assert_eq!(
-        bench.machine.visible().len(),
-        3,
-        "the parent and two children"
+    assert_eq!(bench.machine.pooled_ids(), vec![txs[0].id(), txs[1].id()]);
+}
+
+/// A pooled transaction that fails when it is verified again after a reset
+/// stays out, and its rejection is remembered. One that hits a local fault
+/// is dropped, and nothing is remembered.
+#[test]
+fn a_transaction_that_does_not_pass_after_a_reset_stays_out() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let mut bench = Bench::new();
+    bench.admit(&txs[0]);
+    bench.admit(&txs[1]);
+    let jobs = started_for(&bench.reset());
+
+    let step = bench.fail(
+        jobs[0].0,
+        ExactTipRejectionError::FailedVerification(TestVerifyError),
+        Charge::Ban,
     );
+    assert_eq!(step.changes, vec![Change::Refused(txs[0].id())]);
+    assert!(step.effects.is_empty(), "nobody is charged: {step:?}");
+    let step = bench.outcome(jobs[1].0, Outcome::LocalFault(LocalFault::StateUnavailable));
+    assert_eq!(step.changes, vec![Change::Refused(txs[1].id())]);
+
+    assert!(bench.machine.pooled_ids().is_empty());
+    assert_eq!(bench.rejected(&[&txs[0], &txs[1]]).len(), 1);
+    assert!(matches!(
+        bench.reserve(&txs[0]).0,
+        Err(Unreserved::Rejected(_))
+    ));
+    assert!(bench.reserve(&txs[1]).0.is_ok());
+}
+
+/// What a reset took out and no slot has verified again yet counts against
+/// the cost limit with the pool. So a reset followed by new admissions
+/// cannot hold more than the limit: the newest waiting bodies are dropped.
+#[test]
+fn transactions_waiting_after_a_reset_count_against_the_cost_limit() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 3);
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: txs[0].real.cost() + txs[1].real.cost(),
+            ..Config::default()
+        },
+        Limits {
+            pending: 5,
+            readmitting: 1,
+        },
+    );
+    bench.admit(&txs[0]);
+    bench.admit(&txs[1]);
+
+    // The first is verified again, and the second waits for a slot.
+    let jobs = started_for(&bench.reset());
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(bench.machine.queued_ids(), vec![txs[1].id()]);
+
+    // A new transaction gets in. With the waiting one it fills the limit.
+    bench.admit(&txs[2]);
+    assert_eq!(bench.machine.queued_ids(), vec![txs[1].id()]);
+
+    // The first passes again. The pool is full now, so the one still
+    // waiting is dropped.
+    let step = bench.pass(jobs[0].0, &txs[0]);
+    assert_eq!(step.changes, vec![Change::Added(txs[0].id())]);
+    assert!(bench.machine.queued_ids().is_empty());
+    assert!(started(&step).is_empty());
+    assert_eq!(bench.machine.pooled_ids(), vec![txs[2].id(), txs[0].id()]);
+}
+
+/// A block that mines a transaction still waiting to be verified again
+/// takes it out of the queue.
+#[test]
+fn a_block_that_mines_a_waiting_transaction_takes_it_out_of_the_queue() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let mut bench = Bench::with(
+        Config::default(),
+        Limits {
+            pending: 5,
+            readmitting: 1,
+        },
+    );
+    bench.admit(&txs[0]);
+    bench.admit(&txs[1]);
+    bench.reset();
+    assert_eq!(bench.machine.queued_ids(), vec![txs[1].id()]);
+
+    bench.grow(&[&txs[1]]);
+    assert!(bench.machine.queued_ids().is_empty());
+    assert!(matches!(
+        bench.reserve(&txs[1]).0,
+        Err(Unreserved::Rejected(_))
+    ));
+}
+
+/// Another authorization of a waiting transaction's effects can get in
+/// first, if its body was already being verified at the reset. The waiting
+/// one then has nothing to come back to, and leaves the queue.
+#[test]
+fn an_authorization_admitted_first_takes_the_place_of_the_one_waiting() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let other = twin(&txs[1]);
+    let mut bench = Bench::with(
+        Config::default(),
+        Limits {
+            pending: 5,
+            readmitting: 1,
+        },
+    );
+    let (waiter, job) = bench.start(&other);
+    bench.admit(&txs[0]);
+    bench.admit(&txs[1]);
+
+    // The first is verified again, and the second waits for a slot.
+    bench.reset();
+    assert_eq!(bench.machine.queued_ids(), vec![txs[1].id()]);
+
+    // The other authorization's job was for the old tip, so it runs again,
+    // and passes at the new one.
+    let rerun = started(&bench.pass(job, &other));
+    assert_eq!(rerun.len(), 1);
+    let step = bench.pass(rerun[0], &other);
+    assert!(matches!(step.verdict(waiter), Some(Verdict::Admitted)));
+    assert!(bench.machine.queued_ids().is_empty());
 }
 
 /// A job that runs again after a reset is marked, so the verifier charges no
@@ -379,17 +408,11 @@ fn a_job_run_again_after_a_reset_is_marked() {
     let (_, first) = bench.submit(reservation, &before_reset);
     assert_eq!(marked(&first), vec![false]);
     let job = started(&first)[0];
-    assert!(!bench.machine.job_after_reset(job));
 
     // A reset lands while the job runs, so its outcome is for another tip
     // and it runs again, marked.
     let step = bench.reset();
     assert!(marked(&step).is_empty());
-    // A core that has not started the job yet reads the reset now.
-    assert!(
-        bench.machine.job_after_reset(job),
-        "the job's admission was reset"
-    );
     let step = bench.outcome(job, Outcome::LocalFault(LocalFault::StateUnavailable));
     assert_eq!(marked(&step), vec![true], "the rerun is marked");
 
@@ -411,7 +434,7 @@ fn an_outcome_for_another_tip_runs_the_job_again() {
     bench.grow(&[]);
     let step = bench.pass(job, &txs[0]);
     assert!(step.verdict(waiter).is_none());
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
     let rerun = started(&step);
     assert_eq!(rerun.len(), 1, "the job runs again at the new tip");
     let step = bench.pass(rerun[0], &txs[0]);
@@ -439,7 +462,7 @@ fn five_slots() -> Bench {
         Config::default(),
         Limits {
             pending: 5,
-            revalidating: 4,
+            readmitting: 4,
         },
     )
 }
@@ -611,7 +634,7 @@ fn a_verification_that_runs_too_long_is_a_local_fault() {
 
     bench.now += Duration::from_secs(1);
     assert!(bench.pass(job, &tx).is_empty(), "the late pass is ignored");
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 }
 
 /// A failure on this node is logged, as today's change stream reports a
@@ -664,7 +687,7 @@ fn nothing_expired_gets_in_even_if_a_verification_passes_it() {
         rejection(&step, waiter).scope,
         RejectionScope::EffectsChain(ChainReason::Expired)
     );
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 }
 
 /// A child verified against a parent the pool has since lost is not
@@ -682,11 +705,11 @@ fn a_child_verified_against_a_parent_the_pool_has_since_lost_is_not_admitted() {
     // A block mines a transaction that conflicts with the parent. The
     // child's verifier read the pool that still offered the parent.
     bench.grow(&[&rival]);
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 
     let step = bench.pass_using(job, &child, vec![parent.outpoint(0)]);
     assert!(step.verdict(waiter).is_none());
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
     assert_eq!(started(&step).len(), 1, "it is verified again");
 }
 
@@ -717,7 +740,7 @@ fn a_parked_child_runs_again_when_its_parent_is_admitted() {
     assert_eq!(rerun.len(), 1, "the child runs again: {step:?}");
     let step = bench.pass_using(rerun[0], &child, vec![parent.outpoint(0)]);
     assert!(matches!(step.verdict(waiter), Some(Verdict::Admitted)));
-    assert_eq!(bench.machine.visible(), vec![parent.id(), child.id()]);
+    assert_eq!(bench.machine.pooled_ids(), vec![parent.id(), child.id()]);
 }
 
 /// A parent admitted after the child's verifier looked, and before the
@@ -803,11 +826,11 @@ fn a_parent_that_never_arrives_is_remembered_until_the_tip_changes() {
     assert!(bench.reserve(&child).0.is_ok());
 }
 
-/// A child that spends an output its visible parent does not have is not
+/// A child that spends an output its pooled parent does not have is not
 /// verified in a loop: nothing changed since its verifier looked, so it
 /// waits, and the wait ends.
 #[test]
-fn a_child_that_spends_an_output_its_visible_parent_lacks_waits_once() {
+fn a_child_that_spends_an_output_its_pooled_parent_lacks_waits_once() {
     let mut runner = TestRunner::deterministic();
     let parent = build(&mut runner, &[], 1, None);
     let child = build(&mut runner, &[parent.outpoint(5)], 1, None);
@@ -883,7 +906,7 @@ fn a_deadline_that_has_passed_is_applied_before_the_input_that_shows_it() {
         step.verdict(waiter),
         Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
     ));
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 
     // A block that mines a parent after the child's wait for it has ended
     // finds the wait already decided.
@@ -916,7 +939,7 @@ fn an_older_time_from_a_caller_does_not_turn_the_clock_back() {
     // changes nothing.
     bench.now = Duration::from_secs(1);
     assert!(bench.pass(job, &txs[0]).is_empty());
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 
     // A second submission is judged on the machine's clock too: its
     // deadline runs from then, not from the stale time its caller passes.
@@ -961,7 +984,7 @@ fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
             },
         ]
     );
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
 }
 
 /// A mined parent leaves its child in the pool: the child's input is on the
@@ -974,7 +997,7 @@ fn a_mined_parent_leaves_its_child_in_the_pool() {
     bench.admit(&parent);
     bench.admit_using(&child, vec![parent.outpoint(0)]);
     bench.grow(&[&parent]);
-    assert_eq!(bench.machine.visible(), vec![child.id()]);
+    assert_eq!(bench.machine.pooled_ids(), vec![child.id()]);
 }
 
 /// A block expires transactions by height. One that expires unmined takes
@@ -1072,7 +1095,7 @@ fn a_block_caches_what_it_mined_what_conflicted_and_what_expired() {
     bench.admit(&mined);
 
     bench.grow(&[&rivals[0], &rivals[1], &mined]);
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
     for (tx, reason) in [
         (&spender, ChainReason::DuplicateSpend),
         (&child, ChainReason::DuplicateSpend),
@@ -1168,7 +1191,7 @@ fn turning_the_pool_off_answers_every_waiter() {
     ));
 
     bench.activate();
-    assert!(bench.machine.visible().is_empty());
+    assert!(bench.machine.pooled_ids().is_empty());
     assert!(bench.reserve(&txs[2]).0.is_ok());
 }
 
@@ -1188,25 +1211,22 @@ fn a_reset_checks_the_pool_and_every_parked_transaction_again() {
     bench.missing(job, vec![parent.outpoint(0)]);
 
     let step = bench.reset();
-    assert_eq!(step.changes, vec![Change::Hidden(pooled.id())]);
-    let jobs: Vec<(UnminedTxId, bool)> = step
-        .effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Start {
-                tx, revalidation, ..
-            } => Some((tx.id(), *revalidation)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(jobs, vec![(child.id(), false), (pooled.id(), true)]);
+    assert_eq!(
+        step.changes,
+        vec![Change::Removed {
+            id: pooled.id(),
+            reason: RemovalReason::Reset,
+        }]
+    );
+    let jobs: Vec<UnminedTxId> = started_for(&step).into_iter().map(|(_, id)| id).collect();
+    assert_eq!(jobs, vec![child.id(), pooled.id()]);
 }
 
-/// Revalidation after a reorg takes at most its share of the slots, so new
-/// transactions still get in while the pool is checked again. A finished
-/// revalidation hands its place to the next one queued.
+/// After a reset, the pool's transactions take at most their share of the
+/// slots, so new transactions still get in while the pool is verified
+/// again. One that finishes hands its slot to the next one waiting.
 #[test]
-fn revalidation_leaves_room_for_new_transactions() {
+fn the_pool_verified_again_leaves_room_for_new_transactions() {
     let mut runner = TestRunner::deterministic();
     let pooled = unrelated(&mut runner, 6);
     let fresh = unrelated(&mut runner, 2);
@@ -1215,8 +1235,8 @@ fn revalidation_leaves_room_for_new_transactions() {
         bench.admit(tx);
     }
 
-    let revalidations = started(&bench.reset());
-    assert_eq!(revalidations.len(), 4, "the revalidation share");
+    let jobs = started(&bench.reset());
+    assert_eq!(jobs.len(), 4, "the pool's share of the slots");
     assert_eq!(bench.machine.slots_in_use(), 4);
     assert!(bench.reserve(&fresh[0]).0.is_ok());
     assert!(matches!(
@@ -1224,6 +1244,6 @@ fn revalidation_leaves_room_for_new_transactions() {
         Err(Unreserved::NoRoom)
     ));
 
-    let step = bench.pass(revalidations[0], &pooled[0]);
-    assert_eq!(started(&step).len(), 1, "the next queued one starts");
+    let step = bench.pass(jobs[0], &pooled[0]);
+    assert_eq!(started(&step).len(), 1, "the next one waiting starts");
 }

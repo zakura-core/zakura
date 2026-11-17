@@ -12,7 +12,9 @@ use zakura_chain::{
     transaction::{self, UnminedTx, UnminedTxId},
     transparent::OutPoint,
 };
-use zakura_node_services::mempool::port::{Change, ChangeSeq, Charge, ReservationId, Verdict};
+use zakura_node_services::mempool::port::{
+    Change, ChangeSeq, Charge, RemovalReason, ReservationId, Verdict,
+};
 use zakura_rt::collections::{HashMap, HashSet};
 
 use super::{Machine, Tx};
@@ -22,7 +24,6 @@ use crate::machine::{Effect, JobId, Step, WaiterId};
 struct Answering {
     job: u64,
     tx: UnminedTxId,
-    revalidation: bool,
     /// The charge a failing answer carries, when the tip has not changed
     /// since the job started.
     charge: Option<Charge>,
@@ -38,9 +39,8 @@ pub(crate) struct Tracker {
     waiters: BTreeMap<u64, (UnminedTxId, bool)>,
     /// Every job the machine ever started.
     started: HashSet<u64>,
-    /// The running jobs, with their transaction and whether each is a
-    /// revalidation.
-    jobs: BTreeMap<u64, (UnminedTxId, bool)>,
+    /// The running jobs, with their transaction.
+    jobs: BTreeMap<u64, UnminedTxId>,
     /// The jobs that were running when the tip last changed. Each verified
     /// for another tip.
     stale: BTreeSet<u64>,
@@ -49,11 +49,11 @@ pub(crate) struct Tracker {
     /// The body of every transaction the machine has started a job for,
     /// which is every transaction that was ever pooled.
     bodies: HashMap<UnminedTxId, UnminedTx>,
-    /// The visible pool, replayed from the change log.
-    visible: HashSet<UnminedTxId>,
-    /// The hidden pool, replayed from the change log, with the position of
-    /// each transaction's `Hidden` entry.
-    hidden: HashMap<UnminedTxId, ChangeSeq>,
+    /// The pool, replayed from the change log.
+    pool: HashSet<UnminedTxId>,
+    /// What the log says a reset took out of the pool. The machine verifies
+    /// each again, and may add it again with nobody waiting for it.
+    reset_out: HashSet<UnminedTxId>,
     /// How many changes the log holds.
     logged: u64,
     answering: Option<Answering>,
@@ -96,15 +96,11 @@ impl Tracker {
         if stale && self.jobs.contains_key(&job.0) {
             self.saw("answer for another tip");
         }
-        self.answering = self
-            .jobs
-            .remove(&job.0)
-            .map(|(tx, revalidation)| Answering {
-                job: job.0,
-                tx,
-                revalidation,
-                charge: charge.filter(|_| !stale),
-            });
+        self.answering = self.jobs.remove(&job.0).map(|tx| Answering {
+            job: job.0,
+            tx,
+            charge: charge.filter(|_| !stale),
+        });
     }
 
     /// Counts one occurrence of `kind`.
@@ -118,7 +114,7 @@ impl Tracker {
     pub(crate) fn jobs(&self) -> Vec<(JobId, UnminedTxId)> {
         self.jobs
             .iter()
-            .map(|(job, (tx, _))| (JobId(*job), *tx))
+            .map(|(job, tx)| (JobId(*job), *tx))
             .collect()
     }
 
@@ -127,17 +123,16 @@ impl Tracker {
         &self.cancelled
     }
 
-    /// The effects of the visible pool, as the log describes it.
-    pub(crate) fn visible_effects(&self) -> HashSet<transaction::Hash> {
-        self.visible.iter().map(UnminedTxId::mined_id).collect()
+    /// The effects of the pool, as the log describes it.
+    pub(crate) fn pooled_effects(&self) -> HashSet<transaction::Hash> {
+        self.pool.iter().map(UnminedTxId::mined_id).collect()
     }
 
     /// Whether the log says the pool holds a transaction with the effects of
-    /// `id`, visible or hidden.
+    /// `id`.
     pub(crate) fn pooled(&self, id: &UnminedTxId) -> bool {
-        self.visible
+        self.pool
             .iter()
-            .chain(self.hidden.keys())
             .any(|pooled| pooled.mined_id() == id.mined_id())
     }
 
@@ -152,21 +147,23 @@ impl Tracker {
     /// so far.
     pub(crate) fn step(&mut self, step: &Step) {
         let answering = self.answering.take();
+        // Whether a submission waits for the answer. Nobody waits for a
+        // pooled transaction that is verified again after a reset.
+        let awaited = answering.as_ref().is_some_and(|answering| {
+            self.waiters
+                .values()
+                .any(|(tx, answered)| *tx == answering.tx && !*answered)
+        });
         let mut answered_job_cancelled = false;
         let mut verdicts: Vec<(UnminedTxId, &Verdict)> = Vec::new();
         for effect in &step.effects {
             match effect {
-                Effect::Start {
-                    job,
-                    tx,
-                    revalidation,
-                    ..
-                } => {
+                Effect::Start { job, tx, .. } => {
                     assert!(self.started.insert(job.0), "{job:?} was started twice");
-                    self.jobs.insert(job.0, (tx.id(), *revalidation));
+                    self.jobs.insert(job.0, tx.id());
                     self.bodies.insert(tx.id(), tx.clone());
-                    self.saw(if *revalidation {
-                        "start revalidation"
+                    self.saw(if self.reset_out.contains(&tx.id()) {
+                        "start again after a reset"
                     } else {
                         "start"
                     });
@@ -178,7 +175,7 @@ impl Tracker {
                         .as_ref()
                         .is_some_and(|answering| answering.job == job.0);
                     match self.jobs.remove(&job.0) {
-                        Some((tx, _)) => self.cancelled.push((job.0, tx)),
+                        Some(tx) => self.cancelled.push((job.0, tx)),
                         None => assert!(answered, "{job:?} was cancelled but was not running"),
                     }
                     answered_job_cancelled |= answered;
@@ -215,7 +212,7 @@ impl Tracker {
         // transaction carried. A caller whose fetch outlived its admission
         // gets that admission's verdict later, with its charge.
         let failed = answering
-            .filter(|answering| !answering.revalidation && !answered_job_cancelled)
+            .filter(|_| awaited && !answered_job_cancelled)
             .and_then(|answering| answering.charge.map(|charge| (answering.tx, charge)));
         if let Some((tx, charge)) = failed {
             self.charges.entry(tx).or_default().push(charge);
@@ -257,61 +254,45 @@ impl Tracker {
                         !self.pooled(id),
                         "the log adds {id:?}, and the pool already holds its effects"
                     );
-                    self.visible.insert(*id);
+                    self.pool.insert(*id);
                     added.push(*id);
                     self.saw("added");
                 }
                 Change::Removed { id, reason } => {
                     assert!(
-                        self.visible.remove(id) || self.hidden.remove(id).is_some(),
+                        self.pool.remove(id),
                         "the log removes {id:?}, which it never added"
                     );
+                    if *reason == RemovalReason::Reset {
+                        self.reset_out.insert(*id);
+                    }
                     self.saw(format!("removed {reason:?}"));
-                }
-                Change::Hidden(id) => {
-                    assert!(
-                        self.visible.remove(id),
-                        "the log hides {id:?}, which is not visible"
-                    );
-                    self.hidden.insert(*id, ChangeSeq(self.logged));
-                    self.saw("hidden");
-                }
-                Change::Revealed { id, hidden_at } => {
-                    let at = self.hidden.remove(id);
-                    assert_eq!(
-                        at,
-                        Some(*hidden_at),
-                        "the log reveals {id:?} and names where it was hidden"
-                    );
-                    self.visible.insert(*id);
-                    self.saw("revealed");
                 }
                 Change::Refused(_) => self.saw("refused"),
             }
         }
         // A transaction enters the log in the step that admits its
-        // submission.
+        // submission, or comes back after a reset took it out.
         for id in added {
+            let admitted = verdicts
+                .iter()
+                .any(|(tx, verdict)| *tx == id && matches!(verdict, Verdict::Admitted));
+            let back = self.reset_out.remove(&id);
             assert!(
-                verdicts
-                    .iter()
-                    .any(|(tx, verdict)| *tx == id && matches!(verdict, Verdict::Admitted)),
+                admitted || back,
                 "the log adds {id:?} and no submission of it was admitted"
             );
+            if back && !admitted {
+                self.saw("added again after a reset");
+            }
         }
     }
 
     /// Compares the pool the log describes with the pool the machine holds
     /// and the snapshot it offers.
     pub(crate) fn check(&self, machine: &Machine) {
-        let visible: HashSet<UnminedTxId> = machine.visible().into_iter().collect();
-        assert_eq!(visible, self.visible, "the log leads to the visible pool");
-        let hidden: HashSet<UnminedTxId> = machine.hidden().into_iter().collect();
-        assert_eq!(
-            hidden,
-            self.hidden.keys().copied().collect(),
-            "the log leads to the hidden pool"
-        );
+        let pool: HashSet<UnminedTxId> = machine.pooled_ids().into_iter().collect();
+        assert_eq!(pool, self.pool, "the log leads to the pool");
         let snapshot = machine.snapshot(ChangeSeq(self.logged));
         assert_eq!(snapshot.active, machine.is_active());
         let offered: HashSet<UnminedTxId> = snapshot
@@ -324,20 +305,17 @@ impl Tracker {
             snapshot.transactions.len(),
             "a snapshot offers each transaction once"
         );
-        assert_eq!(
-            offered, self.visible,
-            "a snapshot offers exactly the visible pool"
-        );
-        // Each visible transaction depends on exactly the visible
-        // transactions whose outputs it spends.
-        let visible_effects = self.visible_effects();
+        assert_eq!(offered, self.pool, "a snapshot offers exactly the pool");
+        // Each pooled transaction depends on exactly the pooled transactions
+        // whose outputs it spends.
+        let pooled_effects = self.pooled_effects();
         for tx in &snapshot.transactions {
             let parents: BTreeSet<[u8; 32]> = tx
                 .transaction
                 .transaction()
                 .spent_outpoints()
                 .map(|outpoint| outpoint.hash)
-                .filter(|parent| visible_effects.contains(parent))
+                .filter(|parent| pooled_effects.contains(parent))
                 .map(|parent| parent.0)
                 .collect();
             let dependencies: BTreeSet<[u8; 32]> = snapshot
@@ -364,7 +342,7 @@ impl Tracker {
             .iter()
             .flat_map(|tx| tx.real.transaction.transaction().spent_outpoints())
             .collect();
-        for id in self.visible.iter().chain(self.hidden.keys()) {
+        for id in &self.pool {
             assert!(
                 !effects.contains(&id.mined_id()),
                 "{id:?} is still pooled after a block mined it"
@@ -393,10 +371,9 @@ impl Tracker {
     /// The log says the pool is empty.
     pub(crate) fn pool_is_empty(&self) {
         assert!(
-            self.visible.is_empty() && self.hidden.is_empty(),
-            "the log leaves {} visible and {} hidden",
-            self.visible.len(),
-            self.hidden.len()
+            self.pool.is_empty(),
+            "the log leaves {} pooled",
+            self.pool.len()
         );
     }
 }

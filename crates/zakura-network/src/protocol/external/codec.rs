@@ -152,6 +152,16 @@ impl BlockChecksums {
         (remembered_len == body_len).then_some(checksum)
     }
 
+    /// Returns the body length remembered for the block `hash`, without changing which block
+    /// is forgotten next.
+    fn remembered_len(&self, hash: block::Hash) -> Option<usize> {
+        self.0
+            .lock()
+            .expect("the lock is only held for map operations, which do not panic")
+            .get(&hash)
+            .map(|(body_len, _)| *body_len)
+    }
+
     /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
     /// block that was sent least recently if there is no room.
     fn insert(&self, hash: block::Hash, body_len: usize, checksum: sha256d::Checksum) {
@@ -267,17 +277,6 @@ impl Encoder<Message> for Codec {
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
-
-        let body_length = self.body_length(&item);
-
-        if body_length > self.builder.max_len {
-            return Err(Parse("body length exceeded maximum size"));
-        }
-
-        // Aggregate totals only: per-addr labels are never pruned by the Prometheus
-        // exporter and grow without bound on public listeners.
-        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
-
         use Message::*;
         // Note: because all match arms must have
         // the same type, and the array length is
@@ -303,23 +302,61 @@ impl Encoder<Message> for Codec {
             Tx { .. } => b"tx\0\0\0\0\0\0\0\0\0\0",
             Mempool => b"mempool\0\0\0\0\0",
         };
-        trace!(?item, len = body_length);
 
-        dst.reserve(HEADER_LEN + body_length);
+        // Reserve the whole frame before writing: growing `dst` while the body is written
+        // copies it again at each step, which costs more than measuring it first. A block
+        // that was sent before has its body length remembered with its checksum, so it is
+        // serialized only once; every other message is measured first.
+        let block_hash = match &item {
+            Message::Block(block) => Some(block.hash()),
+            _ => None,
+        };
+        // A remembered length only sizes the reservation; the size limit is checked against
+        // the bytes actually written below.
+        let remembered_len =
+            block_hash.and_then(|hash| self.builder.block_checksums.remembered_len(hash));
+        let expected_len = match remembered_len {
+            Some(len) => len.min(self.builder.max_len),
+            None => {
+                let len = self.body_length(&item)?;
+                if len > self.builder.max_len {
+                    return Err(Parse("body length exceeded maximum size"));
+                }
+                len
+            }
+        };
+
+        // The header's length and checksum are zero until the body is written, then filled
+        // in from the bytes actually written.
         let start_len = dst.len();
-        {
+        dst.reserve(HEADER_LEN + expected_len);
+        let written = (|| {
             let dst = &mut dst.writer();
             dst.write_all(&self.builder.network.magic().0[..])?;
             dst.write_all(command)?;
-            dst.write_u32::<LittleEndian>(body_length as u32)?;
-
-            // We zero the checksum at first, and compute it later
-            // after the body has been written.
             dst.write_u32::<LittleEndian>(0)?;
+            dst.write_u32::<LittleEndian>(0)?;
+            self.write_body(&item, dst)
+        })();
 
-            self.write_body(&item, dst)?;
+        let body_length = dst.len() - start_len - HEADER_LEN;
+        if let Err(error) = written {
+            dst.truncate(start_len);
+            return Err(error);
         }
-        let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
+        if body_length > self.builder.max_len {
+            dst.truncate(start_len);
+            return Err(Parse("body length exceeded maximum size"));
+        }
+
+        trace!(?item, len = body_length);
+        // Aggregate totals only: per-addr labels are never pruned by the Prometheus
+        // exporter and grow without bound on public listeners.
+        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
+
+        // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
+        dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
+        let checksum = self.body_checksum(block_hash, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -330,29 +367,25 @@ impl Codec {
     /// Obtain the size of the body of a given message. This will match the
     /// number of bytes written to the writer provided to `write_body` for the
     /// same message.
-    // # Performance TODO
-    //
-    // If this code shows up in profiles, replace with a size estimate or cached size,
-    // to avoid multiple serializations for large data structures like lists, blocks, and transactions.
-    fn body_length(&self, msg: &Message) -> usize {
+    ///
+    /// Returns the error `write_body` would return for a message it refuses to write.
+    fn body_length(&self, msg: &Message) -> Result<usize, Error> {
         let mut writer = FakeWriter(0);
-
-        self.write_body(msg, &mut writer)
-            .expect("writer should never fail");
-        writer.0
+        self.write_body(msg, &mut writer)?;
+        Ok(writer.0)
     }
 
-    /// Returns the checksum of `body`, the serialized body of `msg`.
+    /// Returns the checksum of `body`, the serialized body of a message, where `block_hash`
+    /// is the hash of the block the message carries, if it carries one.
     ///
     /// A large block's checksum is taken from [`BlockChecksums`] when another send already
     /// hashed that block, and is remembered there otherwise. Every other body is hashed.
-    fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
-        let block = match msg {
-            Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
+    fn body_checksum(&self, block_hash: Option<block::Hash>, body: &[u8]) -> sha256d::Checksum {
+        let hash = match block_hash {
+            Some(hash) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => hash,
             _ => return message_checksum(body),
         };
 
-        let hash = block.hash();
         let block_checksums = &self.builder.block_checksums;
         if let Some(checksum) = block_checksums.get(hash, body.len()) {
             return checksum;

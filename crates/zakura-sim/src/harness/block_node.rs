@@ -1723,6 +1723,20 @@ impl BlockNode {
     }
 }
 
+impl Drop for BlockNode {
+    /// Takes the handle out of the block service's replies, as a teardown
+    /// does. The handle's range source holds the service, and the service
+    /// holds its replies, so a node whose run ended without a teardown
+    /// would otherwise keep its reactor's state for the life of the process.
+    fn drop(&mut self) {
+        let replies = self
+            .controlled
+            .as_ref()
+            .and_then(|(_, replies)| replies.clear());
+        drop(replies);
+    }
+}
+
 impl Link {
     /// A link a harness other than [`Topology`] made, with each side's
     /// connection token, dialer first, so the [`PolicySource`] counts it.

@@ -114,6 +114,7 @@ use crate::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
+        shared_block_downloads::SharedBlockDownloads,
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
@@ -644,6 +645,8 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        // The syncer and gossip download each block once, whichever discovers it first.
+        let shared_block_downloads = SharedBlockDownloads::default();
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -653,7 +656,8 @@ impl StartCmd {
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,
                 )
-                .with_pending_blocks(pending_blocks.clone()),
+                .with_pending_blocks(pending_blocks.clone())
+                .with_shared_block_downloads(shared_block_downloads.clone()),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
@@ -753,7 +757,7 @@ impl StartCmd {
         }
 
         info!("initializing syncer");
-        let (mut syncer, sync_status) = ChainSync::new(
+        let (syncer, sync_status) = ChainSync::new(
             &config,
             max_checkpoint_height,
             peer_set.clone(),
@@ -762,6 +766,7 @@ impl StartCmd {
             latest_chain_tip.clone(),
             misbehavior.clone(),
         );
+        let mut syncer = syncer.with_shared_block_downloads(shared_block_downloads);
 
         // The mempool and `getblocktemplate` trace the path from a new tip to a mining template.
         // They share one writer.

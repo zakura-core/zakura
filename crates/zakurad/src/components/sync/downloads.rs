@@ -35,6 +35,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     download_work::has_sufficient_work,
+    shared_block_downloads::{BlockFetch, Claim, Requester, SharedBlockDownloads},
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -414,6 +415,10 @@ where
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
+
+    /// Block downloads shared with the gossip queue, so a block both queues want crosses the
+    /// wire once.
+    shared: SharedBlockDownloads,
 }
 
 fn take_task_state(
@@ -533,7 +538,15 @@ where
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
             trace,
+            shared: SharedBlockDownloads::default(),
         }
+    }
+
+    /// Shares block downloads with the other queues that use `shared`.
+    ///
+    /// Without this call, the queue still shares downloads, but only with itself.
+    pub fn share_block_downloads(self: Pin<&mut Self>, shared: SharedBlockDownloads) {
+        *self.project().shared = shared;
     }
 
     fn transition_task(
@@ -618,6 +631,17 @@ where
             None,
         );
 
+        // A block another queue is already downloading needs no request of its own.
+        let owner = match self.shared.claim(hash, Requester::Sync) {
+            Claim::Joined(interest) => {
+                return self
+                    .spawn_download_task(hash, BlockFetch::Shared(interest))
+                    .await;
+            }
+            Claim::Owner(slot) => Some(slot),
+            Claim::Bypass => None,
+        };
+
         // We construct the block requests sequentially, waiting for the peer
         // set to be ready to process each request. This ensures that we start
         // block downloads in the order we want them (though they may resolve
@@ -642,6 +666,19 @@ where
             }
         };
         let block_req = network.call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+        let fetch = match owner {
+            Some(slot) => BlockFetch::Shared(slot.start(block_req)),
+            None => BlockFetch::alone(block_req),
+        };
+        self.spawn_download_task(hash, fetch).await
+    }
+
+    /// Spawns the task that waits for `fetch`, checks the block, and verifies it.
+    async fn spawn_download_task(
+        &mut self,
+        hash: block::Hash,
+        mut fetch: BlockFetch,
+    ) -> Result<(), BlockDownloadVerifyError> {
         Self::transition_task(&self.task_states, &self.trace, hash, "downloading", None);
 
         // This oneshot is used to signal cancellation to the download task.
@@ -674,7 +711,7 @@ where
                             .record(download_start.elapsed().as_secs_f64());
                         return Err(BlockDownloadVerifyError::CancelledDuringDownload { hash })
                     }
-                    rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
+                    rsp = fetch.response() => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
                 };
                 Self::transition_task(
                     &task_states,
@@ -967,6 +1004,7 @@ where
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);
+                    fetch.verified();
                 }
 
                 verification

@@ -1,7 +1,8 @@
-//! Attribute duplicate wire downloads to independent queues or the production hedge policy.
+//! Wire-level accounting of block downloads that sync and gossip share, including the hedge.
 use super::*;
 use crate::components::{
     inbound::downloads as inbound_downloads,
+    shared_block_downloads::SharedBlockDownloads,
     sync::{self, downloads as sync_downloads, legacy_trace::LegacySyncTrace},
 };
 use futures::StreamExt;
@@ -157,6 +158,38 @@ fn report(
     }
 }
 
+type GossipQueue = inbound_downloads::Downloads<
+    Peers,
+    BoxCloneSyncService<VerifyRequest, zakura_chain::block::Hash, BoxError>,
+    State,
+>;
+
+/// The gossip queue a node would run, sharing downloads through `shared`.
+fn gossip_queue(node: &Node, network: Peers, shared: &SharedBlockDownloads) -> GossipQueue {
+    inbound_downloads::Downloads::new(
+        8,
+        false,
+        network,
+        verifier(node),
+        node.state.clone(),
+        node.tip.clone(),
+        node.network.clone(),
+    )
+    .with_shared_block_downloads(shared.clone())
+}
+
+/// The total number of block bodies for `hash` that crossed any of `peers`.
+fn bodies(peers: &[WirePeer], hash: zakura_chain::block::Hash) -> usize {
+    peers.iter().map(|p| p.count(hash, "block")).sum()
+}
+
+async fn next_body_request(relay: &mut Node) -> zakura_chain::block::Hash {
+    timeout(Duration::from_secs(10), relay.body_requests.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 async fn queue_case(connections: usize, owner: &str, delayed: bool, block: &Block) {
     let mut relay = Node::new().await;
     let mut receiver = Node::new().await;
@@ -169,18 +202,15 @@ async fn queue_case(connections: usize, owner: &str, delayed: bool, block: &Bloc
     receiver.gate.hold();
     relay.hold_body.send_replace(delayed);
     let attempts = Attempts::default();
-    let mut gossip = inbound_downloads::Downloads::new(
-        8,
-        false,
+    let shared = SharedBlockDownloads::default();
+    let mut gossip = gossip_queue(
+        &receiver,
         attributed(
             vec![(0, peers[0].client.clone())],
             "gossip",
             attempts.clone(),
         ),
-        verifier(&receiver),
-        receiver.state.clone(),
-        receiver.tip.clone(),
-        receiver.network.clone(),
+        &shared,
     );
     let sync_client = peers[connections - 1].client.clone();
     let mut sync = Box::pin(sync_queue(
@@ -191,6 +221,7 @@ async fn queue_case(connections: usize, owner: &str, delayed: bool, block: &Bloc
             attempts.clone(),
         ),
     ));
+    sync.as_mut().share_block_downloads(shared.clone());
     let has_gossip = owner != "sync";
     let has_sync = owner != "gossip";
     if has_gossip {
@@ -211,27 +242,17 @@ async fn queue_case(connections: usize, owner: &str, delayed: bool, block: &Bloc
         ));
     }
     if delayed {
-        assert_eq!(
-            timeout(Duration::from_secs(10), relay.body_requests.recv())
-                .await
-                .unwrap(),
-            Some(block.hash())
-        );
+        assert_eq!(next_body_request(&mut relay).await, block.hash());
         // Delay an actual inbound body response, rather than fabricating a successful download.
         tokio::time::sleep(Duration::from_millis(100)).await;
         relay.hold_body.send_replace(false);
     }
-    let expected = usize::from(has_gossip) + usize::from(has_sync);
-    for _ in 0..expected {
+    // Each queue still verifies the block itself, but only one body crosses the wire.
+    let verifications = usize::from(has_gossip) + usize::from(has_sync);
+    for _ in 0..verifications {
         assert_eq!(receiver.gate.entered().await, block.hash());
     }
-    assert_eq!(
-        peers
-            .iter()
-            .map(|p| p.count(block.hash(), "block"))
-            .sum::<usize>(),
-        expected
-    );
+    assert_eq!(bodies(&peers, block.hash()), 1);
     receiver.gate.release();
     if has_gossip {
         assert!(timeout(Duration::from_secs(20), gossip.next())
@@ -247,16 +268,17 @@ async fn queue_case(connections: usize, owner: &str, delayed: bool, block: &Bloc
     }
     assert_eq!(receiver.tip.best_tip_hash(), Some(block.hash()));
     assert!(!receiver.bans.is_banned(relay.p2p.ip()));
+    assert!(shared.is_empty(), "finished downloads are released");
     let scenario = format!(
         "{owner}/{connections}-connections/{}",
         if delayed { "delayed" } else { "responsive" }
     );
     report(&scenario, block.hash(), &peers, &attempts);
-    assert_eq!(attempts.lock().unwrap().len(), expected);
+    assert_eq!(attempts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn independent_sync_and_gossip_queues_duplicate_downloads() {
+async fn sync_and_gossip_share_one_download() {
     let _init = zakura_test::init();
     let source = Node::new().await;
     let block = large_block(source.template().await);
@@ -267,6 +289,94 @@ async fn independent_sync_and_gossip_queues_duplicate_downloads() {
             }
         }
     }
+}
+
+/// Gossip starts the download and sync joins it. Cancelling gossip, the caller that started the
+/// transfer, leaves the transfer running for sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_gossip_keeps_the_download_sync_still_needs() {
+    let _init = zakura_test::init();
+    let source = Node::new().await;
+    let block = large_block(source.template().await);
+    let mut relay = Node::new().await;
+    let mut receiver = Node::new().await;
+    let peers = [WirePeer::connect(&relay).await];
+    assert_eq!(relay.submit(&block).await, "accepted");
+    relay.hold_body.send_replace(true);
+    let attempts = Attempts::default();
+    let shared = SharedBlockDownloads::default();
+    let network = |owner| attributed(vec![(0, peers[0].client.clone())], owner, attempts.clone());
+    let mut gossip = gossip_queue(&receiver, network("gossip"), &shared);
+    let mut sync = Box::pin(sync_queue(&receiver, network("sync")));
+    sync.as_mut().share_block_downloads(shared.clone());
+
+    gossip.download_and_verify(block.hash(), None);
+    assert_eq!(next_body_request(&mut relay).await, block.hash());
+    sync.download_and_verify(block.hash()).await.unwrap();
+    drop(gossip);
+    relay.hold_body.send_replace(false);
+
+    assert_eq!(receiver.gate.entered().await, block.hash());
+    assert!(timeout(Duration::from_secs(20), sync.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
+    assert_eq!(receiver.tip.best_tip_hash(), Some(block.hash()));
+    assert_eq!(bodies(&peers, block.hash()), 1);
+    let records = attempts.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].owner, "gossip");
+    assert_eq!(records[0].outcome, "received");
+}
+
+/// When every caller leaves a pending download, it is stopped, and the next request for the
+/// block downloads it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_download_is_retried_by_the_next_request() {
+    let _init = zakura_test::init();
+    let source = Node::new().await;
+    let block = large_block(source.template().await);
+    let mut relay = Node::new().await;
+    let mut receiver = Node::new().await;
+    let peers = [WirePeer::connect(&relay).await];
+    assert_eq!(relay.submit(&block).await, "accepted");
+    relay.hold_body.send_replace(true);
+    let attempts = Attempts::default();
+    let shared = SharedBlockDownloads::default();
+    let network = |owner| attributed(vec![(0, peers[0].client.clone())], owner, attempts.clone());
+
+    let mut gossip = gossip_queue(&receiver, network("gossip"), &shared);
+    let mut sync = Box::pin(sync_queue(&receiver, network("sync")));
+    sync.as_mut().share_block_downloads(shared.clone());
+    gossip.download_and_verify(block.hash(), None);
+    assert_eq!(next_body_request(&mut relay).await, block.hash());
+    sync.download_and_verify(block.hash()).await.unwrap();
+    drop(gossip);
+    sync.cancel_all();
+    timeout(Duration::from_secs(10), async {
+        while !shared.is_empty() || attempts.lock().unwrap()[0].finished.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts.lock().unwrap()[0].outcome, "cancelled");
+
+    relay.hold_body.send_replace(false);
+    let mut retry = Box::pin(sync_queue(&receiver, network("sync")));
+    retry.as_mut().share_block_downloads(shared.clone());
+    retry.download_and_verify(block.hash()).await.unwrap();
+    assert_eq!(receiver.gate.entered().await, block.hash());
+    assert!(timeout(Duration::from_secs(20), retry.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
+    assert_eq!(receiver.tip.best_tip_hash(), Some(block.hash()));
+    let records = attempts.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].outcome, "received");
 }
 
 async fn hedge_case(block: &Block) {
@@ -309,38 +419,40 @@ async fn hedge_case(block: &Block) {
     tokio::time::sleep(2 * sync::SYNC_RESTART_DELAY + Duration::from_millis(10)).await;
     while relay.body_requests.try_recv().is_ok() {}
     relay.hold_body.send_replace(true);
+    let shared = SharedBlockDownloads::default();
     let mut downloads = Box::pin(sync_queue(&receiver, hedged));
-    downloads.download_and_verify(block.hash()).await.unwrap();
-    for _ in 0..2 {
-        assert_eq!(
-            timeout(Duration::from_secs(20), relay.body_requests.recv())
-                .await
-                .unwrap(),
-            Some(block.hash())
-        );
-    }
-    assert_eq!(
-        attempts
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|a| a.hash == block.hash())
-            .count(),
-        2
+    downloads.as_mut().share_block_downloads(shared.clone());
+    let mut gossip = gossip_queue(
+        &receiver,
+        attributed(
+            vec![(0, peers[0].client.clone())],
+            "gossip",
+            attempts.clone(),
+        ),
+        &shared,
     );
+    downloads.download_and_verify(block.hash()).await.unwrap();
+    gossip.download_and_verify(block.hash(), None);
+    for _ in 0..2 {
+        assert_eq!(next_body_request(&mut relay).await, block.hash());
+    }
+    // The hedge's backup request belongs to the one shared download; gossip sends none.
+    {
+        let records = attempts.lock().unwrap();
+        assert_eq!(records.iter().filter(|a| a.hash == block.hash()).count(), 2);
+        assert!(records.iter().all(|a| a.owner == "sync"));
+    }
     relay.hold_body.send_replace(false);
     assert!(timeout(Duration::from_secs(20), downloads.next())
         .await
         .unwrap()
+        .is_some());
+    assert!(timeout(Duration::from_secs(20), gossip.next())
+        .await
         .unwrap()
-        .is_ok());
+        .is_some());
     timeout(Duration::from_secs(20), async {
-        while peers
-            .iter()
-            .map(|p| p.count(block.hash(), "block"))
-            .sum::<usize>()
-            != 2
-        {
+        while bodies(&peers, block.hash()) != 2 {
             tokio::task::yield_now().await;
         }
     })
@@ -358,7 +470,7 @@ async fn hedge_case(block: &Block) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "warms and rotates the production 90-second hedge estimator over real TCP"]
-async fn slow_download_hedges_can_transfer_two_bodies() {
+async fn a_shared_download_still_hedges_slow_transfers() {
     let _init = zakura_test::init();
     let source = Node::new().await;
     let block = large_block(source.template().await);

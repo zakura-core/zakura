@@ -37,7 +37,7 @@ use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
 use zakura_rpc::PendingBlockRegistry;
 
-use crate::BoxError;
+use crate::{components::shared_block_downloads::SharedBlockDownloads, BoxError};
 
 // Re-use the syncer timeouts for consistency.
 use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
@@ -397,6 +397,9 @@ pub struct Inbound {
 
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// Block downloads shared with the syncer.
+    shared_block_downloads: SharedBlockDownloads,
 }
 
 impl Inbound {
@@ -426,12 +429,20 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks: PendingBlockRegistry::default(),
+            shared_block_downloads: SharedBlockDownloads::default(),
         }
     }
 
     /// Shares one pending-block registry with the mining RPCs.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.pending_blocks = pending_blocks;
+        self
+    }
+
+    /// Shares gossip block downloads with the syncer that uses `shared`, so a block both
+    /// discover is downloaded once.
+    pub fn with_shared_block_downloads(mut self, shared: SharedBlockDownloads) -> Self {
+        self.shared_block_downloads = shared;
         self
     }
 
@@ -478,15 +489,18 @@ impl Service<zn::Request> for Inbound {
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
 
-                    let block_downloads = Box::pin(BlockDownloads::new(
-                        full_verify_concurrency_limit,
-                        self.expose_peer_addresses,
-                        Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
-                        Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
-                        state.clone(),
-                        latest_chain_tip,
-                        network,
-                    ));
+                    let block_downloads = Box::pin(
+                        BlockDownloads::new(
+                            full_verify_concurrency_limit,
+                            self.expose_peer_addresses,
+                            Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
+                            Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
+                            state.clone(),
+                            latest_chain_tip,
+                            network,
+                        )
+                        .with_shared_block_downloads(self.shared_block_downloads.clone()),
+                    );
 
                     result = Ok(());
                     Setup::Initialized {

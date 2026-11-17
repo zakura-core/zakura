@@ -40,7 +40,11 @@ use zakura_network as zn;
 use zakura_state as zs;
 
 use crate::{
-    components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
+    components::{
+        shared_block_downloads::SharedBlockDownloads, sync::downloads::BlockDownloadVerifyError,
+    },
+    config::ZakuradConfig,
+    BoxError,
 };
 
 mod downloads;
@@ -1227,6 +1231,13 @@ where
         };
 
         (new_syncer, sync_status)
+    }
+
+    /// Shares block downloads with the gossip queue that uses `shared`, so a block both
+    /// discover is downloaded once.
+    pub fn with_shared_block_downloads(mut self, shared: SharedBlockDownloads) -> Self {
+        self.downloads.as_mut().share_block_downloads(shared);
+        self
     }
 
     /// Runs the syncer to synchronize the chain and keep it synchronized.

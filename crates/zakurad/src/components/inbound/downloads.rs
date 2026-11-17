@@ -32,6 +32,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     download_work::has_sufficient_work,
+    shared_block_downloads::{BlockFetch, Claim, Requester, SharedBlockDownloads},
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -425,6 +426,9 @@ struct TaskSpawner<ZN, ZV, ZS> {
 
     admission: Arc<std::sync::Mutex<Admission>>,
 
+    /// Block downloads shared with the syncer, so a block both want crosses the wire once.
+    shared: SharedBlockDownloads,
+
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
     /// results.
     spawned_sender: mpsc::UnboundedSender<DownloadHandle>,
@@ -440,6 +444,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             latest_chain_tip: self.latest_chain_tip.clone(),
             chain_network: self.chain_network.clone(),
             admission: self.admission.clone(),
+            shared: self.shared.clone(),
             spawned_sender: self.spawned_sender.clone(),
         }
     }
@@ -594,12 +599,21 @@ where
                 latest_chain_tip,
                 chain_network,
                 admission: Arc::default(),
+                shared: SharedBlockDownloads::default(),
                 spawned_sender,
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
             poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Shares block downloads with the other queues that use `shared`.
+    ///
+    /// Without this call, the queue still shares downloads, but only with itself.
+    pub fn with_shared_block_downloads(mut self, shared: SharedBlockDownloads) -> Self {
+        self.spawner.shared = shared;
+        self
     }
 
     /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
@@ -906,6 +920,7 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let shared = self.shared.clone();
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -934,8 +949,15 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
+            // A block the syncer is already downloading needs no request of its own.
+            let mut fetch = match shared.claim(hash, Requester::Gossip) {
+                Claim::Owner(slot) => BlockFetch::Shared(slot.start(network.oneshot(request))),
+                Claim::Joined(interest) => BlockFetch::Shared(interest),
+                Claim::Bypass => BlockFetch::alone(network.oneshot(request)),
+            };
+
             let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
+                fetch.response().await.map_err(|e| (e, None))?
             {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.
@@ -1156,9 +1178,13 @@ where
                 None => None,
             };
 
-            verifier
+            let verification = verifier
                 .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+                .await;
+            if verification.is_ok() {
+                fetch.verified();
+            }
+            verification
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
         }

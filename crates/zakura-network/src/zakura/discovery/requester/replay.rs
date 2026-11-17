@@ -1,15 +1,26 @@
-//! The independent models of [`QueryState`](super::QueryState) and of the settlement
-//! ledger in [`Queries`](super::Queries), shared by their proptests and their
-//! cargo-fuzz target. Each model restates the documented rules and never calls the
-//! code it checks.
+//! The `discovery_query` machine target: histories through
+//! [`QueryState`](super::QueryState) under decoder 1, and through one node's
+//! [`Queries`](super::Queries) sessions under decoder 2, shared by their
+//! proptests and their cargo-fuzz target.
+//!
+//! Each replay drives the production code as the session's writer, the
+//! transport reader and the session reader do (see
+//! [`machine_test`](crate::zakura::machine_test)). It checks the invariants
+//! after every operation, and that retiring every session returns every pool
+//! entry. It compares each result only with what the replay sent and holds:
+//! which queries are live, which it wrote, which answers it delivered, claimed
+//! and holds, and each query's own cap. It never re-derives when a query is
+//! due or which frames the transport admits. Named scenarios in `tests.rs` pin
+//! those rules.
 
 use super::*;
 use crate::zakura::{
-    discovery::protocol::ZakuraServiceId, framed_channel, regulation::PrecheckSlot, CloseCause,
+    discovery::protocol::ZakuraServiceId, framed_channel, machine_test::MAX_HISTORY_BYTES,
+    regulation::PrecheckSlot, CloseCause,
 };
 use futures::FutureExt;
 use std::collections::VecDeque;
-use zakura_rt::collections::{hash_map::Entry, HashMap, HashSet};
+use zakura_rt::collections::{HashMap, HashSet};
 
 pub(super) fn get_peers(limit: u16) -> GetPeers {
     GetPeers {
@@ -57,26 +68,13 @@ fn asked_for(kind: QueryKind, size: usize) -> Asked {
     }
 }
 
-/// The model's view of one live query.
+/// One live query, as the replay saw `reserve` and `queued` take it.
 #[derive(Clone, Debug)]
-struct QueryModel {
+struct Live {
     asked: Asked,
     queued: bool,
     /// Distinguishes this reservation from earlier ones of its kind.
     reservation: usize,
-}
-
-/// The largest answer the model allows for `asked`, restated from the
-/// wire caps.
-fn model_cap(asked: &Asked) -> u64 {
-    match asked {
-        Asked::Peers { limit } => 2 + u64::from(*limit) * 648,
-        Asked::Services(query) => {
-            let wanted = query.wanted_services.len();
-            let count = if wanted == 0 { 8 } else { wanted.min(8) };
-            42 + u64::try_from(count).expect("eight summaries fit u64") * 294
-        }
-    }
 }
 
 const PROPERTY: &str = "discovery/query-ownership";
@@ -84,7 +82,7 @@ const PROPERTY: &str = "discovery/query-ownership";
 /// Applicable operations in a decoder-v1 query history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryQueryReplaySummary {
-    /// Operations checked against the model.
+    /// Operations applied to the state.
     pub transitions: usize,
     /// Fresh reservations.
     pub reserved: usize,
@@ -100,14 +98,14 @@ pub struct DiscoveryQueryReplaySummary {
     pub stale: usize,
 }
 
-/// Replay decoder-v1 bytes against the query ownership model.
-/// Each byte chooses a kind, operation and bounded size. Read at most 512 bytes.
+/// Replay decoder-v1 bytes through [`QueryState`]. Each byte chooses a kind,
+/// an operation and a bounded size. Read at most [`MAX_HISTORY_BYTES`] bytes.
 pub fn replay_discovery_query_bytes(data: &[u8]) -> DiscoveryQueryReplaySummary {
     run(decode(data), |_| {})
 }
 
 pub(super) fn decode(data: &[u8]) -> impl Iterator<Item = QueryOp> + '_ {
-    data.iter().take(512).map(|byte| {
+    data.iter().take(MAX_HISTORY_BYTES).map(|byte| {
         let kind = if byte & 1 == 0 {
             QueryKind::Peers
         } else {
@@ -132,12 +130,15 @@ pub(super) fn decode(data: &[u8]) -> impl Iterator<Item = QueryOp> + '_ {
     })
 }
 
+/// Drives `ops` through a fresh [`QueryState`], and calls `after_step` after
+/// each operation, so a test can plant a fault.
 pub(super) fn run(
     ops: impl IntoIterator<Item = QueryOp>,
     mut after_step: impl FnMut(&mut QueryState),
 ) -> DiscoveryQueryReplaySummary {
     let mut state = QueryState::default();
-    let mut model: HashMap<QueryKind, QueryModel> = HashMap::new();
+    // The live queries, as the state's results report them.
+    let mut live: HashMap<QueryKind, Live> = HashMap::new();
     let mut reservations = 0usize;
     let mut admitted = HashSet::new();
     let mut summary = DiscoveryQueryReplaySummary::default();
@@ -146,53 +147,61 @@ pub(super) fn run(
         match op {
             QueryOp::Reserve { kind, size } => {
                 let asked = asked_for(kind, size);
-                let expected = match model.entry(kind) {
-                    Entry::Occupied(_) => Err(QueryLive),
-                    Entry::Vacant(slot) => {
-                        reservations += 1;
-                        slot.insert(QueryModel {
-                            asked: asked.clone(),
+                let reserved = state.reserve(asked.clone());
+                assert_eq!(
+                    reserved.is_err(),
+                    live.contains_key(&kind),
+                    "{PROPERTY}: one live query of each kind"
+                );
+                if reserved.is_ok() {
+                    reservations += 1;
+                    live.insert(
+                        kind,
+                        Live {
+                            asked,
                             queued: false,
                             reservation: reservations,
-                        });
-                        Ok(())
-                    }
-                };
-                summary.reserved += usize::from(expected.is_ok());
-                summary.refused += usize::from(expected.is_err());
-                assert_eq!(state.reserve(asked), expected, "{PROPERTY}");
+                        },
+                    );
+                    summary.reserved += 1;
+                } else {
+                    summary.refused += 1;
+                }
             }
             QueryOp::Queued(kind) => {
                 state.queued(kind);
-                if let Some(query) = model.get_mut(&kind) {
+                if let Some(query) = live.get_mut(&kind) {
                     query.queued = true;
                 }
             }
             QueryOp::ReleaseUnsent(kind) => {
-                let expected = model.get(&kind).is_some_and(|query| !query.queued);
-                if expected {
-                    model.remove(&kind);
+                let released = state.release_unsent(kind);
+                let unsent = live.get(&kind).is_some_and(|query| !query.queued);
+                assert_eq!(
+                    released, unsent,
+                    "{PROPERTY}: only an unsent query is released"
+                );
+                if released {
+                    live.remove(&kind);
+                    summary.released += 1;
                 }
-                summary.released += usize::from(expected);
-                assert_eq!(state.release_unsent(kind), expected, "{PROPERTY}");
             }
             QueryOp::Claim { kind, excess } => {
-                let expected = model.remove(&kind);
-                let payload_len = match (&expected, excess) {
-                    (Some(query), Some(excess)) => model_cap(&query.asked) + excess,
+                let query = live.remove(&kind);
+                let cap = query.as_ref().map(|query| query.asked.cap().bytes);
+                let payload_len = match (cap, excess) {
+                    (Some(cap), Some(excess)) => cap + excess,
                     _ => 0,
                 };
                 let claimed = state.claim(
                     kind,
                     usize::try_from(payload_len).expect("test caps fit usize"),
                 );
-                match (expected, claimed) {
-                    (None, None) => {
-                        summary.stale += 1;
-                    }
+                match (query, claimed) {
+                    (None, None) => summary.stale += 1,
                     (Some(query), Some(Ok(answer))) => {
                         summary.admitted += 1;
-                        assert!(payload_len <= model_cap(&query.asked), "{PROPERTY}");
+                        assert!(payload_len <= query.asked.cap().bytes, "{PROPERTY}");
                         assert_eq!(answer.kind(), kind, "{PROPERTY}");
                         assert_eq!(&answer.asked, &query.asked, "{PROPERTY}");
                         assert!(
@@ -202,7 +211,7 @@ pub(super) fn run(
                     }
                     (Some(query), Some(Err(refused))) => {
                         summary.oversized += 1;
-                        let cap = model_cap(&query.asked);
+                        let cap = query.asked.cap().bytes;
                         assert!(payload_len > cap, "{PROPERTY}");
                         assert_eq!(
                             refused,
@@ -210,24 +219,15 @@ pub(super) fn run(
                             "{PROPERTY}"
                         );
                     }
-                    (expected, claimed) => {
-                        panic!("{PROPERTY}: model {expected:?} disagrees with claim {claimed:?}")
-                    }
+                    (query, claimed) => panic!(
+                        "{PROPERTY}: live {} disagrees with claim {claimed:?}",
+                        query.is_some()
+                    ),
                 }
             }
         }
-
         after_step(&mut state);
-        assert_eq!(state.len(), model.len(), "{PROPERTY}");
-        assert!(state.len() <= QUERY_KINDS.len(), "{PROPERTY}");
-        for (kind, query) in &model {
-            let live = state
-                .live
-                .get(kind)
-                .expect("the model's live query is live");
-            assert_eq!(&live.asked, &query.asked, "{PROPERTY}");
-            assert_eq!(live.phase == QueryPhase::Queued, query.queued, "{PROPERTY}");
-        }
+        state.assert_invariants();
     }
     summary
 }
@@ -295,7 +295,7 @@ pub(super) fn decode_settlement(data: &[u8]) -> impl Iterator<Item = SettlementO
 /// Applicable operations in a decoder-v2 settlement history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct DiscoverySettlementReplaySummary {
-    /// Operations checked against the model.
+    /// Operations applied to the session.
     pub transitions: usize,
     /// Queries sent.
     pub sent: usize,
@@ -324,7 +324,7 @@ pub struct DiscoverySettlementReplaySummary {
     pub closed: usize,
 }
 
-/// The model's view of one live query.
+/// One query the replay sent and has not seen claimed.
 struct SettlementQuery {
     asked: Asked,
     written: bool,
@@ -332,7 +332,7 @@ struct SettlementQuery {
     delivered: Option<usize>,
 }
 
-/// One session under test, and the model's view of it.
+/// One session under test, and what the replay sent and holds on it.
 struct SettlementSession {
     queries: Queries,
     /// The transport's precheck slot for this session's answers.
@@ -396,7 +396,7 @@ impl SettlementSession {
     }
 
     /// The session's claimed answers, `Hello`, and queued answers hold the
-    /// close wait exactly when the model says they do.
+    /// close wait, and nothing else does.
     fn check_close_wait(&self) {
         let holds = !self.answers.is_empty()
             || self.hello.is_some()
@@ -404,36 +404,19 @@ impl SettlementSession {
         assert_eq!(
             self.queries.answers_settled().now_or_never().is_none(),
             holds,
-            "{SETTLEMENT}: the close wait disagrees with the model"
+            "{SETTLEMENT}: the close wait disagrees with what the session holds"
         );
     }
 
-    /// The session's ledger matches the model. A session holds at most one
-    /// answer of each kind.
+    /// The session's ledger keeps its invariants and holds a reservation for
+    /// each query the replay sent and has not seen claimed.
     fn check_ledger(&self) {
-        let settling = *self.queries.settling.borrow();
+        self.queries.assert_invariants();
         assert_eq!(
-            settling,
-            Settling {
-                peers: self.answers_of(QueryKind::Peers),
-                services: self.answers_of(QueryKind::Services),
-                hellos: usize::from(self.hello.is_some()),
-            },
-            "{SETTLEMENT}"
+            self.queries.lock().reservations.len(),
+            self.live.len(),
+            "{SETTLEMENT}: reservations"
         );
-        assert!(
-            settling.peers <= 1 && settling.services <= 1,
-            "{SETTLEMENT}: a kind stacked two answers"
-        );
-        for kind in QUERY_KINDS {
-            assert!(
-                !(self.live.contains_key(&kind) && settling.holds(kind)),
-                "{SETTLEMENT}: a query is live beside its kind's unsettled answer"
-            );
-        }
-        let live = self.queries.lock();
-        assert_eq!(live.state.len(), self.live.len(), "{SETTLEMENT}");
-        assert_eq!(live.reservations.len(), self.live.len(), "{SETTLEMENT}");
     }
 }
 
@@ -441,12 +424,11 @@ impl SettlementSession {
 /// session's two queries, and one unsettled answer beside them.
 const SETTLEMENT_POOL: usize = 3;
 
-/// The largest answer that the transport admits for a kind's row, restated
-/// from the wire caps.
-fn model_row_cap(kind: QueryKind) -> u64 {
+/// The largest answer that the transport admits for a kind's row.
+fn row_cap(kind: QueryKind) -> u64 {
     match kind {
-        QueryKind::Peers => 2 + 32 * 648,
-        QueryKind::Services => 42 + 8 * 294,
+        QueryKind::Peers => LARGEST_PEERS.bytes,
+        QueryKind::Services => LARGEST_SERVICES.bytes,
     }
 }
 
@@ -457,8 +439,9 @@ fn answer_type(kind: QueryKind) -> u16 {
     })
 }
 
-/// Replay decoder-v2 bytes against the settlement model. Each byte chooses a
-/// kind, an operation, and a bounded argument. Read at most 512 bytes.
+/// Replay decoder-v2 bytes through one node's [`Queries`] sessions. Each byte
+/// chooses a kind, an operation, and a bounded argument. Read at most
+/// [`SETTLEMENT_MAX_OPS`] bytes.
 pub fn replay_discovery_settlement_bytes(data: &[u8]) -> DiscoverySettlementReplaySummary {
     run_settlement(decode_settlement(data), |_, _| {})
 }
@@ -478,14 +461,19 @@ pub(super) fn run_settlement(
         match op {
             SettlementOp::Query { kind, size } => {
                 let held = pool.held();
-                let due = !session.live.contains_key(&kind)
-                    && session.answers_of(kind) == 0
-                    && held < SETTLEMENT_POOL;
                 // A `GetPeers` limit of zero asks for nothing, so sizes
                 // start at one.
                 let asked = asked_for(kind, size + usize::from(kind == QueryKind::Peers));
-                match (session.send(asked.clone()), due) {
-                    (Ok(()), true) => {
+                match session.send(asked.clone()) {
+                    Ok(()) => {
+                        // A query is sent only beside no live query or
+                        // unsettled answer of its kind, into a pool with room.
+                        assert!(
+                            !session.live.contains_key(&kind)
+                                && session.answers_of(kind) == 0
+                                && held < SETTLEMENT_POOL,
+                            "{SETTLEMENT}: a query sent while not due"
+                        );
                         summary.sent += 1;
                         session.live.insert(
                             kind,
@@ -497,9 +485,9 @@ pub(super) fn run_settlement(
                         );
                         session.unwritten.push_back(kind);
                     }
-                    (Err(QueryUnsent::NotDue), false) => summary.not_due += 1,
-                    (sent, due) => {
-                        panic!("{SETTLEMENT}: due {due} disagrees with send {sent:?}")
+                    Err(QueryUnsent::NotDue) => summary.not_due += 1,
+                    Err(QueryUnsent::Closed) => {
+                        panic!("{SETTLEMENT}: the current session refused a query as closed")
                     }
                 }
             }
@@ -520,13 +508,13 @@ pub(super) fn run_settlement(
                     }
                     (Err(_), None) => summary.stale += 1,
                     (frame, kind) => {
-                        panic!("{SETTLEMENT}: write {frame:?} disagrees with model {kind:?}")
+                        panic!("{SETTLEMENT}: write {frame:?} disagrees with the queued {kind:?}")
                     }
                 }
             }
             SettlementOp::Deliver { kind, excess } => {
                 let query = session.live.get(&kind);
-                let len = query.map_or(2, |query| model_cap(&query.asked) + u64::from(excess));
+                let len = query.map_or(2, |query| query.asked.cap().bytes + u64::from(excess));
                 let checked = session
                     .precheck
                     .get()
@@ -535,29 +523,25 @@ pub(super) fn run_settlement(
                         answer_type(kind),
                         usize::try_from(len).expect("test caps fit usize"),
                     );
-                let session_query = session.live.get_mut(&kind);
-                match (session_query, checked) {
-                    (None, Err(FrameRejection::Unsolicited)) => summary.refused += 1,
-                    (Some(_), Err(FrameRejection::AboveReservation { .. }))
-                        if len > model_row_cap(kind) =>
-                    {
-                        summary.refused += 1;
-                    }
-                    (Some(query), Err(FrameRejection::AboveOwed { .. }))
-                        if query.delivered.is_some() =>
-                    {
-                        summary.refused += 1;
-                    }
-                    (Some(query), Ok(()))
-                        if query.delivered.is_none() && len <= model_row_cap(kind) =>
-                    {
-                        summary.delivered += 1;
-                        query.delivered = Some(usize::try_from(len).expect("test caps fit usize"));
-                    }
-                    (query, checked) => panic!(
-                        "{SETTLEMENT}: live {} disagrees with admission {checked:?}",
-                        query.is_some()
-                    ),
+                if checked.is_ok() {
+                    // The transport queues only an answer that a live query
+                    // owes, at most one per query, and within its row.
+                    let query = session
+                        .live
+                        .get_mut(&kind)
+                        .unwrap_or_else(|| panic!("{SETTLEMENT}: admitted an unsolicited answer"));
+                    assert!(
+                        query.delivered.is_none(),
+                        "{SETTLEMENT}: admitted a second answer"
+                    );
+                    assert!(
+                        len <= row_cap(kind),
+                        "{SETTLEMENT}: admitted {len} bytes above the row's cap"
+                    );
+                    summary.delivered += 1;
+                    query.delivered = Some(usize::try_from(len).expect("test caps fit usize"));
+                } else {
+                    summary.refused += 1;
                 }
             }
             SettlementOp::Claim(kind) => {
@@ -569,7 +553,7 @@ pub(super) fn run_settlement(
                         .remove(&kind)
                         .expect("the delivered answer's query is live");
                     session.unwritten.retain(|unwritten| *unwritten != kind);
-                    let cap = model_cap(&query.asked);
+                    let cap = query.asked.cap().bytes;
                     match session.queries.claim(answer_type(kind), len) {
                         Ok(Some(answer)) if len as u64 <= cap => {
                             summary.claimed += 1;

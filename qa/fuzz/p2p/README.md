@@ -188,21 +188,27 @@ or fresh-process semantic replay. The block fixture copies public mainnet block
 
 ## Discovery targets
 
-`discovery_session` drives `Hello`, admitted answers and operation outcomes, and
-its model checks exchange completion, single settlement and the ownership
-recheck before a close.
+Each discovery target drives the production machine, checks its invariants
+after every operation, and compares outputs only with what the replay sent.
+Named scenarios beside each machine pin its rules.
 
-`discovery_redial` drives attempt and registration lifetimes, and its model
-checks local limits, backoff growth, registration upgrades, resets and stopping.
+`discovery_session` drives `Hello`, admitted answers and operation outcomes
+under decoder 1. It checks exchange completion, single settlement and the
+ownership recheck before a close.
+
+`discovery_redial` drives attempt and registration lifetimes under decoder 2.
+Its header byte chooses a maintained or a bounded policy. It checks local
+limits, the backoff bounds, registration upgrades, resets and stopping.
 
 `discovery_query` replays each input under both decoders, so its corpus keeps its
-decoder-1 meaning: decoder 1 checks pure query ownership and wire caps, and
-decoder 2 checks the real `Queries` ledger of successive sessions on one pool,
-without a reader to take the `Hello` hold.
+decoder-1 meaning: decoder 1 checks pure query ownership and each query's own
+cap, and decoder 2 checks the real `Queries` ledger of successive sessions on
+one pool, without a reader to take the `Hello` hold.
 
-`discovery_candidate` drives dial, completion, round and logical-time operations,
-and its model checks canonical IP reservations and per-node backoff, not an
-asynchronous worker's admission permit.
+`discovery_candidate` drives dial, completion, round and logical-time
+operations under decoder 1. It checks canonical IP reservations, the bounds of
+per-node backoff and the round interval, not an asynchronous worker's
+admission permit.
 
 These targets check pure policies. They do not check worker cancellation or
 connection ownership across scheduled IO.

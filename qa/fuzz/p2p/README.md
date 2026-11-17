@@ -1,8 +1,8 @@
 # P2P machine fuzzing
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member.
-Each target drives one pure P2P machine from fuzz bytes and checks it against
-an independent model after every input. A target panics with the property ID
+Each target drives one pure P2P machine from fuzz bytes and checks its
+properties after every input. A target panics with the property ID
 that the machine broke.
 
 Run a target from this directory with a pinned nightly toolchain. Pass
@@ -80,8 +80,8 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> path/to/artifact -- -ru
 ## Block machine targets
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member. Each
-target drives one pure P2P machine from fuzz bytes and checks it against an
-independent model after every input. A target panics with the property ID that
+target drives one pure P2P machine from fuzz bytes and checks its properties
+after every input. A target panics with the property ID that
 the machine broke. The targets do not start QUIC or the simulator step loop.
 
 Each owning PR adds its targets as `[[bin]]` entries, with a row in the table

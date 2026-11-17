@@ -397,6 +397,9 @@ pub struct Inbound {
 
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// How long a gossiped block download waits before a second request, if hedging is on.
+    block_hedge_delay: Option<Duration>,
 }
 
 impl Inbound {
@@ -426,12 +429,20 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks: PendingBlockRegistry::default(),
+            block_hedge_delay: None,
         }
     }
 
     /// Shares one pending-block registry with the mining RPCs.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.pending_blocks = pending_blocks;
+        self
+    }
+
+    /// Sends a second request for a gossiped block that has not arrived `delay` after it was
+    /// requested. `None` sends only the first request.
+    pub fn with_block_hedge(mut self, delay: Option<Duration>) -> Self {
+        self.block_hedge_delay = delay;
         self
     }
 
@@ -478,15 +489,18 @@ impl Service<zn::Request> for Inbound {
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
 
-                    let block_downloads = Box::pin(BlockDownloads::new(
-                        full_verify_concurrency_limit,
-                        self.expose_peer_addresses,
-                        Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
-                        Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
-                        state.clone(),
-                        latest_chain_tip,
-                        network,
-                    ));
+                    let block_downloads = Box::pin(
+                        BlockDownloads::new(
+                            full_verify_concurrency_limit,
+                            self.expose_peer_addresses,
+                            Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
+                            Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
+                            state.clone(),
+                            latest_chain_tip,
+                            network,
+                        )
+                        .with_block_hedge(self.block_hedge_delay),
+                    );
 
                     result = Ok(());
                     Setup::Initialized {
@@ -884,6 +898,7 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
+            zn::Request::BlockByHashHedge(_) => unreachable!("hedge requests are local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

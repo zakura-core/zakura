@@ -155,6 +155,19 @@ pub enum Request {
         source: PeerSource,
     },
 
+    /// Request one block a legacy peer announced, as a second request after a first request for
+    /// it has been outstanding for a while.
+    ///
+    /// The legacy peer set sends it only to a ready peer that announced the block, has no
+    /// request outstanding, and has not left its last block request unanswered. Among those it
+    /// picks the peer with the fastest last heartbeat ping. If there is no such peer, the request
+    /// fails at once and is sent to nobody.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    BlockByHashHedge(block::Hash),
+
     /// Request transactions by their unmined transaction ID.
     ///
     /// v4 transactions use a legacy transaction ID, and
@@ -336,6 +349,7 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::BlockByHashHedge(_) => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
                 format!("TransactionsByIdFrom({})", ids.len())
@@ -373,7 +387,9 @@ impl Request {
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
+            Request::BlocksByHash(_)
+            | Request::BlocksByHashFrom { .. }
+            | Request::BlockByHashHedge(_) => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -397,6 +413,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::BlockByHashHedge(_)
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
         )
@@ -410,6 +427,7 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
+            Request::BlockByHashHedge(hash) => HashSet::from([*hash]),
             _ => HashSet::new(),
         }
     }

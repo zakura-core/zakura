@@ -1504,6 +1504,62 @@ where
         .boxed()
     }
 
+    /// Sends a second request for a block that a first request has not delivered yet.
+    ///
+    /// Only a ready peer that announced the block and can take a request now is a candidate, so
+    /// the peer still answering the first request is never chosen. Among the candidates, the
+    /// peer with the fastest last heartbeat ping wins; peers without a measured ping go last.
+    /// The ping time is measured by this node, so a peer cannot claim a faster one. With no
+    /// candidate, fails with [`NotFoundRegistry`](PeerError::NotFoundRegistry) without sending.
+    fn route_block_hedge(
+        &mut self,
+        hash: block::Hash,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let inventory = InventoryHash::from(hash);
+        let peer = self
+            .inventory_registry
+            .advertising_peers(inventory)
+            .filter_map(|addr| {
+                let svc = self.ready_services.get(addr)?;
+                svc.is_preferred_block_source()
+                    .then(|| (*addr, svc.block_gossip.rtt()))
+            })
+            .min_by_key(|(_, rtt)| (rtt.is_none(), *rtt))
+            .map(|(addr, _)| addr);
+
+        let Some((peer, mut svc)) =
+            peer.and_then(|peer| Some((peer, self.take_ready_service(&peer)?)))
+        else {
+            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+            return async move {
+                Err(SharedPeerError::from(PeerError::NotFoundRegistry(vec![inventory])).into())
+            }
+            .boxed();
+        };
+
+        metrics::counter!("pool.route_inv.hedge.count").increment(1);
+        let request_id = self.legacy_peer_trace.next_request_id();
+        let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+        let started = Instant::now();
+        let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
+        self.push_unready(peer, svc);
+
+        let trace = self.legacy_peer_trace.clone();
+        async move {
+            let result = fut.await;
+            trace.block_request_finish(
+                request_id,
+                trace_peer,
+                hash,
+                "hedge",
+                started.elapsed(),
+                &result,
+            );
+            result.map_err(Into::into)
+        }
+        .boxed()
+    }
+
     /// Routes the same request to up to `max_peers` ready peers, ignoring return values.
     ///
     /// `max_peers` must be at least one, and at most the number of ready peers.
@@ -1909,6 +1965,8 @@ where
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
+
+            Request::BlockByHashHedge(hash) => self.route_block_hedge(hash),
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),

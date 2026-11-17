@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{
@@ -428,6 +429,9 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
     /// results.
     spawned_sender: mpsc::UnboundedSender<DownloadHandle>,
+
+    /// How long an advertised block's request waits before a second request, if hedging is on.
+    block_hedge_delay: Option<Duration>,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -441,6 +445,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             chain_network: self.chain_network.clone(),
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
+            block_hedge_delay: self.block_hedge_delay,
         }
     }
 }
@@ -595,11 +600,23 @@ where
                 chain_network,
                 admission: Arc::default(),
                 spawned_sender,
+                block_hedge_delay: None,
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
             poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Sends a second request for an advertised block that has not arrived `delay` after it was
+    /// requested. `None` sends only the first request.
+    ///
+    /// The second request goes to another peer that announced the block (see
+    /// [`zn::Request::BlockByHashHedge`]), and the first copy to arrive is used. Parent
+    /// recoveries are never hedged.
+    pub fn with_block_hedge(mut self, delay: Option<Duration>) -> Self {
+        self.spawner.block_hedge_delay = delay;
+        self
     }
 
     /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
@@ -789,6 +806,65 @@ where
     }
 }
 
+/// Sends `request` for the block `hash` and returns the first successful response.
+///
+/// With a `hedge_delay`, a block that hasn't arrived by then is also requested from another peer
+/// that announced it, and so is a block whose first request fails before then. Whichever request
+/// loses keeps running in its own task until the peer answers or the network service times it
+/// out, so the peer set's trace records both download times; its response is discarded.
+async fn request_block<ZN>(
+    network: ZN,
+    request: zn::Request,
+    hash: block::Hash,
+    hedge_delay: Option<Duration>,
+) -> Result<zn::Response, BoxError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    let Some(hedge_delay) = hedge_delay else {
+        return network.oneshot(request).await;
+    };
+
+    let mut first = network.clone().oneshot(request).boxed();
+    let first_error = tokio::select! {
+        biased;
+        result = &mut first => match result {
+            Ok(response) => return Ok(response),
+            Err(error) => Some(error),
+        },
+        () = tokio::time::sleep(hedge_delay) => None,
+    };
+
+    metrics::counter!("gossip.hedge.sent.count").increment(1);
+    let mut hedge = network.oneshot(zn::Request::BlockByHashHedge(hash)).boxed();
+
+    if let Some(first_error) = first_error {
+        // A hedge that fails, for example because no other peer announced the block, reports
+        // the first request's error, which says why the block is missing.
+        return hedge.await.map_err(|_| first_error);
+    }
+
+    tokio::select! {
+        biased;
+        result = &mut first => match result {
+            Ok(response) => {
+                tokio::spawn(hedge);
+                Ok(response)
+            }
+            Err(first_error) => hedge.await.map_err(|_| first_error),
+        },
+        result = &mut hedge => match result {
+            Ok(response) => {
+                metrics::counter!("gossip.hedge.won.count").increment(1);
+                tokio::spawn(first);
+                Ok(response)
+            }
+            Err(_) => first.await,
+        },
+    }
+}
+
 impl<ZN, ZV, ZS> TaskSpawner<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -906,6 +982,9 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let hedge_delay = self
+            .block_hedge_delay
+            .filter(|_| kind == DownloadKind::Advertised);
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -935,7 +1014,9 @@ where
             };
 
             let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
+                request_block(network, request, hash, hedge_delay)
+                    .await
+                    .map_err(|e| (e, None))?
             {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.

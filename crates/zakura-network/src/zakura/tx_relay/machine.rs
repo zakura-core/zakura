@@ -1437,34 +1437,21 @@ impl RelayMachine {
     }
 
     /// The pool published `changes`, one batch, and `snapshot` is the pool
-    /// after it. A snapshot that turns the pool on again reopens every
-    /// session with the go first, on the pool before the batch, as a
-    /// restart does. Then every session with the go reads the batch.
+    /// after it. Each session reads the batch in a step of its own, on the
+    /// pool after it, as its routine does, and a snapshot that turns the
+    /// pool on opens it there. See [`PeerMachine::pool_changed`].
     pub(crate) fn pool_changed(&mut self, changes: Vec<Change>, snapshot: SnapshotInfo, now: Time) {
         self.now = self.now.max(now);
         let activated = !self.pool.live && snapshot.active;
-        let sessions: Vec<SessionId> = self.machines.keys().copied().collect();
-        let mut woken = BTreeSet::new();
-        if activated {
-            self.pool.live = true;
-            self.pool.tip = snapshot.tip;
-            for &session in &sessions {
-                let marks = Marks::of(&self.shared);
-                let machine = self.machines.get_mut(&session).expect("listed above");
-                if self.shared.reactor.has_go(machine.state.peer, session) {
-                    machine.open(&mut self.shared, &self.pool);
-                }
-                woken.extend(self.owe(marks, Some(session)));
-            }
-        }
         // The first routine to read the batch logs it, in its own step.
         let mut marks = Marks::of(&self.shared);
         let batch = self
             .pool
             .publish(&mut self.shared, changes, snapshot, self.now);
-        for session in sessions {
+        let mut woken = BTreeSet::new();
+        for session in self.machines.keys().copied().collect::<Vec<_>>() {
             let machine = self.machines.get_mut(&session).expect("listed above");
-            machine.pool_changed(&mut self.shared, &self.pool, &batch, false, self.now);
+            machine.pool_changed(&mut self.shared, &self.pool, &batch, activated, self.now);
             woken.extend(self.owe(marks, Some(session)));
             marks = Marks::of(&self.shared);
         }

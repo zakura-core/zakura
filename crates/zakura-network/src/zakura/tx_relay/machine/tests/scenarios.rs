@@ -1126,6 +1126,23 @@ fn the_first_snapshot_opens_sessions_waiting_for_the_pool() {
     assert_eq!(advertised(&bench, pooled), sessions);
 }
 
+/// A batch that turns the pool on again opens each session on the pool
+/// after it, as its routine reads that batch. So an addition in the batch
+/// goes to every session in that step as part of the whole pool, even with
+/// a window of one.
+#[test]
+fn an_addition_in_the_batch_that_turns_the_pool_on_goes_to_everyone_at_once() {
+    let mut bench = Bench::with(one_at_once(ADVERT_DELAY), true, &[]);
+    let sessions = vec![bench.join(1), bench.join(2)];
+    bench.turn_off();
+
+    let added = bench.id(0);
+    bench.active = true;
+    bench.now = Duration::from_secs(1);
+    bench.add(&[added]);
+    assert_eq!(advertised(&bench, added), sessions);
+}
+
 /// A resync keeps the adverts that still stand, forgets the rest, and
 /// announces what it finds.
 #[test]

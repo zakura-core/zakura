@@ -1035,18 +1035,19 @@ fn an_inv_waits_for_room_its_last_write_and_the_byte_rate() {
 }
 
 /// An advert still queued for an `Inv` is withdrawn once the peer announces
-/// the same id, so it never goes back to its source. One already sent
-/// stands, and the peer may still ask for it.
+/// the same id, so it never goes back to its source, and the adverts it
+/// did not name stay queued. One already sent stands, and the peer may
+/// still ask for it.
 #[test]
 fn a_queued_advert_the_peer_announces_is_withdrawn() {
     let mut bench = Bench::new();
-    let (sent, queued) = (bench.id(0), bench.id(1));
+    let (sent, queued, kept) = (bench.id(0), bench.id(1), bench.id(2));
     let session = bench.join(1);
     bench.add(&[sent]);
     assert_eq!(bench.take_inv(session, 16), vec![sent]);
-    bench.add(&[queued]);
+    bench.add(&[queued, kept]);
     bench.inv(session, &[queued, sent]);
-    assert!(bench.take_inv(session, 16).is_empty(), "nothing goes back");
+    assert_eq!(bench.take_inv(session, 16), vec![kept], "nothing goes back");
     bench.get_txs(session, sent);
     assert_eq!(
         bench.effects,

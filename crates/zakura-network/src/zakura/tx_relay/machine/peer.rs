@@ -189,12 +189,28 @@ impl PeerState {
     /// forgetting the one least recently recorded, which only costs one
     /// redundant advert.
     pub(crate) fn mark_known(&mut self, id: UnminedTxId, short: u64, seq: u64) {
-        self.known.mark(short, seq);
-        // An advert of `id` still queued for an `Inv` would go back to a
-        // peer that has it. One already sent stays, so the peer may still
-        // request the id.
-        if self.announced.contains_key(&id) && !self.announced.is_sent(&id) {
-            self.announced.remove(&id);
+        self.mark_all_known([(id, short)], seq);
+    }
+
+    /// Records each of `ids`, given with its short id, as
+    /// [`Self::mark_known`] does one. An advert of one still queued for an
+    /// `Inv` would go back to a peer that has it, so those are withdrawn, in
+    /// one pass over the queue however many an `Inv` names. One already
+    /// sent stays, so the peer may still request the id.
+    pub(crate) fn mark_all_known(
+        &mut self,
+        ids: impl IntoIterator<Item = (UnminedTxId, u64)>,
+        seq: u64,
+    ) {
+        let mut queued: HashSet<UnminedTxId> = HashSet::default();
+        for (id, short) in ids {
+            self.known.mark(short, seq);
+            if self.announced.contains_key(&id) && !self.announced.is_sent(&id) {
+                queued.insert(id);
+            }
+        }
+        if !queued.is_empty() {
+            self.announced.retain(|id, _| !queued.contains(id));
         }
     }
 

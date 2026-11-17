@@ -181,11 +181,8 @@ impl PeerMachine {
         if shared.reactor.is_cooling(peer, self.now) {
             // A cooling peer's ids are not taken, but it still has them, so
             // none is announced back to it.
-            let seq = pool.last_seq();
-            for (id, _) in entries {
-                let short = shared.short(*id);
-                self.state.mark_known(*id, short, seq);
-            }
+            let ids = entries.iter().map(|(id, _)| (*id, shared.short(*id)));
+            self.state.mark_all_known(ids, pool.last_seq());
             return self.settle(shared, pool);
         }
         let hello = self.state.hello.is_some();
@@ -196,11 +193,10 @@ impl PeerMachine {
             // filtered and bounded as the pending set is, so one peer never
             // holds two shares of the table. So does one without a `Hello`,
             // which could never be asked, so it cannot keep an entry alive.
-            let seq = pool.last_seq();
+            let ids = entries.iter().map(|(id, _)| (*id, shared.short(*id)));
+            self.state.mark_all_known(ids, pool.last_seq());
+            let state = &mut self.state;
             for (id, size) in entries.iter().copied() {
-                let short = shared.short(id);
-                let state = &mut self.state;
-                state.mark_known(id, short, seq);
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
@@ -1103,11 +1099,10 @@ impl PeerMachine {
     ) {
         let mut fresh = Vec::new();
         let mut taken: HashSet<UnminedTxId> = HashSet::default();
-        let seq = pool.last_seq();
+        let ids = entries.iter().map(|(id, _)| (*id, shared.short(*id)));
+        self.state.mark_all_known(ids, pool.last_seq());
         let state = &mut self.state;
         for (id, size) in entries.iter().copied() {
-            let short = shared.short(id);
-            state.mark_known(id, short, seq);
             // Announcing an id while a request for it is outstanding says
             // the peer has it now. A `NotFound` for that request, which can
             // arrive later on the other stream, is still the peer's try, but

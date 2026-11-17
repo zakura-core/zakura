@@ -181,30 +181,7 @@ where
                 zn::Request::AdvertiseBlock(block, None)
             };
             let succeeded = match early {
-                Some(mut event) => {
-                    if !event.pending.is_valid() {
-                        false
-                    } else {
-                        let relay_pending = event.pending.clone();
-                        let succeeded = tokio::select! {
-                            biased;
-                            _ = event.pending.wait_for_failure() => false,
-                            succeeded = async {
-                                match event.relay {
-                                    zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => broadcast_early_with_timeout(network, request, admission).await,
-                                    zakura_rpc::EarlyBlockRelay::TrustedSubmission => broadcast_trusted_with_timeout(network, request, relay_pending).await,
-                                }
-                            } => succeeded,
-                        };
-                        if succeeded {
-                            metrics::counter!("mining.optimistic_inventory.early_inventories")
-                                .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => event.submission.rpc_method())
-                                .record(event.submitted_at.elapsed().as_secs_f64());
-                        }
-                        succeeded
-                    }
-                }
+                Some(event) => broadcast_submission(network, request, event).await,
                 None => broadcast_with_timeout(network, request).await,
             };
 
@@ -212,6 +189,48 @@ where
                 let _ = completion_tx.send(MinedBlockBroadcastCompleted { block, succeeded });
             }
         });
+    }
+}
+
+/// Routes an early submission through its explicit cancellation policy, retaining shared metrics.
+async fn broadcast_submission<ZN>(network: ZN, request: zn::Request, event: EarlyMinedBlock) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    if !event.pending.is_valid() {
+        return false;
+    }
+    let succeeded = match event.relay {
+        zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => {
+            broadcast_state_authorized(network, request, admission, event.pending).await
+        }
+        zakura_rpc::EarlyBlockRelay::TrustedSubmission => {
+            broadcast_trusted_with_timeout(network, request, event.pending).await
+        }
+    };
+    if succeeded {
+        metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
+        metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => event.submission.rpc_method())
+            .record(event.submitted_at.elapsed().as_secs_f64());
+    }
+    succeeded
+}
+
+/// Failure cancels even a dispatched state-authorized broadcast; commitment only cancels
+/// readiness inside `broadcast_early_with_timeout` and lets active uploads finish.
+async fn broadcast_state_authorized<ZN>(
+    network: ZN,
+    request: zn::Request,
+    admission: zs::BlockAdmission,
+    mut pending: zakura_rpc::PendingBlockSignal,
+) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    tokio::select! {
+        biased;
+        _ = pending.wait_for_failure() => false,
+        succeeded = broadcast_early_with_timeout(network, request, admission) => succeeded,
     }
 }
 
@@ -249,7 +268,8 @@ where
         .is_ok_and(|result| result.is_ok())
 }
 
-/// Withdraws a trusted announcement if validation finishes before peer readiness.
+/// Withdraws a trusted announcement on commitment or failure, both before readiness and
+/// after dispatch. Cancellation deliberately returns before recording dispatch-completion metrics.
 async fn broadcast_trusted_with_timeout<ZN>(
     mut network: ZN,
     request: zn::Request,

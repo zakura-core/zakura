@@ -25,12 +25,13 @@ use tower::{
 };
 
 use zakura_chain::{
+    amount::Amount,
     block::{Block, Height},
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     serialization::ZcashDeserializeInto,
-    transaction::{self, UnminedTxId, VerifiedUnminedTx},
-    transparent::OutPoint,
+    transaction::{self, LockTime, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transparent::{self, OutPoint},
 };
 use zakura_consensus::{error::TransactionError, transaction as tx};
 use zakura_network as zn;
@@ -547,6 +548,41 @@ fn samples(count: usize) -> Vec<VerifiedUnminedTx> {
     samples
 }
 
+/// Two v5 transactions with the same effects and different authorizing
+/// data, so the same mined id and different full ids. Verification is
+/// mocked, so neither script has to be valid.
+fn v5_pair() -> (VerifiedUnminedTx, VerifiedUnminedTx) {
+    let output = samples(1).remove(0).transaction.transaction().outputs()[0].clone();
+    let with_unlock_script = |byte: u8| {
+        let tx = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![transparent::Input::PrevOut {
+                outpoint: OutPoint::from_usize(unknown_id(0).mined_id(), 0),
+                // A push of one byte, so the script is push-only.
+                unlock_script: transparent::Script::new(&[0x01, byte]),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![output.clone()],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        };
+        VerifiedUnminedTx::new(
+            UnminedTx::from(tx),
+            Amount::try_from(1_000_000).expect("a valid fee"),
+            0,
+            0,
+            Arc::new(Vec::new()),
+        )
+        .expect("the fee pays for one input and one output")
+    };
+    let (a, b) = (with_unlock_script(0xaa), with_unlock_script(0xbb));
+    assert_eq!(a.transaction.id().mined_id(), b.transaction.id().mined_id());
+    assert_ne!(a.transaction.id(), b.transaction.id());
+    (a, b)
+}
+
 /// The first output `tx` creates.
 fn first_output(tx: &VerifiedUnminedTx) -> OutPoint {
     OutPoint::from_usize(tx.transaction.id().mined_id(), 0)
@@ -946,6 +982,28 @@ async fn local_verifier_failures_are_not_cached(mode: Mode) {
         harness.admit(&sample).await;
         assert_eq!(harness.ids().await, [id].into(), "{failure:?}");
     }
+}
+
+/// A failed verification is remembered for its exact authorizing data, so
+/// the same effects with other authorizing data are verified and admitted.
+async fn rejection_is_kept_for_the_exact_authorization(mode: Mode) {
+    let mut harness = active_pool(mode).await;
+    let (a, b) = v5_pair();
+    let (a_id, b_id) = (a.transaction.id(), b.transaction.id());
+
+    let receiver = harness
+        .queue_one(a.transaction.clone())
+        .await
+        .expect("a new body passes the first stage");
+    harness.verify(Err(TransactionError::BadBalance)).await;
+    harness
+        .outcome(receiver)
+        .await
+        .expect_err("an invalid transaction is refused");
+    harness.admit(&b).await;
+
+    assert_eq!(harness.rejected([a_id, b_id]).await, [a_id].into());
+    assert_eq!(harness.ids().await, [b_id].into());
 }
 
 async fn too_large_rejection_is_answered_at_the_receiver_stage(mode: Mode) {
@@ -1959,6 +2017,7 @@ both_pools!(
     failed_fetch_answers_the_receiver_and_caches_nothing,
     failed_verification_is_answered_then_cached_for_the_tip,
     local_verifier_failures_are_not_cached,
+    rejection_is_kept_for_the_exact_authorization,
     too_large_rejection_is_answered_at_the_receiver_stage,
     pool_dependency_limits_are_answered_then_cached_for_the_tip,
     mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end,
@@ -2023,8 +2082,10 @@ impl Harness {
 #[tokio::test(flavor = "multi_thread")]
 async fn both_pools_answer_a_replayed_trace_alike() {
     let samples = || -> Vec<VerifiedUnminedTx> {
+        let (a, b) = v5_pair();
         Network::Mainnet
             .unmined_transactions_in_blocks(2..=10)
+            .chain([a, b])
             .collect()
     };
     let all: Vec<UnminedTxId> = samples().iter().map(|tx| tx.transaction.id()).collect();
@@ -2059,18 +2120,9 @@ async fn both_pools_answer_a_replayed_trace_alike() {
                     harness.replay_submit(&tx, pass).await
                 };
                 let (transactions, tip) = harness.full().await;
-                let mut ids: Vec<_> = transactions
-                    .iter()
-                    .map(|tx| tx.transaction.id().mined_id().0)
-                    .collect();
-                ids.sort_unstable();
-                let mut rejected: Vec<_> = harness
-                    .rejected(all.clone())
-                    .await
-                    .into_iter()
-                    .map(|id| id.mined_id().0)
-                    .collect();
-                rejected.sort_unstable();
+                let ids: HashSet<UnminedTxId> =
+                    transactions.iter().map(|tx| tx.transaction.id()).collect();
+                let rejected = harness.rejected(all.clone()).await;
                 answers.push((answer, ids, rejected, tip));
             }
             if commit {

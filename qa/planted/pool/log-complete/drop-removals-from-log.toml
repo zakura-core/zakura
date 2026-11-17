@@ -1,0 +1,5 @@
+# Drops removals from the published change log, so a reader keeps a
+# transaction the snapshot no longer holds.
+input = "crates/zakura-sim/tests/fixtures/pool-core.bin"
+# The harness drives the pool core and the storage under it.
+checks = ["crates/zakura-mempool/src"]

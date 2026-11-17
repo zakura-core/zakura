@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..7b677eb3a5 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -1573,7 +1573,7 @@ impl<E: VerifyError> MempoolState<E> {
+                     self.reject(
+                         key,
+                         SameEffectsTipRejectionError::SpendConflict.into(),
+-                        Charge::None,
++                        Charge::Ban,
+                     );
+                     return;
+                 }

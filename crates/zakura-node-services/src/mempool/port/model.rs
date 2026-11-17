@@ -1,0 +1,2319 @@
+//! An independent model of the pool core, as callers see it through the port.
+//!
+//! The model restates the documented rules and never calls the code it
+//! checks. The core's machine tests compare the machine with it, and
+//! `tx-relay`'s tests use it as their pool.
+//!
+//! It takes the same inputs as the core: port calls, verification outcomes,
+//! chain events and time. Each input returns the [`Step`] it caused. A
+//! verification is not run here. The model says which job to start, and the
+//! test feeds back the [`Outcome`].
+//!
+//! Two things are left out, because they are rules of the pool's storage,
+//! which keeps its own tests. Eviction at the pool's cost limit: the model
+//! assumes the pool stays below it. And the snapshot's mining order, by
+//! ancestor-package fee: the model has no fees, and [`PoolModel::visible`] is
+//! oldest first, which is not that order.
+//!
+//! Nothing here is about one peer. Per-peer limits and cooldowns belong to
+//! the callers that see the peer, so a verdict only says what its body
+//! earned.
+//!
+//! A slot outlives its admission while the caller that reserved it is still
+//! fetching. If another caller's body decides the id first, the reserving
+//! caller's slot stays taken until it submits its body or drops the
+//! reservation. Otherwise a caller could have more fetches out than slots.
+//!
+//! Two orderings are decided on purpose and are not gaps.
+//!
+//! A deadline is decided on what the core has applied. A parent mined in a
+//! block the core has not read yet can lose that race by a moment. The
+//! transaction is then answered as today's timeout would answer it, and the
+//! tip change that follows forgets the rejection.
+//!
+//! While the chain changes faster than a check completes, pooled
+//! transactions stay hidden, because no check of them can be trusted. They
+//! hold no slot between checks. Today each of those changes empties the
+//! pool.
+//!
+//! A hidden transaction queued behind a hidden parent is waiting for that
+//! parent's check, not for a missing parent, and is decided when the parent
+//! is. A parent that keeps hitting local faults keeps both hidden. That is
+//! the rule for a pooled transaction on a node whose verifier is failing.
+//!
+//! Two rules are for the core's task, not the machine. A worker waits for a
+//! stable generation before its first lookup. And the core publishes a
+//! batch's snapshot before it starts that batch's jobs, so a verification
+//! reads a pool at least as new as the one that started it.
+//!
+//! The model is synchronous, so it has no bodies in transit. What it bounds
+//! is what the core holds: one body for each undecided transaction. A body
+//! on its way to the core is its caller's to bound. A fetched body travels
+//! under a slot. A body a caller held before it reserved, such as one a
+//! peer pushed, is held by that caller whatever the core answers, and the
+//! core asks at most one such caller at a time to send it.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    time::Duration,
+};
+
+use zakura_chain::{
+    block::Height,
+    transaction::{self, UnminedTxId},
+    transparent::OutPoint,
+};
+
+use super::{
+    ChainReason, Change, ChangeEntry, ChangeSeq, Charge, Generation, GenerationRead, Intent,
+    LocalFault, RejectionScope, RemovalReason, ReservationId, MAX_PENDING, MAX_REJECTIONS,
+    MAX_REVALIDATING, MAX_WAITERS,
+};
+
+/// Time since the model started.
+pub type ModelTime = Duration;
+
+pub use super::{
+    MAX_OUTPUT_WAITS, MAX_UNDECIDED, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+};
+
+/// How long a chain-scoped rejection is remembered unless the model is told
+/// otherwise. Today's default `eviction_memory_time`. A rejection made at `T`
+/// holds through `T` plus this, and is forgotten after it, as today's list.
+pub const REJECTION_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// The most pooled ancestors a new transaction can have. Today's
+/// `MAX_MEMPOOL_ANCESTORS`.
+pub const MAX_ANCESTORS: usize = 2;
+
+/// The most transactions in one connected group of pooled dependencies.
+/// Today's `MAX_MEMPOOL_PACKAGE_TRANSACTIONS`.
+pub const MAX_PACKAGE: usize = 3;
+
+/// What the model needs to know about a transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelTx {
+    /// The exact id.
+    pub id: UnminedTxId,
+    /// The transparent outputs it spends.
+    pub spends: Vec<OutPoint>,
+    /// Its shielded spends, as opaque keys.
+    pub nullifiers: Vec<u64>,
+    /// How many transparent outputs it creates.
+    pub outputs: u32,
+    /// Its expiry height, if it has one.
+    pub expiry: Option<Height>,
+}
+
+impl ModelTx {
+    /// A transaction with no inputs, one output and no expiry.
+    pub fn new(id: UnminedTxId) -> Self {
+        Self {
+            id,
+            spends: Vec::new(),
+            nullifiers: Vec::new(),
+            outputs: 1,
+            expiry: None,
+        }
+    }
+
+    /// The same transaction, also spending output `index` of `parent`.
+    pub fn spending(mut self, parent: transaction::Hash, index: u32) -> Self {
+        self.spends.push(OutPoint {
+            hash: parent,
+            index,
+        });
+        self
+    }
+
+    fn parents(&self) -> impl Iterator<Item = transaction::Hash> + '_ {
+        self.spends.iter().map(|outpoint| outpoint.hash)
+    }
+
+    fn conflicts_with(&self, other: &ModelTx) -> bool {
+        self.spends.iter().any(|spend| other.spends.contains(spend))
+            || self
+                .nullifiers
+                .iter()
+                .any(|nullifier| other.nullifiers.contains(nullifier))
+    }
+}
+
+/// What a verification found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    /// The transaction is valid at the tip it was verified against, and
+    /// every input it spends is on the chain.
+    Pass,
+    /// The transaction is valid, and these inputs came from the pool the
+    /// verifier saw, not from the chain.
+    PassUsing(Vec<OutPoint>),
+    /// A block on the best chain already mined the transaction.
+    AlreadyMined,
+    /// The transaction is invalid.
+    Fail {
+        /// How long the rejection is remembered.
+        scope: RejectionScope,
+        /// What it costs a peer supplier.
+        charge: Charge,
+    },
+    /// These transparent inputs are in neither the chain nor the visible
+    /// pool.
+    MissingInputs(Vec<OutPoint>),
+    /// The verification failed on this node.
+    LocalFault(LocalFault),
+}
+
+/// Names one submission that waits for a verdict.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WaiterId(pub u64);
+
+/// Names one verification job.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct JobId(pub u64);
+
+/// The model's verdict: [`super::Verdict`] without the error detail.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ModelVerdict {
+    /// The transaction is in the pool.
+    Admitted,
+    /// The core refused the transaction.
+    Rejected {
+        /// How long the rejection is remembered.
+        scope: RejectionScope,
+        /// What the body earned its supplier.
+        charge: Charge,
+        /// The height of the tip the pool held when it decided. See
+        /// [`super::Rejection::tip`].
+        tip: Height,
+    },
+    /// The node's limit was reached.
+    NoRoom,
+    /// A failure on this node.
+    LocalFault(LocalFault),
+}
+
+/// The model's answer to a refused reservation: [`super::Unreserved`]
+/// without the error detail.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ModelUnreserved {
+    /// The pool is off.
+    Inactive,
+    /// The transaction is in the pool.
+    Pooled,
+    /// The id is undecided and cannot be joined.
+    Pending,
+    /// A cached rejection covers the id.
+    Rejected(RejectionScope),
+    /// The node's limit is reached.
+    NoRoom,
+}
+
+/// A granted reservation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ModelReservation {
+    /// Its name.
+    pub id: ReservationId,
+    /// Whether it joined an id that was already undecided.
+    pub joined: bool,
+    /// Whether the core needs the body from this caller.
+    pub wants_body: bool,
+}
+
+/// One thing the core does because of an input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Effect {
+    /// Start a verification of this transaction.
+    Start {
+        /// The job.
+        job: JobId,
+        /// The transaction.
+        tx: UnminedTxId,
+        /// Whether it is a pooled transaction being verified again.
+        revalidation: bool,
+    },
+    /// Cancel a verification. Its outcome is ignored.
+    Cancel(JobId),
+    /// Tell the caller fetching under this reservation that the body is no
+    /// longer needed, because a block mined the transaction. The caller
+    /// stops and drops the reservation, as today's pool cancels the
+    /// download.
+    CancelFetch(ReservationId),
+    /// Answer a submission.
+    Verdict {
+        /// The submission.
+        waiter: WaiterId,
+        /// Its verdict.
+        verdict: ModelVerdict,
+    },
+    /// The transparent outputs of a transaction that just became visible
+    /// are available, in the same step.
+    Outputs {
+        /// The transaction.
+        tx: transaction::Hash,
+        /// How many outputs it creates.
+        count: u32,
+    },
+    /// A caller waiting for an output is answered with it. The answer is
+    /// the output at `outpoint` of the transaction that just became visible.
+    /// The model carries no output values, so a comparison reads that value
+    /// from the transaction's body and checks the machine returned it.
+    OutputReady {
+        /// The waiting caller.
+        waiter: WaiterId,
+        /// The output.
+        outpoint: OutPoint,
+    },
+    /// A caller waiting for an output is told the pool turned off.
+    OutputWaitEnded(WaiterId),
+}
+
+/// The answer to [`PoolModel::await_output`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OutputAnswer {
+    /// A visible pooled transaction creates the output, and the answer is
+    /// that output: the one at the outpoint asked for.
+    Ready,
+    /// Nothing visible creates it. The caller waits under this name.
+    Waiting(WaiterId),
+    /// Too many distinct outpoints are being waited on.
+    TooManyWaiters,
+    /// The pool is off.
+    Inactive,
+}
+
+/// What one input caused, in order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Step {
+    /// What the core does.
+    pub effects: Vec<Effect>,
+    /// The batch for the change log.
+    pub changes: Vec<Change>,
+}
+
+impl Step {
+    /// The verdict this step gave `waiter`, if it gave one.
+    pub fn verdict(&self, waiter: WaiterId) -> Option<ModelVerdict> {
+        self.effects.iter().find_map(|effect| match effect {
+            Effect::Verdict { waiter: w, verdict } if *w == waiter => Some(*verdict),
+            _ => None,
+        })
+    }
+
+    /// Whether the input caused nothing.
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty() && self.changes.is_empty()
+    }
+
+    /// The jobs this step started.
+    pub fn started(&self) -> Vec<JobId> {
+        self.effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Start { job, .. } => Some(*job),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// A block that joined the best chain, as the model sees it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModelBlock {
+    /// The block's transactions.
+    pub transactions: Vec<ModelTx>,
+}
+
+/// One change to the best chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelTransition {
+    /// How many blocks left the best chain.
+    pub disconnected: usize,
+    /// The blocks that joined, lowest first.
+    pub connected: Vec<ModelBlock>,
+    /// The height of the tip after.
+    pub tip: Height,
+    /// The stable generation the transition ends on.
+    pub generation: Generation,
+    /// Whether the rules change at this tip.
+    pub rules_change: bool,
+}
+
+/// How a reader of the change log decides what to announce. A `tx-relay`
+/// session is one.
+///
+/// It announces an addition only when the snapshot it reads with holds the
+/// transaction. An addition it could not announce, because the transaction
+/// was hidden by then, is deferred and announced when it is revealed. So
+/// what it skips on a reveal is exactly what it has announced.
+#[derive(Clone, Debug)]
+pub struct ModelReader {
+    /// The newest entry it has read.
+    cursor: ChangeSeq,
+    /// The position of the snapshot it last announced in full.
+    baseline: ChangeSeq,
+    /// Additions it has read and not announced.
+    deferred: HashSet<UnminedTxId>,
+}
+
+impl ModelReader {
+    /// Opens on a snapshot and announces all of it.
+    pub fn open(visible: &[UnminedTxId], last_change: ChangeSeq) -> (Self, Vec<UnminedTxId>) {
+        let reader = Self {
+            cursor: last_change,
+            baseline: last_change,
+            deferred: HashSet::new(),
+        };
+        (reader, visible.to_vec())
+    }
+
+    /// The reader fell off the log. It cannot know which additions it lost,
+    /// so it announces the whole snapshot again and starts from it.
+    pub fn resync(&mut self, visible: &[UnminedTxId], last_change: ChangeSeq) -> Vec<UnminedTxId> {
+        self.cursor = last_change;
+        self.baseline = last_change;
+        self.deferred.clear();
+        visible.to_vec()
+    }
+
+    /// The newest entry it has read, which is its cursor for the next view.
+    pub fn cursor(&self) -> ChangeSeq {
+        self.cursor
+    }
+
+    /// Reads one view: the entries after its cursor, and the visible pool of
+    /// the snapshot they lead to. Returns what it announces.
+    pub fn read(&mut self, entries: &[ChangeEntry], visible: &[UnminedTxId]) -> Vec<UnminedTxId> {
+        let mut announced = Vec::new();
+        for entry in entries {
+            match entry.change {
+                Change::Added(id) => {
+                    if visible.contains(&id) {
+                        announced.push(id);
+                    } else {
+                        self.deferred.insert(id);
+                    }
+                }
+                Change::Revealed { id, hidden_at } => {
+                    let unannounced =
+                        self.deferred.contains(&id) || self.baseline.announces_reveal(hidden_at);
+                    if unannounced && visible.contains(&id) {
+                        self.deferred.remove(&id);
+                        announced.push(id);
+                    } else if unannounced {
+                        self.deferred.insert(id);
+                    }
+                }
+                Change::Removed { id, .. } | Change::Refused(id) => {
+                    self.deferred.remove(&id);
+                }
+                Change::Hidden(_) => {}
+            }
+            self.cursor = entry.seq;
+        }
+        announced
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Waiter {
+    id: WaiterId,
+}
+
+#[derive(Clone, Debug)]
+enum Stage {
+    /// No body has arrived.
+    Reserved,
+    /// A job is running.
+    Verifying { job: JobId, deadline: ModelTime },
+    /// The last outcome was stale, and the chain event that made it stale has
+    /// not been applied yet. The job runs again when it has.
+    AwaitingChain,
+    /// Parents are missing.
+    Parked { on: Vec<transaction::Hash> },
+}
+
+#[derive(Clone, Debug)]
+struct Admission {
+    tx_id: UnminedTxId,
+    owner: ReservationId,
+    /// Whether the owner can still submit. False once it has submitted or
+    /// released.
+    owner_waiting: bool,
+    body: Option<ModelTx>,
+    waiters: Vec<Waiter>,
+    stage: Stage,
+    /// When one of its inputs was first found missing. Its wait for a
+    /// parent runs from here and is never restarted.
+    missing_since: Option<ModelTime>,
+    /// Whether the one check allowed after that wait ended has been used.
+    last_check_used: bool,
+    /// When its body arrived. Its slot is held at most [`MAX_UNDECIDED`]
+    /// from here.
+    body_at: Option<ModelTime>,
+}
+
+#[derive(Clone, Debug)]
+enum Hidden {
+    /// Waiting for a slot, or for a hidden parent to pass first.
+    Queued,
+    Running {
+        job: JobId,
+        deadline: ModelTime,
+    },
+    AwaitingChain,
+    Retry {
+        at: ModelTime,
+    },
+    /// Parents are missing.
+    Parked {
+        on: Vec<transaction::Hash>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct Pooled {
+    tx: ModelTx,
+    hidden: Option<Hidden>,
+    /// The wait before the next try after a local fault.
+    backoff: Duration,
+    /// The model's event count when it last became visible.
+    visible_at: u64,
+    /// The log position of its latest `Hidden` entry.
+    hidden_at: ChangeSeq,
+    /// When one of its inputs was first found missing since it was last
+    /// visible. Its wait for a parent runs from here.
+    missing_since: Option<ModelTime>,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum JobTarget {
+    Admission(UnminedTxId),
+    Revalidation(transaction::Hash),
+}
+
+#[derive(Clone, Debug)]
+struct JoinTicket {
+    /// The admission it joined. A later admission of the same id is another
+    /// one, and this ticket does not reach it.
+    admission: u64,
+    /// Whether the core asked this caller for the body.
+    brings: bool,
+}
+
+/// A slot kept for a fetch that is still out after its id was decided.
+#[derive(Clone, Debug)]
+struct Lease {
+    tx_id: UnminedTxId,
+    /// The verdict its admission got, which its caller gets too.
+    verdict: ModelVerdict,
+}
+
+/// One chain-scoped rejection list: when each entry was made, oldest first.
+#[derive(Debug, Default)]
+struct ChainList {
+    at: HashMap<transaction::Hash, ModelTime>,
+    order: VecDeque<transaction::Hash>,
+}
+
+/// The documented rules of the pool core.
+#[derive(Debug)]
+pub struct PoolModel {
+    active: bool,
+    now: ModelTime,
+    applied: Generation,
+    tip: Height,
+    next_id: u64,
+    /// Undecided transactions, oldest first.
+    admissions: BTreeMap<u64, Admission>,
+    admission_of: HashMap<UnminedTxId, u64>,
+    owners: HashMap<ReservationId, u64>,
+    /// Reservations whose id was decided through someone else's body while
+    /// their own fetch was still out. Each keeps its slot until its caller
+    /// submits or drops it, so a caller cannot have more fetches out than
+    /// slots.
+    leases: HashMap<ReservationId, Lease>,
+    tickets: BTreeMap<ReservationId, JoinTicket>,
+    /// Joined reservations whose admission ended before their caller came
+    /// back, with the verdict the admission got. The caller gets that
+    /// verdict when it comes back, as if it had arrived in time.
+    ///
+    /// Each keeps its id too, so a wrong body under it is still told apart,
+    /// as the handle would. An entry lasts as long as its caller holds the
+    /// reservation.
+    ended_joins: HashMap<ReservationId, (UnminedTxId, ModelVerdict)>,
+    /// The pool, oldest first.
+    pool: BTreeMap<u64, Pooled>,
+    pooled: HashMap<transaction::Hash, u64>,
+    /// Each job, with the event count when it started.
+    jobs: HashMap<JobId, (JobTarget, u64)>,
+    rejected_exact: HashSet<UnminedTxId>,
+    rejected_effects_tip: HashSet<transaction::Hash>,
+    /// One list for each reason, as today.
+    rejected_chain: HashMap<ChainReason, ChainList>,
+    rejection_memory: Duration,
+    max_pending: usize,
+    max_revalidating: usize,
+    /// Callers waiting for an output, by outpoint, in the order they came.
+    output_waiters: HashMap<OutPoint, Vec<WaiterId>>,
+    /// Changes returned in earlier steps. Each step is one batch of the log,
+    /// so this is the log position of the last one.
+    logged: u64,
+    step: Step,
+}
+
+impl PoolModel {
+    /// An active, empty pool at `tip` and `generation`.
+    pub fn new(tip: Height, generation: Generation) -> Self {
+        Self {
+            active: true,
+            now: Duration::ZERO,
+            applied: generation,
+            tip,
+            next_id: 0,
+            admissions: BTreeMap::new(),
+            admission_of: HashMap::new(),
+            owners: HashMap::new(),
+            leases: HashMap::new(),
+            tickets: BTreeMap::new(),
+            ended_joins: HashMap::new(),
+            pool: BTreeMap::new(),
+            pooled: HashMap::new(),
+            jobs: HashMap::new(),
+            rejected_exact: HashSet::new(),
+            rejected_effects_tip: HashSet::new(),
+            rejected_chain: HashMap::new(),
+            rejection_memory: REJECTION_MEMORY,
+            max_pending: MAX_PENDING,
+            max_revalidating: MAX_REVALIDATING,
+            output_waiters: HashMap::new(),
+            logged: 0,
+            step: Step::default(),
+        }
+    }
+
+    /// The same model with smaller limits, so a short random run reaches
+    /// every full state. The node's limit, and revalidation's share of it.
+    pub fn with_limits(mut self, pending: usize, revalidating: usize) -> Self {
+        self.max_pending = pending;
+        self.max_revalidating = revalidating;
+        self
+    }
+
+    /// The same model with the configured `eviction_memory_time`.
+    pub fn with_rejection_memory(mut self, memory: Duration) -> Self {
+        self.rejection_memory = memory;
+        self
+    }
+
+    // Inputs.
+
+    /// [`super::PoolHandle::reserve`].
+    ///
+    /// Like every input, this first applies the deadlines that are due, so
+    /// its answer does not depend on whether a tick came just before it.
+    /// Its own return value is the answer to the caller. What the deadlines
+    /// caused is in [`Self::effects`], which the caller takes right after.
+    /// The same holds for [`Self::await_output`], [`Self::rejected_ids`] and
+    /// [`Self::activate`].
+    pub fn reserve(
+        &mut self,
+        tx_id: UnminedTxId,
+        intent: Intent,
+        now: ModelTime,
+    ) -> Result<ModelReservation, ModelUnreserved> {
+        self.enter(now);
+        let now = self.now;
+        if !self.active {
+            return Err(ModelUnreserved::Inactive);
+        }
+        // A slot a deadline just freed goes to a revalidation that was
+        // already waiting for one, before this reservation counts slots.
+        self.start_revalidations();
+        if self.pooled.contains_key(&tx_id.mined_id()) {
+            return Err(ModelUnreserved::Pooled);
+        }
+        if let Some(scope) = self.cached_rejection(tx_id, now) {
+            return Err(ModelUnreserved::Rejected(scope));
+        }
+        if let Some(key) = self.admission_of.get(&tx_id).copied() {
+            return self.join(key, intent);
+        }
+        if self.slots_in_use() >= self.max_pending {
+            return Err(ModelUnreserved::NoRoom);
+        }
+        let owner = ReservationId(self.fresh());
+        let key = self.fresh();
+        self.admissions.insert(
+            key,
+            Admission {
+                tx_id,
+                owner,
+                owner_waiting: true,
+                body: None,
+                waiters: Vec::new(),
+                stage: Stage::Reserved,
+                missing_since: None,
+                last_check_used: false,
+                body_at: None,
+            },
+        );
+        self.admission_of.insert(tx_id, key);
+        self.owners.insert(owner, key);
+        Ok(ModelReservation {
+            id: owner,
+            joined: false,
+            wants_body: true,
+        })
+    }
+
+    /// A reservation dropped before the core accepted it.
+    pub fn release(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
+        self.enter(now);
+        self.drop_reservation(reservation);
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// [`super::PoolHandle::fetch_failed`]: the caller's fetch ended without
+    /// a body. Unlike a plain drop, this is logged, because today's change
+    /// stream reports a download that failed.
+    pub fn fetch_failed(&mut self, reservation: ReservationId, now: ModelTime) -> Step {
+        self.enter(now);
+        // An id that another caller's body already decided has its outcome
+        // in the log. A late failure of this fetch adds nothing to it. Only
+        // the reserving caller's failure ends the admission, so only it is
+        // logged: a joined caller that leaves while the admission goes on
+        // changes nothing a reader sees.
+        let owner = self.owners.contains_key(&reservation);
+        if let Some(tx_id) = self.undecided_for(reservation).filter(|_| owner) {
+            self.step.changes.push(Change::Refused(tx_id));
+        }
+        self.drop_reservation(reservation);
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// [`super::PoolHandle::submit`] with a body. Returns the waiter the
+    /// verdict will name, which can be in the returned step.
+    pub fn submit(
+        &mut self,
+        reservation: ReservationId,
+        tx: ModelTx,
+        now: ModelTime,
+    ) -> (WaiterId, Step) {
+        let tx_id = tx.id;
+        self.arrive(reservation, tx_id, Some(tx), now)
+    }
+
+    /// [`super::PoolHandle::submit`] under a joined reservation that does
+    /// not want the body: the caller waits for the verdict of the body the
+    /// core has or is being brought.
+    pub fn wait(
+        &mut self,
+        reservation: ReservationId,
+        tx_id: UnminedTxId,
+        now: ModelTime,
+    ) -> (WaiterId, Step) {
+        self.arrive(reservation, tx_id, None, now)
+    }
+
+    fn arrive(
+        &mut self,
+        reservation: ReservationId,
+        tx_id: UnminedTxId,
+        body: Option<ModelTx>,
+        now: ModelTime,
+    ) -> (WaiterId, Step) {
+        self.enter(now);
+        let waiter = WaiterId(self.fresh());
+        // The handle checks the body against the reservation before it
+        // sends anything. A wrong body drops the reservation.
+        if self
+            .reserved_for(reservation)
+            .is_some_and(|reserved| reserved != tx_id)
+        {
+            self.drop_reservation(reservation);
+            self.step.effects.push(Effect::Verdict {
+                waiter,
+                verdict: ModelVerdict::LocalFault(LocalFault::WrongTransaction),
+            });
+            self.start_revalidations();
+            return (waiter, self.take_step());
+        }
+        let (key, body) = match self.tickets.remove(&reservation) {
+            // A joined caller that was not asked for the body sends none, as
+            // the handle drops it.
+            Some(ticket) => (Some(ticket.admission), body.filter(|_| ticket.brings)),
+            None => (self.owners.remove(&reservation), body),
+        };
+        // The admission the reservation was granted for, if it is still
+        // undecided. A later admission of the same id has another key.
+        let key = key.filter(|key| {
+            self.admissions
+                .get(key)
+                .is_some_and(|admission| admission.tx_id == tx_id)
+        });
+        let Some(key) = key else {
+            // The admission this reservation was granted for ended before
+            // its caller came back. The caller gets that admission's verdict,
+            // as if it had come in time.
+            let ended = self
+                .leases
+                .remove(&reservation)
+                .map(|lease| lease.verdict)
+                .or_else(|| {
+                    self.ended_joins
+                        .remove(&reservation)
+                        .map(|(_, verdict)| verdict)
+                });
+            let verdict = ended.unwrap_or_else(|| self.stale_verdict(tx_id));
+            self.step.effects.push(Effect::Verdict { waiter, verdict });
+            self.start_revalidations();
+            return (waiter, self.take_step());
+        };
+        // The model's own clock, which never goes back, not the caller's.
+        let clock = self.now;
+        let start = {
+            let admission = self.admission_at(key);
+            if admission.owner == reservation {
+                admission.owner_waiting = false;
+            }
+            admission.waiters.push(Waiter { id: waiter });
+            match body {
+                Some(tx) if admission.body.is_none() => {
+                    admission.body = Some(tx);
+                    admission.body_at = Some(clock);
+                    true
+                }
+                // The core already holds these bytes, or the caller was not
+                // asked for them.
+                _ => false,
+            }
+        };
+        if start {
+            self.start_admission(key);
+        } else {
+            self.settle_bodyless(key);
+        }
+        self.start_revalidations();
+        (waiter, self.take_step())
+    }
+
+    /// The outcome of `job`, with the generation read before its first state
+    /// lookup and after its last.
+    pub fn outcome(
+        &mut self,
+        job: JobId,
+        outcome: Outcome,
+        before: GenerationRead,
+        after: GenerationRead,
+        now: ModelTime,
+    ) -> Step {
+        self.enter(now);
+        let Some((target, started_at)) = self.jobs.remove(&job) else {
+            // Cancelled, or timed out. A deadline applied on the way in may
+            // have freed a slot that a queued revalidation is waiting for.
+            self.start_revalidations();
+            return self.take_step();
+        };
+        let fresh = before.brackets(after, self.applied);
+        // A stale outcome waits for the chain event only when that event is
+        // certainly still to come: a reading is past what the core has
+        // applied, or a change was in flight on top of exactly what it has
+        // applied. In every other case the job runs again at once, so no
+        // work waits for an event that has already been applied.
+        //
+        // A worker waits for a stable reading before its first lookup, so a
+        // "changing" first reading does not happen in practice. It is
+        // handled as unknown.
+        use GenerationRead::{Changing, Stable};
+        let chain_is_ahead = match (before, after) {
+            (Stable(read), _) if read > self.applied => true,
+            (_, Stable(read)) if read > self.applied => true,
+            (Stable(read), Changing) => read == self.applied,
+            _ => false,
+        };
+        match target {
+            JobTarget::Admission(tx_id) => {
+                let key = self.admission_of[&tx_id];
+                if !fresh {
+                    if chain_is_ahead {
+                        self.admission_at(key).stage = Stage::AwaitingChain;
+                    } else {
+                        self.start_admission(key);
+                    }
+                } else {
+                    self.admission_outcome(key, outcome, started_at);
+                }
+            }
+            JobTarget::Revalidation(hash) => {
+                let key = self.pooled[&hash];
+                if !fresh {
+                    if chain_is_ahead {
+                        self.pooled_at(key).hidden = Some(Hidden::AwaitingChain);
+                    } else {
+                        self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    }
+                } else {
+                    self.revalidation_outcome(key, hash, outcome, started_at);
+                }
+            }
+        }
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// The next chain transition.
+    pub fn transition(&mut self, transition: ModelTransition, now: ModelTime) -> Step {
+        self.enter(now);
+        if !self.active {
+            return self.take_step();
+        }
+        self.applied = transition.generation;
+        self.tip = transition.tip;
+        // After a reorg or an activation the pool is verified again, and a
+        // rejection made on the old chain or under the old rules says
+        // nothing. Today's reset drops every list too.
+        let verify_again = transition.disconnected > 0 || transition.rules_change;
+        if verify_again {
+            self.clear_all_rejections();
+        } else {
+            self.clear_tip_rejections();
+        }
+        // What the whole batch mined, and what in the pool it conflicts
+        // with, are worked out before anything is removed. A pooled
+        // transaction that conflicts with a later block transaction is then
+        // found even if an earlier one already took its parent away.
+        let block_txs: Vec<&ModelTx> = transition
+            .connected
+            .iter()
+            .flat_map(|block| &block.transactions)
+            .collect();
+        let mined: Vec<transaction::Hash> = block_txs.iter().map(|tx| tx.id.mined_id()).collect();
+        let conflicting: Vec<UnminedTxId> = self
+            .pool
+            .values()
+            .filter(|pooled| !mined.contains(&pooled.tx.id.mined_id()))
+            .filter(|pooled| block_txs.iter().any(|tx| pooled.tx.conflicts_with(tx)))
+            .map(|pooled| pooled.tx.id)
+            .collect();
+        for block_tx in &block_txs {
+            if let Some(key) = self.pooled.get(&block_tx.id.mined_id()).copied() {
+                // Its dependents stay. Their parent is on the chain now.
+                self.remove_one(key, RemovalReason::Mined);
+            }
+            self.cache(
+                block_tx.id,
+                RejectionScope::EffectsChain(ChainReason::Mined),
+            );
+        }
+        // Today's pool cancels the download and verification of anything a
+        // block mined. The undecided ones end here, and a fetch still out is
+        // told to stop, so its slot is freed once its caller drops it.
+        let ended: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| mined.contains(&admission.tx_id.mined_id()))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in ended {
+            let admission = self.admission_at(key);
+            if admission.owner_waiting {
+                let owner = admission.owner;
+                self.step.effects.push(Effect::CancelFetch(owner));
+            }
+            self.cancel_admission_job(key);
+            self.reject(
+                key,
+                RejectionScope::EffectsChain(ChainReason::Mined),
+                Charge::None,
+            );
+        }
+        for conflict in conflicting {
+            self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
+            self.cache(
+                conflict,
+                RejectionScope::EffectsChain(ChainReason::DuplicateSpend),
+            );
+        }
+        // Every block of this transition was seen, and what they mined is
+        // gone already. So an expired transaction here was not mined, and
+        // what depends on it goes with it.
+        self.remove_expired(true);
+        if verify_again {
+            self.hide_all();
+            // A block that left the chain may have spent an output a parked
+            // transaction is waiting for. Nothing names which, so each one
+            // looks again.
+            self.rerun_parked();
+        }
+        for hash in mined {
+            self.wake(hash);
+        }
+        self.chain_applied();
+        self.take_step()
+    }
+
+    /// The transition queue overflowed. The core no longer knows which
+    /// blocks changed, so every pooled and parked transaction is checked
+    /// again at this tip.
+    pub fn resync(&mut self, tip: Height, generation: Generation, now: ModelTime) -> Step {
+        self.enter(now);
+        if !self.active {
+            return self.take_step();
+        }
+        self.applied = generation;
+        self.tip = tip;
+        self.clear_all_rejections();
+        // Expiry needs no verifier, only the new tip. Only the expired
+        // transaction goes. A block the core missed may have mined it
+        // first, and then what spends its outputs is still valid, so its
+        // dependents are checked again like everything else.
+        self.remove_expired(false);
+        self.hide_all();
+        self.rerun_parked();
+        self.chain_applied();
+        self.take_step()
+    }
+
+    /// Time passed. Applies every deadline at or before `now`.
+    pub fn tick(&mut self, now: ModelTime) -> Step {
+        self.enter(now);
+        self.start_revalidations();
+        self.take_step()
+    }
+
+    /// Moves time to `now` and applies every deadline that is due, before
+    /// the input that brought the time is handled. A deadline that has
+    /// passed is decided whichever of the timer and another input the core
+    /// happens to handle first.
+    fn enter(&mut self, now: ModelTime) {
+        // An input's effects belong to that input. If the caller has not
+        // taken the last one's, they would be handed over as part of this
+        // one, and nothing could tell that they came late.
+        assert!(
+            self.step.is_empty(),
+            "the previous input's effects were not collected before the next input: {:?}",
+            self.step
+        );
+        self.advance(now);
+        // The model's own clock from here on. It never goes back, so a
+        // caller that passes an older time cannot make a deadline that has
+        // passed look as if it had not.
+        let now = self.now;
+        // Each admission can have a deadline for its stage and one for its
+        // slot. Whichever was due first decides it, however late the core
+        // gets to them. When both were due at the same moment, the stage's
+        // own deadline decides, because it says more about the transaction.
+        let mut timed_out = Vec::new();
+        let mut unparked = Vec::new();
+        for (key, admission) in &self.admissions {
+            let slot_due = admission.body_at.map(|at| at.saturating_add(MAX_UNDECIDED));
+            let (stage_due, parked) = match &admission.stage {
+                Stage::Verifying { deadline, .. } => (Some(*deadline), false),
+                Stage::Parked { .. } => (
+                    admission
+                        .missing_since
+                        .map(|since| since.saturating_add(T_PARK)),
+                    true,
+                ),
+                _ => (None, false),
+            };
+            let stage_is_due = stage_due.is_some_and(|due| due <= now);
+            let slot_is_due = slot_due.is_some_and(|due| due <= now);
+            let stage_first = match (stage_due, slot_due) {
+                (Some(stage), Some(slot)) => stage <= slot,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if stage_is_due && (stage_first || !slot_is_due) {
+                if parked {
+                    unparked.push(*key);
+                } else {
+                    timed_out.push(*key);
+                }
+            } else if slot_is_due {
+                timed_out.push(*key);
+            }
+        }
+        for key in timed_out {
+            self.cancel_admission_job(key);
+            self.fail_locally(key, LocalFault::VerifyTimeout);
+        }
+        for key in unparked {
+            // Today a parent that never arrived is a missing-input failure,
+            // remembered for these exact bytes until the tip changes.
+            self.reject(key, RejectionScope::ExactTip, Charge::None);
+        }
+        let keys: Vec<u64> = self.pool.keys().copied().collect();
+        for key in keys {
+            // An earlier removal in this loop can have taken this one with
+            // it, as a dependent.
+            let Some((hidden, parked_out)) = self.pool.get(&key).map(|pooled| {
+                (
+                    pooled.hidden.clone(),
+                    pooled
+                        .missing_since
+                        .is_some_and(|since| since.saturating_add(T_PARK) <= now),
+                )
+            }) else {
+                continue;
+            };
+            match hidden {
+                Some(Hidden::Running { job, deadline }) if deadline <= now => {
+                    self.jobs.remove(&job);
+                    self.step.effects.push(Effect::Cancel(job));
+                    self.retry_later(key);
+                }
+                Some(Hidden::Retry { at }) if at <= now => {
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                }
+                // Its parent never came back.
+                Some(Hidden::Parked { .. }) if parked_out => {
+                    let tx_id = self.pooled_at(key).tx.id;
+                    self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Invalidated);
+                    // Remembered like a new transaction's missing parent.
+                    self.cache(tx_id, RejectionScope::ExactTip);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// [`super::PoolHandle::await_output`]. The lookup and the registration
+    /// are one input, so no admission can fall between them.
+    pub fn await_output(&mut self, outpoint: OutPoint, now: ModelTime) -> OutputAnswer {
+        self.enter(now);
+        // A retry or a slot that the time brought due is used at once.
+        self.start_revalidations();
+        if !self.active {
+            return OutputAnswer::Inactive;
+        }
+        if self.offers(&outpoint) {
+            return OutputAnswer::Ready;
+        }
+        // Today's limit is on distinct outpoints. Another caller for one
+        // already waited on is not refused.
+        if !self.output_waiters.contains_key(&outpoint)
+            && self.output_waiters.len() >= MAX_OUTPUT_WAITS
+        {
+            return OutputAnswer::TooManyWaiters;
+        }
+        let waiter = WaiterId(self.fresh());
+        self.output_waiters
+            .entry(outpoint)
+            .or_default()
+            .push(waiter);
+        OutputAnswer::Waiting(waiter)
+    }
+
+    /// A caller stopped waiting for an output. Its place no longer counts
+    /// toward the limit.
+    pub fn cancel_output_wait(&mut self, waiter: WaiterId) {
+        self.output_waiters.retain(|_, waiters| {
+            waiters.retain(|waiting| *waiting != waiter);
+            !waiters.is_empty()
+        });
+    }
+
+    /// Distinct outpoints callers are waiting for.
+    pub fn output_waits(&self) -> usize {
+        self.output_waiters.len()
+    }
+
+    /// Callers waiting for an output, over every outpoint. A caller that
+    /// stopped waiting is not one of them: nothing is kept for it.
+    pub fn output_waiters(&self) -> usize {
+        self.output_waiters.values().map(Vec::len).sum()
+    }
+
+    /// The node fell far behind the tip. Every undecided submission gets a
+    /// verdict, and the pool empties.
+    pub fn deactivate(&mut self, now: ModelTime) -> Step {
+        self.enter(now);
+        let keys: Vec<u64> = self.admissions.keys().copied().collect();
+        for key in keys {
+            self.cancel_admission_job(key);
+            self.decide(key, ModelVerdict::LocalFault(LocalFault::Deactivated));
+        }
+        // Today's pool drops its downloads when it turns off. Every fetch
+        // still out is told to stop, and its lease stays counted until its
+        // caller drops the reservation.
+        let mut fetching: Vec<ReservationId> = self.leases.keys().copied().collect();
+        fetching.sort();
+        self.step
+            .effects
+            .extend(fetching.into_iter().map(Effect::CancelFetch));
+        self.tickets.clear();
+        self.owners.clear();
+        let keys: Vec<u64> = self.pool.keys().copied().collect();
+        for key in keys {
+            self.remove_one(key, RemovalReason::Deactivated);
+        }
+        self.clear_all_rejections();
+        // Nobody is left waiting on a pool that is off.
+        let mut waiting: Vec<WaiterId> = self
+            .output_waiters
+            .drain()
+            .flat_map(|(_, waiters)| waiters)
+            .collect();
+        waiting.sort();
+        self.step
+            .effects
+            .extend(waiting.into_iter().map(Effect::OutputWaitEnded));
+        self.active = false;
+        self.take_step()
+    }
+
+    /// The node is near the tip again. The pool starts empty.
+    pub fn activate(&mut self, tip: Height, generation: Generation, now: ModelTime) {
+        self.enter(now);
+        self.active = true;
+        self.tip = tip;
+        self.applied = generation;
+        self.start_revalidations();
+    }
+
+    /// What the last call to [`Self::reserve`], [`Self::await_output`],
+    /// [`Self::rejected_ids`] or [`Self::activate`] caused beside its
+    /// answer: the verdicts of deadlines it found due, and the jobs it
+    /// started.
+    ///
+    /// Every input has effects, and these four have an answer of their own
+    /// as well. The caller takes this straight after each of them, so no
+    /// verdict or job start waits for some later input. The next input
+    /// panics if it was not taken, and so does
+    /// [`Self::assert_invariants`].
+    pub fn effects(&mut self) -> Step {
+        self.take_step()
+    }
+
+    // Observations.
+
+    /// Undecided transactions, plus running revalidations.
+    pub fn slots_in_use(&self) -> usize {
+        self.admissions
+            .len()
+            .saturating_add(self.leases.len())
+            .saturating_add(self.revalidating())
+    }
+
+    /// Reservations callers still hold, of every kind. Zero once every
+    /// caller has submitted or dropped what it was granted.
+    pub fn caller_held(&self) -> usize {
+        self.owners
+            .len()
+            .saturating_add(self.tickets.len())
+            .saturating_add(self.leases.len())
+            .saturating_add(self.ended_joins.len())
+    }
+
+    /// Undecided transactions that hold a body.
+    pub fn bodies_held(&self) -> usize {
+        self.admissions
+            .values()
+            .filter(|admission| admission.body.is_some())
+            .count()
+    }
+
+    /// The visible pool, oldest first.
+    pub fn visible(&self) -> Vec<UnminedTxId> {
+        self.pool
+            .values()
+            .filter(|pooled| pooled.hidden.is_none())
+            .map(|pooled| pooled.tx.id)
+            .collect()
+    }
+
+    /// The pooled transactions hidden while they are verified again.
+    pub fn hidden(&self) -> Vec<UnminedTxId> {
+        self.pool
+            .values()
+            .filter(|pooled| pooled.hidden.is_some())
+            .map(|pooled| pooled.tx.id)
+            .collect()
+    }
+
+    /// Whether `tx_id` is parked on a missing parent.
+    pub fn is_parked(&self, tx_id: UnminedTxId) -> bool {
+        self.admission_of
+            .get(&tx_id)
+            .and_then(|key| self.admissions.get(key))
+            .is_some_and(|admission| matches!(admission.stage, Stage::Parked { .. }))
+    }
+
+    /// [`super::PoolHandle::rejected_ids`]: the members of `ids` a cached
+    /// rejection covers at `now`. Takes no slot.
+    ///
+    /// This is a command to the core like the others, so it goes through
+    /// the same boundary: the deadlines that are due are applied first, and
+    /// what they caused is in [`Self::effects`]. A transaction whose wait
+    /// for a parent has just ended is in the answer whether or not a tick
+    /// came before the query.
+    pub fn rejected_ids(
+        &mut self,
+        ids: &HashSet<UnminedTxId>,
+        now: ModelTime,
+    ) -> HashSet<UnminedTxId> {
+        self.enter(now);
+        self.start_revalidations();
+        let now = self.now;
+        ids.iter()
+            .copied()
+            .filter(|id| self.cached_rejection(*id, now).is_some())
+            .collect()
+    }
+
+    /// Checks the invariants every reachable state keeps.
+    ///
+    /// # Panics
+    ///
+    /// If one is broken.
+    pub fn assert_invariants(&self) {
+        assert!(
+            self.slots_in_use() <= self.max_pending,
+            "pool/admissions-within-limits: the node's limit"
+        );
+        for admission in self.admissions.values() {
+            assert!(
+                admission.waiters.len() <= MAX_WAITERS,
+                "the waiter limit of one admission"
+            );
+            assert_eq!(
+                admission.body.is_none(),
+                matches!(admission.stage, Stage::Reserved),
+                "an admission has a body exactly when it has left the reserved stage"
+            );
+        }
+        assert!(
+            self.revalidating() <= self.max_revalidating,
+            "the revalidation share"
+        );
+        assert!(
+            self.rejected_exact.len() <= MAX_REJECTIONS
+                && self.rejected_effects_tip.len() <= MAX_REJECTIONS
+                && self
+                    .rejected_chain
+                    .values()
+                    .all(|list| list.at.len() <= MAX_REJECTIONS),
+            "the rejection lists' limits"
+        );
+        assert!(
+            self.step.is_empty(),
+            "an input's effects were left uncollected: {:?}",
+            self.step
+        );
+        // Nothing that can start is left waiting. A queued revalidation
+        // with room and no hidden parent would have been started by the
+        // input that made it startable, and a retry or deadline that is due
+        // would have been applied by the first input to see the time.
+        if self.active {
+            let room = self.revalidating() < self.max_revalidating
+                && self.slots_in_use() < self.max_pending;
+            for pooled in self.pool.values() {
+                let parent_hidden = pooled.tx.parents().any(|parent| {
+                    self.pooled
+                        .get(&parent)
+                        .is_some_and(|parent| self.pool[parent].hidden.is_some())
+                });
+                match &pooled.hidden {
+                    Some(Hidden::Queued) => assert!(
+                        !room || parent_hidden,
+                        "a revalidation that could start was left queued"
+                    ),
+                    Some(Hidden::Retry { at }) => {
+                        assert!(*at > self.now, "a retry that is due was left waiting")
+                    }
+                    Some(Hidden::Running { deadline, .. }) => assert!(
+                        *deadline > self.now,
+                        "a revalidation past its deadline was left running"
+                    ),
+                    Some(Hidden::Parked { .. }) => assert!(
+                        pooled
+                            .missing_since
+                            .is_some_and(|since| since.saturating_add(T_PARK) > self.now),
+                        "a hidden transaction was left parked past its wait for a parent"
+                    ),
+                    _ => {}
+                }
+            }
+            for admission in self.admissions.values() {
+                if let Stage::Verifying { deadline, .. } = admission.stage {
+                    assert!(
+                        deadline > self.now,
+                        "a verification past its deadline was left running"
+                    );
+                }
+                if matches!(admission.stage, Stage::Parked { .. }) {
+                    assert!(
+                        admission
+                            .missing_since
+                            .is_some_and(|since| since.saturating_add(T_PARK) > self.now),
+                        "a transaction was left parked past its wait for a parent"
+                    );
+                }
+                assert!(
+                    admission
+                        .body_at
+                        .is_none_or(|at| at.saturating_add(MAX_UNDECIDED) > self.now),
+                    "an admission was left holding its slot past the limit"
+                );
+            }
+        }
+        for pooled in self.pool.values().filter(|pooled| pooled.hidden.is_none()) {
+            let seed: HashSet<transaction::Hash> = [pooled.tx.id.mined_id()].into();
+            assert!(
+                self.dependency_group(&seed).len() <= MAX_PACKAGE,
+                "pool/consistent: no visible dependency group past its limit"
+            );
+        }
+        for ticket in self.tickets.values() {
+            assert!(
+                self.admissions.contains_key(&ticket.admission),
+                "a joined reservation names a live admission"
+            );
+        }
+        let entries: Vec<&Pooled> = self.pool.values().collect();
+        for (index, pooled) in entries.iter().enumerate() {
+            assert!(
+                pooled.tx.expiry.is_none_or(|expiry| self.tip < expiry),
+                "pool/consistent: no expired transaction"
+            );
+            for other in &entries[index.saturating_add(1)..] {
+                assert!(
+                    !pooled.tx.conflicts_with(&other.tx),
+                    "pool/consistent: no two pooled transactions conflict"
+                );
+            }
+        }
+    }
+
+    // Rules.
+
+    /// The id a reservation was granted for, while its admission is
+    /// undecided.
+    fn undecided_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
+        let key = self
+            .tickets
+            .get(&reservation)
+            .map(|ticket| ticket.admission)
+            .or_else(|| self.owners.get(&reservation).copied())?;
+        self.admissions.get(&key).map(|admission| admission.tx_id)
+    }
+
+    /// The id a reservation was granted for, for as long as the model knows
+    /// the reservation: while its admission is undecided, and while it
+    /// holds a lease after that.
+    fn reserved_for(&self, reservation: ReservationId) -> Option<UnminedTxId> {
+        self.undecided_for(reservation)
+            .or_else(|| self.leases.get(&reservation).map(|lease| lease.tx_id))
+            .or_else(|| self.ended_joins.get(&reservation).map(|(id, _)| *id))
+    }
+
+    /// Ends a reservation that brought no body: frees its lease, or its
+    /// place in an admission, and ends that admission if nobody can still
+    /// bring its body.
+    fn drop_reservation(&mut self, reservation: ReservationId) {
+        let key = match self.tickets.remove(&reservation) {
+            Some(ticket) => Some(ticket.admission),
+            None => self.owners.remove(&reservation).inspect(|key| {
+                if let Some(admission) = self.admissions.get_mut(key) {
+                    admission.owner_waiting = false;
+                }
+            }),
+        };
+        if let Some(key) = key {
+            self.settle_bodyless(key);
+        }
+        self.leases.remove(&reservation);
+        self.ended_joins.remove(&reservation);
+    }
+
+    /// Joins an id that is already undecided, if there is a place among its
+    /// waiters. Whether one peer may wait on an id twice is its caller's
+    /// rule.
+    fn join(&mut self, key: u64, intent: Intent) -> Result<ModelReservation, ModelUnreserved> {
+        if intent == Intent::Fetch {
+            return Err(ModelUnreserved::Pending);
+        }
+        let tickets: Vec<&JoinTicket> = self
+            .tickets
+            .values()
+            .filter(|ticket| ticket.admission == key)
+            .collect();
+        let admission = &self.admissions[&key];
+        let waiting = admission
+            .waiters
+            .len()
+            .saturating_add(tickets.len())
+            .saturating_add(usize::from(admission.owner_waiting));
+        if waiting >= MAX_WAITERS {
+            return Err(ModelUnreserved::Pending);
+        }
+        // A joined caller is asked for the body only when nobody else can
+        // bring it: the core has none, the reserving caller is not still
+        // fetching or delivering it, and no other joined caller was asked.
+        // Otherwise a second decoded body would wait under the same slot.
+        // So a delivery
+        // that joins while the fetch is out waits for the fetch's verdict,
+        // and its own copy is dropped, as today drops it.
+        let brings = admission.body.is_none()
+            && !admission.owner_waiting
+            && !tickets.iter().any(|ticket| ticket.brings);
+        let id = ReservationId(self.fresh());
+        self.tickets.insert(
+            id,
+            JoinTicket {
+                admission: key,
+                brings,
+            },
+        );
+        Ok(ModelReservation {
+            id,
+            joined: true,
+            wants_body: brings,
+        })
+    }
+
+    fn admission_outcome(&mut self, key: u64, outcome: Outcome, started_at: u64) {
+        let admission = self.admission_at(key).clone();
+        let tx = admission.body.expect("a verified admission holds its body");
+        let hash = tx.id.mined_id();
+        match outcome {
+            Outcome::Pass | Outcome::PassUsing(_) => {
+                let pool_inputs = match outcome {
+                    Outcome::PassUsing(inputs) => inputs,
+                    _ => Vec::new(),
+                };
+                // Today's insertion checks the rejection lists first. A
+                // rejection made while this one was verified, such as a block
+                // that mined it, still holds. It is not cached again.
+                if let Some(scope) = self.cached_rejection(tx.id, self.now) {
+                    self.step.changes.push(Change::Refused(tx.id));
+                    self.decide(
+                        key,
+                        ModelVerdict::Rejected {
+                            scope,
+                            charge: Charge::None,
+                            tip: self.tip,
+                        },
+                    );
+                    return;
+                }
+                // The tip has reached its expiry height. The verifier should
+                // have said so. The pool does not rely on that: nothing
+                // expired gets in.
+                if tx.expiry.is_some_and(|expiry| self.tip >= expiry) {
+                    self.reject(
+                        key,
+                        RejectionScope::EffectsChain(ChainReason::Expired),
+                        Charge::None,
+                    );
+                    return;
+                }
+                // Today's insertion checks, in today's order. First, another
+                // set of authorizing data for the same effects got in while
+                // this one was verified. That is a duplicate, not a
+                // conflict, and nothing is cached against the transaction
+                // the pool holds.
+                if self.pooled.contains_key(&hash) {
+                    // Today's change stream reports an insertion the pool
+                    // refused, this one included.
+                    self.step.changes.push(Change::Refused(tx.id));
+                    self.decide(
+                        key,
+                        ModelVerdict::Rejected {
+                            scope: RejectionScope::Uncached,
+                            charge: Charge::None,
+                            tip: self.tip,
+                        },
+                    );
+                    return;
+                }
+                let conflicts = |hidden: bool| {
+                    self.pool
+                        .values()
+                        .filter(|pooled| pooled.hidden.is_some() == hidden)
+                        .any(|pooled| pooled.tx.conflicts_with(&tx))
+                };
+                let (with_visible, with_hidden) = (conflicts(false), conflicts(true));
+                if with_visible {
+                    // The pool took a conflicting transaction while this one
+                    // was verified.
+                    self.reject(key, RejectionScope::EffectsTip, Charge::None);
+                    return;
+                }
+                if with_hidden {
+                    // It conflicts with a transaction that is hidden because
+                    // nobody knows yet whether it is still valid. If that
+                    // one fails, this one was fine. So this is not a
+                    // rejection and nothing is remembered against it.
+                    self.fail_locally(key, LocalFault::PoolUnsettled);
+                    return;
+                }
+                // The verifier used a pool output that the pool no longer
+                // offers. The generation readings cannot show this: the
+                // state was stable, and the pool the verifier read was older
+                // than the core's. Today this is a rejection. Here the job
+                // runs again, because the parent may have been mined, and
+                // the child is then valid against the chain.
+                if !pool_inputs.iter().all(|input| self.offers(input)) {
+                    self.start_admission(key);
+                    return;
+                }
+                let parents: HashSet<transaction::Hash> =
+                    pool_inputs.iter().map(|input| input.hash).collect();
+                let ancestors = self.ancestors(parents);
+                if ancestors.len() > MAX_ANCESTORS
+                    || self.dependency_group(&ancestors).len() >= MAX_PACKAGE
+                {
+                    self.reject(key, RejectionScope::EffectsTip, Charge::None);
+                    return;
+                }
+                let pool_key = self.fresh();
+                self.step.changes.push(Change::Added(tx.id));
+                self.offer_outputs(hash, tx.outputs);
+                self.pool.insert(
+                    pool_key,
+                    Pooled {
+                        tx,
+                        hidden: None,
+                        backoff: REVALIDATE_RETRY,
+                        visible_at: pool_key,
+                        hidden_at: ChangeSeq(0),
+                        missing_since: None,
+                    },
+                );
+                self.pooled.insert(hash, pool_key);
+                self.decide(key, ModelVerdict::Admitted);
+                self.wake(hash);
+            }
+            // Found in the best chain by this job's own lookup. Today that
+            // leaves the rejection lists alone, so a second submission gets
+            // the same answer at the same stage. Only a block the core sees
+            // connect fills the mined list.
+            Outcome::AlreadyMined => self.reject(key, RejectionScope::Uncached, Charge::None),
+            Outcome::Fail { scope, charge } => self.reject(key, scope, charge),
+            Outcome::MissingInputs(missing) => {
+                // One of the missing outputs became available after this job
+                // started looking: its transaction is visible now, creates
+                // that output, and became visible after the job began. Its
+                // admission has already been announced, so nothing would
+                // wake this transaction. It runs again at once.
+                //
+                // A parent that was visible all along, or that has no such
+                // output, is not a reason to run again: the answer would be
+                // the same.
+                let arrived = missing
+                    .iter()
+                    .any(|outpoint| self.arrived_since(outpoint, started_at));
+                // Its wait runs from the first time an input was missing,
+                // and is never restarted.
+                let now = self.now;
+                let admission = self.admission_at(key);
+                let since = *admission.missing_since.get_or_insert(now);
+                let wait_over = since.saturating_add(T_PARK) <= now;
+                // After the wait, an input that arrived during this check
+                // earns one more check and no more. Otherwise inputs that
+                // keep arriving one at a time could hold the slot for as
+                // long as they kept coming.
+                let last_check = wait_over && arrived && !admission.last_check_used;
+                if last_check {
+                    admission.last_check_used = true;
+                }
+                if (arrived && !wait_over) || last_check {
+                    self.start_admission(key);
+                    return;
+                }
+                if wait_over && arrived {
+                    // An input arrived during this check too, so its answer
+                    // is already out of date, and there is no check left to
+                    // give. The core has no answer it can trust.
+                    self.fail_locally(key, LocalFault::VerifyTimeout);
+                    return;
+                }
+                if wait_over {
+                    // Today a parent that never arrived is a missing-input
+                    // failure, remembered for these exact bytes until the
+                    // tip changes.
+                    self.reject(key, RejectionScope::ExactTip, Charge::None);
+                    return;
+                }
+                let mut on: Vec<transaction::Hash> = Vec::new();
+                for outpoint in missing {
+                    if !on.contains(&outpoint.hash) {
+                        on.push(outpoint.hash);
+                    }
+                }
+                self.admission_at(key).stage = Stage::Parked { on };
+            }
+            Outcome::LocalFault(fault) => self.fail_locally(key, fault),
+        }
+    }
+
+    fn revalidation_outcome(
+        &mut self,
+        key: u64,
+        hash: transaction::Hash,
+        outcome: Outcome,
+        started_at: u64,
+    ) {
+        match outcome {
+            Outcome::Pass | Outcome::PassUsing(_) => {
+                let pool_inputs = match outcome {
+                    Outcome::PassUsing(inputs) => inputs,
+                    _ => Vec::new(),
+                };
+                if !pool_inputs.iter().all(|input| self.offers(input)) {
+                    // As for a new transaction: verified against a pool that
+                    // has since lost that output. It runs again.
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    return;
+                }
+                // Nothing expired becomes visible either.
+                let expired = self.pool[&key]
+                    .tx
+                    .expiry
+                    .is_some_and(|expiry| self.tip >= expiry);
+                if expired {
+                    let tx_id = self.pool[&key].tx.id;
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Expired);
+                    self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
+                    return;
+                }
+                // Today's insertion limits, as for a new transaction. A
+                // parent that was mined, then put back by a reorg, can have
+                // gained more pooled children than one group holds.
+                let parents: HashSet<transaction::Hash> =
+                    pool_inputs.iter().map(|input| input.hash).collect();
+                let ancestors = self.ancestors(parents);
+                if ancestors.len() > MAX_ANCESTORS
+                    || self.dependency_group(&ancestors).len() >= MAX_PACKAGE
+                {
+                    let tx_id = self.pool[&key].tx.id;
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    // Remembered until the tip changes, as an insertion the
+                    // pool refuses for this reason is today.
+                    self.cache(tx_id, RejectionScope::EffectsTip);
+                    return;
+                }
+                let visible_at = self.fresh();
+                let pooled = self.pooled_at(key);
+                pooled.hidden = None;
+                pooled.backoff = REVALIDATE_RETRY;
+                pooled.visible_at = visible_at;
+                pooled.missing_since = None;
+                let (id, hidden_at, count) = (pooled.tx.id, pooled.hidden_at, pooled.tx.outputs);
+                self.step.changes.push(Change::Revealed { id, hidden_at });
+                // Its outputs are available again, to waiters as well.
+                self.offer_outputs(hash, count);
+                self.wake(hash);
+            }
+            // A block the core never saw mined it. Its dependents stay and
+            // are checked against the chain when their turn comes.
+            Outcome::AlreadyMined => {
+                // Its job has reported, so there is nothing to cancel.
+                self.pooled_at(key).hidden = Some(Hidden::Queued);
+                self.remove_one(key, RemovalReason::Mined);
+                // Found by a lookup, not in a block the core saw connect, so
+                // it is not cached. A later submission is looked up again.
+                self.wake(hash);
+            }
+            // Its parent is in neither the chain nor the visible pool. After
+            // a reorg that can be a mined parent that is on its way back, so
+            // it waits as a new transaction would, still hidden, and by the
+            // same rules.
+            Outcome::MissingInputs(missing) => {
+                let arrived = missing
+                    .iter()
+                    .any(|outpoint| self.arrived_since(outpoint, started_at));
+                let now = self.now;
+                let since = *self.pooled_at(key).missing_since.get_or_insert(now);
+                let wait_over = since.saturating_add(T_PARK) <= now;
+                // An input arrived during this check, so its answer is out
+                // of date. A hidden transaction holds no slot, so it is
+                // simply checked again, however late.
+                if arrived {
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    return;
+                }
+                if wait_over {
+                    let tx_id = self.pooled_at(key).tx.id;
+                    // Its job has reported, so there is nothing to cancel.
+                    self.pooled_at(key).hidden = Some(Hidden::Queued);
+                    self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                    self.cache(tx_id, RejectionScope::ExactTip);
+                    return;
+                }
+                let mut on: Vec<transaction::Hash> = Vec::new();
+                for outpoint in missing {
+                    if !on.contains(&outpoint.hash) {
+                        on.push(outpoint.hash);
+                    }
+                }
+                self.pooled_at(key).hidden = Some(Hidden::Parked { on });
+            }
+            Outcome::Fail { scope, .. } => {
+                let tx_id = self.pooled_at(key).tx.id;
+                // Its job has reported, so there is nothing to cancel.
+                self.pooled_at(key).hidden = Some(Hidden::Queued);
+                self.remove_with_dependents(hash, RemovalReason::Invalidated);
+                // Nobody is charged for a transaction that passed once. The
+                // rejection is still remembered, as today's retry after a
+                // reset remembers it, so it is not fetched again at once.
+                self.cache(tx_id, scope);
+            }
+            Outcome::LocalFault(_) => self.retry_later(key),
+        }
+    }
+
+    /// Rejects an admission: caches the rejection, logs it, and answers
+    /// every waiter.
+    fn reject(&mut self, key: u64, scope: RejectionScope, charge: Charge) {
+        let tx_id = self.admission_at(key).tx_id;
+        self.cache(tx_id, scope);
+        self.step.changes.push(Change::Refused(tx_id));
+        self.decide(
+            key,
+            ModelVerdict::Rejected {
+                scope,
+                charge,
+                tip: self.tip,
+            },
+        );
+    }
+
+    /// Ends an admission: every waiter gets the verdict, and the slot is
+    /// free.
+    fn decide(&mut self, key: u64, verdict: ModelVerdict) {
+        let admission = self
+            .admissions
+            .remove(&key)
+            .expect("the caller names a live admission");
+        self.admission_of.remove(&admission.tx_id);
+        self.owners.remove(&admission.owner);
+        if admission.owner_waiting {
+            // The reserving caller's fetch is still out. Its body will
+            // arrive decoded, so its slot is not free yet.
+            self.leases.insert(
+                admission.owner,
+                Lease {
+                    tx_id: admission.tx_id,
+                    verdict,
+                },
+            );
+        }
+        // A reservation that joined this admission dies with it. Its caller
+        // may still come back with a body.
+        let tx_id = admission.tx_id;
+        let ended: Vec<ReservationId> = self
+            .tickets
+            .iter()
+            .filter(|(_, ticket)| ticket.admission == key)
+            .map(|(reservation, _)| *reservation)
+            .collect();
+        for reservation in ended {
+            self.tickets.remove(&reservation);
+            self.ended_joins.insert(reservation, (tx_id, verdict));
+        }
+        for waiter in admission.waiters {
+            self.step.effects.push(Effect::Verdict {
+                waiter: waiter.id,
+                verdict,
+            });
+        }
+    }
+
+    /// The answer to a body whose reservation no longer names an admission.
+    fn stale_verdict(&self, tx_id: UnminedTxId) -> ModelVerdict {
+        if self.pooled.contains_key(&tx_id.mined_id()) {
+            return ModelVerdict::Rejected {
+                scope: RejectionScope::Uncached,
+                charge: Charge::None,
+                tip: self.tip,
+            };
+        }
+        if let Some(scope) = self.cached_rejection(tx_id, self.now) {
+            return ModelVerdict::Rejected {
+                scope,
+                charge: Charge::None,
+                tip: self.tip,
+            };
+        }
+        ModelVerdict::LocalFault(LocalFault::StaleReservation)
+    }
+
+    fn start_admission(&mut self, key: u64) {
+        // No new check starts once the slot's time is up.
+        if self.undecided_too_long(key) {
+            self.fail_locally(key, LocalFault::VerifyTimeout);
+            return;
+        }
+        let job = JobId(self.fresh());
+        let deadline = self.now.saturating_add(T_VERIFY);
+        let admission = self.admission_at(key);
+        admission.stage = Stage::Verifying { job, deadline };
+        let tx_id = admission.tx_id;
+        self.jobs.insert(job, (JobTarget::Admission(tx_id), job.0));
+        self.step.effects.push(Effect::Start {
+            job,
+            tx: tx_id,
+            revalidation: false,
+        });
+    }
+
+    /// Whether an admission has held its slot for [`MAX_UNDECIDED`] since
+    /// its body arrived.
+    fn undecided_too_long(&self, key: u64) -> bool {
+        self.admissions[&key]
+            .body_at
+            .is_some_and(|at| at.saturating_add(MAX_UNDECIDED) <= self.now)
+    }
+
+    /// Cancels the job of an admission that is being verified.
+    fn cancel_admission_job(&mut self, key: u64) {
+        let job = match &self.admission_at(key).stage {
+            Stage::Verifying { job, .. } => *job,
+            _ => return,
+        };
+        self.jobs.remove(&job);
+        self.step.effects.push(Effect::Cancel(job));
+    }
+
+    /// Runs every admission parked on `parent` again.
+    fn wake(&mut self, parent: transaction::Hash) {
+        let woken: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| match &admission.stage {
+                Stage::Parked { on, .. } => on.contains(&parent),
+                _ => false,
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in woken {
+            self.start_admission(key);
+        }
+        for pooled in self.pool.values_mut() {
+            if matches!(&pooled.hidden, Some(Hidden::Parked { on }) if on.contains(&parent)) {
+                pooled.hidden = Some(Hidden::Queued);
+            }
+        }
+    }
+
+    /// The outputs of a transaction that just became visible are available.
+    /// Every caller waiting for one of them is answered, in the order the
+    /// callers came, in this step.
+    fn offer_outputs(&mut self, tx: transaction::Hash, count: u32) {
+        self.step.effects.push(Effect::Outputs { tx, count });
+        for index in 0..count {
+            let outpoint = OutPoint { hash: tx, index };
+            for waiter in self.output_waiters.remove(&outpoint).unwrap_or_default() {
+                self.step
+                    .effects
+                    .push(Effect::OutputReady { waiter, outpoint });
+            }
+        }
+    }
+
+    /// Removes every pooled transaction whose expiry height the tip has
+    /// reached, and remembers each as expired. With `with_dependents`, what
+    /// depends on it goes too.
+    fn remove_expired(&mut self, with_dependents: bool) {
+        let expired: Vec<(UnminedTxId, bool)> = self
+            .pool
+            .values()
+            .filter(|pooled| pooled.tx.expiry.is_some_and(|expiry| self.tip >= expiry))
+            .map(|pooled| (pooled.tx.id, pooled.hidden.is_none()))
+            .collect();
+        for (tx_id, visible) in expired {
+            // A hidden transaction has not been checked against the chain
+            // since a reorg or a missed event. It may have been mined in a
+            // block the core did not see, and then what spends its outputs
+            // is still valid. So only a visible one takes its dependents
+            // with it. A hidden one's dependents are hidden too, and are
+            // checked when their turn comes.
+            if with_dependents && visible {
+                self.remove_with_dependents(tx_id.mined_id(), RemovalReason::Expired);
+            } else if let Some(key) = self.pooled.get(&tx_id.mined_id()).copied() {
+                self.remove_one(key, RemovalReason::Expired);
+            }
+            self.cache(tx_id, RejectionScope::EffectsChain(ChainReason::Expired));
+        }
+    }
+
+    /// Runs every parked admission again.
+    fn rerun_parked(&mut self) {
+        let parked: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| matches!(admission.stage, Stage::Parked { .. }))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in parked {
+            self.start_admission(key);
+        }
+    }
+
+    /// Ends an admission for a failure on this node. Today's change stream
+    /// reports a verification that failed or timed out, so this is logged
+    /// too. Nothing is cached and nobody is charged.
+    fn fail_locally(&mut self, key: u64, fault: LocalFault) {
+        let tx_id = self.admission_at(key).tx_id;
+        self.step.changes.push(Change::Refused(tx_id));
+        self.decide(key, ModelVerdict::LocalFault(fault));
+    }
+
+    /// Hides every visible pooled transaction, to be verified again.
+    fn hide_all(&mut self) {
+        for pooled in self.pool.values_mut() {
+            match pooled.hidden {
+                None => {
+                    let pending =
+                        u64::try_from(self.step.changes.len()).expect("a batch fits in u64");
+                    pooled.hidden = Some(Hidden::Queued);
+                    pooled.hidden_at =
+                        ChangeSeq(self.logged.saturating_add(pending).saturating_add(1));
+                    self.step.changes.push(Change::Hidden(pooled.tx.id));
+                }
+                // A running job read the old chain, so its outcome will be
+                // stale and it will run again.
+                Some(Hidden::Running { .. }) => {}
+                Some(_) => pooled.hidden = Some(Hidden::Queued),
+            }
+        }
+    }
+
+    /// The model has applied a chain event: everything that waited for it
+    /// runs again.
+    fn chain_applied(&mut self) {
+        let waiting: Vec<u64> = self
+            .admissions
+            .iter()
+            .filter(|(_, admission)| matches!(admission.stage, Stage::AwaitingChain))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in waiting {
+            self.start_admission(key);
+        }
+        for pooled in self.pool.values_mut() {
+            if matches!(pooled.hidden, Some(Hidden::AwaitingChain)) {
+                pooled.hidden = Some(Hidden::Queued);
+            }
+        }
+        self.start_revalidations();
+    }
+
+    /// Starts queued revalidations, parents first, while the revalidation
+    /// share and the node's limit allow.
+    fn start_revalidations(&mut self) {
+        let queued: Vec<u64> = self
+            .pool
+            .iter()
+            .filter(|(_, pooled)| matches!(pooled.hidden, Some(Hidden::Queued)))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in queued {
+            if self.revalidating() >= self.max_revalidating
+                || self.slots_in_use() >= self.max_pending
+            {
+                break;
+            }
+            let tx = self.pool[&key].tx.clone();
+            let parent_hidden = tx.parents().any(|parent| {
+                self.pooled
+                    .get(&parent)
+                    .is_some_and(|parent| self.pool[parent].hidden.is_some())
+            });
+            if parent_hidden {
+                continue;
+            }
+            let job = JobId(self.fresh());
+            let deadline = self.now.saturating_add(T_VERIFY);
+            self.pooled_at(key).hidden = Some(Hidden::Running { job, deadline });
+            self.jobs
+                .insert(job, (JobTarget::Revalidation(tx.id.mined_id()), job.0));
+            self.step.effects.push(Effect::Start {
+                job,
+                tx: tx.id,
+                revalidation: true,
+            });
+        }
+    }
+
+    /// A revalidation hit a local fault. The transaction stays hidden and is
+    /// tried again later.
+    fn retry_later(&mut self, key: u64) {
+        let at = self.now;
+        let pooled = self.pooled_at(key);
+        let backoff = pooled.backoff;
+        pooled.hidden = Some(Hidden::Retry {
+            at: at.saturating_add(backoff),
+        });
+        pooled.backoff = backoff.saturating_mul(2).min(REVALIDATE_RETRY_MAX);
+    }
+
+    /// Removes one pooled transaction and logs it.
+    fn remove_one(&mut self, key: u64, reason: RemovalReason) {
+        let Some(pooled) = self.pool.remove(&key) else {
+            return;
+        };
+        self.pooled.remove(&pooled.tx.id.mined_id());
+        if let Some(Hidden::Running { job, .. }) = pooled.hidden {
+            self.jobs.remove(&job);
+            self.step.effects.push(Effect::Cancel(job));
+        }
+        self.step.changes.push(Change::Removed {
+            id: pooled.tx.id,
+            reason,
+        });
+    }
+
+    /// Removes a pooled transaction and everything in the pool that spends
+    /// its outputs. The dependents leave as invalidated.
+    fn remove_with_dependents(&mut self, hash: transaction::Hash, reason: RemovalReason) {
+        let Some(key) = self.pooled.get(&hash).copied() else {
+            return;
+        };
+        self.remove_one(key, reason);
+        let dependents: Vec<transaction::Hash> = self
+            .pool
+            .values()
+            .filter(|pooled| pooled.tx.parents().any(|parent| parent == hash))
+            .map(|pooled| pooled.tx.id.mined_id())
+            .collect();
+        for dependent in dependents {
+            self.remove_with_dependents(dependent, RemovalReason::Invalidated);
+        }
+    }
+
+    /// Ends an admission that holds no body once nobody can still bring one:
+    /// its owner submitted nothing and released, and no joined caller was
+    /// asked for the body. Callers already waiting on it get a local fault.
+    fn settle_bodyless(&mut self, key: u64) {
+        let Some(admission) = self.admissions.get(&key) else {
+            return;
+        };
+        let body_coming = admission.body.is_some()
+            || admission.owner_waiting
+            || self
+                .tickets
+                .values()
+                .any(|ticket| ticket.admission == key && ticket.brings);
+        if !body_coming {
+            self.decide(key, ModelVerdict::LocalFault(LocalFault::NoBody));
+        }
+    }
+
+    /// Moves time to `now`. A remembered rejection ends at its time,
+    /// whichever input comes next.
+    fn advance(&mut self, now: ModelTime) {
+        if now <= self.now {
+            return;
+        }
+        self.now = now;
+        let memory = self.rejection_memory;
+        for list in self.rejected_chain.values_mut() {
+            while let Some(oldest) = list.order.front().copied() {
+                let forgotten = list
+                    .at
+                    .get(&oldest)
+                    .is_none_or(|at| at.saturating_add(memory) < now);
+                if !forgotten {
+                    break;
+                }
+                list.order.pop_front();
+                list.at.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear_tip_rejections(&mut self) {
+        self.rejected_exact.clear();
+        self.rejected_effects_tip.clear();
+    }
+
+    fn clear_all_rejections(&mut self) {
+        self.clear_tip_rejections();
+        self.rejected_chain.clear();
+    }
+
+    /// Remembers a rejection in the list its scope names. A tip-scoped list
+    /// that grows past its limit is cleared. A chain-scoped list drops its
+    /// oldest entry.
+    fn cache(&mut self, tx_id: UnminedTxId, scope: RejectionScope) {
+        match scope {
+            RejectionScope::ExactTip => {
+                self.rejected_exact.insert(tx_id);
+                if self.rejected_exact.len() > MAX_REJECTIONS {
+                    self.rejected_exact.clear();
+                }
+            }
+            RejectionScope::EffectsTip => {
+                self.rejected_effects_tip.insert(tx_id.mined_id());
+                if self.rejected_effects_tip.len() > MAX_REJECTIONS {
+                    self.rejected_effects_tip.clear();
+                }
+            }
+            RejectionScope::EffectsChain(reason) => {
+                let hash = tx_id.mined_id();
+                let now = self.now;
+                let list = self.rejected_chain.entry(reason).or_default();
+                // An id already in the list keeps its first entry, so its
+                // time and its place in the order stay in step. Today's list
+                // is never given an id twice.
+                if let std::collections::hash_map::Entry::Vacant(entry) = list.at.entry(hash) {
+                    entry.insert(now);
+                    list.order.push_back(hash);
+                }
+                if list.at.len() > MAX_REJECTIONS {
+                    if let Some(oldest) = list.order.pop_front() {
+                        list.at.remove(&oldest);
+                    }
+                }
+            }
+            RejectionScope::Uncached => {}
+        }
+    }
+
+    fn cached_rejection(&self, tx_id: UnminedTxId, now: ModelTime) -> Option<RejectionScope> {
+        let hash = tx_id.mined_id();
+        if self.rejected_exact.contains(&tx_id) {
+            return Some(RejectionScope::ExactTip);
+        }
+        if self.rejected_effects_tip.contains(&hash) {
+            return Some(RejectionScope::EffectsTip);
+        }
+        [
+            ChainReason::Expired,
+            ChainReason::DuplicateSpend,
+            ChainReason::Mined,
+        ]
+        .into_iter()
+        .find(|reason| {
+            self.rejected_chain
+                .get(reason)
+                .and_then(|list| list.at.get(&hash))
+                // Today's list forgets an entry once it is older than the
+                // memory, so at exactly the memory it still holds.
+                .is_some_and(|at| at.saturating_add(self.rejection_memory) >= now)
+        })
+        .map(RejectionScope::EffectsChain)
+    }
+
+    /// Whether `outpoint` became available after the event count
+    /// `started_at`: its transaction is visible now, creates that output,
+    /// and became visible after that count.
+    fn arrived_since(&self, outpoint: &OutPoint, started_at: u64) -> bool {
+        self.offers(outpoint)
+            && self
+                .pooled
+                .get(&outpoint.hash)
+                .is_some_and(|key| self.pool[key].visible_at > started_at)
+    }
+
+    /// Whether the visible pool offers `outpoint`: its transaction is
+    /// visible and creates that output.
+    fn offers(&self, outpoint: &OutPoint) -> bool {
+        self.pooled.get(&outpoint.hash).is_some_and(|key| {
+            let pooled = &self.pool[key];
+            pooled.hidden.is_none() && outpoint.index < pooled.tx.outputs
+        })
+    }
+
+    /// Whether `hash` is pooled and visible. The dependency limits are
+    /// about the visible pool, as today's are about the verified set.
+    fn is_visible(&self, hash: &transaction::Hash) -> bool {
+        self.pooled
+            .get(hash)
+            .is_some_and(|key| self.pool[key].hidden.is_none())
+    }
+
+    /// The visible parents of a pooled transaction.
+    fn pooled_parents(&self, hash: &transaction::Hash) -> Vec<transaction::Hash> {
+        self.pooled
+            .get(hash)
+            .map(|key| {
+                self.pool[key]
+                    .tx
+                    .parents()
+                    .filter(|parent| self.is_visible(parent))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `parents` and every pooled transaction they depend on.
+    fn ancestors(&self, parents: HashSet<transaction::Hash>) -> HashSet<transaction::Hash> {
+        let mut ancestors = HashSet::new();
+        let mut next: Vec<transaction::Hash> = parents.into_iter().collect();
+        while let Some(hash) = next.pop() {
+            if self.is_visible(&hash) && ancestors.insert(hash) {
+                next.extend(self.pooled_parents(&hash));
+            }
+        }
+        ancestors
+    }
+
+    /// Every pooled transaction connected to `seeds` through parents,
+    /// children or both.
+    fn dependency_group(&self, seeds: &HashSet<transaction::Hash>) -> HashSet<transaction::Hash> {
+        let mut group = HashSet::new();
+        let mut next: Vec<transaction::Hash> = seeds.iter().copied().collect();
+        while let Some(hash) = next.pop() {
+            if !self.is_visible(&hash) || !group.insert(hash) {
+                continue;
+            }
+            next.extend(self.pooled_parents(&hash));
+            next.extend(
+                self.pool
+                    .values()
+                    .filter(|pooled| pooled.hidden.is_none())
+                    .filter(|pooled| pooled.tx.parents().any(|parent| parent == hash))
+                    .map(|pooled| pooled.tx.id.mined_id()),
+            );
+        }
+        group
+    }
+
+    fn revalidating(&self) -> usize {
+        self.pool
+            .values()
+            .filter(|pooled| matches!(pooled.hidden, Some(Hidden::Running { .. })))
+            .count()
+    }
+
+    fn admission_at(&mut self, key: u64) -> &mut Admission {
+        self.admissions
+            .get_mut(&key)
+            .expect("the caller names a live admission")
+    }
+
+    fn pooled_at(&mut self, key: u64) -> &mut Pooled {
+        self.pool
+            .get_mut(&key)
+            .expect("the caller names a pooled transaction")
+    }
+
+    fn fresh(&mut self) -> u64 {
+        self.next_id = self.next_id.saturating_add(1);
+        self.next_id
+    }
+
+    /// The one way out of an input that returns a step. Queued
+    /// revalidations that can start are started first, so no input can free
+    /// a slot, or bring a retry due, and leave it unused until something
+    /// else happens.
+    fn take_step(&mut self) -> Step {
+        if self.active {
+            self.start_revalidations();
+        }
+        let step = std::mem::take(&mut self.step);
+        let changes = u64::try_from(step.changes.len()).expect("a batch fits in u64");
+        self.logged = self.logged.saturating_add(changes);
+        step
+    }
+}

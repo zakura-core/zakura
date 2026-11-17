@@ -2710,6 +2710,7 @@ dependencies = [
  "zakura-consensus",
  "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
@@ -3004,6 +3005,26 @@ dependencies = [
  "libc",
  "libz-sys",
  "lz4-sys",
+]
+
+[[package]]
+name = "zakura-mempool"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "futures",
+ "metrics",
+ "proptest",
+ "proptest-derive",
+ "thiserror",
+ "tokio",
+ "zakura-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-script",
+ "zakura-test",
+ "zakura-zcash-script",
 ]
 
 [[package]]
@@ -3459,6 +3480,7 @@ dependencies = [
  "toml",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-quic",

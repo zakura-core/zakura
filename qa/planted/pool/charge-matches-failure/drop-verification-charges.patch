@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index af9a2c6362..1d28d807e1 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -1528,7 +1528,10 @@ impl<E: VerifyError> MempoolState<E> {
+                     }),
+                 );
+             }
+-            Outcome::Fail { error, charge } => self.reject(key, error, charge),
++            Outcome::Fail { error, charge } => {
++                let _ = charge;
++                self.reject(key, error, Charge::None)
++            }
+             Outcome::MissingInputs { missing, error } => {
+                 // One of the missing outputs became available after this job
+                 // started looking. Its admission has already been announced, so

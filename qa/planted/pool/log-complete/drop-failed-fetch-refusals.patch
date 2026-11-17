@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index 7f17f01218..a2ca79704e 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -356,7 +356,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+             PoolCommand::FetchFailed(reservation) => {
+                 let id = reservation.accept();
+                 self.fetches.remove(&id);
+-                let step = self.machine.fetch_failed(id, now);
++                let mut step = self.machine.fetch_failed(id, now);
++                step.changes.clear();
+                 self.finish(step);
+             }
+             PoolCommand::Released(id) => {

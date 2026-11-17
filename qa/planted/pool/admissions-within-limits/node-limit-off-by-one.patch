@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index af9a2c6362..9f56c8a5aa 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -501,7 +501,7 @@ impl<E: VerifyError> MempoolState<E> {
+         if let Some(key) = self.admission_of.get(&tx_id).copied() {
+             return self.join(key, intent);
+         }
+-        if self.slots_in_use() >= self.limits.pending {
++        if self.slots_in_use() > self.limits.pending {
+             return Err(Unreserved::NoRoom);
+         }
+         let owner = ReservationId(self.fresh());

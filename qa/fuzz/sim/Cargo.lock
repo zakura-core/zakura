@@ -1802,6 +1802,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-mempool"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "metrics",
+ "serde",
+ "thiserror",
+ "tracing",
+ "zakura-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-script",
+ "zakura-zcash-script",
+]
+
+[[package]]
 name = "zakura-mmr-tree"
 version = "0.1.0"
 dependencies = [
@@ -2073,6 +2089,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-script"
+version = "5.0.7"
+dependencies = [
+ "thiserror",
+ "zakura-chain",
+ "zakura-primitives",
+ "zakura-zcash-script",
+]
+
+[[package]]
 name = "zakura-sensei"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2137,6 +2163,7 @@ dependencies = [
  "toml",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-quic",

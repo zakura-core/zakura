@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-node-services/src/mempool/port.rs b/crates/zakura-node-services/src/mempool/port.rs
+index 7ea6b6424f..45a3fa2ec0 100644
+--- a/crates/zakura-node-services/src/mempool/port.rs
++++ b/crates/zakura-node-services/src/mempool/port.rs
+@@ -1205,7 +1205,15 @@ impl PoolInbox {
+         if let Some(Publications(observe)) = &self.publications {
+             observe(&batches, &snapshot);
+         }
+-        self.snapshot.send_replace(Some(snapshot));
++        static PUBLISHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++        if PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 15 {
++            self.snapshot.send_replace(Some(snapshot));
++        } else {
++            self.snapshot.send_if_modified(|latest| {
++                *latest = Some(snapshot);
++                false
++            });
++        }
+     }
+ 
+     /// Under the simulator, has `observe` see every later publication.

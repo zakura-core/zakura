@@ -126,6 +126,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/pool_core.rs"
+test = "regenerate_pool_core_seed"
+run = false
+reason = "a tool, not a test: it rewrites the committed seed, the default pool scenario's prefix"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/replay_exact.rs"
 test = "regenerate_discovery_book_input"
 run = false
@@ -295,6 +301,14 @@ timeout-secs = 2700
 [[target]]
 package = "sim"
 name = "discovery_wait_complete"
+smoke-secs = 60
+timeout-secs = 1800
+
+# `pool/core`'s two-byte prefix sets the verifier's delay and picks an
+# upgrade, a reorg and a resync. The target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "pool_core"
 smoke-secs = 60
 timeout-secs = 1800
 

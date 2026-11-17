@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-mempool/src/machine.rs b/crates/zakura-mempool/src/machine.rs
+index f15ab160cb..f3948a3777 100644
+--- a/crates/zakura-mempool/src/machine.rs
++++ b/crates/zakura-mempool/src/machine.rs
+@@ -708,7 +708,7 @@ impl<E: VerifyError> MempoolState<E> {
+             .map(|pooled| pooled.id)
+             .collect();
+         for hash in &mined {
+-            if let Some(key) = self.pooled.get(hash).copied() {
++            if let Some(key) = self.pooled.get(hash).copied().filter(|_| false) {
+                 // Its dependents stay. Their parent is on the chain now.
+                 self.remove_one(key, RemovalReason::Mined);
+             }

@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-mempool/src/io.rs b/crates/zakura-mempool/src/io.rs
+index 268cfc97de..3c050196ad 100644
+--- a/crates/zakura-mempool/src/io.rs
++++ b/crates/zakura-mempool/src/io.rs
+@@ -317,6 +317,12 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+                     self.inbox
+                         .grant(grant.id, tx_id, grant.joined, grant.wants_body, cancel)
+                 });
++                let answer = match answer {
++                    Ok(reservation) if reservation.joined() => {
++                        Err(zakura_node_services::mempool::port::Unreserved::Pending)
++                    }
++                    other => other,
++                };
+                 // A caller that left drops the reservation with the reply,
+                 // which frees the slot.
+                 self.reply(move || {

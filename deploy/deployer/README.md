@@ -225,10 +225,11 @@ across would silently reintroduce the stall.
 
 `asia-hedged` and `asia-scored` are legacy-only nodes in Singapore that each
 measure one experimental setting from an open PR: `[network.block_hedge]` from
-PR 2548 and `[network.block_source_score]` from PR 2558. Their configs enable those
-settings, so each entry is pinned to the build the node runs instead of the
-deployed ref: a build from `main` would refuse the config. Unpin an entry when
-its PR merges, or remove it when the experiment ends.
+PR 2548 and `[network.block_source_score]` from PR 2558. `asia-hedged` follows the
+deployed ref now that this revision supports its setting. `asia-scored` remains
+pinned to a build that supports its unmerged setting: a build without that setting
+would refuse its config. Unpin it when its PR merges, or remove it when the
+experiment ends.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated

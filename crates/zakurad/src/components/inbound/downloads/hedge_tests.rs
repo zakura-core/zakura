@@ -39,11 +39,11 @@ fn hash() -> block::Hash {
     block::Hash([7; 32])
 }
 
-/// The second request, sent once the first has waited `first_request_waited`.
-fn hedge_request(first_request_waited: Duration) -> zn::Request {
+/// The second request carries the original start until the peer set dispatches it.
+fn hedge_request(first_request_started: Option<tokio::time::Instant>) -> zn::Request {
     zn::Request::BlockByHashHedge {
         hash: hash(),
-        first_request_waited,
+        first_request_started,
     }
 }
 
@@ -105,6 +105,7 @@ async fn an_answer_within_the_delay_sends_no_second_request() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_first_request_gets_a_second_request_and_the_first_answer_wins() {
     let (network, mut sent) = network();
+    let started = tokio::time::Instant::now();
     let download = tokio::spawn(request_block(network, first_request(), hash(), Some(DELAY)));
 
     let first = next_sent(&mut sent).await;
@@ -112,8 +113,8 @@ async fn a_slow_first_request_gets_a_second_request_and_the_first_answer_wins() 
     let hedge = next_sent(&mut sent).await;
     assert_eq!(
         hedge.request,
-        hedge_request(DELAY),
-        "the second request says how long the first has been waiting"
+        hedge_request(Some(started)),
+        "the second request preserves when the first started"
     );
 
     hedge.answer.send(Ok(from_hedge())).unwrap();
@@ -176,7 +177,7 @@ async fn a_first_request_that_fails_early_is_hedged_at_once() {
     let hedge = next_sent(&mut sent).await;
     assert_eq!(
         hedge.request,
-        hedge_request(Duration::ZERO),
+        hedge_request(None),
         "a failed first request is no longer waiting"
     );
 

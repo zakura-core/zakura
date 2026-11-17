@@ -102,7 +102,7 @@ use std::{
     net::IpAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use futures::{
@@ -1514,7 +1514,7 @@ where
     fn route_block_hedge(
         &mut self,
         hash: block::Hash,
-        first_request_waited: Duration,
+        first_request_started: Option<tokio::time::Instant>,
     ) -> <Self as tower::Service<Request>>::Future {
         let inventory = InventoryHash::from(hash);
         let peer = self
@@ -1541,7 +1541,11 @@ where
         metrics::counter!("pool.route_inv.hedge.count").increment(1);
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
+        // Measure at dispatch so the original wait includes this request's time in the queue.
+        let first_request_waited = first_request_started
+            .map(|first| started.saturating_duration_since(first))
+            .unwrap_or_default();
         let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
 
@@ -1971,8 +1975,8 @@ where
 
             Request::BlockByHashHedge {
                 hash,
-                first_request_waited,
-            } => self.route_block_hedge(hash, first_request_waited),
+                first_request_started,
+            } => self.route_block_hedge(hash, first_request_started),
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),

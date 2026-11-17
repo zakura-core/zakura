@@ -1393,7 +1393,9 @@ async fn block_hedge_goes_to_the_fastest_idle_advertiser() {
             .expect("peer set is ready")
             .call(Request::BlockByHashHedge {
                 hash: BLOCK_HASH,
-                first_request_waited: Duration::from_millis(50),
+                first_request_started: Some(
+                    tokio::time::Instant::now() - Duration::from_millis(50),
+                ),
             });
 
     assert_eq!(
@@ -1425,10 +1427,101 @@ async fn block_hedge_without_an_idle_advertiser_fails_at_once() {
         .expect("peer set is ready")
         .call(Request::BlockByHashHedge {
             hash: BLOCK_HASH,
-            first_request_waited: Duration::from_millis(50),
+            first_request_started: Some(tokio::time::Instant::now() - Duration::from_millis(50)),
         })
         .await;
 
     assert!(result.is_err(), "no idle advertiser means no hedge");
     assert_eq!(busy.written_now().await, None);
+}
+
+/// The production driver can queue a hedge before any peer is ready. Its trace must include
+/// that wait when the original is pending, and exclude it when the original already failed.
+#[tokio::test]
+async fn block_hedge_trace_includes_dispatch_queue_time() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for original_pending in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut peer = TestPeer::spawn(1);
+            let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            let hash = block.hash();
+            let (discover_tx, discover_rx) = futures::channel::mpsc::unbounded();
+            let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+            let mut config = crate::Config::default();
+            config.zakura.trace_dir = Some(directory.path().to_path_buf());
+            let (peer_set, mut guard) = PeerSetBuilder::new()
+                .with_config(config)
+                .with_discover(discover_rx)
+                .with_minimum_peer_version(minimum)
+                .build();
+            let shutdown = zakura_rt::sync::CancellationToken::new();
+            let (network, _adverts) = crate::peer_set::driver::spawn(peer_set, shutdown.clone());
+
+            let original_started = tokio::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let response = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+                hash,
+                first_request_started: original_pending.then_some(original_started),
+            }));
+            // No peer exists yet: the real driver must hold this request in its queue.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!response.is_finished());
+            guard
+                .inventory_sender()
+                .as_mut()
+                .unwrap()
+                .send(InventoryStatus::new_available(hash.into(), peer.addr))
+                .unwrap();
+            let (addr, client) = peer.discovered();
+            discover_tx
+                .unbounded_send(Ok::<_, BoxError>(Change::Insert(addr, client)))
+                .unwrap();
+            assert_eq!(
+                StoragePeers::next_message(&mut peer).await,
+                Message::GetData(vec![hash.into()]),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            peer.peer_inbound
+                .send(Ok(Message::Block(block.into())))
+                .await
+                .unwrap();
+            assert!(matches!(response.await.unwrap(), Ok(Response::Blocks(_))));
+            shutdown.cancel();
+
+            // Driver shutdown drops the trace sender; the writer drains and flushes its row.
+            let row = loop {
+                if let Ok(contents) =
+                    std::fs::read_to_string(directory.path().join("legacy_peer_request.jsonl"))
+                {
+                    if let Some(row) = contents
+                        .lines()
+                        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    {
+                        break row;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(row["route"], "hedge");
+            assert_eq!(row["result"], "available");
+            let waited = row["first_request_waited_ms"].as_u64().unwrap();
+            if original_pending {
+                assert!(
+                    waited >= 150,
+                    "the original wait includes the dispatch queue: {row}"
+                );
+                assert!(waited + row["elapsed_ms"].as_u64().unwrap() >= 170);
+            } else {
+                assert_eq!(
+                    waited, 0,
+                    "a failed original does not extend the retry's time"
+                );
+            }
+        }
+    })
+    .await
+    .expect("both queued hedge traces are flushed promptly");
 }

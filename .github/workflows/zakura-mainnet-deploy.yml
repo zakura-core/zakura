@@ -516,24 +516,19 @@ jobs:
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # Two legacy-only nodes in Singapore that each measure one experimental
-          # setting from an open PR. Each is pinned to the build it runs, because
-          # its hand-written config enables a setting that main does not have yet:
-          # a main build would refuse that config and fail to start. A fleet deploy
-          # therefore reinstalls the pinned build and restarts the node; to change
-          # the build, update the pin. Remove the pin (use "${REF}") once the PR
-          # merges, or remove the entry when the experiment ends.
-          #
-          # asia-hedged measures `[network.block_hedge]` (#2548).
+          # Legacy-only Singapore node measuring `[network.block_hedge]` (#2548).
+          # The setting is supported by this revision, so use the requested ref.
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
           monitor    = { profiler_url = "http://127.0.0.1:8107" }
-          commit     = "120535dbbb74e65f4a8c57ae3f19f9a10d77afc3"
+          commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored measures `[network.block_source_score]` (#2558).
+          # asia-scored measures `[network.block_source_score]` (#2558). Its config
+          # still requires an unmerged setting, so preserve its supporting build.
+          # Remove the pin once that PR merges, or the entry when the experiment ends.
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"

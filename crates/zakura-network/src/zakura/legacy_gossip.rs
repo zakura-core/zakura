@@ -8395,7 +8395,9 @@ mod tests {
             .await?
             .call(Request::BlockByHashHedge {
                 hash,
-                first_request_waited: Duration::from_millis(50),
+                first_request_started: Some(
+                    tokio::time::Instant::now() - Duration::from_millis(50),
+                ),
             })
             .await?;
         assert!(matches!(

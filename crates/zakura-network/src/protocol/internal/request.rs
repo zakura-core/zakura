@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, time::Duration};
+use std::{collections::HashSet, fmt};
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -17,6 +17,14 @@ use proptest_derive::Arbitrary;
 #[cfg(any(test, feature = "proptest-impl"))]
 fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
     vec(any::<block::Hash>(), 0..100).prop_map(|hashes| hashes.into_iter().collect())
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn arbitrary_request_started() -> impl Strategy<Value = Option<tokio::time::Instant>> {
+    proptest::option::of(
+        (0u64..=5_000)
+            .prop_map(|ms| tokio::time::Instant::now() - std::time::Duration::from_millis(ms)),
+    )
 }
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
@@ -169,11 +177,14 @@ pub enum Request {
     BlockByHashHedge {
         /// The block to request.
         hash: block::Hash,
-        /// How long the first request had been waiting for an answer when this one was sent, or
-        /// zero when the first request had already failed. The legacy peer trace writes it with
-        /// this request's own time, so a download this request wins is timed from the first
-        /// request without waiting for the first request's answer.
-        first_request_waited: Duration,
+        /// When the first request started, or `None` when it already failed. The peer set
+        /// measures its wait at dispatch, including time this request spent queued, so the
+        /// trace can time a winning hedge without waiting for the first request's answer.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_request_started()")
+        )]
+        first_request_started: Option<tokio::time::Instant>,
     },
 
     /// Request transactions by their unmined transaction ID.

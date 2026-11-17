@@ -840,15 +840,11 @@ where
     metrics::counter!("gossip.hedge.sent.count").increment(1);
     // A first request that already failed is no longer waiting, so a download the second
     // request wins is timed from the second request alone, as a retry would be.
-    let first_request_waited = if first_error.is_some() {
-        Duration::ZERO
-    } else {
-        first_sent.elapsed()
-    };
+    let first_request_started = first_error.is_none().then_some(first_sent);
     let mut hedge = network
         .oneshot(zn::Request::BlockByHashHedge {
             hash,
-            first_request_waited,
+            first_request_started,
         })
         .boxed();
 

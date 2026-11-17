@@ -2,9 +2,9 @@
 
 use std::{
     fmt,
-    io::{Cursor, Read, Write},
+    io::{BufWriter, Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[cfg(test)]
@@ -26,6 +26,8 @@ use zakura_chain::{
     },
     transaction::Transaction,
 };
+
+use zakura_node_services::block_memory::BlockHandle;
 
 use crate::constants;
 
@@ -67,9 +69,11 @@ const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 
 /// The smallest `block` message body whose checksum is shared between connections.
 ///
-/// Looking a checksum up hashes the block's header, which is about 1.5 kB. Hashing a body
-/// smaller than this costs too little for the lookup to save time.
-const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 64 * 1024;
+/// Sharing avoids hashing the body on each send, at the cost of a shared cache lookup. The
+/// message already carries its block hash, so the lookup does not hash the header again.
+/// The `block_checksum_threshold` benchmark compares the lookup and body-hashing costs;
+/// this conservative threshold keeps small messages off the shared checksum path.
+pub(crate) const MIN_SHARED_CHECKSUM_BODY_LEN: usize = 8 * 1024;
 
 /// The number of blocks whose checksums are remembered.
 ///
@@ -117,13 +121,14 @@ enum BodyDecodePanic {
     AfterTransactionConversion,
 }
 
-/// Checksums of the large `block` messages this node sent most recently.
+/// Checksums of the large `block` messages this node sent or is about to send.
 ///
 /// Sending the same block body to multiple peers uses the same message checksum.
 /// Hashing a full block takes milliseconds, and many peers request a new block at the same
-/// moment. Connections that share one `BlockChecksums` reuse a
-/// block's checksum after a send has calculated and stored it. Concurrent sends that miss the
-/// cache can each calculate the checksum before either stores it.
+/// moment. Connections that share one `BlockChecksums` hash each block once: concurrent sends
+/// of a block wait for the one send that is hashing it, then reuse its checksum. Block
+/// advertisement can also [`precompute`](Self::precompute) a checksum before peers request
+/// the block.
 ///
 /// A checksum is found by the block's hash. Bodies using this cache must come from committed
 /// state, or from trusted `submitblock` callers after semantic verification. Before contextual
@@ -136,35 +141,120 @@ enum BodyDecodePanic {
 /// The body length is checked as well, so a body of another length is hashed again. This check
 /// does not distinguish different bodies of the same length or replace commitment validation.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, sha256d::Checksum)>>>);
+pub(crate) struct BlockChecksums(Arc<Mutex<IndexMap<block::Hash, (usize, ChecksumSlot)>>>);
+
+/// The checksum of one block body, set once by whichever send or precomputation hashes it
+/// first. Others that need it meanwhile wait for that hash instead of repeating it.
+type ChecksumSlot = Arc<OnceLock<sha256d::Checksum>>;
 
 impl BlockChecksums {
-    /// Returns the body length and checksum remembered for the block `hash`.
+    /// Returns the body length and checksum remembered for the block `hash`, if hashing has
+    /// finished.
     ///
     /// A block that is found becomes the last one to be forgotten.
-    fn get(&self, hash: block::Hash) -> Option<(usize, sha256d::Checksum)> {
+    pub(crate) fn get(&self, hash: block::Hash) -> Option<(usize, sha256d::Checksum)> {
         let mut checksums = self
             .0
             .lock()
             .expect("the lock is only held for map operations, which do not panic");
-        let remembered = checksums.shift_remove(&hash)?;
-        checksums.insert(hash, remembered);
-        Some(remembered)
+        let (remembered_len, slot) = checksums.shift_remove(&hash)?;
+        let remembered = slot
+            .get()
+            .copied()
+            .map(|checksum| (remembered_len, checksum));
+        checksums.insert(hash, (remembered_len, slot));
+        remembered
     }
 
-    /// Remembers `checksum` for the `body_len` byte body of the block `hash`, forgetting the
-    /// block that was sent least recently if there is no room.
-    fn insert(&self, hash: block::Hash, body_len: usize, checksum: sha256d::Checksum) {
+    /// Returns the checksum of the `body_len` byte body of the block `hash`.
+    ///
+    /// Calls `compute` only if no other caller has hashed this body or is hashing it. Callers
+    /// that arrive while another one hashes the body block until it finishes, which takes no
+    /// longer than hashing the body themselves. The map lock is never held while hashing.
+    ///
+    /// The block becomes the last one to be forgotten. If there is no room, the block that was
+    /// used least recently is forgotten.
+    pub(crate) fn checksum_with(
+        &self,
+        hash: block::Hash,
+        body_len: usize,
+        compute: impl FnOnce() -> sha256d::Checksum,
+    ) -> sha256d::Checksum {
+        let slot = self.slot(hash, body_len);
+        *slot.get_or_init(compute)
+    }
+
+    /// Hashes the `block` message body of `block` and remembers its checksum, unless the body
+    /// is too small to share or its checksum is already known or being calculated.
+    ///
+    /// The body is hashed as it is serialized, so the full body is never held in memory. This
+    /// takes milliseconds for a large block, so async callers must run it on a blocking thread.
+    pub(crate) fn precompute(&self, block: &BlockHandle) {
+        let body_len = block.zcash_serialized_size();
+        if body_len < MIN_SHARED_CHECKSUM_BODY_LEN {
+            return;
+        }
+
+        let mut precomputed = false;
+        self.checksum_with(block.hash(), body_len, || {
+            precomputed = true;
+            serialized_block_checksum(block)
+        });
+        if precomputed {
+            metrics::counter!("peer.block_checksum.precomputed").increment(1);
+        }
+    }
+
+    /// Returns the slot for the `body_len` byte body of the block `hash`, adding an empty one
+    /// if the block is unknown or was remembered with another body length.
+    fn slot(&self, hash: block::Hash, body_len: usize) -> ChecksumSlot {
         let mut checksums = self
             .0
             .lock()
             .expect("the lock is only held for map operations, which do not panic");
-        checksums.shift_remove(&hash);
+        let slot = match checksums.shift_remove(&hash) {
+            Some((remembered_len, slot)) if remembered_len == body_len => slot,
+            _ => ChecksumSlot::default(),
+        };
         if checksums.len() >= SHARED_CHECKSUM_BLOCKS {
             checksums.shift_remove_index(0);
         }
-        checksums.insert(hash, (body_len, checksum));
+        checksums.insert(hash, (body_len, slot.clone()));
+        slot
     }
+}
+
+/// Returns the message checksum of `block`'s serialized body, without buffering the body.
+fn serialized_block_checksum(block: &BlockHandle) -> sha256d::Checksum {
+    /// Feeds written bytes into a SHA-256 digest.
+    struct DigestWriter(ring::digest::Context);
+
+    impl Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Serialization writes many small fields. Buffering them keeps each digest update large.
+    let mut writer = BufWriter::with_capacity(
+        MIN_SHARED_CHECKSUM_BODY_LEN,
+        DigestWriter(ring::digest::Context::new(&ring::digest::SHA256)),
+    );
+    block
+        .zcash_serialize(&mut writer)
+        .expect("writing to a digest does not fail");
+    let first = writer
+        .into_inner()
+        .map_err(|error| error.into_error())
+        .expect("flushing to a digest does not fail")
+        .0
+        .finish();
+    sha256d_checksum_of_digest(first)
 }
 
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
@@ -253,7 +343,11 @@ impl Builder {
 /// connection's task, and blocks are the largest messages, so this hash bounds how fast one
 /// connection can send or receive blocks.
 fn message_checksum(body: &[u8]) -> sha256d::Checksum {
-    let first = ring::digest::digest(&ring::digest::SHA256, body);
+    sha256d_checksum_of_digest(ring::digest::digest(&ring::digest::SHA256, body))
+}
+
+/// Returns the message checksum whose first SHA-256 pass produced `first`.
+fn sha256d_checksum_of_digest(first: ring::digest::Digest) -> sha256d::Checksum {
     let second = ring::digest::digest(&ring::digest::SHA256, first.as_ref());
     let mut checksum = [0; 4];
     checksum.copy_from_slice(&second.as_ref()[..4]);
@@ -369,8 +463,8 @@ impl Codec {
     /// is the hash of the block the message carries, if it carries one, and `remembered` is
     /// what [`BlockChecksums`] held for that block before the body was written.
     ///
-    /// A large block's remembered checksum is used when it was remembered for a body of the
-    /// same length. Otherwise the body is hashed, and a large block's checksum is remembered.
+    /// A large block's remembered checksum is used when its body length matches. Otherwise
+    /// the send shares any calculation already in progress, or hashes and remembers the body.
     fn body_checksum(
         &self,
         block_hash: Option<block::Hash>,
@@ -382,16 +476,27 @@ impl Codec {
             _ => return message_checksum(body),
         };
 
-        match remembered {
-            Some((remembered_len, checksum)) if remembered_len == body.len() => checksum,
-            _ => {
-                let checksum = message_checksum(body);
-                self.builder
-                    .block_checksums
-                    .insert(hash, body.len(), checksum);
-                checksum
+        if let Some((remembered_len, checksum)) = remembered {
+            if remembered_len == body.len() {
+                metrics::counter!("peer.block_checksum.hit").increment(1);
+                return checksum;
             }
         }
+
+        let mut hashed_here = false;
+        let checksum = self
+            .builder
+            .block_checksums
+            .checksum_with(hash, body.len(), || {
+                hashed_here = true;
+                message_checksum(body)
+            });
+        if hashed_here {
+            metrics::counter!("peer.block_checksum.miss").increment(1);
+        } else {
+            metrics::counter!("peer.block_checksum.hit").increment(1);
+        }
+        checksum
     }
 
     /// Write the body of the message into the given writer. This allows writing
@@ -1061,5 +1166,48 @@ impl Codec {
         });
 
         result.expect("scope has already finished")
+    }
+}
+
+/// Benchmark access to the two ways a `block` message body's checksum is obtained, used to
+/// choose [`MIN_SHARED_CHECKSUM_BODY_LEN`]. Not part of the production API.
+#[cfg(feature = "internal-bench")]
+pub mod checksum_bench {
+    use super::*;
+
+    /// The smallest `block` message body whose checksum is shared between connections.
+    pub const MIN_SHARED_BODY_LEN: usize = MIN_SHARED_CHECKSUM_BODY_LEN;
+
+    /// Hashes `body` the way every unshared message body is hashed.
+    pub fn hash_body(body: &[u8]) -> sha256d::Checksum {
+        message_checksum(body)
+    }
+
+    /// A full shared checksum cache that remembers `block`'s checksum.
+    pub struct CachedBlock {
+        checksums: BlockChecksums,
+    }
+
+    impl CachedBlock {
+        /// Fills a cache to capacity with other blocks, then remembers `block`'s checksum.
+        pub fn new(block: &Block, body_len: usize) -> Self {
+            let checksums = BlockChecksums::default();
+            for i in 0..SHARED_CHECKSUM_BLOCKS {
+                let mut other = [0; 32];
+                // Widening usize to u64 is lossless on supported targets.
+                other[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                checksums.checksum_with(block::Hash(other), body_len, || sha256d::Checksum([0; 4]));
+            }
+            checksums.checksum_with(block.hash(), body_len, || sha256d::Checksum([1; 4]));
+            Self { checksums }
+        }
+
+        /// Finds the checksum using the hash already carried by an outgoing block message.
+        pub fn lookup(&self, hash: block::Hash) -> sha256d::Checksum {
+            self.checksums
+                .get(hash)
+                .expect("the benchmark block's checksum is remembered")
+                .1
+        }
     }
 }

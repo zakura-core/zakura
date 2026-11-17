@@ -19,7 +19,9 @@ mod tests;
 pub(crate) use addr::canonical::canonical_ip;
 pub use addr::{canonical_peer_addr, canonical_socket_addr, AddrInVersion};
 pub use codec::Codec;
-pub(crate) use codec::{BlockChecksums, MAX_INCOMPLETE_MESSAGE_BYTES};
+pub(crate) use codec::{
+    BlockChecksums, MAX_INCOMPLETE_MESSAGE_BYTES, MIN_SHARED_CHECKSUM_BODY_LEN,
+};
 pub(crate) use inv::MIN_INV_HASH_SIZE;
 pub use inv::{InventoryHash, MAX_TX_INV_IN_SENT_MESSAGE};
 pub use message::{HashedBlock, Message, VersionMessage};

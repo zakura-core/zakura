@@ -218,6 +218,9 @@ stream's receive share bounds the bytes held, and a bucket's depth is a count of
   caps, so a conformant sender never empties it.
 - An overrun is a violation. The receiver closes the connection with the cause
   `ordered_byte_rate_overrun`.
+- A byte-rate row is the only row whose exhaustion closes the connection. A cadence row records
+  and forwards on exhaustion, because buffered arrivals after a stall cannot prove a violation. The
+  receiver depth above counts every byte such a stall can buffer, so an overrun does.
 
 ## Capacity admission
 

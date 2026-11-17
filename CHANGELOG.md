@@ -11,13 +11,6 @@ independently.
 
 ## [Unreleased]
 
-### Fixed
-
-- The mempool no longer remembers a transaction as rejected when its
-  verification failed on this node, such as a failed median-time lookup, so
-  resending it before the next block can admit it
-  ([#2502](https://github.com/zakura-core/zakura/pull/2502)).
-
 ## [1.8.9] - 2026-11-16
 
 ### Added

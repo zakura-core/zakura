@@ -266,9 +266,7 @@ impl Bench {
     /// Reserves `tx`. Returns the answer, and what else the input caused.
     fn reserve(&mut self, tx: &Tx) -> (Result<ReservationId, Unreserved>, Step) {
         let (answer, step) = self.machine.reserve(tx.id(), self.at());
-        if let Ok(reservation) = &answer {
-            self.tracker.reserved(*reservation);
-        }
+        self.tracker.reserve_answered(tx.id(), &answer);
         (answer, self.took(step))
     }
 
@@ -317,7 +315,8 @@ impl Bench {
             Outcome::Fail { charge, .. } => Some(*charge),
             _ => None,
         };
-        self.tracker.answers(job, charge);
+        let passed = matches!(outcome, Outcome::Pass { .. });
+        self.tracker.answers(job, passed, charge);
         let step = self
             .machine
             .outcome(job, outcome, self.at(), chrono::Utc::now());
@@ -431,6 +430,7 @@ impl Bench {
     /// The node falls behind the tip, and the pool turns off.
     fn deactivate(&mut self) -> Step {
         let step = self.machine.near_tip(false, self.at());
+        self.tracker.forget_rejections();
         let step = self.took(step);
         self.tracker.every_submission_is_answered();
         self.tracker.pool_is_empty();

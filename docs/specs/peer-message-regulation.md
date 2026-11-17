@@ -994,7 +994,7 @@ MAX_SERVES        = 16        requests this node serves at once, sent in its Hel
 |---------|--------|---------|------|--------|
 | `Hello` | State | requests served at once (`u16`), largest transaction accepted (`u32`) | First on the state stream, once. Served requests 1 to the table's maximum. Size at most `MAX_TX_BYTES`. | Close rows 4 and 5 |
 | `Inv` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Inv` byte rate. | Close rows 2 and 3 |
-| `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests it allows, counted until the sender starts writing each answer. No id outstanding twice. | Close rows 6 to 8 |
+| `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests that `Hello` serves. No id outstanding twice. The receiver counts a request it serves until it starts writing the `Tx`. One it answers `NotFound` takes no place, since that answer is queued at once. | Close rows 6 to 8 |
 | `Tx` | Data | the requested id, then the body | Answers a request outstanding to that peer, once. Exactly the announced size, at most the requester's limit, hashes to the id, and decodes as one transaction. | Close rows 9 to 12 |
 | `NotFound` | State | the requested id | Answers a request outstanding to that peer | Close row 9 |
 
@@ -1010,18 +1010,20 @@ or one from a peer that started cooling, unread and without penalty.
 #### Closes
 
 Each way `tx-relay` ends a peer's connection or session has one row and one owner, and the code
-that closes names its row. A stall is the one breach that ends the session before the connection.
+that closes names its row. Failures every ordered stream shares, such as a frame that stops arriving
+partway, follow the [common requirements](#common-requirements) and are not listed. A stall is the
+one breach that ends the session before the connection.
 
 | Row | Breach | Owner | Ends | Recorded cause |
 |-----|--------|-------|------|----------------|
-| 1 | A frame the stream's table rejects: a message type the stream does not carry, reserved flags, or a payload outside its row's sizes or past the frame cap | Transport frame filter | Connection | `ordered_read_rejected`, or `ordered_oversize` past the cap |
+| 1 | A frame the stream's table rejects: a message type the stream does not carry, reserved flags, or a payload outside its row's sizes or past the frame cap | Transport frame filter | Connection | `ordered_read_rejected` |
 | 2 | `Inv` bytes past the connection's byte rate | Transport byte bucket | Connection | `ordered_byte_rate_overrun` |
 | 3 | A payload that does not decode as its message | Session routine | Connection | `tx-relay: malformed frame` |
 | 4 | A second `Hello` in a session | Machine, `HelloTwice` | Connection | `tx-relay: protocol violation` |
 | 5 | A `Hello` outside the table's limits | Machine, `BadHello` | Connection | `tx-relay: protocol violation` |
 | 6 | A `GetTxs` before the peer's `Hello` | Machine, `NoHelloFirst` | Connection | `tx-relay: protocol violation` |
-| 7 | A `GetTxs` for an id whose answer is still coming | Machine, `RequestedTwice` | Connection | `tx-relay: id requested twice` |
-| 8 | A `GetTxs` past the requests this node's `Hello` serves | Machine, `TooManyRequests` | Connection | `tx-relay: too many requests` |
+| 7 | A `GetTxs` for an id this node is still serving the peer | Machine, `RequestedTwice` | Connection | `tx-relay: id requested twice` |
+| 8 | A `GetTxs` past the requests this node's `Hello` serves, counted as the `GetTxs` rule says | Machine, `TooManyRequests` | Connection | `tx-relay: too many requests` |
 | 9 | A `Tx` or `NotFound` that answers no outstanding request | Machine, `Unrequested` | Connection | `tx-relay: protocol violation` |
 | 10 | A `Tx` of another size than announced | Machine, `WrongSize` | Connection | `tx-relay: protocol violation` |
 | 11 | A `Tx` that does not hash to the requested id | Machine, `WrongId` | Connection | `tx-relay: protocol violation` |

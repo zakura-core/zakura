@@ -47,21 +47,12 @@ use zakura_chain::{
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError,
-    },
+    sync::{mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError},
 };
 
 use super::TransactionDependencies;
 use crate::block_memory::TransactionHandle;
 
-pub use chain::{
-    chain_transitions, AlreadySubscribed, ChainEvents, ChainStart, ChainTransitionSender,
-    ChainTransitions, MAX_QUEUED_TRANSITION_BLOCKS,
-};
-
-mod chain;
 #[cfg(test)]
 mod tests;
 
@@ -86,25 +77,10 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// parent.
 ///
 /// The wait is flat. It does not stop while a parent is being verified, and
-/// waking the transaction or checking it again does not restart it. So a
-/// transaction with a missing input is answered within this long plus one
-/// verification, whatever its parents, the chain or its peers do.
+/// waking the transaction or checking it again does not restart it. When it
+/// ends, a parked transaction is rejected, and one whose inputs keep
+/// arriving during its checks gets one more check and no more.
 pub const T_PARK: Duration = Duration::from_secs(60);
-
-/// The longest an undecided transaction holds its slot after its body
-/// arrives: the wait for a parent plus one verification.
-///
-/// Every other deadline is about one stage, and a transaction can move
-/// between stages for as long as something keeps moving it: a chain that
-/// changes during every check, or inputs that arrive one at a time. This one
-/// is about the slot. When it ends the submission is answered with a local
-/// fault, nothing is cached and nobody is charged, because the core never
-/// got a trustworthy answer.
-///
-/// It bounds the admission. A slot kept as a lease, for a fetch that is
-/// still out after another caller's body decided the id, lasts until that
-/// fetch's caller submits or drops, and is that caller's to bound.
-pub const MAX_UNDECIDED: Duration = Duration::from_secs(120);
 
 /// The first wait before a revalidation that hit a local fault is tried
 /// again. It doubles up to [`REVALIDATE_RETRY_MAX`]. Provisional.
@@ -318,82 +294,6 @@ pub enum Verdict {
     LocalFault(LocalFault),
 }
 
-/// A stable number for the best chain as state readers see it.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Generation(pub u64);
-
-/// One reading of the [`GenerationCell`].
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum GenerationRead {
-    /// Readers see this generation, and no change has begun.
-    Stable(Generation),
-    /// A change is becoming visible. Readers can see the old chain or the
-    /// new one.
-    Changing,
-}
-
-impl GenerationRead {
-    /// Whether `self` and `after` bracket work that saw only generation
-    /// `applied`: both are the same stable number, and it is `applied`.
-    pub fn brackets(self, after: Self, applied: Generation) -> bool {
-        self == after && self == Self::Stable(applied)
-    }
-}
-
-/// The best chain's generation, shared by the state writer and its readers.
-///
-/// The writer calls [`Self::begin_change`] before any new best-chain state
-/// becomes readable, and [`Self::finish_change`] once the tip is published.
-/// A reader that sees the same stable number before and after its lookups
-/// knows no change became visible in between.
-#[derive(Clone, Debug, Default)]
-pub struct GenerationCell(Arc<AtomicU64>);
-
-impl GenerationCell {
-    /// A cell at generation zero, stable.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Mark the generation as changing. Only the state writer calls this.
-    ///
-    /// # Panics
-    ///
-    /// If a change has already begun.
-    pub fn begin_change(&self) {
-        let before = self.0.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            before.is_multiple_of(2),
-            "the one state writer finishes each change before it begins the next"
-        );
-    }
-
-    /// Mark the next generation as stable, and return it. Only the state
-    /// writer calls this.
-    ///
-    /// # Panics
-    ///
-    /// If no change has begun.
-    pub fn finish_change(&self) -> Generation {
-        let before = self.0.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            !before.is_multiple_of(2),
-            "the one state writer begins a change before it finishes one"
-        );
-        Generation(before.saturating_add(1) / 2)
-    }
-
-    /// Read the generation.
-    pub fn read(&self) -> GenerationRead {
-        let raw = self.0.load(Ordering::SeqCst);
-        if raw.is_multiple_of(2) {
-            GenerationRead::Stable(Generation(raw / 2))
-        } else {
-            GenerationRead::Changing
-        }
-    }
-}
-
 /// A best-chain tip.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ChainTip {
@@ -408,8 +308,7 @@ pub struct ChainTip {
 /// It carries its transactions, not only their ids. The core removes the
 /// pool transactions that spend what these spend, and an id cannot find a
 /// conflict with a transaction that was never in the pool. They are the
-/// handles the state already holds, not copies, so a queued block keeps its
-/// decoded memory until the core takes it.
+/// handles the state already holds, not copies.
 #[derive(Clone, Debug)]
 pub struct ConnectedBlock {
     /// The block's hash.
@@ -422,55 +321,16 @@ pub struct ConnectedBlock {
     pub transaction_hashes: Arc<[transaction::Hash]>,
 }
 
-/// One change to the best chain: the blocks that left it, then the blocks
-/// that joined it.
-#[derive(Clone, Debug)]
-pub struct ChainTransition {
-    /// The tip before, or `None` for the first block.
-    pub before: Option<ChainTip>,
-    /// The blocks that left the best chain, tip first. Empty unless this is
-    /// a reorg.
-    pub disconnected: Vec<ChainTip>,
-    /// The blocks that joined, lowest first.
-    pub connected: Vec<ConnectedBlock>,
-    /// The tip after.
-    pub after: ChainTip,
-    /// The stable generation this transition ends on.
-    pub generation: Generation,
-    /// Whether the rules change at this tip: the next block activates a
-    /// network upgrade or the temporary Orchard-disabling soft fork, which
-    /// is where today's tip handling resets the pool. The pool was verified
-    /// under the old rules, so the core verifies all of it again, as it does
-    /// after a reorg.
-    pub rules_change: bool,
-}
-
-impl ChainTransition {
-    /// The blocks this transition names, which is what the queue's bound
-    /// counts.
-    pub fn blocks(&self) -> usize {
-        self.disconnected.len().saturating_add(self.connected.len())
-    }
-
-    /// Whether any block left the best chain.
-    pub fn is_reorg(&self) -> bool {
-        !self.disconnected.is_empty()
-    }
-}
-
-/// What the core takes from the state's transition queue.
+/// One change to the best chain, as the state's tip watch reports it.
 #[derive(Clone, Debug)]
 pub enum ChainEvent {
-    /// The next transition, none skipped.
-    Transition(ChainTransition),
-    /// The queue overflowed. The core no longer knows which blocks changed,
-    /// so it checks every pooled and parked transaction again at this tip.
-    Resync {
-        /// The tip now.
-        tip: ChainTip,
-        /// Its stable generation.
-        generation: Generation,
-    },
+    /// The best chain grew by this one block.
+    Grow(ConnectedBlock),
+    /// The tip changed some other way: a reorg, several blocks at once, or a
+    /// block whose successor is verified under new rules. Nothing names the
+    /// blocks that changed, so the core checks every pooled and parked
+    /// transaction again at this tip.
+    Reset(ChainTip),
 }
 
 /// A position in the change log. The first entry is 1, and 0 is "before any
@@ -624,8 +484,6 @@ pub struct PoolSnapshot {
     pub active: bool,
     /// The tip the pool is valid for.
     pub tip: ChainTip,
-    /// The generation of that tip.
-    pub generation: Generation,
     /// The newest change this snapshot includes.
     pub last_change: ChangeSeq,
     /// The visible transactions, in mining order.
@@ -640,7 +498,6 @@ impl PoolSnapshot {
     /// Build a snapshot and its lookup indexes.
     pub fn new(
         tip: ChainTip,
-        generation: Generation,
         last_change: ChangeSeq,
         transactions: Vec<VerifiedUnminedTx>,
         dependencies: TransactionDependencies,
@@ -654,7 +511,6 @@ impl PoolSnapshot {
         Self {
             active: true,
             tip,
-            generation,
             last_change,
             transactions,
             dependencies,
@@ -666,12 +522,11 @@ impl PoolSnapshot {
     /// The snapshot of a pool that is off. The core publishes one when it
     /// turns off, and a new active one when it turns on, though no
     /// transaction changed.
-    pub fn inactive(tip: ChainTip, generation: Generation, last_change: ChangeSeq) -> Self {
+    pub fn inactive(tip: ChainTip, last_change: ChangeSeq) -> Self {
         Self {
             active: false,
             ..Self::new(
                 tip,
-                generation,
                 last_change,
                 Vec::new(),
                 TransactionDependencies::default(),

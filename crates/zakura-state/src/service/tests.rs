@@ -4,8 +4,6 @@
 
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
-mod chain_transitions;
-
 use std::{env, sync::Arc, time::Duration};
 use zakura_node_services::block_memory::DecodedBlockPool;
 

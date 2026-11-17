@@ -38,10 +38,9 @@ use zakura_chain::{
     transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
-    ChainReason, ChainTip, ChainTransition, Change, ChangeSeq, Charge, Generation, GenerationRead,
-    LocalFault, PoolSnapshot, Rejection, RejectionDetail, RejectionScope, RemovalReason,
-    ReservationId, Unreserved, Verdict, MAX_PENDING, MAX_REVALIDATING, MAX_UNDECIDED,
-    REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
+    ChainReason, ChainTip, Change, ChangeSeq, Charge, ConnectedBlock, LocalFault, PoolSnapshot,
+    Rejection, RejectionDetail, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
+    MAX_PENDING, MAX_REVALIDATING, REVALIDATE_RETRY, REVALIDATE_RETRY_MAX, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -119,8 +118,8 @@ pub enum Effect {
         tx: UnminedTx,
         /// Whether it is a pooled transaction being verified again.
         revalidation: bool,
-        /// Whether the chain was reset since its body arrived, by a reorg, a
-        /// rules change or a missed event. Today's pool charges no cooldown
+        /// Whether the chain was reset since its body arrived, by a reorg,
+        /// skipped blocks or a rules change. Today's pool charges no cooldown
         /// for a transaction it retries after a tip reset, and neither does
         /// the core's verifier. Bans still apply.
         after_reset: bool,
@@ -191,9 +190,6 @@ enum Stage {
     Reserved,
     /// A job is running.
     Verifying { job: JobId, deadline: Instant },
-    /// The last outcome was stale, and the chain event that made it stale has
-    /// not been applied yet. The job runs again when it has.
-    AwaitingChain,
     /// Parents are missing.
     Parked { on: Vec<transaction::Hash> },
 }
@@ -216,9 +212,6 @@ struct Admission<E> {
     missing_error: Option<E>,
     /// Whether the one check allowed after that wait ended has been used.
     last_check_used: bool,
-    /// When its body arrived. Its slot is held at most [`MAX_UNDECIDED`] from
-    /// here.
-    body_at: Option<Instant>,
     /// Whether the chain was reset since it was reserved. See
     /// [`Effect::Start`].
     after_reset: bool,
@@ -233,7 +226,6 @@ enum Hidden {
         job: JobId,
         deadline: Instant,
     },
-    AwaitingChain,
     Retry {
         at: Instant,
     },
@@ -253,7 +245,7 @@ fn hidden_deadline(hidden: Option<&Hidden>, missing_since: Option<Instant>) -> O
         Hidden::Running { deadline, .. } => Some(*deadline),
         Hidden::Retry { at } => Some(*at),
         Hidden::Parked { .. } => missing_since.map(|since| since + T_PARK),
-        Hidden::Queued | Hidden::AwaitingChain => None,
+        Hidden::Queued => None,
     }
 }
 
@@ -349,8 +341,10 @@ impl Spends {
 pub struct MempoolState<E> {
     active: bool,
     now: Instant,
-    applied: Generation,
     tip: ChainTip,
+    /// The event count when the tip last changed. A job that started before
+    /// it verified for another tip.
+    tip_at: u64,
     next_id: u64,
     limits: Limits,
     /// The visible pool, and the rejection lists.
@@ -399,13 +393,13 @@ pub struct MempoolState<E> {
 }
 
 impl<E: VerifyError> MempoolState<E> {
-    /// An active, empty pool at `tip` and `generation`.
-    pub fn new(config: &Config, tip: ChainTip, generation: Generation, now: Instant) -> Self {
+    /// An active, empty pool at `tip`.
+    pub fn new(config: &Config, tip: ChainTip, now: Instant) -> Self {
         Self {
             active: true,
             now,
-            applied: generation,
             tip,
+            tip_at: 0,
             next_id: 0,
             limits: Limits::default(),
             storage: Storage::new(config),
@@ -481,7 +475,6 @@ impl<E: VerifyError> MempoolState<E> {
                 missing_since: None,
                 missing_error: None,
                 last_check_used: false,
-                body_at: None,
                 after_reset: false,
             },
         );
@@ -519,7 +512,6 @@ impl<E: VerifyError> MempoolState<E> {
         now: Instant,
     ) -> (WaiterId, Step) {
         self.enter(now);
-        let now = self.now;
         let tx_id = tx.id();
         let waiter = WaiterId(self.fresh());
         // The handle checks the body against the reservation before it sends
@@ -549,20 +541,20 @@ impl<E: VerifyError> MempoolState<E> {
         let admission = self.admission_at(key);
         admission.waiter = Some(waiter);
         admission.body = Some(tx);
-        admission.body_at = Some(now);
         self.start_admission(key);
         (waiter, self.take_step())
     }
 
-    /// The outcome of `job`, with the generation read before its first state
-    /// lookup and after its last. `wall` is the wall-clock time, stamped on a
+    /// The outcome of `job`. `wall` is the wall-clock time, stamped on a
     /// transaction that enters the pool.
+    ///
+    /// A job verifies for the block after the tip it started at, so its
+    /// outcome counts only while that is still the tip, as today's pool
+    /// checks the tip before it inserts. Otherwise the job runs again.
     pub fn outcome(
         &mut self,
         job: JobId,
         outcome: Outcome<E>,
-        before: GenerationRead,
-        after: GenerationRead,
         now: Instant,
         wall: DateTime<Utc>,
     ) -> Step {
@@ -571,39 +563,20 @@ impl<E: VerifyError> MempoolState<E> {
             // Cancelled, or timed out.
             return self.take_step();
         };
-        let fresh = before.brackets(after, self.applied);
-        // A stale outcome waits for the chain event only when that event is
-        // certainly still to come. In every other case the job runs again at
-        // once, so no work waits for an event that has already been applied.
-        use GenerationRead::{Changing, Stable};
-        let chain_is_ahead = match (before, after) {
-            (Stable(read), _) if read > self.applied => true,
-            (_, Stable(read)) if read > self.applied => true,
-            (Stable(read), Changing) => read == self.applied,
-            _ => false,
-        };
+        let stale = started_at < self.tip_at;
         match target {
             JobTarget::Admission(tx_id) => {
                 let key = self.admission_of[&tx_id];
-                if !fresh {
-                    if chain_is_ahead {
-                        self.admission_at(key).stage = Stage::AwaitingChain;
-                    } else {
-                        self.start_admission(key);
-                    }
+                if stale {
+                    self.start_admission(key);
                 } else {
                     self.admission_outcome(key, outcome, started_at, wall);
                 }
             }
             JobTarget::Revalidation(hash) => {
                 let key = self.pooled[&hash];
-                if !fresh {
-                    let next = if chain_is_ahead {
-                        Hidden::AwaitingChain
-                    } else {
-                        Hidden::Queued
-                    };
-                    self.set_hidden(key, Some(next));
+                if stale {
+                    self.set_hidden(key, Some(Hidden::Queued));
                 } else {
                     self.revalidation_outcome(key, hash, outcome, started_at, wall);
                 }
@@ -612,41 +585,25 @@ impl<E: VerifyError> MempoolState<E> {
         self.take_step()
     }
 
-    /// The next chain transition.
-    pub fn transition(&mut self, transition: ChainTransition, now: Instant) -> Step {
+    /// The best chain grew by `block`.
+    pub fn grow(&mut self, block: ConnectedBlock, now: Instant) -> Step {
         self.enter(now);
         if !self.active {
             return self.take_step();
         }
         let now = self.now;
-        self.applied = transition.generation;
-        self.tip = transition.after;
-        // After a reorg or an activation the pool is verified again, and a
-        // rejection made on the old chain or under the old rules says
-        // nothing. Today's reset drops every list too.
-        let verify_again = transition.is_reorg() || transition.rules_change;
-        if verify_again {
-            self.mark_reset();
-            self.storage.clear_rejections();
-        } else {
-            self.storage.clear_tip_rejections();
-        }
-        // What the whole batch mined, and what in the pool conflicts with it,
-        // are worked out before anything is removed. A pooled transaction that
+        self.set_tip(ChainTip {
+            hash: block.hash,
+            height: block.height,
+        });
+        self.storage.clear_tip_rejections();
+        // What the block mined, and what in the pool conflicts with it, are
+        // worked out before anything is removed. A pooled transaction that
         // conflicts with a later block transaction is then found even if an
         // earlier one already took its parent away.
-        let mined: Vec<transaction::Hash> = transition
-            .connected
-            .iter()
-            .flat_map(|block| block.transaction_hashes.iter().copied())
-            .collect();
+        let mined = block.transaction_hashes;
         let mined_set: HashSet<transaction::Hash> = mined.iter().copied().collect();
-        let spends = Spends::of(
-            transition
-                .connected
-                .iter()
-                .flat_map(|block| block.transactions.iter().map(|tx| &**tx)),
-        );
+        let spends = Spends::of(block.transactions.iter().map(|tx| &**tx));
         let conflicting: Vec<UnminedTxId> = self
             .pool
             .values()
@@ -657,7 +614,7 @@ impl<E: VerifyError> MempoolState<E> {
             })
             .map(|pooled| pooled.id)
             .collect();
-        for hash in &mined {
+        for hash in mined.iter() {
             if let Some(key) = self.pooled.get(hash).copied() {
                 // Its dependents stay. Their parent is on the chain now.
                 self.remove_one(key, RemovalReason::Mined);
@@ -695,34 +652,27 @@ impl<E: VerifyError> MempoolState<E> {
                 now,
             );
         }
-        // Every block of this transition was seen, and what they mined is gone
-        // already. So an expired transaction here was not mined, and what
-        // depends on it goes with it.
+        // The block was seen, and what it mined is gone already. So an
+        // expired transaction here was not mined, and what depends on it goes
+        // with it.
         self.remove_expired(true);
-        if verify_again {
-            self.hide_all();
-            // A block that left the chain may have spent an output a parked
-            // transaction is waiting for. Nothing names which, so each one
-            // looks again.
-            self.rerun_parked();
+        for hash in mined.iter() {
+            self.wake(*hash);
         }
-        for hash in mined {
-            self.wake(hash);
-        }
-        self.chain_applied();
         self.take_step()
     }
 
-    /// The transition queue overflowed. The core no longer knows which blocks
-    /// changed, so every pooled and parked transaction is checked again at
-    /// this tip.
-    pub fn resync(&mut self, tip: ChainTip, generation: Generation, now: Instant) -> Step {
+    /// The tip changed some other way than by one block: a reorg, several
+    /// blocks at once, or new rules for the next block. The core does not
+    /// know which blocks changed, so every pooled and parked transaction is
+    /// checked again at `tip`. A rejection made on the old chain or under the
+    /// old rules says nothing, so today's reset drops every list too.
+    pub fn reset(&mut self, tip: ChainTip, now: Instant) -> Step {
         self.enter(now);
         if !self.active {
             return self.take_step();
         }
-        self.applied = generation;
-        self.tip = tip;
+        self.set_tip(tip);
         self.mark_reset();
         self.storage.clear_rejections();
         // Expiry needs no verifier, only the new tip. Only the expired
@@ -731,8 +681,10 @@ impl<E: VerifyError> MempoolState<E> {
         // are checked again like everything else.
         self.remove_expired(false);
         self.hide_all();
+        // A block that left the chain may have spent an output a parked
+        // transaction is waiting for. Nothing names which, so each one looks
+        // again.
         self.rerun_parked();
-        self.chain_applied();
         self.take_step()
     }
 
@@ -779,11 +731,10 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The node is near the tip again. The pool starts empty. What this
     /// caused is in [`Self::effects`].
-    pub fn activate(&mut self, tip: ChainTip, generation: Generation, now: Instant) {
+    pub fn activate(&mut self, tip: ChainTip, now: Instant) {
         self.enter(now);
         self.active = true;
-        self.tip = tip;
-        self.applied = generation;
+        self.set_tip(tip);
         self.start_revalidations();
     }
 
@@ -820,20 +771,14 @@ impl<E: VerifyError> MempoolState<E> {
         self.tip
     }
 
-    /// The generation the machine has applied.
-    pub fn generation(&self) -> Generation {
-        self.applied
-    }
-
     /// The visible pool as a snapshot, for the change log position
     /// `last_change`.
     pub fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
         if !self.active {
-            return PoolSnapshot::inactive(self.tip, self.applied, last_change);
+            return PoolSnapshot::inactive(self.tip, last_change);
         }
         PoolSnapshot::new(
             self.tip,
-            self.applied,
             last_change,
             self.storage.mining_transactions().cloned().collect(),
             self.storage.transaction_dependencies().clone(),
@@ -847,16 +792,16 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The earliest time an input would apply a deadline, if any is set.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let admissions = self.admissions.values().flat_map(|admission| {
-            let stage = match &admission.stage {
+        let admissions = self
+            .admissions
+            .values()
+            .filter_map(|admission| match &admission.stage {
                 Stage::Verifying { deadline, .. } => Some(*deadline),
                 Stage::Parked { .. } => admission.missing_since.map(|since| since + T_PARK),
-                _ => None,
-            };
-            [stage, admission.body_at.map(|at| at + MAX_UNDECIDED)]
-        });
+                Stage::Reserved => None,
+            });
         let hidden = self.hidden_due.first().map(|(due, _)| *due);
-        admissions.flatten().chain(hidden).min()
+        admissions.chain(hidden).min()
     }
 
     /// Undecided transactions, plus leases, plus running revalidations.
@@ -937,13 +882,9 @@ impl<E: VerifyError> MempoolState<E> {
     #[cfg(test)]
     pub(crate) fn assert_invariants(&self) {
         // A snapshot is the storage's mining transactions, in its order and
-        // with the stamps it gave them, at the machine's tip and generation.
+        // with the stamps it gave them, at the machine's tip.
         let snapshot = self.snapshot(ChangeSeq(self.logged));
         assert_eq!(snapshot.tip, self.tip, "a snapshot is of the machine's tip");
-        assert_eq!(
-            snapshot.generation, self.applied,
-            "a snapshot carries the applied generation"
-        );
         if self.active {
             assert!(
                 snapshot
@@ -1117,7 +1058,7 @@ impl<E: VerifyError> MempoolState<E> {
                 if let Stage::Verifying { deadline, .. } = admission.stage {
                     assert!(
                         deadline > self.now,
-                        "a verification past its deadline was left running"
+                        "pool/slot-time-within-limit: a verification past its deadline was left running"
                     );
                 }
                 if matches!(admission.stage, Stage::Parked { .. }) {
@@ -1125,15 +1066,9 @@ impl<E: VerifyError> MempoolState<E> {
                         admission
                             .missing_since
                             .is_some_and(|since| since + T_PARK > self.now),
-                        "a transaction was left parked past its wait for a parent"
+                        "pool/slot-time-within-limit: a transaction was left parked past its wait for a parent"
                     );
                 }
-                assert!(
-                    admission
-                        .body_at
-                        .is_none_or(|at| at + MAX_UNDECIDED > self.now),
-                    "pool/slot-time-within-limit: an admission held its slot past the limit"
-                );
             }
         }
     }
@@ -1157,33 +1092,19 @@ impl<E: VerifyError> MempoolState<E> {
         }
         let now = self.now;
         self.storage.prune_rejections(now);
-        // Each admission can have a deadline for its stage and one for its
-        // slot. Whichever was due first decides it. When both were due at the
-        // same moment, the stage's own deadline decides.
         let mut timed_out = Vec::new();
         let mut unparked = Vec::new();
         for (key, admission) in &self.admissions {
-            let slot_due = admission.body_at.map(|at| at + MAX_UNDECIDED);
-            let (stage_due, parked) = match &admission.stage {
-                Stage::Verifying { deadline, .. } => (Some(*deadline), false),
-                Stage::Parked { .. } => (admission.missing_since.map(|since| since + T_PARK), true),
-                _ => (None, false),
-            };
-            let stage_is_due = stage_due.is_some_and(|due| due <= now);
-            let slot_is_due = slot_due.is_some_and(|due| due <= now);
-            let stage_first = match (stage_due, slot_due) {
-                (Some(stage), Some(slot)) => stage <= slot,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if stage_is_due && (stage_first || !slot_is_due) {
-                if parked {
-                    unparked.push(*key);
-                } else {
-                    timed_out.push(*key);
+            match &admission.stage {
+                Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
+                Stage::Parked { .. }
+                    if admission
+                        .missing_since
+                        .is_some_and(|since| since + T_PARK <= now) =>
+                {
+                    unparked.push(*key)
                 }
-            } else if slot_is_due {
-                timed_out.push(*key);
+                _ => {}
             }
         }
         for key in timed_out {
@@ -1691,11 +1612,6 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// Starts a verification of an admission that holds its body.
     fn start_admission(&mut self, key: u64) {
-        // No new check starts once the slot's time is up.
-        if self.undecided_too_long(key) {
-            self.fail_locally(key, LocalFault::VerifyTimeout);
-            return;
-        }
         let job = JobId(self.fresh());
         let deadline = self.now + T_VERIFY;
         let admission = self.admission_at(key);
@@ -1713,14 +1629,6 @@ impl<E: VerifyError> MempoolState<E> {
             revalidation: false,
             after_reset,
         });
-    }
-
-    /// Whether an admission has held its slot for [`MAX_UNDECIDED`] since its
-    /// body arrived.
-    fn undecided_too_long(&self, key: u64) -> bool {
-        self.admissions[&key]
-            .body_at
-            .is_some_and(|at| at + MAX_UNDECIDED <= self.now)
     }
 
     /// Cancels the job of an admission that is being verified.
@@ -1851,30 +1759,6 @@ impl<E: VerifyError> MempoolState<E> {
             }
         }
         debug_assert!(bodies.is_empty(), "storage held only pooled transactions");
-    }
-
-    /// The machine has applied a chain event: everything that waited for it
-    /// runs again.
-    fn chain_applied(&mut self) {
-        let waiting: Vec<u64> = self
-            .admissions
-            .iter()
-            .filter(|(_, admission)| matches!(admission.stage, Stage::AwaitingChain))
-            .map(|(key, _)| *key)
-            .collect();
-        for key in waiting {
-            self.start_admission(key);
-        }
-        let waiting: Vec<u64> = self
-            .hidden
-            .iter()
-            .copied()
-            .filter(|key| matches!(self.pool[key].hidden, Some(Hidden::AwaitingChain)))
-            .collect();
-        for key in waiting {
-            self.set_hidden(key, Some(Hidden::Queued));
-        }
-        self.start_revalidations();
     }
 
     /// Starts queued revalidations, parents first, while the revalidation
@@ -2149,6 +2033,12 @@ impl<E: VerifyError> MempoolState<E> {
         self.pool
             .get_mut(&key)
             .expect("the caller names a pooled transaction")
+    }
+
+    /// Moves the tip. Every running job verified for the old one.
+    fn set_tip(&mut self, tip: ChainTip) {
+        self.tip = tip;
+        self.tip_at = self.fresh();
     }
 
     fn fresh(&mut self) -> u64 {

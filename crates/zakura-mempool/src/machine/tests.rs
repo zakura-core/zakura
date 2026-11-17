@@ -28,10 +28,7 @@ use zakura_chain::{
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
-    mempool::port::{
-        ChainTip, ChainTransition, Charge, ConnectedBlock, Generation, GenerationRead,
-        ReservationId, Unreserved, Verdict,
-    },
+    mempool::port::{ChainTip, Charge, ConnectedBlock, ReservationId, Unreserved, Verdict},
 };
 use zakura_rt::collections::HashSet;
 
@@ -215,8 +212,6 @@ struct Bench {
     base: Instant,
     /// How far the test's clock is past `base`.
     now: Duration,
-    /// The generation of the last chain event the machine was handed.
-    generation: u64,
     height: u32,
     fork: u8,
 }
@@ -238,11 +233,10 @@ impl Bench {
     fn with(config: Config, limits: Limits) -> Self {
         let base = Instant::now();
         Self {
-            machine: Machine::new(&config, tip(START, 0), Generation(0), base).with_limits(limits),
+            machine: Machine::new(&config, tip(START, 0), base).with_limits(limits),
             tracker: Tracker::default(),
             base,
             now: Duration::ZERO,
-            generation: 0,
             height: START,
             fork: 0,
         }
@@ -315,33 +309,17 @@ impl Bench {
         self.took(step)
     }
 
-    /// Reports `outcome` for `job`, with the generation readings `before`
-    /// and `after` its lookups.
-    fn outcome_read(
-        &mut self,
-        job: JobId,
-        outcome: Outcome<TestVerifyError>,
-        before: GenerationRead,
-        after: GenerationRead,
-    ) -> Step {
-        // The test knows the answer is not stale when both readings are the
-        // generation it last handed the machine.
-        let current = GenerationRead::Stable(Generation(self.generation));
+    /// Reports `outcome` for `job`.
+    fn outcome(&mut self, job: JobId, outcome: Outcome<TestVerifyError>) -> Step {
         let charge = match &outcome {
-            Outcome::Fail { charge, .. } if before == current && after == current => Some(*charge),
+            Outcome::Fail { charge, .. } => Some(*charge),
             _ => None,
         };
         self.tracker.answers(job, charge);
         let step = self
             .machine
-            .outcome(job, outcome, before, after, self.at(), chrono::Utc::now());
+            .outcome(job, outcome, self.at(), chrono::Utc::now());
         self.took(step)
-    }
-
-    /// Reports `outcome` for `job`, read at the generation the machine has.
-    fn outcome(&mut self, job: JobId, outcome: Outcome<TestVerifyError>) -> Step {
-        let read = GenerationRead::Stable(Generation(self.generation));
-        self.outcome_read(job, outcome, read, read)
     }
 
     /// `job` passes `tx`, which spends `pool_inputs` from the pool.
@@ -402,70 +380,42 @@ impl Bench {
         self.admit_using(tx, Vec::new());
     }
 
-    /// `disconnect` blocks leave the chain, then one block joins it for
-    /// each entry of `blocks`, mining that entry's transactions.
-    fn transition(&mut self, disconnect: u32, blocks: &[Vec<&Tx>], rules_change: bool) -> Step {
-        self.generation += 1;
-        let before = self.tip();
-        let old_fork = self.fork;
-        if disconnect > 0 {
-            self.fork = self.fork.wrapping_add(1);
-        }
-        let base = self.height - disconnect;
-        let connected: Vec<ConnectedBlock> = blocks
-            .iter()
-            .enumerate()
-            .map(|(index, mined)| {
-                let height = base + 1 + u32::try_from(index).expect("a small block count");
-                let at = tip(height, self.fork);
-                ConnectedBlock {
-                    hash: at.hash,
-                    height: at.height,
-                    transactions: mined
-                        .iter()
-                        .map(|tx| {
-                            TransactionHandle::Shared(tx.real.transaction.transaction().clone())
-                        })
-                        .collect(),
-                    transaction_hashes: mined.iter().map(|tx| tx.id().mined_id()).collect(),
-                }
-            })
-            .collect();
-        self.height = base + u32::try_from(blocks.len()).expect("a small block count");
-        let transition = ChainTransition {
-            before: Some(before),
-            disconnected: (0..disconnect)
-                .map(|back| tip(before.height.0 - back, old_fork))
+    /// The chain grows by one block that mines `mined`.
+    fn grow(&mut self, mined: &[&Tx]) -> Step {
+        self.height += 1;
+        let at = self.tip();
+        let block = ConnectedBlock {
+            hash: at.hash,
+            height: at.height,
+            transactions: mined
+                .iter()
+                .map(|tx| TransactionHandle::Shared(tx.real.transaction.transaction().clone()))
                 .collect(),
-            connected,
-            after: self.tip(),
-            generation: Generation(self.generation),
-            rules_change,
+            transaction_hashes: mined.iter().map(|tx| tx.id().mined_id()).collect(),
         };
-        let step = self.machine.transition(transition, self.at());
+        self.tracker.tip_changed();
+        let step = self.machine.grow(block, self.at());
         let step = self.took(step);
-        let mined: Vec<&Tx> = blocks.iter().flatten().copied().collect();
-        self.tracker.connected(&mined);
+        self.tracker.connected(mined);
         step
     }
 
-    /// The chain grows by one block that mines `mined`.
-    fn grow(&mut self, mined: &[&Tx]) -> Step {
-        self.transition(0, &[mined.to_vec()], false)
+    /// The tip moves to another fork at the same height, and the machine is
+    /// told only the new tip.
+    fn reset(&mut self) -> Step {
+        self.reset_by(0)
     }
 
-    /// The tip block leaves the chain, and a block that mines `mined` takes
-    /// its place.
-    fn reorg(&mut self, mined: &[&Tx]) -> Step {
-        self.transition(1, &[mined.to_vec()], false)
-    }
-
-    /// The machine missed chain events, and is told only the tip.
-    fn resync(&mut self) -> Step {
-        self.generation += 1;
-        let step = self
-            .machine
-            .resync(self.tip(), Generation(self.generation), self.at());
+    /// The tip moves `blocks` up without the machine seeing them, or to
+    /// another fork at the same height if that is zero. The machine is told
+    /// only the new tip.
+    fn reset_by(&mut self, blocks: u32) -> Step {
+        if blocks == 0 {
+            self.fork = self.fork.wrapping_add(1);
+        }
+        self.height += blocks;
+        self.tracker.tip_changed();
+        let step = self.machine.reset(self.tip(), self.at());
         self.took(step)
     }
 
@@ -487,8 +437,7 @@ impl Bench {
 
     /// The pool turns on again, at the tip the test is at.
     fn activate(&mut self) -> Step {
-        self.machine
-            .activate(self.tip(), Generation(self.generation), self.at());
+        self.machine.activate(self.tip(), self.at());
         let step = self.machine.effects();
         self.took(step)
     }

@@ -245,10 +245,6 @@ async fn pool_on(
             (PoolUnderTest::Classic(Box::new(pool)), subscriber)
         }
         Mode::Core => {
-            let transitions = read_state
-                .chain_transitions()
-                .expect("a writable state publishes chain transitions")
-                .clone();
             let (active, active_rx) = watch::channel(false);
             // The announcer's advertisements are answered here, so the peer
             // set only sees the requests these tests name.
@@ -266,9 +262,8 @@ async fn pool_on(
                 false,
                 outbound,
                 BoxCloneService::new(read_state),
-                &transitions,
+                chain_tip_change.clone(),
                 tx_verifier,
-                network.clone(),
                 Arc::new(|_| true),
                 {
                     let latest_chain_tip = latest_chain_tip.clone();
@@ -277,8 +272,7 @@ async fn pool_on(
                 crate::components::test_misbehavior::reporter(),
                 Exempt::default(),
                 active_rx,
-            )
-            .expect("the test is the only consumer of the chain transitions");
+            );
             tokio::spawn(assembled.core.run());
             tokio::spawn(assembled.follower.run());
             (

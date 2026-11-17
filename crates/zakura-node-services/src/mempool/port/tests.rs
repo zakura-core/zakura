@@ -8,9 +8,8 @@ use zakura_chain::{
 };
 
 use super::{
-    pool_port, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, Generation, GenerationCell,
-    GenerationRead, LocalFault, PoolCommand, PoolSnapshot, ReservationId, Unreserved, Verdict,
-    CHANGE_LOG_CAPACITY, COMMAND_QUEUE,
+    pool_port, ChainTip, Change, ChangeLog, ChangeSeq, ChangesSince, LocalFault, PoolCommand,
+    PoolSnapshot, ReservationId, Unreserved, Verdict, CHANGE_LOG_CAPACITY, COMMAND_QUEUE,
 };
 use crate::mempool::TransactionDependencies;
 
@@ -22,10 +21,6 @@ fn hash(n: u16) -> transaction::Hash {
 
 fn id(n: u16) -> UnminedTxId {
     UnminedTxId::Legacy(hash(n))
-}
-
-fn stable(generation: u64) -> GenerationRead {
-    GenerationRead::Stable(Generation(generation))
 }
 
 fn secs(seconds: u64) -> Duration {
@@ -57,35 +52,10 @@ fn snapshot_at(last_change: ChangeSeq) -> PoolSnapshot {
             hash: zakura_chain::block::Hash([0; 32]),
             height: Height(100),
         },
-        Generation(0),
         last_change,
         Vec::new(),
         TransactionDependencies::default(),
     )
-}
-
-#[test]
-fn generation_reads_changing_from_begin_until_finish() {
-    let cell = GenerationCell::new();
-    assert_eq!(cell.read(), stable(0));
-
-    cell.begin_change();
-    assert_eq!(cell.read(), GenerationRead::Changing);
-
-    assert_eq!(cell.finish_change(), Generation(1));
-    assert_eq!(cell.read(), stable(1));
-}
-
-#[test]
-fn only_two_equal_stable_reads_of_the_applied_generation_bracket_work() {
-    let applied = Generation(3);
-    assert!(stable(3).brackets(stable(3), applied));
-    // A change became visible during the work.
-    assert!(!stable(3).brackets(stable(4), applied));
-    assert!(!stable(3).brackets(GenerationRead::Changing, applied));
-    assert!(!GenerationRead::Changing.brackets(GenerationRead::Changing, applied));
-    // The readers were already ahead of what the core has applied.
-    assert!(!stable(4).brackets(stable(4), applied));
 }
 
 #[test]
@@ -292,7 +262,7 @@ fn a_snapshot_says_whether_the_pool_is_on() {
         height: Height(100),
     };
     assert!(snapshot_at(ChangeSeq(0)).active);
-    let off = PoolSnapshot::inactive(tip, Generation(0), ChangeSeq(0));
+    let off = PoolSnapshot::inactive(tip, ChangeSeq(0));
     assert!(!off.active);
     assert!(off.transactions.is_empty());
 }

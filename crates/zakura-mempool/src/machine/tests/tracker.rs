@@ -23,8 +23,8 @@ struct Answering {
     job: u64,
     tx: UnminedTxId,
     revalidation: bool,
-    /// The charge a failing answer carries, when the test also knows the
-    /// answer is not stale.
+    /// The charge a failing answer carries, when the tip has not changed
+    /// since the job started.
     charge: Option<Charge>,
 }
 
@@ -41,6 +41,9 @@ pub(crate) struct Tracker {
     /// The running jobs, with their transaction and whether each is a
     /// revalidation.
     jobs: BTreeMap<u64, (UnminedTxId, bool)>,
+    /// The jobs that were running when the tip last changed. Each verified
+    /// for another tip.
+    stale: BTreeSet<u64>,
     /// Jobs the machine cancelled before the test answered them.
     cancelled: Vec<(u64, UnminedTxId)>,
     /// The body of every transaction the machine has started a job for,
@@ -79,11 +82,20 @@ impl Tracker {
         );
     }
 
+    /// The tip is about to change. Every running job verified for the old
+    /// one.
+    pub(crate) fn tip_changed(&mut self) {
+        self.stale.extend(self.jobs.keys().copied());
+    }
+
     /// The test is about to answer `job`. `charge` is the charge a failing
-    /// answer carries, given only when the test knows the answer is not
-    /// stale.
+    /// answer carries.
     pub(crate) fn answers(&mut self, job: JobId, charge: Option<Charge>) {
         self.cancelled.retain(|(cancelled, _)| *cancelled != job.0);
+        let stale = self.stale.remove(&job.0);
+        if stale && self.jobs.contains_key(&job.0) {
+            self.saw("answer for another tip");
+        }
         self.answering = self
             .jobs
             .remove(&job.0)
@@ -91,7 +103,7 @@ impl Tracker {
                 job: job.0,
                 tx,
                 revalidation,
-                charge,
+                charge: charge.filter(|_| !stale),
             });
     }
 

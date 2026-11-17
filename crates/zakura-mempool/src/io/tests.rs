@@ -22,17 +22,16 @@ use zakura_chain::{
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        chain_transitions, pool_port, ChainReason, ChainTip, ChainTransition,
-        ChainTransitionSender, ConnectedBlock, LocalFault, PoolHandle, PoolReader, RejectionScope,
-        Unreserved, Verdict,
+        pool_port, ChainEvent, ChainReason, ChainTip, ConnectedBlock, LocalFault, PoolHandle,
+        PoolReader, RejectionScope, Unreserved, Verdict,
     },
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{watch, Notify},
+    sync::{mpsc, watch, Notify},
 };
 
-use super::{PoolCore, Verifier};
+use super::{ChainFeed, PoolCore, Verifier};
 
 mod mirror;
 use crate::{
@@ -48,6 +47,15 @@ const ANSWER: Duration = Duration::from_secs(5);
 
 /// Run once while the verifier builds a transaction's future.
 type Hook = Box<dyn FnOnce() + Send>;
+
+/// The chain events a test sends, as the core's feed.
+struct Feed(mpsc::UnboundedReceiver<ChainEvent>);
+
+impl ChainFeed for Feed {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<ChainEvent>> + Send + '_>> {
+        Box::pin(self.0.recv())
+    }
+}
 
 /// A verifier that reads the pool through the published snapshot. It can be
 /// told to hold a transaction forever or to panic on it.
@@ -146,7 +154,7 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
                 std::future::pending::<()>().await;
             }
             assert!(!panics, "the verifier panics on this transaction");
-            // The chain is read only now, inside the generation readings.
+            // The chain is read only now, while the job runs.
             let mined = mined.lock().expect("no test panics holding it").clone();
             let known: HashSet<_> = txs.keys().map(UnminedTxId::mined_id).collect();
             let (from_pool, missing): (Vec<OutPoint>, Vec<OutPoint>) = tx
@@ -174,15 +182,13 @@ impl Verifier<TestVerifyError> for SnapshotVerifier {
 /// A running core and what drives it.
 struct Harness {
     handle: PoolHandle,
-    chain: Arc<Mutex<ChainTransitionSender>>,
+    chain: mpsc::UnboundedSender<ChainEvent>,
     core: tokio::task::JoinHandle<()>,
     active: watch::Sender<bool>,
     verifier: SnapshotVerifier,
     height: u32,
     /// What the core reported for each chain event it applied.
     tips: Mutex<std::sync::mpsc::Receiver<super::TipApplied>>,
-    /// The chain's generation cell, which the core's verification jobs read.
-    generation: zakura_node_services::mempool::port::GenerationCell,
 }
 
 impl Harness {
@@ -204,18 +210,21 @@ impl Harness {
         )
     }
 
-    /// Starts a core at `start_tip` that knows `txs`.
+    /// Starts a core that knows `txs`. Its chain names `start_tip` first, or
+    /// nothing yet.
     fn start_at(txs: &[Tx], start_tip: Option<ChainTip>) -> Self {
         Self::start_with(txs, start_tip, Limits::default())
     }
 
-    /// Starts a core at `start_tip` that knows `txs`, with `limits`.
+    /// [`Self::start_at`] with `limits`.
     fn start_with(txs: &[Tx], start_tip: Option<ChainTip>, limits: Limits) -> Self {
-        let chain = chain_transitions(start_tip);
-        let transitions = chain.transitions();
-        let (start, events) = transitions
-            .subscribe()
-            .expect("the test is the only consumer");
+        let (chain, events) = mpsc::unbounded_channel();
+        // The state's tip watch names the tip first, as a reset.
+        if let Some(tip) = start_tip {
+            chain
+                .send(ChainEvent::Reset(tip))
+                .expect("the feed is open");
+        }
         let (handle, inbox) = pool_port();
         let (active, active_rx) = watch::channel(true);
         let verifier = SnapshotVerifier {
@@ -237,15 +246,12 @@ impl Harness {
                 tx_cost_limit: u64::MAX / 2,
                 ..Config::default()
             },
-            start,
-            events,
-            transitions.generation(),
+            Box::new(Feed(events)),
             verifier.clone(),
             inbox,
             active_rx,
             limits,
         );
-        let generation = transitions.generation();
         let (tips_tx, tips) = std::sync::mpsc::channel();
         let core = core.on_tip_applied(move |applied| {
             let _ = tips_tx.send(applied.clone());
@@ -253,13 +259,12 @@ impl Harness {
         let core = tokio::spawn(core.run());
         Self {
             handle,
-            chain: Arc::new(Mutex::new(chain)),
+            chain,
             core,
             active,
             verifier,
             height: 100,
             tips: Mutex::new(tips),
-            generation,
         }
     }
 
@@ -296,89 +301,43 @@ impl Harness {
 
     /// Mines `txs` in one new block on fork 0.
     fn mine(&mut self, txs: &[&Tx]) {
-        self.change(0, 0, txs);
+        self.verifier
+            .mined
+            .lock()
+            .expect("no test panics holding it")
+            .extend(txs.iter().map(|tx| tx.id().mined_id()));
+        self.height += 1;
+        let block = tip(self.height, 0);
+        self.send(ChainEvent::Grow(ConnectedBlock {
+            hash: block.hash,
+            height: block.height,
+            transactions: txs
+                .iter()
+                .map(|tx| TransactionHandle::Shared(tx.real.transaction.transaction().clone()))
+                .collect(),
+            transaction_hashes: txs.iter().map(|tx| tx.id().mined_id()).collect(),
+        }));
     }
 
-    /// Disconnects `disconnect` blocks and connects one new block on `fork`
-    /// that mines `txs`. The chain is marked as changing before anything else
-    /// happens, as the state writer does.
-    fn change(&mut self, disconnect: u32, fork: u8, txs: &[&Tx]) {
-        self.change_under(disconnect, fork, txs, false);
-    }
-
-    /// Connects `blocks` empty blocks in one transition, with none leaving.
-    fn grow_by(&mut self, blocks: u32) {
-        let mut chain = self.chain.lock().expect("no test panics holding it");
-        chain.begin_change();
-        let before = chain.tip().expect("the test chain has a tip");
-        let connected: Vec<ConnectedBlock> = (1..=blocks)
-            .map(|ahead| {
-                let block = tip(self.height + ahead, 0);
-                ConnectedBlock {
-                    hash: block.hash,
-                    height: block.height,
-                    transactions: Vec::new(),
-                    transaction_hashes: Vec::new().into(),
-                }
-            })
-            .collect();
-        self.height += blocks;
-        let after = tip(self.height, 0);
-        chain.finish_change(after, |_, generation| {
-            Some(ChainTransition {
-                before: Some(before),
-                disconnected: Vec::new(),
-                connected,
-                after,
-                generation,
-                rules_change: false,
-            })
-        });
-    }
-
-    /// [`Harness::change`], where the new block's height activates new
-    /// rules if `rules_change`.
-    fn change_under(&mut self, disconnect: u32, fork: u8, txs: &[&Tx], rules_change: bool) {
-        let mut chain = self.chain.lock().expect("no test panics holding it");
-        chain.begin_change();
+    /// The best chain switches to `fork` at the same height, and the new
+    /// chain has mined only `txs`. The core is told only the new tip.
+    fn reorg(&mut self, fork: u8, txs: &[&Tx]) {
         {
             let mut mined = self
                 .verifier
                 .mined
                 .lock()
                 .expect("no test panics holding it");
-            if disconnect > 0 {
-                // The tests do not track what each block mined.
-                mined.clear();
-            }
+            // The tests do not track what each block mined.
+            mined.clear();
             mined.extend(txs.iter().map(|tx| tx.id().mined_id()));
         }
-        let before = chain.tip().expect("the test chain has a tip");
-        let height = self.height - disconnect + 1;
-        self.height = height;
-        let after = tip(height, fork);
-        chain.finish_change(after, |_, generation| {
-            Some(ChainTransition {
-                before: Some(before),
-                disconnected: (0..disconnect)
-                    .map(|back| tip(before.height.0 - back, 0xff))
-                    .collect(),
-                connected: vec![ConnectedBlock {
-                    hash: after.hash,
-                    height: after.height,
-                    transactions: txs
-                        .iter()
-                        .map(|tx| {
-                            TransactionHandle::Shared(tx.real.transaction.transaction().clone())
-                        })
-                        .collect(),
-                    transaction_hashes: txs.iter().map(|tx| tx.id().mined_id()).collect(),
-                }],
-                after,
-                generation,
-                rules_change,
-            })
-        });
+        self.send(ChainEvent::Reset(tip(self.height, fork)));
+    }
+
+    /// Sends the core one chain event.
+    fn send(&self, event: ChainEvent) {
+        self.chain.send(event).expect("the core reads its feed");
     }
 
     /// Holds the next verification of `tx` until the returned gate opens.
@@ -536,8 +495,8 @@ async fn a_block_that_mines_a_pooled_transaction_removes_it() {
 }
 
 /// Each chain event the core applies is reported for the node's trace: a
-/// one-block growth with what stays visible, and a reorg as a reset with
-/// what waits hidden to be verified again.
+/// one-block growth with what stays visible, and a reset with what waits
+/// hidden to be verified again.
 #[tokio::test]
 async fn each_applied_chain_event_is_reported_for_the_trace() {
     let (parent, child) = parent_and_child();
@@ -551,13 +510,7 @@ async fn each_applied_chain_event_is_reported_for_the_trace() {
     assert_eq!(grew.tip.height.0, harness.height);
     assert_eq!((grew.visible, grew.hidden), (1, 0), "the child stays");
 
-    // Two blocks at once with none leaving is growth too: nothing is hidden.
-    harness.grow_by(2);
-    let jumped = harness.next_tip().await;
-    assert!(!jumped.reset, "{jumped:?}");
-    assert_eq!((jumped.visible, jumped.hidden), (1, 0), "the child stays");
-
-    harness.change(1, 1, &[]);
+    harness.reorg(1, &[]);
     let reorged = harness.next_tip().await;
     assert!(reorged.reset, "{reorged:?}");
     assert_eq!(
@@ -567,13 +520,8 @@ async fn each_applied_chain_event_is_reported_for_the_trace() {
     );
 
     // A reset counts what the pool held before it, as today's counts its
-    // retries before it clears: here the reorg's block mines the child, and
-    // it is still counted.
-    harness.change(1, 2, &[&child]);
-    let reset = harness.next_tip().await;
-    assert!(reset.reset, "{reset:?}");
-    assert_eq!((reset.visible, reset.hidden), (0, 0), "the child was mined");
-    assert_eq!(reset.held_before, 1, "the child is counted from before");
+    // retries before it clears.
+    assert_eq!(reorged.held_before, 1, "the child is counted from before");
 
     // While the pool is off, a chain event is remembered and not applied,
     // so it writes no row, as today's pool writes none while disabled.
@@ -752,57 +700,6 @@ async fn a_verification_that_spans_a_block_runs_again() {
     );
 }
 
-/// A verification during which the chain's generation moves is not trusted,
-/// even when its outcome reaches the core before the chain event does, so
-/// the core verifies it again once the event comes.
-#[tokio::test]
-async fn a_verification_read_across_a_generation_change_runs_again() {
-    let (parent, _) = parent_and_child();
-    let mut harness = Harness::start(std::slice::from_ref(&parent));
-    let gate = harness.gate(&parent);
-
-    let verdict = harness.submit_in_background(&parent).await;
-    harness.calls_reach(&parent, 1).await;
-    // The state writer starts a change while the job looks, and the outcome
-    // reaches the core before the chain event does.
-    harness.generation.begin_change();
-    gate.notify_one();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    harness.generation.finish_change();
-    harness.mine(&[]);
-
-    assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
-    assert_eq!(
-        harness.calls(&parent),
-        2,
-        "the outcome straddled a change, so the core checked again"
-    );
-}
-
-/// A verification that starts while the state writer is already changing
-/// the chain is not trusted, so the core verifies it again once the change
-/// lands.
-#[tokio::test]
-async fn a_verification_started_during_a_change_runs_again() {
-    let (parent, _) = parent_and_child();
-    let mut harness = Harness::start(std::slice::from_ref(&parent));
-    let gate = harness.gate(&parent);
-
-    harness.generation.begin_change();
-    let verdict = harness.submit_in_background(&parent).await;
-    harness.calls_reach(&parent, 1).await;
-    gate.notify_one();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    harness.generation.finish_change();
-    harness.mine(&[]);
-
-    assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
-    assert!(
-        harness.calls(&parent) >= 2,
-        "the job read a chain that was changing, so the core checked again"
-    );
-}
-
 #[tokio::test]
 async fn a_chain_that_reorgs_and_comes_back_during_a_verification_runs_it_again() {
     let (parent, _) = parent_and_child();
@@ -811,10 +708,10 @@ async fn a_chain_that_reorgs_and_comes_back_during_a_verification_runs_it_again(
 
     let verdict = harness.submit_in_background(&parent).await;
     harness.calls_reach(&parent, 1).await;
-    // A to B and back to A. The tip ends where it started, but the
-    // generation does not, so the outcome is not trusted.
-    harness.change(1, 1, &[]);
-    harness.change(1, 0, &[]);
+    // A to B and back to A. The tip ends where it started, but it moved
+    // while the job ran, so the outcome is not trusted.
+    harness.reorg(1, &[]);
+    harness.reorg(0, &[]);
     gate.notify_one();
 
     assert!(matches!(verdict_of(verdict).await, Verdict::Admitted));
@@ -849,7 +746,7 @@ async fn a_revalidation_that_panics_is_tried_again_later() {
         .insert(parent.id());
 
     // A reorg hides the pool, and its revalidation panics.
-    harness.change(1, 1, &[]);
+    harness.reorg(1, &[]);
     harness.calls_reach(&parent, 2).await;
     harness
         .snapshot_until(|snapshot| snapshot.transaction(&parent.id().mined_id()).is_none())
@@ -938,7 +835,7 @@ async fn dropping_every_outside_handle_stops_the_core() {
 #[tokio::test]
 async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
     let (parent, _) = parent_and_child();
-    let mut harness = Harness::start_at(std::slice::from_ref(&parent), None);
+    let harness = Harness::start_at(std::slice::from_ref(&parent), None);
     harness.snapshot_until(|snapshot| !snapshot.active).await;
     assert!(matches!(
         harness.handle.reserve(parent.id()).await,
@@ -946,76 +843,17 @@ async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
     ));
 
     // The first block names a tip, and the pool turns on at it.
-    harness.height = 0;
-    {
-        let mut chain = harness.chain.lock().expect("no test panics holding it");
-        chain.begin_change();
-        let after = tip(1, 0);
-        chain.finish_change(after, |_, _| None);
-    }
+    harness.send(ChainEvent::Reset(tip(1, 0)));
     harness
         .snapshot_until(|snapshot| snapshot.active && snapshot.tip.height.0 == 1)
         .await;
     assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
 }
 
-#[tokio::test]
-async fn a_chain_change_before_the_worker_first_looks_runs_the_job_again() {
-    let (parent, _) = parent_and_child();
-    let harness = Harness::start(std::slice::from_ref(&parent));
-    // While the core starts the job, inside its step, a block lands. The job
-    // was bound to the tip before it, so its result cannot be trusted at the
-    // new tip, though both of the worker's readings agree with each other.
-    let chain = harness.chain.clone();
-    harness
-        .verifier
-        .hooks
-        .lock()
-        .expect("no test panics holding it")
-        .insert(
-            parent.id(),
-            Box::new(move || {
-                let mut chain = chain.lock().expect("no test panics holding it");
-                let before = chain.tip().expect("the test chain has a tip");
-                let after = tip(before.height.0 + 1, 0);
-                chain.begin_change();
-                chain.finish_change(after, |_, generation| {
-                    Some(ChainTransition {
-                        before: Some(before),
-                        disconnected: Vec::new(),
-                        connected: vec![ConnectedBlock {
-                            hash: after.hash,
-                            height: after.height,
-                            transactions: Vec::new(),
-                            transaction_hashes: Arc::new([]),
-                        }],
-                        after,
-                        generation,
-                        rules_change: false,
-                    })
-                });
-            }),
-        );
-
-    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
-    assert_eq!(
-        harness.calls(&parent),
-        2,
-        "the job bound to the old tip ran again at the new one"
-    );
-}
-
-/// The reorg half of the recovery gate. After a reorg the core gets every
-/// pooled transaction back as it does after an upgrade: both hide the whole
-/// pool, both show the first transaction again and get it all back in about
-/// the same time, and neither runs more
-/// verifications at once than the revalidation share. Today's pool resets
-/// the same way after both, so the boundary test that compares the two pools
-/// after an upgrade covers a reorg as well.
-// Paused time makes both recoveries take their verifications' delays and
-// nothing else, so scheduling noise on a busy machine cannot tell them apart.
+/// After a reset the core gets every pooled transaction back, and runs no
+/// more verifications at once than the revalidation share.
 #[tokio::test(start_paused = true)]
-async fn a_reorg_recovers_the_pool_as_an_upgrade_does() {
+async fn a_reset_gets_the_pool_back_within_the_revalidation_share() {
     use std::sync::atomic::Ordering;
     use zakura_node_services::mempool::port::MAX_REVALIDATING;
 
@@ -1026,64 +864,35 @@ async fn a_reorg_recovers_the_pool_as_an_upgrade_does() {
         .map(|_| build(&mut runner, &[], 1, None))
         .collect();
 
-    let mut recoveries = Vec::new();
-    for reorg in [false, true] {
-        let mut harness = Harness::start(&txs);
-        for tx in &txs {
-            assert!(matches!(harness.submit(tx).await, Verdict::Admitted));
+    let mut harness = Harness::start(&txs);
+    for tx in &txs {
+        assert!(matches!(harness.submit(tx).await, Verdict::Admitted));
+    }
+    *harness
+        .verifier
+        .delay
+        .lock()
+        .expect("no test panics holding it") = Some(DELAY);
+    harness.reorg(1, &[]);
+    let applied = harness.next_tip().await;
+    assert!(applied.reset, "the reset hides the pool to verify it again");
+    assert_eq!(applied.hidden, POOLED, "every pooled transaction is hidden");
+    // The tip is reported before the core publishes the step, so a snapshot
+    // counts only once it is of the new tip.
+    let new_tip = applied.tip;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while harness
+            .handle
+            .snapshot()
+            .is_none_or(|snapshot| snapshot.tip != new_tip || snapshot.transactions.len() < POOLED)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        *harness
-            .verifier
-            .delay
-            .lock()
-            .expect("no test panics holding it") = Some(DELAY);
-        let started = tokio::time::Instant::now();
-        if reorg {
-            harness.change(1, 1, &[]);
-        } else {
-            harness.change_under(0, 0, &[], true);
-        }
-        let applied = harness.next_tip().await;
-        assert!(
-            applied.reset,
-            "the change hides the pool to verify it again"
-        );
-        assert_eq!(applied.hidden, POOLED, "every pooled transaction is hidden");
-        // The tip is reported before the core publishes the step, so a
-        // snapshot counts only once it is of the new tip.
-        let new_tip = applied.tip;
-        let back = |count: usize| {
-            let handle = &harness.handle;
-            async move {
-                tokio::time::timeout(Duration::from_secs(60), async {
-                    while handle.snapshot().is_none_or(|snapshot| {
-                        snapshot.tip != new_tip || snapshot.transactions.len() < count
-                    }) {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                })
-                .await
-                .expect("the core gets the transactions back");
-                started.elapsed()
-            }
-        };
-        let first = back(1).await;
-        let full = back(POOLED).await;
-        recoveries.push((first, full, harness.verifier.peak.load(Ordering::SeqCst)));
-    }
-    let [(upgrade_first, upgrade, upgrade_peak), (reorg_first, reorg, reorg_peak)] = recoveries[..]
-    else {
-        unreachable!("two runs");
-    };
-    for peak in [upgrade_peak, reorg_peak] {
-        assert!(peak <= MAX_REVALIDATING, "within the share: {recoveries:?}");
-    }
-    // One verification's delay either way, for where each run's last batch
-    // of verifications starts.
-    for (reorg, upgrade) in [(reorg_first, upgrade_first), (reorg, upgrade)] {
-        assert!(
-            reorg <= upgrade + DELAY && upgrade <= reorg + DELAY,
-            "a reorg recovers as an upgrade does, first and full: {recoveries:?}"
-        );
-    }
+    })
+    .await
+    .expect("the core gets the transactions back");
+    assert!(
+        harness.verifier.peak.load(Ordering::SeqCst) <= MAX_REVALIDATING,
+        "within the share"
+    );
 }

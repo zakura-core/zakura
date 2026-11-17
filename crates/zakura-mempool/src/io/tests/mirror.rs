@@ -1,6 +1,6 @@
 //! The core through its port, compared with the machine alone.
 //!
-//! `pool_state_matches_model` shows the machine is right. This shows the task
+//! The machine's own tests show the machine is right. This shows the task
 //! around it adds nothing and loses nothing. A random run drives the core
 //! through its port and gives a second machine the same inputs directly, one
 //! at a time. After each one, everything a caller can see must be what the
@@ -23,24 +23,24 @@ use chrono::Utc;
 use proptest::test_runner::TestRunner;
 use tokio::task::JoinHandle;
 use zakura_chain::{
-    block::Height,
+    block::{self, Height},
     transaction::{self, UnminedTx, UnminedTxId},
     transparent::OutPoint,
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
-        chain_transitions, pool_port, ChainTip, ChainTransition, ChainTransitionSender, Change,
-        ChangeSeq, ChangesSince, Charge, ConnectedBlock, Generation, GenerationCell,
-        GenerationRead, PoolHandle, PoolSnapshot, Reservation, ReservationId, Verdict,
+        pool_port, ChainEvent, ChainTip, Change, ChangeSeq, ChangesSince, Charge, ConnectedBlock,
+        PoolHandle, PoolSnapshot, Reservation, ReservationId, Verdict,
     },
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time::{self, Instant},
 };
 
+use super::Feed;
 use crate::{
     config::Config,
     io::{PoolCore, Verifier},
@@ -123,8 +123,7 @@ impl Dice {
 /// the core's callers should see next.
 struct Mirror {
     handle: PoolHandle,
-    chain: ChainTransitionSender,
-    generation: GenerationCell,
+    chain: mpsc::UnboundedSender<ChainEvent>,
     active: watch::Sender<bool>,
     core: JoinHandle<()>,
     calls: Arc<Mutex<Vec<Call>>>,
@@ -136,7 +135,6 @@ struct Mirror {
     blocks: Vec<Vec<transaction::Hash>>,
     fork: u8,
     chain_tip: ChainTip,
-    chain_generation: Generation,
     wanted_active: bool,
     /// The machine's steps that carried changes: the log's batches.
     log: Vec<Vec<Change>>,
@@ -145,8 +143,8 @@ struct Mirror {
     cursor: ChangeSeq,
     /// The verifications the machine started in this step.
     started: Vec<(JobId, UnminedTxId, bool, bool)>,
-    /// The verifications running, with the reading each began at.
-    running: Vec<(JobId, Call, GenerationRead)>,
+    /// The verifications running.
+    running: Vec<(JobId, Call)>,
     cancelled: Vec<JobId>,
     cancelled_fetches: HashSet<ReservationId>,
     held: Vec<(usize, Reservation)>,
@@ -157,8 +155,8 @@ struct Mirror {
 }
 
 impl Mirror {
-    /// Starts a core and a machine on one tip, with a fixed set of
-    /// transactions: four that stand alone, a parent and its two children,
+    /// Starts a core and a machine, names one tip to both, and gives them a
+    /// fixed set of transactions: four that stand alone, a parent and its two children,
     /// two that spend one chain output, two the verifier rejects, and one
     /// that expires.
     fn start() -> Self {
@@ -183,12 +181,7 @@ impl Mirror {
         txs.extend(invalid);
         txs.push(make(&[], 1, Some(Height(START + 3))));
 
-        let start_tip = tip(START, 0);
-        let chain = chain_transitions(Some(start_tip));
-        let transitions = chain.transitions();
-        let (start, events) = transitions
-            .subscribe()
-            .expect("the test is the only consumer");
+        let (chain, events) = mpsc::unbounded_channel();
         let (handle, inbox) = pool_port();
         let (active, active_rx) = watch::channel(true);
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -204,23 +197,25 @@ impl Mirror {
             pending: 4,
             revalidating: 2,
         };
-        let chain_generation = start.generation;
-        let reference = MempoolState::new(&config, start_tip, chain_generation, Instant::now())
-            .with_limits(limits);
+        // The core is off until its chain names a tip, and so is the
+        // machine it is compared with.
+        let no_tip = ChainTip {
+            hash: block::Hash([0; 32]),
+            height: Height(0),
+        };
+        let mut reference = MempoolState::new(&config, no_tip, Instant::now()).with_limits(limits);
+        assert!(reference.deactivate(Instant::now()).is_empty());
         let core = PoolCore::with_limits(
             &config,
-            start,
-            events,
-            transitions.generation(),
+            Box::new(Feed(events)),
             verifier,
             inbox,
             active_rx,
             limits,
         );
-        Self {
+        let mut mirror = Self {
             handle,
             chain,
-            generation: transitions.generation(),
             active,
             core: tokio::spawn(core.run()),
             calls,
@@ -229,8 +224,7 @@ impl Mirror {
             invalid: invalid_ids,
             blocks: Vec::new(),
             fork: 0,
-            chain_tip: start_tip,
-            chain_generation,
+            chain_tip: no_tip,
             wanted_active: true,
             log: Vec::new(),
             read: Vec::new(),
@@ -243,7 +237,9 @@ impl Mirror {
             at: String::new(),
             verdicts: HashMap::default(),
             due_verdicts: Vec::new(),
-        }
+        };
+        mirror.reset_to(tip(START, 0));
+        mirror
     }
 
     /// Takes in one step of the machine: what the log, the verifier and the
@@ -278,8 +274,7 @@ impl Mirror {
         }
         let now = Instant::now();
         if self.wanted_active {
-            self.reference
-                .activate(self.chain_tip, self.chain_generation, now);
+            self.reference.activate(self.chain_tip, now);
             let step = self.reference.effects();
             self.absorb(step);
         } else {
@@ -312,8 +307,8 @@ impl Mirror {
         let cancelled = self.cancelled.iter().all(|job| {
             self.running
                 .iter()
-                .find(|(running, ..)| running == job)
-                .is_none_or(|(_, call, _)| call.answer.is_closed())
+                .find(|(running, _)| running == job)
+                .is_none_or(|(_, call)| call.answer.is_closed())
         });
         let verdicts = self.due_verdicts.iter().all(|(waiter, _)| {
             self.verdicts
@@ -325,12 +320,10 @@ impl Mirror {
             (
                 snapshot.active,
                 snapshot.tip,
-                snapshot.generation,
                 usize::try_from(snapshot.last_change.0).ok(),
             ) == (
                 self.reference.is_active(),
                 self.reference.tip(),
-                self.reference.generation(),
                 Some(logged),
             )
         });
@@ -364,25 +357,15 @@ impl Mirror {
                 (tx, self.reference.tip(), revalidation, after_reset),
                 "{what}: a verification's transaction, tip and flags"
             );
-            let read = self.generation.read();
-            let before = if read == GenerationRead::Stable(self.reference.generation()) {
-                read
-            } else {
-                GenerationRead::Changing
-            };
-            self.running.push((job, call, before));
+            self.running.push((job, call));
         }
         for job in std::mem::take(&mut self.cancelled) {
-            if let Some(at) = self
-                .running
-                .iter()
-                .position(|(running, ..)| *running == job)
-            {
-                let (_, call, _) = self.running.remove(at);
+            if let Some(at) = self.running.iter().position(|(running, _)| *running == job) {
+                let (_, call) = self.running.remove(at);
                 assert!(call.answer.is_closed(), "{what}: a cancelled job stops");
             }
         }
-        for (_, call, _) in &self.running {
+        for (_, call) in &self.running {
             assert!(
                 !call.answer.is_closed(),
                 "{what}: a running job keeps running"
@@ -439,19 +422,9 @@ impl Mirror {
         // Both the latest snapshot and the one a reader gets with the log.
         for published in [&latest, &view.snapshot] {
             assert_eq!(
-                (
-                    published.active,
-                    published.tip,
-                    published.generation,
-                    published.last_change
-                ),
-                (
-                    expected.active,
-                    expected.tip,
-                    expected.generation,
-                    expected.last_change
-                ),
-                "{what}: the snapshot's state, tip, generation and position"
+                (published.active, published.tip, published.last_change),
+                (expected.active, expected.tip, expected.last_change),
+                "{what}: the snapshot's state, tip and position"
             );
             assert!(
                 untimed(published) == untimed(&expected),
@@ -531,7 +504,7 @@ impl Mirror {
     /// Answers a running verification, on both sides, with what a verifier
     /// reading the chain now and the pool the job started with would find.
     fn answer(&mut self, running: usize) {
-        let (job, call, before) = self.running.remove(running);
+        let (job, call) = self.running.remove(running);
         let mined: HashSet<transaction::Hash> = self.blocks.iter().flatten().copied().collect();
         let known: HashSet<transaction::Hash> =
             self.txs.iter().map(|tx| tx.id().mined_id()).collect();
@@ -571,44 +544,35 @@ impl Mirror {
                 }
             }
         };
-        let step = self.reference.outcome(
-            job,
-            outcome.clone(),
-            before,
-            self.generation.read(),
-            Instant::now(),
-            Utc::now(),
-        );
+        let step = self
+            .reference
+            .outcome(job, outcome.clone(), Instant::now(), Utc::now());
         self.absorb(step);
         let _ = call.answer.send(outcome);
     }
 
-    /// Moves the chain: takes `disconnect` blocks off, then connects one that
-    /// mines `mines`.
-    fn change(&mut self, disconnect: usize, mines: Vec<usize>, rules_change: bool) {
-        let disconnect = disconnect.min(self.blocks.len());
-        self.chain.begin_change();
-        let before = self.chain_tip;
-        let disconnected: Vec<ChainTip> = (0..disconnect)
-            .map(|back| {
-                let height = before.height.0 - u32::try_from(back).expect("a short reorg");
-                tip(height, self.fork)
-            })
-            .collect();
-        self.blocks.truncate(self.blocks.len() - disconnect);
-        if disconnect > 0 {
-            self.fork = self.fork.wrapping_add(1);
-        }
+    /// The transactions of `mines` the chain has not mined yet.
+    fn unmined(&self, mines: Vec<usize>) -> Vec<Tx> {
         let mined: HashSet<transaction::Hash> = self.blocks.iter().flatten().copied().collect();
-        let mines: Vec<&Tx> = mines
+        mines
             .into_iter()
-            .map(|tx| &self.txs[tx])
+            .map(|tx| self.txs[tx].clone())
             .filter(|tx| !mined.contains(&tx.id().mined_id()))
-            .collect();
+            .collect()
+    }
+
+    /// The tip of the chain the test keeps.
+    fn tip(&self) -> ChainTip {
+        let height = START + u32::try_from(self.blocks.len()).expect("a short chain");
+        tip(height, self.fork)
+    }
+
+    /// Connects one block that mines `mines`.
+    fn grow(&mut self, mines: Vec<usize>) {
+        let mines = self.unmined(mines);
         self.blocks
             .push(mines.iter().map(|tx| tx.id().mined_id()).collect());
-        let height = START + u32::try_from(self.blocks.len()).expect("a short chain");
-        let after = tip(height, self.fork);
+        let after = self.tip();
         let block = ConnectedBlock {
             hash: after.hash,
             height: after.height,
@@ -618,34 +582,43 @@ impl Mirror {
                 .collect(),
             transaction_hashes: mines.iter().map(|tx| tx.id().mined_id()).collect(),
         };
-        let mut sent = None;
-        self.chain_generation = self.chain.finish_change(after, |_, generation| {
-            let transition = ChainTransition {
-                before: Some(before),
-                disconnected,
-                connected: vec![block],
-                after,
-                generation,
-                rules_change,
-            };
-            sent = Some(transition.clone());
-            Some(transition)
-        });
-        self.chain_tip = after;
-        let transition = sent.expect("the core is subscribed");
-        let step = self.reference.transition(transition, Instant::now());
+        self.chain
+            .send(ChainEvent::Grow(block.clone()))
+            .expect("the core reads its feed");
+        let step = self.reference.grow(block, Instant::now());
         self.absorb(step);
+        self.chain_tip = after;
         self.mirror_activity();
     }
 
-    /// Loses the transition queue: both sides resynchronize at the tip.
-    fn resync(&mut self) {
-        self.chain.begin_change();
-        self.chain_generation = self.chain.finish_unknown_change(Some(self.chain_tip));
-        let step = self
-            .reference
-            .resync(self.chain_tip, self.chain_generation, Instant::now());
+    /// Takes the tip block off and connects one on another fork that mines
+    /// `mines`. Both sides are told only the new tip.
+    fn reorg(&mut self, mines: Vec<usize>) {
+        self.blocks.pop();
+        self.fork = self.fork.wrapping_add(1);
+        self.skip(mines, 1);
+    }
+
+    /// Connects `blocks` blocks at once, the first of which mines `mines`.
+    /// Both sides are told only the new tip.
+    fn skip(&mut self, mines: Vec<usize>, blocks: usize) {
+        let mines = self.unmined(mines);
+        self.blocks
+            .push(mines.iter().map(|tx| tx.id().mined_id()).collect());
+        for _ in 1..blocks {
+            self.blocks.push(Vec::new());
+        }
+        self.reset_to(self.tip());
+    }
+
+    /// Tells both sides the tip is `tip`, and nothing else.
+    fn reset_to(&mut self, tip: ChainTip) {
+        self.chain
+            .send(ChainEvent::Reset(tip))
+            .expect("the core reads its feed");
+        let step = self.reference.reset(tip, Instant::now());
         self.absorb(step);
+        self.chain_tip = tip;
         self.mirror_activity();
     }
 
@@ -729,20 +702,16 @@ impl Mirror {
                 let mines = (0..dice.below(3))
                     .map(|_| dice.below(self.txs.len()))
                     .collect();
-                self.change(0, mines, false);
+                self.grow(mines);
                 self.compare("a block").await;
             }
             80..=81 => {
-                self.change(1, vec![any_tx], false);
+                self.reorg(vec![any_tx]);
                 self.compare("a reorg").await;
             }
-            82 => {
-                self.change(0, Vec::new(), true);
-                self.compare("a rules change").await;
-            }
-            83 => {
-                self.resync();
-                self.compare("a resync").await;
+            82..=83 => {
+                self.skip(vec![any_tx], 2);
+                self.compare("two blocks at once").await;
             }
             84..=91 => {
                 let ids: HashSet<UnminedTxId> = (0..3)

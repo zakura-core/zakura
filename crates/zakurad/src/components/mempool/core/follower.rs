@@ -373,7 +373,7 @@ mod tests {
     use tower::util::BoxCloneSyncService;
     use zakura_chain::{block, parameters::Network};
     use zakura_node_services::mempool::{
-        port::{pool_port, ChainTip, Generation, PoolSnapshot},
+        port::{pool_port, ChainTip, PoolSnapshot},
         MempoolChangeKind, TransactionDependencies,
     };
 
@@ -422,7 +422,6 @@ mod tests {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
             },
-            Generation(0),
             last_change,
             txs,
             TransactionDependencies::default(),

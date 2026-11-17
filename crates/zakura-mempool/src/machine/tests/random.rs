@@ -24,9 +24,7 @@ use zakura_chain::{
     transaction::{self, UnminedTxId},
     transparent::OutPoint,
 };
-use zakura_node_services::mempool::port::{
-    Charge, Generation, GenerationRead, LocalFault, ReservationId, Unreserved,
-};
+use zakura_node_services::mempool::port::{Charge, LocalFault, ReservationId, Unreserved};
 use zakura_rt::collections::HashSet;
 
 use super::{build, twin, Bench, TestVerifyError, Tx, START};
@@ -223,7 +221,7 @@ impl Run {
             5..=8 => self.submit(),
             9 => self.drop_held(),
             10..=13 => self.outcome(),
-            14 => self.transition(),
+            14 => self.chain(),
             15..=16 => self.tick(),
             17..=18 => self.rejected_ids(),
             _ => self.toggle(),
@@ -332,21 +330,6 @@ impl Run {
         self.took("drop", &step);
     }
 
-    /// The generation readings a job reports: mostly fresh, sometimes stale.
-    fn readings(&mut self) -> (GenerationRead, GenerationRead) {
-        let applied = self.bench.generation;
-        let stable = |generation| GenerationRead::Stable(Generation(generation));
-        if self.draining {
-            return (stable(applied), stable(applied));
-        }
-        match pick(&mut self.rng, 8) {
-            0 => (stable(applied), GenerationRead::Changing),
-            1 => (stable(applied.saturating_sub(1)), stable(applied)),
-            2 => (stable(applied + 1), stable(applied + 1)),
-            _ => (stable(applied), stable(applied)),
-        }
-    }
-
     fn outcome(&mut self) {
         // Sometimes a cancelled job answers late. The machine ignores it.
         let cancelled = self.bench.tracker.cancelled().to_vec();
@@ -438,59 +421,45 @@ impl Run {
                 ][pick(&mut self.rng, 3)],
             ),
         };
-        let (before, after) = self.readings();
-        let step = self.bench.outcome_read(job, outcome, before, after);
+        let step = self.bench.outcome(job, outcome);
         self.took("outcome", &step);
     }
 
-    fn transition(&mut self) {
+    /// The chain grows by one block, or the tip moves some other way and
+    /// the machine is told only where it is.
+    fn chain(&mut self) {
         if !self.active {
             return self.tick();
         }
-        if chance(&mut self.rng, 12) {
-            let step = self.bench.resync();
-            return self.took("resync", &step);
-        }
-        let disconnected = if chance(&mut self.rng, 6) {
-            1 + pick(&mut self.rng, 2)
-        } else {
-            0
-        };
-        if disconnected > 0 {
-            // The run does not track which block mined what, so a reorg
-            // forgets every block it mined. The new blocks may mine them again.
-            self.mined.clear();
-        }
-        let blocks = if disconnected > 0 && chance(&mut self.rng, 4) {
-            // The tip goes back and nothing connects.
-            0
-        } else if disconnected > 0 {
-            disconnected + pick(&mut self.rng, 2)
-        } else {
-            1 + pick(&mut self.rng, 2)
-        };
-        let mut mined: Vec<Vec<Tx>> = Vec::new();
-        for _ in 0..blocks {
-            // A chain mines a transaction once.
-            let candidates: Vec<Tx> = (0..pick(&mut self.rng, 3))
-                .map(|_| self.txs[pick(&mut self.rng, self.txs.len())].clone())
-                .collect();
-            let mut block = Vec::new();
-            for tx in candidates {
-                if self.mined.insert(tx.id().mined_id()) {
-                    block.push(tx);
-                }
+        if chance(&mut self.rng, 5) {
+            let skipped = pick(&mut self.rng, 3);
+            if skipped == 0 {
+                // A reorg. The run does not track which block mined what,
+                // so it forgets every transaction it mined. Later blocks may
+                // mine them again.
+                self.mined.clear();
             }
-            mined.push(block);
+            // Blocks the machine never sees mine transactions too.
+            for _ in 0..skipped {
+                let tx = pick(&mut self.rng, self.txs.len());
+                self.mined.insert(self.txs[tx].id().mined_id());
+            }
+            let step = self
+                .bench
+                .reset_by(u32::try_from(skipped).expect("a small count"));
+            return self.took("reset", &step);
         }
-        let rules_change = chance(&mut self.rng, 15);
-        let blocks: Vec<Vec<&Tx>> = mined.iter().map(|block| block.iter().collect()).collect();
-        let step = self.bench.transition(
-            u32::try_from(disconnected).expect("a small reorg"),
-            &blocks,
-            rules_change,
-        );
-        self.took("transition", &step);
+        // A chain mines a transaction once.
+        let mut block = Vec::new();
+        for _ in 0..pick(&mut self.rng, 3) {
+            let tx = self.txs[pick(&mut self.rng, self.txs.len())].clone();
+            if self.mined.insert(tx.id().mined_id()) {
+                block.push(tx);
+            }
+        }
+        let mined: Vec<&Tx> = block.iter().collect();
+        let step = self.bench.grow(&mined);
+        self.took("grow", &step);
     }
 
     fn tick(&mut self) {
@@ -525,12 +494,6 @@ impl Run {
     /// Ends the run: every caller lets go, every job reports, and time passes
     /// until nothing is undecided.
     fn drain(&mut self) {
-        // A stale reading may have named a generation past the last
-        // transition. Its transition comes now, as the state's would.
-        if self.active {
-            let step = self.bench.resync();
-            self.took("drain resync", &step);
-        }
         self.draining = true;
         for reservation in std::mem::take(&mut self.to_drop) {
             let step = self.bench.release(reservation);
@@ -637,6 +600,7 @@ fn random_runs_keep_the_invariants_and_drain() {
             "start revalidation",
             "cancel",
             "cancel fetch",
+            "answer for another tip",
             "removed Mined",
             "removed Conflicted",
             "removed Expired",

@@ -16,7 +16,7 @@
 //! The mempool handle other components take keeps its type, so nothing
 //! outside `start.rs` knows which pool runs.
 
-use std::{collections::HashSet, net::IpAddr, sync::Arc};
+use std::{collections::HashSet, future::Future, net::IpAddr, pin::Pin, sync::Arc};
 
 use tokio::{sync::watch, task::JoinHandle};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
@@ -24,19 +24,18 @@ use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
 use zakura_chain::{
     block::{self, Height},
     chain_tip::ChainTip,
-    parameters::Network,
 };
 use zakura_jsonl_trace::JsonlEventEmitter;
-use zakura_mempool::io::PoolCore;
+use zakura_mempool::io::{ChainFeed, PoolCore};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::{
     mempool::{
-        port::{pool_port, ChainTransitions},
+        port::{self, pool_port, ChainEvent, ConnectedBlock},
         MempoolTxSubscriber, Request, Response,
     },
     task::{spawn_buffer, spawn_erased},
 };
-use zakura_state::{ChainTipChange, LatestChainTip};
+use zakura_state::{ChainTipChange, LatestChainTip, TipAction};
 
 use crate::components::sync::SyncStatus;
 
@@ -115,7 +114,6 @@ pub(crate) fn start(
     expose_peer_addresses: bool,
     outbound: Outbound,
     read_state: ReadState,
-    chain_transitions: &ChainTransitions,
     tx_verifier: TxVerifier,
     sync_status: SyncStatus,
     latest_chain_tip: LatestChainTip,
@@ -123,7 +121,7 @@ pub(crate) fn start(
     misbehavior: zn::MisbehaviorReporter,
     exempt: Exempt,
     trace: JsonlEventEmitter,
-) -> Result<CoreParts, BoxError> {
+) -> CoreParts {
     let best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync> = {
         let latest_chain_tip = latest_chain_tip.clone();
         Arc::new(move || latest_chain_tip.best_tip_hash())
@@ -147,9 +145,8 @@ pub(crate) fn start(
         expose_peer_addresses,
         outbound,
         read_state,
-        chain_transitions,
+        chain_tip_change,
         tx_verifier,
-        chain_tip_change.network().clone(),
         {
             let currentness = activation.currentness();
             Arc::new(move |height| currentness.may_cool(height))
@@ -158,7 +155,7 @@ pub(crate) fn start(
         misbehavior,
         exempt,
         active_rx,
-    )?;
+    );
     // The same `mempool.jsonl` row today's pool writes for each tip it
     // applies.
     let trace = MempoolTrace(trace);
@@ -174,13 +171,36 @@ pub(crate) fn start(
         }
     });
 
-    Ok(CoreParts {
+    CoreParts {
         mempool,
         verifier_pool,
         subscriber,
         core_task,
         follower_task,
-    })
+    }
+}
+
+/// The state's tip changes, as the core's chain feed.
+struct TipFeed(ChainTipChange);
+
+impl ChainFeed for TipFeed {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<ChainEvent>> + Send + '_>> {
+        Box::pin(async move {
+            // Waiting on a watch loses nothing when it is dropped.
+            let action = self.0.wait_for_tip_change().await.ok()?;
+            Some(match action {
+                TipAction::Grow { block } => ChainEvent::Grow(ConnectedBlock {
+                    hash: block.hash,
+                    height: block.height,
+                    transactions: block.transactions,
+                    transaction_hashes: block.transaction_hashes,
+                }),
+                TipAction::Reset { height, hash } => {
+                    ChainEvent::Reset(port::ChainTip { hash, height })
+                }
+            })
+        })
+    }
 }
 
 /// The pool core and its connections, built but not running.
@@ -197,26 +217,25 @@ pub(crate) struct Assembled {
     pub follower: follower::Follower,
 }
 
-/// Builds the pool core and its connections. The core is on while `active`
-/// holds `true`, and the adapter starts a cooldown only when `may_cool`
-/// allows it for the verdict's tip. [`start`] decides both as today's pool
-/// does.
+/// Builds the pool core and its connections. The core follows
+/// `chain_tip_change`, whose first action names the tip. It is on while
+/// `active` holds `true`, and the adapter starts a cooldown only when
+/// `may_cool` allows it for the verdict's tip. [`start`] decides both as
+/// today's pool does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     config: &Config,
     expose_peer_addresses: bool,
     outbound: Outbound,
     read_state: ReadState,
-    chain_transitions: &ChainTransitions,
+    chain_tip_change: ChainTipChange,
     tx_verifier: TxVerifier,
-    network: Network,
     may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
     best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync>,
     misbehavior: zn::MisbehaviorReporter,
     exempt: Exempt,
     active: watch::Receiver<bool>,
-) -> Result<Assembled, BoxError> {
-    let (start, events) = chain_transitions.subscribe()?;
+) -> Assembled {
     let (handle, inbox) = pool_port();
 
     let adapter_read_state = read_state.clone();
@@ -224,13 +243,13 @@ pub(crate) fn assemble(
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         read_state,
         config.max_transaction_bytes,
-        network,
+        chain_tip_change.network().clone(),
     );
     let core = PoolCore::new(
         &core_config(config),
-        start,
-        events,
-        chain_transitions.generation(),
+        // A clone starts behind the tip, so its first action is a reset
+        // that names it.
+        Box::new(TipFeed(chain_tip_change.clone())),
         verifier,
         inbox,
         active,
@@ -264,13 +283,13 @@ pub(crate) fn assemble(
         MAX_INBOUND_CONCURRENCY,
     );
 
-    Ok(Assembled {
+    Assembled {
         mempool,
         verifier_pool,
         subscriber,
         core,
         follower,
-    })
+    }
 }
 
 /// Writes today's `mempool_tip_processed` row for a tip the core applied:

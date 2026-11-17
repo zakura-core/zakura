@@ -797,18 +797,11 @@ impl StartCmd {
         info!(?pool_implementation, "initializing mempool");
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
-                let chain_transitions = read_only_state_service
-                    .chain_transitions()
-                    .ok_or_else(|| {
-                        eyre!("the pool core needs the state writer's chain transitions")
-                    })?
-                    .clone();
                 let parts = mempool::core::start(
                     &config.mempool,
                     config.network.expose_peer_addresses,
                     peer_set.clone(),
                     tower::util::BoxCloneService::new(read_only_state_service.clone()),
-                    &chain_transitions,
                     tx_verifier,
                     sync_status.clone(),
                     latest_chain_tip.clone(),
@@ -822,8 +815,7 @@ impl StartCmd {
                         unconditional: config.network.unconditional_peers.clone(),
                     },
                     template_path_trace.clone(),
-                )
-                .map_err(|error| eyre!(error))?;
+                );
                 (
                     parts.mempool,
                     parts.subscriber,

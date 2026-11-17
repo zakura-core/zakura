@@ -1769,7 +1769,7 @@ mod tests {
     /// has after [`MAX_TIP_WAIT`].
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_query_waits_for_the_core_to_apply_the_states_best_tip() {
-        use zakura_node_services::mempool::port::{pool_port, ChainTip, Generation, PoolSnapshot};
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolSnapshot};
 
         let (handle, inbox) = pool_port();
         let best = Arc::new(std::sync::Mutex::new(block::Hash([2; 32])));
@@ -1801,7 +1801,7 @@ mod tests {
             .expect("a vector transaction");
         // The core still holds a transaction the state's tip 2 mined.
         inbox.publish([], |last| {
-            PoolSnapshot::new(tip(1), Generation(1), last, vec![mined], Default::default())
+            PoolSnapshot::new(tip(1), last, vec![mined], Default::default())
         });
         let mut query = core.call(Request::TransactionIds);
         assert!(
@@ -1811,7 +1811,7 @@ mod tests {
             "the query waits while the core is a tip behind"
         );
         inbox.publish([], |last| {
-            PoolSnapshot::new(tip(2), Generation(2), last, Vec::new(), Default::default())
+            PoolSnapshot::new(tip(2), last, Vec::new(), Default::default())
         });
         let Ok(Response::TransactionIds(ids)) = query.await else {
             panic!("`TransactionIds` is answered with ids");
@@ -2150,9 +2150,7 @@ mod tests {
     /// waits for it outside the limits.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_push_does_not_wait_for_the_core_to_catch_up() {
-        use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
-        };
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
 
         let (handle, mut inbox) = pool_port();
         let mut core = adapter_at(handle, Some(block::Hash([2; 32])));
@@ -2162,7 +2160,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 Vec::new(),
                 Default::default(),
@@ -2315,7 +2312,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_peer_batch_costs_the_core_a_bounded_number_of_commands() {
         use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot, ReservationId,
+            pool_port, ChainTip, PoolCommand, PoolSnapshot, ReservationId,
         };
 
         let (handle, mut inbox) = pool_port();
@@ -2340,7 +2337,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 vec![pooled],
                 Default::default(),
@@ -2405,9 +2401,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn pushes_through_the_service_wait_only_within_the_node_limit() {
         use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
-        use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
-        };
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
 
         let pushed = MAX_INBOUND_CONCURRENCY + 100;
         let template = Network::Mainnet
@@ -2423,7 +2417,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 Vec::new(),
                 Default::default(),
@@ -2489,9 +2482,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_queued_batch_takes_every_bodys_slots_first() {
         use zakura_chain::transaction::{LockTime, Transaction, UnminedTx};
-        use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
-        };
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
 
         let template = Network::Mainnet
             .unmined_transactions_in_blocks(1..=1)
@@ -2520,7 +2511,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 Vec::new(),
                 Default::default(),
@@ -2592,7 +2582,7 @@ mod tests {
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.
     fn publish_empty(inbox: &zakura_node_services::mempool::port::PoolInbox) {
-        use zakura_node_services::mempool::port::{ChainTip, Generation, PoolSnapshot};
+        use zakura_node_services::mempool::port::{ChainTip, PoolSnapshot};
 
         inbox.publish([], |last| {
             PoolSnapshot::new(
@@ -2600,7 +2590,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 Vec::new(),
                 Default::default(),
@@ -3442,9 +3431,7 @@ mod tests {
     /// reserves.
     #[tokio::test(flavor = "current_thread")]
     async fn pooled_bodies_do_not_take_a_fresh_bodys_slot() {
-        use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
-        };
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
 
         let mut vectors = Network::Mainnet.unmined_transactions_in_blocks(..);
         let pooled: Vec<_> = vectors
@@ -3469,7 +3456,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 pooled,
                 Default::default(),
@@ -3522,9 +3508,7 @@ mod tests {
     /// mined it, so the body goes to the core, which knows.
     #[tokio::test(flavor = "current_thread")]
     async fn a_pooled_body_on_a_stale_snapshot_goes_to_the_core() {
-        use zakura_node_services::mempool::port::{
-            pool_port, ChainTip, Generation, PoolCommand, PoolSnapshot,
-        };
+        use zakura_node_services::mempool::port::{pool_port, ChainTip, PoolCommand, PoolSnapshot};
 
         let pooled = Network::Mainnet
             .unmined_transactions_in_blocks(1..=1)
@@ -3539,7 +3523,6 @@ mod tests {
                     hash: block::Hash([1; 32]),
                     height: Height(1),
                 },
-                Generation(1),
                 last,
                 vec![pooled],
                 Default::default(),

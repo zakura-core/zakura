@@ -305,7 +305,7 @@ fn build_block(
 
     let time = chrono::DateTime::from_timestamp(timestamp, 0).ok_or("invalid genesis timestamp")?;
 
-    let header = Header::new(crate::block::HeaderFields {
+    let header = Header::new(crate::block::HeaderData {
         version: 4,
         previous_block_hash: previous_hash,
         merkle_root,

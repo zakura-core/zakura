@@ -36,7 +36,7 @@ use proptest_derive::Arbitrary;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Header {
-    fields: HeaderFields,
+    fields: HeaderData,
     #[serde(skip)]
     hash: OnceLock<Hash>,
 }
@@ -45,7 +45,7 @@ pub struct Header {
 ///
 /// Convert these fields with [`Header::new`] before sharing or hashing the header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HeaderFields {
+pub struct HeaderData {
     /// The block's version field. This is supposed to be `4`:
     ///
     /// > The current and only defined block version number for Zcash is 4.
@@ -123,7 +123,7 @@ pub enum BlockTimeError {
 
 impl Header {
     /// Constructs a header whose hash is computed on its first use.
-    pub fn new(fields: HeaderFields) -> Self {
+    pub fn new(fields: HeaderData) -> Self {
         Self {
             fields,
             hash: OnceLock::new(),
@@ -131,7 +131,7 @@ impl Header {
     }
 
     /// Copies the editable fields, without copying cached metadata.
-    pub fn fields(&self) -> HeaderFields {
+    pub fn fields(&self) -> HeaderData {
         self.fields
     }
 
@@ -179,22 +179,22 @@ impl Header {
     }
 }
 
-impl From<HeaderFields> for Header {
-    fn from(fields: HeaderFields) -> Self {
+impl From<HeaderData> for Header {
+    fn from(fields: HeaderData) -> Self {
         Self::new(fields)
     }
 }
 
 impl Deref for Header {
-    type Target = HeaderFields;
+    type Target = HeaderData;
 
-    fn deref(&self) -> &HeaderFields {
+    fn deref(&self) -> &HeaderData {
         &self.fields
     }
 }
 
 impl DerefMut for Header {
-    fn deref_mut(&mut self) -> &mut HeaderFields {
+    fn deref_mut(&mut self) -> &mut HeaderData {
         self.hash.take();
         &mut self.fields
     }

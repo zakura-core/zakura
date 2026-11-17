@@ -46,7 +46,7 @@ fn pow_policy_waiver_is_derived_only_from_custom_network_identity() {
     let custom_policy = PowPolicy::for_network(&pow_disabled_custom)
         .expect("configured custom networks may authenticate a PoW waiver");
     assert!(custom_policy.is_authenticated_custom_waiver());
-    let proposal_header = block::Header::new(zakura_chain::block::HeaderFields {
+    let proposal_header = block::Header::new(zakura_chain::block::HeaderData {
         solution: equihash::Solution::for_proposal(),
         ..(regtest_genesis_block().header).fields()
     });

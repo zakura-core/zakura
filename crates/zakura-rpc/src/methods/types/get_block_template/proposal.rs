@@ -218,7 +218,7 @@ pub fn proposal_block_from_template(
     .into();
 
     Ok(Block {
-        header: Arc::new(block::Header::new(zakura_chain::block::HeaderFields {
+        header: Arc::new(block::Header::new(zakura_chain::block::HeaderData {
             version,
             previous_block_hash,
             merkle_root,

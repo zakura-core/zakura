@@ -49,7 +49,7 @@ fn equihash_solution_roundtrip() {
 }
 
 prop_compose! {
-    fn randomized_solutions(real_header: block::HeaderFields)
+    fn randomized_solutions(real_header: block::HeaderData)
         (fake_solution in any::<equihash::Solution>()
             .prop_filter("solution must not be the actual solution", move |s| {
                 s != &real_header.solution
@@ -96,7 +96,7 @@ fn equihash_prop_test_solution() -> eyre::Result<()> {
 }
 
 prop_compose! {
-    fn randomized_nonce(real_header: block::HeaderFields)
+    fn randomized_nonce(real_header: block::HeaderData)
         (fake_nonce in proptest::array::uniform32(any::<u8>())
             .prop_filter("nonce must not be the actual nonce", move |fake_nonce| {
                 fake_nonce != &real_header.nonce.0
@@ -139,7 +139,7 @@ fn equihash_prop_test_nonce() -> eyre::Result<()> {
 }
 
 prop_compose! {
-    fn randomized_input(real_header: block::HeaderFields)
+    fn randomized_input(real_header: block::HeaderData)
         (fake_header in any::<block::Header>()
             .prop_map(move |mut fake_header| {
                 fake_header.nonce = real_header.nonce;

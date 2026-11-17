@@ -430,6 +430,8 @@ pub struct Config {
     /// disconnects them on protocol errors or inbound overload.
     ///
     /// Entries match legacy peer IP addresses, and only the legacy P2P stack dials them.
+    /// `tx-relay` also matches them against each v2 session's address, and never
+    /// charges a matching session for the transactions it supplies.
     /// An IPv4 entry also matches the IPv4-mapped IPv6 form of the same address. The
     /// default is empty.
     ///
@@ -1660,6 +1662,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay,
         )
         .map_err(de::Error::custom)?;
+        zakura.tx_relay.validate().map_err(de::Error::custom)?;
         tcp_warmup.validate().map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {

@@ -1,8 +1,8 @@
 # Zakura peer message regulation: specification
 
 > **Status: first draft.** This specification defines the rules introduced by
-> the [peer message regulation design](../design/peer-message-regulation.md). It covers the 14 native
-> application messages in discovery, header sync, and block sync.
+> the [peer message regulation design](../design/peer-message-regulation.md). It covers the 19 native
+> application messages in discovery, header sync, block sync, and transaction relay.
 
 ## Regulation model
 
@@ -960,6 +960,79 @@ A sender can report a smaller count after clamping a request to its available he
 The ending closes the entire original range. The handler MUST requeue every unreceived height in
 that original range, not just the reported count. A retry policy MAY avoid this peer for the
 immediate retry.
+
+### Transaction relay — streams 9 and 10, version 1 (experimental)
+
+`tx-relay` uses capability bit 11 and two stream kinds negotiated together as one session. It is
+off by default. A node runs it only with the v2 stack and the pool core. The source is
+`crates/zakura-network/src/zakura/tx_relay/`, and its contract is the module docs of
+`tx_relay/machine.rs`.
+
+| Stream | Kind | Carries | Frame cap |
+|--------|------|---------|-----------|
+| Data | 9 | `Inv` (2) and `Tx` (4) | 2,000,000 bytes plus 4 KiB |
+| State | 10 | `Hello` (1), `GetTxs` (3) and `NotFound` (5) | 4 KiB |
+
+Haves sit behind data in one flow control, so a peer learns of new transactions only as fast as it
+drains bodies. Wants never wait behind uploads. A `GetTxs` is answered on either stream: `Tx` on
+the data stream, `NotFound` on the state stream. The two streams are not ordered with each other,
+so an `Inv` may arrive before the peer's `Hello`, and it is accepted.
+
+An exact transaction id is 64 bytes: the mined id, then the authorizing-data digest. A transaction
+before v5 carries 32 bytes of `0xFF` as its digest, as ZIP 239 defines for inventory.
+
+```text
+MAX_TX_BYTES      = 2,000,000 bytes
+MAX_INV_ENTRIES   = 1,024
+MAX_SERVES        = 16        requests this node serves at once, sent in its Hello
+```
+
+| Message | Stream | Payload | Rule | Breach |
+|---------|--------|---------|------|--------|
+| `Hello` | State | requests served at once (`u16`), largest transaction accepted (`u32`) | First on the state stream, once. Served requests 1 to the table's maximum. Size at most `MAX_TX_BYTES`. | Violation |
+| `Inv` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Inv` byte rate. | Violation |
+| `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests it allows, counted until each answer is queued. No id outstanding twice. | Violation |
+| `Tx` | Data | the requested id, then the body | Answers a request outstanding to that peer, once. Exactly the announced size, at most the requester's limit, and hashes to the id. | Violation |
+| `NotFound` | State | the requested id | Answers a request outstanding to that peer | Violation if unrequested |
+
+The sender serves an id only once it has queued an `Inv` carrying it on the data stream. The body
+then follows that `Inv` on the same ordered stream, so the peer always reads the `Inv` first. It
+answers `NotFound` for an id it never announced to that peer, or one its pool no longer holds. A
+transaction the pool hides while it checks it again after a reorg is still held, so a request for
+one is served: the receiver checks the body against its own tip, and charges nothing for a failure
+that depends on the tip. Nothing new is announced while it is hidden. It never answers `NotFound`,
+and never closes a peer, because of its own load: a full queue makes it wait.
+
+A wire violation closes the connection with a recorded cause. The receiver judges a `Tx` by its id
+and length before it decodes the body. It drops a late answer, or one from a peer that started
+cooling, unread and without penalty.
+
+- **Cadence**
+  - `Hello`: capacity = 3, refill = 1 message / 300 seconds
+  - on_empty = record and forward (exhaustion is not a violation)
+- **Byte rate**
+  - `Inv`: 256,000 payload bytes a second, an opening allowance of 544,000 bytes (8,000
+    entries) and a sender allowance of 512 KiB, all provisional. The receiver's depth adds the
+    stream receive window this node granted on the connection.
+  - The sender sends new ids at once and folds new ones into the frame it holds only while it
+    waits for the rate, so it batches only under load. It keeps one `Inv` unwritten at most,
+    about 70 KB, which with 64 KiB of write-ahead keeps it within the allowance.
+  - on_empty = close the connection (`ordered_byte_rate_overrun`)
+- **Capacity**
+  - requester: at most 5 ids requested or awaiting a verdict per peer, and the node-wide 500
+    undecided transactions the pool core holds
+  - receiver: at most the requests its `Hello` serves, and one more is a violation. Each request
+    waits on its data writer as an id, and the writer builds the body from the pool as it is when
+    it reaches it, so the data stream's output share bounds the bytes queued to the peer, plus
+    one body being built.
+  - per-connection receive and output shares: 4 MiB for the data stream and 64 KiB for the state
+    stream, both provisional
+
+While a peer has a live `tx-relay` session, the legacy adapter leaves that peer's transactions to
+it. It drops the peer's transaction id adverts, answers its transaction and mempool requests as
+missing or empty, and neither advertises nor requests transactions from it. Block traffic is
+unchanged. A session counts as live once `tx-relay` holds a view of the pool, and stops when the
+session ends or the pool stops.
 
 ### Block sync successor (planned)
 

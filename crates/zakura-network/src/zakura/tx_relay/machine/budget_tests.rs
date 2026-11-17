@@ -1,0 +1,256 @@
+//! The machine's bounds with 100 sessions: a full pool costs a few refused
+//! reserves per `NoRoom` backoff, and nothing the machine keeps grows past
+//! what its sessions hold.
+
+use std::time::Duration;
+
+use zakura_chain::transaction::UnminedTxId;
+
+use super::{
+    tests::{body, hello, on, script_len, SIZE},
+    CallId, Granted, PeerKey, RelayConfig, RelayEffect, RelayMachine, Unreserved,
+    MAX_REQUESTS_PER_PEER, NO_ROOM_FIRST, PENDING_PER_PEER,
+};
+
+/// The number of sessions the bounds are for.
+const SESSIONS: u64 = 100;
+
+/// The reserve calls among `effects`.
+fn reserves(effects: &[RelayEffect]) -> Vec<CallId> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            RelayEffect::Reserve { call, .. } => Some(*call),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A full pool costs a few refused reserves per `NoRoom` backoff, not one per
+/// session: those in flight when the first `NoRoom` lands, then one probe
+/// per backoff.
+#[test]
+fn refused_reserves_per_backoff_stay_within_those_in_flight_plus_the_probe() {
+    let script = script_len();
+    let mut machine = RelayMachine::new(
+        RelayConfig {
+            fan_out: super::FanOut::default(),
+            short_id_key: 7,
+        },
+        on(Vec::new()),
+        Vec::new(),
+    );
+    let mut now = Duration::ZERO;
+    // Every session announces five ids of its own.
+    for peer in 0..SESSIONS {
+        let session = machine.connect(PeerKey(peer), false, now);
+        machine.hello(session, hello(), now);
+        let first = u32::try_from(peer).expect("small") * 5;
+        let announced: Vec<(UnminedTxId, u32)> = (first..first + 5)
+            .map(|n| (body(n, script).id(), SIZE))
+            .collect();
+        machine.inv(session, &announced, now);
+    }
+    let in_flight = reserves(&machine.take_effects());
+    assert!(!in_flight.is_empty(), "the sessions reserve");
+    let mut refused = 0;
+    for call in &in_flight {
+        machine.reserve_answer(*call, Err(Unreserved::NoRoom), now);
+        refused += 1;
+    }
+    // Every call in flight is refused, and none starts in its place.
+    assert!(reserves(&machine.take_effects()).is_empty());
+
+    // Each backoff ends with exactly one probe, which is refused again.
+    let mut probes = 0;
+    let mut backoff = NO_ROOM_FIRST;
+    for _ in 0..3 {
+        now += backoff;
+        machine.tick(now);
+        let calls = reserves(&machine.take_effects());
+        assert_eq!(calls.len(), 1, "one probe per backoff, at {now:?}");
+        for call in calls {
+            machine.reserve_answer(call, Err(Unreserved::NoRoom), now);
+            probes += 1;
+        }
+        assert!(reserves(&machine.take_effects()).is_empty());
+        backoff = backoff.saturating_mul(2);
+    }
+    assert_eq!(refused + probes, in_flight.len() + 3);
+
+    // Room again: the probe's grant clears the backoff and every session
+    // reserves again.
+    now += backoff;
+    machine.tick(now);
+    let probe = reserves(&machine.take_effects());
+    assert_eq!(probe.len(), 1);
+    machine.reserve_answer(
+        probe[0],
+        Ok(Granted {
+            reservation: zakura_node_services::mempool::port::ReservationId(1),
+            cancelled: false,
+        }),
+        now,
+    );
+    assert!(reserves(&machine.take_effects()).len() > 1);
+    machine.assert_invariants();
+}
+
+/// The many-sessions load the plan names, in one run: 100 sessions, each
+/// with a full pending set of the same pool-sized set of ids, beside a full
+/// pool of other transactions the node holds and announces, which stays
+/// full through repeated `NoRoom` backoffs, then rounds in which every
+/// grant's request misses its deadline and releases its slot before the
+/// peer answers `NotFound`, with the actor falling off the pool's change log
+/// after each round. The refused reserves per backoff stay within the
+/// budget, and nothing the machine keeps grows past what its sessions hold.
+#[test]
+fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
+    let script = script_len();
+    let pool_size = u32::try_from(PENDING_PER_PEER).expect("small");
+    // A full pool the node holds, apart from the ids the peers announce.
+    let pooled: Vec<(UnminedTxId, u32)> = (0..pool_size)
+        .map(|n| (body(1_000_000 + n, script).id(), SIZE))
+        .collect();
+    let mut machine = RelayMachine::new(
+        RelayConfig {
+            fan_out: super::FanOut::default(),
+            short_id_key: 7,
+        },
+        on(pooled.clone()),
+        pooled.clone(),
+    );
+    let mut now = Duration::ZERO;
+    let ids: Vec<(UnminedTxId, u32)> = (0..pool_size)
+        .map(|n| (body(n, script).id(), SIZE))
+        .collect();
+    let mut sessions = Vec::new();
+    for peer in 0..SESSIONS {
+        let session = machine.connect(PeerKey(peer), false, now);
+        machine.hello(session, hello(), now);
+        machine.inv(session, &ids, now);
+        sessions.push(session);
+    }
+    for session in &sessions {
+        let state = machine.session(*session).expect("live");
+        assert_eq!(state.pending.len(), PENDING_PER_PEER, "a full pending set");
+    }
+    assert_eq!(machine.wanted().len(), PENDING_PER_PEER);
+    let sessions_count = usize::try_from(SESSIONS).expect("small");
+
+    // A full pool: those in flight are refused, then one probe a backoff.
+    let in_flight = reserves(&machine.take_effects());
+    assert!(in_flight.len() <= sessions_count * MAX_REQUESTS_PER_PEER);
+    for call in &in_flight {
+        machine.reserve_answer(*call, Err(Unreserved::NoRoom), now);
+    }
+    assert!(reserves(&machine.take_effects()).is_empty());
+    let mut backoff = NO_ROOM_FIRST;
+    for _ in 0..3 {
+        now += backoff;
+        machine.tick(now);
+        let calls = reserves(&machine.take_effects());
+        assert_eq!(calls.len(), 1, "one probe per backoff under a full load");
+        machine.reserve_answer(calls[0], Err(Unreserved::NoRoom), now);
+        backoff = backoff.saturating_mul(2);
+    }
+
+    let mut reservation = 0;
+    // Reserve calls the last round's answers started, which this one grants.
+    let mut carried: Vec<CallId> = Vec::new();
+    for round in 0..5 {
+        now += backoff;
+        machine.tick(now);
+        // Every reserve is granted, and each grant sends a request.
+        let mut granted = 0;
+        loop {
+            let mut calls = std::mem::take(&mut carried);
+            calls.extend(reserves(&machine.take_effects()));
+            if calls.is_empty() {
+                break;
+            }
+            for call in calls {
+                reservation += 1;
+                granted += 1;
+                machine.reserve_answer(
+                    call,
+                    Ok(Granted {
+                        reservation: zakura_node_services::mempool::port::ReservationId(
+                            reservation,
+                        ),
+                        cancelled: false,
+                    }),
+                    now,
+                );
+            }
+        }
+        assert!(granted > 0, "round {round}: the sessions fetch");
+        assert!(machine.reservations_held() <= sessions_count * MAX_REQUESTS_PER_PEER);
+        // Each request misses its deadline and gives its slot back.
+        while machine.reservations_held() > 0 {
+            now = machine.next_deadline().expect("a deadline is pending");
+            machine.tick(now);
+            let _ = machine.take_effects();
+        }
+        // The peers answer late, before their sessions give up on them.
+        for session in &sessions {
+            let asked: Vec<UnminedTxId> = machine
+                .session(*session)
+                .map(|state| state.requests.keys().copied().collect())
+                .unwrap_or_default();
+            for id in asked {
+                machine.not_found(*session, id, now);
+            }
+        }
+        carried.extend(reserves(&machine.take_effects()));
+        // The actor falls off the pool's change log.
+        machine.pool_resynced(pooled.clone(), on(pooled.clone()), now);
+        carried.extend(reserves(&machine.take_effects()));
+
+        assert_eq!(
+            machine.session_ids().count(),
+            sessions_count,
+            "round {round}: none closed"
+        );
+        assert_eq!(machine.calls_in_flight(), carried.len());
+        assert!(carried.len() <= sessions_count * MAX_REQUESTS_PER_PEER);
+        assert_eq!(
+            machine.reservations_held(),
+            0,
+            "round {round}: every slot came back"
+        );
+        assert!(machine.wanted().len() <= PENDING_PER_PEER);
+        assert_eq!(
+            machine.visible().len(),
+            PENDING_PER_PEER,
+            "the pool stays full"
+        );
+        let adverts: usize = sessions
+            .iter()
+            .filter_map(|session| machine.session(*session))
+            .map(|state| state.held.iter().count() + state.announced.iter().count())
+            .sum();
+        assert!(adverts > 0, "round {round}: the full pool is announced");
+        for (id, _) in &ids {
+            assert!(machine.holders_of(*id) <= sessions_count);
+        }
+        for session in &sessions {
+            let state = machine.session(*session).expect("live");
+            assert!(state.pending.len() <= PENDING_PER_PEER);
+            assert!(
+                state.held.iter().count() + state.announced.iter().count() <= 2 * PENDING_PER_PEER,
+                "round {round}: a session's adverts stay within the pool"
+            );
+            assert!(
+                state.requests.is_empty(),
+                "round {round}: every request answered"
+            );
+        }
+        assert!(
+            machine.timers_len() <= 4 * sessions_count * MAX_REQUESTS_PER_PEER,
+            "round {round}: {} timers kept",
+            machine.timers_len()
+        );
+    }
+    machine.assert_invariants();
+}

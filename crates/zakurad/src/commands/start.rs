@@ -419,7 +419,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        custom_services: Vec<zakura_network::zakura::CustomService>,
+        mut custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -677,9 +677,36 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
+        // The pool is chosen once, at startup. `tx-relay` needs the pool
+        // core's port before the network starts, so it is built here and
+        // handed to the core below.
+        let pool_implementation = config.mempool.implementation.resolve();
+        let tx_relay_port = if config.network.zakura.tx_relay.enabled {
+            if pool_implementation == mempool::config::Implementation::Core {
+                let port = mempool::core::TxRelayPort::new();
+                custom_services.push(zakura_network::zakura::tx_relay_service(
+                    port.handle(),
+                    port.may_cool(),
+                    &config.network.zakura.tx_relay,
+                    config.network.unconditional_peers.clone(),
+                ));
+                Some(port)
+            } else {
+                warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
+                None
+            }
+        } else {
+            None
+        };
+
+        // The network counts `tx-relay`'s memory shares only when it is
+        // registered, not merely enabled.
+        let mut network_config = config.network.clone();
+        network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+
         let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
-                config.network.clone(),
+                network_config,
                 inbound,
                 latest_chain_tip.clone(),
                 user_agent(),
@@ -792,8 +819,6 @@ impl StartCmd {
             zakura_jsonl_trace::node_id(),
         );
 
-        // The pool is chosen once, at startup.
-        let pool_implementation = config.mempool.implementation.resolve();
         info!(?pool_implementation, "initializing mempool");
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
@@ -815,6 +840,7 @@ impl StartCmd {
                         unconditional: config.network.unconditional_peers.clone(),
                     },
                     template_path_trace.clone(),
+                    tx_relay_port,
                 );
                 (
                     parts.mempool,

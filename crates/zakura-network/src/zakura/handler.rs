@@ -406,6 +406,8 @@ pub struct ZakuraConfig {
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
     pub block_sync: ZakuraBlockSyncConfig,
+    /// `tx-relay` settings (`[network.zakura.tx_relay]`).
+    pub tx_relay: super::ZakuraTxRelayConfig,
     /// Optional private dev-network cohort tag.
     ///
     /// When set, this node only forms Zakura (v2) connections with peers
@@ -441,6 +443,7 @@ impl Default for ZakuraConfig {
             trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
+            tx_relay: super::ZakuraTxRelayConfig::default(),
             dev_network: None,
         }
     }
@@ -481,7 +484,8 @@ impl ZakuraConfig {
     ///
     /// The handshake share is the `[network.zakura.quic]` receive window. The
     /// kinds are legacy gossip (2), legacy requests (3), discovery (4), header
-    /// sync (5) and block sync (6). The compatibility exchanges and TCP ingress
+    /// sync (5) and block sync (6), and `tx-relay`'s data (9) and state (10)
+    /// when it is enabled. The compatibility exchanges and TCP ingress
     /// have their own envelope terms, so they are not kinds. Other kinds keep
     /// [`ReactorShares::from_quic`]'s share.
     pub fn reactor_shares(&self, network: &Network) -> ReactorShares {
@@ -495,17 +499,28 @@ impl ZakuraConfig {
             receive: u64::MAX,
             output: u64::MAX,
         });
+        let mut kinds = vec![
+            (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
+            (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
+            (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
+            (
+                HEADER_SYNC_STREAM_KIND,
+                super::header_sync::v9::budget(network),
+            ),
+            (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
+        ];
+        // `tx-relay`'s kinds are listed only when it runs, so a node with it
+        // off budgets exactly as before.
+        if self.tx_relay.enabled {
+            use super::tx_relay::wire::{
+                TX_RELAY_DATA_BUDGET, TX_RELAY_DATA_KIND, TX_RELAY_STATE_BUDGET,
+                TX_RELAY_STATE_KIND,
+            };
+            kinds.push((TX_RELAY_DATA_KIND, TX_RELAY_DATA_BUDGET));
+            kinds.push((TX_RELAY_STATE_KIND, TX_RELAY_STATE_BUDGET));
+        }
         ReactorShares {
-            kinds: vec![
-                (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
-                (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
-                (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
-                (
-                    HEADER_SYNC_STREAM_KIND,
-                    super::header_sync::v9::budget(network),
-                ),
-                (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
-            ],
+            kinds,
             ..ReactorShares::from_quic(&self.quic)
         }
     }
@@ -951,6 +966,11 @@ pub struct CustomService {
 
     /// Remote service ids to prefer when selecting outbound discovery peers.
     pub seeks: Vec<ZakuraServiceId>,
+
+    /// `tx-relay`'s live-session record, set only by
+    /// [`tx_relay_service`](super::tx_relay_service). With it, the legacy
+    /// adapter leaves each peer with a live session to `tx-relay`.
+    pub tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 impl From<CustomService> for Arc<dyn Service> {
@@ -1462,6 +1482,9 @@ pub struct ZakuraSupervisorHandle {
     /// The same counts the supervisor state charges, read by the QUIC acceptor.
     ip_slots: IpSlots,
     max_connections_per_ip: usize,
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 /// Connections charged to each source IP: registered connections, and inbound
@@ -1852,7 +1875,24 @@ impl ZakuraSupervisorHandle {
             peer_registry,
             ip_slots,
             max_connections_per_ip,
+            tx_relay_sessions: None,
         }
+    }
+
+    /// This supervisor with `tx-relay`'s live-session record, which the
+    /// legacy adapters built from it read. Set it before cloning the handle.
+    pub(crate) fn with_tx_relay_sessions(
+        mut self,
+        sessions: Option<super::TxRelaySessions>,
+    ) -> Self {
+        self.tx_relay_sessions = sessions;
+        self
+    }
+
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    pub(crate) fn tx_relay_sessions(&self) -> Option<&super::TxRelaySessions> {
+        self.tx_relay_sessions.as_ref()
     }
 
     /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
@@ -4930,9 +4970,13 @@ async fn spawn_zakura_endpoint_inner(
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
+    // A custom kind with its own share, such as `tx-relay`'s, is counted
+    // once, with the native kinds.
+    let named_kinds = config.zakura.reactor_shares(&config.network).kinds;
     let custom_kinds: Vec<u16> = custom_services
         .iter()
         .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
+        .filter(|kind| !named_kinds.iter().any(|(named, _)| named == kind))
         .collect();
     let budgeted_max_connections = config.zakura.budgeted_max_connections_for_node(
         &config.network,
@@ -4976,7 +5020,12 @@ async fn spawn_zakura_endpoint_inner(
             peer_registry,
         ),
         None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
-    };
+    }
+    .with_tx_relay_sessions(
+        custom_services
+            .iter()
+            .find_map(|custom| custom.tx_relay_sessions.clone()),
+    );
     let tracer = config
         .zakura
         .trace_dir
@@ -7646,6 +7695,8 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        super::tx_relay::wire::TX_RELAY_DATA_KIND => "tx_relay_data",
+        super::tx_relay::wire::TX_RELAY_STATE_KIND => "tx_relay_state",
         _ => "unknown",
     }
 }
@@ -9533,6 +9584,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await
@@ -9970,6 +10022,7 @@ mod tests {
                 }),
                 provides: vec![service_id.clone()],
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await?
@@ -9997,6 +10050,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: vec![service_id],
+                tx_relay_sessions: None,
             }],
         )
         .await?

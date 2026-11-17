@@ -2702,6 +2702,30 @@ fn advert_delay_roundtrips_and_validates() {
     assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
 }
 
+#[test]
+fn block_hedge_is_off_by_default_and_validates_its_delay() {
+    let _init_guard = zakura_test::init();
+    let default: Config = toml::from_str("").unwrap();
+    assert!(!default.block_hedge.enabled);
+    assert_eq!(default.block_hedge.enabled_delay(), None);
+
+    let config: Config = toml::from_str("[block_hedge]\nenabled = true\ndelay = '30ms'").unwrap();
+    assert_eq!(
+        config.block_hedge.enabled_delay(),
+        Some(Duration::from_millis(30))
+    );
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(config, roundtrip);
+
+    for delay in ["'1ms'", "'6s'"] {
+        assert!(
+            toml::from_str::<Config>(&format!("[block_hedge]\ndelay = {delay}")).is_err(),
+            "a delay of {delay} is outside the supported range"
+        );
+    }
+    assert!(toml::from_str::<Config>("[block_hedge]\nunknown = 1").is_err());
+}
+
 /// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
 /// the maximum becomes the delay, and the minimum is ignored.
 #[test]

@@ -1308,3 +1308,120 @@ async fn tx_getdata_routing_ignores_request_slot() {
         "the transaction request is written after the earlier response",
     );
 }
+
+/// Gives `peer` a measured heartbeat round trip of `rtt_ms`, as the heartbeat task records it.
+fn measure_rtt(
+    peer: &mut TestPeer,
+    registry: &crate::peer_registry::PeerRegistry,
+    rtt_ms: u64,
+) -> crate::peer_registry::PeerRegistryGuard {
+    let (guard, updater) = registry.register_legacy(crate::peer_registry::ConnectedPeer {
+        addr: peer.addr,
+        user_agent: "test".into(),
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        start_height: block::Height(0),
+        is_inbound: false,
+        rtt: Some(Duration::from_millis(rtt_ms)),
+        ping_sent_at: None,
+    });
+    peer.client
+        .as_mut()
+        .expect("peer is not yet in the peer set")
+        .block_gossip
+        .registry = Some(updater);
+    guard
+}
+
+/// Builds a peer set from `peers` in which each of them announced `BLOCK_HASH`.
+async fn peer_set_with_block_advertisers(
+    peers: &mut [&mut TestPeer],
+) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
+    let (minimum_peer_version, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (mut peer_set, mut guard) = PeerSetBuilder::new()
+        .with_discover(discover(
+            peers.iter_mut().map(|peer| peer.discovered()).collect(),
+        ))
+        .with_minimum_peer_version(minimum_peer_version)
+        .max_conns_per_ip(peers.len())
+        .build();
+
+    // The test inventory channel holds one change, so register each advert before the next.
+    for peer in peers.iter() {
+        guard
+            .inventory_sender()
+            .as_mut()
+            .expect("guard has an inventory sender")
+            .send(InventoryStatus::new_available(
+                InventoryHash::Block(BLOCK_HASH),
+                peer.addr,
+            ))
+            .expect("peer set receives inventory");
+        peer_set.ready().await.expect("peer set is ready");
+    }
+    (peer_set, guard)
+}
+
+/// A hedge goes to the idle advertiser with the fastest ping, never to a busy one, even when
+/// the busy peer's ping is faster still.
+#[tokio::test(start_paused = true)]
+async fn block_hedge_goes_to_the_fastest_idle_advertiser() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+
+    let mut busy = TestPeer::spawn(1);
+    let mut slow = TestPeer::spawn(2);
+    let mut fast = TestPeer::spawn(3);
+    let _guards = [
+        measure_rtt(&mut busy, &registry, 1),
+        measure_rtt(&mut slow, &registry, 200),
+        measure_rtt(&mut fast, &registry, 10),
+    ];
+
+    let tx = test_transaction();
+    let (_tx_response, _tx_getdata) = busy
+        .send_direct(Request::TransactionsById(iter::once(tx.id()).collect()))
+        .await;
+
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut busy, &mut slow, &mut fast]).await;
+    assert!(!peer_set.ready_services[&busy.addr].can_send_request_now());
+
+    let _hedge_response = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlockByHashHedge(BLOCK_HASH));
+
+    assert_eq!(
+        fast.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the hedge is an ordinary block getdata to the fastest idle advertiser",
+    );
+    assert_eq!(slow.written_now().await, None);
+    assert_eq!(busy.written_now().await, None);
+}
+
+/// With no idle advertiser, a hedge fails at once and nothing is sent.
+#[tokio::test(start_paused = true)]
+async fn block_hedge_without_an_idle_advertiser_fails_at_once() {
+    let _init_guard = zakura_test::init();
+
+    let mut busy = TestPeer::spawn(1);
+    let tx = test_transaction();
+    let (_tx_response, _tx_getdata) = busy
+        .send_direct(Request::TransactionsById(iter::once(tx.id()).collect()))
+        .await;
+
+    // Only the busy peer announced the block.
+    let (mut peer_set, _guard) = peer_set_with_block_advertisers(&mut [&mut busy]).await;
+
+    let result = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlockByHashHedge(BLOCK_HASH))
+        .await;
+
+    assert!(result.is_err(), "no idle advertiser means no hedge");
+    assert_eq!(busy.written_now().await, None);
+}

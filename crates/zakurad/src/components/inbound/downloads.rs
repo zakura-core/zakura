@@ -1302,6 +1302,9 @@ where
 mod missing_parent_tests;
 
 #[cfg(test)]
+mod hedge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt as _;

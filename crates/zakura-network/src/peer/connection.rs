@@ -1269,7 +1269,9 @@ where
             .send_authorized(
                 Message::Inv(vec![InventoryHash::Block(advert.hash)]),
                 || {
-                    version >= minimum.current()
+                    // Validation can withdraw the advert while writer readiness is pending.
+                    !advert.result.is_closed()
+                        && version >= minimum.current()
                         && !address.is_some_and(|addr| bans.contains(addr.ip()))
                 },
             )
@@ -1282,7 +1284,7 @@ where
                 let _ = advert.result.send(Ok(()));
             }
             Ok(false) => {
-                debug!(hash = ?advert.hash, "not advertising block: peer authorization was revoked");
+                debug!(hash = ?advert.hash, "not advertising block: cancelled or peer authorization revoked");
                 let _ = advert
                     .result
                     .send(Err(BlockAdvertError::AuthorizationRevoked));

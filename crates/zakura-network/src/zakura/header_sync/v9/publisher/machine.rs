@@ -49,7 +49,7 @@ use crate::zakura::{
         reactor::{HeaderMachineFailure, HeaderMachinePhase},
         v9::{Cursor, Operation, RegtestMessage},
     },
-    machine_test::MAX_HISTORY_BYTES,
+    machine_test::{with_property, MAX_HISTORY_BYTES},
     wire_codec::decode_frame,
     Credit,
 };
@@ -459,7 +459,7 @@ impl Machine {
     /// Check the owner's invariants, and that its ledger holds what the test
     /// granted, spent, and has not acknowledged.
     fn check(&mut self) {
-        self.owner.assert_invariants();
+        with_property(PROPERTY, || self.owner.assert_invariants());
         if let Some(record) = &self.job {
             assert!(
                 self.owner.state.is_current(record.job.key),

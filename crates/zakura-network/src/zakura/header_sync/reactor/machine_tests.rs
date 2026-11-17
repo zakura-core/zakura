@@ -36,7 +36,7 @@ use proptest::prelude::*;
 use super::{state::*, *};
 #[cfg(test)]
 use crate::zakura::machine_test::machine_target_tests;
-use crate::zakura::machine_test::MAX_HISTORY_BYTES;
+use crate::zakura::machine_test::{panic_text, with_property, MAX_HISTORY_BYTES};
 
 const PEERS: usize = 3;
 
@@ -1049,7 +1049,7 @@ impl Harness {
             ),
         }
         self.check_repair_suppliers();
-        self.state.assert_invariants();
+        with_property(PROPERTY, || self.state.assert_invariants());
     }
 
     /// Each started read stays pending with its call until it settles, and
@@ -1779,15 +1779,7 @@ impl HeaderMachineFailure {
         phase: HeaderMachinePhase,
         payload: &(dyn std::any::Any + Send),
     ) -> Self {
-        let message = payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .downcast_ref::<&str>()
-                    .map(|text| (*text).to_owned())
-            })
-            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        let message = panic_text(payload);
         Self {
             property_failure: message == property
                 || message.starts_with(&format!("{property}:"))

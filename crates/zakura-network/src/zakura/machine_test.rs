@@ -22,6 +22,33 @@
 /// the same.
 pub const MAX_HISTORY_BYTES: usize = 512;
 
+/// Run `check`, a machine's own invariant check, and prefix any panic it
+/// raises with `property`, so the simulator reads it as that property's
+/// failure. Wrap only the invariant call: a panic in the driver around it
+/// stays a driver panic.
+pub(crate) fn with_property(property: &str, check: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+        let message = panic_text(payload.as_ref());
+        if message.starts_with(property) {
+            std::panic::resume_unwind(payload);
+        }
+        std::panic::resume_unwind(Box::new(format!("{property}: {message}")));
+    }
+}
+
+/// A panic payload's text.
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 /// The tests every machine target shares: its witness reaches the expected
 /// counters, empty input reaches nothing, and random histories keep every
 /// property.

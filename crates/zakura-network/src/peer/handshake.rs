@@ -1944,7 +1944,8 @@ where
                 alternate_addrs.collect(),
                 inbound_budget,
             )
-            .with_gossip_trace(gossip_trace);
+            .with_gossip_trace(gossip_trace)
+            .with_delivery_samples(peer_registry_updater.clone());
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();

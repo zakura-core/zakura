@@ -9,6 +9,11 @@ use std::{
 
 use zakura_chain::block;
 
+mod delivery;
+
+use delivery::DeliveryEstimate;
+pub(crate) use delivery::MISSED_BLOCK_PENALTY;
+
 use crate::{
     peer::ConnectionInfo,
     protocol::external::types::Version,
@@ -60,6 +65,8 @@ pub(crate) struct PeerRegistry {
 struct RegistryState {
     next_legacy_generation: u64,
     active_connections: HashMap<ConnectionKey, ConnectedPeer>,
+    /// How long each active legacy connection takes to answer, for choosing block sources.
+    delivery_estimates: HashMap<ConnectionKey, DeliveryEstimate>,
     native_connections: HashMap<ZakuraPeerId, NativeConnection>,
     retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
 }
@@ -266,11 +273,12 @@ impl PeerRegistry {
     }
 
     fn remove_connection(&self, key: &ConnectionKey) {
-        self.inner
+        let mut state = self
+            .inner
             .lock()
-            .expect("peer registry mutex is never poisoned")
-            .active_connections
-            .remove(key);
+            .expect("peer registry mutex is never poisoned");
+        state.active_connections.remove(key);
+        state.delivery_estimates.remove(key);
     }
 }
 
@@ -305,6 +313,43 @@ impl PeerRegistryUpdater {
                 connected_peer.rtt = Some(rtt);
                 connected_peer.ping_sent_at = None;
             });
+        self.record_delivery_sample(rtt, Instant::now());
+    }
+
+    /// Records how long the peer took, measured at `now`, to answer a ping, a transaction
+    /// request or a small block request, or [`MISSED_BLOCK_PENALTY`] when it failed to deliver a
+    /// block it announced.
+    ///
+    /// Does nothing once the connection has closed, or for a native connection, whose blocks
+    /// are not chosen this way.
+    pub(crate) fn record_delivery_sample(&self, sample: Duration, now: Instant) {
+        if !matches!(self.key, ConnectionKey::Legacy(_)) {
+            return;
+        }
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned");
+        if state.active_connections.contains_key(&self.key) {
+            state
+                .delivery_estimates
+                .entry(self.key.clone())
+                .or_default()
+                .record(sample, now);
+        }
+    }
+
+    /// The expected time for this peer to answer a block request, from its recent answers, or
+    /// `None` before its first measured answer.
+    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+        self.registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .delivery_estimates
+            .get(&self.key)
+            .and_then(DeliveryEstimate::score)
     }
 }
 
@@ -393,6 +438,25 @@ mod tests {
 
         registry.deregister_native_connection(&peer_id, 2);
         assert!(registry.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
+        let registry = PeerRegistry::default();
+        let (guard, updater) = registry.register_legacy(peer(1));
+        assert_eq!(updater.delivery_score(), None);
+
+        updater.record_response(Duration::from_millis(30));
+        assert_eq!(updater.delivery_score(), Some(Duration::from_millis(30)));
+
+        drop(guard);
+        assert_eq!(updater.delivery_score(), None);
+        updater.record_delivery_sample(Duration::from_millis(5), Instant::now());
+        assert_eq!(
+            updater.delivery_score(),
+            None,
+            "a closed connection keeps no estimate"
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ use crate::{
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
+    peer_registry::PeerRegistryUpdater,
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, InventoryHash, Message},
@@ -727,6 +728,41 @@ where
 
     /// Funds the payloads of the current client request's response until its handoff.
     response_charge: Option<InboundCharge>,
+
+    /// Where this connection records how long the peer takes to answer, for choosing block
+    /// sources. `None` when the node keeps no peer registry.
+    delivery_samples: Option<PeerRegistryUpdater>,
+
+    /// When the current client request started being written, if one is outstanding.
+    request_started_at: Option<tokio::time::Instant>,
+}
+
+/// The largest block, by decoded size, whose answer time counts as a delivery sample.
+///
+/// A larger block's answer time is mostly the time to send it, which says little about how
+/// quickly the peer answers the next request.
+const MAX_SAMPLED_BLOCK_BYTES: u64 = 256 * 1024;
+
+/// Returns true if `response`'s answer time says how quickly the peer answers a block request:
+/// a reply with at least one transaction, or with blocks that are all small.
+///
+/// Pings are measured by the heartbeat, and other replies (block hashes, headers, addresses,
+/// "not found" alone) take the peer a different amount of work, so they don't count.
+fn is_delivery_sample(response: &Response) -> bool {
+    match response {
+        Response::Transactions(transactions) => transactions
+            .iter()
+            .any(|transaction| transaction.available().is_some()),
+        Response::Blocks(blocks) => {
+            let mut available = blocks
+                .iter()
+                .filter_map(InventoryResponse::available)
+                .peekable();
+            available.peek().is_some()
+                && available.all(|(block, _)| block.decoded_bytes() <= MAX_SAMPLED_BLOCK_BYTES)
+        }
+        _ => false,
+    }
 }
 
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
@@ -839,7 +875,18 @@ where
             last_overload_time: None,
             inbound_budget,
             response_charge: None,
+            delivery_samples: None,
+            request_started_at: None,
         }
+    }
+
+    /// Makes this connection record how long the peer takes to answer in `delivery_samples`.
+    pub(super) fn with_delivery_samples(
+        mut self,
+        delivery_samples: Option<PeerRegistryUpdater>,
+    ) -> Self {
+        self.delivery_samples = delivery_samples;
+        self
     }
 
     /// Makes this connection write its block gossip to `gossip_trace`.
@@ -999,6 +1046,7 @@ where
                         Either::Right(Some(req)) => {
                             // The request may wait for the peer writer before the state changes.
                             self.request_slot.set_busy(true);
+                            self.request_started_at = Some(tokio::time::Instant::now());
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -1852,6 +1900,16 @@ where
 
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
+            }
+
+            if let (Some(delivery_samples), Some(started_at), Ok(response)) = (
+                &self.delivery_samples,
+                self.request_started_at.take(),
+                response.as_ref(),
+            ) {
+                if is_delivery_sample(response) {
+                    delivery_samples.record_delivery_sample(started_at.elapsed(), Instant::now());
+                }
             }
 
             let _ = tx.send(response.map_err(Into::into));

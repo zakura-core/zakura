@@ -375,7 +375,8 @@ jobs:
             139.59.64.115 \
             168.144.173.250 \
             159.203.113.196 \
-            104.131.174.28; do
+            104.131.174.28 \
+            206.189.45.15; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -512,6 +513,18 @@ jobs:
           # failed` and the header chain ran ~6,000 blocks ahead of the verified
           # tip. Switching the node to `legacy` cleared it immediately. Do not flip
           # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
+
+          # Legacy-only node in Singapore that measures `[network.block_source_score]`:
+          # its own config chooses block sources by measured answer time, and its
+          # trace rows record each choice. Binary-only like the rest of the fleet;
+          # p2p_stack here is metadata that matches its config.
+          [[nodes]]
+          name       = "asia-scored"
+          ssh_string = "root@206.189.45.15"
+          monitor    = { profiler_url = "http://127.0.0.1:8108" }
+          commit     = "${REF}"
+          rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF
 

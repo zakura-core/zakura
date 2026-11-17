@@ -205,6 +205,7 @@ and deploys it to:
 - `asia-pacific-0` — `root@168.144.173.250`
 - `zakura-compat` — `root@159.203.113.196`
 - `archive-vct-off` — `root@104.131.174.28`
+- `asia-scored` — `root@206.189.45.15`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
@@ -220,6 +221,9 @@ coordinator logged `accepted block apply lost terminal observation; apply
 lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
+
+`asia-scored` is a legacy-only node in Singapore with
+`[network.block_source_score]` enabled, kept to measure that setting.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated

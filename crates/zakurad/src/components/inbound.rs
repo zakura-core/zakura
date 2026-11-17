@@ -545,11 +545,13 @@ impl Service<zn::Request> for Inbound {
                     // A rewritten coinbase height on a tip child is rejected before the block
                     // reaches the verifier, so it is never a `RouterError` or a
                     // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
-                    // the one rejection that must re-request the block: the poisoned response
+                    // a rejection that must re-request the block: the poisoned response
                     // held the per-hash dedupe slot while it was outstanding, so honest peers'
                     // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
                     // the re-request the block waits for the syncer's next round, which is the
                     // delay the attack is trying to cause.
+                    // Failed pushes separately retain one concurrent announcement and transfer
+                    // their queue slot to its download, regardless of the rejection reason.
                     //
                     // Scoring and re-requesting are kept together here rather than split across
                     // `block_misbehavior`, because the re-request needs `block_downloads` and

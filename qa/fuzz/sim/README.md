@@ -91,7 +91,8 @@ or close a pool. Eight slots hold production handles. Two pools enforce equal
 pipeline byte limits, and a third pool enforces a count limit. The fixture uses the
 Regtest genesis payload. Each history drains its handles before pool destruction.
 
-The independent model derives charges from its handle graph. Weak probes read
+The model derives charges from its handle graph, and checks each admission the
+pools decide against the pool's closure and the blocks it holds. Weak probes read
 actual header and transaction references, the allocation's pool, and a
 fresh attributed-size traversal. They detect raw handles that escape the owner.
 These checks cover completed owner operations. They do not establish asynchronous
@@ -102,8 +103,13 @@ and incorrect release. A charge cannot change pool, so no wrong-owner settlement
 path exists for decoded blocks; this is an API check, not a runtime mutation.
 Campaigns run outside blocking PR CI.
 
-The funding property compares actual retention with the independent model at
-completed operations. It does not establish asynchronous cancellation races,
+The ownership property checks the queue's invariants after every input, that
+draining the queue releases exactly its ledger, and that each transition moves
+the ledger by the bytes it reports and touches only its owner's heights. The
+funding property checks at completed operations that the shared budget charges
+exactly the funding the driver's owners retain, that the pool funds exactly the
+queue's ledger until accounting closes, and that admission keeps each session
+within the owner cap. It does not establish asynchronous cancellation races,
 decoded-body retention, or backend-worker retention. Run long campaigns manually
 or nightly; this target adds no blocking PR fuzz campaign.
 

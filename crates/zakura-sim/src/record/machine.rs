@@ -30,7 +30,7 @@ pub enum MachineStep {
     /// [`crate::harness::fixtures`] tests the simulator. No production machine
     /// records it.
     Fixture(FixtureStep),
-    /// Logical block-work ownership and its independent model.
+    /// Logical block-work ownership read from the pure owner.
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
     WorkFunding(WorkFundingStep),
@@ -58,7 +58,7 @@ pub struct DecodedRetentionStep {
     pub drain: bool,
     /// Independent allocation reads and actual pool counters.
     pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
-    /// The independent model's retained handle graph and expected pool charges.
+    /// The model's retained handle graph and expected pool charges.
     pub expected: zakura_node_services::block_memory::model::RetentionView,
     /// The model's disagreement. An unavailable capture or a driver panic is
     /// marked as no property detection.
@@ -199,7 +199,7 @@ pub struct WorkView {
     pub authority: Option<BodyAuthority>,
     /// Entries sorted by height and location; duplicate heights remain visible.
     pub items: Vec<WorkItem>,
-    /// Maintained total, or independently summed model charges.
+    /// Maintained total.
     pub reserved: u64,
     /// Charges scanned from retained entries.
     pub scanned: u64,
@@ -215,8 +215,6 @@ pub struct WorkStep {
     pub input: Vec<u8>,
     /// State read from the production pure owner.
     pub actual: WorkView,
-    /// State derived independently by the model.
-    pub expected: WorkView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -431,7 +429,6 @@ impl From<zakura_network::zakura::WorkOwnershipStep> for WorkStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -457,7 +454,7 @@ pub enum FundingRequestPhase {
     Dropped,
 }
 
-/// Actual or independently predicted request retention.
+/// Request retention read from its runtime owner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingRequest {
@@ -485,7 +482,7 @@ pub struct FundingReceipt {
     pub bytes: u64,
 }
 
-/// Resource reads or independent model predictions at a runtime boundary.
+/// Resource reads at a runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkFundingView {
@@ -515,10 +512,8 @@ pub struct WorkFundingStep {
     pub input: Vec<u8>,
     /// Whether the driver drains its owners before aggregate destruction.
     pub drain: bool,
-    /// Independent reads of actual runtime resources.
+    /// Reads of actual runtime resources.
     pub actual: WorkFundingView,
-    /// Independent model predictions.
-    pub expected: WorkFundingView,
     /// First transition or invariant failure.
     pub failure: Option<MachineFailure>,
 }
@@ -571,7 +566,6 @@ impl From<zakura_network::zakura::WorkFundingStep> for WorkFundingStep {
             input: value.input,
             drain: value.drain,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }

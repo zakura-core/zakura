@@ -103,8 +103,12 @@ below.
 | `block_fill` | `block/fill-retry-run`, `block/fill-retained-funding`, `block/fill-commit-window` | 1 |
 | `block_request_lifecycle` | `block/request-lifecycle` | 1 |
 
-`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` model through
+`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` owner through
 trace and replay, so it needs no target here.
+
+The retry target checks the supplier and alarm owners' invariants and compares
+each lookup only with the deferrals it wrote. The peer-table target keeps a
+small bookkeeping model of generations, close flags and published claims.
 
 The input decoding, the model and the checks live in `zakura-network` behind the
 `p2p-fuzz` feature, so the machine types stay private to the crate.
@@ -167,8 +171,9 @@ targets follow their owning delivery packets.
 | `block_sequencer_evidence` | `block/required-evidence` | 1 |
 
 These targets preserve PR #1680 at
-`3bc8261c6d1a0c1ec1daf55d361f5a33e34b5a8d`. Each target uses the independent
-model from its proptest driver. Ordering and evidence consume three-byte
+`3bc8261c6d1a0c1ec1daf55d361f5a33e34b5a8d`. Each target checks the sequencer's
+invariants and compares its outputs with bookkeeping of the heights it
+delivered and the driver accepted. Ordering and evidence consume three-byte
 operations. Reset consumes one byte for the retired-apply count, then three-byte
 operations. Each decoder reads at most 512 bytes. Empty input reports zero
 applicability. Setup transitions do not count as generated coverage.
@@ -176,7 +181,7 @@ applicability. Setup transitions do not count as generated coverage.
 The ordering witness retries a refused contiguous submission. The reset witness
 completes a retired apply while current work remains. The evidence witness holds
 required evidence through modeled backpressure, then delivers it. Planted state
-corruption must fail the intended model check. These checks do not establish
+corruption must fail the intended check. These checks do not establish
 production-mutation detection, decoded-memory retention, actual channel delivery,
 or fresh-process semantic replay. The block fixture copies public mainnet block
 1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.

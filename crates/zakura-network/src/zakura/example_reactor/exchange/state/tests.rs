@@ -1,16 +1,18 @@
 //! Tests for the example exchange state and its watch rules.
 //!
-//! The proptest drives the production [`ExchangeState`]. It checks the state's
-//! invariants after every input, and it compares each output only with facts
-//! that follow from the inputs the test chose: which range an item was sent
-//! for, how many items arrived, and what count the peer reported. The test
-//! never re-derives a decision the state makes. Named cases pin the watch
-//! rules.
-
-use proptest::prelude::*;
+//! [`replay_exchange_bytes`] is the template for a machine target (see
+//! [`machine_test`](crate::zakura::machine_test)). It drives the production
+//! [`ExchangeState`], checks the state's invariants after every input, and
+//! compares each output only with facts that follow from the inputs it chose:
+//! which range an item was sent for, how many items arrived, and what count the
+//! peer reported. It never re-derives a decision the state makes. Named cases
+//! pin the watch rules.
 
 use super::*;
-use crate::zakura::example_reactor::{message_type, MAX_ITEMS_PER_REQUEST};
+use crate::zakura::{
+    example_reactor::{message_type, MAX_ITEMS_PER_REQUEST},
+    machine_test::{machine_target_tests, MAX_HISTORY_BYTES},
+};
 
 /// Ranges one node may have outstanding: the `GetItems` row's limit.
 const MAX_IN_FLIGHT: usize = 4;
@@ -23,7 +25,7 @@ const SLOT: u32 = 2 * MAX_ITEMS_PER_REQUEST;
 const SLOTS: u32 = 4;
 
 /// One input IO delivers to the state, in the order it would deliver it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Op {
     /// IO reserved and wrote a request for `count` items, starting `shift`
     /// heights into `slot`.
@@ -40,23 +42,52 @@ enum Op {
     Unavailable { index: usize },
 }
 
-fn op() -> impl Strategy<Value = Op> {
-    let count = 1..=MAX_ITEMS_PER_REQUEST;
-    prop_oneof![
-        2 => (0..SLOTS, 0..=SLOT - MAX_ITEMS_PER_REQUEST, count.clone())
-            .prop_map(|(slot, shift, count)| Op::Request { slot, shift, count }),
-        5 => (0..MAX_IN_FLIGHT, 0..MAX_ITEMS_PER_REQUEST)
-            .prop_map(|(index, offset)| Op::Item { index, offset }),
-        2 => (0..SLOTS * SLOT).prop_map(|height| Op::Stray { height }),
-        2 => (0..MAX_IN_FLIGHT, prop_oneof![3 => Just(0u32), 1 => 1..3u32])
-            .prop_map(|(index, miscount)| Op::Done { index, miscount }),
-        1 => (0..MAX_IN_FLIGHT).prop_map(|index| Op::Unavailable { index }),
-    ]
+/// Decoder v1: each pair of bytes is one input. The first byte's low three
+/// bits choose the input; the second byte and the first byte's high bits
+/// choose its arguments.
+fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks_exact(2)
+        .map(|pair| {
+            let (kind, high, arg) = (pair[0] & 7, u32::from(pair[0] >> 3), pair[1]);
+            let index = usize::from(arg & 3);
+            match kind {
+                0 => Op::Request {
+                    slot: u32::from(arg & 3),
+                    shift: u32::from(arg >> 2) % (SLOT - MAX_ITEMS_PER_REQUEST + 1),
+                    count: high % MAX_ITEMS_PER_REQUEST + 1,
+                },
+                1..=3 => Op::Item {
+                    index,
+                    offset: u32::from(arg >> 2) % MAX_ITEMS_PER_REQUEST,
+                },
+                4 => Op::Stray {
+                    height: u32::from(arg) % (SLOTS * SLOT),
+                },
+                5 | 6 => Op::Done {
+                    index,
+                    miscount: (high % 4).saturating_sub(1),
+                },
+                _ => Op::Unavailable { index },
+            }
+        })
 }
 
 /// An item's bytes. Any value works; the state must return it unchanged.
 fn bytes(height: u32) -> Vec<u8> {
     height.to_le_bytes().to_vec()
+}
+
+/// Transitions one history reached.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ExchangeCounters {
+    requested: usize,
+    items: usize,
+    strays_refused: usize,
+    done: usize,
+    miscounts_refused: usize,
+    unavailable: usize,
+    late_unavailable_refused: usize,
 }
 
 /// What the test sent: each outstanding range, in request order, with the
@@ -73,7 +104,7 @@ impl Sent {
     }
 
     /// Deliver an item the state placed in the range at `start`.
-    fn deliver(&mut self, state: &mut ExchangeState, start: Height, height: Height) {
+    fn deliver(&mut self, state: &mut ExchangeState, start: Height, height: Height) -> bool {
         let (range, items) = self
             .outstanding
             .iter_mut()
@@ -81,94 +112,182 @@ impl Sent {
             .expect("the state names only outstanding ranges");
         // The reservation admits at most `count` frames.
         if items.len() == usize::try_from(range.count).expect("a count fits usize") {
-            return;
+            return false;
         }
         state.item(start, height, bytes(height.0));
         items.push((height, bytes(height.0)));
+        true
     }
 }
 
-proptest! {
-    /// The state keeps its invariants after every input. An item the test sent
-    /// for a range lands in that range. An ending succeeds exactly when the
-    /// peer reports the count that arrived, returns the items in arrival
-    /// order, and retires the range.
-    #[test]
-    fn exchange_state_keeps_its_invariants(ops in prop::collection::vec(op(), 1..64)) {
-        let mut state = ExchangeState::default();
-        let mut sent = Sent::default();
-        for op in ops {
-            match op {
-                Op::Request { slot, shift, count } => {
-                    let start = Height(slot * SLOT + shift);
-                    // IO's reservations admit at most the row's limit, and
-                    // this node requests at most one range per slot.
-                    if sent.outstanding.len() == MAX_IN_FLIGHT
-                        || sent.outstanding.iter().any(|(range, _)| range.start.0 / SLOT == slot)
-                    {
-                        continue;
-                    }
-                    let range = ItemRange { start, count };
-                    state.requested(range);
-                    sent.outstanding.push((range, Vec::new()));
+/// Replay at most [`MAX_HISTORY_BYTES`] bytes through [`ExchangeState`].
+///
+/// The state keeps its invariants after every input. An item the test sent for
+/// a range lands in that range. An ending succeeds exactly when the peer
+/// reports the count that arrived, returns the items in arrival order, and
+/// retires the range.
+fn replay_exchange_bytes(data: &[u8]) -> ExchangeCounters {
+    let mut state = ExchangeState::default();
+    let mut sent = Sent::default();
+    let mut counters = ExchangeCounters::default();
+    for op in decode(data) {
+        match op {
+            Op::Request { slot, shift, count } => {
+                // IO's reservations admit at most the row's limit, and this
+                // node requests at most one range per slot.
+                if sent.outstanding.len() == MAX_IN_FLIGHT
+                    || sent
+                        .outstanding
+                        .iter()
+                        .any(|(range, _)| range.start.0 / SLOT == slot)
+                {
+                    continue;
                 }
-                Op::Item { index, offset } => {
-                    let Some(index) = sent.pick(index) else { continue };
-                    let range = sent.outstanding[index].0;
-                    if offset >= range.count {
-                        continue;
-                    }
-                    let height = Height(range.start.0 + offset);
-                    prop_assert_eq!(state.range_of(height, message_type::ITEM), Ok(range.start));
-                    sent.deliver(&mut state, range.start, height);
+                let range = ItemRange {
+                    start: Height(slot * SLOT + shift),
+                    count,
+                };
+                state.requested(range);
+                sent.outstanding.push((range, Vec::new()));
+                counters.requested += 1;
+            }
+            Op::Item { index, offset } => {
+                let Some(index) = sent.pick(index) else {
+                    continue;
+                };
+                let range = sent.outstanding[index].0;
+                if offset >= range.count {
+                    continue;
                 }
-                Op::Stray { height } => {
-                    // The invariants check that a found range contains the item.
-                    if let Ok(start) = state.range_of(Height(height), message_type::ITEM) {
-                        sent.deliver(&mut state, start, Height(height));
-                    }
-                }
-                Op::Done { index, miscount } => {
-                    let Some(index) = sent.pick(index) else { continue };
-                    let (range, items) = &sent.outstanding[index];
-                    let claimed = u32::try_from(items.len()).expect("at most eight items");
-                    let returned = claimed + miscount;
-                    // The codec refuses an ending that reports no item.
-                    if returned == 0 {
-                        continue;
-                    }
-                    let ended = state.items_done(range.start, returned, claimed);
-                    if miscount == 0 {
-                        let (_, items) = sent.outstanding.remove(index);
-                        prop_assert_eq!(ended, Ok(items));
-                    } else {
-                        prop_assert_eq!(
-                            ended,
-                            Err(Violation::Count { reported: returned, received: claimed })
-                        );
-                    }
-                }
-                Op::Unavailable { index } => {
-                    let Some(index) = sent.pick(index) else { continue };
-                    let (range, items) = &sent.outstanding[index];
-                    let range = *range;
-                    let claimed = u32::try_from(items.len()).expect("at most eight items");
-                    let ended = state.range_unavailable(range.start, claimed);
-                    if claimed == 0 {
-                        sent.outstanding.remove(index);
-                        prop_assert_eq!(ended, Ok(range));
-                    } else {
-                        prop_assert_eq!(
-                            ended,
-                            Err(Violation::Count { reported: 0, received: claimed })
-                        );
-                    }
+                let height = Height(range.start.0 + offset);
+                assert_eq!(
+                    state.range_of(height, message_type::ITEM),
+                    Ok(range.start),
+                    "an item lands in the range it was sent for"
+                );
+                if sent.deliver(&mut state, range.start, height) {
+                    counters.items += 1;
                 }
             }
-            state.assert_invariants();
-            prop_assert_eq!(state.idle(), sent.outstanding.is_empty());
+            Op::Stray { height } => {
+                // The invariants check that a found range contains the item.
+                match state.range_of(Height(height), message_type::ITEM) {
+                    Ok(start) => {
+                        if sent.deliver(&mut state, start, Height(height)) {
+                            counters.items += 1;
+                        }
+                    }
+                    Err(_) => counters.strays_refused += 1,
+                }
+            }
+            Op::Done { index, miscount } => {
+                let Some(index) = sent.pick(index) else {
+                    continue;
+                };
+                let (range, items) = &sent.outstanding[index];
+                let claimed = u32::try_from(items.len()).expect("at most eight items");
+                let returned = claimed + miscount;
+                // The codec refuses an ending that reports no item.
+                if returned == 0 {
+                    continue;
+                }
+                let ended = state.items_done(range.start, returned, claimed);
+                if miscount == 0 {
+                    let (_, items) = sent.outstanding.remove(index);
+                    assert_eq!(ended, Ok(items), "an ending returns what arrived");
+                    counters.done += 1;
+                } else {
+                    assert_eq!(
+                        ended,
+                        Err(Violation::Count {
+                            reported: returned,
+                            received: claimed
+                        })
+                    );
+                    counters.miscounts_refused += 1;
+                }
+            }
+            Op::Unavailable { index } => {
+                let Some(index) = sent.pick(index) else {
+                    continue;
+                };
+                let (range, items) = &sent.outstanding[index];
+                let range = *range;
+                let claimed = u32::try_from(items.len()).expect("at most eight items");
+                let ended = state.range_unavailable(range.start, claimed);
+                if claimed == 0 {
+                    sent.outstanding.remove(index);
+                    assert_eq!(ended, Ok(range));
+                    counters.unavailable += 1;
+                } else {
+                    assert_eq!(
+                        ended,
+                        Err(Violation::Count {
+                            reported: 0,
+                            received: claimed
+                        })
+                    );
+                    counters.late_unavailable_refused += 1;
+                }
+            }
         }
+        state.assert_invariants();
+        assert_eq!(state.idle(), sent.outstanding.is_empty());
     }
+    counters
+}
+
+/// Requests two ranges, fills and ends one, refuses a miscount, a stray and a
+/// late `RangeUnavailable`, ends the other, then ends a third as unavailable.
+const WITNESS: &[u8] = &[
+    // Request three items at 0 and two items at 18.
+    0b10_000,
+    0b0000_0000,
+    0b01_000,
+    0b0000_1001,
+    // Items at offsets 0, 1 and 2 of range 0.
+    1,
+    0b0000_0000,
+    1,
+    0b0000_0100,
+    1,
+    0b0000_1000,
+    // Height 40 is in no range.
+    4,
+    40,
+    // Range 0 reports one item too many, then the right count.
+    0b10_101,
+    0,
+    5,
+    0,
+    // Range 18 gets one item, refuses `RangeUnavailable`, then ends with one
+    // item.
+    1,
+    0,
+    7,
+    0,
+    5,
+    0,
+    // A one-item range at 32 ends as unavailable.
+    0,
+    0b0000_0010,
+    7,
+    0,
+];
+
+machine_target_tests! {
+    replay: replay_exchange_bytes,
+    target: "example_exchange",
+    decoder: 1,
+    witness: WITNESS => ExchangeCounters {
+        requested: 3,
+        items: 4,
+        strays_refused: 1,
+        done: 2,
+        miscounts_refused: 1,
+        unavailable: 1,
+        late_unavailable_refused: 1,
+    },
 }
 
 #[test]

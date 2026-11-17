@@ -117,6 +117,10 @@ async fn legacy_only_startup_keeps_its_bootstrap_wait_and_cancels_dials() -> Res
 /// A repeatable latency probe using the same production initialization and native fetch path.
 #[tokio::test]
 #[ignore = "controlled startup timing; run explicitly with output enabled"]
+#[expect(
+    clippy::print_stdout,
+    reason = "the ignored timing probe reports its measurements"
+)]
 async fn startup_timing_with_two_second_legacy_seed() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for _ in 0..3 {

@@ -919,6 +919,35 @@ async fn failed_verification_is_answered_then_cached_for_the_tip(mode: Mode) {
     assert!(harness.ids().await.is_empty());
 }
 
+/// A verifier failure on this node says nothing about the transaction, so
+/// neither pool caches it, and the same body is admitted at the same tip.
+async fn local_verifier_failures_are_not_cached(mode: Mode) {
+    let local_failures = [
+        TransactionError::StateUnavailable("read capacity exhausted".into()),
+        TransactionError::ValidateMempoolLockTimeError("median-time lookup failed".into()),
+        TransactionError::InternalDowncastError("unknown verifier error".into()),
+    ];
+    for failure in local_failures {
+        let mut harness = active_pool(mode).await;
+        let sample = samples(1).remove(0);
+        let id = sample.transaction.id();
+
+        let receiver = harness
+            .queue_one(sample.transaction.clone())
+            .await
+            .expect("a new body passes the first stage");
+        harness.verify(Err(failure.clone())).await;
+        harness
+            .outcome(receiver)
+            .await
+            .expect_err("a local verifier failure refuses the transaction");
+        assert!(harness.rejected([id]).await.is_empty(), "{failure:?}");
+
+        harness.admit(&sample).await;
+        assert_eq!(harness.ids().await, [id].into(), "{failure:?}");
+    }
+}
+
 async fn too_large_rejection_is_answered_at_the_receiver_stage(mode: Mode) {
     let config = Config {
         max_transaction_bytes: 1,
@@ -1929,6 +1958,7 @@ both_pools!(
     queued_id_is_fetched_then_verified,
     failed_fetch_answers_the_receiver_and_caches_nothing,
     failed_verification_is_answered_then_cached_for_the_tip,
+    local_verifier_failures_are_not_cached,
     too_large_rejection_is_answered_at_the_receiver_stage,
     pool_dependency_limits_are_answered_then_cached_for_the_tip,
     mined_transaction_is_rejected_for_the_chain_and_tip_rejections_end,

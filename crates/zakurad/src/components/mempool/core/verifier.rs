@@ -43,7 +43,7 @@ use zakura_state as zs;
 use crate::BoxError;
 
 use super::super::{
-    downloads::TransactionDownloadVerifyError, failure_bans, failure_cools_down,
+    downloads::TransactionDownloadVerifyError, failure_bans, failure_cools_down, is_local_failure,
     upgrade_grace_period, ReadState, TxVerifier,
 };
 
@@ -209,18 +209,6 @@ impl Verifier<TransactionError> for ConsensusVerifier {
     ) -> Pin<Box<dyn Future<Output = Outcome<TransactionError>> + Send>> {
         Box::pin(self.clone().check(tx, tip, after_reset))
     }
-}
-
-/// Whether `error` is a failure on this node that says nothing about the
-/// transaction: a failed state lookup, or an internal error. The lock-time
-/// check turns a failed median-time lookup into its own error.
-fn is_local_failure(error: &TransactionError) -> bool {
-    matches!(
-        error,
-        TransactionError::StateUnavailable(_)
-            | TransactionError::ValidateMempoolLockTimeError(_)
-            | TransactionError::InternalDowncastError(_)
-    )
 }
 
 /// The transaction verifier's pool handle in core mode. It answers

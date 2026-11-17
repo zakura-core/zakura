@@ -26,6 +26,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     parameters::Network,
 };
+use zakura_jsonl_trace::{saturating_micros, JsonlDisplay, JsonlEventEmitter};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::block_memory::BlockHandle;
 use zakura_rpc::{PendingBlockRegistry, PendingBlockResolution};
@@ -49,16 +50,44 @@ const LOCAL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// Waits up to [`LOCAL_SUBMISSION_WAIT`] for this node's own submission of a block to be
 /// verified, and returns whether it committed. A submission that fails, is abandoned, or is
 /// still being verified returns false, so the caller downloads the block.
-async fn local_submission_committed(resolution: PendingBlockResolution) -> bool {
+async fn local_submission_committed(
+    hash: block::Hash,
+    resolution: PendingBlockResolution,
+    trace: &JsonlEventEmitter,
+) -> bool {
+    let started = tokio::time::Instant::now();
     let verdict = tokio::time::timeout(LOCAL_SUBMISSION_WAIT, resolution.committed()).await;
+    let elapsed = started.elapsed();
     let outcome = match verdict {
         Ok(true) => "committed",
         Ok(false) => "failed",
         Err(_) => "unresolved",
     };
     metrics::counter!("gossip.local_submission.waited", "outcome" => outcome).increment(1);
+    metrics::histogram!("gossip.local_submission.wait.duration_seconds", "outcome" => outcome)
+        .record(elapsed.as_secs_f64());
+    trace.emit_event(|| LocalSubmissionWait {
+        event: "local_submission_wait_finished",
+        hash: JsonlDisplay(&hash),
+        elapsed_us: saturating_micros(elapsed),
+        outcome,
+    });
     verdict == Ok(true)
 }
+
+/// A completed gossip wait for a local submission, joined to download traces by block hash.
+#[derive(serde::Serialize)]
+struct LocalSubmissionWait<'a> {
+    event: &'static str,
+    hash: JsonlDisplay<'a, block::Hash>,
+    elapsed_us: u64,
+    outcome: &'static str,
+}
+
+zakura_jsonl_trace::impl_jsonl_trace_event!(
+    LocalSubmissionWait<'_>,
+    zn::zakura::COMMIT_STATE_TABLE
+);
 
 /// A gossiped block claims our best tip as its parent, but its coinbase height is not one
 /// above the tip height.
@@ -483,6 +512,9 @@ struct TaskSpawner<ZN, ZV, ZS> {
     misbehavior: zn::MisbehaviorReporter,
     /// Blocks this node is verifying from its own submissions, before they commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// Completed local-submission waits, using the node's existing bounded trace writer.
+    trace: JsonlEventEmitter,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -499,6 +531,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             second_block_request: self.second_block_request,
             misbehavior: self.misbehavior.clone(),
             pending_blocks: self.pending_blocks.clone(),
+            trace: self.trace.clone(),
         }
     }
 }
@@ -658,6 +691,7 @@ where
                 second_block_request: false,
                 misbehavior,
                 pending_blocks: PendingBlockRegistry::default(),
+                trace: JsonlEventEmitter::noop(),
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
@@ -678,6 +712,12 @@ where
     /// peer's copy of one is only downloaded if the local submission fails.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.spawner.pending_blocks = pending_blocks;
+        self
+    }
+
+    /// Records completed local-submission waits in the existing commit-state trace table.
+    pub fn with_trace(mut self, trace: JsonlEventEmitter) -> Self {
+        self.spawner.trace = trace;
         self
     }
 
@@ -1181,7 +1221,7 @@ where
             // download the block if the local submission fails. Subscribe before reading state,
             // so a commit between the two reads is still seen.
             if let Some(resolution) = spawner.pending_blocks.resolution(hash) {
-                if local_submission_committed(resolution).await {
+                if local_submission_committed(hash, resolution, &spawner.trace).await {
                     return Err(("already present".into(), None));
                 }
             }
@@ -2075,6 +2115,8 @@ mod tests {
             .insert(block.clone())
             .expect("an empty registry accepts the block");
         let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let (trace, mut trace_rx) = local_submission_wait_trace();
+        downloads = downloads.with_trace(trace);
         let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
 
         assert_eq!(
@@ -2089,13 +2131,48 @@ mod tests {
             "the block is not requested while the local submission is being verified"
         );
 
-        registration.resolve(Ok(block));
+        registration.resolve(Ok(block.clone()));
         assert!(tokio::time::timeout(Duration::from_secs(5), finished).await??);
         assert!(
             network_rx.try_recv().is_err(),
             "a committed local submission is never requested from the peer"
         );
+        assert_local_submission_wait_trace(&mut trace_rx, block.hash(), "committed");
         Ok(())
+    }
+
+    fn local_submission_wait_trace() -> (
+        JsonlEventEmitter,
+        mpsc::Receiver<zakura_jsonl_trace::JsonlWriteEvent>,
+    ) {
+        let (sender, receiver) = mpsc::channel(1);
+        (
+            JsonlEventEmitter::new(zakura_jsonl_trace::JsonlTracer::new(sender), "test-node"),
+            receiver,
+        )
+    }
+
+    fn assert_local_submission_wait_trace(
+        receiver: &mut mpsc::Receiver<zakura_jsonl_trace::JsonlWriteEvent>,
+        hash: block::Hash,
+        outcome: &str,
+    ) -> u64 {
+        let event = receiver
+            .try_recv()
+            .expect("the completed wait emits a trace");
+        assert_eq!(event.file_name, "commit_state.jsonl");
+        let row: serde_json::Value =
+            serde_json::from_slice(&event.line).expect("the trace is valid JSON");
+        assert_eq!(row["event"], "local_submission_wait_finished");
+        assert_eq!(row["hash"], hash.to_string());
+        assert_eq!(row["outcome"], outcome);
+        assert_eq!(row["node"], "test-node");
+        assert!(row["ts"].is_u64());
+        assert!(row["process_trace_id"].is_string());
+        assert!(receiver.try_recv().is_err(), "each wait emits one outcome");
+        row["elapsed_us"]
+            .as_u64()
+            .expect("the wait duration is recorded")
     }
 
     /// An unresolved local submission delays the peer request for at most five seconds.
@@ -2109,6 +2186,8 @@ mod tests {
             .insert(block.clone())
             .expect("an empty registry accepts the block");
         let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let (trace, mut trace_rx) = local_submission_wait_trace();
+        downloads = downloads.with_trace(trace);
         let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
 
         assert_eq!(
@@ -2140,6 +2219,10 @@ mod tests {
                 source: peer,
             }
         );
+        assert_eq!(
+            assert_local_submission_wait_trace(&mut trace_rx, block.hash(), "unresolved"),
+            5_000_000
+        );
         poll_task.abort();
         Ok(())
     }
@@ -2155,6 +2238,8 @@ mod tests {
             .insert(block.clone())
             .expect("an empty registry accepts the block");
         let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let (trace, mut trace_rx) = local_submission_wait_trace();
+        downloads = downloads.with_trace(trace);
         let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
 
         assert_eq!(
@@ -2182,6 +2267,7 @@ mod tests {
                 source: peer,
             }
         );
+        assert_local_submission_wait_trace(&mut trace_rx, block.hash(), "failed");
         poll_task.abort();
         Ok(())
     }

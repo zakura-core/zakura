@@ -22,7 +22,7 @@ pub use codec::Codec;
 pub(crate) use codec::{BlockChecksums, MAX_INCOMPLETE_MESSAGE_BYTES};
 pub(crate) use inv::MIN_INV_HASH_SIZE;
 pub use inv::{InventoryHash, MAX_TX_INV_IN_SENT_MESSAGE};
-pub use message::{Message, VersionMessage};
+pub use message::{HashedBlock, Message, VersionMessage};
 pub use types::{Nonce, Version};
 
 pub use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;

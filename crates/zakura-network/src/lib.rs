@@ -183,6 +183,9 @@ pub use crate::{
     protocol::external::canonical_peer_addr,
 };
 
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::{Codec, HashedBlock, Message};
+
 pub use crate::{
     address_book::{AddressBook, BannedIps, MisbehaviorReporter},
     address_book_peers::AddressBookPeers,

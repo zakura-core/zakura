@@ -34,7 +34,7 @@ fn request(auth: &str) -> hyper::http::request::Builder {
 }
 
 #[test]
-fn trusted_submission_requires_an_authenticated_primary_listener() {
+fn trusted_submission_requires_a_primary_listener_with_either_auth_policy() {
     let mut config = Config::default();
     assert!(!config.enable_trusted_block_submission);
     config.enable_trusted_block_submission = true;
@@ -42,7 +42,8 @@ fn trusted_submission_requires_an_authenticated_primary_listener() {
     config.listen_addr = Some("127.0.0.1:0".parse().unwrap());
     assert!(config.validate().is_ok());
     config.enable_cookie_auth = false;
-    config.allow_unauthenticated_admin = true;
+    assert!(config.validate().is_ok());
+    config.listen_addr = None;
     assert!(config.validate().is_err());
 }
 
@@ -58,15 +59,20 @@ async fn trusted_http_authenticates_before_polling_the_body() {
     let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
     let service = TrustedBlockHttpService::new(json, Some(cookie), Some(submit));
     for (authorization, origin, status) in [
-        ("invalid", false, StatusCode::UNAUTHORIZED),
-        (auth.as_str(), true, StatusCode::FORBIDDEN),
+        (None, false, StatusCode::UNAUTHORIZED),
+        (Some("invalid"), false, StatusCode::UNAUTHORIZED),
+        (Some(auth.as_str()), true, StatusCode::FORBIDDEN),
     ] {
         let body = StreamBody::new(futures::stream::poll_fn(
             |_| -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
                 panic!("unauthorized request body must not be polled")
             },
         ));
-        let mut builder = request(authorization);
+        let mut builder =
+            Request::post("/submittrustedblock").header("Content-Type", "application/octet-stream");
+        if let Some(authorization) = authorization {
+            builder = builder.header("Authorization", authorization);
+        }
         if origin {
             builder = builder.header("Origin", "https://example.invalid");
         }
@@ -189,10 +195,59 @@ async fn trusted_http_capacity_is_released_when_incomplete_clients_disconnect() 
 }
 
 #[tokio::test]
-async fn trusted_http_cannot_enable_without_a_cookie() {
-    let submit: Submit = Arc::new(|_| panic!("missing credentials must disable the handler"));
+async fn trusted_http_without_cookie_accepts_requests_without_credentials() {
+    let submit: Submit = Arc::new(|bytes| {
+        assert_eq!(bytes.as_ref(), &[0, 255, 128]);
+        Box::pin(async { Ok(SubmitBlockResponse::Accepted) })
+    });
     let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
     let service = TrustedBlockHttpService::new(json, None, Some(submit));
+    let response = service
+        .oneshot(
+            Request::post("/submittrustedblock")
+                .header("Content-Type", "application/octet-stream")
+                .body(Full::new(Bytes::from_static(&[0, 255, 128])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "accepted"
+    );
+}
+
+#[tokio::test]
+async fn trusted_http_without_cookie_rejects_browser_requests_before_reading_body() {
+    let submit: Submit = Arc::new(|_| panic!("browser requests must not be submitted"));
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(json, None, Some(submit));
+    let body = StreamBody::new(futures::stream::poll_fn(
+        |_| -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            panic!("browser request body must not be polled")
+        },
+    ));
+    assert_eq!(
+        service
+            .oneshot(
+                Request::post("/submittrustedblock")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Origin", "https://example.invalid")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn trusted_http_without_cookie_still_requires_explicit_enablement() {
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(json, None, None);
     assert_eq!(
         service
             .oneshot(request("").body(Full::new(Bytes::new())).unwrap())

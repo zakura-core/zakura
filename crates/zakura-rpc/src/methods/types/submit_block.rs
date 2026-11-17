@@ -107,7 +107,7 @@ pub enum MinedBlockSubmission {
     FullBlock,
     /// The miner submitted a compact solved header.
     CompactHeader,
-    /// An authenticated caller requested relay before local verification.
+    /// An operator-authorized caller requested relay before local verification.
     TrustedBlock,
 }
 
@@ -127,7 +127,7 @@ impl MinedBlockSubmission {
 pub enum EarlyBlockRelay {
     /// Consensus authorized relay and state admitted the candidate.
     StateAdmission(zakura_state::BlockAdmission),
-    /// An authenticated operator explicitly authorized relay before validation.
+    /// An operator explicitly authorized relay before validation.
     TrustedSubmission,
 }
 

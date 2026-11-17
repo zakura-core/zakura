@@ -1,4 +1,4 @@
-//! Authenticated submission: relay a pending body, then verify it through normal consensus.
+//! Trusted submission: relay a pending body, then verify it through normal consensus.
 
 use super::*;
 use crate::server::trusted_block::TrustedSubmissionError;

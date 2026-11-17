@@ -182,7 +182,8 @@ impl Step {
     }
 
     /// The verdict this step gave `waiter`, if it gave one.
-    pub fn verdict(&self, waiter: WaiterId) -> Option<&Verdict> {
+    #[cfg(test)]
+    pub(crate) fn verdict(&self, waiter: WaiterId) -> Option<&Verdict> {
         self.effects.iter().find_map(|effect| match effect {
             Effect::Verdict { waiter: w, verdict } if *w == waiter => Some(verdict),
             _ => None,
@@ -366,13 +367,18 @@ impl Spends {
     fn of<'a>(transactions: impl IntoIterator<Item = &'a Transaction>) -> Self {
         let mut spends = Self::default();
         for tx in transactions {
-            spends.outpoints.extend(tx.spent_outpoints());
-            spends.sprout.extend(tx.sprout_nullifiers().copied());
-            spends.sapling.extend(tx.sapling_nullifiers().copied());
-            spends.orchard.extend(tx.orchard_nullifiers().copied());
-            spends.ironwood.extend(tx.ironwood_nullifiers().copied());
+            spends.add(tx);
         }
         spends
+    }
+
+    /// Adds the spends of `tx`.
+    fn add(&mut self, tx: &Transaction) {
+        self.outpoints.extend(tx.spent_outpoints());
+        self.sprout.extend(tx.sprout_nullifiers().copied());
+        self.sapling.extend(tx.sapling_nullifiers().copied());
+        self.orchard.extend(tx.orchard_nullifiers().copied());
+        self.ironwood.extend(tx.ironwood_nullifiers().copied());
     }
 
     /// Whether `tx` spends an output or reveals a nullifier these do.
@@ -971,7 +977,7 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Undecided transactions, plus leases, plus running revalidations.
-    pub fn slots_in_use(&self) -> usize {
+    fn slots_in_use(&self) -> usize {
         self.admissions
             .len()
             .saturating_add(self.leases.len())
@@ -979,7 +985,8 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Reservations callers still hold, of every kind.
-    pub fn caller_held(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn caller_held(&self) -> usize {
         self.owners
             .len()
             .saturating_add(self.tickets.len())
@@ -987,16 +994,9 @@ impl<E: VerifyError> MempoolState<E> {
             .saturating_add(self.ended_joins.len())
     }
 
-    /// Undecided transactions that hold a body.
-    pub fn bodies_held(&self) -> usize {
-        self.admissions
-            .values()
-            .filter(|admission| admission.body.is_some())
-            .count()
-    }
-
     /// The visible pool, oldest first.
-    pub fn visible(&self) -> Vec<UnminedTxId> {
+    #[cfg(test)]
+    pub(crate) fn visible(&self) -> Vec<UnminedTxId> {
         self.pool
             .values()
             .filter(|pooled| pooled.hidden.is_none())
@@ -1022,16 +1022,9 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// The pooled transactions hidden while they are verified again.
-    pub fn hidden(&self) -> Vec<UnminedTxId> {
+    #[cfg(test)]
+    pub(crate) fn hidden(&self) -> Vec<UnminedTxId> {
         self.hidden.iter().map(|key| self.pool[key].id).collect()
-    }
-
-    /// Whether `tx_id` is parked on a missing parent.
-    pub fn is_parked(&self, tx_id: UnminedTxId) -> bool {
-        self.admission_of
-            .get(&tx_id)
-            .and_then(|key| self.admissions.get(key))
-            .is_some_and(|admission| matches!(admission.stage, Stage::Parked { .. }))
     }
 
     /// Whether the chain was reset since the body of `job`'s transaction
@@ -1050,15 +1043,11 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Whether any undecided transaction is parked on a missing parent.
-    pub fn is_parked_any(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_parked_any(&self) -> bool {
         self.admissions
             .values()
             .any(|admission| matches!(admission.stage, Stage::Parked { .. }))
-    }
-
-    /// Distinct outpoints callers are waiting for.
-    pub fn output_waits(&self) -> usize {
-        self.output_waiters.len()
     }
 
     /// Checks the invariants every reachable state keeps.
@@ -1066,7 +1055,8 @@ impl<E: VerifyError> MempoolState<E> {
     /// # Panics
     ///
     /// If one is broken.
-    pub fn assert_invariants(&self) {
+    #[cfg(test)]
+    pub(crate) fn assert_invariants(&self) {
         // A snapshot is the storage's mining transactions, in its order and
         // with the stamps it gave them, at the machine's tip and generation.
         let snapshot = self.snapshot(ChangeSeq(self.logged));
@@ -1197,6 +1187,75 @@ impl<E: VerifyError> MempoolState<E> {
             self.pool.len() - self.hidden.len(),
             "storage holds exactly the visible pool"
         );
+        let mut spends = Spends::default();
+        for pooled in self.pool.values() {
+            let tx = self
+                .pooled_transaction(pooled)
+                .expect("a pooled transaction's body is in storage or beside it");
+            assert!(
+                !spends.conflict_with(tx),
+                "pool/consistent: no two pooled transactions conflict"
+            );
+            spends.add(tx);
+        }
+        self.storage.assert_invariants();
+        // Nothing that can start is left waiting, and nothing past its
+        // deadline is left as it was. The input that made a revalidation
+        // startable started it, and the first input to see a time applied
+        // every deadline due by then.
+        if self.active {
+            let room = self.running < self.limits.revalidating
+                && self.slots_in_use() < self.limits.pending;
+            for pooled in self.pool.values() {
+                let parent_hidden = pooled.parents.iter().any(|parent| {
+                    self.pooled
+                        .get(parent)
+                        .is_some_and(|parent| self.pool[parent].hidden.is_some())
+                });
+                match &pooled.hidden {
+                    Some(Hidden::Queued) => assert!(
+                        !room || parent_hidden,
+                        "a revalidation that could start was left queued"
+                    ),
+                    Some(Hidden::Retry { at }) => {
+                        assert!(*at > self.now, "a retry that is due was left waiting")
+                    }
+                    Some(Hidden::Running { deadline, .. }) => assert!(
+                        *deadline > self.now,
+                        "a revalidation past its deadline was left running"
+                    ),
+                    Some(Hidden::Parked { .. }) => assert!(
+                        pooled
+                            .missing_since
+                            .is_some_and(|since| since + T_PARK > self.now),
+                        "a hidden transaction was left parked past its wait for a parent"
+                    ),
+                    _ => {}
+                }
+            }
+            for admission in self.admissions.values() {
+                if let Stage::Verifying { deadline, .. } = admission.stage {
+                    assert!(
+                        deadline > self.now,
+                        "a verification past its deadline was left running"
+                    );
+                }
+                if matches!(admission.stage, Stage::Parked { .. }) {
+                    assert!(
+                        admission
+                            .missing_since
+                            .is_some_and(|since| since + T_PARK > self.now),
+                        "a transaction was left parked past its wait for a parent"
+                    );
+                }
+                assert!(
+                    admission
+                        .body_at
+                        .is_none_or(|at| at + MAX_UNDECIDED > self.now),
+                    "pool/slot-time-within-limit: an admission held its slot past the limit"
+                );
+            }
+        }
         for ticket in self.tickets.values() {
             assert!(
                 self.admissions.contains_key(&ticket.admission),

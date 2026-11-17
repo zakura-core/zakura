@@ -878,6 +878,29 @@ impl<E: Clone> Storage<E> {
             .filter(move |tx_id| self.rejection(tx_id, now).is_some())
     }
 
+    /// Checks the limits storage keeps: each rejection list within its
+    /// capacity, and the pool within its cost limit.
+    ///
+    /// # Panics
+    ///
+    /// If one is broken.
+    #[cfg(test)]
+    pub(crate) fn assert_invariants(&self) {
+        assert!(
+            self.tip_rejected_exact.len() <= self.rejection_list_capacity
+                && self.tip_rejected_same_effects.len() <= self.rejection_list_capacity
+                && self
+                    .chain_rejected_same_effects
+                    .values()
+                    .all(|list| list.len() <= self.rejection_list_capacity),
+            "pool/rejections-within-limit: each rejection list within its capacity"
+        );
+        assert!(
+            self.total_cost() <= self.tx_cost_limit,
+            "pool/cost-within-limit: the pool within its cost limit"
+        );
+    }
+
     /// Entries in the rejection lists. See [`StorageStats::rejected`].
     pub fn rejected_count(&self) -> usize {
         self.tip_rejected_exact.len()

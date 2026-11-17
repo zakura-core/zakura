@@ -211,18 +211,8 @@ impl Bench {
 
     /// `session`'s peer announces `entries`, at the sizes they give.
     pub(super) fn inv_sized(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)]) {
-        // The machine drops a cooling peer's `Inv` whole, so it tells the
-        // node nothing.
-        let heard = self
-            .machine
-            .session(session)
-            .is_some_and(|state| !self.machine.reactor.is_cooling(state.peer, self.now));
         self.machine.inv(session, entries, self.now);
-        let ids = entries
-            .iter()
-            .filter(|_| heard)
-            .map(|(id, _)| *id)
-            .collect();
+        let ids = entries.iter().map(|(id, _)| *id).collect();
         self.took(Cause::Inv(session, ids));
     }
 

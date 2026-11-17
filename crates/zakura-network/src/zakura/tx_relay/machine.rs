@@ -757,6 +757,14 @@ impl RelayMachine {
             return self.settle();
         };
         if self.reactor.is_cooling(peer, self.now) {
+            // A cooling peer's ids are not taken, but it still has them, so
+            // none is announced back to it.
+            let seq = self.last_seq;
+            let shorts: Vec<u64> = entries.iter().map(|(id, _)| self.short(*id)).collect();
+            let state = self.sessions.get_mut(&session).expect("checked above");
+            for short in shorts {
+                state.mark_known(short, seq);
+            }
             return self.settle();
         }
         let hello = self

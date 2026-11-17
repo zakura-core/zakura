@@ -721,6 +721,23 @@ fn ended_sessions_leave_the_holders_index_while_another_holds_the_id() {
 
 // Charges.
 
+/// Never back to its source: an id a peer announced while it cooled is not
+/// announced back to it when the pool admits the id from elsewhere.
+#[test]
+fn an_id_a_cooling_peer_announced_is_not_announced_back_to_it() {
+    let mut bench = Bench::new();
+    let cooling = bench.join(1);
+    let waiter = bench.supply(cooling, 0);
+    bench.verdict(
+        waiter,
+        bench.rejection(RejectionScope::ExactTip, Charge::Cooldown),
+    );
+    let id = bench.id(1);
+    bench.inv(cooling, &[id]);
+    bench.add(&[id]);
+    assert!(advertised(&bench, id).is_empty(), "its peer announced it");
+}
+
 /// A verdict's charge reaches only the peer that supplied the body: a
 /// cooldown stops new asks of that peer and no other, its announcements are
 /// dropped until the cooldown ends, and a second cooldown after the first

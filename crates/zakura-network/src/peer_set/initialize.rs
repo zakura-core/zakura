@@ -185,9 +185,9 @@ where
 
 /// Initialize a peer set with optional Zakura runtime components.
 ///
-/// Legacy seed dialing and address discovery run in the supervised peer-set background
-/// tasks. Returning does not require a connected legacy peer; requests wait for a suitable
-/// peer through the returned service. Native startup can proceed independently.
+/// With native networking enabled, legacy seed dialing and address discovery continue in
+/// the supervised background tasks after this returns. Legacy-only startup still waits
+/// for bootstrap. Requests use the returned service's normal peer-readiness checks.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -412,6 +412,8 @@ where
         // The task stays alive in the crawler after bootstrap; a normal bootstrap completion
         // must not look like a background-task exit to the peer-set owner.
         let config = config.clone();
+        let wait_for_legacy_bootstrap = !config.v2_p2p();
+        let (bootstrap_ready, bootstrap_finished) = tokio::sync::oneshot::channel();
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
         let bootstrap_and_crawl = async move {
             let mut active_outbound_connections = add_initial_peers(
@@ -441,6 +443,7 @@ where
                 let _ = demand_tx.try_send(MorePeers);
             }
 
+            let _ = bootstrap_ready.send(());
             crawl_and_dial(
                 config,
                 demand_tx,
@@ -456,6 +459,9 @@ where
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             bootstrap_and_crawl.in_current_span(),
         ))));
+        if wait_for_legacy_bootstrap {
+            bootstrap_finished.await?;
+        }
     } else {
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             async move {

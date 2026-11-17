@@ -83,13 +83,13 @@ async fn native_block_download_does_not_wait_for_legacy_handshake() -> Result<()
     Ok(())
 }
 
-/// Legacy-only startup can return without a peer, and dropping its services cancels dialing.
+/// Legacy-only startup keeps its bootstrap wait, and cancelling startup closes its dials.
 #[tokio::test]
-async fn legacy_startup_and_shutdown_do_not_wait_for_handshake() -> Result<(), BoxError> {
+async fn legacy_only_startup_keeps_its_bootstrap_wait_and_cancels_dials() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let mut seed = SilentSeed::bind().await?;
     let inbound = service_fn(|_| async { Ok::<_, BoxError>(Response::Nil) });
-    let mut startup = AbortOnDropHandle::new(tokio::spawn(init_with_zakura(
+    let startup = AbortOnDropHandle::new(tokio::spawn(init_with_zakura(
         config(seed.addr, P2pStack::Legacy),
         inbound,
         NoChainTip,
@@ -100,19 +100,16 @@ async fn legacy_startup_and_shutdown_do_not_wait_for_handshake() -> Result<(), B
         Vec::new(),
     )));
     timeout(TEST_TIMEOUT, &mut seed.connected).await??;
-    let (network, book, reporter, endpoint, adverts) =
-        timeout(Duration::from_secs(1), &mut startup)
-            .await
-            .expect("legacy network initialization must not wait for the seed handshake")??;
-    assert!(endpoint.is_none());
+    tokio::task::yield_now().await;
     assert!(
-        !seed.closed.is_finished(),
-        "the seed handshake is still pending"
+        !startup.is_finished(),
+        "legacy-only startup still waits for bootstrap"
     );
-    drop((network, book, reporter, adverts));
+    startup.abort();
+    assert!(startup.await.unwrap_err().is_cancelled());
     assert!(
-        timeout(TEST_TIMEOUT, &mut seed.closed).await???,
-        "shutdown closes the pending TCP connection"
+        timeout(Duration::from_secs(1), &mut seed.closed).await???,
+        "cancelling startup closes the pending TCP connection before its handshake timeout"
     );
     Ok(())
 }
@@ -227,8 +224,8 @@ async fn native_download_with_silent_seed(
     drop((network, book, reporter, adverts));
     if release_after.is_none() {
         assert!(
-            timeout(TEST_TIMEOUT, &mut seed.closed).await???,
-            "shutdown closes the pending legacy connection"
+            timeout(Duration::from_secs(1), &mut seed.closed).await???,
+            "shutdown closes the pending legacy connection before its handshake timeout"
         );
     }
     peer.shutdown().await;

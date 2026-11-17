@@ -268,8 +268,9 @@ where
         .is_ok_and(|result| result.is_ok())
 }
 
-/// Withdraws a trusted announcement on commitment or failure, both before readiness and
-/// after dispatch. Cancellation deliberately returns before recording dispatch-completion metrics.
+/// Commitment suppresses an undispatched trusted announcement, but preserves active uploads
+/// so the committed broadcast can join their per-connection claims without another inventory.
+/// Failure still cancels dispatched work; cancellation does not record completion metrics.
 async fn broadcast_trusted_with_timeout<ZN>(
     mut network: ZN,
     request: zn::Request,
@@ -294,7 +295,7 @@ where
         let dispatch_signal = pending.clone();
         let succeeded = tokio::select! {
             biased;
-            _ = pending.wait_for_resolution() => return false,
+            _ = pending.wait_for_failure() => return false,
             result = async {
                 dispatch_signal.mark_dispatched();
                 metrics::counter!("rpc.trusted_submission.relay_dispatched").increment(1);
@@ -467,3 +468,7 @@ mod tests {
         assert!(!broadcasts.is_in_flight(&hash));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/trusted_relay.rs"]
+mod trusted_relay;

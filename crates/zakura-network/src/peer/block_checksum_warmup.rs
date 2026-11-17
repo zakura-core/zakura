@@ -36,6 +36,15 @@ mod tests;
 /// finish before the first `getdata`, and only that request would have reused its result.
 const BLOCK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often a committed announcement retries a lookup that still returns the pending body.
+///
+/// A submission's committed announcement can race ahead of read state, so the first lookup
+/// may find only its pending registration. Peers ask about one network round trip later.
+const COMMITTED_LOOKUP_RETRIES: usize = 5;
+
+/// The delay between committed-body lookup retries.
+const COMMITTED_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// The most block checksums precomputed at once. Further advertisements are not warmed while
 /// this many are in flight; their first send hashes the body as before.
 ///
@@ -81,9 +90,13 @@ where
         let block = match request {
             Request::AdvertiseBlock(block, _)
             | Request::AdvertiseBlockToAll(block)
-            | Request::AdvertiseMinedBlock(block) => *block,
+            | Request::AdvertiseMinedBlock(block) => block,
             _ => return,
         };
+        // A pending body uses a per-attempt checksum; its committed broadcast warms the cache.
+        if block.pending_send.is_some() {
+            return;
+        }
         // An unknown size is checked once the block is found.
         if let Some(size) = block.size {
             // Widening u32 to usize is lossless on supported targets.
@@ -104,8 +117,16 @@ where
         spawn_erased(
             async move {
                 let _permit = permit;
-                let Some(block) = lookup_block(inbound, hash).await else {
-                    return;
+                let mut retries = COMMITTED_LOOKUP_RETRIES;
+                let block = loop {
+                    match lookup_block(inbound.clone(), hash).await {
+                        Lookup::Committed(block) => break block,
+                        Lookup::Pending if retries > 0 => {
+                            retries -= 1;
+                            tokio::time::sleep(COMMITTED_LOOKUP_RETRY_DELAY).await;
+                        }
+                        Lookup::Pending | Lookup::Missing => return,
+                    }
                 };
                 let hashed = tokio::task::spawn_blocking(move || checksums.precompute(&block));
                 if let Err(error) = hashed.await {
@@ -139,9 +160,18 @@ where
     }
 }
 
-/// Returns the block `hash` that `inbound` would send to a peer, if it has the block and answers
-/// within [`BLOCK_LOOKUP_TIMEOUT`].
-async fn lookup_block<I>(inbound: I, hash: block::Hash) -> Option<BlockHandle>
+/// What a peer requesting a block would currently be sent.
+enum Lookup {
+    /// The committed body, whose checksum the shared cache may hold.
+    Committed(BlockHandle),
+    /// Only a pending body, which uses its own per-attempt checksum.
+    Pending,
+    /// No body, or no answer within [`BLOCK_LOOKUP_TIMEOUT`].
+    Missing,
+}
+
+/// Looks up the block `hash` the way `inbound` answers a peer's request for it.
+async fn lookup_block<I>(inbound: I, hash: block::Hash) -> Lookup
 where
     I: Service<Request, Response = Response, Error = BoxError>,
 {
@@ -150,18 +180,26 @@ where
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             tracing::debug!(?hash, %error, "could not look up a block to precompute its checksum");
-            return None;
+            return Lookup::Missing;
         }
         Err(_elapsed) => {
             tracing::debug!(?hash, "block lookup for checksum precomputation timed out");
-            return None;
+            return Lookup::Missing;
         }
     };
     let Response::Blocks(blocks) = response else {
-        return None;
+        return Lookup::Missing;
     };
-    blocks.into_iter().find_map(|block| match block {
-        InventoryResponse::Available((block, _)) if block.hash() == hash => Some(block),
-        _ => None,
-    })
+    blocks
+        .into_iter()
+        .find_map(|block| match block {
+            InventoryResponse::Available((served, _)) if served.hash() == hash => {
+                Some(match served.pending_send {
+                    Some(_) => Lookup::Pending,
+                    None => Lookup::Committed(served.block),
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or(Lookup::Missing)
 }

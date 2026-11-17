@@ -84,11 +84,20 @@ enum Outgoing {
 struct Bodies {
     pool: PoolReader,
     state: mpsc::Sender<Outgoing>,
-    close: Closer,
-    /// Tells the routine the writer started answering a request, before
-    /// the answer can reach the peer, so the request's place is free before
-    /// the peer can count it free.
-    started: mpsc::UnboundedSender<UnminedTxId>,
+    /// Where the writer reports to the routine.
+    reports: mpsc::UnboundedSender<WriterReport>,
+}
+
+/// What a data writer tells its routine.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WriterReport {
+    /// It started answering the peer's request for this id. It says so
+    /// before the answer can reach the peer, so the request's place is free
+    /// before the peer can count it free.
+    Started(UnminedTxId),
+    /// Its `NotFound` found the state writer's queue full: the peer stopped
+    /// reading.
+    Stalled,
 }
 
 /// The `tx-relay` service.
@@ -307,12 +316,11 @@ impl Service for TxRelayService {
             close_cause,
         };
         let state = spawn_writer(state_send, STATE_QUEUE, session_cancel.clone(), None);
-        let (started, started_rx) = mpsc::unbounded_channel();
+        let (reports, reports_rx) = mpsc::unbounded_channel();
         let bodies = Bodies {
             pool: self.wiring.pool.reader(),
             state: state.clone(),
-            close: close.clone(),
-            started,
+            reports,
         };
         let data = spawn_writer(data_send, DATA_QUEUE, session_cancel.clone(), Some(bodies));
         let inv = MeteredSender::new(open_inv_bucket(&self.wiring.inv_buckets, &connection));
@@ -320,7 +328,7 @@ impl Service for TxRelayService {
             self.wiring.clone(),
             peer_key,
             exempt,
-            SessionIo::new(data, state, close, started_rx, inv, connection),
+            SessionIo::new(data, state, close, reports_rx, inv, connection),
             session_cancel,
         );
         task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
@@ -389,7 +397,7 @@ fn spawn_writer(
                     let Some(bodies) = &bodies else {
                         continue;
                     };
-                    let _ = bodies.started.send(id);
+                    let _ = bodies.reports.send(WriterReport::Started(id));
                     if !serve_body(&send, bodies, id).await {
                         return;
                     }
@@ -427,7 +435,7 @@ async fn serve_body(send: &FramedSend, bodies: &Bodies, id: UnminedTxId) -> bool
         match bodies.state.try_send(Outgoing::Frame(frame, None)) {
             Ok(()) => count(&message, "sent"),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                bodies.close.close("tx-relay: peer stopped reading");
+                let _ = bodies.reports.send(WriterReport::Stalled);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
@@ -466,8 +474,10 @@ struct SessionIo {
     data: mpsc::Sender<Outgoing>,
     state: mpsc::Sender<Outgoing>,
     close: Closer,
-    /// The ids whose answers the data writer started writing.
-    started: mpsc::UnboundedReceiver<UnminedTxId>,
+    /// What the data writer reports.
+    reports: mpsc::UnboundedReceiver<WriterReport>,
+    /// A writer's queue was full at this step: the peer stopped reading.
+    stalled: bool,
     /// Pays the connection's `Inv` byte rate and keeps one `Inv` unwritten
     /// at most. One unwritten `Inv` of at most about 70 KB, with the
     /// transport's 64 KiB of write-ahead, stays within the row's 512 KiB
@@ -482,13 +492,13 @@ struct SessionIo {
 
 impl SessionIo {
     /// A session's IO on these writers, closing with `close`, sending `Inv`
-    /// through `inv`, running on `connection`. `started` hears from the
+    /// through `inv`, running on `connection`. `reports` hears from the
     /// data writer.
     fn new(
         data: mpsc::Sender<Outgoing>,
         state: mpsc::Sender<Outgoing>,
         close: Closer,
-        started: mpsc::UnboundedReceiver<UnminedTxId>,
+        reports: mpsc::UnboundedReceiver<WriterReport>,
         inv: MeteredSender,
         connection: (ZakuraPeerId, ZakuraConnId),
     ) -> Self {
@@ -496,7 +506,8 @@ impl SessionIo {
             data,
             state,
             close,
-            started,
+            reports,
+            stalled: false,
             inv,
             connection,
             live: None,
@@ -731,12 +742,25 @@ impl Routine {
                         self.pool_stopped();
                     }
                 }
+                Some(report) = self.io.reports.recv() => self.writer_report(report),
                 () = wake.notified() => self.tick(),
                 () = time::sleep_until(deadline) => self.tick(),
             }
             self.after_step();
         }
         self.finish();
+    }
+
+    /// Hands what the data writer reported to the machine.
+    fn writer_report(&mut self, report: WriterReport) {
+        match report {
+            WriterReport::Started(id) => {
+                self.step(|machine, shared, pool, now| machine.served(shared, pool, id, now));
+            }
+            WriterReport::Stalled => {
+                self.step(stopped_reading);
+            }
+        }
     }
 
     /// Hands one input to the machine under the shared lock, after the mail
@@ -777,7 +801,16 @@ impl Routine {
         for effect in effects {
             self.effect(effect);
         }
+        self.stopped_reading();
         result
+    }
+
+    /// A writer's queue was full in the last step: the peer stopped
+    /// reading, which the machine decides on in a step of its own.
+    fn stopped_reading(&mut self) {
+        if std::mem::take(&mut self.io.stalled) {
+            self.step(stopped_reading);
+        }
     }
 
     /// Time passed, or another step woke this one.
@@ -789,7 +822,8 @@ impl Routine {
     /// joins the live-session record once it holds a view of the pool.
     fn after_step(&mut self) {
         self.flush_adverts();
-        if self.pool_open && self.cursor.is_some() && self.io.live.is_none() {
+        let open = !self.machine.is_ended() && self.pool_open;
+        if open && self.cursor.is_some() && self.io.live.is_none() {
             let (peer, conn_id) = self.io.connection.clone();
             self.io.live = Some(
                 self.wiring
@@ -846,10 +880,8 @@ impl Routine {
                 // The writer reports an answer it started before handing it
                 // to the transport, so each answer the peer has seen is read
                 // here before the peer's next request.
-                while let Ok(started) = self.io.started.try_recv() {
-                    self.step(|machine, shared, pool, now| {
-                        machine.served(shared, pool, started, now);
-                    });
+                while let Ok(report) = self.io.reports.try_recv() {
+                    self.writer_report(report);
                 }
                 self.step(|machine, shared, pool, now| machine.get_txs(shared, pool, id, now));
             }
@@ -1022,18 +1054,26 @@ impl Routine {
     fn effect(&mut self, effect: RelayEffect) {
         match effect {
             RelayEffect::Ask { id, .. } => {
-                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id), None);
+                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id));
             }
             // The machine queued the id, and `flush_adverts` asks it for an
             // `Inv` after every step.
             RelayEffect::Advert { .. } => {}
             RelayEffect::Serve { id, .. } => self.serve(id),
             RelayEffect::NotFound { id, .. } => {
-                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::NotFound(id), None);
+                self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::NotFound(id));
             }
             RelayEffect::Close { session, reason } => {
                 if session == self.machine.session() {
                     self.io.close.close(close_reason(reason));
+                }
+            }
+            // Ending the session leaves the connection, and its other
+            // services, alone.
+            RelayEffect::Park { session } => {
+                if session == self.machine.session() {
+                    metrics::counter!("zakura.p2p.tx_relay.parked").increment(1);
+                    self.cancel.cancel();
                 }
             }
             RelayEffect::Reserve { call, id } => {
@@ -1093,16 +1133,14 @@ impl Routine {
     fn serve(&mut self, id: UnminedTxId) {
         match self.io.data.try_send(Outgoing::Serve(id)) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.io.close.close("tx-relay: peer stopped reading");
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.io.stalled = true,
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
-    /// Encodes `message` and queues it on the stream of `kind`, with `guard`
-    /// held until it is written.
-    fn send(&self, kind: u16, message: &TxRelayMessage, guard: Option<FrameGuard>) {
+    /// Encodes `message` and queues it on the stream of `kind`. A full queue
+    /// says the peer stopped reading.
+    fn send(&mut self, kind: u16, message: &TxRelayMessage) {
         let Ok(frame) = encode_frame(message) else {
             return;
         };
@@ -1111,11 +1149,9 @@ impl Routine {
         } else {
             &self.io.state
         };
-        match writer.try_send(Outgoing::Frame(frame, guard)) {
+        match writer.try_send(Outgoing::Frame(frame, None)) {
             Ok(()) => count(message, "sent"),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.io.close.close("tx-relay: peer stopped reading");
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.io.stalled = true,
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
@@ -1165,6 +1201,12 @@ impl Routine {
             }
         }
     }
+}
+
+/// The machine's input for a peer that stopped reading. See
+/// [`PeerMachine::stopped_reading`].
+fn stopped_reading(machine: &mut PeerMachine, shared: &mut Shared, pool: &dyn PoolView, now: Time) {
+    machine.stopped_reading(shared, pool, now);
 }
 
 /// Counts an admission, and for a rejection returns whether `may_cool` lets
@@ -1379,6 +1421,7 @@ fn close_reason(reason: CloseReason) -> &'static str {
         CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",
         CloseReason::CooldownsFull => "tx-relay: cooldown table full",
         CloseReason::Unresponsive => "tx-relay: unanswered request",
+        CloseReason::StoppedReading => "tx-relay: peer stopped reading",
     }
 }
 

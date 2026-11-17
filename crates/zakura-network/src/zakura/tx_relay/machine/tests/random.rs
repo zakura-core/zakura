@@ -55,7 +55,8 @@ const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv 
     answer not found; close Violation(HelloTwice); close Violation(BadHello);
     close Violation(NoHelloFirst); close Violation(Unrequested); close Violation(WrongSize);
     close Violation(WrongId); close Violation(Undecodable); close Violation(RequestedTwice);
-    close Ban; close RepeatedCooldown; close Unresponsive;
+    close Ban; close RepeatedCooldown; close Unresponsive; close StoppedReading; park;
+    park refused;
     answer grant; answer cancelled grant; answer Pooled; answer Pending; answer Rejected;
     answer NoRoom; answer Inactive; answer Stopped; verdict Admitted;
     verdict Rejected cached, None; verdict Rejected uncached, None;
@@ -289,6 +290,7 @@ impl Run {
             21 | 22 => self.get_txs(),
             23 => self.end(),
             24 | 25 => self.served(),
+            26 if self.rng.one_in(2) => self.stopped_reading(),
             29..=34 => self.answer_call(near_end),
             35..=38 => self.verdict(near_end),
             39 => self.cancel(),
@@ -454,6 +456,15 @@ impl Run {
         };
         self.note(|run| format!("{} asks for {}", session.0, run.name(id)));
         self.bench.get_txs(session, id);
+    }
+
+    /// A session's IO finds one of its writers' queues full.
+    fn stopped_reading(&mut self) {
+        let Some(session) = self.session() else {
+            return self.tick();
+        };
+        self.note(|_| format!("{}'s peer stops reading", session.0));
+        self.bench.stopped_reading(session);
     }
 
     /// A session's IO starts writing one of its answers.

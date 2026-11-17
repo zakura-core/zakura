@@ -15,8 +15,8 @@ use crate::zakura::tx_relay::machine::{
     session::{Timer, Timers},
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST,
-    TRIED_PER_ENTRY,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN,
+    PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -324,7 +324,7 @@ fn a_deadline_moves_the_id_on_and_one_more_ends_the_session() {
             assert!(bench.reserved(next), "an answered peer stays, uncharged");
         } else {
             assert!(bench.next());
-            assert_eq!(bench.closes(), vec![(slow, CloseReason::Unresponsive)]);
+            assert_eq!(bench.parks(), vec![slow], "a first stall parks");
         }
     }
 }
@@ -368,11 +368,36 @@ fn a_cancelled_fetch_drops_its_body_but_its_deadline_still_runs() {
             assert!(bench.reserved(id), "the id is asked about again");
             continue;
         }
-        while bench.closes().is_empty() {
+        while bench.parks().is_empty() {
             assert!(bench.next(), "the deadlines run");
         }
-        assert_eq!(bench.closes(), vec![(session, CloseReason::Unresponsive)]);
+        assert_eq!(bench.parks(), vec![session]);
     }
+}
+
+/// A stall parks the session, not its connection. The first stall, a
+/// request left unanswered past one more deadline or a writer its peer
+/// stopped reading, ends the session, and the peer's next sessions are
+/// refused until the park ends. The session the park lets in then closes
+/// its connection on its own stall. Neither is a charge.
+#[test]
+fn a_stall_parks_the_session_and_a_repeat_closes_the_connection() {
+    let mut bench = Bench::new();
+    let stalled = bench.join(1);
+    bench.stopped_reading(stalled);
+    assert_eq!(bench.parks(), vec![stalled], "the first stall parks");
+    let refused = bench.connect(1, false);
+    assert_eq!(bench.parks(), vec![refused], "refused while the park runs");
+    bench.tick(PARK_COOLDOWN);
+    let readmitted = bench.connect(1, false);
+    assert!(bench.parks().is_empty(), "the ended park lets it in");
+    bench.hello(readmitted, hello());
+    let id = bench.id(0);
+    bench.inv(readmitted, &[id]);
+    assert!(bench.reserved(id), "uncharged, it is asked");
+    bench.stopped_reading(readmitted);
+    let closed = (readmitted, CloseReason::StoppedReading);
+    assert_eq!(bench.closes(), vec![closed], "its stall closes");
 }
 
 /// Honest ids get fetched despite hostile announcers: with `K` announcers

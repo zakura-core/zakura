@@ -78,13 +78,11 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
 
     let (send, mut recv) = framed_channel(1);
     let (state, mut answers) = mpsc::channel(STATE_QUEUE);
-    let (close, _cause, _cancel) = closer();
-    let (started, mut started_rx) = mpsc::unbounded_channel();
+    let (reports, mut reports_rx) = mpsc::unbounded_channel();
     let bodies = Bodies {
         pool: handle.reader(),
         state,
-        close,
-        started,
+        reports,
     };
     let writer = spawn_writer(send, DATA_QUEUE, CancellationToken::new(), Some(bodies));
 
@@ -138,8 +136,8 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
         "no body goes out"
     );
     for _ in 0..2 {
-        let started = started_rx.try_recv().expect("each answer is reported");
-        assert_eq!(started, id);
+        let report = reports_rx.try_recv().expect("each answer is reported");
+        assert_eq!(report, WriterReport::Started(id));
     }
 }
 
@@ -181,7 +179,7 @@ struct Session {
     data: mpsc::Receiver<Outgoing>,
     /// Held unread, so the state writer's queue stays open.
     _state: mpsc::Receiver<Outgoing>,
-    _started: mpsc::UnboundedSender<UnminedTxId>,
+    _reports: mpsc::UnboundedSender<WriterReport>,
 }
 
 impl Session {
@@ -190,10 +188,10 @@ impl Session {
     fn open(wiring: &Wiring) -> Self {
         let (data, data_recv) = mpsc::channel(DATA_QUEUE);
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
-        let (started, started_rx) = mpsc::unbounded_channel();
+        let (reports, reports_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
         let inv = MeteredSender::new(open_inv_bucket(&wiring.inv_buckets, &connection()));
-        let io = SessionIo::new(data, state, close, started_rx, inv, connection());
+        let io = SessionIo::new(data, state, close, reports_rx, inv, connection());
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
@@ -209,7 +207,7 @@ impl Session {
             cancel,
             data: data_recv,
             _state: state_recv,
-            _started: started,
+            _reports: reports,
         }
     }
 

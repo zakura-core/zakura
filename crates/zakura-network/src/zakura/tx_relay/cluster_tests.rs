@@ -541,6 +541,22 @@ impl RawRelay {
         Ok(())
     }
 
+    /// Waits up to `within` until the node ends the data stream, which it
+    /// reads, so the session is over.
+    async fn data_ended(&mut self, within: Duration) -> Result<(), BoxError> {
+        let rx = self.data_rx.as_mut().ok_or("the data stream is unread")?;
+        tokio::time::timeout(within, async {
+            while let Some(got) = rx.recv().await {
+                if matches!(got, Got::Ended) {
+                    return;
+                }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for the data stream to end")?;
+        Ok(())
+    }
+
     /// Waits until the node ends the state stream, so the transport has
     /// retired the session.
     async fn state_ended(&mut self) -> Result<(), BoxError> {
@@ -1290,20 +1306,19 @@ async fn requests_past_our_hello_with_their_answers_waiting_close_the_peer() -> 
 /// Unread `NotFound`s, part two: a peer that stops reading its state stream
 /// and keeps asking for ids nobody has is answered `NotFound` at once, which
 /// frees each request's place, so it never breaks our `Hello`'s limit. The
-/// answers fill the state writer's queue instead, and the peer is closed as
-/// having stopped reading.
+/// answers fill the state writer's queue instead. That is the peer's first
+/// stall, so its session is parked: it ends, and the connection stays.
 #[tokio::test]
-async fn a_peer_that_never_reads_its_not_founds_is_closed_for_not_reading() -> Result<(), BoxError>
-{
+async fn a_peer_that_never_reads_its_not_founds_is_parked() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let (victim, observed) =
         observed_node(134, TestPool::new(Held::default()), cools(), 16).await?;
-    let peer = flood_unread(&victim, 1_134).await?;
-    peer.closed().await?;
-    assert_eq!(
-        observed.cause(&peer),
-        Some("tx-relay: peer stopped reading")
-    );
+    let sessions = victim.sessions.clone().expect("the node runs tx-relay");
+    let mut peer = flood_unread(&victim, 1_134).await?;
+    peer.data_ended(NET).await?;
+    assert!(!peer.is_closed(), "the connection stays");
+    assert_eq!(observed.cause(&peer), None);
+    assert!(!sessions.is_live(&peer.id()));
 
     victim.node.shutdown().await;
     Ok(())
@@ -1336,13 +1351,15 @@ async fn flood_unread(victim: &RelayNode, seed: u64) -> Result<RawRelay, BoxErro
     Ok(peer)
 }
 
-/// Liveness closes are not violations. A peer stalled past the write
-/// deadline loses its session. One that fills a writer queue and one that
-/// leaves a request unanswered for a second deadline lose their
-/// connections. Each is closed for liveness, not for a protocol violation,
-/// and none is charged: each comes back and is asked for what it announces.
+/// A stall costs a peer its session, never its connection or a charge. One
+/// stalled past the write deadline loses its session to the transport, and
+/// comes back at once and is asked for what it announces. One that fills a
+/// writer queue and one that leaves a request unanswered for a second
+/// deadline stalled for the first time, so their sessions are parked: they
+/// end, their connections stay, and nothing is recorded as a close. The
+/// machine's scenario follows a park to its readmission.
 #[tokio::test]
-async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
+async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let body = large(1, BLOCKED_BODY);
     let pool = TestPool::new(Held {
@@ -1351,7 +1368,7 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
     });
     let (victim, observed) = observed_node(136, pool, cools(), 16).await?;
     let sessions = victim.sessions.clone().expect("the node runs tx-relay");
-    let [stalled_tx, flood_tx, silent_tx, silent_again]: [VerifiedUnminedTx; 4] = vectors(4)
+    let [stalled_tx, silent_tx]: [VerifiedUnminedTx; 2] = vectors(2)
         .try_into()
         .expect("vectors returns what it is asked for");
 
@@ -1386,15 +1403,10 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
     };
 
     let flooding = async {
-        let peer = flooded;
-        peer.closed().await?;
-        assert_eq!(
-            observed.cause(&peer),
-            Some("tx-relay: peer stopped reading")
-        );
-        let mut peer = RawRelay::reconnect(&victim, 1_137).await?;
-        supply(&mut peer, &flood_tx).await?;
-        reaches(&victim, &flood_tx).await?;
+        let mut peer = flooded;
+        peer.data_ended(NET).await?;
+        assert!(!peer.is_closed(), "the flooding peer keeps its connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };
@@ -1406,13 +1418,9 @@ async fn liveness_closes_are_not_charged() -> Result<(), BoxError> {
             .await?;
         peer.asked(id(&silent_tx)).await?;
         // Two deadlines of about 13 seconds each.
-        tokio::time::timeout(Duration::from_secs(60), peer.raw.connection.closed())
-            .await
-            .map_err(|_| "the silent peer was not closed")?;
-        assert_eq!(observed.cause(&peer), Some("tx-relay: unanswered request"));
-        let mut peer = RawRelay::reconnect(&victim, 1_138).await?;
-        supply(&mut peer, &silent_again).await?;
-        reaches(&victim, &silent_again).await?;
+        peer.data_ended(Duration::from_secs(60)).await?;
+        assert!(!peer.is_closed(), "the silent peer keeps its connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };

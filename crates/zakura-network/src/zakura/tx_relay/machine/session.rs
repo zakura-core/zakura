@@ -17,10 +17,11 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::{
     file,
     peer::{Hello, PeerState, Pending, Reserving},
+    reactor::SessionAdmission,
     wanted::{Admission, Changes},
     CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
     PoolView, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
-    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PENDING_PER_PEER,
+    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN, PENDING_PER_PEER,
 };
 use crate::zakura::tx_relay::wire::{inv_payload_bound, MAX_INV_ENTRIES};
 
@@ -71,6 +72,8 @@ pub(crate) struct PeerMachine {
     inv_due: Option<Time>,
     /// Where it reads the wanted table's ring from.
     ring_cursor: u64,
+    /// Its peer's park let it in, so a stall closes its connection.
+    readmitted: bool,
     /// It ended, and handed what it held to the table and the reactor.
     ended: bool,
 }
@@ -78,7 +81,8 @@ pub(crate) struct PeerMachine {
 impl PeerMachine {
     /// A session of `peer` opens. If `exempt`, the bodies it supplies are
     /// never charged, even when their verdict comes after it ends. It gets
-    /// the go once every older session of the peer ended.
+    /// the go once every older session of the peer ended. While the peer's
+    /// park runs, it is parked at once and ends before it begins.
     pub(crate) fn connect(
         shared: &mut Shared,
         pool: &dyn PoolView,
@@ -87,6 +91,7 @@ impl PeerMachine {
         now: Time,
     ) -> Self {
         let session = shared.new_session();
+        let admission = shared.reactor.admit(peer, now);
         let mut machine = Self {
             session,
             now,
@@ -98,8 +103,15 @@ impl PeerMachine {
             timers: Timers::default(),
             inv_due: None,
             ring_cursor: shared.wanted.ring_end(),
+            readmitted: admission == SessionAdmission::Readmitted,
             ended: false,
         };
+        if admission == SessionAdmission::Parked {
+            // It never joins the reactor, so it has nothing to hand back.
+            machine.ended = true;
+            shared.effects.push(RelayEffect::Park { session });
+            return machine;
+        }
         machine.enter(shared, pool, now);
         if shared.reactor.connect(peer, session) {
             machine.open(shared, pool);
@@ -1292,15 +1304,37 @@ impl PeerMachine {
                 .release(id, generation, self.session, now, false);
         }
         // A request on the wire stays written until it is answered, so a
-        // peer that leaves one unanswered for a further deadline loses the
-        // session, which frees its slots.
+        // peer that leaves one unanswered for a further deadline stalled,
+        // and loses the session, which frees its slots.
         if unresponsive {
-            shared.effects.push(RelayEffect::Close {
-                session: self.session,
-                reason: CloseReason::Unresponsive,
-            });
-            self.end_session(shared);
+            self.stalled(shared, CloseReason::Unresponsive);
         }
+    }
+
+    /// Its peer stalled. The first stall parks the session: it ends, its
+    /// connection stays, so the peer's other services keep going, and the
+    /// peer's next sessions are refused for [`PARK_COOLDOWN`]. A stall in
+    /// the session the park lets in afterwards closes the connection for
+    /// `reason`, as block sync does. Neither is a charge.
+    fn stalled(&mut self, shared: &mut Shared, reason: CloseReason) {
+        let session = self.session;
+        let until = self.now.saturating_add(PARK_COOLDOWN);
+        if !self.readmitted && shared.reactor.park(self.state.peer, until, self.now) {
+            shared.effects.push(RelayEffect::Park { session });
+        } else {
+            shared.effects.push(RelayEffect::Close { session, reason });
+        }
+        self.end_session(shared);
+    }
+
+    /// Its peer stopped reading what this node writes: the IO found one of
+    /// its writers' queues full. See [`Self::stalled`].
+    pub(crate) fn stopped_reading(&mut self, shared: &mut Shared, pool: &dyn PoolView, now: Time) {
+        self.enter(shared, pool, now);
+        if !self.ended {
+            self.stalled(shared, CloseReason::StoppedReading);
+        }
+        self.settle(shared, pool);
     }
 
     /// Claims and starts reserve calls while this session has free slots,

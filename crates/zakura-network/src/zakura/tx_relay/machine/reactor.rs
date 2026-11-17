@@ -1,8 +1,9 @@
 //! `tx-relay`'s reactor: node-wide state only.
 //!
-//! It keeps the v2 cooldowns, keyed by peer, which session of each peer may
-//! fetch, the submissions and reserve calls of sessions that ended, and the
-//! fan-out ranking. It never picks a peer to ask for an id.
+//! It keeps the v2 cooldowns and the parks of peers that stalled, keyed by
+//! peer, which session of each peer may fetch, the submissions and reserve
+//! calls of sessions that ended, and the fan-out ranking. It never picks a
+//! peer to ask for an id.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -44,10 +45,26 @@ pub(crate) enum Recorded {
     TableFull,
 }
 
+/// How a new session of a peer is let in, after any park of the peer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionAdmission {
+    /// The peer's park runs: the session ends before it begins.
+    Parked,
+    /// The peer's park ended, and this is the session it lets in. Its own
+    /// stall closes the connection.
+    Readmitted,
+    /// No park of the peer.
+    Fresh,
+}
+
 /// The reactor's state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Reactor {
     cooldowns: HashMap<PeerKey, Cooldown>,
+    /// Peers whose session stalled, with when the park ends. A park ends
+    /// in the next session of the peer it lets in, or is dropped once over
+    /// when the table needs room.
+    parks: HashMap<PeerKey, Time>,
     /// Every session, by peer, oldest first.
     sessions: BTreeMap<PeerKey, BTreeSet<SessionId>>,
     /// The one session of each peer that may announce and fetch.
@@ -75,6 +92,33 @@ pub(crate) struct Reactor {
 }
 
 impl Reactor {
+    /// How a new session of `peer` is let in at `now`. An ended park lets
+    /// in this session and is gone.
+    pub(crate) fn admit(&mut self, peer: PeerKey, now: Time) -> SessionAdmission {
+        match self.parks.get(&peer) {
+            Some(until) if now < *until => SessionAdmission::Parked,
+            Some(_) => {
+                self.parks.remove(&peer);
+                SessionAdmission::Readmitted
+            }
+            None => SessionAdmission::Fresh,
+        }
+    }
+
+    /// Parks `peer` until `until`: its sessions are refused until then.
+    /// Returns false, parking nothing, when the table holds
+    /// [`MAX_COOLDOWN_PEERS`] parks still running.
+    pub(crate) fn park(&mut self, peer: PeerKey, until: Time, now: Time) -> bool {
+        if !self.parks.contains_key(&peer) && self.parks.len() >= MAX_COOLDOWN_PEERS {
+            self.parks.retain(|_, park| now < *park);
+            if self.parks.len() >= MAX_COOLDOWN_PEERS {
+                return false;
+            }
+        }
+        self.parks.insert(peer, until);
+        true
+    }
+
     /// A new session of `peer`. Returns whether it has the go at once,
     /// which it does when it is the peer's only session.
     pub(crate) fn connect(&mut self, peer: PeerKey, session: SessionId) -> bool {

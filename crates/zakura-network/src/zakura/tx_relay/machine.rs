@@ -317,8 +317,12 @@ pub(crate) const BASE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Today's longest cooldown.
 pub(crate) const MAX_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Peers with a cooldown history, at most.
+/// Peers with a cooldown history, at most. The parks are bounded the same.
 pub(crate) const MAX_COOLDOWN_PEERS: usize = 20_000;
+
+/// How long a peer whose session stalled has its sessions refused, as
+/// block sync's no-progress cooldown.
+pub(crate) const PARK_COOLDOWN: Duration = Duration::from_secs(180);
 
 /// Names one session. A peer that reconnects or replaces its session gets a
 /// new one.
@@ -487,8 +491,12 @@ pub(crate) enum CloseReason {
     /// A body it supplied earned a cooldown, and the full cooldown table had
     /// no room for the peer.
     CooldownsFull,
-    /// It left a request unanswered for one more deadline after missing it.
+    /// It left a request unanswered for one more deadline after missing it,
+    /// in the session its park let in.
     Unresponsive,
+    /// It stopped reading what this node writes, in the session its park
+    /// let in.
+    StoppedReading,
 }
 
 /// A broken wire rule.
@@ -551,6 +559,12 @@ pub(crate) enum RelayEffect {
         session: SessionId,
         /// Why.
         reason: CloseReason,
+    },
+    /// End `session` but not its connection: its peer stalled, or its
+    /// peer's park still runs.
+    Park {
+        /// The session.
+        session: SessionId,
     },
     /// Reserve a slot at the pool to fetch `id`, and answer through
     /// [`RelayMachine::reserve_answer`] with `call`.
@@ -1297,6 +1311,14 @@ impl RelayMachine {
     pub(crate) fn served(&mut self, session: SessionId, id: UnminedTxId, now: Time) {
         self.on(session, now, |machine, shared, pool, now| {
             machine.served(shared, pool, id, now);
+        });
+    }
+
+    /// `session`'s peer stopped reading what this node writes. See
+    /// [`PeerMachine::stopped_reading`].
+    pub(crate) fn stopped_reading(&mut self, session: SessionId, now: Time) {
+        self.on(session, now, |machine, shared, pool, now| {
+            machine.stopped_reading(shared, pool, now);
         });
     }
 

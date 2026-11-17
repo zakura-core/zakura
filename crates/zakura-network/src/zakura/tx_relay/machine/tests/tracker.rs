@@ -19,7 +19,8 @@ use zakura_rt::collections::HashSet;
 
 use crate::zakura::tx_relay::machine::{
     CallId, CloseReason, Granted, PeerKey, RelayEffect, RelayMachine, SessionId, Unreserved,
-    Verdict, Violation, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, MAX_SERVES, TRIED_PER_ENTRY,
+    Verdict, Violation, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, MAX_SERVES, PARK_COOLDOWN,
+    TRIED_PER_ENTRY,
 };
 
 /// The input a step answers, with what the record needs of it.
@@ -39,6 +40,10 @@ pub(crate) enum Cause {
     /// The session's IO started writing its answer to the peer's request
     /// for the id.
     Served(SessionId, UnminedTxId),
+    /// The machine opened the session.
+    Opened(SessionId),
+    /// The session's IO found a writer's queue full.
+    StoppedReading(SessionId),
     /// The session's peer answered `NotFound`.
     NotFound(SessionId, UnminedTxId),
     /// The session's peer asked for the id.
@@ -71,6 +76,10 @@ pub(crate) struct Open {
     pub(crate) sent: IndexSet<UnminedTxId>,
     /// Its requests the node serves, until the IO starts each answer.
     pub(crate) serving: IndexSet<UnminedTxId>,
+    /// Its peer's park ran when it opened, so it is refused at once.
+    refused: bool,
+    /// Its peer's park let it in, so its stall closes the connection.
+    readmitted: bool,
 }
 
 /// What a granted reservation is used for.
@@ -118,6 +127,8 @@ pub(crate) struct Tracker {
     /// For each peer a verdict charged, when its cooldown surely ends and
     /// when it may end at the latest. See [`Tracker::charged`].
     cooling: BTreeMap<PeerKey, (Duration, Duration)>,
+    /// For each peer whose session stalled, when its park ends.
+    parks: BTreeMap<PeerKey, Duration>,
     /// How often each kind of effect, answer and change happened.
     pub(crate) seen: BTreeMap<String, usize>,
 }
@@ -133,11 +144,25 @@ impl Tracker {
         }
     }
 
-    /// The machine opened `session` for `peer`. The peer's bodies at the
-    /// pool count as told from the start.
-    pub(crate) fn opened(&mut self, session: SessionId, peer: PeerKey, exempt: bool) {
+    /// The machine opened `session` for `peer` at `now`. The peer's bodies
+    /// at the pool count as told from the start. While the peer's park
+    /// runs, the session is refused. Once it ended, the park lets this
+    /// session in.
+    pub(crate) fn opened(
+        &mut self,
+        session: SessionId,
+        peer: PeerKey,
+        exempt: bool,
+        now: Duration,
+    ) {
         let told = self.unsettled(peer).collect();
         let (hello, sent, serving) = (false, IndexSet::new(), IndexSet::new());
+        let parked = self.parks.get(&peer).copied();
+        let refused = parked.is_some_and(|until| now < until);
+        let readmitted = parked.is_some() && !refused;
+        if readmitted {
+            self.parks.remove(&peer);
+        }
         self.open.insert(
             session,
             Open {
@@ -147,6 +172,8 @@ impl Tracker {
                 told,
                 sent,
                 serving,
+                refused,
+                readmitted,
             },
         );
         let peers: IndexSet<PeerKey> = self.open.values().map(|open| open.peer).collect();
@@ -227,6 +254,13 @@ impl Tracker {
             }),
             _ => None,
         };
+        // Whether the session this step opened was refused, and whether its
+        // park came.
+        let refused = match cause {
+            Cause::Opened(session) => self.open.get(session).is_some_and(|open| open.refused),
+            _ => false,
+        };
+        let mut parked = false;
         self.before(cause);
         if let Cause::Verdict(
             _,
@@ -329,7 +363,29 @@ impl Tracker {
                     self.close(*session);
                     self.saw(format!("close {reason:?}"));
                 }
+                RelayEffect::Park { session } => {
+                    let open = self.open.get(session).expect("a park of a live session");
+                    if matches!(cause, Cause::Opened(of) if of == session) {
+                        assert!(open.refused, "refused only while its peer's park runs");
+                        parked = true;
+                        self.saw("park refused");
+                    } else {
+                        let first = !open.refused && !open.readmitted;
+                        assert!(first, "a park is a first stall");
+                        let peer = open.peer;
+                        self.check_stall(cause, *session);
+                        self.parks.insert(peer, now + PARK_COOLDOWN);
+                        self.saw("park");
+                    }
+                    self.close(*session);
+                }
             }
+        }
+        if matches!(cause, Cause::Opened(_)) {
+            assert_eq!(
+                parked, refused,
+                "a parked peer's session is refused at once"
+            );
         }
         if let Cause::GetTxs(session, _) = cause {
             let closed = |violation| CloseReason::Violation(violation);
@@ -499,9 +555,12 @@ impl Tracker {
                 assert!(decoded, "an undecodable body's close");
             }
             CloseReason::Violation(_) => assert_eq!(sender, Some(&session), "a violation's sender"),
-            CloseReason::Unresponsive => {
-                let asked = self.requests.keys().any(|(asked, _)| *asked == session);
-                assert!(asked, "unresponsive with a request out");
+            CloseReason::Unresponsive | CloseReason::StoppedReading => {
+                assert!(
+                    open.readmitted,
+                    "a stall closes only the session a park let in"
+                );
+                self.check_stall(cause, session);
             }
             CloseReason::Ban | CloseReason::RepeatedCooldown | CloseReason::CooldownsFull => {
                 let Cause::Verdict(_, Verdict::Rejected { charge, .. }) = cause else {
@@ -515,6 +574,14 @@ impl Tracker {
                 assert_eq!(*charge, earned, "{reason:?} is that charge's close");
             }
         }
+    }
+
+    /// A stall of `session` in the step `cause` started: its IO found a
+    /// writer full, or it has a request out that it left unanswered.
+    fn check_stall(&self, cause: &Cause, session: SessionId) {
+        let full = matches!(cause, Cause::StoppedReading(of) if *of == session);
+        let asked = self.requests.keys().any(|(asked, _)| *asked == session);
+        assert!(full || asked, "a stall: a full writer, or a request out");
     }
 
     /// `session` ended. Its requests end with it, and its peer's other

@@ -186,8 +186,9 @@ impl Bench {
     /// A session of `peer` opens, unconditional if `exempt`.
     pub(super) fn connect(&mut self, peer: u64, exempt: bool) -> SessionId {
         let session = self.machine.connect(PeerKey(peer), exempt, self.now);
-        self.tracker.opened(session, PeerKey(peer), exempt);
-        self.took(Cause::Other);
+        self.tracker
+            .opened(session, PeerKey(peer), exempt, self.now);
+        self.took(Cause::Opened(session));
         session
     }
 
@@ -254,6 +255,12 @@ impl Bench {
     pub(super) fn served(&mut self, session: SessionId, id: UnminedTxId) {
         self.machine.served(session, id, self.now);
         self.took(Cause::Served(session, id));
+    }
+
+    /// `session`'s IO finds one of its writers' queues full.
+    pub(super) fn stopped_reading(&mut self, session: SessionId) {
+        self.machine.stopped_reading(session, self.now);
+        self.took(Cause::StoppedReading(session));
     }
 
     /// `session`'s peer answers the request for `id` with a body of the
@@ -553,6 +560,17 @@ impl Bench {
             .iter()
             .filter_map(|effect| match effect {
                 RelayEffect::Advert { session, id } => Some((*session, *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sessions the last input parked.
+    pub(super) fn parks(&self) -> Vec<SessionId> {
+        self.effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RelayEffect::Park { session } => Some(*session),
                 _ => None,
             })
             .collect()

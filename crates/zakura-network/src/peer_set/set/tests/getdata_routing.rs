@@ -1386,11 +1386,15 @@ async fn block_hedge_goes_to_the_fastest_idle_advertiser() {
         peer_set_with_block_advertisers(&mut [&mut busy, &mut slow, &mut fast]).await;
     assert!(!peer_set.ready_services[&busy.addr].can_send_request_now());
 
-    let _hedge_response = peer_set
-        .ready()
-        .await
-        .expect("peer set is ready")
-        .call(Request::BlockByHashHedge(BLOCK_HASH));
+    let _hedge_response =
+        peer_set
+            .ready()
+            .await
+            .expect("peer set is ready")
+            .call(Request::BlockByHashHedge {
+                hash: BLOCK_HASH,
+                first_request_waited: Duration::from_millis(50),
+            });
 
     assert_eq!(
         fast.written_now().await,
@@ -1419,7 +1423,10 @@ async fn block_hedge_without_an_idle_advertiser_fails_at_once() {
         .ready()
         .await
         .expect("peer set is ready")
-        .call(Request::BlockByHashHedge(BLOCK_HASH))
+        .call(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            first_request_waited: Duration::from_millis(50),
+        })
         .await;
 
     assert!(result.is_err(), "no idle advertiser means no hedge");

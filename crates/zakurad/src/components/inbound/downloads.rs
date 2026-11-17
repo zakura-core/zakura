@@ -826,6 +826,7 @@ where
         return network.oneshot(request).await;
     };
 
+    let first_sent = tokio::time::Instant::now();
     let mut first = network.clone().oneshot(request).boxed();
     let first_error = tokio::select! {
         biased;
@@ -837,7 +838,19 @@ where
     };
 
     metrics::counter!("gossip.hedge.sent.count").increment(1);
-    let mut hedge = network.oneshot(zn::Request::BlockByHashHedge(hash)).boxed();
+    // A first request that already failed is no longer waiting, so a download the second
+    // request wins is timed from the second request alone, as a retry would be.
+    let first_request_waited = if first_error.is_some() {
+        Duration::ZERO
+    } else {
+        first_sent.elapsed()
+    };
+    let mut hedge = network
+        .oneshot(zn::Request::BlockByHashHedge {
+            hash,
+            first_request_waited,
+        })
+        .boxed();
 
     if let Some(first_error) = first_error {
         // A hedge that fails, for example because no other peer announced the block, reports

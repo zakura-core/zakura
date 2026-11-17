@@ -3,6 +3,9 @@
 //! Legacy sync learns ordered hashes from `FindBlocks`, then distributes individual block
 //! downloads across the peer set. A download routed to `maybe` has no exact inventory claim from
 //! that peer; `advertised` means the selected peer recently sent an `inv` for that exact hash.
+//! A `hedge` download is a second request for a block whose first request was slow (see
+//! `[network.block_hedge]`); its `first_request_waited_ms` says how long the first request had
+//! been waiting when it was sent, so the download can be timed from the first request.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
 //! inventory guarantee. A connection's process-local
 //! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
@@ -31,6 +34,37 @@ use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedP
 
 const TABLE: JsonlTraceTable =
     JsonlTraceTable::new("legacy_peer_request", "legacy_peer_request.jsonl");
+
+/// How the peer set chose the peer for a block request, written as the row's `route`.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum BlockRequestRoute {
+    /// The peer recently announced the block.
+    Advertised,
+    /// No ready peer had announced the block, so the peer may not have it.
+    Maybe,
+    /// A second request for a slow block, sent once the first request had been waiting
+    /// `first_request_waited`, or zero when the first request had already failed.
+    Hedge { first_request_waited: Duration },
+}
+
+impl BlockRequestRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Advertised => "advertised",
+            Self::Maybe => "maybe",
+            Self::Hedge { .. } => "hedge",
+        }
+    }
+
+    fn first_request_waited(self) -> Option<Duration> {
+        match self {
+            Self::Hedge {
+                first_request_waited,
+            } => Some(first_request_waited),
+            Self::Advertised | Self::Maybe => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
@@ -79,6 +113,8 @@ enum LegacyPeerEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         local_tip_height: Option<u32>,
         elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_request_waited_ms: Option<u64>,
         requested_hash: JsonlDisplay<'a, block::Hash>,
         route: &'static str,
         #[serde(flatten)]
@@ -209,7 +245,7 @@ impl LegacyPeerTrace {
         request_id: u64,
         peer: PeerTraceContext,
         requested_hash: block::Hash,
-        route: &'static str,
+        route: BlockRequestRoute,
         elapsed: Duration,
         result: &Result<Response, SharedPeerError>,
     ) {
@@ -259,8 +295,9 @@ impl LegacyPeerTrace {
                 peer_start_height: peer.peer_start_height.0,
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
                 elapsed_ms: saturating_millis(elapsed),
+                first_request_waited_ms: route.first_request_waited().map(saturating_millis),
                 requested_hash: JsonlDisplay(&requested_hash),
-                route,
+                route: route.label(),
                 result,
             }
         });
@@ -361,7 +398,7 @@ mod tests {
             2,
             peer,
             hash(2),
-            "advertised",
+            BlockRequestRoute::Advertised,
             Duration::from_millis(4),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
                 InventoryHash::Block(hash(2)),
@@ -446,7 +483,7 @@ mod tests {
             1,
             test_peer(),
             hash(2),
-            "maybe",
+            BlockRequestRoute::Maybe,
             Duration::from_millis(4),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
                 InventoryHash::Block(hash(2)),
@@ -462,6 +499,52 @@ mod tests {
 
         assert_eq!(event["peer"], "192.0.2.7:8233");
         assert_eq!(event["user_agent"], "/Zakura:1.8.7/");
+    }
+
+    #[tokio::test]
+    async fn a_hedge_row_says_how_long_the_first_request_had_waited() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = test_trace(&guard, false);
+        let missing = || {
+            Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
+                InventoryHash::Block(hash(2)),
+            ])))
+        };
+
+        trace.block_request_finish(
+            1,
+            test_peer(),
+            hash(2),
+            BlockRequestRoute::Advertised,
+            Duration::from_millis(90),
+            &missing(),
+        );
+        trace.block_request_finish(
+            2,
+            test_peer(),
+            hash(2),
+            BlockRequestRoute::Hedge {
+                first_request_waited: Duration::from_millis(50),
+            },
+            Duration::from_millis(20),
+            &missing(),
+        );
+
+        drop(trace);
+        guard.shutdown().await;
+
+        let events = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
+            .expect("legacy peer trace file is written");
+        let events: Vec<Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+            .collect();
+
+        assert!(events[0].get("first_request_waited_ms").is_none());
+        assert_eq!(events[1]["route"], "hedge");
+        assert_eq!(events[1]["elapsed_ms"], 20);
+        assert_eq!(events[1]["first_request_waited_ms"], 50);
     }
 
     #[tokio::test]

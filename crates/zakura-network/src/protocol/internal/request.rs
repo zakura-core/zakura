@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -166,7 +166,15 @@ pub enum Request {
     /// # Returns
     ///
     /// Returns [`Response::Blocks`](super::Response::Blocks).
-    BlockByHashHedge(block::Hash),
+    BlockByHashHedge {
+        /// The block to request.
+        hash: block::Hash,
+        /// How long the first request had been waiting for an answer when this one was sent, or
+        /// zero when the first request had already failed. The legacy peer trace writes it with
+        /// this request's own time, so a download this request wins is timed from the first
+        /// request without waiting for the first request's answer.
+        first_request_waited: Duration,
+    },
 
     /// Request transactions by their unmined transaction ID.
     ///
@@ -349,7 +357,7 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
-            Request::BlockByHashHedge(_) => "BlockByHashHedge".to_string(),
+            Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
                 format!("TransactionsByIdFrom({})", ids.len())
@@ -389,7 +397,7 @@ impl Request {
 
             Request::BlocksByHash(_)
             | Request::BlocksByHashFrom { .. }
-            | Request::BlockByHashHedge(_) => "BlocksByHash",
+            | Request::BlockByHashHedge { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -413,7 +421,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
-                | Request::BlockByHashHedge(_)
+                | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
         )
@@ -427,7 +435,7 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
-            Request::BlockByHashHedge(hash) => HashSet::from([*hash]),
+            Request::BlockByHashHedge { hash, .. } => HashSet::from([*hash]),
             _ => HashSet::new(),
         }
     }

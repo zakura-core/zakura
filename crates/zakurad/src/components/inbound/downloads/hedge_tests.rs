@@ -39,6 +39,14 @@ fn hash() -> block::Hash {
     block::Hash([7; 32])
 }
 
+/// The second request, sent once the first has waited `first_request_waited`.
+fn hedge_request(first_request_waited: Duration) -> zn::Request {
+    zn::Request::BlockByHashHedge {
+        hash: hash(),
+        first_request_waited,
+    }
+}
+
 fn first_request() -> zn::Request {
     zn::Request::BlocksByHash([hash()].into_iter().collect())
 }
@@ -102,7 +110,11 @@ async fn a_slow_first_request_gets_a_second_request_and_the_first_answer_wins() 
     let first = next_sent(&mut sent).await;
     tokio::time::sleep(DELAY).await;
     let hedge = next_sent(&mut sent).await;
-    assert_eq!(hedge.request, zn::Request::BlockByHashHedge(hash()));
+    assert_eq!(
+        hedge.request,
+        hedge_request(DELAY),
+        "the second request says how long the first has been waiting"
+    );
 
     hedge.answer.send(Ok(from_hedge())).unwrap();
     assert_eq!(download.await.unwrap().unwrap(), from_hedge());
@@ -162,7 +174,11 @@ async fn a_first_request_that_fails_early_is_hedged_at_once() {
     let first = next_sent(&mut sent).await;
     first.answer.send(Err("peer disconnected".into())).unwrap();
     let hedge = next_sent(&mut sent).await;
-    assert_eq!(hedge.request, zn::Request::BlockByHashHedge(hash()));
+    assert_eq!(
+        hedge.request,
+        hedge_request(Duration::ZERO),
+        "a failed first request is no longer waiting"
+    );
 
     hedge.answer.send(Ok(from_hedge())).unwrap();
     assert_eq!(download.await.unwrap().unwrap(), from_hedge());

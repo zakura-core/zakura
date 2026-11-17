@@ -102,7 +102,7 @@ use std::{
     net::IpAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -133,7 +133,7 @@ use crate::{
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
-        legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
+        legacy_peer_trace::{BlockRequestRoute, LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -1384,7 +1384,7 @@ where
                         request_id,
                         peer,
                         hash,
-                        "advertised",
+                        BlockRequestRoute::Advertised,
                         started.elapsed(),
                         &result,
                     );
@@ -1457,7 +1457,7 @@ where
                         request_id,
                         peer,
                         hash,
-                        "maybe",
+                        BlockRequestRoute::Maybe,
                         started.elapsed(),
                         &result,
                     );
@@ -1514,6 +1514,7 @@ where
     fn route_block_hedge(
         &mut self,
         hash: block::Hash,
+        first_request_waited: Duration,
     ) -> <Self as tower::Service<Request>>::Future {
         let inventory = InventoryHash::from(hash);
         let peer = self
@@ -1551,7 +1552,9 @@ where
                 request_id,
                 trace_peer,
                 hash,
-                "hedge",
+                BlockRequestRoute::Hedge {
+                    first_request_waited,
+                },
                 started.elapsed(),
                 &result,
             );
@@ -1966,7 +1969,10 @@ where
                 self.route_inv(req, hash)
             }
 
-            Request::BlockByHashHedge(hash) => self.route_block_hedge(hash),
+            Request::BlockByHashHedge {
+                hash,
+                first_request_waited,
+            } => self.route_block_hedge(hash, first_request_waited),
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),

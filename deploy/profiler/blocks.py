@@ -263,16 +263,20 @@ def note_download(seen, download):
         downloads.append(download)
 
 
-def note_legacy_download(seen, when, elapsed_ms, result):
+def note_legacy_download(seen, when, elapsed_ms, result, first_request_waited_ms=None):
     """Record one legacy request for a block, finished at `when` after `elapsed_ms`.
 
     The download stage runs from the earliest request that was still waiting when the first copy
-    arrived, until that arrival. A request that failed before then does not count. With
-    `[network.block_hedge]` a slow block gets a second request; when that one wins, the first
-    request's answer comes later, and its earlier start adds the wait before the hedge was sent.
+    arrived, until that arrival. A request that failed before then does not count; one that
+    failed after it does, since it was still waiting.
+
+    With `[network.block_hedge]` a slow block gets a second request. Its row says how long the
+    first request had been waiting when it was sent (`first_request_waited_ms`), so when it wins,
+    its own row times the download from the first request. The first request's answer can come
+    later, fail, or come after this block's record was published; none of that changes the time.
     Rows are read in the order they were written, which is the order the requests finished.
     """
-    start = when - round(elapsed_ms * 1000)
+    start = when - round((elapsed_ms + (first_request_waited_ms or 0)) * 1000)
     if "arrived" not in seen:
         if result != "available":
             return
@@ -487,6 +491,16 @@ class BlockStages:
                     "result": row.get("result"), "route": row.get("route"),
                 },
             )  # fmt: skip
+        requested = row.get("requested_hash") or row.get("returned_hash")
+        if event == "block_request_finish" and isinstance(requested, str):
+            if isinstance(row.get("elapsed_ms"), (int, float)):
+                # Before the failure check below: a request that fails after the block arrived
+                # was still waiting when it did, so it can start the download stage.
+                waited = row.get("first_request_waited_ms")
+                note_legacy_download(
+                    self._by_hash.setdefault((process, requested), {}), when, row["elapsed_ms"],
+                    row.get("result"), waited if isinstance(waited, (int, float)) else None,
+                )  # fmt: skip
         if event == "block_body_received" and type(row.get("height")) is int:
             note_download(
                 self._by_height.setdefault((process, row["height"]), {}),
@@ -526,8 +540,6 @@ class BlockStages:
                 if len(times) < MAX_STATUS_TIMES:
                     times.append(when)
                 continue
-            if event == "block_request_finish" and isinstance(row.get("elapsed_ms"), (int, float)):
-                note_legacy_download(seen, when, row["elapsed_ms"], row.get("result"))
             if event in seen:
                 continue
             seen[event] = when

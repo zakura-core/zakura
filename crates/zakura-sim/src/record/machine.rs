@@ -36,7 +36,7 @@ pub enum MachineStep {
     WorkFunding(WorkFundingStep),
     /// Decoded allocations retained by block, header, and transaction owners.
     DecodedRetention(DecodedRetentionStep),
-    /// Header reactor scheduling and locator policy, with its independent model.
+    /// Header reactor scheduling and locator policy, checked by its invariants.
     HeaderReactor(HeaderReactorStep),
     /// Reactor query and view policy and its independent model.
     Reactor(ReactorStep),
@@ -44,7 +44,7 @@ pub enum MachineStep {
     DiscoveryBook(BookStep),
     /// Discovery's real session and hint owner and its independent model.
     DiscoveryState(DiscoverySessionStep),
-    /// Header publisher credit and terminal policy, with its independent model.
+    /// Header publisher credit and terminal policy, checked by its invariants.
     HeaderPublisher(HeaderPublisherStep),
 }
 

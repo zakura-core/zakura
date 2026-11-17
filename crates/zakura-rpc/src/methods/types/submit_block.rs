@@ -129,8 +129,9 @@ impl MinedBlockSubmission {
 /// The authority for relaying a local submission before commit.
 ///
 /// State-authorized relay stops waiting for readiness at commitment, but a dispatched broadcast
-/// may finish; contextual failure cancels it. Trusted relay preserves dispatched work on commitment,
-/// but failure withdraws both announcements and queued bodies. Both policies retain the gossip deadline and committed fallback.
+/// may finish. Trusted relay preserves dispatched work on commitment. For both policies, failure
+/// withdraws queued announcements and temporary bodies before their peer writes start, and both
+/// retain the gossip deadline and committed fallback.
 #[derive(Debug)]
 pub enum EarlyBlockRelay {
     /// Consensus authorized relay and state admitted the candidate.
@@ -246,7 +247,7 @@ impl PendingBlockSignal {
     /// Resolves when contextual verification rejects the block.
     pub async fn wait_for_failure(&mut self) {
         loop {
-            let status = self.status.borrow_and_update().clone();
+            let status = *self.status.borrow_and_update();
             match status {
                 PendingStatus::Failed => return,
                 PendingStatus::Committed => std::future::pending::<()>().await,
@@ -373,18 +374,19 @@ impl PendingBlockRegistry {
         {
             return;
         }
+        let entry = entries
+            .remove(&hash)
+            .expect("entry exists because its owner matched under the same lock");
+        drop(entries);
+
         let status = match result {
             Ok(_) => PendingStatus::Committed,
             Err(()) => PendingStatus::Failed,
         };
-        // Publish under the registry lock before removing the body. Escaped send permits
-        // order their synchronous write starts against this same status update.
-        entries
-            .get(&hash)
-            .expect("entry exists because its owner matched under the same lock")
-            .status
-            .send_replace(status);
-        entries.remove(&hash);
+        // Publish after releasing the registry. Removal already stops new permits escaping, and
+        // this update waits for write starts that hold a permit, which can take milliseconds per
+        // block encode. Holding the registry lock here would stall every other lookup meanwhile.
+        entry.status.send_replace(status);
     }
 
     /// Returns the pending verdict on block `hash`, if this node is verifying a submission of it.
@@ -596,6 +598,43 @@ mod tests {
             assert!(permit.try_start_write(|| ()).is_none());
             retry.resolve(Ok(block));
         }
+    }
+
+    /// Resolution waits for write starts that hold a permit. It must not hold the registry
+    /// meanwhile, or every other pending lookup would wait for that block's encode.
+    #[test]
+    fn resolution_waiting_on_a_write_start_does_not_block_other_lookups() {
+        use std::{sync::mpsc, time::Duration};
+
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let owner = registry.insert(block).unwrap();
+        let permit = registry.get_for_peer(hash).unwrap().pending_send.unwrap();
+        let other = block::Hash([7; 32]);
+
+        let lookup_finished = permit
+            .try_start_write(|| {
+                let resolver = std::thread::spawn(move || owner.resolve(Err(())));
+                // Give the resolver time to block on the in-progress write start.
+                std::thread::sleep(Duration::from_millis(100));
+                let (finished, lookup) = mpsc::channel();
+                let registry = registry.clone();
+                std::thread::spawn(move || {
+                    let _ = finished.send(registry.get_for_peer(other).is_none());
+                });
+                let result = lookup.recv_timeout(Duration::from_secs(2));
+                (resolver, result)
+            })
+            .unwrap();
+        let (resolver, result) = lookup_finished;
+        resolver.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(true),
+            "another lookup completes while resolution waits for a write start"
+        );
+        assert!(permit.try_start_write(|| ()).is_none());
     }
 
     #[test]

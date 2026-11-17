@@ -43,8 +43,9 @@ impl PendingBlockSendPermit {
 
     /// Runs a synchronous write start unless this submission has been withdrawn.
     ///
-    /// The watch read lock orders the callback against resolution's write lock. Call only
-    /// after writer readiness; never await or acquire the pending registry inside the callback.
+    /// The watch read lock orders the callback against resolution's write lock, so resolution
+    /// waits for the callback to return. Call only after writer readiness, keep the callback
+    /// short and synchronous, and never resolve this permit's submission inside it.
     /// Writes that started before withdrawal may finish flushing afterward.
     pub fn try_start_write<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
         let status = self.0.borrow();

@@ -321,7 +321,7 @@ impl Encoder<Message> for Codec {
         // exporter and grow without bound on public listeners.
         metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
 
-        // `max_len` is at most `MAX_PROTOCOL_MESSAGE_LEN`, so the length fits in a u32.
+        // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
         dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
         let checksum = self.body_checksum(&item, &dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);

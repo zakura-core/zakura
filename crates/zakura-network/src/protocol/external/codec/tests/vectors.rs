@@ -401,6 +401,93 @@ fn max_msg_size_round_trip() {
     });
 }
 
+/// Rejecting an oversized message preserves earlier frames and allows another send.
+#[test]
+fn oversized_encode_preserves_buffered_frames() {
+    let _init_guard = zakura_test::init();
+    let mut codec = Codec::builder().with_max_body_len(8).finish();
+    let first = Message::Ping(Nonce(1));
+    let next = Message::Pong(Nonce(2));
+    let mut bytes = BytesMut::new();
+    codec.encode(first.clone(), &mut bytes).unwrap();
+    let original = bytes.clone();
+    let tx: Transaction = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .unwrap();
+
+    assert!(matches!(
+        codec.encode(Message::Tx(tx.into()), &mut bytes),
+        Err(Error::Parse("body length exceeded maximum size"))
+    ));
+    assert_eq!(bytes, original, "rejection must preserve the queued frame");
+
+    codec.encode(next.clone(), &mut bytes).unwrap();
+    assert_eq!(codec.decode(&mut bytes).unwrap(), Some(first));
+    assert_eq!(codec.decode(&mut bytes).unwrap(), Some(next));
+    assert!(bytes.is_empty());
+}
+
+/// A body validation error rolls back partial output, including after earlier frames.
+#[test]
+fn failed_body_encode_restores_buffer() {
+    let _init_guard = zakura_test::init();
+    let Message::Version(mut version) = VERSION_TEST_VECTOR.clone() else {
+        unreachable!("the version test vector is a version message");
+    };
+    // The serializer writes the version fields before checking the user agent length.
+    version.user_agent = "X".repeat(MAX_USER_AGENT_LENGTH + 1);
+    let invalid = Message::Version(version);
+
+    for buffered_frame in [false, true] {
+        let mut codec = Codec::builder().finish();
+        let mut bytes = BytesMut::new();
+        let ping = Message::Ping(Nonce(1));
+        if buffered_frame {
+            codec.encode(ping.clone(), &mut bytes).unwrap();
+        }
+        let original = bytes.clone();
+
+        assert!(matches!(
+            codec.encode(invalid.clone(), &mut bytes),
+            Err(Error::Parse(
+                "user agent too long: must be 256 bytes or less"
+            ))
+        ));
+        assert_eq!(
+            bytes, original,
+            "a body error must restore the queued bytes"
+        );
+
+        codec.encode(Message::Verack, &mut bytes).unwrap();
+        if buffered_frame {
+            assert_eq!(codec.decode(&mut bytes).unwrap(), Some(ping));
+        }
+        assert_eq!(codec.decode(&mut bytes).unwrap(), Some(Message::Verack));
+        assert!(bytes.is_empty());
+    }
+}
+
+/// Header fields and checksums describe each appended frame, including empty bodies.
+#[test]
+fn appended_frames_round_trip() {
+    let _init_guard = zakura_test::init();
+    let mut codec = Codec::builder().finish();
+    let messages = [
+        Message::Ping(Nonce(1)),
+        Message::Verack,
+        Message::Pong(Nonce(2)),
+    ];
+    let mut bytes = BytesMut::new();
+    for message in &messages {
+        codec.encode(message.clone(), &mut bytes).unwrap();
+    }
+
+    for message in messages {
+        assert_eq!(codec.decode(&mut bytes).unwrap(), Some(message));
+    }
+    assert!(bytes.is_empty());
+}
+
 /// Check that the version test vector deserializes correctly without the relay byte
 #[test]
 fn version_message_omitted_relay() {

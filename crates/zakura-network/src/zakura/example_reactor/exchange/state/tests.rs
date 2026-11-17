@@ -47,7 +47,9 @@ enum Op {
 /// choose its arguments.
 fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
     data[..data.len().min(MAX_HISTORY_BYTES)]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let (kind, high, arg) = (pair[0] & 7, u32::from(pair[0] >> 3), pair[1]);
             let index = usize::from(arg & 3);

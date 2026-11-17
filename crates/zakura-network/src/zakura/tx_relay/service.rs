@@ -50,6 +50,7 @@ use crate::{
     config::UnconditionalPeers,
     zakura::{
         regulation::{ByteBucket, MeteredReady, MeteredSender},
+        transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
         Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
         Stream, ZakuraConnId, ZakuraPeerId,
@@ -747,6 +748,12 @@ impl Routine {
                 () = time::sleep_until(deadline) => self.tick(),
             }
             self.after_step();
+        }
+        // The transport retires a session it cannot write to by its write
+        // deadline. That peer stopped reading, a stall as a full writer
+        // queue is. The session's streams share one failure record.
+        if data.failure() == Some(OrderedStreamFailure::WriteTimeout) {
+            self.step(stopped_reading);
         }
         self.finish();
     }

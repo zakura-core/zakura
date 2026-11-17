@@ -1029,14 +1029,14 @@ that closes names its row. A stall is the one breach that ends the session befor
 | 13 | A body that earned a ban | Machine, `Ban` | Every session of the supplier | `tx-relay: banned transaction` |
 | 14 | A body that earned a second cooldown | Machine, `RepeatedCooldown` | Every session of the supplier | `tx-relay: repeated cooldown` |
 | 15 | A body that earned a cooldown while the cooldown table is full | Machine, `CooldownsFull` | Every session of the supplier | `tx-relay: cooldown table full` |
-| 16 | A stall: a request left unanswered for a deadline past the one it missed, or a peer that stopped reading until one of this node's writer queues filled | Machine | The session, and the peer's next sessions are refused for 180 seconds, block sync's no-progress cooldown. The connection, in the session that park lets in afterwards or when the park table is full. | None for the session. `tx-relay: unanswered request` or `tx-relay: peer stopped reading` for the connection. |
+| 16 | A stall: a request left unanswered for a deadline past the one it missed, or a peer that stopped reading until one of this node's writer queues filled or a write passed the transport's write deadline | Machine | The session, and the peer's next sessions are refused for 180 seconds, block sync's no-progress cooldown. The connection, in the session that park lets in afterwards or when the park table is full. | None for the session. `tx-relay: unanswered request` or `tx-relay: peer stopped reading` for the connection. |
 
 Three rules are also stated where they bound without closing. The `Hello` row's cadence records an
 overrun and forwards the frame, so row 4 alone closes a second `Hello`. The `GetTxs` row's
 `max_in_flight` of 16 sizes the stream's budget, and no transport check counts the requests, so
 row 8 alone closes one past it. No response precheck runs on these streams, so the transport admits
-every `Tx` and `NotFound` header, and row 9 alone closes an answer to nothing. A stall and the
-transport's write deadline, which retires a session it cannot write to, are not charges.
+every `Tx` and `NotFound` header, and row 9 alone closes an answer to nothing. A stall is not a
+charge.
 
 - **Cadence**
   - `Hello`: capacity = 3, refill = 1 message / 300 seconds

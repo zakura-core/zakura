@@ -1324,7 +1324,8 @@ impl PeerMachine {
     }
 
     /// Its peer stopped reading what this node writes: the IO found one of
-    /// its writers' queues full. See [`Self::stalled`].
+    /// its writers' queues full, or a write passed the transport's write
+    /// deadline. See [`Self::stalled`].
     pub(crate) fn stopped_reading(&mut self, shared: &mut Shared, pool: &dyn PoolView, now: Time) {
         self.enter(shared, pool, now);
         if !self.ended {

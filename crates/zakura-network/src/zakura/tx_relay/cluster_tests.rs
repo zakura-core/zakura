@@ -1351,13 +1351,13 @@ async fn flood_unread(victim: &RelayNode, seed: u64) -> Result<RawRelay, BoxErro
     Ok(peer)
 }
 
-/// A stall costs a peer its session, never its connection or a charge. One
-/// stalled past the write deadline loses its session to the transport, and
-/// comes back at once and is asked for what it announces. One that fills a
-/// writer queue and one that leaves a request unanswered for a second
-/// deadline stalled for the first time, so their sessions are parked: they
-/// end, their connections stay, and nothing is recorded as a close. The
-/// machine's scenario follows a park to its readmission.
+/// A stall costs a peer its session, never its connection or a charge. Three
+/// peers stall for the first time: one past the transport's write deadline,
+/// one by filling a writer queue, and one by leaving a request unanswered
+/// for a second deadline. So their sessions are parked: they end, their
+/// connections stay, and nothing is recorded as a close. The first one's
+/// next session is refused at once. The machine's scenario follows a park
+/// to its readmission.
 #[tokio::test]
 async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
@@ -1368,7 +1368,7 @@ async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> 
     });
     let (victim, observed) = observed_node(136, pool, cools(), 16).await?;
     let sessions = victim.sessions.clone().expect("the node runs tx-relay");
-    let [stalled_tx, silent_tx]: [VerifiedUnminedTx; 2] = vectors(2)
+    let [silent_tx]: [VerifiedUnminedTx; 1] = vectors(1)
         .try_into()
         .expect("vectors returns what it is asked for");
 
@@ -1395,9 +1395,13 @@ async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> 
             !sessions.is_live(&peer.id())
         })
         .await?;
-        peer.start().await?;
-        supply(&mut peer, &stalled_tx).await?;
-        reaches(&victim, &stalled_tx).await?;
+        // The session ran its stall step before it left the live record,
+        // so the park stands, and the next session ends as it opens.
+        peer.open().await?;
+        peer.read_data();
+        peer.data_ended(NET).await?;
+        assert!(!peer.is_closed(), "a parked session leaves the connection");
+        assert_eq!(observed.cause(&peer), None);
         peer.shutdown().await;
         Ok::<(), BoxError>(())
     };

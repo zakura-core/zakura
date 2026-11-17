@@ -1228,11 +1228,9 @@ fn remembered_oversized_length_does_not_reject_a_block() {
     let alone = encode_block(&mut Codec::builder().finish(), &block);
 
     let shared = BlockChecksums::default();
-    shared.checksum_with(
-        block.hash(),
-        MAX_PROTOCOL_MESSAGE_LEN + 1,
-        || sha256d::Checksum([0xAB; 4]),
-    );
+    shared.checksum_with(block.hash(), MAX_PROTOCOL_MESSAGE_LEN + 1, || {
+        sha256d::Checksum([0xAB; 4])
+    });
     let mut codec = Codec::builder().with_block_checksums(shared).finish();
 
     assert_eq!(encode_block(&mut codec, &block), alone);

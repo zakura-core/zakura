@@ -1,7 +1,7 @@
 //! Chooses the smallest `block` message body whose checksum is shared between connections.
 //!
-//! A send whose checksum is shared hashes the block's header to find it. Otherwise the send
-//! hashes its whole body. With `n` sends of one block, sharing costs `n` lookups and one body
+//! A send whose checksum is shared looks it up using the hash carried by its message.
+//! Otherwise the send hashes its whole body. With `n` sends of one block, sharing costs `n` lookups and one body
 //! hash, against `n` body hashes, so it saves time once a body hash costs more than
 //! `n / (n - 1)` lookups. Two sends is the worst case: twice a lookup.
 //!
@@ -35,13 +35,12 @@ fn body_hash(c: &mut Criterion) {
 }
 
 fn cached_lookup(c: &mut Criterion) {
-    // A Mainnet header has the full 1344-byte Equihash solution, like every header hashed
-    // for a lookup.
     let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_419199_BYTES[..])
         .expect("the block test vector deserializes");
     let cached = CachedBlock::new(&block, MIN_SHARED_BODY_LEN);
+    let hash = block.hash();
     c.bench_function("cached_lookup", |b| {
-        b.iter(|| cached.lookup(black_box(&block)))
+        b.iter(|| cached.lookup(black_box(hash)))
     });
 }
 

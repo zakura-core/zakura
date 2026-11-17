@@ -89,7 +89,10 @@ where
             // Widening u32 to usize is lossless on supported targets.
             let size = size as usize;
             if size < MIN_SHARED_CHECKSUM_BODY_LEN
-                || self.checksums.get(block.hash).is_some_and(|(len, _)| len == size)
+                || self
+                    .checksums
+                    .get(block.hash)
+                    .is_some_and(|(len, _)| len == size)
             {
                 return;
             }

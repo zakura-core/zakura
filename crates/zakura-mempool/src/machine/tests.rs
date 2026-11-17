@@ -229,11 +229,14 @@ impl Bench {
         )
     }
 
-    /// A machine at the start tip, with `config` and `limits`.
+    /// A machine at the start tip, with `config` and `limits`, turned on.
     fn with(config: Config, limits: Limits) -> Self {
         let base = Instant::now();
+        let mut machine = Machine::new(&config, base).with_limits(limits);
+        assert!(machine.reset(tip(START, 0), base).is_empty());
+        assert!(machine.near_tip(true, base).is_empty());
         Self {
-            machine: Machine::new(&config, tip(START, 0), base).with_limits(limits),
+            machine,
             tracker: Tracker::default(),
             base,
             now: Duration::ZERO,
@@ -262,11 +265,10 @@ impl Bench {
 
     /// Reserves `tx`. Returns the answer, and what else the input caused.
     fn reserve(&mut self, tx: &Tx) -> (Result<ReservationId, Unreserved>, Step) {
-        let answer = self.machine.reserve(tx.id(), self.at());
+        let (answer, step) = self.machine.reserve(tx.id(), self.at());
         if let Ok(reservation) = &answer {
             self.tracker.reserved(*reservation);
         }
-        let step = self.machine.effects();
         (answer, self.took(step))
     }
 
@@ -426,32 +428,29 @@ impl Bench {
         self.took(step)
     }
 
-    /// The pool turns off.
+    /// The node falls behind the tip, and the pool turns off.
     fn deactivate(&mut self) -> Step {
-        let step = self.machine.deactivate(self.at());
+        let step = self.machine.near_tip(false, self.at());
         let step = self.took(step);
         self.tracker.every_submission_is_answered();
         self.tracker.pool_is_empty();
         step
     }
 
-    /// The pool turns on again, at the tip the test is at.
+    /// The node is near the tip again, and the pool turns on.
     fn activate(&mut self) -> Step {
-        self.machine.activate(self.tip(), self.at());
-        let step = self.machine.effects();
+        let step = self.machine.near_tip(true, self.at());
         self.took(step)
     }
 
     /// The members of `txs` a cached rejection covers.
-    fn rejected(&mut self, txs: &[&Tx]) -> HashSet<UnminedTxId> {
+    fn rejected(&self, txs: &[&Tx]) -> HashSet<UnminedTxId> {
         let ids: HashSet<UnminedTxId> = txs.iter().map(|tx| tx.id()).collect();
         let rejected = self.machine.rejected_ids(ids.clone(), self.at());
         assert!(
             rejected.is_subset(&ids),
             "a rejection of an id nobody asked about"
         );
-        let step = self.machine.effects();
-        self.took(step);
         rejected
     }
 }

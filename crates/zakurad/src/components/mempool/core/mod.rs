@@ -1,6 +1,6 @@
 //! The pool core, run by zakurad behind `[mempool] implementation = "core"`.
 //!
-//! The core itself is [`zakura_mempool::io::PoolCore`], which knows nothing
+//! The core itself is [`zakura_mempool::io::MempoolIO`], which knows nothing
 //! of tokio, the peer set or the verifier. This module connects it to the
 //! node:
 //!
@@ -26,7 +26,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
 };
 use zakura_jsonl_trace::JsonlEventEmitter;
-use zakura_mempool::io::{ChainFeed, PoolCore};
+use zakura_mempool::io::{ChainFeed, MempoolIO};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::{
     mempool::{
@@ -212,7 +212,7 @@ pub(crate) struct Assembled {
     /// The indexer's change stream.
     pub subscriber: MempoolTxSubscriber,
     /// The core, to run.
-    pub core: PoolCore<zakura_consensus::error::TransactionError, verifier::ConsensusVerifier>,
+    pub core: MempoolIO<zakura_consensus::error::TransactionError, verifier::ConsensusVerifier>,
     /// The announcer and change stream, to run.
     pub follower: follower::Follower,
 }
@@ -245,7 +245,7 @@ pub(crate) fn assemble(
         config.max_transaction_bytes,
         chain_tip_change.network().clone(),
     );
-    let core = PoolCore::new(
+    let core = MempoolIO::new(
         &core_config(config),
         // A clone starts behind the tip, so its first action is a reset
         // that names it.

@@ -23,7 +23,7 @@ use chrono::Utc;
 use proptest::test_runner::TestRunner;
 use tokio::task::JoinHandle;
 use zakura_chain::{
-    block::{self, Height},
+    block::Height,
     transaction::{self, UnminedTx, UnminedTxId},
     transparent::OutPoint,
 };
@@ -43,7 +43,7 @@ use zakura_rt::{
 use super::Feed;
 use crate::{
     config::Config,
-    io::{PoolCore, Verifier},
+    io::{MempoolIO, Verifier},
     machine::{
         tests::{build, tip, TestVerifyError, Tx},
         Effect, JobId, Limits, MempoolState, Outcome, Step, WaiterId,
@@ -131,15 +131,15 @@ struct Mirror {
     /// What each block above the start mined.
     blocks: Vec<Vec<transaction::Hash>>,
     fork: u8,
-    chain_tip: ChainTip,
-    wanted_active: bool,
+    /// Whether the test last told both sides the node is near the tip.
+    near_tip: bool,
     /// The machine's steps that carried changes: the log's batches.
     log: Vec<Vec<Change>>,
     /// The batches a reader has read through the port, and its cursor.
     read: Vec<(u64, Vec<Change>)>,
     cursor: ChangeSeq,
     /// The verifications the machine started in this step.
-    started: Vec<(JobId, UnminedTxId, bool)>,
+    started: Vec<(JobId, UnminedTxId, ChainTip, bool)>,
     /// The verifications running.
     running: Vec<(JobId, Call)>,
     cancelled: Vec<JobId>,
@@ -194,15 +194,11 @@ impl Mirror {
             pending: 4,
             readmitting: 2,
         };
-        // The core is off until its chain names a tip, and so is the
-        // machine it is compared with.
-        let no_tip = ChainTip {
-            hash: block::Hash([0; 32]),
-            height: Height(0),
-        };
-        let mut reference = MempoolState::new(&config, no_tip, Instant::now()).with_limits(limits);
-        assert!(reference.deactivate(Instant::now()).is_empty());
-        let core = PoolCore::with_limits(
+        // The core tells its machine the node is near the tip when it
+        // starts, and so does the test.
+        let mut reference = MempoolState::new(&config, Instant::now()).with_limits(limits);
+        assert!(reference.near_tip(true, Instant::now()).is_empty());
+        let core = MempoolIO::with_limits(
             &config,
             Box::new(Feed(events)),
             verifier,
@@ -221,8 +217,7 @@ impl Mirror {
             invalid: invalid_ids,
             blocks: Vec::new(),
             fork: 0,
-            chain_tip: no_tip,
-            wanted_active: true,
+            near_tip: true,
             log: Vec::new(),
             read: Vec::new(),
             cursor: ChangeSeq(0),
@@ -250,32 +245,15 @@ impl Mirror {
                 Effect::Start {
                     job,
                     tx,
+                    tip,
                     after_reset,
-                } => self.started.push((job, tx.id(), after_reset)),
+                } => self.started.push((job, tx.id(), tip, after_reset)),
                 Effect::Cancel(job) => self.cancelled.push(job),
                 Effect::CancelFetch(reservation) => {
                     self.cancelled_fetches.insert(reservation);
                 }
                 Effect::Verdict { waiter, verdict } => self.due_verdicts.push((waiter, verdict)),
             }
-        }
-    }
-
-    /// The machine's answer to the node moving toward or away from the tip,
-    /// as the core asks for it after an activity change and after each chain
-    /// event.
-    fn mirror_activity(&mut self) {
-        if self.wanted_active == self.reference.is_active() {
-            return;
-        }
-        let now = Instant::now();
-        if self.wanted_active {
-            self.reference.activate(self.chain_tip, now);
-            let step = self.reference.effects();
-            self.absorb(step);
-        } else {
-            let step = self.reference.deactivate(now);
-            self.absorb(step);
         }
     }
 
@@ -346,10 +324,10 @@ impl Mirror {
         let calls: Vec<Call> = std::mem::take(&mut *self.calls.lock().expect("not poisoned"));
         let started = std::mem::take(&mut self.started);
         assert_eq!(calls.len(), started.len(), "{what}: verifications started");
-        for (call, (job, tx, after_reset)) in calls.into_iter().zip(started) {
+        for (call, (job, tx, tip, after_reset)) in calls.into_iter().zip(started) {
             assert_eq!(
                 (call.tx, call.tip, call.after_reset),
-                (tx, self.reference.tip(), after_reset),
+                (tx, tip, after_reset),
                 "{what}: a verification's transaction, tip and flags"
             );
             self.running.push((job, call));
@@ -455,8 +433,7 @@ impl Mirror {
     /// Reserves `tx`, and holds the reservation if one is granted.
     async fn reserve(&mut self, tx: usize) {
         let id = self.txs[tx].id();
-        let expected = self.reference.reserve(id, Instant::now());
-        let step = self.reference.effects();
+        let (expected, step) = self.reference.reserve(id, Instant::now());
         self.absorb(step);
         match (expected, answered(self.handle.reserve(id)).await) {
             (Ok(granted), Ok(reservation)) => {
@@ -582,8 +559,6 @@ impl Mirror {
             .expect("the core reads its feed");
         let step = self.reference.grow(block, Instant::now());
         self.absorb(step);
-        self.chain_tip = after;
-        self.mirror_activity();
     }
 
     /// Takes the tip block off and connects one on another fork that mines
@@ -613,8 +588,6 @@ impl Mirror {
             .expect("the core reads its feed");
         let step = self.reference.reset(tip, Instant::now());
         self.absorb(step);
-        self.chain_tip = tip;
-        self.mirror_activity();
     }
 
     /// Moves time on by `by`, stopping at each of the machine's deadlines on
@@ -713,8 +686,6 @@ impl Mirror {
                     .map(|_| self.txs[dice.below(self.txs.len())].id())
                     .collect();
                 let expected = self.reference.rejected_ids(ids.clone(), Instant::now());
-                let step = self.reference.effects();
-                self.absorb(step);
                 assert_eq!(
                     answered(self.handle.rejected_ids(ids)).await,
                     expected,
@@ -724,9 +695,10 @@ impl Mirror {
                 self.compare("a rejection lookup").await;
             }
             92 => {
-                self.wanted_active = !self.wanted_active;
-                self.active.send_replace(self.wanted_active);
-                self.mirror_activity();
+                self.near_tip = !self.near_tip;
+                self.active.send_replace(self.near_tip);
+                let step = self.reference.near_tip(self.near_tip, Instant::now());
+                self.absorb(step);
                 self.compare("the pool turning on or off").await;
             }
             _ => {

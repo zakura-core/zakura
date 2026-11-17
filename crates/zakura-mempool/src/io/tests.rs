@@ -31,7 +31,7 @@ use zakura_rt::{
     sync::{mpsc, watch, Notify},
 };
 
-use super::{ChainFeed, PoolCore, Verifier};
+use super::{ChainFeed, MempoolIO, Verifier};
 
 mod mirror;
 use crate::{
@@ -240,7 +240,7 @@ impl Harness {
             running: Arc::default(),
             peak: Arc::default(),
         };
-        let core = PoolCore::with_limits(
+        let core = MempoolIO::with_limits(
             &Config {
                 tx_cost_limit: u64::MAX / 2,
                 ..Config::default()

@@ -1,4 +1,6 @@
-//! The pool core's task: [`PoolCore`] owns the machine and serves the port.
+//! The pool core's task: [`MempoolIO`] owns the machine and serves the port.
+//! It holds the channels, the timer and the running verifications, and
+//! decides nothing: every rule is the machine's.
 //!
 //! The task takes one input at a time: a caller's command, a chain event, a
 //! verification's outcome, a change to whether the pool is on, or a deadline.
@@ -15,10 +17,8 @@
 //! 3. It does each step's effects in order: starts and cancels
 //!    verifications, and sends verdicts.
 //!
-//! The pool stays off until the chain names a real tip, whatever the
-//! activity signal says. A verifier the core owns reads the pool through a
-//! `PoolReader`, so it does not keep the core running once every handle is
-//! gone.
+//! A verifier the core owns reads the pool through a `PoolReader`, so it
+//! does not keep the core running once every handle is gone.
 //!
 //! A verification runs in a task of its own, outside the core's task, and
 //! comes back as an input. See [`MempoolState::outcome`] for when the machine
@@ -33,10 +33,7 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
-use zakura_chain::{
-    block::{self, Height},
-    transaction::UnminedTx,
-};
+use zakura_chain::transaction::UnminedTx;
 use zakura_node_services::mempool::port::{
     ChainEvent, ChainTip, LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
 };
@@ -105,19 +102,13 @@ struct Published {
 }
 
 /// The pool core: the machine, the port's inbox, and the work in flight.
-pub struct PoolCore<E, V> {
+pub struct MempoolIO<E, V> {
     machine: MempoolState<E>,
     inbox: PoolInbox,
     chain: Box<dyn ChainFeed>,
     verifier: V,
     /// Whether the node is near enough to the tip for the pool to be on.
-    active: watch::Receiver<bool>,
-    /// The latest tip from the chain, which the machine skips while it is
-    /// off and takes when it turns on.
-    chain_tip: ChainTip,
-    /// Whether the chain has named a real tip. Before it has, the pool stays
-    /// off, whatever the activity signal says.
-    has_tip: bool,
+    near_tip: watch::Receiver<bool>,
     /// Every verification reports here. At most one report per running job
     /// is in flight, and the machine bounds the jobs, so this is bounded.
     reports_tx: mpsc::UnboundedSender<Report<E>>,
@@ -142,7 +133,7 @@ pub struct PoolCore<E, V> {
     tips: Option<TipObserver>,
 }
 
-/// What [`PoolCore::on_tip_applied`] registers.
+/// What [`MempoolIO::on_tip_applied`] registers.
 type TipObserver = Box<dyn FnMut(&TipApplied) + Send>;
 
 /// One chain event the core applied, for the node's trace.
@@ -165,17 +156,17 @@ pub struct TipApplied {
     pub took: std::time::Duration,
 }
 
-impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
+impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
     /// A core that reads chain events from `chain` and serves `inbox`. It is
-    /// on while `active` holds `true` and `chain` has named a tip.
+    /// on while `near_tip` holds `true` and `chain` has named a tip.
     pub fn new(
         config: &Config,
         chain: Box<dyn ChainFeed>,
         verifier: V,
         inbox: PoolInbox,
-        active: watch::Receiver<bool>,
+        near_tip: watch::Receiver<bool>,
     ) -> Self {
-        Self::with_limits(config, chain, verifier, inbox, active, Limits::default())
+        Self::with_limits(config, chain, verifier, inbox, near_tip, Limits::default())
     }
 
     /// [`Self::new`] with other limits.
@@ -184,25 +175,17 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         chain: Box<dyn ChainFeed>,
         verifier: V,
         inbox: PoolInbox,
-        active: watch::Receiver<bool>,
+        near_tip: watch::Receiver<bool>,
         limits: Limits,
     ) -> Self {
-        // The pool stays off until the first chain event names a tip.
-        let chain_tip = ChainTip {
-            hash: block::Hash([0; 32]),
-            height: Height(0),
-        };
-        let machine =
-            MempoolState::new(config, chain_tip, time::Instant::now()).with_limits(limits);
+        let machine = MempoolState::new(config, time::Instant::now()).with_limits(limits);
         let (reports_tx, reports) = mpsc::unbounded_channel();
         Self {
             machine,
             inbox,
             chain,
             verifier,
-            active,
-            chain_tip,
-            has_tip: false,
+            near_tip,
             reports_tx,
             reports,
             jobs: HashMap::default(),
@@ -219,10 +202,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     /// Runs the core until every port handle is gone or the chain feed
     /// ends.
     pub async fn run(mut self) {
-        // The machine starts on. The pool is off until the chain names a tip
-        // and the node is near it, and the first snapshot says so.
-        let step = self.machine.deactivate(time::Instant::now());
-        self.finish(step);
+        // The pool is off until the chain names a tip and the node is near
+        // it, and the first snapshot says so.
+        self.near_tip();
         self.flush();
         loop {
             let deadline = self.machine.next_deadline();
@@ -239,11 +221,11 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                     None => break,
                 },
                 Some(report) = self.reports.recv() => self.report(report),
-                changed = self.active.changed() => {
+                changed = self.near_tip.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    self.activity();
+                    self.near_tip();
                 }
                 command = self.inbox.next() => match command {
                     Some(command) => self.command(command),
@@ -273,7 +255,8 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         let now = time::Instant::now();
         match command {
             PoolCommand::Reserve { tx_id, reply } => {
-                let answer = self.machine.reserve(tx_id, now).map(|id| {
+                let (answer, step) = self.machine.reserve(tx_id, now);
+                let answer = answer.map(|id| {
                     let cancel = CancellationToken::new();
                     self.fetches.insert(id, cancel.clone());
                     self.inbox.grant(id, tx_id, cancel)
@@ -283,7 +266,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 self.reply(move || {
                     let _ = reply.send(answer);
                 });
-                let step = self.machine.effects();
                 self.finish(step);
             }
             PoolCommand::Submit {
@@ -323,8 +305,6 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 self.reply(move || {
                     let _ = reply.send(answer);
                 });
-                let step = self.machine.effects();
-                self.finish(step);
             }
         }
     }
@@ -336,42 +316,31 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
         self
     }
 
-    /// One chain event. The core remembers the tip even while it is off.
+    /// One chain event.
     fn chain_event(&mut self, event: ChainEvent) {
         let now = time::Instant::now();
+        let was_active = self.machine.is_active();
         let held_before = self
             .machine
             .pooled_count()
             .saturating_add(self.machine.undecided_count())
             .saturating_add(self.machine.queued_count());
         let (step, reset) = match event {
-            ChainEvent::Grow(block) => {
-                self.chain_tip = ChainTip {
-                    hash: block.hash,
-                    height: block.height,
-                };
-                (self.machine.grow(block, now), false)
-            }
-            ChainEvent::Reset(tip) => {
-                self.chain_tip = tip;
-                (self.machine.reset(tip, now), true)
-            }
+            ChainEvent::Grow(block) => (self.machine.grow(block, now), false),
+            ChainEvent::Reset(tip) => (self.machine.reset(tip, now), true),
         };
         // Today's pool writes its trace row only for a tip it applies, and it
         // applies none while it is off.
-        if let Some(tips) = self.tips.as_mut().filter(|_| self.machine.is_active()) {
+        if let Some(tips) = self.tips.as_mut().filter(|_| was_active) {
             tips(&TipApplied {
-                tip: self.chain_tip,
+                tip: self.machine.tip(),
                 reset,
                 pooled: self.machine.pooled_count(),
                 held_before,
                 took: time::Instant::now().saturating_duration_since(now),
             });
         }
-        self.has_tip = true;
         self.finish(step);
-        // The pool may have been waiting only for a real tip.
-        self.activity();
     }
 
     /// One verification's report.
@@ -384,20 +353,10 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     }
 
     /// The node moved toward or away from the tip.
-    fn activity(&mut self) {
-        let active = *self.active.borrow_and_update() && self.has_tip;
-        if active == self.machine.is_active() {
-            return;
-        }
-        let now = time::Instant::now();
-        if active {
-            self.machine.activate(self.chain_tip, now);
-            let step = self.machine.effects();
-            self.finish(step);
-        } else {
-            let step = self.machine.deactivate(now);
-            self.finish(step);
-        }
+    fn near_tip(&mut self) {
+        let near = *self.near_tip.borrow_and_update();
+        let step = self.machine.near_tip(near, time::Instant::now());
+        self.finish(step);
     }
 
     /// Keeps an answer to send at the next [`Self::flush`], after the steps
@@ -428,8 +387,9 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
                 Effect::Start {
                     job,
                     tx,
+                    tip,
                     after_reset,
-                } => self.start(job, tx, after_reset),
+                } => self.start(job, tx, tip, after_reset),
                 Effect::Cancel(job) => {
                     self.jobs.remove(&job);
                 }
@@ -529,11 +489,11 @@ impl<E: VerifyError, V: Verifier<E>> PoolCore<E, V> {
     }
 
     /// Starts a verification task for `job`.
-    fn start(&mut self, job: JobId, tx: UnminedTx, after_reset: bool) {
+    fn start(&mut self, job: JobId, tx: UnminedTx, tip: ChainTip, after_reset: bool) {
         // A panic while the verifier builds its future is a local fault too,
         // not the end of the core.
         let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.verifier.verify(tx, self.machine.tip(), after_reset)
+            self.verifier.verify(tx, tip, after_reset)
         }))
         .unwrap_or_else(|_| {
             Box::pin(std::future::ready(Outcome::LocalFault(

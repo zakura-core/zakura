@@ -1,6 +1,6 @@
-//! Zakura's pool core: a pure state machine, its storage and policy, and the
-//! one task that runs it behind the port in
-//! `zakura_node_services::mempool::port`.
+//! Zakura's pool core: [`machine::MempoolState`], a pure state machine, its
+//! storage and policy, and [`io::MempoolIO`], the one task that runs it
+//! behind the port in `zakura_node_services::mempool::port`.
 //!
 //! The machine and its storage emit no metrics and no logs. The task reads
 //! their state after each step and emits the metrics.

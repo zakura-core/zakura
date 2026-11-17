@@ -2,8 +2,9 @@
 //!
 //! [`MempoolState`] holds the node's unmined transactions and decides every
 //! submission. It is pure. Each input carries the time and returns what it
-//! caused as a [`Step`]. It runs no verification and touches no channel. The
-//! core's task runs it behind the port in `zakura_node_services::mempool::port`.
+//! caused as a [`Step`]. It runs no verification and touches no channel.
+//! `MempoolIO` runs it behind the port in
+//! `zakura_node_services::mempool::port`.
 //!
 //! Its rules are the port's, in `zakura_node_services::mempool::port`. Two
 //! more belong to storage: eviction at the cost limit and mining order.
@@ -16,18 +17,21 @@
 //! leaves it and comes back through admission, like a new one, a share of
 //! the slots at a time.
 //!
-//! Every input enters the same way. It panics if the last input's effects were
-//! not taken, moves the clock, and applies every deadline that is due. Every
-//! input leaves the same way too, through [`MempoolState::take_step`], which
-//! starts the queued re-admissions that can start. An input that answers its caller,
-//! such as [`MempoolState::reserve`], leaves its other effects for
-//! [`MempoolState::effects`], which the caller takes straight after.
+//! The pool is on while the node is near a tip the chain has named. The
+//! machine is told both, by [`MempoolState::near_tip`] and the chain inputs,
+//! and turns itself on and off.
+//!
+//! Every input enters the same way: it moves the clock and applies every
+//! deadline that is due. Every input leaves the same way too, through
+//! [`MempoolState::take_step`], which starts the queued re-admissions that
+//! can start. An input that answers its caller, such as
+//! [`MempoolState::reserve`], returns the answer with its step.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::Height,
+    block::{self, Height},
     ironwood, orchard, sapling, sprout,
     transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent::OutPoint,
@@ -105,12 +109,14 @@ pub enum Outcome<E> {
 /// One thing the core does because of an input.
 #[derive(Clone, Debug)]
 pub enum Effect {
-    /// Start a verification of this transaction at the machine's tip.
+    /// Start a verification of this transaction for the block after `tip`.
     Start {
         /// The job.
         job: JobId,
         /// The transaction.
         tx: UnminedTx,
+        /// The machine's tip.
+        tip: ChainTip,
         /// Whether the chain was reset since its body arrived, by a reorg,
         /// skipped blocks or a rules change. Today's pool charges no cooldown
         /// for a transaction it retries after a tip reset, and neither does
@@ -290,9 +296,20 @@ impl Spends {
     }
 }
 
+/// The tip before the chain names one. The pool is off until then.
+const NO_TIP: ChainTip = ChainTip {
+    hash: block::Hash([0; 32]),
+    height: Height(0),
+};
+
 /// The pool core's rules, over the node's real transactions and storage.
 pub struct MempoolState<E> {
+    /// Whether the pool is on: the node is near a tip the chain has named.
     active: bool,
+    /// Whether the node is near the tip.
+    near_tip: bool,
+    /// Whether the chain has named a tip.
+    has_tip: bool,
     now: Instant,
     tip: ChainTip,
     /// The event count when the tip last changed. A job that started before
@@ -340,12 +357,15 @@ pub struct MempoolState<E> {
 }
 
 impl<E: VerifyError> MempoolState<E> {
-    /// An active, empty pool at `tip`.
-    pub fn new(config: &Config, tip: ChainTip, now: Instant) -> Self {
+    /// An empty pool that is off: the chain has named no tip yet, and the
+    /// node is not known to be near one.
+    pub fn new(config: &Config, now: Instant) -> Self {
         Self {
-            active: true,
+            active: false,
+            near_tip: false,
+            has_tip: false,
             now,
-            tip,
+            tip: NO_TIP,
             tip_at: 0,
             next_id: 0,
             limits: Limits::default(),
@@ -376,13 +396,19 @@ impl<E: VerifyError> MempoolState<E> {
     // Inputs.
 
     /// Reserve one of the node's slots for `tx_id`. See
-    /// `PoolHandle::reserve`. What else this caused is in [`Self::effects`].
+    /// `PoolHandle::reserve`.
     pub fn reserve(
         &mut self,
         tx_id: UnminedTxId,
         now: Instant,
-    ) -> Result<ReservationId, Unreserved> {
+    ) -> (Result<ReservationId, Unreserved>, Step) {
         self.enter(now);
+        let answer = self.grant(tx_id);
+        (answer, self.take_step())
+    }
+
+    /// Grants a reservation for `tx_id`, or says why not.
+    fn grant(&mut self, tx_id: UnminedTxId) -> Result<ReservationId, Unreserved> {
         if !self.active {
             return Err(Unreserved::Inactive);
         }
@@ -522,14 +548,15 @@ impl<E: VerifyError> MempoolState<E> {
     /// The best chain grew by `block`.
     pub fn grow(&mut self, block: ConnectedBlock, now: Instant) -> Step {
         self.enter(now);
-        if !self.active {
-            return self.take_step();
-        }
-        let now = self.now;
+        let was_active = self.active;
         self.set_tip(ChainTip {
             hash: block.hash,
             height: block.height,
         });
+        if !was_active {
+            return self.take_step();
+        }
+        let now = self.now;
         self.storage.clear_tip_rejections();
         // What the block mined, and what in the pool conflicts with it, are
         // worked out before anything is removed. A pooled transaction that
@@ -607,10 +634,11 @@ impl<E: VerifyError> MempoolState<E> {
     /// again.
     pub fn reset(&mut self, tip: ChainTip, now: Instant) -> Step {
         self.enter(now);
-        if !self.active {
+        let was_active = self.active;
+        self.set_tip(tip);
+        if !was_active {
             return self.take_step();
         }
-        self.set_tip(tip);
         self.mark_reset();
         self.storage.clear_rejections();
         let mut bodies: HashMap<transaction::Hash, VerifiedUnminedTx> = self
@@ -668,71 +696,21 @@ impl<E: VerifyError> MempoolState<E> {
         self.take_step()
     }
 
-    /// The node fell far behind the tip. Every undecided submission gets a
-    /// verdict, and the pool empties.
-    pub fn deactivate(&mut self, now: Instant) -> Step {
+    /// The node moved near the tip, or away from it. Near a tip the chain
+    /// has named, the pool turns on, empty. Away from it, the pool turns off.
+    pub fn near_tip(&mut self, near: bool, now: Instant) -> Step {
         self.enter(now);
-        let keys: Vec<u64> = self.admissions.keys().copied().collect();
-        for key in keys {
-            self.cancel_admission_job(key);
-            self.decide(key, Verdict::LocalFault(LocalFault::Deactivated));
-        }
-        // Today's pool drops its downloads when it turns off. Every fetch
-        // still out is told to stop, and its lease stays counted until its
-        // caller drops the reservation.
-        let mut fetching: Vec<ReservationId> = self.leases.keys().copied().collect();
-        fetching.sort();
-        self.step
-            .effects
-            .extend(fetching.into_iter().map(Effect::CancelFetch));
-        self.owners.clear();
-        let keys: Vec<u64> = self.pool.keys().copied().collect();
-        for key in keys {
-            self.remove_one(key, RemovalReason::Deactivated);
-        }
-        // What a reset took out left the pool then, and that is logged.
-        self.queue.clear();
-        self.queued.clear();
-        self.queued_cost = 0;
-        // Every pooled transaction was removed, so storage is empty and only
-        // its rejection lists are left.
-        self.storage.clear_rejections();
-        debug_assert_eq!(
-            self.storage.transaction_count(),
-            0,
-            "storage held only the pool"
-        );
-        self.active = false;
+        self.near_tip = near;
+        self.switch();
         self.take_step()
     }
 
-    /// The node is near the tip again. The pool starts empty. What this
-    /// caused is in [`Self::effects`].
-    pub fn activate(&mut self, tip: ChainTip, now: Instant) {
-        self.enter(now);
-        self.active = true;
-        self.set_tip(tip);
-    }
-
-    /// The members of `ids` a cached rejection covers. Takes no slot. What
-    /// else this caused is in [`Self::effects`].
-    pub fn rejected_ids(
-        &mut self,
-        ids: HashSet<UnminedTxId>,
-        now: Instant,
-    ) -> HashSet<UnminedTxId> {
-        self.enter(now);
-        self.start_queued();
-        self.storage.rejected_transactions(ids, self.now).collect()
-    }
-
-    /// What the last input that answers its caller caused beside its answer:
-    /// the verdicts of deadlines it found due, and the jobs it started. The
-    /// caller takes this straight after [`Self::reserve`],
-    /// [`Self::rejected_ids`] and [`Self::activate`]. The next input panics
-    /// if it was not taken.
-    pub fn effects(&mut self) -> Step {
-        self.take_step()
+    /// The members of `ids` a cached rejection covers at `now`. Takes no
+    /// slot and changes nothing.
+    pub fn rejected_ids(&self, ids: HashSet<UnminedTxId>, now: Instant) -> HashSet<UnminedTxId> {
+        self.storage
+            .rejected_transactions(ids, now.max(self.now))
+            .collect()
     }
 
     // Observations.
@@ -742,7 +720,8 @@ impl<E: VerifyError> MempoolState<E> {
         self.active
     }
 
-    /// The tip the pool is valid for.
+    /// The tip the pool is valid for, or the zero tip before the chain
+    /// names one.
     pub fn tip(&self) -> ChainTip {
         self.tip
     }
@@ -848,8 +827,13 @@ impl<E: VerifyError> MempoolState<E> {
         }
         assert!(
             self.step.is_empty(),
-            "an input's effects were left uncollected: {:?}",
+            "an input left effects behind: {:?}",
             self.step
+        );
+        assert_eq!(
+            self.active,
+            self.near_tip && self.has_tip,
+            "the pool is on exactly while the node is near a tip the chain has named"
         );
         assert!(
             self.slots_in_use() <= self.limits.pending,
@@ -994,14 +978,6 @@ impl<E: VerifyError> MempoolState<E> {
     /// Moves time to `now` and applies every deadline that is due, before the
     /// input that brought the time is handled.
     fn enter(&mut self, now: Instant) {
-        // An input's effects belong to that input. If the caller has not taken
-        // the last one's, they would be handed over as part of this one, and
-        // nothing could tell that they came late.
-        assert!(
-            self.step.is_empty(),
-            "the previous input's effects were not collected before the next input: {:?}",
-            self.step
-        );
         // The machine's own clock never goes back.
         if now > self.now {
             self.now = now;
@@ -1401,6 +1377,7 @@ impl<E: VerifyError> MempoolState<E> {
         self.step.effects.push(Effect::Start {
             job,
             tx,
+            tip: self.tip,
             after_reset,
         });
     }
@@ -1593,6 +1570,54 @@ impl<E: VerifyError> MempoolState<E> {
     fn set_tip(&mut self, tip: ChainTip) {
         self.tip = tip;
         self.tip_at = self.fresh();
+        self.has_tip = true;
+        self.switch();
+    }
+
+    /// Turns the pool on or off, if what it was told calls for that.
+    fn switch(&mut self) {
+        let on = self.near_tip && self.has_tip;
+        if on && !self.active {
+            self.active = true;
+        } else if !on && self.active {
+            self.turn_off();
+        }
+    }
+
+    /// Turns the pool off. Every undecided submission gets a verdict, and
+    /// the pool empties.
+    fn turn_off(&mut self) {
+        let keys: Vec<u64> = self.admissions.keys().copied().collect();
+        for key in keys {
+            self.cancel_admission_job(key);
+            self.decide(key, Verdict::LocalFault(LocalFault::Deactivated));
+        }
+        // Today's pool drops its downloads when it turns off. Every fetch
+        // still out is told to stop, and its lease stays counted until its
+        // caller drops the reservation.
+        let mut fetching: Vec<ReservationId> = self.leases.keys().copied().collect();
+        fetching.sort();
+        self.step
+            .effects
+            .extend(fetching.into_iter().map(Effect::CancelFetch));
+        self.owners.clear();
+        let keys: Vec<u64> = self.pool.keys().copied().collect();
+        for key in keys {
+            self.remove_one(key, RemovalReason::Deactivated);
+        }
+        // What a reset took out left the pool then, and that is logged.
+        self.queue.clear();
+        self.queued.clear();
+        self.queued_cost = 0;
+        // Every pooled transaction was removed, so storage is empty and only
+        // its rejection lists are left.
+        self.storage.clear_rejections();
+        debug_assert_eq!(
+            self.storage.transaction_count(),
+            0,
+            "storage held only the pool"
+        );
+        self.active = false;
     }
 
     fn fresh(&mut self) -> u64 {

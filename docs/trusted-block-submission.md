@@ -111,7 +111,10 @@ response; its announcements are not withdrawn. The final permission check is
 ordered against withdrawal at the start of each local write. Writes already
 started may finish; bytes already sent cannot be recalled. A corrected-body
 retry has independent permission even when its header hash matches the rejected
-submission. Ordinary `submitblock` early relay, enabled by
+submission. Temporary bodies compute each legacy message checksum from their exact
+bytes and never read or populate the shared checksum cache. A different body with
+the same header and length therefore cannot poison a corrected retry. Committed
+state reads retain checksum sharing. Ordinary `submitblock` early relay, enabled by
 `optimistic_block_inventory`, applies the same withdrawal when contextual
 validation fails.
 

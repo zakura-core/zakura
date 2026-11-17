@@ -281,3 +281,68 @@ fn post_handshake_codec() -> Codec {
     codec.reconfigure_full_body_len();
     codec
 }
+
+/// Real TCP decoding checks both temporary sends and a committed send under one header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporary_body_checksums_do_not_poison_same_header_retries() {
+    use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(20), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (remote, _) = listener.accept().await.unwrap();
+        let mut sender = crate::peer::connection::peer_tx::PeerTx::from(Framed::new(
+            local,
+            post_handshake_codec(),
+        ));
+        let mut received = Framed::new(remote, post_handshake_codec());
+        let valid: std::sync::Arc<block::Block> = zakura_test::vectors::BLOCK_TESTNET_141042_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let mut changed = (*valid).clone();
+        std::sync::Arc::make_mut(&mut changed.transactions[0]).outputs_mut()[0].value =
+            zakura_chain::amount::Amount::try_from(1u64).unwrap();
+        let changed = std::sync::Arc::new(changed);
+        assert_eq!(valid.hash(), changed.hash());
+        assert_ne!(valid, changed);
+        assert_eq!(
+            valid.zcash_serialized_size(),
+            changed.zcash_serialized_size()
+        );
+
+        let (rejected, first) = PendingBlockSendPermit::channel();
+        let (retry_status, retry) = PendingBlockSendPermit::channel();
+        let (_, later) = PendingBlockSendPermit::channel();
+        for (index, (body, permit)) in [
+            (changed.clone(), Some(first)),
+            (valid.clone(), Some(retry)),
+            (valid.clone(), None),
+            (changed.clone(), Some(later)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message = Message::Block(body.into());
+            let (sent, decoded) = tokio::join!(
+                sender.send_authorized(message.clone(), || true, permit),
+                received.next(),
+            );
+            assert!(sent.unwrap());
+            assert_eq!(
+                decoded
+                    .unwrap()
+                    .expect("each block has the checksum of its own bytes"),
+                message
+            );
+            if index == 0 {
+                rejected.send_replace(PendingBlockStatus::Failed);
+            } else if index == 1 {
+                retry_status.send_replace(PendingBlockStatus::Committed);
+            }
+        }
+    })
+    .await
+    .expect("large temporary and committed bodies remain decodable");
+}

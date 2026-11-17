@@ -1133,6 +1133,64 @@ fn large_block() -> std::sync::Arc<Block> {
     std::sync::Arc::new(block)
 }
 
+/// Temporary bodies must neither seed nor consume a checksum shared by header hash.
+#[test]
+fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
+    let _init_guard = zakura_test::init();
+    let valid = large_block();
+    let mut changed = (*valid).clone();
+    std::sync::Arc::make_mut(&mut changed.transactions[0]).outputs_mut()[0].value =
+        zakura_chain::amount::Amount::try_from(1u64).unwrap();
+    let changed = std::sync::Arc::new(changed);
+    assert_eq!(valid.hash(), changed.hash());
+    assert_ne!(valid, changed);
+    assert_eq!(
+        valid.zcash_serialized_size(),
+        changed.zcash_serialized_size()
+    );
+    assert!(valid.zcash_serialized_size() >= MIN_SHARED_CHECKSUM_BODY_LEN);
+
+    let shared = BlockChecksums::default();
+    let mut temporary = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+    temporary.reconfigure_full_body_len();
+    let mut frame = BytesMut::new();
+    temporary
+        .encode(Message::UncachedBlock(changed.clone().into()), &mut frame)
+        .unwrap();
+    assert_eq!(
+        frame[20..HEADER_LEN],
+        sha256d::Checksum::from(&frame[HEADER_LEN..]).0,
+    );
+    assert!(shared.get(valid.hash(), frame.len() - HEADER_LEN).is_none());
+
+    // The corrected body uses the same shared cache through a different connection.
+    let expected = encode_block(&mut Codec::builder().finish(), &valid);
+    let mut committed = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+    assert_eq!(encode_block(&mut committed, &valid), expected);
+    let remembered = shared
+        .get(valid.hash(), expected.len() - HEADER_LEN)
+        .unwrap();
+
+    // A temporary body also ignores a cached checksum belonging to the corrected body.
+    frame.clear();
+    temporary
+        .encode(Message::UncachedBlock(changed.into()), &mut frame)
+        .unwrap();
+    assert_eq!(
+        frame[20..HEADER_LEN],
+        sha256d::Checksum::from(&frame[HEADER_LEN..]).0,
+    );
+    assert_ne!(frame[20..HEADER_LEN], remembered.0);
+    assert_eq!(
+        shared.get(valid.hash(), expected.len() - HEADER_LEN),
+        Some(remembered)
+    );
+}
+
 /// A block sent through connections that share checksums is byte-for-byte the block a
 /// connection on its own sends, on the first send and on the ones that reuse its checksum.
 #[test]

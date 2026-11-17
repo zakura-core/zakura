@@ -37,7 +37,8 @@ where
     /// immediately before starting the local write.
     ///
     /// Returns `Ok(false)` without writing anything if authorization was revoked, and a timeout
-    /// error if readiness and the write together take too long.
+    /// error if readiness and the write together take too long. Temporary block bodies also
+    /// bypass the checksum cache so one submission cannot poison a same-header retry.
     pub(crate) async fn send_authorized(
         &mut self,
         msg: Message,
@@ -64,6 +65,10 @@ where
         authorized: impl FnOnce() -> bool,
         pending_send: Option<&PendingBlockSendPermit>,
     ) -> Result<bool, PeerError> {
+        let msg = match msg {
+            Message::Block(block) if pending_send.is_some() => Message::UncachedBlock(block),
+            message => message,
+        };
         let start = || -> Result<bool, PeerError> {
             if !authorized() {
                 return Ok(false);

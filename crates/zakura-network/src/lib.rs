@@ -200,6 +200,9 @@ pub use crate::{
     },
 };
 
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::codec::checksum_bench;
+
 /// Types used in the definition of [`Request`], [`Response`], and [`VersionMessage`].
 pub mod types {
     pub use crate::{

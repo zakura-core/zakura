@@ -156,3 +156,8 @@ required-features = ["internal-bench"]
 name = "block_work_churn"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_checksum_threshold"
+harness = false
+required-features = ["internal-bench"]

@@ -195,10 +195,13 @@ struct Seen {
     causes: HashMap<ZakuraConnId, Option<&'static str>>,
     /// `tx-relay` setups that expired before they completed.
     expired: usize,
+    /// How many `tx-relay` sessions each connection's transport saw exit.
+    exited: HashMap<ZakuraConnId, usize>,
 }
 
 impl TransportObserver for Observed {
-    /// Keeps registrations, close causes and expired `tx-relay` setups.
+    /// Keeps registrations, close causes, and expired and exited `tx-relay`
+    /// sessions.
     fn observe(&self, event: TransportEvent) {
         let mut seen = self.0.lock().expect("no test panics while holding it");
         match event {
@@ -219,6 +222,11 @@ impl TransportObserver for Observed {
                 step: SessionStep::OfferExpired { .. },
                 ..
             } => seen.expired += 1,
+            TransportEvent::SessionLifecycle {
+                conn_id,
+                kind: TX_RELAY_DATA_KIND,
+                step: SessionStep::GenerationExited { .. },
+            } => *seen.exited.entry(conn_id).or_default() += 1,
             _ => {}
         }
     }
@@ -238,6 +246,17 @@ impl Observed {
             .lock()
             .expect("no test panics while holding it")
             .expired
+    }
+
+    /// How many `tx-relay` sessions on `peer`'s connection the transport
+    /// saw exit. Until it sees one, it refuses the peer's next offer as a
+    /// duplicate.
+    fn exited(&self, peer: &RawRelay) -> usize {
+        let seen = self.0.lock().expect("no test panics while holding it");
+        let conn_id = seen.connections.get(&peer.raw.connection.shared_id());
+        conn_id
+            .and_then(|conn_id| seen.exited.get(conn_id).copied())
+            .unwrap_or(0)
     }
 }
 
@@ -1396,7 +1415,12 @@ async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> 
         })
         .await?;
         // The session ran its stall step before it left the live record,
-        // so the park stands, and the next session ends as it opens.
+        // so the park stands. Once the transport saw the session exit, it
+        // takes the next one, which `tx-relay` ends as it opens.
+        await_until("the transport sees the session exit", NET, || {
+            observed.exited(&peer) >= 1
+        })
+        .await?;
         peer.open().await?;
         peer.read_data();
         peer.data_ended(NET).await?;

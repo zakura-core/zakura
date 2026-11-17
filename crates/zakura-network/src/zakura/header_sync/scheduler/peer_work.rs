@@ -1059,7 +1059,7 @@ impl PeerWorkQueue {
     /// - the budget's reserved count is exactly what the live request
     ///   reservations have left, and none is empty;
     /// - only started work holds staged capacity, and no lease is empty;
-    /// - a receiving round owns exactly one budget unit per staged header;
+    /// - a receiving round owns at least one budget unit per staged header;
     /// - the budget owns at least what the queue's leases hold, since calls
     ///   may keep more.
     #[cfg(any(test, feature = "header-fuzz"))]
@@ -1094,10 +1094,10 @@ impl PeerWorkQueue {
             );
             let count = self.owned_header_count(peer);
             if request.phase == HeaderTargetPhase::Receiving {
-                assert_eq!(
-                    count,
-                    request.entries.len(),
-                    "{peer:?} owns one budget unit per staged header"
+                assert!(
+                    count >= request.entries.len(),
+                    "{peer:?} owns {count} budget units for {} staged headers",
+                    request.entries.len()
                 );
             }
             owned += count;

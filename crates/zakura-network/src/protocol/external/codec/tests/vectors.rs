@@ -1154,7 +1154,7 @@ fn large_block_is_sent_with_its_remembered_checksum() {
     // A value the body does not hash to, so it can only come from the shared checksums.
     let remembered = sha256d::Checksum([0xAB; 4]);
     let shared = BlockChecksums::default();
-    shared.insert(block.hash(), body_len, remembered);
+    shared.checksum_with(block.hash(), body_len, || remembered);
 
     let mut codec = Codec::builder().with_block_checksums(shared).finish();
     let frame = encode_block(&mut codec, &block);
@@ -1172,7 +1172,7 @@ fn checksum_remembered_for_another_body_length_is_replaced() {
     let body_len = alone.len() - HEADER_LEN;
 
     let shared = BlockChecksums::default();
-    shared.insert(block.hash(), body_len + 1, sha256d::Checksum([0xAB; 4]));
+    shared.checksum_with(block.hash(), body_len + 1, || sha256d::Checksum([0xAB; 4]));
 
     let mut codec = Codec::builder()
         .with_block_checksums(shared.clone())
@@ -1198,7 +1198,7 @@ fn small_block_checksum_is_always_hashed() {
     assert!(body_len < MIN_SHARED_CHECKSUM_BODY_LEN);
 
     let shared = BlockChecksums::default();
-    shared.insert(block.hash(), body_len, sha256d::Checksum([0xAB; 4]));
+    shared.checksum_with(block.hash(), body_len, || sha256d::Checksum([0xAB; 4]));
 
     let mut codec = Codec::builder().with_block_checksums(shared).finish();
 
@@ -1219,12 +1219,12 @@ fn block_checksums_forget_the_block_sent_least_recently() {
 
     let checksums = BlockChecksums::default();
     for index in 0..SHARED_CHECKSUM_BLOCKS {
-        checksums.insert(hash(index), 100_000, checksum);
+        checksums.checksum_with(hash(index), 100_000, || checksum);
     }
 
     // Sending the oldest block again makes the second-oldest the next to be forgotten.
     assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
-    checksums.insert(hash(SHARED_CHECKSUM_BLOCKS), 100_000, checksum);
+    checksums.checksum_with(hash(SHARED_CHECKSUM_BLOCKS), 100_000, || checksum);
 
     assert_eq!(checksums.get(hash(0), 100_000), Some(checksum));
     assert_eq!(checksums.get(hash(1), 100_000), None);
@@ -1232,4 +1232,114 @@ fn block_checksums_forget_the_block_sent_least_recently() {
         checksums.get(hash(SHARED_CHECKSUM_BLOCKS), 100_000),
         Some(checksum)
     );
+}
+
+/// Sends of one block that miss the shared checksums at the same moment hash its body once.
+/// The others wait for that hash and use its checksum.
+#[test]
+fn concurrent_sends_of_a_block_hash_it_once() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Barrier,
+    };
+
+    let _init_guard = zakura_test::init();
+    const SENDS: usize = 8;
+    let hash = block::Hash([7; 32]);
+    let checksum = sha256d::Checksum([1, 2, 3, 4]);
+    let checksums = BlockChecksums::default();
+    let hashes = AtomicUsize::new(0);
+    let start = Barrier::new(SENDS);
+
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let sends: Vec<_> = (0..SENDS)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    checksums.checksum_with(hash, 100_000, || {
+                        hashes.fetch_add(1, Ordering::SeqCst);
+                        // Keep hashing while the other sends look the block up.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        checksum
+                    })
+                })
+            })
+            .collect();
+        sends
+            .into_iter()
+            .map(|send| send.join().expect("send thread does not panic"))
+            .collect()
+    });
+
+    assert_eq!(hashes.load(Ordering::SeqCst), 1);
+    assert!(results.iter().all(|result| *result == checksum));
+}
+
+/// Connections that send one block at the same moment all send it byte-for-byte as a
+/// connection on its own does.
+#[test]
+fn block_sent_concurrently_with_shared_checksums_is_unchanged() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let shared = BlockChecksums::default();
+    let start = std::sync::Barrier::new(4);
+
+    std::thread::scope(|scope| {
+        let sends: Vec<_> = (0..4)
+            .map(|_| {
+                let mut codec = Codec::builder()
+                    .with_block_checksums(shared.clone())
+                    .finish();
+                let (block, start) = (&block, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    encode_block(&mut codec, block)
+                })
+            })
+            .collect();
+        for send in sends {
+            assert_eq!(send.join().expect("send thread does not panic"), alone);
+        }
+    });
+}
+
+/// A precomputed checksum is the one the block message is sent with, and sending the block
+/// afterwards does not hash it again.
+#[test]
+fn precomputed_block_checksum_is_sent_without_hashing_again() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    let alone = encode_block(&mut Codec::builder().finish(), &block);
+    let body_len = alone.len() - HEADER_LEN;
+    let expected = sha256d::Checksum::from(&alone[HEADER_LEN..]);
+
+    let shared = BlockChecksums::default();
+    shared.precompute(&block.clone().into());
+
+    assert_eq!(shared.get(block.hash(), body_len), Some(expected));
+    assert_eq!(
+        shared.checksum_with(block.hash(), body_len, || panic!(
+            "the body is hashed again"
+        )),
+        expected,
+    );
+    let mut codec = Codec::builder().with_block_checksums(shared).finish();
+    assert_eq!(encode_block(&mut codec, &block), alone);
+}
+
+/// A block too small to share its checksum is not precomputed.
+#[test]
+fn small_block_checksum_is_not_precomputed() {
+    let _init_guard = zakura_test::init();
+    let block = std::sync::Arc::new(
+        Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+            .expect("block test vector should deserialize"),
+    );
+    let body_len = block.zcash_serialized_size();
+
+    let shared = BlockChecksums::default();
+    shared.precompute(&block.clone().into());
+
+    assert_eq!(shared.get(block.hash(), body_len), None);
 }

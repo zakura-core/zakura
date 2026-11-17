@@ -9,7 +9,7 @@ use crate::{
 const OWNERSHIP: Machine = Machine {
     name: "block/work-ownership",
     identity: "block-work",
-    claim: "The block work owner agrees with the independent ownership model after every input.",
+    claim: "After every input, the block work owner keeps its height partition and ledger invariants, can drain exactly its ledger, moves the ledger by exactly the bytes each transition reports, and changes only the heights the input's owner held.",
     generator: 1,
     budget: 128,
     history: |input| {
@@ -20,11 +20,11 @@ const OWNERSHIP: Machine = Machine {
             .collect()
     },
     reached: |steps, _| {
-        // The model's nonzero charge proves the input reached resource-bearing
-        // work, including when a mutation prevents the actual owner from charging.
+        // An item's nonzero charge proves the input reached resource-bearing
+        // work, including when a mutation drops the charge from the ledger total.
         steps.iter().any(|step| {
             matches!(step, MachineStep::Work(work) if work
-                .expected
+                .actual
                 .items
                 .iter()
                 .any(|item| item.in_flight && item.owner.is_some() && item.charge > 0))
@@ -63,7 +63,7 @@ const REACTOR: Machine = Machine {
 const FUNDING: Machine = Machine {
     name: "block/work-funding",
     identity: "block-work-funding",
-    claim: "At each completed driver operation and before queue destruction, actual queue funding and retained request/receipt reservations agree with the independent model.",
+    claim: "At each completed driver operation and before queue destruction, the shared budget charges exactly the queue's pooled funding and the retained request, receipt and quarantined reservations; the pool funds exactly the queue's ledger until accounting closes; and admission keeps each session within the owner cap.",
     // Generator 2 caps each session's published reservations.
     generator: 2,
     budget: 129,
@@ -81,11 +81,9 @@ const FUNDING: Machine = Machine {
                 _ => None,
             })
         };
-        funding().any(|work| work.expected.reserved > 0)
+        funding().any(|work| work.actual.reserved > 0)
             && (expect != Expect::Holds
-                || funding().any(|work| {
-                    work.drain && work.actual.reserved == 0 && work.expected.reserved == 0
-                }))
+                || funding().any(|work| work.drain && work.actual.reserved == 0))
     },
 };
 

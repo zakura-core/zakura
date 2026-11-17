@@ -73,7 +73,10 @@ use crate::{
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.
 /// Version 44 adds the run's wire-event `order` stamp to `frame-written`,
 /// `peer-written` and `peer-received`.
-pub const FORMAT_VERSION: u32 = 44;
+/// Version 45 drops each machine step's model view, `expected`: a machine
+/// target checks the production machine's invariants and the facts its inputs
+/// fix, so it records only what the machine did.
+pub const FORMAT_VERSION: u32 = 45;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -496,7 +499,7 @@ mod tests {
             r#""fair-scheduling""#
         );
         assert_eq!(
-            FORMAT_VERSION, 44,
+            FORMAT_VERSION, 45,
             "a pick's `by` encoding changed, so bump FORMAT_VERSION and update this test"
         );
         assert_eq!(CONTRACT_VERSION, 4, "the recovering drain is contract 4");

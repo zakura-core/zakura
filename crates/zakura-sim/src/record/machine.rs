@@ -119,7 +119,7 @@ impl MachineStep {
 pub enum FailurePhase {
     /// Applying the input and checking its immediate outcome.
     Transition,
-    /// Comparing the resulting owner with the independent model.
+    /// Checking the resulting owner's invariants.
     Invariant,
 }
 

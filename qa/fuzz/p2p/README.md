@@ -141,7 +141,7 @@ The registry and retry targets preserve the drivers from PR #1679, change
 `d4fc17f468487d03b3b554dade009bf2538be95b`. The head's later witness-message
 correction remains intact. Decoder 1 keeps the original byte interpretation.
 `block_query` and `block_reactor` preserve the query portion of PR #1677 and the
-reactor model from PR #1683. `block_query` generates accepted and refused
+reactor target from PR #1683. `block_query` generates accepted and refused
 proposals, exact and stale replies, resets, authority changes, and retry expiry.
 Its identity ledger calls no production policy helper. `block_reactor` shares its
 byte decoder with proptest, checks the reactor's invariants after every input,

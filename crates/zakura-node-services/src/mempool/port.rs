@@ -38,8 +38,6 @@
 //!
 //! Readers follow the pool without asking the core for work: the latest
 //! [`PoolSnapshot`] and the numbered [`ChangeEntry`] log.
-//!
-//! [`model`] restates these rules as an independent model.
 
 use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 
@@ -65,8 +63,6 @@ pub use chain::{
 };
 
 mod chain;
-#[cfg(any(test, feature = "test-support"))]
-pub mod model;
 #[cfg(test)]
 mod tests;
 
@@ -85,10 +81,6 @@ pub const MAX_REVALIDATING: usize = 400;
 /// resynchronizes from the snapshot. The pool's 8,000 transactions plus a
 /// ring of 16,384 removals.
 pub const CHANGE_LOG_CAPACITY: usize = 24_384;
-
-/// Entries in each rejection list. A tip-scoped list that grows past this is
-/// cleared, as today. Each chain-scoped list drops its oldest entry.
-pub const MAX_REJECTIONS: usize = 40_000;
 
 /// How long one verification can take. Provisional.
 pub const T_VERIFY: Duration = Duration::from_secs(60);
@@ -542,28 +534,6 @@ pub enum ChainEvent {
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChangeSeq(pub u64);
 
-impl ChangeSeq {
-    /// Whether a reader announces a [`Change::Revealed`] whose transaction
-    /// was hidden at `hidden_at`. `self` is the reader's baseline: the
-    /// [`PoolSnapshot::last_change`] of the snapshot it last announced in
-    /// full, at its opening or at its latest resynchronization.
-    ///
-    /// A baseline at or after `hidden_at` is a snapshot taken while the
-    /// transaction was hidden, so the reader has not announced it and does
-    /// now. An earlier baseline means the reader announced it from that
-    /// snapshot or from the log, and skips this.
-    ///
-    /// A reader that resynchronizes announces the whole snapshot again and
-    /// moves its baseline, because it cannot know which additions it lost.
-    ///
-    /// This is not the whole rule. A reader can read an addition only after
-    /// the transaction was hidden, and it then announces nothing. It defers
-    /// that addition and announces it on the reveal, whatever its baseline.
-    pub fn announces_reveal(self, hidden_at: ChangeSeq) -> bool {
-        self >= hidden_at
-    }
-}
-
 /// Why a transaction left the pool.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RemovalReason {
@@ -600,7 +570,7 @@ pub enum Change {
     /// A hidden transaction passed and is visible again.
     ///
     /// A reader announces it unless it has already announced the
-    /// transaction. [`model::ModelReader`] is that rule in full.
+    /// transaction.
     Revealed {
         /// The transaction.
         id: UnminedTxId,

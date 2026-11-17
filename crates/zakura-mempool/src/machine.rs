@@ -5,10 +5,8 @@
 //! caused as a [`Step`]. It runs no verification and touches no channel. The
 //! core's task runs it behind the port in `zakura_node_services::mempool::port`.
 //!
-//! Its rules are the port's, which `zakura_node_services::mempool::port::model`
-//! restates as an independent model. The machine tests drive both with the
-//! same inputs and compare them. Two rules belong to storage and the model
-//! leaves them out: eviction at the cost limit and mining order.
+//! Its rules are the port's, in `zakura_node_services::mempool::port`. Two
+//! more belong to storage: eviction at the cost limit and mining order.
 //!
 //! It knows nothing about peers. Per-peer limits and cooldowns belong to the
 //! callers that see the peer. A verdict says what its body earned, and the
@@ -17,7 +15,7 @@
 //! [`Storage`] holds exactly the visible pool. A transaction hidden while it is
 //! verified again leaves storage and waits here with its body. So the
 //! dependency limits, the conflicts storage checks and the snapshot are about
-//! the visible pool only, as the model's are.
+//! the visible pool only.
 //!
 //! Every input enters the same way. It panics if the last input's effects were
 //! not taken, moves the clock, and applies every deadline that is due. Every
@@ -1796,7 +1794,7 @@ impl<E: VerifyError> MempoolState<E> {
                     .set_outside_cost(self.hidden_cost.saturating_sub(cost));
                 // A rejection cached for another authorization of these
                 // effects while this one was pooled says nothing about it, so
-                // the lists are not checked, as the model's reveal does not.
+                // the lists are not checked.
                 let (result, evicted) = self.storage.reinsert_with_evicted_ids(
                     tx.clone(),
                     pool_inputs,

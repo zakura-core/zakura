@@ -435,3 +435,6 @@ async fn thirty_paired_submissions_send_one_inventory_and_one_body() {
         );
     }
 }
+
+#[path = "downloads.rs"]
+mod downloads;

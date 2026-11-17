@@ -104,13 +104,19 @@ Once an authenticated request passes its header checks and takes a receipt slot,
 which happens as soon as the HTTP server parses the request head, its body is
 received and submitted by a task that the HTTP connection does not own. A client
 disconnect from then on does not abandon the submission: receipt, decoding, the
-state lookups, validation and relay continue without the client. This includes a
-client that writes the whole request and closes the connection at once. The task
-keeps its slot until the submission finishes, so at most 16 bodies are buffered
-whether or not their clients stay connected. A body that ends early, because the
-client disconnected mid-body or the 30-second receipt deadline passed, is never
+state lookups, validation and relay continue without the client. The task keeps
+its slot until the submission finishes, so at most 16 bodies are buffered whether
+or not their clients stay connected. A body that ends early, because the client
+disconnected mid-body or the 30-second receipt deadline passed, is never
 submitted and frees its slot. A client that disconnects gets no response, so it
 cannot learn the outcome.
+
+On the plain HTTP listener, this covers a client that writes the whole request
+and closes the connection at once. On the TLS listener it does not. The server
+sends session tickets after the handshake, and a client that closes without
+reading them resets the connection and discards the part of the body it has not
+transmitted yet. A block-sized body is then cut short and never submitted. A TLS
+client must keep the connection open until it has read the response.
 
 Transport errors use HTTP 400 for malformed blocks, 401 for missing or invalid
 credentials when cookie authentication is enabled, 403 for browser requests,

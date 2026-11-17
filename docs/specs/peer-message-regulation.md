@@ -29,6 +29,7 @@ which eligible peers receive service within those bounds.
 | Role | Required bounds |
 | --- | --- |
 | Announcement | Frame and allocation bounds; protocol cadence |
+| Metered announcement | Frame and allocation bounds; a per-connection byte rate |
 | Request | Bounded execution and output capacity; message-specific limits and cadence where declared |
 | Response | Frame and allocation bounds; a receiver-created one-shot, range, or subscription reservation |
 
@@ -199,6 +200,24 @@ unchanged messages MUST count toward cadence.
 - Implementations MUST validate candidate cadence values with the tests under Parameters to
   validate. Reopening a stream MUST NOT permit unbounded resets of initial-message allowances
   within an admitted connection.
+
+## Byte rate
+
+A metered announcement row is charged by payload bytes in place of a message cadence. Its bucket
+belongs to the connection, as the cadence buckets do, so a session that ends and reopens on the
+same connection finds it as the last session left it. Memory and burst are separate numbers: the
+stream's receive share bounds the bytes held, and a bucket's depth is a count of tokens.
+
+- The sender MUST pay its own bucket for each frame before handing the frame on. Its bucket holds
+  at most the row's opening allowance and starts full.
+- The sender MUST NOT hold more than the row's sender allowance of paid bytes that are not yet
+  written into the stream.
+- The receiver's depth is the opening allowance, plus the sender allowance, plus the stream receive
+  window it granted on that connection. It refills an eighth faster than the sender's rate. Every
+  paid byte not yet read sits in the sender's buffers or in the stream window, which flow control
+  caps, so a conformant sender never empties it.
+- An overrun is a violation. The receiver closes the connection with the cause
+  `ordered_byte_rate_overrun`.
 
 ## Capacity admission
 

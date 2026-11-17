@@ -563,13 +563,14 @@ impl Rates {
         *now += by;
     }
 
-    /// Charges one frame of `rule` on `layout`: `exempt`, `admit`, or
-    /// `exhausted`.
+    /// Charges one frame of `rule` on `layout`: `exempt`, `admit`,
+    /// `exhausted`, or `overrun`.
     pub fn charge(&mut self, layout: u16, rule: &MessageRule) -> &'static str {
         match self.buckets.charge(layout, rule) {
             CadenceCharge::Exempt => "exempt",
             CadenceCharge::Admit => "admit",
             CadenceCharge::Exhausted => "exhausted",
+            CadenceCharge::Overrun => "overrun",
         }
     }
 

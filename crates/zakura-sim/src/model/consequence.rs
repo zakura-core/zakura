@@ -29,7 +29,8 @@ pub const fn consequence(label: Label) -> Consequence {
         | Label::OverLive
         | Label::OverCredit
         | Label::AfterClose
-        | Label::BadCursor => Consequence::FaultClose,
+        | Label::BadCursor
+        | Label::OverRate => Consequence::FaultClose,
         Label::BadContent => Consequence::FamilyContent,
         Label::Conformant => Consequence::NoPunishment,
     }
@@ -48,6 +49,9 @@ pub const FAULT_CAUSES: &[&str] = &[
     "ordered_read_rejected",
     "request_read_rejected",
     "undersized_frame_cap",
+    // A metered row's bucket already holds every byte a conformant sender
+    // can have buffered, so an overrun is the sender's fault.
+    "ordered_byte_rate_overrun",
 ];
 
 /// True if a close with first recorded cause `cause` assigns the peer a

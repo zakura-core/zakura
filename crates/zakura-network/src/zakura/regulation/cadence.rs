@@ -11,8 +11,13 @@
 //! Exhaustion therefore measures a burst, not a protocol violation. The reader
 //! records exhaustion and forwards the frame. Local read pauses add tokens.
 //!
-//! Rows without a cadence charge nothing. Commitments bound requests, and
-//! reservations bound responses.
+//! A [`MessageRole::Metered`] row is charged by payload bytes instead, in a
+//! [`ByteBucket`] that belongs to the connection as the cadence buckets do.
+//! Its depth already covers every byte a conformant sender can have buffered,
+//! so an overrun is a violation and closes the connection.
+//!
+//! Rows without a cadence or a byte rate charge nothing. Commitments bound
+//! requests, and reservations bound responses.
 //!
 //! # Properties and their tests
 //!
@@ -29,6 +34,10 @@
 //! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
 //! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
 //! | Charges at explicit instants match an interval-stepping bucket | `the_ledger_matches_an_interval_stepping_bucket` |
+//! | A byte bucket pays its depth back to back, then refills at its rate | `a_byte_bucket_pays_its_depth_then_refills_at_its_rate` |
+//! | A metered row overruns only past the receiver's depth | `a_metered_row_overruns_only_past_the_receivers_depth` |
+//! | A conformant sender that stalls and resumes is never cut off | `a_sender_that_stalls_and_resumes_never_overruns_the_receiver` |
+//! | Reopening sessions on one connection buys no bytes | `reopening_sessions_on_one_connection_buys_no_bytes` |
 
 use std::time::Duration;
 
@@ -36,7 +45,7 @@ use zakura_rt::{collections::HashMap, time::Instant};
 
 use crate::zakura::{
     wire_codec::{encode_frame, WireMessage},
-    Cadence, Clock, FrameGuard, FramedSend, MessageRole, MessageRule, RealClock,
+    ByteRate, Cadence, Clock, FrameGuard, FramedSend, MessageRole, MessageRule, RealClock,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -55,6 +64,108 @@ pub(crate) enum CadenceCharge {
     Admit,
     /// The bucket is empty; transport buffering can cause this.
     Exhausted,
+    /// A metered row's frame is past the connection's byte bucket. A
+    /// conformant sender never does this.
+    Overrun,
+}
+
+/// Payload bytes earned at a fixed rate, up to a depth.
+///
+/// The sender pays one for each metered frame before handing it on, and the
+/// receiver charges one for each metered frame it reads. Both start full.
+#[derive(Clone, Debug)]
+pub(crate) struct ByteBucket {
+    depth: u64,
+    bytes_per_second: u64,
+    tokens: u64,
+    last_refill: Instant,
+}
+
+impl ByteBucket {
+    /// A sender's bucket for `rate`: the opening allowance at the row's rate.
+    pub(crate) fn sender(rate: ByteRate, now: Instant) -> Self {
+        // Widening u32 to u64 is lossless.
+        Self::new(
+            rate.opening_allowance as u64,
+            rate.bytes_per_second as u64,
+            now,
+        )
+    }
+
+    /// A receiver's bucket for `rate` on a connection whose stream receive
+    /// window is `receive_window`. See [`ByteRate::receiver_depth`].
+    pub(crate) fn receiver(rate: ByteRate, receive_window: u64, now: Instant) -> Self {
+        Self::new(
+            rate.receiver_depth(receive_window),
+            rate.receiver_bytes_per_second(),
+            now,
+        )
+    }
+
+    fn new(depth: u64, bytes_per_second: u64, now: Instant) -> Self {
+        Self {
+            depth,
+            bytes_per_second,
+            tokens: depth,
+            last_refill: now,
+        }
+    }
+
+    /// Add the bytes that elapsed time earned, up to the depth.
+    ///
+    /// `last_refill` advances only by the time the earned bytes took, so the
+    /// remainder carries over and the rate never drifts.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_nanos();
+        let rate = u128::from(self.bytes_per_second);
+        let earned = elapsed.saturating_mul(rate) / 1_000_000_000;
+        if earned == 0 {
+            return;
+        }
+        let room = u128::from(self.depth - self.tokens);
+        if earned >= room {
+            self.tokens = self.depth;
+            self.last_refill = now;
+            return;
+        }
+        // `earned` is below `room`, which fits a u64.
+        self.tokens += u64::try_from(earned).expect("earned is below the room left in a u64");
+        // The time `earned` bytes took is at most `elapsed`, which fits a
+        // Duration.
+        let took = (earned * 1_000_000_000).div_ceil(rate);
+        self.last_refill += Duration::from_nanos(u64::try_from(took).unwrap_or(u64::MAX));
+    }
+
+    /// Pay `bytes` at `now` if the bucket holds them.
+    pub(crate) fn try_pay(&mut self, bytes: u64, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens < bytes {
+            return false;
+        }
+        self.tokens -= bytes;
+        true
+    }
+
+    /// When the bucket will hold `bytes`, refilled to `now`, or `None` if it
+    /// never can because `bytes` is past its depth.
+    pub(crate) fn ready_at(&mut self, bytes: u64, now: Instant) -> Option<Instant> {
+        self.refill(now);
+        if bytes > self.depth || (self.bytes_per_second == 0 && bytes > self.tokens) {
+            return None;
+        }
+        let missing = u128::from(bytes.saturating_sub(self.tokens));
+        if missing == 0 {
+            return Some(now);
+        }
+        let wait = (missing * 1_000_000_000).div_ceil(u128::from(self.bytes_per_second));
+        Some(self.last_refill + Duration::from_nanos(u64::try_from(wait).unwrap_or(u64::MAX)))
+    }
+
+    /// The bytes the bucket holds, as of its last refill.
+    #[cfg(test)]
+    pub(crate) fn tokens(&self) -> u64 {
+        self.tokens
+    }
 }
 
 /// A bucket key. Message types are unique only within a layout, so the key
@@ -175,6 +286,11 @@ impl CadenceLedger {
 #[derive(Debug)]
 pub(crate) struct CadenceBuckets<C: Clock = RealClock> {
     ledger: CadenceLedger,
+    /// The byte bucket of each metered row, made full on first use.
+    bytes: HashMap<CadenceKey, ByteBucket>,
+    /// The stream receive window this node granted on the connection, which
+    /// deepens each byte bucket.
+    receive_window: u64,
     clock: C,
 }
 
@@ -188,13 +304,38 @@ impl<C: Clock> CadenceBuckets<C> {
     pub(crate) fn new(clock: C) -> Self {
         Self {
             ledger: CadenceLedger::default(),
+            bytes: HashMap::new(),
+            receive_window: 0,
             clock,
         }
     }
 
+    /// These buckets on a connection whose stream receive window is
+    /// `receive_window`, read when the connection starts.
+    pub(crate) fn with_receive_window(mut self, receive_window: u64) -> Self {
+        self.receive_window = receive_window;
+        self
+    }
+
     /// Charge one frame of `rule` on `layout`, whose row the frame filter
-    /// already found.
+    /// already found, as [`Self::charge_frame`] does for a payload of the
+    /// row's largest size.
     pub(crate) fn charge(&mut self, layout: u16, rule: &MessageRule) -> CadenceCharge {
+        self.charge_frame(layout, rule, rule.payload.max())
+    }
+
+    /// Charge one frame of `rule` on `layout`, whose row the frame filter
+    /// already found, with a payload of `payload_len` bytes. Only a metered
+    /// row reads the length.
+    pub(crate) fn charge_frame(
+        &mut self,
+        layout: u16,
+        rule: &MessageRule,
+        payload_len: usize,
+    ) -> CadenceCharge {
+        if let MessageRole::Metered { rate } = rule.role {
+            return self.charge_bytes(layout, rule.message_type, rate, payload_len);
+        }
         let Some(cadence) = cadence(rule) else {
             return CadenceCharge::Exempt;
         };
@@ -227,10 +368,41 @@ impl<C: Clock> CadenceBuckets<C> {
         }
     }
 
+    /// Charge `payload_len` bytes of a metered row to its connection bucket.
+    fn charge_bytes(
+        &mut self,
+        layout: u16,
+        message_type: u16,
+        rate: ByteRate,
+        payload_len: usize,
+    ) -> CadenceCharge {
+        let now = self.clock.now();
+        let receive_window = self.receive_window;
+        let bucket = self
+            .bytes
+            .entry(CadenceKey {
+                layout,
+                message_type,
+            })
+            .or_insert_with(|| ByteBucket::receiver(rate, receive_window, now));
+        // Widening usize to u64 is lossless on supported targets.
+        if bucket.try_pay(payload_len as u64, now) {
+            return CadenceCharge::Admit;
+        }
+        metrics::counter!(
+            "zakura.p2p.byte_rate.overrun",
+            "layout" => layout.to_string(),
+            "message_type" => message_type.to_string(),
+        )
+        .increment(1);
+        CadenceCharge::Overrun
+    }
+
     /// Credit a local read pause on a stream of `layout` that carries `rules`.
     ///
     /// While this node's reader waits for its own handler, the sender keeps
-    /// sending into transport buffers. Each of the stream's buckets gains one
+    /// sending into transport buffers. Metered rows earn nothing: their depth
+    /// already holds the stream window those buffers fill. Each of the stream's buckets gains one
     /// token per `refill_interval` paused, above `capacity`, so the burst that
     /// the pause buffered never counts against the sender.
     pub(crate) fn credit_pause(&mut self, layout: u16, rules: &[MessageRule], paused: Duration) {
@@ -265,7 +437,7 @@ fn cadence(rule: &MessageRule) -> Option<Cadence> {
     match rule.role {
         MessageRole::Announcement { cadence } => Some(cadence),
         MessageRole::Request { cadence, .. } | MessageRole::Subscription { cadence, .. } => cadence,
-        MessageRole::Response { .. } => None,
+        MessageRole::Metered { .. } | MessageRole::Response { .. } => None,
     }
 }
 

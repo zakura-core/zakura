@@ -46,7 +46,7 @@ fn cadence(row: &MessageRule) -> Option<Cadence> {
     match row.role {
         MessageRole::Announcement { cadence } => Some(cadence),
         MessageRole::Request { cadence, .. } | MessageRole::Subscription { cadence, .. } => cadence,
-        MessageRole::Response { .. } => None,
+        MessageRole::Metered { .. } | MessageRole::Response { .. } => None,
     }
 }
 

@@ -2739,6 +2739,8 @@ enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
+    /// A metered row overran its connection's byte bucket.
+    ByteRateOverrun,
 }
 
 fn admit_inbound_message(
@@ -2776,7 +2778,20 @@ fn admit_inbound_message(
             .buckets
             .lock()
             .expect("Zakura cadence bucket mutex is never poisoned")
-            .charge(cadence.layout, rule);
+            .charge_frame(cadence.layout, rule, payload_len);
+        // A metered row's bucket already holds every byte a conformant sender
+        // can have buffered, so an overrun is a violation.
+        if charge == CadenceCharge::Overrun {
+            context.conn.trace_rate_limit(
+                "byte_rate.overrun",
+                context.stream_id,
+                stream_kind,
+                Some(u64::try_from(payload_len).unwrap_or(u64::MAX)),
+                None,
+                None,
+            );
+            return InboundMessageAdmission::ByteRateOverrun;
+        }
         // A sibling stream can keep the connection alive during an unbounded
         // transport stall. Exhaustion cannot prove a sender violation.
         if charge == CadenceCharge::Exhausted {
@@ -3415,7 +3430,9 @@ impl ZakuraProtocolHandler {
         let mut pending_sessions = PendingSessions::default();
         let mut incoming_setup: Option<BoxFuture<'static, Option<IncomingStreamSetup>>> = None;
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
-        let mut message_buckets = MessageRateBuckets::new();
+        let mut message_buckets = MessageRateBuckets::with_receive_window(u64::from(
+            self.limits.quic.stream_receive_window_bytes,
+        ));
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
@@ -5804,6 +5821,9 @@ async fn persistent_stream_worker_with_policy(
                         }
                         InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
                         InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
+                        InboundMessageAdmission::ByteRateOverrun => {
+                            ZakuraHandlerError::ByteRateOverrun
+                        }
                     }
                 }
                 Err(error) => {
@@ -5983,7 +6003,9 @@ fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)>
     let code = match error {
         ZakuraHandlerError::Closed => return None,
         ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
-        ZakuraHandlerError::RateLimited => ZAKURA_CLOSE_RATE_LIMIT,
+        ZakuraHandlerError::RateLimited | ZakuraHandlerError::ByteRateOverrun => {
+            ZAKURA_CLOSE_RATE_LIMIT
+        }
         _ => ZAKURA_CLOSE_BAD_PRELUDE,
     };
     Some((code, read_close_cause(ReadPath::Ordered, error)))
@@ -6020,6 +6042,7 @@ fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str 
     match (path, error) {
         (ReadPath::Ordered, Oversize) => "ordered_oversize",
         (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
+        (ReadPath::Ordered, ByteRateOverrun) => "ordered_byte_rate_overrun",
         (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
         (ReadPath::Request, _) if rejected => "request_read_rejected",
         (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
@@ -6109,6 +6132,14 @@ async fn request_stream_worker(
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
             context.close_cause.record("request_oversize");
+            context.connection_token.cancel();
+            return;
+        }
+        InboundMessageAdmission::ByteRateOverrun => {
+            // The layout keeps metered rows off request streams, so this is
+            // unreachable today. Close as a persistent reader would.
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
+            context.close_cause.record("request_byte_rate_overrun");
             context.connection_token.cancel();
             return;
         }
@@ -7715,10 +7746,20 @@ struct MessageRateBuckets<C: Clock = RealClock> {
 }
 
 impl<C: Clock + Default> MessageRateBuckets<C> {
+    /// Buckets for a connection with no stream receive window, as tests use.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_receive_window(0)
+    }
+
+    /// Buckets for a connection whose stream receive window is
+    /// `receive_window`, which deepens its byte buckets.
+    fn with_receive_window(receive_window: u64) -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
+            cadence: Arc::new(StdMutex::new(
+                CadenceBuckets::new(C::default()).with_receive_window(receive_window),
+            )),
         }
     }
 }
@@ -7882,6 +7923,9 @@ pub enum ZakuraHandlerError {
     /// The peer exceeded its per-kind inbound message rate.
     #[error("Zakura message rate exceeded")]
     RateLimited,
+    /// The peer sent a metered row past its connection's byte bucket.
+    #[error("Zakura byte rate exceeded")]
+    ByteRateOverrun,
     /// QUIC connection error.
     #[error(transparent)]
     QuicConnection(#[from] zakura_quic::ConnectionError),
@@ -11471,6 +11515,38 @@ mod tests {
             flags: 0,
             payload: vec![1; payload_len],
         }
+    }
+
+    #[test]
+    fn a_metered_row_past_its_byte_bucket_closes_the_connection() {
+        const METERED: MessageRule = MessageRule {
+            name: "metered",
+            message_type: 40,
+            payload: crate::zakura::PayloadLen::between(1, 512),
+            role: crate::zakura::MessageRole::Metered {
+                rate: crate::zakura::ByteRate {
+                    bytes_per_second: 1,
+                    opening_allowance: 512,
+                    sender_allowance: 512,
+                },
+            },
+        };
+        // With no receive window, the receiver's depth is the two allowances.
+        let context = tabled_context(Some(&[METERED]), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                admit_inbound_message(&probe_frame(40, 512), &context, 900),
+                InboundMessageAdmission::Admit
+            );
+        }
+        assert_eq!(
+            admit_inbound_message(&probe_frame(40, 1), &context, 900),
+            InboundMessageAdmission::ByteRateOverrun
+        );
+        assert_eq!(
+            ordered_read_close(&ZakuraHandlerError::ByteRateOverrun),
+            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_byte_rate_overrun"))
+        );
     }
 
     #[test]

@@ -375,6 +375,10 @@ fn large_block(mut block: Block) -> Block {
     block
 }
 
+#[expect(
+    clippy::print_stdout,
+    reason = "explicit accounting runs emit machine-readable measurements"
+)]
 async fn measured_submission(
     relay: &mut Node,
     peer: &mut WirePeer,

@@ -251,22 +251,17 @@ impl PublisherOwner {
     }
 
     /// End every subscription state says is due, report each end, and return
-    /// the outcomes in order.
-    fn end_due(&mut self) -> Vec<HeadersOutcomeCode> {
-        let outcomes = self
-            .state
-            .end_due()
-            .into_iter()
-            .map(|(id, outcome)| {
-                self.reporter.ended(&id);
-                #[cfg(any(test, zakura_sim))]
-                self.report_change(id, PublicationChange::Ended);
-                outcome
-            })
-            .collect();
+    /// each ended subscription's ID and outcome, in the order they are sent.
+    fn end_due(&mut self) -> Vec<(u64, HeadersOutcomeCode)> {
+        let ended = self.state.end_due();
+        for &(id, _) in &ended {
+            self.reporter.ended(&id);
+            #[cfg(any(test, zakura_sim))]
+            self.report_change(id, PublicationChange::Ended);
+        }
         #[cfg(any(test, zakura_sim))]
         self.report_serving(PublisherSite::EndDue, None);
-        outcomes
+        ended
     }
 
     /// Take the next terminal outcome state lets the task write, and bind it
@@ -698,7 +693,7 @@ async fn publish<const HEADER_BYTES: usize>(
                 .is_some_and(|(key, _)| !shared.state.is_current(*key));
             (outcomes, abandoned)
         };
-        for outcome in outcomes {
+        for (_, outcome) in outcomes {
             metrics::counter!(
                 "sync.header.v9.publisher.outcome",
                 "outcome" => outcome_label(outcome),

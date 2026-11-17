@@ -179,13 +179,6 @@ impl Sub {
     }
 }
 
-/// A subscription that `end_due` ended, until its outcome is written.
-#[derive(Copy, Clone, Debug)]
-struct Ended {
-    id: u64,
-    closing: bool,
-}
-
 /// A job the test started, with what it needs to answer it.
 #[derive(Clone, Debug)]
 struct JobRecord {
@@ -382,10 +375,9 @@ struct Machine {
     job: Option<JobRecord>,
     /// Jobs that settled or that state abandoned.
     stale: Vec<JobRecord>,
-    /// Outcomes `end_due` returned and the test has not taken, in order.
-    queued: VecDeque<HeadersOutcomeCode>,
-    /// Subscriptions that ended and whose outcome is not yet taken.
-    unwritten: Vec<Ended>,
+    /// Subscriptions and outcomes `end_due` returned and the test has not
+    /// taken, in order.
+    queued: VecDeque<(u64, HeadersOutcomeCode)>,
     /// The terminal outcome the test is writing.
     writing: Option<OwnedTerminal>,
     exit: Option<Exit>,
@@ -404,7 +396,6 @@ impl Machine {
             job: None,
             stale: Vec::new(),
             queued: VecDeque::new(),
-            unwritten: Vec::new(),
             writing: None,
             exit: None,
             signals: Vec::new(),
@@ -932,7 +923,7 @@ impl Machine {
     /// End what state says is due. Every closing subscription ends, and only
     /// a closing one ends as `SubscriptionClosed`.
     fn end_due(&mut self) {
-        let codes = self.owner.end_due();
+        let outcomes = self.owner.end_due();
         let ledger = self.owner.state.publications();
         let ended: Vec<u64> = self
             .subs
@@ -940,10 +931,11 @@ impl Machine {
             .copied()
             .filter(|id| ledger.credit(id).is_none())
             .collect();
+        let mut named: Vec<u64> = outcomes.iter().map(|(id, _)| *id).collect();
+        named.sort_unstable();
         assert_eq!(
-            ended.len(),
-            codes.len(),
-            "{PROPERTY}: one outcome per ended subscription"
+            named, ended,
+            "{PROPERTY}: one outcome for each ended subscription"
         );
         for (id, sub) in &self.subs {
             assert!(
@@ -951,15 +943,12 @@ impl Machine {
                 "{PROPERTY}: closing subscription {id} ends"
             );
         }
-        let closing = ended.iter().filter(|id| self.subs[id].closing).count();
-        assert!(
-            codes
-                .iter()
-                .filter(|code| **code == HeadersOutcomeCode::SubscriptionClosed)
-                .count()
-                <= closing,
-            "{PROPERTY}: only a closing subscription ends as closed"
-        );
+        for (id, outcome) in &outcomes {
+            assert!(
+                *outcome != HeadersOutcomeCode::SubscriptionClosed || self.subs[id].closing,
+                "{PROPERTY}: {id} ends as closed without a Close"
+            );
+        }
         for id in ended {
             let sub = self
                 .subs
@@ -973,13 +962,9 @@ impl Machine {
                 self.stale.push(record);
             }
             self.dead_sequences.insert(id, sub.sequence);
-            self.unwritten.push(Ended {
-                id,
-                closing: sub.closing,
-            });
         }
-        self.counters.ended += codes.len();
-        self.queued.extend(codes);
+        self.counters.ended += outcomes.len();
+        self.queued.extend(outcomes);
     }
 
     /// Take the next terminal outcome to write: the oldest one queued, unless
@@ -1000,25 +985,13 @@ impl Machine {
             (outcome.subscription_id, outcome.outcome)
         });
         assert_eq!(
-            found.map(|(_, outcome)| outcome),
-            expected,
+            found, expected,
             "{PROPERTY}: the next terminal outcome, one at a time and in order"
         );
-        let Some((id, outcome)) = found else {
-            return;
-        };
-        self.queued.pop_front();
-        let index = self
-            .unwritten
-            .iter()
-            .position(|ended| ended.id == id)
-            .unwrap_or_else(|| panic!("{PROPERTY}: an outcome for {id}, which did not end"));
-        let ended = self.unwritten.remove(index);
-        assert!(
-            outcome != HeadersOutcomeCode::SubscriptionClosed || ended.closing,
-            "{PROPERTY}: {id} ends as closed without a Close"
-        );
-        self.writing = terminal;
+        if found.is_some() {
+            self.queued.pop_front();
+            self.writing = terminal;
+        }
     }
 
     /// Report the stream's answer to the terminal outcome being written.

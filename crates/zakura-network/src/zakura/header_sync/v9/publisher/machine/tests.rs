@@ -84,7 +84,7 @@ fn outcomes_after(steps: &[Step]) -> Vec<HeadersOutcomeCode> {
         machine.run(step);
     }
     machine.run(&Step::EndDue);
-    machine.queued.iter().copied().collect()
+    machine.queued.iter().map(|(_, outcome)| *outcome).collect()
 }
 
 /// A follower of the selected tip at (0, 8) whose locator was its target at
@@ -342,7 +342,10 @@ fn a_follower_is_superseded_when_the_tip_drops_to_its_last_header() {
     }
     assert_eq!(job_id(&machine), None, "no state read");
     machine.run(&Step::EndDue);
-    assert_eq!(machine.queued, [HeadersOutcomeCode::SubscriptionSuperseded]);
+    assert_eq!(
+        machine.queued,
+        [(1, HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
 }
 
 /// A follower at the selected tip waits for a higher one.
@@ -638,6 +641,21 @@ fn two_closed_one_writing() -> Machine {
     machine.run(&Step::NextTerminal);
     assert_eq!(machine.queued.len(), 1, "one write at a time");
     machine
+}
+
+/// The order check compares subscription IDs as well as outcomes, so two
+/// `SubscriptionClosed` outcomes taken out of order break it.
+#[test]
+#[should_panic(expected = "header/publisher-policy: the next terminal outcome")]
+fn closed_outcomes_out_of_order_break_the_order_check() {
+    let mut machine = Machine::new();
+    for id in [1, 2] {
+        machine.run(&open_path(id));
+        machine.run(&close(id));
+    }
+    machine.run(&Step::EndDue);
+    machine.queued.make_contiguous().reverse();
+    machine.run(&Step::NextTerminal);
 }
 
 /// Cancellation during a terminal write stops the publisher: the queued

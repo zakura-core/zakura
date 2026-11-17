@@ -892,8 +892,12 @@ impl Routine {
             TxRelayMessage::Tx { id, body } => {
                 // A frame's body is at most the data stream's cap.
                 let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
-                let read = self.step(|machine, shared, pool, now| {
-                    machine.tx_arrived(shared, pool, id, size, now)
+                // The body is judged at the time it arrived, before and after
+                // it decodes, so a body on time when it came is not late
+                // because its decode took time.
+                let arrived = self.now();
+                let read = self.step(|machine, shared, pool, _| {
+                    machine.tx_arrived(shared, pool, id, size, arrived)
                 });
                 if !read {
                     return;
@@ -904,13 +908,13 @@ impl Routine {
                 match Transaction::zcash_deserialize_bounded(&mut bytes) {
                     Ok(transaction) if bytes.is_empty() => {
                         let body = UnminedTx::from(transaction);
-                        self.step(|machine, shared, pool, now| {
-                            machine.tx(shared, pool, id, body, now);
+                        self.step(|machine, shared, pool, _| {
+                            machine.tx(shared, pool, id, body, arrived);
                         });
                     }
                     _ => {
-                        self.step(|machine, shared, pool, now| {
-                            machine.undecodable(shared, pool, now);
+                        self.step(|machine, shared, pool, _| {
+                            machine.undecodable(shared, pool, arrived);
                         });
                     }
                 }
@@ -1165,8 +1169,12 @@ impl Routine {
     /// batches only under load.
     fn flush_adverts(&mut self) {
         loop {
-            let (now, at) = (Instant::now(), self.now());
+            // One instant for the check, the machine's decision and the
+            // payment, so a refill between two samples cannot let the
+            // machine take ids the rate then refuses to pay for.
+            let now = Instant::now();
             let (inv, base) = (&self.io.inv, self.wiring.base);
+            let at = now.saturating_duration_since(base);
             let room = InvRoom {
                 free: self.io.data.capacity(),
                 paid: |bytes| match inv.ready(bytes, now) {

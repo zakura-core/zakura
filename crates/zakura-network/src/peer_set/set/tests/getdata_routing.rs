@@ -1308,3 +1308,178 @@ async fn tx_getdata_routing_ignores_request_slot() {
         "the transaction request is written after the earlier response",
     );
 }
+
+/// Registers `peer` in `registry`, and records one answer of `answer_ms` for it if given.
+fn measured_peer(
+    peer: &mut TestPeer,
+    registry: &crate::peer_registry::PeerRegistry,
+    answer_ms: Option<u64>,
+) -> (
+    crate::peer_registry::PeerRegistryGuard,
+    crate::peer_registry::PeerRegistryUpdater,
+) {
+    let (guard, updater) = registry.register_legacy(crate::peer_registry::ConnectedPeer {
+        addr: peer.addr,
+        user_agent: "test".into(),
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        start_height: block::Height(0),
+        is_inbound: false,
+        rtt: None,
+        ping_sent_at: None,
+    });
+    if let Some(answer_ms) = answer_ms {
+        updater.record_delivery_sample(Duration::from_millis(answer_ms), std::time::Instant::now());
+    }
+    peer.client
+        .as_mut()
+        .expect("peer is not yet in the peer set")
+        .block_gossip
+        .registry = Some(updater.clone());
+    (guard, updater)
+}
+
+/// Builds a peer set from `peers`, each of which announced `BLOCK_HASH`, with
+/// `[network.block_source_score]` set to `scored`.
+async fn peer_set_with_block_advertisers(
+    peers: &mut [&mut TestPeer],
+    scored: bool,
+) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
+    let (minimum_peer_version, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let mut config = crate::Config::default();
+    config.block_source_score.enabled = scored;
+    let (mut peer_set, mut guard) = PeerSetBuilder::new()
+        .with_config(config)
+        .with_discover(discover(
+            peers.iter_mut().map(|peer| peer.discovered()).collect(),
+        ))
+        .with_minimum_peer_version(minimum_peer_version)
+        .max_conns_per_ip(peers.len())
+        .build();
+
+    // The test inventory channel holds one change, so register each advert before the next.
+    for peer in peers.iter() {
+        guard
+            .inventory_sender()
+            .as_mut()
+            .expect("guard has an inventory sender")
+            .send(InventoryStatus::new_available(
+                InventoryHash::Block(BLOCK_HASH),
+                peer.addr,
+            ))
+            .expect("peer set receives inventory");
+        peer_set.ready().await.expect("peer set is ready");
+    }
+    (peer_set, guard)
+}
+
+/// Requests `BLOCK_HASH` through `peer_set`, and returns the response future.
+async fn request_block(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+) -> impl std::future::Future<Output = Result<Response, BoxError>> {
+    peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()))
+}
+
+/// With scoring on, of two idle announcers the one expected to answer sooner is asked.
+#[tokio::test(start_paused = true)]
+async fn scored_block_routing_asks_the_announcer_expected_to_answer_sooner() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut slow = TestPeer::spawn(1);
+    let mut fast = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut slow, &registry, Some(200)),
+        measured_peer(&mut fast, &registry, Some(10)),
+    ];
+
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut slow, &mut fast], true).await;
+    let _response = request_block(&mut peer_set).await;
+
+    assert_eq!(
+        fast.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(slow.written_now().await, None);
+}
+
+/// With scoring on, an announcer whose answers have not been measured loses to one whose have,
+/// however slow.
+#[tokio::test(start_paused = true)]
+async fn scored_block_routing_prefers_a_measured_announcer() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut unmeasured = TestPeer::spawn(1);
+    let mut measured = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut unmeasured, &registry, None),
+        measured_peer(&mut measured, &registry, Some(900)),
+    ];
+
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut unmeasured, &mut measured], true).await;
+    let _response = request_block(&mut peer_set).await;
+
+    assert_eq!(
+        measured.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(unmeasured.written_now().await, None);
+}
+
+/// With scoring off, the choice between equally loaded announcers ignores their scores, so the
+/// slower one is still sometimes asked.
+#[tokio::test(start_paused = true)]
+async fn unscored_block_routing_ignores_answer_times() {
+    let _init_guard = zakura_test::init();
+    let mut slow_was_asked = false;
+    // Each trial asks the slower peer with probability 1/2.
+    for _ in 0..20 {
+        let registry = crate::peer_registry::PeerRegistry::default();
+        let mut slow = TestPeer::spawn(1);
+        let mut fast = TestPeer::spawn(2);
+        let _measured = [
+            measured_peer(&mut slow, &registry, Some(200)),
+            measured_peer(&mut fast, &registry, Some(10)),
+        ];
+        let (mut peer_set, _guard) =
+            peer_set_with_block_advertisers(&mut [&mut slow, &mut fast], false).await;
+        let _response = request_block(&mut peer_set).await;
+
+        if slow.written_now().await.is_some() {
+            slow_was_asked = true;
+            break;
+        }
+    }
+    assert!(slow_was_asked, "load-based routing does not read scores");
+}
+
+/// An announcer that answers its block request with `notfound` is expected to answer slowly.
+#[tokio::test(start_paused = true)]
+async fn an_announcer_that_does_not_deliver_its_block_scores_worse() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut peer = TestPeer::spawn(1);
+    let (_registry_guard, updater) = measured_peer(&mut peer, &registry, Some(10));
+
+    let (mut peer_set, _guard) = peer_set_with_block_advertisers(&mut [&mut peer], true).await;
+    let response = request_block(&mut peer_set).await;
+    assert_eq!(
+        peer.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    peer.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(response.await.is_err(), "the peer did not have the block");
+
+    let score = updater.delivery_score().expect("measured");
+    assert!(
+        score > Duration::from_millis(500),
+        "a missed block raises the score: {score:?}"
+    );
+}

@@ -352,6 +352,13 @@ impl BlockGossipPeer {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
 
+    /// The expected time for this peer to answer a block request, from its recent answers.
+    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+        self.registry
+            .as_ref()
+            .and_then(PeerRegistryUpdater::delivery_score)
+    }
+
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.
     ///
     /// Returns false if the `inv` was not written, or if the peer requested the block and the

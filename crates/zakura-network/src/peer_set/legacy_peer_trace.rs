@@ -3,6 +3,10 @@
 //! Legacy sync learns ordered hashes from `FindBlocks`, then distributes individual block
 //! downloads across the peer set. A download routed to `maybe` has no exact inventory claim from
 //! that peer; `advertised` means the selected peer recently sent an `inv` for that exact hash.
+//! An `advertised` row also says how the peer was chosen: `candidates` is the number of idle
+//! peers that had announced the block, `score_ms` the chosen peer's expected answer time and
+//! `best_score_ms` the lowest among the candidates (see `[network.block_source_score]`). A score
+//! is missing for a peer whose answers have not been measured yet.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
 //! inventory guarantee. A connection's process-local
 //! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
@@ -37,6 +41,26 @@ pub(super) struct LegacyPeerTrace {
     emitter: JsonlEventEmitter,
     expose_peer_addresses: bool,
     next_request_id: Arc<AtomicU64>,
+}
+
+/// How the peer set chose the peer for a block request, written as the row's `route`.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum BlockRequestRoute {
+    /// The peer recently announced the block.
+    Advertised(BlockSourceChoice),
+    /// No ready peer had announced the block, so the peer may not have it.
+    Maybe,
+}
+
+/// The idle announcers a block request chose among, and their expected answer times.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BlockSourceChoice {
+    /// The number of idle peers that had announced the block.
+    pub(super) candidates: usize,
+    /// The chosen peer's expected answer time, if it has been measured.
+    pub(super) score: Option<Duration>,
+    /// The lowest expected answer time among the candidates, if any has been measured.
+    pub(super) best_score: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +105,12 @@ enum LegacyPeerEvent<'a> {
         elapsed_ms: u64,
         requested_hash: JsonlDisplay<'a, block::Hash>,
         route: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        candidates: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        best_score_ms: Option<u64>,
         #[serde(flatten)]
         result: BlockRequestResult<'a>,
     },
@@ -209,10 +239,14 @@ impl LegacyPeerTrace {
         request_id: u64,
         peer: PeerTraceContext,
         requested_hash: block::Hash,
-        route: &'static str,
+        route: BlockRequestRoute,
         elapsed: Duration,
         result: &Result<Response, SharedPeerError>,
     ) {
+        let choice = match route {
+            BlockRequestRoute::Advertised(choice) => Some(choice),
+            BlockRequestRoute::Maybe => None,
+        };
         self.emitter.emit_event(|| {
             let result = match result {
                 Ok(Response::Blocks(blocks)) => {
@@ -260,7 +294,17 @@ impl LegacyPeerTrace {
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
                 elapsed_ms: saturating_millis(elapsed),
                 requested_hash: JsonlDisplay(&requested_hash),
-                route,
+                route: match route {
+                    BlockRequestRoute::Advertised(_) => "advertised",
+                    BlockRequestRoute::Maybe => "maybe",
+                },
+                candidates: choice.map(|choice| choice.candidates),
+                score_ms: choice
+                    .and_then(|choice| choice.score)
+                    .map(saturating_millis),
+                best_score_ms: choice
+                    .and_then(|choice| choice.best_score)
+                    .map(saturating_millis),
                 result,
             }
         });
@@ -361,7 +405,7 @@ mod tests {
             2,
             peer,
             hash(2),
-            "advertised",
+            BlockRequestRoute::Advertised(BlockSourceChoice::default()),
             Duration::from_millis(4),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
                 InventoryHash::Block(hash(2)),
@@ -446,7 +490,7 @@ mod tests {
             1,
             test_peer(),
             hash(2),
-            "maybe",
+            BlockRequestRoute::Maybe,
             Duration::from_millis(4),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
                 InventoryHash::Block(hash(2)),
@@ -462,6 +506,57 @@ mod tests {
 
         assert_eq!(event["peer"], "192.0.2.7:8233");
         assert_eq!(event["user_agent"], "/Zakura:1.8.7/");
+    }
+
+    #[tokio::test]
+    async fn an_advertised_row_says_how_its_peer_was_chosen() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = test_trace(&guard, false);
+        let missing = || {
+            Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
+                InventoryHash::Block(hash(2)),
+            ])))
+        };
+
+        trace.block_request_finish(
+            1,
+            test_peer(),
+            hash(2),
+            BlockRequestRoute::Advertised(BlockSourceChoice {
+                candidates: 3,
+                score: Some(Duration::from_millis(40)),
+                best_score: Some(Duration::from_millis(12)),
+            }),
+            Duration::from_millis(90),
+            &missing(),
+        );
+        trace.block_request_finish(
+            2,
+            test_peer(),
+            hash(2),
+            BlockRequestRoute::Maybe,
+            Duration::from_millis(90),
+            &missing(),
+        );
+
+        drop(trace);
+        guard.shutdown().await;
+
+        let events = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
+            .expect("legacy peer trace file is written");
+        let events: Vec<Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+            .collect();
+
+        assert_eq!(events[0]["route"], "advertised");
+        assert_eq!(events[0]["candidates"], 3);
+        assert_eq!(events[0]["score_ms"], 40);
+        assert_eq!(events[0]["best_score_ms"], 12);
+        assert_eq!(events[1]["route"], "maybe");
+        assert!(events[1].get("candidates").is_none());
+        assert!(events[1].get("score_ms").is_none());
     }
 
     #[tokio::test]

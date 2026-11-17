@@ -102,7 +102,7 @@ use std::{
     net::IpAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -132,8 +132,11 @@ use crate::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
         LoadTrackedClient, MinimumPeerVersion,
     },
+    peer_registry::MISSED_BLOCK_PENALTY,
     peer_set::{
-        legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
+        legacy_peer_trace::{
+            BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
+        },
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -305,8 +308,18 @@ where
     /// Whether peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
+    /// Whether announced blocks are requested from the announcer expected to answer sooner,
+    /// rather than the less loaded one. See [`crate::config::BlockSourceScoreConfig`].
+    block_source_score: bool,
+
     /// The network of this peer set.
     network: Network,
+}
+
+/// Returns true if `result` delivered at least one block.
+fn delivered_block(result: &Result<Response, SharedPeerError>) -> bool {
+    matches!(result, Ok(Response::Blocks(blocks))
+        if blocks.iter().any(|block| block.available().is_some()))
 }
 
 impl<D, C> Drop for PeerSet<D, C>
@@ -406,6 +419,7 @@ where
 
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            block_source_score: config.block_source_score.enabled,
 
             network: config.network.clone(),
         }
@@ -1120,22 +1134,7 @@ where
             ),
             len => {
                 // Choose 2 random peers, then return the least loaded of those 2 peers.
-                let (a, b) = {
-                    let idxs = rand_10::seq::index::sample(&mut rand_10::rng(), len, 2);
-                    let a = idxs.index(0);
-                    let b = idxs.index(1);
-
-                    let a = *ready_service_list
-                        .iter()
-                        .nth(a)
-                        .expect("sample returns valid indexes");
-                    let b = *ready_service_list
-                        .iter()
-                        .nth(b)
-                        .expect("sample returns valid indexes");
-
-                    (a, b)
-                };
+                let (a, b) = Self::sample_two(ready_service_list, len);
 
                 let a_load = self.query_load(&a).expect("supplied services are ready");
                 let b_load = self.query_load(&b).expect("supplied services are ready");
@@ -1157,16 +1156,59 @@ where
         }
     }
 
-    /// Performs P2C on the ready block `advertisers` that are preferred block sources.
+    /// Chooses two different random peers from `peers`, which has `len >= 2` entries.
+    fn sample_two(peers: &HashSet<D::Key>, len: usize) -> (D::Key, D::Key) {
+        let idxs = rand_10::seq::index::sample(&mut rand_10::rng(), len, 2);
+        let nth = |index| {
+            *peers
+                .iter()
+                .nth(index)
+                .expect("sample returns valid indexes")
+        };
+        (nth(idxs.index(0)), nth(idxs.index(1)))
+    }
+
+    /// The expected time for the ready peer `key` to answer a block request, if measured.
+    fn delivery_score(&self, key: &D::Key) -> Option<Duration> {
+        self.ready_services
+            .get(key)
+            .and_then(|svc| svc.block_gossip.delivery_score())
+    }
+
+    /// Draws two random peers from `peers` and returns the one expected to answer sooner.
+    ///
+    /// A peer whose answers have not been measured loses to one whose have. If neither has
+    /// been measured, the first drawn wins, which is already a random choice.
+    fn select_p2c_peer_by_delivery_score(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
+        match peers.len() {
+            0 => None,
+            1 => peers.iter().next().copied(),
+            len => {
+                let (a, b) = Self::sample_two(peers, len);
+                let selected = match (self.delivery_score(&a), self.delivery_score(&b)) {
+                    (Some(a_score), Some(b_score)) if b_score < a_score => b,
+                    (None, Some(_)) => b,
+                    _ => a,
+                };
+                Some(selected)
+            }
+        }
+    }
+
+    /// Chooses one of the ready block `advertisers`, and describes the choice for the trace.
+    ///
+    /// Among the advertisers that are preferred block sources, it draws two at random and takes
+    /// the less loaded one, or, with `[network.block_source_score]` enabled, the one expected to
+    /// answer sooner. Falls back to load-based P2C over all `advertisers` if none is preferred.
     ///
     /// A ready client only has space in its request channel. If its connection is awaiting a
     /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
     /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
     /// estimate can be less loaded even with a request outstanding.
-    ///
-    /// Falls back to P2C over all `advertisers` if none of them is preferred. If the selected
-    /// connection is busy, the block request still waits behind its current response.
-    fn select_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
+    fn select_block_advertiser(
+        &self,
+        advertisers: &HashSet<D::Key>,
+    ) -> Option<(D::Key, BlockSourceChoice)> {
         let preferred_advertisers: HashSet<D::Key> = advertisers
             .iter()
             .filter(|key| {
@@ -1177,10 +1219,35 @@ where
             .copied()
             .collect();
 
-        if let Some(peer) = self.select_p2c_peer_from_list(&preferred_advertisers) {
-            return Some(peer);
+        let peer = if self.block_source_score {
+            self.select_p2c_peer_by_delivery_score(&preferred_advertisers)
+        } else {
+            self.select_p2c_peer_from_list(&preferred_advertisers)
         }
+        .or_else(|| self.select_busy_block_advertiser(advertisers))?;
 
+        let choice = BlockSourceChoice {
+            candidates: preferred_advertisers.len(),
+            score: self.delivery_score(&peer),
+            best_score: preferred_advertisers
+                .iter()
+                .filter_map(|key| self.delivery_score(key))
+                .min(),
+        };
+        if choice.candidates >= 2 {
+            metrics::counter!("pool.route_inv.score.choices.count").increment(1);
+            if choice.score.is_none() {
+                metrics::counter!("pool.route_inv.score.unscored.count").increment(1);
+            } else if choice.score == choice.best_score {
+                metrics::counter!("pool.route_inv.score.chosen_best.count").increment(1);
+            }
+        }
+        Some((peer, choice))
+    }
+
+    /// Performs P2C over all `advertisers`, for when none of them is a preferred block source.
+    /// If the selected connection is busy, the block request waits behind its current response.
+    fn select_busy_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
         let peer = self.select_p2c_peer_from_list(advertisers);
         let selected_busy_peer = peer
             .and_then(|key| self.ready_services.get(&key))
@@ -1352,9 +1419,11 @@ where
         // peers would be able to influence our choice by switching addresses.
         // But we need the choice to be random,
         // so that a peer can't provide all our inventory responses.
-        let peer = match hash {
-            InventoryHash::Block(_) => self.select_block_advertiser(&advertising_peer_list),
-            _ => self.select_p2c_peer_from_list(&advertising_peer_list),
+        let (peer, choice) = match hash {
+            InventoryHash::Block(_) => self
+                .select_block_advertiser(&advertising_peer_list)
+                .map_or((None, None), |(peer, choice)| (Some(peer), Some(choice))),
+            _ => (self.select_p2c_peer_from_list(&advertising_peer_list), None),
         };
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
@@ -1371,20 +1440,30 @@ where
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
+                    svc.block_gossip.registry.clone(),
                 )),
                 _ => None,
             };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
-            if let Some((request_id, peer, hash, started)) = trace_context {
+            if let Some((request_id, peer, hash, started, delivery_samples)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
+                let choice = choice.unwrap_or_default();
                 return async move {
                     let result = fut.await;
+                    // A peer that announced the block and then did not deliver it should be
+                    // expected to answer slowly.
+                    if let Some(delivery_samples) =
+                        delivery_samples.filter(|_| !delivered_block(&result))
+                    {
+                        delivery_samples
+                            .record_delivery_sample(MISSED_BLOCK_PENALTY, Instant::now());
+                    }
                     trace.block_request_finish(
                         request_id,
                         peer,
                         hash,
-                        "advertised",
+                        BlockRequestRoute::Advertised(choice),
                         started.elapsed(),
                         &result,
                     );
@@ -1457,7 +1536,7 @@ where
                         request_id,
                         peer,
                         hash,
-                        "maybe",
+                        BlockRequestRoute::Maybe,
                         started.elapsed(),
                         &result,
                     );

@@ -44,7 +44,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 ///
 /// Verifying the local body normally takes well under a second. If it takes longer than this,
 /// downloading and verifying a peer's copy in parallel is the safer way to get the block.
-const LOCAL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const LOCAL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Waits up to [`LOCAL_SUBMISSION_WAIT`] for this node's own submission of a block to be
 /// verified, and returns whether it committed. A submission that fails, is abandoned, or is
@@ -2095,6 +2095,52 @@ mod tests {
             network_rx.try_recv().is_err(),
             "a committed local submission is never requested from the peer"
         );
+        Ok(())
+    }
+
+    /// An unresolved local submission delays the peer request for at most five seconds.
+    #[tokio::test(start_paused = true)]
+    async fn unresolved_local_submission_is_downloaded_after_five_seconds() -> Result<(), BoxError>
+    {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let _registration = pending_blocks
+            .insert(block.clone())
+            .expect("an empty registry accepts the block");
+        let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        let poll_task = tokio::spawn(async move {
+            let _ = downloads.next().await;
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(
+            matches!(
+                network_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the peer request waits while the local submission still has time to finish"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let request = tokio::time::timeout(Duration::from_millis(1), network_rx.recv())
+            .await?
+            .expect("network request channel is open");
+        assert_eq!(
+            request,
+            zn::Request::BlocksByHashFrom {
+                hashes: IndexSet::from([block.hash()]),
+                source: peer,
+            }
+        );
+        poll_task.abort();
         Ok(())
     }
 

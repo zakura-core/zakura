@@ -138,6 +138,11 @@ harness = false
 required-features = ["internal-bench"]
 
 [[bench]]
+name = "legacy_encode"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
 name = "supervised_spawn"
 harness = false
 required-features = ["internal-bench"]

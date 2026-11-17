@@ -20,13 +20,14 @@ use std::{
 use support::{byte_inputs, inputs};
 use tempfile::TempDir;
 use zakura_sim::{
-    domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+    domain::cross::{BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK},
     harness::{
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncScenario, SyncStorage},
         HarnessError, Subsystem,
     },
-    seed, MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
+    observe::BlockSyncFact,
+    seed, MemorySink, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Runs `scenario` under `input`, and returns the report with its records
@@ -362,19 +363,133 @@ fn regenerate_reorg_stale_body_input() {
         .unwrap_or_else(|| {
             panic!("none of {REGENERATE_CANDIDATES} candidates fills the input's role")
         });
-    let base = fixtures().join(REORG_STALE_BODY);
-    fs::write(base.with_extension("bin"), &chosen).expect("the fixture directory exists");
+    write_input(REORG_STALE_BODY, &chosen);
+}
+
+/// Writes `input` as committed input `name`, and its sidecar's SHA-256 to
+/// match. The sidecar's other lines stay as they are.
+fn write_input(name: &str, input: &[u8]) {
+    let base = fixtures().join(name);
+    fs::write(base.with_extension("bin"), input).expect("the fixture directory exists");
     let sidecar = base.with_extension("toml");
     let text = fs::read_to_string(&sidecar).expect("the input has a sidecar");
     let text: String = text
         .lines()
         .map(|line| {
             if line.starts_with("sha256 = ") {
-                format!("sha256 = \"{}\"\n", seed::sha256(&chosen))
+                format!("sha256 = \"{}\"\n", seed::sha256(input))
             } else {
                 format!("{line}\n")
             }
         })
         .collect();
     fs::write(&sidecar, text).expect("the sidecar is writable");
+}
+
+/// Whether the sequencer applied a new body-work epoch while the work queue
+/// still held an older epoch's taken work above the new verified tip: work
+/// the reset that comes with the apply retires. The queue reports that
+/// reset after the sequencer reports the apply, so its last snapshot before
+/// the apply is the work the reset finds.
+fn reset_finds_stale_work(log: &ObservationLog) -> bool {
+    let mut queue = &Vec::new();
+    log.entries().iter().any(|entry| match &entry.obs {
+        Observation::BlockSync {
+            event: BlockSyncFact::WorkQueue { items },
+            ..
+        } => {
+            queue = items;
+            false
+        }
+        Observation::BlockSync {
+            event:
+                BlockSyncFact::EpochApplied {
+                    epoch,
+                    verified_tip,
+                },
+            ..
+        } => queue.iter().any(|item| {
+            item.height > *verified_tip
+                && item
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| owner.body_work_epoch)
+                    .is_some_and(|own| own < *epoch)
+        }),
+        _ => false,
+    })
+}
+
+/// `omit-work-reset`'s input, the saved `reorg-request` scenario, still has
+/// the sequencer apply the new epoch while the work queue holds the old
+/// epoch's taken work above the verified tip, which the held range read
+/// keeps there. Without that work the case's bypass leaves nothing behind,
+/// as #2321 left `sync-storage-reorg.bin`.
+#[test]
+fn the_reorg_request_input_resets_old_epoch_work() {
+    let (input, _) = committed(SavedSync::ReorgRequest);
+    let (report, _, _) = replay(&input);
+    assert!(reset_finds_stale_work(&report.log), "{:?}", report.end);
+}
+
+/// The committed input of `sync/block-requests-follow-headers`' planted
+/// case: the saved `reorg-verdict` scenario under a fuzz Plan in which,
+/// under `keep-work-queue-authority.patch`, a request under the first new
+/// epoch drops before the second one, and a routine takes its returned work
+/// and publishes it under the first epoch after the sequencer applied the
+/// second.
+const REORG_VERDICT_REPUBLISH: &str = "sync-storage-reorg-verdict-republish";
+
+/// Rewrites the republish input with the first of [`REGENERATE_CANDIDATES`]
+/// fuzz Plans, after the `reorg-verdict` tag, whose run violates
+/// `sync/block-requests-follow-headers` and no other property, and its
+/// sidecar's SHA-256 to match. No unpatched run shows which Plans give that
+/// order, so run it with
+/// `qa/planted/sync/block-requests-follow-headers/keep-work-queue-authority.patch`
+/// applied, then revert the patch and run `cargo xtask planted
+/// sync/block-requests-follow-headers`, which checks that the unpatched run
+/// holds and the patched one is caught. Run it with `RUSTFLAGS="--cfg
+/// zakura_sim" cargo test --profile planted -p zakura-sim --test
+/// sync_harness -- --ignored regenerate_reorg_verdict_republish_input
+/// --nocapture`.
+#[test]
+#[ignore = "rewrites the committed input, under a planted patch"]
+#[allow(clippy::print_stdout)]
+fn regenerate_reorg_verdict_republish_input() {
+    let tag = SavedSync::ReorgVerdict.tag();
+    let chosen = byte_inputs(REGENERATE_CANDIDATES, 16_384)
+        .into_iter()
+        .enumerate()
+        .map(|(index, plan)| (index, [&tag[..], &plan].concat()))
+        .find(|(index, input)| {
+            let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
+            let scenario = SyncStorage::draw(prefix);
+            let ports = SyncStorage::prepare(&scenario);
+            let mut sink = MemorySink::default();
+            let violated: Result<Vec<String>, String> = run_prepared::<SyncStorage>(
+                &scenario,
+                ports,
+                Plan::from_fuzz(plan),
+                &mut sink,
+                None,
+            )
+            .map(|report| {
+                report
+                    .properties
+                    .into_iter()
+                    .filter(|property| {
+                        matches!(property.outcome, PropertyOutcome::Violated { .. })
+                    })
+                    .map(|property| property.property)
+                    .collect()
+            })
+            .map_err(|error| error.to_string());
+            println!("{REORG_VERDICT_REPUBLISH}: candidate {index}: {violated:?}");
+            violated.is_ok_and(|violated| violated == [BLOCK_REQUESTS_FOLLOW_HEADERS])
+        })
+        .map(|(_, input)| input)
+        .unwrap_or_else(|| {
+            panic!("none of {REGENERATE_CANDIDATES} candidates violates only {BLOCK_REQUESTS_FOLLOW_HEADERS}")
+        });
+    write_input(REORG_VERDICT_REPUBLISH, &chosen);
 }

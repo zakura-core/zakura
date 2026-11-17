@@ -184,6 +184,10 @@ where
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
+///
+/// Legacy seed dialing and address discovery run in the supervised peer-set background
+/// tasks. Returning does not require a connected legacy peer; requests wait for a suitable
+/// peer through the returned service. Native startup can proceed independently.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -403,65 +407,54 @@ where
             ))));
         }
 
-        // 3. Initial peers, specified in the config and cached on disk.
-        let initial_peers_fut = add_initial_peers(
-            config.clone(),
-            outbound_connector.clone(),
-            peerset_tx.clone(),
-            address_book_updater.clone(),
-        );
-        let initial_peers_join =
-            AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
-
-        // 4. Outgoing peers we connect to in response to load.
+        // Keep legacy bootstrap and crawling in one supervised task. Native peers can already
+        // announce headers, so returning must not wait for legacy dials or address discovery.
+        // The task stays alive in the crawler after bootstrap; a normal bootstrap completion
+        // must not look like a background-task exit to the peer-set owner.
+        let config = config.clone();
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
+        let bootstrap_and_crawl = async move {
+            let mut active_outbound_connections = add_initial_peers(
+                config.clone(),
+                outbound_connector.clone(),
+                peerset_tx.clone(),
+                address_book_updater.clone(),
+            )
+            .await?;
+            let active_initial_peer_count = active_outbound_connections.update_count();
 
-        // Wait for the initial seed peer count
-        let mut active_outbound_connections = initial_peers_join
+            // Consume the first address response here: zcashd rate-limits address requests,
+            // and the crawler must retain that response when there is only one initial peer.
+            info!(
+                ?active_initial_peer_count,
+                "sending initial request for peers"
+            );
+            let _ = candidates
+                .update_initial(active_initial_peer_count)
+                .boxed()
+                .await;
+
+            let demand_count = config
+                .peerset_initial_target_size
+                .saturating_sub(active_outbound_connections.update_count());
+            for _ in 0..demand_count {
+                let _ = demand_tx.try_send(MorePeers);
+            }
+
+            crawl_and_dial(
+                config,
+                demand_tx,
+                demand_rx,
+                candidates,
+                outbound_connector,
+                peerset_tx,
+                active_outbound_connections,
+                address_book_updater,
+            )
             .await
-            .panic_if_task_has_panicked()
-            .expect("initial peer task is not cancelled")
-            .expect("unexpected error connecting to initial peers");
-        let active_initial_peer_count = active_outbound_connections.update_count();
-
-        // We need to await candidates.update() here,
-        // because zcashd rate-limits `addr`/`addrv2` messages per connection,
-        // and if we only have one initial peer,
-        // we need to ensure that its `Response::Addr` is used by the crawler.
-        //
-        // TODO: this might not be needed after we added the Connection peer address cache,
-        //       try removing it in a future release?
-        info!(
-            ?active_initial_peer_count,
-            "sending initial request for peers"
-        );
-        let _ = candidates
-            .update_initial(active_initial_peer_count)
-            .boxed()
-            .await;
-
-        // Compute remaining connections to open.
-        let demand_count = config
-            .peerset_initial_target_size
-            .saturating_sub(active_outbound_connections.update_count());
-
-        for _ in 0..demand_count {
-            let _ = demand_tx.try_send(MorePeers);
-        }
-
-        // Start the peer crawler
-        let crawl_fut = crawl_and_dial(
-            config.clone(),
-            demand_tx,
-            demand_rx,
-            candidates,
-            outbound_connector,
-            peerset_tx,
-            active_outbound_connections,
-            address_book_updater,
-        );
+        };
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
-            crawl_fut.in_current_span(),
+            bootstrap_and_crawl.in_current_span(),
         ))));
     } else {
         task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(

@@ -127,7 +127,8 @@ enum BodyDecodePanic {
 ///
 /// A checksum is found by the block's hash. Bodies using this cache come from committed
 /// state. Temporary submission bodies use [`Message::UncachedBlock`] instead, even when
-/// they later commit, and neither read nor populate this cache. Before contextual
+/// they later commit, and neither read nor populate this cache; they share a checksum
+/// only across sends of the same submission attempt. Before contextual
 /// verification checks `hashBlockCommitments`, different v5 authorization data can produce
 /// bodies with the same block hash and length, even when their proofs and signatures verify.
 /// Untrusted bodies served before that check must not use this cache: they could leave a
@@ -346,11 +347,15 @@ impl Codec {
     /// Returns the checksum of `body`, the serialized body of `msg`.
     ///
     /// A large block's checksum is taken from [`BlockChecksums`] when another send already
-    /// hashed that block, and is remembered there otherwise. Temporary `UncachedBlock`
-    /// bodies always hash their exact bytes, without changing the shared cache.
+    /// hashed that block, and is remembered there otherwise. A temporary `UncachedBlock`
+    /// body shares a checksum only with sends of its own submission attempt, without reading
+    /// or changing the shared cache.
     fn body_checksum(&self, msg: &Message, body: &[u8]) -> sha256d::Checksum {
         let block = match msg {
             Message::Block(block) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => block,
+            Message::UncachedBlock(_, attempt) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => {
+                return attempt.get_or_compute(body, message_checksum);
+            }
             _ => return message_checksum(body),
         };
 
@@ -463,7 +468,7 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) | Message::UncachedBlock(block) => {
+            Message::Block(block) | Message::UncachedBlock(block, _) => {
                 block.zcash_serialize(writer)?
             }
             Message::GetBlocks { known_blocks, stop } => {

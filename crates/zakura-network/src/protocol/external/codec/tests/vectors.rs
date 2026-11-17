@@ -1059,9 +1059,14 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         .with_block_checksums(shared.clone())
         .finish();
     temporary.reconfigure_full_body_len();
+    let (_, rejected) = zakura_node_services::block_relay::PendingBlockSendPermit::channel();
+    let attempt = rejected.body_checksum();
     let mut frame = BytesMut::new();
     temporary
-        .encode(Message::UncachedBlock(changed.clone().into()), &mut frame)
+        .encode(
+            Message::UncachedBlock(changed.clone().into(), attempt.clone()),
+            &mut frame,
+        )
         .unwrap();
     assert_eq!(
         frame[20..HEADER_LEN],
@@ -1082,7 +1087,10 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
     // A temporary body also ignores a cached checksum belonging to the corrected body.
     frame.clear();
     temporary
-        .encode(Message::UncachedBlock(changed.into()), &mut frame)
+        .encode(
+            Message::UncachedBlock(changed.into(), attempt.clone()),
+            &mut frame,
+        )
         .unwrap();
     assert_eq!(
         frame[20..HEADER_LEN],
@@ -1093,6 +1101,27 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         shared.get(valid.hash(), expected.len() - HEADER_LEN),
         Some(remembered)
     );
+
+    // Later sends of the same attempt reuse its checksum instead of hashing again.
+    assert_eq!(
+        attempt
+            .get_or_compute(&frame[HEADER_LEN..], |_| panic!(
+                "the attempt already hashed"
+            ))
+            .0,
+        frame[20..HEADER_LEN]
+    );
+
+    // A same-header retry is a new attempt, so it hashes its own corrected bytes.
+    let (_, retry) = zakura_node_services::block_relay::PendingBlockSendPermit::channel();
+    frame.clear();
+    temporary
+        .encode(
+            Message::UncachedBlock(valid.into(), retry.body_checksum()),
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(frame[20..HEADER_LEN], remembered.0);
 }
 
 /// A block sent through connections that share checksums is byte-for-byte the block a

@@ -487,10 +487,10 @@ impl Tracker {
     pub(crate) fn check(&self, machine: &RelayMachine) {
         let live = machine.session_ids().eq(self.open.keys().copied());
         assert!(live, "the machine's sessions are the open ones");
-        let made = |call: &CallId| machine.calls.contains_key(call);
-        let owed = machine.calls.len() == self.calls.len() && self.calls.keys().all(made);
+        let made = |call: &CallId| machine.has_call(*call);
+        let owed = machine.calls_in_flight() == self.calls.len() && self.calls.keys().all(made);
         assert!(owed, "the machine waits for the calls the pool owes");
-        assert_eq!(machine.waiters.len(), self.bodies.len(), "and the verdicts");
+        assert_eq!(machine.waiters_len(), self.bodies.len(), "and the verdicts");
         let (mut granted, mut asked) = (0, 0);
         for used in self.reservations.values() {
             granted += usize::from(matches!(used, Use::Granted(_)));
@@ -501,7 +501,11 @@ impl Tracker {
         assert_eq!(held, asked, "requests hold the reservations");
         // An entry's tries are at most one more than the cap or the most
         // peers connected at once.
-        let tries = machine.reactor.tries().values().map(IndexSet::len).max();
+        let tries = machine
+            .wanted()
+            .entries()
+            .map(|(_, entry)| entry.tried.len())
+            .max();
         let bound = TRIED_PER_ENTRY.max(self.peak_peers) + 1;
         assert!(tries.unwrap_or(0) <= bound, "the tries bound");
     }

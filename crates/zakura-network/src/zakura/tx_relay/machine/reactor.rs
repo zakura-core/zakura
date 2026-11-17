@@ -1,22 +1,20 @@
 //! `tx-relay`'s reactor: node-wide state only.
 //!
 //! It keeps the v2 cooldowns, keyed by peer, which session of each peer may
-//! fetch, the submissions of sessions that ended before their verdict, which
-//! peers tried each wanted entry, and the fan-out ranking. It never picks a
-//! peer to ask for an id.
+//! fetch, the submissions and reserve calls of sessions that ended, and the
+//! fan-out ranking. It never picks a peer to ask for an id.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
 };
 
-use indexmap::IndexSet;
 use zakura_chain::transaction::UnminedTxId;
 use zakura_rt::collections::HashMap;
 
 use super::{
     EntryGen, PeerKey, SessionId, Time, WaiterId, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    RANDOM_EVERY, RANK_INTERVAL, TRIED_PER_ENTRY,
+    RANDOM_EVERY, RANK_INTERVAL,
 };
 
 /// One peer's cooldown history, as today's `PeerCooldowns` keeps it.
@@ -70,15 +68,6 @@ pub(crate) struct Reactor {
     /// Each session's smoothed round-trip time, as its routine last
     /// reported it.
     rtts: HashMap<SessionId, Duration>,
-    /// The peers that tried each wanted entry, by entry: they answered
-    /// `NotFound`, missed the deadline, ended with the claim out, or
-    /// supplied a body the pool rejected without settling the id. Kept for the entry's life,
-    /// across the peer's sessions, so neither announcing the id again nor
-    /// reconnecting gives a peer a second try. Oldest first. Past
-    /// [`TRIED_PER_ENTRY`] only peers with no session are forgotten, so an
-    /// entry holds at most one more than the larger of that cap and the most
-    /// peers connected at once. No entry has an empty set.
-    tried: HashMap<(UnminedTxId, EntryGen), IndexSet<PeerKey>>,
     /// The deterministic source of the random places.
     random: u64,
     /// When the ranking is next refreshed.
@@ -351,38 +340,6 @@ impl Reactor {
     pub(crate) fn rank(&self, session: SessionId) -> Option<usize> {
         self.places.get(&session).copied()
     }
-
-    /// `peer` tried `id` in `generation`. Past [`TRIED_PER_ENTRY`] it
-    /// forgets the oldest peer with no session left, and forgets none while
-    /// every one has a session.
-    pub(crate) fn mark_tried(&mut self, peer: PeerKey, id: UnminedTxId, generation: EntryGen) {
-        let peers = self.tried.entry((id, generation)).or_default();
-        if !peers.contains(&peer) && peers.len() >= TRIED_PER_ENTRY {
-            // A connected peer is never forgotten, so peers that take turns
-            // at failing must reconnect for a second try, and a session that
-            // reconnects is younger than every holder that waited.
-            if let Some(gone) = peers
-                .iter()
-                .position(|tried| !self.sessions.contains_key(tried))
-            {
-                peers.shift_remove_index(gone);
-            }
-        }
-        peers.insert(peer);
-    }
-
-    /// Whether `peer` tried `id` in `generation`.
-    pub(crate) fn has_tried(&self, peer: PeerKey, id: UnminedTxId, generation: EntryGen) -> bool {
-        self.tried
-            .get(&(id, generation))
-            .is_some_and(|peers| peers.contains(&peer))
-    }
-
-    /// Forgets the tries at `id`'s entry in `generation`, which ended, so a
-    /// later announcement starts a fresh entry where every peer may try.
-    pub(crate) fn forget_tries(&mut self, id: UnminedTxId, generation: EntryGen) {
-        self.tried.remove(&(id, generation));
-    }
 }
 
 /// Read-only views for the machine's invariants.
@@ -413,11 +370,6 @@ impl Reactor {
     /// The reserve calls of ended sessions, by peer.
     pub(crate) fn ended_calls(&self) -> &HashMap<PeerKey, usize> {
         &self.ended_calls
-    }
-
-    /// The peers that tried each entry.
-    pub(crate) fn tries(&self) -> &HashMap<(UnminedTxId, EntryGen), IndexSet<PeerKey>> {
-        &self.tried
     }
 
     /// How many peers the cooldown table holds.

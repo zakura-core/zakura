@@ -435,6 +435,12 @@ impl PendingSet {
             .find(|pending| pending.generation == generation)
     }
 
+    /// The oldest pending reference to `id`, in any generation.
+    pub(crate) fn of(&self, id: UnminedTxId) -> Option<Pending> {
+        let place = self.by_id.get(&id)?.first()?;
+        self.list.get(place).copied()
+    }
+
     /// Takes the oldest pending reference to `id` out.
     pub(crate) fn take(&mut self, id: UnminedTxId) -> Option<Pending> {
         let places = self.by_id.get_mut(&id)?;
@@ -747,7 +753,13 @@ impl Submissions {
         self.by_waiter.len()
     }
 
+    /// Whether `waiter` names one of these submissions.
+    pub(crate) fn contains_waiter(&self, waiter: WaiterId) -> bool {
+        self.by_waiter.contains_key(&waiter)
+    }
+
     /// The waiters, in order.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &WaiterId> {
         self.by_waiter.keys()
     }

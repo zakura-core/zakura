@@ -525,10 +525,10 @@ impl Run {
 
     /// The pool cancels a fetch it no longer needs.
     fn cancel(&mut self) {
-        let reservations = &self.bench.machine.reservations;
+        let machine = &self.bench.machine;
         let held = self.requests().into_iter();
         let held: Vec<_> = held
-            .filter(|(.., held)| reservations.contains_key(held))
+            .filter(|(.., held)| machine.holds_reservation(*held))
             .collect();
         if held.is_empty() {
             return self.tick();
@@ -687,23 +687,18 @@ impl Run {
             machine.session_ids().next().is_none(),
             "every session ended"
         );
-        assert!(machine.calls.is_empty(), "no call is left");
-        assert!(
-            machine.waiters.is_empty() && machine.submitted_at.is_empty(),
-            "no body"
-        );
+        assert_eq!(machine.calls_in_flight(), 0, "no call is left");
+        assert_eq!(machine.waiters_len(), 0, "no body");
         assert_eq!(machine.reservations_held(), 0, "no reservation is left");
         let wanted = machine.wanted();
         assert!(
             wanted.len() == 0 && wanted.retries_len() == 0,
             "no wanted entry is left"
         );
-        assert!(machine.holders.is_empty(), "no holder is left");
         assert_eq!(machine.timers_len(), 0, "no timer is left");
-        let reactor = &machine.reactor;
+        let reactor = machine.reactor();
         assert!(reactor.by_peer().is_empty() && reactor.go().is_empty());
         assert!(reactor.unsettled().is_empty() && reactor.ended_calls().is_empty());
-        assert!(reactor.tries().is_empty(), "no tries are left");
         assert_eq!(machine.next_deadline(), None, "nothing is due");
     }
 

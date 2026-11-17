@@ -1,17 +1,33 @@
 //! `WantedIds`: the node-wide table of ids this node wants.
 //!
-//! An entry is shared state about one id. It holds no peer facts: not who
-//! announced the id, not who tried it, not any peer's announced size. Those
-//! live in each peer routine. The entry has only its claim, how many pending
-//! sets hold it, and its timing. The table also holds the pool's `NoRoom`
-//! backoff and its one probe permit, which are shared too.
+//! An entry is shared state about one id: its claim, how many pending sets
+//! hold it, its timing, and which peers tried it in this generation. It
+//! holds no peer's announced size and not who announced it. Those live in
+//! each peer routine. The table also holds the pool's `NoRoom` backoff and
+//! its one probe permit, which are shared too.
+//!
+//! Every change to an entry that can change how a holder files it goes on a
+//! bounded ring. Each routine reads the ring from its own cursor and files
+//! the ids it holds again. A routine that fell behind the ring files every
+//! id it holds again.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 
+use indexmap::IndexSet;
 use zakura_chain::transaction::UnminedTxId;
 use zakura_rt::collections::HashMap;
 
-use super::{EntryGen, SessionId, Time, NO_ROOM_FIRST, NO_ROOM_MAX, RETRY_FIRST, RETRY_MAX};
+use super::{
+    EntryGen, PeerKey, SessionId, Time, NO_ROOM_FIRST, NO_ROOM_MAX, RETRY_FIRST, RETRY_MAX,
+    TRIED_PER_ENTRY,
+};
+
+/// Changed ids the ring keeps. A routine further behind files every id it
+/// holds again (*provisional*).
+pub(crate) const RING_CAP: usize = 4_096;
 
 /// One wanted id.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +58,14 @@ pub(crate) struct Entry {
     /// adapter, that the pool said is fetching it. If that caller's attempt
     /// ends, the pool logs it as refused, and the delay ends at once.
     pub(crate) waits_for_other: bool,
+    /// The peers that tried this generation, oldest first: they answered
+    /// `NotFound`, missed the deadline, ended a session with the claim out,
+    /// or supplied a body the pool rejected without settling the id. None is
+    /// asked for it again while the entry lives. Past [`TRIED_PER_ENTRY`]
+    /// only a peer with no session is forgotten, so the set holds at most
+    /// one more than the larger of that cap and the most peers connected at
+    /// once.
+    pub(crate) tried: IndexSet<PeerKey>,
 }
 
 /// The pool answered `NoRoom`, so nobody claims until `until`. After that
@@ -78,15 +102,26 @@ pub(crate) struct WantedIds {
     backoff: Option<Backoff>,
     next_backoff: u64,
     /// Ids whose entry may have changed how a holder files it: claimed or
-    /// released, re-timed, decided or dropped. The machine takes them with
-    /// [`Self::take_changed`].
-    changed: Vec<UnminedTxId>,
+    /// released, re-timed, tried, decided or dropped, newest last. Routines
+    /// read it with [`Self::changes_since`].
+    ring: VecDeque<UnminedTxId>,
+    /// The ring position after its newest id.
+    ring_end: u64,
     /// Every retry time set, in order, for [`Self::next_wake`]. A later
     /// change to the entry leaves the old time here, and readers check it.
     retries: BTreeMap<(Time, u64), UnminedTxId>,
     next_retry: u64,
-    /// Entries that ended, decided or dropped, for [`Self::take_ended`].
-    ended: Vec<(UnminedTxId, EntryGen)>,
+}
+
+/// What a routine reads from the ring.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Changes {
+    /// The ids changed since the routine's cursor, oldest first. An id may
+    /// repeat.
+    Ids(Vec<UnminedTxId>),
+    /// The ring no longer holds the cursor's position: every held id may
+    /// have changed.
+    Overrun,
 }
 
 impl WantedIds {
@@ -124,6 +159,7 @@ impl WantedIds {
                 retry_delay: None,
                 requeued_at: None,
                 waits_for_other: false,
+                tried: IndexSet::new(),
                 order: {
                     *order = order.saturating_add(1);
                     *order
@@ -165,7 +201,7 @@ impl WantedIds {
         assert!(entry.claim.is_none(), "one claim per id");
         entry.claim = Some(session);
         entry.waits_for_other = false;
-        self.changed.push(id);
+        self.note(id);
     }
 
     /// `session`'s claim on `id` ends because another caller is fetching
@@ -198,7 +234,7 @@ impl WantedIds {
             if entry.waits_for_other && entry.claim.is_none() {
                 entry.retry_at = entry.retry_at.min(now);
                 entry.waits_for_other = false;
-                self.changed.push(id);
+                self.note(id);
             }
         }
     }
@@ -263,7 +299,7 @@ impl WantedIds {
             self.next_retry = self.next_retry.saturating_add(1);
             self.retries.insert((entry.retry_at, self.next_retry), id);
         }
-        self.changed.push(id);
+        self.note(id);
         self.collect(id);
     }
 
@@ -277,8 +313,7 @@ impl WantedIds {
             .is_some_and(|entry| entry.generation == generation)
         {
             self.entries.remove(&id);
-            self.changed.push(id);
-            self.ended.push((id, generation));
+            self.note(id);
             true
         } else {
             false
@@ -373,21 +408,73 @@ impl WantedIds {
             .get(&id)
             .is_some_and(|entry| entry.holders == 0 && entry.claim.is_none())
         {
-            if let Some(entry) = self.entries.remove(&id) {
-                self.ended.push((id, entry.generation));
-            }
-            self.changed.push(id);
+            self.entries.remove(&id);
+            self.note(id);
         }
     }
 
-    /// Takes the entries that ended since the last call.
-    pub(crate) fn take_ended(&mut self) -> Vec<(UnminedTxId, EntryGen)> {
-        std::mem::take(&mut self.ended)
+    /// Puts `id` on the ring, dropping the oldest id past [`RING_CAP`].
+    fn note(&mut self, id: UnminedTxId) {
+        if self.ring.len() >= RING_CAP {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(id);
+        self.ring_end = self.ring_end.saturating_add(1);
     }
 
-    /// Takes the ids marked changed since the last call. An id may repeat.
-    pub(crate) fn take_changed(&mut self) -> Vec<UnminedTxId> {
-        std::mem::take(&mut self.changed)
+    /// The ring position after its newest id, where a new reader starts.
+    pub(crate) fn ring_end(&self) -> u64 {
+        self.ring_end
+    }
+
+    /// The ids changed from ring position `cursor` on, and the position to
+    /// read from next.
+    pub(crate) fn changes_since(&self, cursor: u64) -> (Changes, u64) {
+        // Widening a length to u64 is lossless.
+        let start = self.ring_end.saturating_sub(self.ring.len() as u64);
+        if cursor < start {
+            return (Changes::Overrun, self.ring_end);
+        }
+        let skip = usize::try_from(cursor - start).unwrap_or(usize::MAX);
+        let ids = self.ring.iter().skip(skip).copied().collect();
+        (Changes::Ids(ids), self.ring_end)
+    }
+
+    /// `peer` tried `id` in `generation`. Past [`TRIED_PER_ENTRY`] peers it
+    /// forgets the oldest one for which `connected` is false, and none while
+    /// every one is connected, so a peer can try an entry again only after
+    /// it disconnected and that many others tried it. A try at an entry
+    /// that already ended changes nothing.
+    pub(crate) fn mark_tried(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+        peer: PeerKey,
+        connected: impl Fn(&PeerKey) -> bool,
+    ) {
+        let Some(entry) = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        if !entry.tried.contains(&peer) && entry.tried.len() >= TRIED_PER_ENTRY {
+            if let Some(gone) = entry.tried.iter().position(|tried| !connected(tried)) {
+                entry.tried.shift_remove_index(gone);
+            }
+        }
+        if entry.tried.insert(peer) {
+            // The peer's other references to the entry go when their
+            // routines read this.
+            self.note(id);
+        }
+    }
+
+    /// Whether `peer` tried `id` in `generation`.
+    pub(crate) fn has_tried(&self, peer: PeerKey, id: UnminedTxId, generation: EntryGen) -> bool {
+        self.current(id, generation)
+            .is_some_and(|entry| entry.tried.contains(&peer))
     }
 
     /// The earliest time after `now` that an entry's retry delay ends, over

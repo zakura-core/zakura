@@ -232,7 +232,8 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
             .sum();
         assert!(adverts > 0, "round {round}: the full pool is announced");
         for (id, _) in &ids {
-            assert!(machine.holders_of(*id) <= sessions_count);
+            let holders = machine.wanted().entry(*id).map_or(0, |entry| entry.holders);
+            assert!(holders <= sessions_count);
         }
         for session in &sessions {
             let state = machine.session(*session).expect("live");

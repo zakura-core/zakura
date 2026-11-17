@@ -10,10 +10,12 @@ use zakura_node_services::mempool::port::{
 
 use super::{body, hello, ids, script_len, Bench, SIZE};
 use crate::zakura::tx_relay::machine::{
-    peer::Hello, reactor::Recorded, CloseReason, FanOut, PeerKey, RelayEffect, SessionId, Timer,
-    Timers, Unreserved, Verdict, Violation, ADVERT_DELAY, BASE_COOLDOWN, MAX_COOLDOWN,
-    MAX_COOLDOWN_PEERS, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST,
-    PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
+    peer::Hello,
+    reactor::Recorded,
+    session::{Timer, Timers},
+    CloseReason, FanOut, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
+    ADVERT_DELAY, BASE_COOLDOWN, MAX_COOLDOWN, MAX_COOLDOWN_PEERS, MAX_REQUESTS_PER_PEER,
+    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -95,19 +97,17 @@ fn a_request_goes_out_only_once_the_pool_grants_its_reservation() {
     bench.fetch(session, granted);
 }
 
-/// The id ready longest goes first, over every session: after a full pool's
-/// backoff the one probe goes to the oldest announcement, though a session
-/// looked at first holds a younger one. An attempt that ends undecided sends
-/// its id behind the work already waiting.
+/// Each session takes its own id ready longest first: after a full pool's
+/// backoff the one probe is for the oldest id it holds, and an attempt that
+/// ends undecided sends its id behind the work already waiting there.
 #[test]
-fn the_id_ready_longest_goes_first_over_every_session() {
+fn each_session_takes_its_id_ready_longest_first() {
     let mut bench = Bench::new();
-    let (young, old) = (bench.id(0), bench.id(1));
-    let first = bench.join(1);
-    let second = bench.join(2);
-    bench.inv(second, &[old]);
+    let (old, young) = (bench.id(0), bench.id(1));
+    let session = bench.join(1);
+    bench.inv(session, &[old]);
     bench.tick(Duration::from_secs(1));
-    bench.inv(first, &[young]);
+    bench.inv(session, &[young]);
     for (call, _) in bench.calls() {
         bench.answer(call, Err(Unreserved::NoRoom));
     }
@@ -694,12 +694,12 @@ fn a_refusal_leaves_other_retries_alone() {
     assert!(bench.calls().is_empty(), "the delay stands");
 }
 
-/// A session that announces an id and ends leaves the holders index, even
-/// while another session keeps the id pending: a peer that keeps
+/// A session that announces an id and ends gives up its hold on the entry,
+/// even while another session keeps the id pending: a peer that keeps
 /// reconnecting and announcing it during a `NoRoom` backoff can't grow the
-/// index.
+/// entry's holder count.
 #[test]
-fn ended_sessions_leave_the_holders_index_while_another_holds_the_id() {
+fn ended_sessions_give_up_their_hold_while_another_holds_the_id() {
     let mut bench = Bench::new();
     let id = bench.id(1);
     let keeper = bench.join(1);
@@ -708,15 +708,22 @@ fn ended_sessions_leave_the_holders_index_while_another_holds_the_id() {
     for (call, _) in bench.calls() {
         bench.answer(call, Err(Unreserved::NoRoom));
     }
-    assert_eq!(bench.machine.holders_of(id), 1);
+    let holders = |bench: &Bench| {
+        bench
+            .machine
+            .wanted()
+            .entry(id)
+            .map_or(0, |entry| entry.holders)
+    };
+    assert_eq!(holders(&bench), 1);
     for round in 0..50 {
         let churn = bench.join(2);
         bench.inv(churn, &[id]);
-        let named = bench.machine.holders_of(id);
-        assert!(named <= 2, "round {round}: {named} named");
+        let named = holders(&bench);
+        assert!(named <= 2, "round {round}: {named} holders");
         bench.end(churn);
     }
-    assert_eq!(bench.machine.holders_of(id), 1, "only the holder is left");
+    assert_eq!(holders(&bench), 1, "only the holder is left");
 }
 
 // Charges.
@@ -883,7 +890,7 @@ fn a_ban_after_the_session_ended_cools_the_peer_id_and_closes_its_live_sessions(
     let banned_at = bench.now;
     let cooling = bench
         .machine
-        .reactor
+        .reactor()
         .cooling_until(PeerKey(peer), banned_at);
     assert_eq!(cooling, Some(banned_at + MAX_COOLDOWN));
 
@@ -902,7 +909,7 @@ fn a_full_cooldown_table_closes_a_fresh_offender_and_keeps_every_cooldown() {
     let count = u64::try_from(MAX_COOLDOWN_PEERS).expect("20,000 fits a u64");
     let held: Vec<PeerKey> = (0..count).map(|n| PeerKey(1_000 + n)).collect();
     for peer in &held {
-        let recorded = bench.machine.reactor.record_invalid(*peer, bench.now);
+        let recorded = bench.machine.reactor_mut().record_invalid(*peer, bench.now);
         assert_eq!(recorded, Recorded::Started(BASE_COOLDOWN));
     }
 
@@ -915,7 +922,7 @@ fn a_full_cooldown_table_closes_a_fresh_offender_and_keeps_every_cooldown() {
     );
     assert_eq!(bench.closes(), vec![(session, CloseReason::CooldownsFull)]);
     let now = bench.now;
-    let reactor = &mut bench.machine.reactor;
+    let reactor = bench.machine.reactor_mut();
     assert!(!reactor.is_cooling(PeerKey(fresh), now), "not cooled");
     let kept = held.iter().all(|peer| reactor.is_cooling(*peer, now));
     assert!(kept, "no cooldown is lost");
@@ -1217,24 +1224,23 @@ fn a_body_is_judged_before_it_is_decoded() {
 // The machine's own bookkeeping.
 
 /// A timer kind with one time at once keeps one entry however often its
-/// source moves it, as a cooling peer that keeps reopening or a peer whose
-/// deadlines move on every send would push it. Held adverts keep one entry
-/// per due time, and popping the front forgets it.
+/// source moves it, as a peer whose deadlines move on every send would push
+/// it. Held adverts keep one entry per due time, and popping the front
+/// forgets it.
 #[test]
 fn a_moved_timer_replaces_its_older_entry() {
     let id = ids(0..1)[0];
     let mut timers = Timers::default();
     for n in 1..=1_000u64 {
         let at = Duration::from_secs(n);
-        timers.push(at, Timer::Cooling(PeerKey(1)));
-        timers.push(at, Timer::Deadline(SessionId(1), id));
-        timers.push(at, Timer::GiveUp(SessionId(1), id));
+        timers.push(at, Timer::Deadline(id));
+        timers.push(at, Timer::GiveUp(id));
     }
-    assert_eq!(timers.set.len(), 3);
+    assert_eq!(timers.set.len(), 2);
     for n in 1..=3u64 {
-        timers.push(Duration::from_secs(n), Timer::Held(SessionId(1)));
+        timers.push(Duration::from_secs(n), Timer::Held);
     }
-    assert_eq!(timers.set.len(), 6);
+    assert_eq!(timers.set.len(), 5);
     while timers.first().is_some() {
         timers.pop_first();
     }

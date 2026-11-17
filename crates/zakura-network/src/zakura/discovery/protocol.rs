@@ -2305,11 +2305,11 @@ impl ZakuraDiscoveryBook {
             self.relayed == relayed,
             "{PROPERTY}: relay attribution disagrees with the entries"
         );
+        let busiest = relayed.values().copied().max().unwrap_or(0);
         assert!(
-            relayed
-                .values()
-                .all(|count| *count <= self.limits.max_records_per_source),
-            "{PROPERTY}: a relay above its quota: {relayed:?}"
+            busiest <= self.limits.max_records_per_source,
+            "{PROPERTY}: a relay holds {busiest} records, above its quota of {}",
+            self.limits.max_records_per_source
         );
         assert!(
             self.discovered_len() <= self.limits.max_records,

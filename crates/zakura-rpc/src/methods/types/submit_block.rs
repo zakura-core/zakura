@@ -123,6 +123,10 @@ impl MinedBlockSubmission {
 }
 
 /// The authority for relaying a local submission before commit.
+///
+/// State-authorized relay stops waiting for readiness at commitment, but a dispatched broadcast
+/// may finish; contextual failure cancels it. Trusted relay stops on either commitment or failure,
+/// including after dispatch. Both policies retain the gossip deadline and committed fallback.
 #[derive(Debug)]
 pub enum EarlyBlockRelay {
     /// Consensus authorized relay and state admitted the candidate.

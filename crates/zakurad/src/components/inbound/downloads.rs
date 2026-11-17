@@ -28,6 +28,7 @@ use zakura_chain::{
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::block_memory::BlockHandle;
+use zakura_rpc::{PendingBlockRegistry, PendingBlockResolution};
 use zakura_state as zs;
 
 use crate::components::{
@@ -37,6 +38,27 @@ use crate::components::{
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The longest a gossiped block's download waits for this node's own submission of the same
+/// block to be verified.
+///
+/// Verifying the local body normally takes well under a second. If it takes longer than this,
+/// downloading and verifying a peer's copy in parallel is the safer way to get the block.
+const LOCAL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Waits up to [`LOCAL_SUBMISSION_WAIT`] for this node's own submission of a block to be
+/// verified, and returns whether it committed. A submission that fails, is abandoned, or is
+/// still being verified returns false, so the caller downloads the block.
+async fn local_submission_committed(resolution: PendingBlockResolution) -> bool {
+    let verdict = tokio::time::timeout(LOCAL_SUBMISSION_WAIT, resolution.committed()).await;
+    let outcome = match verdict {
+        Ok(true) => "committed",
+        Ok(false) => "failed",
+        Err(_) => "unresolved",
+    };
+    metrics::counter!("gossip.local_submission.waited", "outcome" => outcome).increment(1);
+    verdict == Ok(true)
+}
 
 /// A gossiped block claims our best tip as its parent, but its coinbase height is not one
 /// above the tip height.
@@ -459,6 +481,8 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// deliver it sooner.
     second_block_request: bool,
     misbehavior: zn::MisbehaviorReporter,
+    /// Blocks this node is verifying from its own submissions, before they commit.
+    pending_blocks: PendingBlockRegistry,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -474,6 +498,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             spawned_sender: self.spawned_sender.clone(),
             second_block_request: self.second_block_request,
             misbehavior: self.misbehavior.clone(),
+            pending_blocks: self.pending_blocks.clone(),
         }
     }
 }
@@ -632,6 +657,7 @@ where
                 spawned_sender,
                 second_block_request: false,
                 misbehavior,
+                pending_blocks: PendingBlockRegistry::default(),
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
@@ -645,6 +671,13 @@ where
     /// body-specific rejection can use the other dispatched copy. Parent recoveries send one request.
     pub fn with_second_block_request(mut self, enabled: bool) -> Self {
         self.spawner.second_block_request = enabled;
+        self
+    }
+
+    /// Shares the registry of this node's own submissions that are still being verified, so a
+    /// peer's copy of one is only downloaded if the local submission fails.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.spawner.pending_blocks = pending_blocks;
         self
     }
 
@@ -1143,6 +1176,16 @@ where
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
         let fut: BoxFuture<'static, _> = async move {
+            // This node may be verifying its own submission of this block. Verifying a peer's
+            // copy as well would repeat that work, so wait for the local verdict, and only
+            // download the block if the local submission fails. Subscribe before reading state,
+            // so a commit between the two reads is still seen.
+            if let Some(resolution) = spawner.pending_blocks.resolution(hash) {
+                if local_submission_committed(resolution).await {
+                    return Err(("already present".into(), None));
+                }
+            }
+
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
@@ -1982,6 +2025,119 @@ mod tests {
             }
         );
         poll_task.abort();
+    }
+
+    /// Downloads that report each network request on the returned channel, and find no block
+    /// in state, with `pending_blocks` as this node's own submissions.
+    fn downloads_reporting_requests(
+        pending_blocks: zakura_rpc::PendingBlockRegistry,
+    ) -> (
+        Downloads<PendingNetwork, PendingVerifier, PendingState>,
+        tokio::sync::mpsc::UnboundedReceiver<zn::Request>,
+    ) {
+        let (network_tx, network_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            BoxCloneService::new(service_fn(move |request| {
+                let network_tx = network_tx.clone();
+                async move {
+                    network_tx.send(request)?;
+                    future::pending::<Result<zn::Response, BoxError>>().await
+                }
+            })),
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<block::Hash, BoxError>>()
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        )
+        .with_pending_blocks(pending_blocks);
+        (downloads, network_rx)
+    }
+
+    /// A peer announces a block this node is verifying from its own submission. The download
+    /// waits for the local verdict, and a commit means the peer's copy is never requested.
+    #[tokio::test]
+    async fn local_submission_that_commits_is_not_downloaded() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let registration = pending_blocks
+            .insert(block.clone())
+            .expect("an empty registry accepts the block");
+        let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), Some(peer)),
+            DownloadAction::AddedToQueue
+        );
+        let finished = tokio::spawn(async move { downloads.next().await.is_some() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), network_rx.recv())
+                .await
+                .is_err(),
+            "the block is not requested while the local submission is being verified"
+        );
+
+        registration.resolve(Ok(block));
+        assert!(tokio::time::timeout(Duration::from_secs(5), finished).await??);
+        assert!(
+            network_rx.try_recv().is_err(),
+            "a committed local submission is never requested from the peer"
+        );
+        Ok(())
+    }
+
+    /// If this node's own submission of an announced block fails, the peer's copy is
+    /// downloaded, so a bad local body cannot hide a good block.
+    #[tokio::test]
+    async fn local_submission_that_fails_is_downloaded_from_the_peer() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let registration = pending_blocks
+            .insert(block.clone())
+            .expect("an empty registry accepts the block");
+        let (mut downloads, mut network_rx) = downloads_reporting_requests(pending_blocks);
+        let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+
+        assert_eq!(
+            downloads.download_and_verify(block.hash(), Some(peer.clone())),
+            DownloadAction::AddedToQueue
+        );
+        let poll_task = tokio::spawn(async move {
+            let _ = downloads.next().await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), network_rx.recv())
+                .await
+                .is_err(),
+            "the block is not requested while the local submission is being verified"
+        );
+
+        registration.resolve(Err(()));
+        let request = tokio::time::timeout(Duration::from_secs(5), network_rx.recv())
+            .await?
+            .expect("network request channel is open");
+        assert_eq!(
+            request,
+            zn::Request::BlocksByHashFrom {
+                hashes: IndexSet::from([block.hash()]),
+                source: peer,
+            }
+        );
+        poll_task.abort();
+        Ok(())
     }
 
     #[tokio::test]

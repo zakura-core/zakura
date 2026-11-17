@@ -501,7 +501,8 @@ impl Service<zn::Request> for Inbound {
                             latest_chain_tip,
                             network,
                         )
-                        .with_second_block_request(self.second_block_request),
+                        .with_second_block_request(self.second_block_request)
+                        .with_pending_blocks(self.pending_blocks.clone()),
                     );
 
                     result = Ok(());

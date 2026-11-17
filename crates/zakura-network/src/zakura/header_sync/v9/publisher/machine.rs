@@ -1088,6 +1088,7 @@ impl Machine {
 
     /// Apply `step` and check the result, unless the publisher stopped: the
     /// task returns then, so no step follows.
+    #[cfg(test)]
     fn run(&mut self, step: &Step) {
         if self.exit.is_some() {
             return;

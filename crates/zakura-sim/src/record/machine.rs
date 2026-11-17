@@ -295,7 +295,7 @@ pub struct ReactorReadView {
     pub call: CallRef,
 }
 
-/// A reactor state view, read from the machine or derived by its model.
+/// A header reactor state view, read from the machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderReactorView {
@@ -317,9 +317,7 @@ pub struct HeaderReactorView {
     pub stall: Option<ReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
-    /// Milliseconds from the run's clock origin to the next deadline. A deferred
-    /// cached pass adds a refill the model bounds rather than predicts, so
-    /// then this holds `None` on both sides.
+    /// Milliseconds from the run's clock origin to the next deadline.
     pub next_deadline_millis: Option<u64>,
 }
 
@@ -331,8 +329,6 @@ pub struct HeaderReactorStep {
     pub input: Vec<u8>,
     /// State read from the production pure owner.
     pub actual: HeaderReactorView,
-    /// State derived independently by the model.
-    pub expected: HeaderReactorView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -908,7 +904,6 @@ impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }

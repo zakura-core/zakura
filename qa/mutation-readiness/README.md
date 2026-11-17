@@ -39,7 +39,7 @@ The smoke uses one existing production mutation,
 `qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch`,
 and its committed witness `crates/zakura-sim/tests/fixtures/header-reactor-policy.bin`.
 The patch leaves a settled storage call in the pending-call map.
-The `header/reactor-policy` model must reject that state.
+The `header/reactor-policy` target must reject that state.
 
 ```sh
 FIXTURE=crates/zakura-sim/tests/fixtures/header-reactor-policy.bin

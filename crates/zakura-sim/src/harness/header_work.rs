@@ -4,12 +4,15 @@
 use super::{machine::Machine, HarnessEntry};
 use crate::record::machine::MachineStep;
 
-/// Header reactor policy, against its independent model.
+/// Header reactor policy: the production owner's invariants and the facts that
+/// follow from the inputs.
 pub const REACTOR: Machine = Machine {
     name: "header/reactor-policy",
     identity: "header-reactor",
-    claim: "The header reactor's scheduling and locator state agree with the \
-            independent model after every input, with exact storage call identities.",
+    claim: "The header reactor keeps its invariants after every input: each started \
+            locator call settles once, by its exact identity; owed closes wait no longer \
+            than their interval; cached passes stay within their budget; and a stalled \
+            repair reports once per generation.",
     generator: 1,
     budget: 128,
     history: reactor_history,
@@ -54,10 +57,9 @@ fn publisher_history(input: &[u8]) -> Vec<(usize, MachineStep)> {
         .collect()
 }
 
-/// Whether `step`'s model saw a resource-bearing transition. The model's view
-/// proves it even when a mutation keeps the actual owner from reaching it.
+/// Whether a storage call is pending after `step`.
 fn reactor_reached(step: &MachineStep) -> bool {
-    matches!(step, MachineStep::HeaderReactor(work) if !work.expected.calls.is_empty())
+    matches!(step, MachineStep::HeaderReactor(work) if !work.actual.calls.is_empty())
 }
 
 /// Whether the publisher holds a subscription slot after `step`.

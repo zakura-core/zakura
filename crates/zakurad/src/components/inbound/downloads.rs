@@ -27,6 +27,7 @@ use zakura_chain::{
     parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_state as zs;
 
 use crate::components::{
@@ -124,6 +125,8 @@ struct DownloadTask {
     download_source: Option<zn::PeerSource>,
     advertiser: Option<AdvertiserSource>,
     kind: DownloadKind,
+    /// The block's body, if the source pushed it. The task then skips the download.
+    pushed: Option<BlockHandle>,
 }
 
 /// What happened when an advertised child revealed that its parent is missing.
@@ -245,7 +248,8 @@ pub enum DownloadAction {
     /// The block hash was successfully queued for download and verification.
     AddedToQueue,
 
-    /// The block hash is already queued, so this request was ignored.
+    /// The block hash is already queued. During a push, one other peer's announcement is
+    /// retained for a replacement download if the pushed body fails.
     ///
     /// Another peer has already gossiped the same hash to us.
     AlreadyQueued,
@@ -350,6 +354,10 @@ struct Admission {
     /// Every admitted task has exactly one entry, so this is the inbound queue.
     cancel_handles: HashMap<block::Hash, (oneshot::Sender<()>, Option<AdvertiserSource>)>,
 
+    /// One deferred announcement per in-flight push. A failed push transfers its slot to
+    /// this download, so an untrusted body cannot consume another peer's announcement.
+    pushes: HashMap<block::Hash, PendingPush>,
+
     /// Fair source-local verification gates for admitted downloads.
     ///
     /// Tasks are spawned immediately, but same-source tasks must acquire this gate
@@ -368,6 +376,14 @@ struct Admission {
     parent_recoveries: HashMap<block::Hash, Option<AdvertiserSource>>,
 }
 
+#[derive(Debug)]
+struct PendingPush {
+    source: Option<zn::PeerSource>,
+    /// The outer option records whether another peer announced the hash; the inner option
+    /// selects that peer, or inventory routing when its source is unavailable.
+    announcement: Option<Option<zn::PeerSource>>,
+}
+
 impl Admission {
     fn queue_len(&self) -> usize {
         self.cancel_handles.len()
@@ -379,6 +395,7 @@ impl Admission {
     /// polls it, and until then a stale entry would misdirect other tasks' parent recoveries.
     fn release(&mut self, hash: &block::Hash) {
         self.parent_recoveries.remove(hash);
+        self.pushes.remove(hash);
 
         if let Some((_, Some(source))) = self.cancel_handles.remove(hash) {
             let source_count = self
@@ -693,14 +710,38 @@ where
     ///
     /// If the downloaded block's parent is missing, the task recovers it: see
     /// [`TaskSpawner::recover_parent`].
-    #[instrument(
-        skip(self, hash, download_source),
-        fields(hash = %hash, source = tracing::field::Empty)
-    )]
     pub fn download_and_verify(
         &mut self,
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
+    ) -> DownloadAction {
+        self.queue(hash, download_source, None)
+    }
+
+    /// Queues `block`, which `source` pushed without advertising it, for verification.
+    ///
+    /// Admission and the checks before verification are those of [`Self::download_and_verify`],
+    /// but the task skips the download. A concurrent announcement from another peer is retained
+    /// until the push finishes: failure transfers the slot to one ordinary download, and
+    /// success discards the announcement. An `inv` from the same known source does not arm recovery.
+    pub fn verify_pushed(
+        &mut self,
+        block: BlockHandle,
+        source: Option<zn::PeerSource>,
+    ) -> DownloadAction {
+        self.queue(block.hash(), source, Some(block))
+    }
+
+    /// Queues `hash` for verification, downloading it unless `pushed` holds its body.
+    #[instrument(
+        skip(self, hash, download_source, pushed),
+        fields(hash = %hash, source = tracing::field::Empty)
+    )]
+    fn queue(
+        &mut self,
+        hash: block::Hash,
+        download_source: Option<zn::PeerSource>,
+        pushed: Option<BlockHandle>,
     ) -> DownloadAction {
         let source_label = download_source
             .as_ref()
@@ -713,6 +754,13 @@ where
         let queue_len = admission.queue_len();
 
         if admission.cancel_handles.contains_key(&hash) {
+            if let Some(push) = admission.pushes.get_mut(&hash) {
+                if (download_source.is_none() || download_source != push.source)
+                    && push.announcement.is_none()
+                {
+                    push.announcement = Some(download_source);
+                }
+            }
             debug!(
                 ?hash,
                 queue_len,
@@ -770,6 +818,7 @@ where
             advertiser,
             download_source,
             kind: DownloadKind::Advertised,
+            pushed,
         };
 
         let task = self.spawner.spawn_download_task(&mut admission, download);
@@ -863,6 +912,7 @@ where
             download_source: child_source,
             advertiser: None,
             kind: DownloadKind::ParentRecovery,
+            pushed: None,
         };
         let task = self.spawn_download_task(&mut admission, download);
         admission.parent_recoveries.insert(parent, charged_source);
@@ -885,7 +935,18 @@ where
             download_source,
             advertiser,
             kind,
+            pushed,
         } = download;
+
+        if pushed.is_some() {
+            admission.pushes.insert(
+                hash,
+                PendingPush {
+                    source: download_source.clone(),
+                    announcement: None,
+                },
+            );
+        }
 
         let source_lock = advertiser.as_ref().map(|source| {
             *admission.source_counts.entry(source.clone()).or_default() += 1;
@@ -925,63 +986,17 @@ where
             }
             .map_err(|e| (e, None))?;
 
-            let request_hashes = std::iter::once(hash).collect();
-            let request = match download_source.clone() {
-                Some(source) => zn::Request::BlocksByHashFrom {
-                    hashes: request_hashes,
-                    source,
-                },
-                None => zn::Request::BlocksByHash(request_hashes),
-            };
-
-            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
-            {
-                // A peer must answer a single-hash block request with exactly one
-                // block entry. A malformed or empty response is a peer fault (e.g.
-                // a Zakura peer that tore its connection down mid-response), not a
-                // local invariant, so fail the download gracefully rather than
-                // panicking the task.
-                if blocks.len() != 1 {
-                    return Err((
-                        format!(
-                            "wrong number of blocks in response to a single hash: got {}",
-                            blocks.len()
-                        )
-                        .into(),
-                        None,
-                    ));
+            let (block, advertiser_addr) = match pushed {
+                Some(block) => {
+                    metrics::counter!("gossip.pushed.block.count").increment(1);
+                    let pusher_addr = match &download_source {
+                        Some(zn::PeerSource::LegacySocket(addr)) => Some(*addr),
+                        _ => None,
+                    };
+                    (block, pusher_addr)
                 }
-
-                let Some(available) = blocks.first().expect("just checked length").available()
-                else {
-                    return Err((
-                        "unexpected missing block status: single block failures should be errors"
-                            .into(),
-                        None,
-                    ));
-                };
-                available
-            } else {
-                unreachable!("wrong response to block request");
+                None => download_block(network, hash, download_source.clone()).await?,
             };
-
-            // Bind the delivered block to the hash we requested. A peer that
-            // substitutes a different (even valid) block must not be able to
-            // corrupt our hash/source accounting: the verifier returns the
-            // committed block's hash, and queue cleanup keys on it, so a
-            // mismatch would leave the originally requested entry stale.
-            if block.hash() != hash {
-                return Err((
-                    format!(
-                        "peer returned block {} in response to a request for {hash}",
-                        block.hash()
-                    )
-                    .into(),
-                    advertiser_addr,
-                ));
-            }
-            metrics::counter!("gossip.downloaded.block.count").increment(1);
 
             // # Security & Performance
             //
@@ -1027,7 +1042,7 @@ where
 
                     BoxError::from("gossiped block with no height")
                 })
-                .map_err(|e| (e, None))?;
+                .map_err(|e| (e, advertiser_addr))?;
 
             // Security: authenticate the claimed coinbase height against our own tip before the
             // height policies below run. See `crate::components::auth_download_height`.
@@ -1183,7 +1198,8 @@ where
         .in_current_span()
         .boxed();
 
-        let task_admission = self.admission.clone();
+        let completion_spawner = self.clone();
+        let retry_advertiser = advertiser.clone();
         let task = tokio::spawn(async move {
             // Prefer the cancel handle if both are ready.
             let result = tokio::select! {
@@ -1197,10 +1213,31 @@ where
             };
 
             // `spawn_download_task` holds this lock until it has recorded the task.
-            task_admission
-                .lock()
-                .expect("admission is only mutated by non-panicking bookkeeping code")
-                .release(&hash);
+            let mut admission = completion_spawner.admission();
+            let announcement = admission
+                .pushes
+                .remove(&hash)
+                .and_then(|push| push.announcement);
+            admission.release(&hash);
+
+            if result.is_err() && !admission.closed {
+                if let Some(download_source) = announcement {
+                    // Transfer the original slot and source charge under the same lock.
+                    // The replacement is a normal download: duplicate announcements cannot
+                    // arm another replacement, even if this download also fails.
+                    let replacement = completion_spawner.spawn_download_task(
+                        &mut admission,
+                        DownloadTask {
+                            hash,
+                            download_source,
+                            advertiser: retry_advertiser,
+                            kind,
+                            pushed: None,
+                        },
+                    );
+                    let _ = completion_spawner.spawned_sender.send(replacement);
+                }
+            }
 
             result
         });
@@ -1215,6 +1252,76 @@ where
 
         task
     }
+}
+
+/// Downloads the block `hash` from `download_source`, or from any peer without a source.
+///
+/// Returns the block and the address of the peer that sent it. Fails unless the peer sends
+/// exactly the block `hash`.
+async fn download_block<ZN>(
+    network: ZN,
+    hash: block::Hash,
+    download_source: Option<zn::PeerSource>,
+) -> Result<(BlockHandle, Option<PeerSocketAddr>), (BoxError, Option<PeerSocketAddr>)>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    let request_hashes = std::iter::once(hash).collect();
+    let request = match download_source {
+        Some(source) => zn::Request::BlocksByHashFrom {
+            hashes: request_hashes,
+            source,
+        },
+        None => zn::Request::BlocksByHash(request_hashes),
+    };
+
+    let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
+        network.oneshot(request).await.map_err(|e| (e, None))?
+    {
+        // A peer must answer a single-hash block request with exactly one
+        // block entry. A malformed or empty response is a peer fault (e.g.
+        // a Zakura peer that tore its connection down mid-response), not a
+        // local invariant, so fail the download gracefully rather than
+        // panicking the task.
+        if blocks.len() != 1 {
+            return Err((
+                format!(
+                    "wrong number of blocks in response to a single hash: got {}",
+                    blocks.len()
+                )
+                .into(),
+                None,
+            ));
+        }
+
+        let Some(available) = blocks.first().expect("just checked length").available() else {
+            return Err((
+                "unexpected missing block status: single block failures should be errors".into(),
+                None,
+            ));
+        };
+        available
+    } else {
+        unreachable!("wrong response to block request");
+    };
+
+    // Bind the delivered block to the hash we requested. A peer that
+    // substitutes a different (even valid) block must not be able to
+    // corrupt our hash/source accounting: the verifier returns the
+    // committed block's hash, and queue cleanup keys on it, so a
+    // mismatch would leave the originally requested entry stale.
+    if block.hash() != hash {
+        return Err((
+            format!(
+                "peer returned block {} in response to a request for {hash}",
+                block.hash()
+            )
+            .into(),
+            advertiser_addr,
+        ));
+    }
+    metrics::counter!("gossip.downloaded.block.count").increment(1);
+    Ok((block, advertiser_addr))
 }
 
 #[cfg(test)]
@@ -1719,6 +1826,202 @@ mod tests {
         assert!(admission.source_locks.is_empty());
         assert_eq!(admission.queue_len(), 0);
 
+        Ok(())
+    }
+
+    /// A pushed block is verified without a download, and its `inv` does not queue it again.
+    #[tokio::test]
+    async fn pushed_block_is_verified_without_download() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let source = zn::PeerSource::LegacySocket("203.0.113.7:8233".parse()?);
+
+        let network = BoxCloneService::new(service_fn(|request: zn::Request| async move {
+            Err(format!("a pushed block must not be downloaded: {request:?}").into())
+        }));
+        let verifier = BoxCloneService::new(service_fn(
+            |request: zakura_consensus::Request| async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    return Err("unexpected verifier request".into());
+                };
+                Ok(block.hash())
+            },
+        ));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        assert_eq!(
+            downloads.verify_pushed(block.into(), Some(source.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(source)),
+            DownloadAction::AlreadyQueued,
+            "the inv that follows a push does not start a download"
+        );
+        assert_eq!(
+            downloads.download_and_verify(
+                hash,
+                Some(zn::PeerSource::LegacySocket("203.0.113.8:8233".parse()?,))
+            ),
+            DownloadAction::AlreadyQueued,
+        );
+
+        let verified = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("verification completes")
+            .expect("downloads stream is open");
+        assert_eq!(verified.map_err(|(error, _)| error)?, hash);
+        assert_eq!(downloads.spawner.admission().queue_len(), 0);
+        assert!(
+            downloads.next().await.is_none(),
+            "a successful push needs no replacement"
+        );
+
+        Ok(())
+    }
+
+    /// A rejected push must not consume a concurrent honest announcement of the same header.
+    #[tokio::test]
+    async fn rejected_push_preserves_concurrent_announcement() -> Result<(), BoxError> {
+        let canonical: Arc<Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = canonical.hash();
+        let pusher = zn::PeerSource::LegacySocket("203.0.113.7:8233".parse()?);
+        let honest = zn::PeerSource::LegacySocket("203.0.113.8:8233".parse()?);
+
+        for (empty, honest_push, recovery_fails, other_peer) in [
+            (true, false, false, true),
+            (false, false, false, true),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, false, false, false),
+        ] {
+            let malformed = if empty {
+                let mut block = canonical.as_ref().clone();
+                block.transactions.clear();
+                Arc::new(block)
+            } else {
+                poison_coinbase_height(&canonical, block::Height(999_999))
+            };
+            assert_eq!(malformed.hash(), hash);
+            let (requested_tx, mut requested_rx) = mpsc::unbounded_channel();
+            let network_block = canonical.clone();
+            let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+                let canonical = network_block.clone();
+                let requested_tx = requested_tx.clone();
+                async move {
+                    requested_tx.send(request)?;
+                    if recovery_fails {
+                        return Err("replacement download failed".into());
+                    }
+                    Ok(zn::Response::Blocks(vec![Available((
+                        canonical.into(),
+                        None,
+                    ))]))
+                }
+            }));
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let state_gate = gate.clone();
+            let state = BoxCloneService::new(service_fn(move |request| {
+                let gate = state_gate.clone();
+                async move {
+                    let _permit = gate.acquire().await?;
+                    match request {
+                        zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                        request => Err(format!("unexpected state request: {request:?}").into()),
+                    }
+                }
+            }));
+            let verifier = BoxCloneService::new(service_fn(
+                |request: zakura_consensus::Request| async move {
+                    let zakura_consensus::Request::Commit(block) = request else {
+                        return Err("unexpected verifier request".into());
+                    };
+                    assert_eq!(block.coinbase_height(), Some(block::Height(1)));
+                    Ok(block.hash())
+                },
+            ));
+            let (_tip_sender, latest_chain_tip, _tip_change) =
+                zs::ChainTipSender::new(None, &Network::Mainnet);
+            let mut downloads = Downloads::new(
+                MAX_INBOUND_CONCURRENCY,
+                false,
+                network,
+                verifier,
+                state,
+                latest_chain_tip,
+                Network::Mainnet,
+            );
+            assert_eq!(
+                downloads.verify_pushed(malformed.into(), Some(pusher.clone())),
+                DownloadAction::AddedToQueue
+            );
+            let announcer = if other_peer {
+                honest.clone()
+            } else {
+                pusher.clone()
+            };
+            let announcement = if honest_push {
+                downloads.verify_pushed(canonical.clone().into(), Some(announcer))
+            } else {
+                downloads.download_and_verify(hash, Some(announcer))
+            };
+            assert_eq!(announcement, DownloadAction::AlreadyQueued);
+            gate.add_permits(1);
+            let mut recovered = false;
+            for _ in 0..if other_peer { 2 } else { 1 } {
+                match tokio::time::timeout(Duration::from_secs(1), downloads.next())
+                    .await?
+                    .expect("the failed push and replacement both produce results")
+                {
+                    Ok(verified) => {
+                        assert_eq!(verified, hash);
+                        recovered = true;
+                    }
+                    Err((error, address)) => {
+                        if error.to_string() == "gossiped block with no height" {
+                            assert_eq!(address, Some("203.0.113.7:8233".parse()?));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                recovered,
+                other_peer && !recovery_fails,
+                "the honest announcement must survive the rejected push"
+            );
+            if other_peer {
+                let request = requested_rx.try_recv().expect("one replacement download");
+                assert!(
+                    matches!(request, zn::Request::BlocksByHashFrom { hashes, source }
+                    if hashes == std::iter::once(hash).collect::<IndexSet<_>>() && source == honest)
+                );
+            }
+            assert!(
+                requested_rx.try_recv().is_err(),
+                "recovery is bounded to one download"
+            );
+            assert_eq!(downloads.spawner.admission().queue_len(), 0);
+            assert!(downloads.next().await.is_none());
+            assert!(downloads.spawner.admission().pushes.is_empty());
+            assert!(downloads.spawner.admission().source_counts.is_empty());
+        }
         Ok(())
     }
 

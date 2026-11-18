@@ -1,8 +1,8 @@
 //! [`REACTOR_QUERY_LIFECYCLE`](super::REACTOR_QUERY_LIFECYCLE)'s model: the
 //! effects of the needed-block query lifecycle at the runtime boundary.
 //!
-//! `Model` and the `block_query` ledger in `zakura-network` check the pure query
-//! rules after every generated input. This model checks what they can't see:
+//! The `block_reactor` and `block_query` machine targets in `zakura-network`
+//! check the pure query rules after every generated input. This model checks what they can't see:
 //! which queries the real storage took, and the state the real reactor reported.
 //!
 //! The property's binding (properties.md, Observation bindings):

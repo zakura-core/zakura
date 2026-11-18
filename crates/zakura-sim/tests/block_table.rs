@@ -14,18 +14,19 @@
 mod support;
 
 use support::{
-    inputs,
+    byte_inputs, inputs,
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
 use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
+        block_hostile::{get_blocks, held_read, hostile_scenarios},
         block_node::{
-            control::{ControlAction, ControlStep},
+            control::ControlAction,
             policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
             probe::ProbeFrame,
-            Policy, PROBE,
+            Policy,
         },
         block_sync::{table_wiring_properties, BlockScenario, Ports, Storage, FAMILY},
         run_prepared, Subsystem,
@@ -99,23 +100,37 @@ fn causes(report: &RunReport) -> Vec<&str> {
         .collect()
 }
 
-/// A hold on the node's `nth` range read until the probe's connection
-/// closes.
-fn held_read(nth: u32) -> Hold {
-    Hold {
-        select: Select::nth(BlockKind::Read, nth),
-        until: Trigger::Closed(PROBE.to_owned()),
-        then: vec![BlockAllow::Serve, BlockAllow::Error],
-        deadline_ms: None,
-    }
+/// A node holding every fixture body, with no mirrors, and a probe that
+/// sends `frames` once the node's status has reached it.
+fn probe(frames: Vec<ProbeFrame>) -> BlockScenario {
+    BlockScenario::probe_sends(frames)
 }
 
-/// A request for `count` bodies from `start_height`.
-fn get_blocks(start_height: u32, count: u32) -> ProbeFrame {
-    ProbeFrame::GetBlocks {
-        start_height,
-        count,
-    }
+/// Each hostile scenario the node judges outside any exchange of its own,
+/// but over-margin, by the ID suffix it reaches.
+fn probe_faults() -> Vec<(&'static str, BlockScenario)> {
+    hostile_scenarios()
+        .into_iter()
+        .filter(|hostile| !hostile.in_exchange && hostile.name != "get-blocks-over-margin")
+        .map(|hostile| (hostile.reaches, hostile.scenario))
+        .collect()
+}
+
+/// Each hostile scenario inside the node's own exchange, by the ID suffix
+/// it reaches: a body over the bytes the node's request allows, an
+/// undecodable body, a body whose header doesn't commit to its
+/// transactions, and endings that disagree with the bodies before them.
+fn exchange_faults() -> Vec<(&'static str, BlockScenario)> {
+    hostile_scenarios()
+        .into_iter()
+        .filter(|hostile| hostile.in_exchange)
+        .map(|hostile| (hostile.reaches, hostile.scenario))
+        .collect()
+}
+
+/// Requests past twice the node's serving limit while none is served.
+fn over_margin() -> BlockScenario {
+    BlockScenario::over_margin()
 }
 
 /// The outcome `report` gives `id`.
@@ -131,59 +146,6 @@ fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
 /// True if `id` applied in `report` and held.
 fn held(report: &RunReport, id: &str) -> bool {
     matches!(outcome(report, id), PropertyOutcome::Held { applicable } if *applicable > 0)
-}
-
-/// A node holding every fixture body, with no mirrors, and a probe that
-/// sends `frames` once the node's status has reached it.
-fn probe(frames: Vec<ProbeFrame>) -> BlockScenario {
-    BlockScenario {
-        node_bodies: 8,
-        mirrors: Vec::new(),
-        probe: true,
-        control: vec![ControlStep {
-            action: ControlAction::ProbeSend { frames },
-            when: Some(Trigger::VirtualTime(1_000)),
-        }],
-        ..BlockScenario::default()
-    }
-}
-
-/// A node holding no body, with no mirrors, and a probe that advertises the
-/// whole chain with `max_response_bytes`, so the node asks it for bodies,
-/// then sends `frames` while that request is open.
-fn requested(max_response_bytes: u32, frames: Vec<ProbeFrame>) -> BlockScenario {
-    BlockScenario {
-        node_bodies: 0,
-        mirrors: Vec::new(),
-        probe: true,
-        control: vec![
-            ControlStep {
-                action: ControlAction::ProbeSend {
-                    frames: vec![ProbeFrame::LimitedStatus {
-                        servable_low: 0,
-                        servable_high: 8,
-                        max_inflight_requests: 1,
-                        max_response_bytes,
-                    }],
-                },
-                when: None,
-            },
-            ControlStep {
-                action: ControlAction::ProbeSend { frames },
-                when: Some(Trigger::VirtualTime(2_000)),
-            },
-        ],
-        ..BlockScenario::default()
-    }
-}
-
-/// A raw frame of `message_type` with `flags` and a `len`-byte payload.
-fn raw(message_type: u16, flags: u16, len: u32) -> ProbeFrame {
-    ProbeFrame::Raw {
-        message_type,
-        flags,
-        len,
-    }
 }
 
 /// The node's honest run: one mirror serves it the chain.
@@ -288,9 +250,11 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
-/// The committed reset-mid-flight input: a 2-byte scenario prefix, then
-/// Plan bytes.
-const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-mid-flight.bin");
+/// The committed Plan bytes under which [`old_chain_scenario`]'s run has a
+/// routine judge an old-chain body after a fork request reserved its height
+/// ([`old_chain_shortfall`]). `regenerate_old_chain_plan` picks them.
+const OLD_CHAIN_PLAN: &[u8] =
+    include_bytes!("fixtures/block-sync-old-chain-after-fork-request.plan");
 
 /// The committed input whose reset-mid-flight run reads an old-epoch body
 /// for a height past the fork while the routine's old request is still
@@ -379,28 +343,75 @@ fn old_body_judged_after_a_fork_request(
     })
 }
 
-/// A reset while old-chain bodies are on the wire credits none of them to
-/// the fork's work. The reset-mid-flight scenario resets once the mirrors
-/// have completed 14 range reads instead of at the third submission, so
-/// bodies of heights past the fork that the old epoch asked for cross after
-/// the node's new epoch reserves those heights. Under the reset-mid-flight
-/// input's plan, one such body reaches its routine after the routine
-/// dropped its request, so first-completion-wins must refuse its hash.
-#[test]
-fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
+/// The reset-mid-flight scenario, resetting once the mirrors have completed
+/// 14 range reads instead of at the third submission, so bodies of heights
+/// past the fork that the old epoch asked for cross after the node's new
+/// epoch reserves those heights.
+fn old_chain_scenario() -> BlockScenario {
     let mut scenario = BlockScenario::reset_mid_flight();
     scenario.control[0].when = Some(Trigger::Completed(Select::nth(BlockKind::MirrorRead, 14)));
-    let (report, ports) = run(&scenario, Plan::from_fuzz(&RESET_MID_FLIGHT_INPUT[2..]));
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        held(&report, &id("block/receiver-work-authorized")),
-        "{:?}",
-        report.properties
+    scenario
+}
+
+/// Checks that `plan` fills [`OLD_CHAIN_PLAN`]'s role, or returns why it
+/// falls short. [`old_chain_scenario`]'s run under it must end without a
+/// violation, hold `receiver-work-authorized`, and have a routine judge an
+/// old-chain body after a fork request reserved its height.
+fn old_chain_shortfall(plan: &[u8]) -> Result<(), String> {
+    let scenario = old_chain_scenario();
+    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
+    if report.end.violation.is_some() {
+        return Err(format!("a violation: {:?}", report.end));
+    }
+    if !held(&report, &id("block/receiver-work-authorized")) {
+        return Err(format!(
+            "receiver-work-authorized didn't hold: {:?}",
+            report.properties
+        ));
+    }
+    if !old_body_judged_after_a_fork_request(&report, &ports, &scenario) {
+        return Err(
+            "no routine judged an old-chain body after a fork request reserved its height"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// A reset while old-chain bodies are on the wire credits none of them to
+/// the fork's work. Under [`OLD_CHAIN_PLAN`], one such body reaches its
+/// routine after the routine dropped its request, so first-completion-wins
+/// must refuse its hash.
+#[test]
+fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
+    if let Err(shortfall) = old_chain_shortfall(OLD_CHAIN_PLAN) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Rewrites [`OLD_CHAIN_PLAN`] with the first of 64 fuzz inputs that fills
+/// its role ([`old_chain_shortfall`]). Rerun it when a block-sync change
+/// moves the plan off the crossing.
+#[test]
+#[ignore = "rewrites the committed plan"]
+#[allow(clippy::print_stdout)]
+fn regenerate_old_chain_plan() {
+    let plans = byte_inputs(64, 16_384);
+    let (index, plan) = plans
+        .iter()
+        .enumerate()
+        .find(|(index, plan)| {
+            let result = old_chain_shortfall(plan);
+            println!("old-chain plan: candidate {index}: {result:?}");
+            result.is_ok()
+        })
+        .expect("one of 64 candidates fills the plan's role");
+    let path = format!(
+        "{}/tests/fixtures/block-sync-old-chain-after-fork-request.plan",
+        env!("CARGO_MANIFEST_DIR")
     );
-    assert!(
-        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
-        "no routine judged an old-chain body after a fork request reserved its height"
-    );
+    std::fs::write(path, plan).expect("the fixture directory exists");
+    println!("old-chain plan: wrote candidate {index}");
 }
 
 /// The stale-request-body input holds `receiver-work-authorized` after an
@@ -425,166 +436,6 @@ fn the_stale_request_body_input_holds_receiver_work_authorized() {
         old_body_judged_after_a_fork_request(&report, &ports, &scenario),
         "no routine judged an old-chain body after a fork request reserved its height"
     );
-}
-
-/// Each probe fault the node judges outside any exchange of its own, by the
-/// ID it reaches: undeclared types, flags, short and long payloads on every
-/// row, bad content on the rows the codec checks, unsolicited responses,
-/// and an overlapping request while the first one's read is held. A burst
-/// of statuses empties the cadence bucket.
-fn probe_faults() -> Vec<(&'static str, BlockScenario)> {
-    let mut cases = vec![
-        ("undeclared-type-closes", probe(vec![raw(9, 0, 1)])),
-        ("status/bad-content-closes", probe(vec![raw(1, 0, 53)])),
-        ("get-blocks/bad-content-closes", probe(vec![raw(2, 0, 9)])),
-        ("block/unsolicited-closes", probe(vec![raw(3, 0, 2)])),
-        (
-            "blocks-done/unsolicited-closes",
-            probe(vec![ProbeFrame::BlocksDone {
-                start_height: 1,
-                returned: 1,
-            }]),
-        ),
-        (
-            "range-unavailable/unsolicited-closes",
-            probe(vec![ProbeFrame::RangeUnavailable {
-                start_height: 1,
-                count: 1,
-            }]),
-        ),
-        (
-            "status/cadence-never-closes",
-            probe(
-                (0..30)
-                    .map(|_| ProbeFrame::Status {
-                        servable_low: 0,
-                        servable_high: 0,
-                    })
-                    .collect(),
-            ),
-        ),
-    ];
-    for (name, message_type, len) in [
-        ("status", 1, 53),
-        ("get-blocks", 2, 9),
-        ("block", 3, 2),
-        ("blocks-done", 4, 9),
-        ("range-unavailable", 5, 9),
-    ] {
-        cases.push((
-            match name {
-                "status" => "status/reserved-flags-closes",
-                "get-blocks" => "get-blocks/reserved-flags-closes",
-                "block" => "block/reserved-flags-closes",
-                "blocks-done" => "blocks-done/reserved-flags-closes",
-                _ => "range-unavailable/reserved-flags-closes",
-            },
-            probe(vec![raw(message_type, 1, len)]),
-        ));
-        cases.push((
-            match name {
-                "status" => "status/short-payload-closes",
-                "get-blocks" => "get-blocks/short-payload-closes",
-                "block" => "block/short-payload-closes",
-                "blocks-done" => "blocks-done/short-payload-closes",
-                _ => "range-unavailable/short-payload-closes",
-            },
-            probe(vec![raw(message_type, 0, len - 1)]),
-        ));
-        let long = if message_type == 3 {
-            2_000_002
-        } else {
-            len + 1
-        };
-        cases.push((
-            match name {
-                "status" => "status/long-payload-closes",
-                "get-blocks" => "get-blocks/long-payload-closes",
-                "block" => "block/long-payload-closes",
-                "blocks-done" => "blocks-done/long-payload-closes",
-                _ => "range-unavailable/long-payload-closes",
-            },
-            probe(vec![raw(message_type, 0, long)]),
-        ));
-    }
-    // Each raw flagged frame above also breaks a content or solicitation
-    // rule, which closes the connection without the flag check. This
-    // status breaks the flag rule only.
-    cases.push((
-        "status/reserved-flags-closes",
-        probe(vec![ProbeFrame::FlaggedStatus {
-            servable_low: 0,
-            servable_high: 0,
-            flags: 1,
-        }]),
-    ));
-    // The node's read for the first request stays held until the probe's
-    // connection closes, so the overlap is certain.
-    let mut overlap = probe(vec![get_blocks(1, 1), get_blocks(1, 1)]);
-    overlap.policy = Policy {
-        holds: vec![held_read(1)],
-        ..Policy::converging()
-    };
-    cases.push(("get-blocks/bad-content-closes", overlap));
-    cases
-}
-
-/// Each probe fault inside the node's own exchange, by the ID it reaches:
-/// a body over the bytes the node's request allows, an undecodable body, a
-/// body whose header doesn't commit to its transactions, and endings that
-/// disagree with the bodies before them.
-fn exchange_faults() -> Vec<(&'static str, BlockScenario)> {
-    vec![
-        (
-            "block/over-owed-closes",
-            requested(1_000, vec![ProbeFrame::Block { height: 1 }]),
-        ),
-        (
-            "block/bad-content-closes",
-            requested(2_000_000, vec![raw(3, 0, 2)]),
-        ),
-        (
-            "block/bad-content-closes",
-            requested(2_000_000, vec![ProbeFrame::TamperedBlock { height: 1 }]),
-        ),
-        (
-            "blocks-done/bad-content-closes",
-            requested(
-                2_000_000,
-                vec![ProbeFrame::BlocksDone {
-                    start_height: 1,
-                    returned: 2,
-                }],
-            ),
-        ),
-        (
-            "range-unavailable/bad-content-closes",
-            requested(
-                2_000_000,
-                vec![
-                    ProbeFrame::Block { height: 1 },
-                    ProbeFrame::RangeUnavailable {
-                        start_height: 1,
-                        count: 1,
-                    },
-                ],
-            ),
-        ),
-    ]
-}
-
-/// The node holds every fixture body and serves one request at a time.
-/// The probe sends three requests while the node's first two reads are
-/// held, which is past twice its limit.
-fn over_margin() -> BlockScenario {
-    BlockScenario {
-        serving_limit: Some(1),
-        policy: Policy {
-            holds: vec![held_read(1), held_read(2)],
-            ..Policy::converging()
-        },
-        ..probe(vec![get_blocks(1, 1), get_blocks(2, 1), get_blocks(3, 1)])
-    }
 }
 
 /// Four generated IDs no block-sync scenario reaches stay `NotApplicable`
@@ -719,7 +570,10 @@ fn an_overlap_is_judged_against_the_nodes_live_ranges() {
 #[test]
 fn a_repeated_body_admits_its_work_once() {
     let body = ProbeFrame::Block { height: 1 };
-    for report in runs(&requested(2_000_000, vec![body, body]), 4) {
+    for report in runs(
+        &BlockScenario::probe_answers(2_000_000, vec![body, body]),
+        4,
+    ) {
         assert_eq!(report.end.violation, None, "{:?}", report.end);
         assert!(
             held(&report, &id("block/receiver-work-authorized")),

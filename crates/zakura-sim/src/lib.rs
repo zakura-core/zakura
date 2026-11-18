@@ -52,4 +52,4 @@ pub use plan::{
     TraceScript,
 };
 pub use record::{MemorySink, NullSink, Record, RecordSink};
-pub use sim::{RunConfig, RunReport, Sim, TaskHold};
+pub use sim::{RunConfig, RunReport, Sim, Steer, SteeredPlan, TaskHold};

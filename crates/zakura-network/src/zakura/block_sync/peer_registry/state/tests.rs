@@ -1,17 +1,26 @@
 //! Machine tests for the peer-registry owners.
 //!
-//! Each proptest drives a pure owner with generated inputs and compares every
-//! observation with an independent model after each step. The models keep flat
-//! record lists and never call the owners' helpers.
+//! Each machine target drives the pure owners with decoded inputs. The retry
+//! target checks the owners' invariants after every input and compares
+//! lookups only with facts that follow from what it wrote: a fresh deferral
+//! is avoided, nothing is avoided past the latest deadline written, a cleared
+//! body is free, and a compatible refresh keeps every avoidance of its epoch.
+//! Named scenarios pin the rekeying rules. The peer-table target keeps a small
+//! bookkeeping model: each peer's generation, close flag and published claims.
 
-use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+    time::Duration,
+};
 
-#[cfg(test)]
-use proptest::prelude::*;
 use zakura_header_chain::{BodyWorkEpoch, HeaderGeneration, HeaderWorkAuthority};
 
 use super::*;
-use crate::zakura::block_sync::{test_work_scope, ZakuraBlockSyncConfig};
+use crate::zakura::{
+    block_sync::{test_work_scope, ZakuraBlockSyncConfig},
+    machine_test::MAX_HISTORY_BYTES,
+};
 
 const SOURCES: u8 = 3;
 const GENERATIONS: u64 = 3;
@@ -44,203 +53,6 @@ fn authority((generation, epoch): (u64, u64)) -> BodyWorkAuthority {
 /// Retry-key coordinates: (header generation, body-work epoch).
 type Scope = (u64, u64);
 
-/// One supplier deferral in the model.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct Deferral {
-    source: u8,
-    scope: Scope,
-    hash: u8,
-    incompatible: bool,
-    /// Seconds after the test's base instant.
-    until: u64,
-}
-
-impl Deferral {
-    fn same_key(&self, other: &Self) -> bool {
-        self.source == other.source
-            && self.scope == other.scope
-            && self.hash == other.hash
-            && self.incompatible == other.incompatible
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct Alarm {
-    scope: Scope,
-    hash: u8,
-    until: u64,
-}
-
-#[derive(Debug, Default)]
-struct RetryModel {
-    now: u64,
-    current: Option<Scope>,
-    deferrals: Vec<Deferral>,
-    alarm: Option<Alarm>,
-}
-
-impl RetryModel {
-    fn find(
-        &mut self,
-        source: u8,
-        scope: Scope,
-        hash: u8,
-        incompatible: bool,
-    ) -> Option<&mut Deferral> {
-        self.deferrals.iter_mut().find(|deferral| {
-            deferral.source == source
-                && deferral.scope == scope
-                && deferral.hash == hash
-                && deferral.incompatible == incompatible
-        })
-    }
-
-    /// Merge deferrals that rekeying made identical, keeping the latest deadline.
-    fn merge(&mut self) {
-        let mut merged: Vec<Deferral> = Vec::new();
-        for deferral in std::mem::take(&mut self.deferrals) {
-            match merged.iter_mut().find(|kept| kept.same_key(&deferral)) {
-                Some(kept) => kept.until = kept.until.max(deferral.until),
-                None => merged.push(deferral),
-            }
-        }
-        self.deferrals = merged;
-    }
-
-    fn defer_unavailable(&mut self, sources: &[u8], scope: Scope, hash: u8, until: u64) {
-        self.deferrals.retain(|deferral| {
-            deferral.incompatible
-                || deferral.scope != scope
-                || deferral.hash != hash
-                || sources.contains(&deferral.source)
-        });
-        for source in sources {
-            match self.find(*source, scope, hash, false) {
-                Some(deferral) => deferral.until = until,
-                None => self.deferrals.push(Deferral {
-                    source: *source,
-                    scope,
-                    hash,
-                    incompatible: false,
-                    until,
-                }),
-            }
-        }
-    }
-
-    fn defer_incompatible(&mut self, source: u8, bodies: &[(Scope, u8)], until: u64) {
-        let now = self.now;
-        self.deferrals.retain(|deferral| deferral.until > now);
-        for (scope, hash) in bodies {
-            let scope = match self.current {
-                Some(current) if current.1 == scope.1 => current,
-                Some(current) if current.1 > scope.1 => continue,
-                _ => *scope,
-            };
-            match self.find(source, scope, *hash, true) {
-                Some(deferral) => deferral.until = deferral.until.max(until),
-                None => self.deferrals.push(Deferral {
-                    source,
-                    scope,
-                    hash: *hash,
-                    incompatible: true,
-                    until,
-                }),
-            }
-        }
-    }
-
-    fn clear(&mut self, scope: Scope, hash: u8) {
-        self.deferrals
-            .retain(|deferral| deferral.scope != scope || deferral.hash != hash);
-        if self
-            .alarm
-            .is_some_and(|alarm| alarm.scope == scope && alarm.hash == hash)
-        {
-            self.alarm = None;
-        }
-    }
-
-    fn retain(&mut self, current: Option<Scope>) {
-        self.current = current;
-        let Some(current) = current else {
-            self.deferrals.clear();
-            self.alarm = None;
-            return;
-        };
-        self.deferrals.retain_mut(|deferral| {
-            if !deferral.incompatible {
-                return deferral.scope == current;
-            }
-            if deferral.scope.1 < current.1 {
-                return false;
-            }
-            if deferral.scope.1 == current.1 {
-                deferral.scope = current;
-            }
-            true
-        });
-        self.merge();
-        self.alarm = self.alarm.and_then(|mut alarm| {
-            if alarm.scope.1 < current.1 {
-                return None;
-            }
-            if alarm.scope.1 == current.1 {
-                alarm.scope = current;
-            }
-            Some(alarm)
-        });
-    }
-
-    fn refresh(&mut self, current: Scope) {
-        self.current = Some(current);
-        if let Some(alarm) = &mut self.alarm {
-            if alarm.scope.1 == current.1 {
-                alarm.scope = current;
-            }
-        }
-        for deferral in &mut self.deferrals {
-            if !deferral.incompatible || deferral.scope.1 == current.1 {
-                deferral.scope = current;
-            }
-        }
-        self.merge();
-    }
-
-    fn is_avoided(&self, source: u8, scope: Scope, hash: u8, at: u64) -> bool {
-        let current = self
-            .current
-            .filter(|current| current.1 == scope.1)
-            .unwrap_or(scope);
-        self.alarm
-            .is_some_and(|alarm| alarm.until > at && alarm.hash == hash && alarm.scope.1 == scope.1)
-            || self.deferrals.iter().any(|deferral| {
-                deferral.source == source
-                    && deferral.hash == hash
-                    && (deferral.scope == current || deferral.scope == scope)
-                    && deferral.until > at
-            })
-    }
-
-    fn next_deadline(&mut self, source: u8) -> Option<u64> {
-        let now = self.now;
-        if self.alarm.is_some_and(|alarm| alarm.until <= now) {
-            self.alarm = None;
-        }
-        self.deferrals.retain(|deferral| deferral.until > now);
-        self.alarm
-            .map(|alarm| alarm.until)
-            .into_iter()
-            .chain(
-                self.deferrals
-                    .iter()
-                    .filter(|deferral| deferral.source == source)
-                    .map(|deferral| deferral.until),
-            )
-            .min()
-    }
-}
-
 #[derive(Clone, Debug)]
 enum RetryOp {
     DeferUnavailable {
@@ -262,33 +74,63 @@ enum RetryOp {
     NextDeadline(u8),
 }
 
-#[cfg(test)]
-fn scope() -> impl Strategy<Value = Scope> {
-    (0..GENERATIONS, 0..EPOCHS)
+fn scopes() -> impl Iterator<Item = Scope> {
+    (0..GENERATIONS).flat_map(|generation| (0..EPOCHS).map(move |epoch| (generation, epoch)))
 }
 
-#[cfg(test)]
-fn retry_op() -> impl Strategy<Value = RetryOp> {
-    prop_oneof![
-        3 => (prop::collection::btree_set(0..SOURCES, 0..=3), scope(), 0..HASHES, 1..20u64)
-            .prop_map(|(sources, scope, hash, ttl)| RetryOp::DeferUnavailable {
-                sources: sources.into_iter().collect(),
-                scope,
-                hash,
-                ttl,
-            }),
-        3 => (0..SOURCES, prop::collection::vec((scope(), 0..HASHES), 0..4), 1..20u64)
-            .prop_map(|(source, bodies, ttl)| RetryOp::DeferIncompatible { source, bodies, ttl }),
-        1 => prop::option::of((scope(), 0..HASHES, 1..20u64)).prop_map(RetryOp::SetAlarm),
-        1 => (scope(), 0..HASHES).prop_map(|(scope, hash)| RetryOp::Clear(scope, hash)),
-        1 => prop::option::of(scope()).prop_map(RetryOp::Retain),
-        1 => scope().prop_map(RetryOp::Refresh),
-        2 => (0..8u64).prop_map(RetryOp::Advance),
-        1 => (0..SOURCES).prop_map(RetryOp::NextDeadline),
-    ]
+fn bodies() -> impl Iterator<Item = (Scope, u8)> {
+    scopes().flat_map(|scope| (0..HASHES).map(move |hash| (scope, hash)))
 }
 
-/// Owners under test, with the base instant that model seconds count from.
+/// Deadlines the test wrote, in seconds after the history's base instant.
+#[derive(Debug, Default)]
+struct Written {
+    now: u64,
+    /// The authority the last retain or refresh installed.
+    current: Option<Scope>,
+    /// Every supplier deadline written for each (source, hash).
+    deferrals: BTreeMap<(u8, u8), BTreeSet<u64>>,
+    /// Every alarm deadline written for each hash.
+    alarms: BTreeMap<u8, BTreeSet<u64>>,
+}
+
+impl Written {
+    /// The latest deadline that could still avoid `source` for `hash`.
+    fn latest(&self, source: u8, hash: u8) -> u64 {
+        let deferral = self.deferrals.get(&(source, hash)).and_then(BTreeSet::last);
+        let alarm = self.alarms.get(&hash).and_then(BTreeSet::last);
+        deferral.max(alarm).copied().unwrap_or(0)
+    }
+
+    /// Whether the test wrote `deadline` for `source` or for the alarm.
+    fn wrote(&self, source: u8, deadline: u64) -> bool {
+        self.deferrals
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == source)
+            .map(|(_, deadlines)| deadlines)
+            .chain(self.alarms.values())
+            .any(|deadlines| deadlines.contains(&deadline))
+    }
+}
+
+/// A fact that follows from one input, checked after the step's hook.
+#[derive(Debug)]
+enum Fresh {
+    /// The source avoids the body it was just deferred for.
+    Avoided(u8, Scope, u8),
+    /// The alarm just set avoids its body.
+    Alarmed(Scope, u8),
+    /// The alarm was just cleared.
+    NoAlarm,
+    /// No supplier avoids the body just cleared under the current authority.
+    Cleared(Scope, u8),
+    /// Work older than the authority just retained avoids nothing.
+    Retained(Option<Scope>),
+    /// A compatible refresh kept these avoidances of its epoch.
+    Kept(BTreeSet<(u64, u8, Scope, u8)>),
+}
+
+/// Owners under test, with the base instant that test seconds count from.
 struct RetryOwners {
     base: Instant,
     alarms: BodyRetryAlarms,
@@ -300,8 +142,62 @@ impl RetryOwners {
         self.base + Duration::from_secs(seconds)
     }
 
-    fn apply(&mut self, model: &mut RetryModel, op: RetryOp) {
-        let now = model.now;
+    fn avoided(&self, source: u8, scope: Scope, raw_hash: u8, at: u64) -> bool {
+        is_body_retry_avoided(
+            &self.alarms,
+            &self.suppliers,
+            self::source(source),
+            authority(scope),
+            hash(raw_hash),
+            self.at(at),
+        )
+    }
+
+    /// The same lookup with only the supplier deferrals.
+    fn supplier_avoided(&self, source: u8, scope: Scope, raw_hash: u8, at: u64) -> bool {
+        is_body_retry_avoided(
+            &BodyRetryAlarms::default(),
+            &self.suppliers,
+            self::source(source),
+            authority(scope),
+            hash(raw_hash),
+            self.at(at),
+        )
+    }
+
+    /// The same lookup with only the alarm.
+    fn alarm_avoided(&self, scope: Scope, raw_hash: u8, at: u64) -> bool {
+        is_body_retry_avoided(
+            &self.alarms,
+            &SupplierRetryState::default(),
+            source(0),
+            authority(scope),
+            hash(raw_hash),
+            self.at(at),
+        )
+    }
+
+    /// Every (source, scope, hash) lookup at `now` and at a later instant.
+    fn avoidances(&self, now: u64) -> BTreeSet<(u64, u8, Scope, u8)> {
+        let mut avoided = BTreeSet::new();
+        for at in [now, now + 7] {
+            for raw_source in 0..SOURCES {
+                for scope in scopes() {
+                    for raw_hash in 0..HASHES {
+                        if self.avoided(raw_source, scope, raw_hash, at) {
+                            avoided.insert((at, raw_source, scope, raw_hash));
+                        }
+                    }
+                }
+            }
+        }
+        avoided
+    }
+
+    /// Apply `op`. Returns the facts that follow directly from it.
+    fn apply(&mut self, written: &mut Written, op: RetryOp) -> Vec<Fresh> {
+        let now = written.now;
+        let mut fresh = Vec::new();
         match op {
             RetryOp::DeferUnavailable {
                 sources,
@@ -309,7 +205,6 @@ impl RetryOwners {
                 hash: raw_hash,
                 ttl,
             } => {
-                model.defer_unavailable(&sources, scope, raw_hash, now + ttl);
                 let skipped = self.suppliers.defer_unavailable(
                     sources.iter().copied().map(source).collect(),
                     authority(scope),
@@ -317,13 +212,24 @@ impl RetryOwners {
                     self.at(now + ttl),
                 );
                 assert_eq!(skipped, 0, "{RETRY_PROPERTY}");
+                for raw_source in &sources {
+                    written
+                        .deferrals
+                        .entry((*raw_source, raw_hash))
+                        .or_default()
+                        .insert(now + ttl);
+                }
+                fresh.extend(
+                    sources
+                        .into_iter()
+                        .map(|raw_source| Fresh::Avoided(raw_source, scope, raw_hash)),
+                );
             }
             RetryOp::DeferIncompatible {
                 source: raw_source,
                 bodies,
                 ttl,
             } => {
-                model.defer_incompatible(raw_source, &bodies, now + ttl);
                 let skipped = self.suppliers.defer_incompatible(
                     source(raw_source),
                     bodies
@@ -334,100 +240,137 @@ impl RetryOwners {
                     self.at(now),
                 );
                 assert_eq!(skipped, 0, "{RETRY_PROPERTY}");
+                for (scope, raw_hash) in bodies {
+                    written
+                        .deferrals
+                        .entry((raw_source, raw_hash))
+                        .or_default()
+                        .insert(now + ttl);
+                    // Work older than the current authority defers nothing.
+                    if written.current.is_none_or(|current| scope.1 >= current.1) {
+                        fresh.push(Fresh::Avoided(raw_source, scope, raw_hash));
+                    }
+                }
             }
             RetryOp::SetAlarm(alarm) => {
-                model.alarm = alarm.map(|(scope, hash, ttl)| Alarm {
-                    scope,
-                    hash,
-                    until: now + ttl,
-                });
                 self.alarms.set(alarm.map(|(scope, raw_hash, ttl)| {
                     (authority(scope), hash(raw_hash), self.at(now + ttl))
                 }));
+                match alarm {
+                    Some((scope, raw_hash, ttl)) => {
+                        written
+                            .alarms
+                            .entry(raw_hash)
+                            .or_default()
+                            .insert(now + ttl);
+                        fresh.push(Fresh::Alarmed(scope, raw_hash));
+                    }
+                    None => fresh.push(Fresh::NoAlarm),
+                }
             }
             RetryOp::Clear(scope, raw_hash) => {
-                model.clear(scope, raw_hash);
                 self.suppliers.clear(authority(scope), hash(raw_hash));
                 self.alarms.clear(authority(scope), hash(raw_hash));
+                // Under the authority the test installed, the body is free of
+                // every supplier deferral.
+                if written.current.is_none_or(|current| current == scope) {
+                    fresh.push(Fresh::Cleared(scope, raw_hash));
+                }
             }
             RetryOp::Retain(current) => {
-                model.retain(current);
+                written.current = current;
                 retain_body_retry_scope(
                     &mut self.alarms,
                     &mut self.suppliers,
                     current.map(authority),
                 );
-                self.check_stale_work_is_retired(current);
+                fresh.push(Fresh::Retained(current));
             }
             RetryOp::Refresh(current) => {
-                model.refresh(current);
+                written.current = Some(current);
+                let mut before = self.avoidances(now);
+                before.retain(|(_, _, scope, _)| scope.1 == current.1);
                 refresh_body_retry_scope(&mut self.alarms, &mut self.suppliers, authority(current));
+                fresh.push(Fresh::Kept(before));
             }
-            RetryOp::Advance(seconds) => model.now += seconds,
+            RetryOp::Advance(seconds) => written.now += seconds,
             RetryOp::NextDeadline(raw_source) => {
-                let expected = model.next_deadline(raw_source).map(|until| self.at(until));
                 let all = self.alarms.next_deadline(self.at(now));
                 let supplier = self
                     .suppliers
                     .next_deadline(source(raw_source), self.at(now));
-                assert_eq!(
-                    all.into_iter().chain(supplier).min(),
-                    expected,
-                    "{RETRY_PROPERTY}"
-                );
+                match all.into_iter().chain(supplier).min() {
+                    Some(deadline) => {
+                        let seconds = deadline.duration_since(self.base).as_secs();
+                        assert!(
+                            seconds > now && written.wrote(raw_source, seconds),
+                            "{RETRY_PROPERTY}: {raw_source}'s next deadline {seconds} was not written after {now}"
+                        );
+                    }
+                    None => {
+                        for (scope, raw_hash) in bodies() {
+                            assert!(
+                                !self.avoided(raw_source, scope, raw_hash, now),
+                                "{RETRY_PROPERTY}: {raw_source} has no deadline but avoids {raw_hash} under {scope:?}"
+                            );
+                        }
+                    }
+                }
             }
+        }
+        fresh
+    }
+
+    /// Check each fact that followed from the step's input.
+    fn check_fresh(&self, now: u64, fresh: Vec<Fresh>) {
+        for fact in fresh {
+            let holds = match &fact {
+                Fresh::Avoided(raw_source, scope, raw_hash) => {
+                    self.avoided(*raw_source, *scope, *raw_hash, now)
+                }
+                Fresh::Alarmed(scope, raw_hash) => self.alarm_avoided(*scope, *raw_hash, now),
+                Fresh::NoAlarm => {
+                    bodies().all(|(scope, raw_hash)| !self.alarm_avoided(scope, raw_hash, now))
+                }
+                Fresh::Cleared(scope, raw_hash) => (0..SOURCES)
+                    .all(|raw_source| !self.supplier_avoided(raw_source, *scope, *raw_hash, now)),
+                Fresh::Retained(current) => {
+                    self.check_stale_work_is_retired(*current);
+                    true
+                }
+                Fresh::Kept(before) => before.is_subset(&self.avoidances(now)),
+            };
+            assert!(holds, "{RETRY_PROPERTY}: {fact:?} does not hold");
         }
     }
 
     /// Right after a retain, work from an older epoch avoids nothing, and a
     /// retain to `None` clears every deferral and alarm.
     fn check_stale_work_is_retired(&self, current: Option<Scope>) {
-        for scope in (0..GENERATIONS)
-            .flat_map(|generation| (0..EPOCHS).map(move |epoch| (generation, epoch)))
-        {
+        for scope in scopes() {
             if current.is_some_and(|current| scope.1 >= current.1) {
                 continue;
             }
             for raw_source in 0..SOURCES {
                 for raw_hash in 0..HASHES {
                     assert!(
-                        !is_body_retry_avoided(
-                            &self.alarms,
-                            &self.suppliers,
-                            source(raw_source),
-                            authority(scope),
-                            hash(raw_hash),
-                            self.base,
-                        ),
+                        !self.avoided(raw_source, scope, raw_hash, 0),
                         "{RETRY_PROPERTY}: stale scope {scope:?} still avoids after retaining {current:?}");
                 }
             }
         }
     }
 
-    /// Compare every lookup with the model now and after a later instant.
-    fn check(&self, model: &RetryModel) {
-        for at in [model.now, model.now + 7] {
-            for raw_source in 0..SOURCES {
-                for generation in 0..GENERATIONS {
-                    for epoch in 0..EPOCHS {
-                        for raw_hash in 0..HASHES {
-                            let scope = (generation, epoch);
-                            assert_eq!(
-                                is_body_retry_avoided(
-                                    &self.alarms,
-                                    &self.suppliers,
-                                    source(raw_source),
-                                    authority(scope),
-                                    hash(raw_hash),
-                                    self.at(at),
-                                ),
-                                model.is_avoided(raw_source, scope, raw_hash, at),
-                                "{RETRY_PROPERTY}: source {raw_source} scope {scope:?} hash {raw_hash} at {at}");
-                        }
-                    }
-                }
-            }
+    /// Check the owners' invariants, and that nothing is avoided at or past
+    /// the latest deadline the test wrote for it.
+    fn check(&self, written: &Written) {
+        self.alarms.assert_invariants();
+        self.suppliers.assert_invariants();
+        for (at, raw_source, scope, raw_hash) in self.avoidances(written.now) {
+            assert!(
+                at < written.latest(raw_source, raw_hash),
+                "{RETRY_PROPERTY}: source {raw_source} scope {scope:?} hash {raw_hash} is avoided at {at}, past every deadline written"
+            );
         }
     }
 }
@@ -437,7 +380,7 @@ const RETRY_PROPERTY: &str = "block/retry-authority";
 /// Applicable retry operations in a decoder-v1 history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct RetryAuthorityReplaySummary {
-    /// Operations compared with the independent model.
+    /// Operations checked.
     pub transitions: usize,
     /// Deferral writes checked.
     pub deferrals: usize,
@@ -449,43 +392,46 @@ pub struct RetryAuthorityReplaySummary {
     pub deadline_queries: usize,
 }
 
-/// Replay decoder-v1 quadruples against the supplier and alarm model.
-/// Read at most 512 bytes. Time is relative to one origin per history.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the supplier
+/// and alarm owners. Each quadruple is one input. Time is relative to one
+/// origin per history.
 pub fn replay_retry_authority_bytes(data: &[u8]) -> RetryAuthorityReplaySummary {
     run_retry(decode_retry(data), |_| {})
 }
 
 fn decode_retry(data: &[u8]) -> impl Iterator<Item = RetryOp> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        let scope = (u64::from(b) % GENERATIONS, u64::from(b / 3) % EPOCHS);
-        let hash = c % HASHES;
-        let ttl = u64::from(d % 20) + 1;
-        match a % 8 {
-            0 => RetryOp::DeferUnavailable {
-                sources: (0..SOURCES)
-                    .filter(|source| (c / 3) & (1 << source) != 0)
-                    .collect(),
-                scope,
-                hash,
-                ttl,
-            },
-            1 => RetryOp::DeferIncompatible {
-                source: c / 3 % SOURCES,
-                bodies: vec![(scope, hash)],
-                ttl,
-            },
-            2 => RetryOp::SetAlarm((a & 128 == 0).then_some((scope, hash, ttl))),
-            3 => RetryOp::Clear(scope, hash),
-            4 => RetryOp::Retain((a & 128 == 0).then_some(scope)),
-            5 => RetryOp::Refresh(scope),
-            6 => RetryOp::Advance(u64::from(d)),
-            _ => RetryOp::NextDeadline(c % SOURCES),
-        }
-    })
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks(4)
+        .map(|chunk| {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            let d = chunk.get(3).copied().unwrap_or(0);
+            let scope = (u64::from(b) % GENERATIONS, u64::from(b / 3) % EPOCHS);
+            let hash = c % HASHES;
+            let ttl = u64::from(d % 20) + 1;
+            match a % 8 {
+                0 => RetryOp::DeferUnavailable {
+                    sources: (0..SOURCES)
+                        .filter(|source| (c / 3) & (1 << source) != 0)
+                        .collect(),
+                    scope,
+                    hash,
+                    ttl,
+                },
+                1 => RetryOp::DeferIncompatible {
+                    source: c / 3 % SOURCES,
+                    bodies: vec![(scope, hash)],
+                    ttl,
+                },
+                2 => RetryOp::SetAlarm((a & 128 == 0).then_some((scope, hash, ttl))),
+                3 => RetryOp::Clear(scope, hash),
+                4 => RetryOp::Retain((a & 128 == 0).then_some(scope)),
+                5 => RetryOp::Refresh(scope),
+                6 => RetryOp::Advance(u64::from(d)),
+                _ => RetryOp::NextDeadline(c % SOURCES),
+            }
+        })
 }
 
 fn run_retry(
@@ -497,7 +443,7 @@ fn run_retry(
         alarms: BodyRetryAlarms::default(),
         suppliers: SupplierRetryState::default(),
     };
-    let mut model = RetryModel::default();
+    let mut written = Written::default();
     let mut summary = RetryAuthorityReplaySummary::default();
     for op in ops {
         summary.transitions += 1;
@@ -510,53 +456,39 @@ fn run_retry(
         summary.time_advances +=
             usize::from(matches!(op, RetryOp::Advance(seconds) if seconds > 0));
         summary.deadline_queries += usize::from(matches!(op, RetryOp::NextDeadline(_)));
-        owners.apply(&mut model, op);
+        let fresh = owners.apply(&mut written, op);
         after_step(&mut owners);
-        owners.check(&model);
+        owners.check_fresh(written.now, fresh);
+        owners.check(&written);
     }
     summary
 }
 
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn retry_avoidance_matches_an_independent_model(ops in prop::collection::vec(retry_op(), 1..60)) {
-        run_retry(ops, |_| {});
-    }
-    #[test]
-    fn retry_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_retry_authority_bytes(&bytes);
-    }
-}
-
+/// Defers one supplier's unavailability and another's incompatibility,
+/// refreshes, retains a newer epoch, sets an alarm, advances time and reads a
+/// deadline.
 #[cfg(test)]
 const RETRY_WITNESS: &[u8] = &[
     0, 0, 3, 2, 1, 0, 3, 3, 5, 1, 0, 0, 4, 4, 0, 0, 2, 4, 0, 2, 6, 0, 0, 5, 7, 0, 0, 0,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn retry_witness_exercises_expiry_and_authority_changes() {
-    let summary = replay_retry_authority_bytes(RETRY_WITNESS);
-    assert_eq!(
-        summary,
-        RetryAuthorityReplaySummary {
+#[cfg(test)]
+mod retry_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_retry_authority_bytes,
+        target: "block_retry_authority",
+        decoder: 1,
+        witness: RETRY_WITNESS => RetryAuthorityReplaySummary {
             transitions: 7,
             deferrals: 2,
             scope_changes: 2,
             time_advances: 1,
-            deadline_queries: 1
-        }
-    );
-    assert_eq!(
-        replay_retry_authority_bytes(&[]),
-        RetryAuthorityReplaySummary::default()
-    );
-    println!("tier=Machine target=block_retry_authority decoder=1 {summary:?}");
+            deadline_queries: 1,
+        },
+    }
 }
 
 #[test]
@@ -575,34 +507,179 @@ fn retry_witness_rejects_lost_alarm() {
     });
 }
 
+/// Fresh owners and the instant `seconds` after their base.
+#[cfg(test)]
+fn retry_owners() -> (BodyRetryAlarms, SupplierRetryState, impl Fn(u64) -> Instant) {
+    let base = Instant::now();
+    (
+        BodyRetryAlarms::default(),
+        SupplierRetryState::default(),
+        move |seconds| base + Duration::from_secs(seconds),
+    )
+}
+
 #[test]
 fn incompatible_report_from_stale_work_cannot_suppress_current_work() {
-    let base = Instant::now();
-    let mut alarms = BodyRetryAlarms::default();
-    let mut suppliers = SupplierRetryState::default();
+    let (mut alarms, mut suppliers, at) = retry_owners();
     retain_body_retry_scope(&mut alarms, &mut suppliers, Some(authority((0, 1))));
-    let until = base + Duration::from_secs(60);
     assert_eq!(
-        suppliers.defer_incompatible(source(0), vec![(authority((0, 0)), hash(0))], until, base),
+        suppliers.defer_incompatible(source(0), vec![(authority((0, 0)), hash(0))], at(60), at(0)),
         0,
     );
-    assert!(!is_body_retry_avoided(
-        &alarms,
-        &suppliers,
-        source(0),
-        authority((0, 1)),
-        hash(0),
-        base
-    ));
-    assert!(!is_body_retry_avoided(
-        &alarms,
-        &suppliers,
-        source(0),
-        authority((0, 0)),
-        hash(0),
-        base
-    ));
+    for scope in [(0, 1), (0, 0)] {
+        assert!(!is_body_retry_avoided(
+            &alarms,
+            &suppliers,
+            source(0),
+            authority(scope),
+            hash(0),
+            at(0)
+        ));
+    }
     assert_eq!(suppliers.len(), 0);
+}
+
+/// Rekeying merges two deadlines of one cooldown; the later one survives.
+#[test]
+fn a_rekey_merge_keeps_the_latest_deadline() {
+    for (first, second) in [(10, 30), (30, 10)] {
+        let (mut alarms, mut suppliers, at) = retry_owners();
+        let _ = suppliers.defer_unavailable(
+            BTreeSet::from([source(0)]),
+            authority((0, 0)),
+            hash(0),
+            at(first),
+        );
+        let _ = suppliers.defer_unavailable(
+            BTreeSet::from([source(0)]),
+            authority((1, 0)),
+            hash(0),
+            at(second),
+        );
+        refresh_body_retry_scope(&mut alarms, &mut suppliers, authority((2, 0)));
+        assert_eq!(suppliers.len(), 1);
+        assert_eq!(suppliers.next_deadline(source(0), at(0)), Some(at(30)));
+    }
+}
+
+/// Deferring a body again installs the exact supplier set: a departed
+/// supplier's unavailability ends, and a repeated one takes the new deadline.
+#[test]
+fn an_unavailable_deferral_installs_the_exact_supplier_set() {
+    let (alarms, mut suppliers, at) = retry_owners();
+    let scope = authority((0, 0));
+    let _ = suppliers.defer_unavailable(
+        BTreeSet::from([source(0), source(1)]),
+        scope,
+        hash(0),
+        at(30),
+    );
+    let _ = suppliers.defer_unavailable(BTreeSet::from([source(1)]), scope, hash(0), at(10));
+    let avoided = |source, seconds| {
+        is_body_retry_avoided(&alarms, &suppliers, source, scope, hash(0), at(seconds))
+    };
+    assert!(!avoided(source(0), 0));
+    assert!(avoided(source(1), 9));
+    assert!(!avoided(source(1), 10));
+}
+
+/// Another incompatibility report extends a cooldown and never shortens it.
+#[test]
+fn an_incompatibility_report_only_extends_its_cooldown() {
+    let (alarms, mut suppliers, at) = retry_owners();
+    let scope = authority((0, 0));
+    for until in [30, 10] {
+        let _ = suppliers.defer_incompatible(source(0), vec![(scope, hash(0))], at(until), at(0));
+    }
+    assert!(is_body_retry_avoided(
+        &alarms,
+        &suppliers,
+        source(0),
+        scope,
+        hash(0),
+        at(29)
+    ));
+    assert!(!is_body_retry_avoided(
+        &alarms,
+        &suppliers,
+        source(0),
+        scope,
+        hash(0),
+        at(30)
+    ));
+}
+
+/// A retain keeps an unavailability only under its exact authority; a
+/// compatible refresh carries it to the new one.
+#[test]
+fn a_retain_drops_and_a_refresh_carries_an_unavailability() {
+    for refresh in [false, true] {
+        let (mut alarms, mut suppliers, at) = retry_owners();
+        let _ = suppliers.defer_unavailable(
+            BTreeSet::from([source(0)]),
+            authority((0, 0)),
+            hash(0),
+            at(30),
+        );
+        let next = authority((1, 0));
+        if refresh {
+            refresh_body_retry_scope(&mut alarms, &mut suppliers, next);
+        } else {
+            retain_body_retry_scope(&mut alarms, &mut suppliers, Some(next));
+        }
+        assert_eq!(
+            is_body_retry_avoided(&alarms, &suppliers, source(0), next, hash(0), at(0)),
+            refresh,
+            "refresh: {refresh}"
+        );
+    }
+}
+
+/// A refresh into a new epoch carries an unavailability, which names
+/// suppliers, but not an incompatibility, which names the old work.
+#[test]
+fn a_refresh_across_epochs_carries_only_an_unavailability() {
+    let (mut alarms, mut suppliers, at) = retry_owners();
+    let old = authority((0, 0));
+    let _ = suppliers.defer_unavailable(BTreeSet::from([source(0)]), old, hash(0), at(30));
+    let _ = suppliers.defer_incompatible(source(1), vec![(old, hash(0))], at(30), at(0));
+    let new = authority((0, 1));
+    refresh_body_retry_scope(&mut alarms, &mut suppliers, new);
+    let avoided =
+        |raw| is_body_retry_avoided(&alarms, &suppliers, source(raw), new, hash(0), at(0));
+    assert!(avoided(0));
+    assert!(!avoided(1));
+}
+
+/// A lookup under an older snapshot of the current epoch finds a deferral
+/// keyed under the current authority.
+#[test]
+fn a_lookup_checks_the_current_authority_of_its_epoch() {
+    let (mut alarms, mut suppliers, at) = retry_owners();
+    refresh_body_retry_scope(&mut alarms, &mut suppliers, authority((1, 0)));
+    let _ =
+        suppliers.defer_incompatible(source(0), vec![(authority((0, 0)), hash(0))], at(30), at(0));
+    for scope in [(0, 0), (1, 0), (2, 0)] {
+        assert!(
+            is_body_retry_avoided(
+                &alarms,
+                &suppliers,
+                source(0),
+                authority(scope),
+                hash(0),
+                at(0)
+            ),
+            "{scope:?}"
+        );
+    }
+    assert!(!is_body_retry_avoided(
+        &alarms,
+        &suppliers,
+        source(0),
+        authority((1, 1)),
+        hash(0),
+        at(0)
+    ));
 }
 
 // ---- peer summaries ----
@@ -656,25 +733,6 @@ enum TableOp {
 
 const PEERS: u8 = 3;
 const HEIGHTS: u32 = 6;
-
-#[cfg(test)]
-fn table_op() -> impl Strategy<Value = TableOp> {
-    let heights = || prop::collection::vec(0..HEIGHTS, 0..4);
-    prop_oneof![
-        2 => (0..PEERS).prop_map(TableOp::Admit),
-        3 => (0..PEERS, 0..2u64, 1..4u64, heights(), 0..2u8).prop_map(
-            |(peer, age, request, heights, hash)| TableOp::Insert { peer, age, request, heights, hash }
-        ),
-        2 => (0..PEERS, 0..2u64, 1..4u64, heights()).prop_map(
-            |(peer, age, request, heights)| TableOp::RemoveForOwner { peer, age, request, heights }
-        ),
-        1 => (0..PEERS, 0..2u64).prop_map(|(peer, age)| TableOp::Take { peer, age }),
-        2 => (0..PEERS, 0..HEIGHTS, 1..4u64)
-            .prop_map(|(peer, height, request)| TableOp::ClearHeight { peer, height, request }),
-        1 => (0..PEERS, 0..2u64).prop_map(|(peer, age)| TableOp::Close { peer, age }),
-        1 => (0..PEERS).prop_map(TableOp::RemoveClosed),
-    ]
-}
 
 fn peer_id(raw: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![raw + 1; 32]).expect("32-byte test peer id is valid")
@@ -911,7 +969,7 @@ const TABLE_PROPERTY: &str = "block/peer-registry";
 /// Applicable peer-table operations in a decoder-v1 history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct PeerRegistryReplaySummary {
-    /// Operations compared with the independent model.
+    /// Operations compared with the bookkeeping model.
     pub transitions: usize,
     /// Session admissions checked.
     pub admissions: usize,
@@ -923,51 +981,54 @@ pub struct PeerRegistryReplaySummary {
     pub owner_checks: usize,
 }
 
-/// Replay decoder-v1 quadruples against the existing peer-table model.
-/// Read at most 512 bytes and preserve exact generation and owner identities.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the peer
+/// table. Each quadruple is one input; generation and owner identities stay
+/// exact.
 pub fn replay_peer_registry_bytes(data: &[u8]) -> PeerRegistryReplaySummary {
     run_table(decode_table(data), |_, _| {})
 }
 
 fn decode_table(data: &[u8]) -> impl Iterator<Item = TableOp> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        let peer = b % PEERS;
-        let age = u64::from(b / PEERS % 2);
-        let request = u64::from(d % 3) + 1;
-        let heights = || {
-            (0..HEIGHTS)
-                .filter(|height| c & (1 << height) != 0)
-                .collect()
-        };
-        match a % 7 {
-            0 => TableOp::Admit(peer),
-            1 => TableOp::Insert {
-                peer,
-                age,
-                request,
-                heights: heights(),
-                hash: d / 3 % HASHES,
-            },
-            2 => TableOp::RemoveForOwner {
-                peer,
-                age,
-                request,
-                heights: heights(),
-            },
-            3 => TableOp::Take { peer, age },
-            4 => TableOp::ClearHeight {
-                peer,
-                height: u32::from(c) % HEIGHTS,
-                request,
-            },
-            5 => TableOp::Close { peer, age },
-            _ => TableOp::RemoveClosed(peer),
-        }
-    })
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks(4)
+        .map(|chunk| {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            let d = chunk.get(3).copied().unwrap_or(0);
+            let peer = b % PEERS;
+            let age = u64::from(b / PEERS % 2);
+            let request = u64::from(d % 3) + 1;
+            let heights = || {
+                (0..HEIGHTS)
+                    .filter(|height| c & (1 << height) != 0)
+                    .collect()
+            };
+            match a % 7 {
+                0 => TableOp::Admit(peer),
+                1 => TableOp::Insert {
+                    peer,
+                    age,
+                    request,
+                    heights: heights(),
+                    hash: d / 3 % HASHES,
+                },
+                2 => TableOp::RemoveForOwner {
+                    peer,
+                    age,
+                    request,
+                    heights: heights(),
+                },
+                3 => TableOp::Take { peer, age },
+                4 => TableOp::ClearHeight {
+                    peer,
+                    height: u32::from(c) % HEIGHTS,
+                    request,
+                },
+                5 => TableOp::Close { peer, age },
+                _ => TableOp::RemoveClosed(peer),
+            }
+        })
 }
 
 fn run_table(
@@ -1008,47 +1069,31 @@ fn run_table(
     summary
 }
 
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn peer_table_isolates_stale_generations_and_owners(ops in prop::collection::vec(table_op(), 1..60)) {
-        run_table(ops, |_, _| {});
-    }
-    #[test]
-    fn peer_table_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_peer_registry_bytes(&bytes);
-    }
-}
-
+/// Admits two peers, replaces one, inserts and removes claims under current
+/// and stale generations, takes, closes and removes a closed session.
 #[cfg(test)]
 const TABLE_WITNESS: &[u8] = &[
     0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 3, 3, 0, 0, 5, 3, 0, 0, 4, 0, 0, 1, 4, 0, 0, 0,
     5, 0, 0, 0, 6, 0, 0, 0,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn registry_witness_exercises_replacement_and_exact_owner() {
-    let summary = replay_peer_registry_bytes(TABLE_WITNESS);
-    assert_eq!(
-        summary,
-        PeerRegistryReplaySummary {
+#[cfg(test)]
+mod table_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_peer_registry_bytes,
+        target: "block_peer_registry",
+        decoder: 1,
+        witness: TABLE_WITNESS => PeerRegistryReplaySummary {
             transitions: 10,
             admissions: 2,
             replacements: 1,
             stale_generations: 2,
-            owner_checks: 2
-        }
-    );
-    assert_eq!(
-        replay_peer_registry_bytes(&[]),
-        PeerRegistryReplaySummary::default()
-    );
-    println!("tier=Machine target=block_peer_registry decoder=1 {summary:?}");
+            owner_checks: 2,
+        },
+    }
 }
 
 #[test]

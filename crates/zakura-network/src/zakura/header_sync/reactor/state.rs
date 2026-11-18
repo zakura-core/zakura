@@ -944,6 +944,45 @@ impl ReactorState {
             )
             .min()
     }
+
+    /// Panic unless the records agree with each other:
+    ///
+    /// - the repair supplier order holds each admitted peer once, and no other
+    ///   peer;
+    /// - every pending storage call and locator read carries a number already
+    ///   issued, and each locator read's call is a locator call;
+    /// - the cached-pass budget holds at most [`CACHED_PASS_BURST`] passes.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        let ordered: HashSet<&ZakuraPeerId> = self.vct_supplier_order.iter().collect();
+        assert_eq!(
+            ordered.len(),
+            self.vct_supplier_order.len(),
+            "a supplier appears once in the supplier order"
+        );
+        assert!(
+            ordered.len() == self.peers.len()
+                && self.peers.keys().all(|peer| ordered.contains(peer)),
+            "the supplier order holds exactly the admitted peers"
+        );
+        assert!(
+            self.calls
+                .pending
+                .keys()
+                .all(|number| *number <= self.calls.last),
+            "a pending call carries an issued number"
+        );
+        assert!(
+            self.locators.pending.values().all(|query| {
+                query.call.number <= self.calls.last && query.call.kind == StorageCallKind::Locator
+            }),
+            "a locator read carries an issued locator call"
+        );
+        assert!(
+            self.cached_pass_budget.passes <= CACHED_PASS_BURST,
+            "the cached-pass budget holds at most its burst"
+        );
+    }
 }
 
 /// How an attempt to send `Close` on a session ended.
@@ -1480,6 +1519,14 @@ pub(super) struct RepairCandidates {
 /// tip. So this checks only reachable height, response capacity, and schema
 /// support. The supplier proves branch membership by returning the exact target
 /// hash after the exact predecessor hash, and admission rejects anything else.
+///
+/// Each supplier becomes a candidate or lands in one rejection bucket, under
+/// the first of these that holds: its tip is below the target height; it
+/// cannot send the request in one response; it lacks schema 1; it already
+/// serves this reactor; its subscription is live, so the pass also names it in
+/// [`RepairCandidates::closing`]; the context retains its source; the task
+/// excluded its input; the task already tried it; or the task waits for its
+/// next status.
 pub(super) fn repair_candidates<'a>(
     task: &RepairRequirement,
     context: &zakura_header_chain::VctRepairContext,

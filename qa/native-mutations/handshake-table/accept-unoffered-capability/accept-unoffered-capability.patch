@@ -1,0 +1,12 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1214,9 +1214,6 @@
+         }
+         if self.remote_peer_nonce != local_peer_nonce || self.peer_nonce != remote_peer_nonce {
+             return Err(ZakuraValidationError::ControlNonceMismatch);
+-        }
+-        if self.accepted_capabilities & !offered_capabilities != 0 {
+-            return Err(ZakuraValidationError::UnofferedCapability);
+         }
+         validate_initial_limits(self.accepted_limits, local)
+             .map_err(ZakuraValidationError::from_wire_reject)?;

@@ -1,6 +1,6 @@
 # Drops a queued terminal outcome instead of offering it, so the subscriber never
 # learns that its subscription ended and the slot stays held. The input's
-# `NextTerminal` finds no outcome where the model expects one.
+# `NextTerminal` finds no outcome although one ended and none is being written.
 input = "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin"
 checks = [
     "crates/zakura-network/src/zakura/header_sync/v9/publisher",

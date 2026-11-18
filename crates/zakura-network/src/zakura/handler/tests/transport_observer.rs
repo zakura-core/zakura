@@ -749,33 +749,52 @@ async fn an_observer_panic_in_a_pipe_unwinds_once() {
     assert_eq!(cause.get_or("unset"), "service_panic");
 }
 
-/// An inbound connection that finds no admission permit left when the
-/// handler takes it over is refused before registration, keyed by its
-/// remote address.
+/// An inbound connection whose claim finds a budget full is refused before
+/// registration, keyed by its remote address and named by that budget.
 #[tokio::test]
 async fn an_inbound_connection_without_a_permit_is_refused() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    let link = Link::connect().await?;
-    let config = crate::Config::default();
-    let recorder = Arc::new(Recorder::default());
-    let handler = ZakuraProtocolHandler::new(
-        ZakuraSupervisorHandle::new(8),
-        config.network.clone(),
-        ZakuraHandshakeConfig::for_network(&config.network),
-        ZakuraLocalLimits::from_config(&config),
-    )
-    .with_transport_observer(recorder.clone());
-    let connection = link.connection.clone();
-    handler.serve_inbound(connection.clone(), None).await;
-    assert_eq!(
-        recorder.events(),
-        vec![TransportEvent::HandshakeRefused {
-            remote: connection.admitted_addr(),
-            shared_id: connection.shared_id(),
-            reason: "admission".to_owned(),
-        }]
-    );
-    link.close().await;
+    for (refusal, reason) in [
+        (InboundRefusal::Admission, "admission"),
+        (
+            InboundRefusal::PendingHandshake,
+            "Zakura resource limit exceeded: pending handshake",
+        ),
+    ] {
+        let link = Link::connect().await?;
+        let config = crate::Config::default();
+        let recorder = Arc::new(Recorder::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(8),
+            config.network.clone(),
+            ZakuraHandshakeConfig::for_network(&config.network),
+            ZakuraLocalLimits::from_config(&config),
+        )
+        .with_transport_observer(recorder.clone());
+        let connection = link.connection.clone();
+        handler
+            .serve_inbound(connection.clone(), Err(refusal))
+            .await;
+        assert_eq!(
+            recorder.events(),
+            vec![
+                TransportEvent::HandshakeRefused {
+                    remote: connection.admitted_addr(),
+                    shared_id: connection.shared_id(),
+                    reason: reason.to_owned(),
+                },
+                TransportEvent::Handshake {
+                    remote: connection.admitted_addr(),
+                    shared_id: connection.shared_id(),
+                    stage: "released",
+                    validation: None,
+                    error: None,
+                    elapsed: None,
+                },
+            ]
+        );
+        link.close().await;
+    }
     Ok(())
 }
 

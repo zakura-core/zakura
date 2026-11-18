@@ -103,13 +103,13 @@ fn state_features_have_distinct_indices_inside_their_blocks() {
     }
 }
 
-/// [`FEEDBACK_VERSION`] 4's layout: one pinned index per block, and every
+/// [`FEEDBACK_VERSION`] 5's layout: one pinned index per block, and every
 /// vocabulary's size. A change here changes what a corpus means, so it
 /// bumps the version.
 #[test]
 fn the_layout_is_pinned_to_its_version() {
     use zakura_sim::explore::state::*;
-    assert_eq!(FEEDBACK_VERSION, 4);
+    assert_eq!(FEEDBACK_VERSION, 5);
     let pinned = [
         (
             StateFeature::HeaderRetired {
@@ -203,7 +203,7 @@ fn the_layout_is_pinned_to_its_version() {
                 label: FrameLabel::Conformant,
                 stage: FrameStage::Unpunished,
             },
-            20480 + ((2 * 2) * 13 + 12) * 6 + 5,
+            20480 + ((2 * 2) * 14 + 13) * 6 + 5,
         ),
         (
             StateFeature::Transition(Transition::RefusedUnlisted),
@@ -290,11 +290,11 @@ fn the_layout_is_pinned_to_its_version() {
     assert_eq!(
         sizes,
         [
-            10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 8, 2, 3, 4, 4, 4, 2, 4, 12, 2, 13, 6,
+            10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 8, 2, 3, 4, 4, 4, 2, 4, 12, 2, 14, 6,
             18, 2, 3, 7, 8, 3, 3, 2, 2, 2
         ]
     );
-    assert_eq!(StateFeature::all().len(), 2_689);
+    assert_eq!(StateFeature::all().len(), 2_833);
     // Swapping two values inside a vocabulary keeps every size above, and
     // can keep every pinned index, but moves both values' indices. The
     // digest of every feature's index pins the whole mapping.
@@ -307,7 +307,7 @@ fn the_layout_is_pinned_to_its_version() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        digest, "62dda724b9a4bc56960d601ac0bb3a9baff241866c1b52fd4dede0ef73b65df6",
+        digest, "97fbed6b88912692acac743b89144d2bf44e6817ba5a03b7d12b63b2a5a9e4dd",
         "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
     );
 }

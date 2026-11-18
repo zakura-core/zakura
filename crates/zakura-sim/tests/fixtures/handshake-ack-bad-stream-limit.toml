@@ -1,0 +1,13 @@
+harness = "handshake/wire"
+generator = 11
+sha256 = "3269d4d1105df5878e65733117001809a5960a196d4f90a854a088532e22c1a4"
+scenario_sha256 = "abca4eff9f9ac0e491943beed4fa0a9f16750b97359ebd260b0ec17bca60fe9b"
+source = "crates/zakura-sim/tests/support/handshake_seeds.rs"
+
+[[witness]]
+property = "handshake/ack/bad-stream-limit-refused"
+expect = "holds"
+
+[[witness]]
+property = "handshake/ack/refusal-releases-slot"
+expect = "holds"

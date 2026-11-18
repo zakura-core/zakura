@@ -15,6 +15,7 @@ members = [
         "crates/zakura-consensus",
         "crates/zakura-rpc",
         "crates/zakura-node-services",
+        "crates/zakura-mempool",
         "crates/zakura-test",
         "crates/zakura-utils",
         "crates/xtask",
@@ -372,6 +373,9 @@ codegen-units = 1
 codegen-units = 1
 
 [profile.release.package.zakura-node-services]
+codegen-units = 1
+
+[profile.release.package.zakura-mempool]
 codegen-units = 1
 
 [profile.ci-tests]

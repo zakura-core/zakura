@@ -50,7 +50,10 @@
 //! response cap that covers every frame, and a guard held through the write.
 
 mod cadence;
-pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend};
+pub(crate) use cadence::{
+    Bucket, ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender,
+    MeteredReady, MeteredSender, RowSend,
+};
 
 mod serve;
 #[cfg(any(test, zakura_sim))]
@@ -74,7 +77,7 @@ pub(crate) use reservations::{
 mod session_capacity;
 pub(crate) use session_capacity::SessionCapacity;
 #[cfg(zakura_sim)]
-pub use session_capacity::{FreeSlots, SessionSlotsProbe};
+pub use session_capacity::{FreeSlots, SessionOwnership, SessionSlotsProbe};
 
 mod session_table;
 pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};

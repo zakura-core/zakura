@@ -2,12 +2,14 @@
 //!
 //! The proptest drives [`ReactorState`] the way `ReactorIO` does: it applies a
 //! committed view, runs the hint operation the update chose, and reports each
-//! request's dispatch answer before the next input. An independent model
-//! predicts every update and request from the raw view fields.
+//! request's dispatch answer before the next input. It checks the state's
+//! invariants and compares each update and request only with the view fields
+//! the test changed. Named cases pin the supplier, hint, and epoch rules.
 
 use std::{collections::BTreeSet, sync::Arc};
 
 use chrono::{DateTime, TimeZone, Utc};
+use proptest::prelude::*;
 use zakura_header_chain::{
     AlarmSet, BodySizeHint, BodySizeHintBatch, BodyWorkEpoch, ChainScore, EngineMode, EvidenceId,
     FrontierSet, SuffixWork, VerifiedGeneration,
@@ -321,7 +323,111 @@ fn only_misbehavior_reports_are_optional_actions() {
     let _ = state.queries.refused(query, ActionRefusal::Full, now);
 }
 
-// ---- model ----
+/// The alarm restarts its body search only for a supplier it has not tried:
+/// more eligible suppliers than it recorded, or as many under another set.
+#[test]
+fn a_restart_needs_a_supplier_the_alarm_has_not_tried() {
+    for (suppliers, digest_of, eligible, restarts) in [
+        (1, 0b0001, 0b0011, true),
+        (1, 0b0001, 0b0010, true),
+        (1, 0b0001, 0b0001, false),
+        (2, 0b0011, 0b0001, false),
+        (2, 0b0011, 0b0011, false),
+        (2, 0b0011, 0b0101, true),
+    ] {
+        let mut state = reactor_state(0, 20);
+        let alarmed = Spec {
+            alarm: Some(AlarmSpec {
+                attempts: 1,
+                suppliers,
+                digest_of,
+            }),
+            ..base_spec()
+        };
+        let _ = observe(&mut state, &alarmed, time::Instant::now());
+        assert_eq!(
+            state
+                .propose_supplier_restart(&sources(eligible), wall(1))
+                .is_some(),
+            restarts,
+            "{suppliers} suppliers {digest_of:#06b}, eligible {eligible:#06b}"
+        );
+    }
+}
+
+/// A changed hint revision applies the view's batches when they continue from
+/// the previous revision, and restarts from state when one is missing. Either
+/// retires the pending query, whose sizes may predate the correction. A new
+/// epoch does neither: the Sequencer resets the queued work.
+#[test]
+fn a_hint_change_applies_contiguous_batches_and_restarts_after_a_gap() {
+    let now = Instant::now();
+    for (epoch, hint_revision, first_batch, expected) in [
+        (0, 0, None, HintUpdate::Unchanged),
+        (0, 1, Some(1), HintUpdate::Apply { after_revision: 0 }),
+        (0, 3, Some(1), HintUpdate::Apply { after_revision: 0 }),
+        (0, 3, Some(2), HintUpdate::Restart { revision: 3 }),
+        (0, 1, None, HintUpdate::Restart { revision: 1 }),
+        (1, 3, Some(3), HintUpdate::Unchanged),
+    ] {
+        let mut state = reactor_state(0, 20);
+        let _ = observe(&mut state, &base_spec(), time::Instant::now());
+        let query = expect_accepted(committed_refill(&mut state, true, now));
+        let update = observe(
+            &mut state,
+            &Spec {
+                epoch,
+                hint_revision,
+                first_batch,
+                ..base_spec()
+            },
+            time::Instant::now(),
+        );
+        assert_eq!(
+            update.hints, expected,
+            "epoch {epoch}, revision {hint_revision}"
+        );
+        let kept = epoch == 0 && hint_revision == 0;
+        assert_eq!(
+            state.queries.pending(),
+            kept.then_some(query),
+            "epoch {epoch}, revision {hint_revision}"
+        );
+    }
+}
+
+/// A new epoch resets the Sequencer to the epoch's frontiers through its
+/// authority update, so the frontier update reports no advance. The same
+/// progress within an epoch is an advance.
+#[test]
+fn a_new_epoch_reports_its_frontiers_through_the_authority() {
+    for (epoch, frontiers) in [
+        (0, FrontierUpdate::Advanced(verified_frontiers(5))),
+        (1, FrontierUpdate::Unchanged),
+    ] {
+        let mut state = reactor_state(0, 20);
+        let _ = observe(&mut state, &base_spec(), time::Instant::now());
+        let advanced = Spec {
+            epoch,
+            verified: 5,
+            header: 25,
+            ..base_spec()
+        };
+        let update = observe(&mut state, &advanced, time::Instant::now());
+        assert_eq!(update.frontiers, frontiers, "epoch {epoch}");
+        if epoch == 1 {
+            assert_eq!(
+                update.authority,
+                Some(AuthorityUpdate::EpochChanged {
+                    authority: BodyWorkAuthority::for_view(&committed(&advanced)),
+                    frontiers: verified_frontiers(5),
+                })
+            );
+        }
+    }
+}
+
+// ---- property ----
 
 #[derive(Clone, Debug)]
 enum Input {
@@ -406,46 +512,27 @@ fn input() -> impl Strategy<Value = Input> {
     ]
 }
 
-/// The independent model: the previous view's raw fields, the pending query,
-/// the hint refresh, and the accepted request keys.
-struct Model {
-    spec: Option<Spec>,
-    pending: bool,
-    hint_refresh: bool,
-    accepted_restart: Option<(u64, block::Hash, [u8; 32])>,
-    accepted_retry: Option<(u64, block::Hash, [u8; 32])>,
-    evidence: Vec<((u8, u64, block::Hash, [u8; 32]), EvidenceId)>,
-}
+/// A request's deduplication key: (state version, header hash, supplier-set
+/// digest).
+type Key = (u64, block::Hash, [u8; 32]);
 
-/// The fields a body-work authority depends on.
-fn authority_key(spec: &Spec) -> (u64, u64, u64, u32, u32, u8) {
-    (
-        spec.epoch,
-        spec.header_generation,
-        spec.verified_generation,
-        spec.finalized,
-        spec.header,
-        spec.header_branch,
-    )
+/// The last view the test sent, the requests it accepted against that view,
+/// and every request's evidence.
+#[derive(Default)]
+struct Sent {
+    spec: Option<Spec>,
+    /// The eligible-source bits of the last accepted restart and retry.
+    accepted_restart: Option<u8>,
+    accepted_retry: Option<u8>,
+    evidence: Vec<((u8, Key), EvidenceId)>,
 }
 
 fn header_hash_of(spec: &Spec) -> block::Hash {
     branch_hash(spec.header, spec.header_branch)
 }
 
-/// The model's prediction for one view.
-#[derive(Debug, PartialEq)]
-struct Expected {
-    alarm_cleared: Option<block::Hash>,
-    state_version: Option<u64>,
-    /// `Some(true)` for a new epoch, `Some(false)` for a refresh.
-    authority: Option<bool>,
-    frontiers: FrontierUpdate,
-    hints: HintUpdate,
-    forces_refill: bool,
-}
-
-impl Model {
+impl Sent {
+    /// The next valid view: the previous one with `step`'s changes.
     fn next_spec(&self, step: &ViewStep) -> Spec {
         let prev = self.spec.clone().unwrap_or_else(base_spec);
         let epoch = prev.epoch + u64::from(step.epoch);
@@ -477,121 +564,30 @@ impl Model {
         }
     }
 
-    fn observe(&mut self, spec: &Spec) -> Expected {
-        let prev = self.spec.replace(spec.clone());
-        self.accepted_restart = None;
-        self.accepted_retry = None;
-        let alarm_cleared = prev
-            .as_ref()
-            .filter(|prev| prev.alarm.is_some())
-            .map(header_hash_of)
-            .filter(|hash| spec.alarm.is_none() || header_hash_of(spec) != *hash);
-        let state_version = prev
-            .as_ref()
-            .is_none_or(|prev| prev.version != spec.version)
-            .then_some(spec.version);
-        let epoch_changed = prev.as_ref().is_some_and(|prev| prev.epoch != spec.epoch);
-        let authority_changed = prev
-            .as_ref()
-            .is_none_or(|prev| authority_key(prev) != authority_key(spec));
-        let authority = authority_changed.then_some(epoch_changed);
-        if authority_changed {
-            self.pending = false;
-        }
-        let frontiers = match prev.as_ref() {
-            None => FrontierUpdate::Initial(model_frontiers(spec)),
-            Some(_) if epoch_changed => FrontierUpdate::Unchanged,
-            Some(prev) if (prev.verified, prev.finalized) != (spec.verified, spec.finalized) => {
-                FrontierUpdate::Advanced(model_frontiers(spec))
-            }
-            Some(_) => FrontierUpdate::Unchanged,
-        };
-        if epoch_changed {
-            self.hint_refresh = false;
-        }
-        let old_revision = prev
-            .as_ref()
-            .map(|prev| prev.hint_revision)
-            .filter(|old| *old != spec.hint_revision);
-        let refreshed_pending = old_revision.is_some() && self.pending;
-        let hints = match old_revision {
-            None => HintUpdate::Unchanged,
-            Some(_) if epoch_changed => HintUpdate::Unchanged,
-            Some(old) if spec.first_batch.is_some_and(|first| first <= old + 1) => {
-                HintUpdate::Apply {
-                    after_revision: old,
-                }
-            }
-            Some(_) => {
-                self.hint_refresh = true;
-                HintUpdate::Restart {
-                    revision: spec.hint_revision,
-                }
-            }
-        };
-        if old_revision.is_some() {
-            self.pending = false;
-        }
-        let header_changed = prev.as_ref().is_none_or(|prev| {
-            header_hash_of(prev) != header_hash_of(spec) || prev.header != spec.header
-        });
-        Expected {
-            alarm_cleared,
-            state_version,
-            authority,
-            frontiers,
-            hints,
-            forces_refill: header_changed
-                || authority_changed
-                || refreshed_pending
-                || (old_revision.is_some() && self.hint_refresh),
-        }
-    }
-
-    /// The restart key the model expects a proposal for, if any.
-    fn restart(&self, bits: u8) -> Option<(u64, block::Hash, [u8; 32])> {
-        let spec = self.spec.as_ref()?;
-        let alarm = spec.alarm?;
-        let eligible = sources(bits);
-        let suppliers = eligible.len() as u32;
-        let digest = BodyUnavailableSummary::supplier_set_digest(&eligible);
-        let recorded = BodyUnavailableSummary::supplier_set_digest(&sources(alarm.digest_of));
-        let new_supplier =
-            suppliers > alarm.suppliers || (suppliers == alarm.suppliers && digest != recorded);
-        let key = (spec.version, header_hash_of(spec), digest);
-        (new_supplier && self.accepted_restart != Some(key)).then_some(key)
-    }
-
-    /// The operator-retry key the model expects a proposal for, if any.
-    fn retry(&self, matching: bool, bits: u8) -> Option<(u64, block::Hash, [u8; 32])> {
-        let spec = self.spec.as_ref()?;
-        spec.alarm?;
-        let eligible = sources(bits);
-        let key = (
-            spec.version,
-            header_hash_of(spec),
-            BodyUnavailableSummary::supplier_set_digest(&eligible),
-        );
-        (matching && !eligible.is_empty() && self.accepted_retry != Some(key)).then_some(key)
-    }
-
-    /// Check that one key always maps to one evidence ID, and distinct keys to distinct IDs.
+    /// One key always maps to one evidence ID, and distinct keys to distinct IDs.
     fn check_evidence(
         &mut self,
         kind: u8,
-        key: (u64, block::Hash, [u8; 32]),
+        key: Key,
         evidence: EvidenceId,
     ) -> Result<(), TestCaseError> {
-        let key = (kind, key.0, key.1, key.2);
         for (known, known_evidence) in &self.evidence {
-            prop_assert_eq!(*known == key, *known_evidence == evidence);
+            prop_assert_eq!(*known == (kind, key), *known_evidence == evidence);
         }
-        self.evidence.push((key, evidence));
+        self.evidence.push(((kind, key), evidence));
         Ok(())
     }
 }
 
-fn model_frontiers(spec: &Spec) -> BlockSyncFrontiers {
+fn verified_frontiers(verified: u32) -> BlockSyncFrontiers {
+    frontiers_of(&Spec {
+        verified,
+        ..base_spec()
+    })
+}
+
+/// The verified and finalized frontiers `spec` names.
+fn frontiers_of(spec: &Spec) -> BlockSyncFrontiers {
     BlockSyncFrontiers {
         finalized_height: block::Height(spec.finalized),
         verified_block_tip: block::Height(spec.verified),
@@ -599,152 +595,211 @@ fn model_frontiers(spec: &Spec) -> BlockSyncFrontiers {
     }
 }
 
-fn check_update(
-    actual: &CommittedViewUpdate,
-    previous: Option<&CommittedHeaderChainView>,
-    current: &CommittedHeaderChainView,
-    expected: &Expected,
-    hint_refresh_active: bool,
+/// Check a view's update against the fields the test changed, after IO ran its
+/// hint operation.
+fn check_view(
+    state: &ReactorState,
+    update: &CommittedViewUpdate,
+    prev: Option<&Spec>,
+    spec: &Spec,
 ) -> Result<(), TestCaseError> {
+    let current = committed(spec);
+    let scope = BodyWorkAuthority::for_view(&current);
+    let previous_scope = prev.map(|prev| BodyWorkAuthority::for_view(&committed(prev)));
+    let authority_changed = previous_scope != Some(scope);
+    let epoch_changed = prev.is_some_and(|prev| prev.epoch != spec.epoch);
+    let revision_changed = prev.is_some_and(|prev| prev.hint_revision != spec.hint_revision);
+    let frontiers_changed =
+        prev.is_some_and(|prev| (prev.verified, prev.finalized) != (spec.verified, spec.finalized));
+    let header_changed = prev.is_none_or(|prev| {
+        (prev.header, header_hash_of(prev)) != (spec.header, header_hash_of(spec))
+    });
+
+    // The update names the previous view's alarm that this view no longer raises.
+    let cleared = prev
+        .filter(|prev| prev.alarm.is_some())
+        .map(header_hash_of)
+        .filter(|hash| spec.alarm.is_none() || header_hash_of(spec) != *hash);
     prop_assert_eq!(
-        actual.alarm_cleared.map(|(_, hash)| hash),
-        expected.alarm_cleared
+        update.alarm_cleared,
+        cleared.map(|hash| (previous_scope.expect("an alarm has a view"), hash))
     );
-    if let Some((scope, _)) = actual.alarm_cleared {
-        let previous = previous.expect("a cleared alarm has a previous view");
-        prop_assert_eq!(scope, BodyWorkAuthority::for_view(previous));
-    }
     prop_assert_eq!(
-        actual.state_version.map(StateVersion::get),
-        expected.state_version
+        update.state_version.map(StateVersion::get),
+        prev.is_none_or(|prev| prev.version != spec.version)
+            .then_some(spec.version)
     );
-    let current_authority = BodyWorkAuthority::for_view(current);
-    match (actual.authority, expected.authority) {
-        (None, None) => {}
-        (
-            Some(AuthorityUpdate::EpochChanged {
-                authority,
-                frontiers,
-            }),
-            Some(true),
-        ) => {
-            prop_assert_eq!(authority, current_authority);
-            prop_assert_eq!(frontiers, block_sync_frontiers(current));
+    match update.authority {
+        None => prop_assert!(!authority_changed),
+        Some(AuthorityUpdate::EpochChanged {
+            authority,
+            frontiers,
+        }) => {
+            prop_assert!(authority_changed && epoch_changed);
+            prop_assert_eq!(authority, scope);
+            prop_assert_eq!(frontiers, frontiers_of(spec));
         }
-        (Some(AuthorityUpdate::Refreshed(authority)), Some(false)) => {
-            prop_assert_eq!(authority, current_authority);
+        Some(AuthorityUpdate::Refreshed(authority)) => {
+            prop_assert!(authority_changed && !epoch_changed);
+            prop_assert_eq!(authority, scope);
         }
-        (actual, expected) => prop_assert!(false, "authority {actual:?}, expected {expected:?}"),
     }
-    prop_assert_eq!(actual.frontiers, expected.frontiers);
-    prop_assert_eq!(actual.hints, expected.hints);
-    prop_assert_eq!(
-        actual.forces_refill(hint_refresh_active),
-        expected.forces_refill
-    );
+    match update.frontiers {
+        FrontierUpdate::Initial(frontiers) => {
+            prop_assert!(prev.is_none());
+            prop_assert_eq!(frontiers, frontiers_of(spec));
+        }
+        FrontierUpdate::Advanced(frontiers) => {
+            prop_assert!(frontiers_changed);
+            prop_assert_eq!(frontiers, frontiers_of(spec));
+        }
+        FrontierUpdate::Unchanged => {
+            prop_assert!(prev.is_some() && (epoch_changed || !frontiers_changed));
+        }
+    }
+    match update.hints {
+        HintUpdate::Unchanged => prop_assert!(epoch_changed || !revision_changed),
+        HintUpdate::Apply { after_revision } => {
+            prop_assert!(revision_changed);
+            prop_assert_eq!(Some(after_revision), prev.map(|prev| prev.hint_revision));
+        }
+        HintUpdate::Restart { revision } => {
+            prop_assert!(revision_changed);
+            prop_assert_eq!(revision, spec.hint_revision);
+        }
+    }
+    if authority_changed || revision_changed {
+        prop_assert_eq!(state.queries.pending(), None);
+    }
+    if epoch_changed {
+        prop_assert_eq!(state.queries.hint_refresh(), None);
+    }
+    if authority_changed || header_changed {
+        prop_assert!(update.forces_refill(state.queries.hint_refresh().is_some()));
+    }
+    prop_assert_eq!(state.committed_view(), Some(&current));
+    prop_assert_eq!(state.body_work_scope(), Some(scope));
+    prop_assert_eq!(state.progress.best_header_tip.0, spec.header);
+    prop_assert_eq!(state.progress.best_header_hash, header_hash_of(spec));
     Ok(())
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
     /// Committed views, refills, and body-availability requests keep the
-    /// update, pending query, hint refresh, mirrors, and accepted request keys
-    /// equal to the model's after every step.
+    /// state's invariants. Each update and request reports what the views the
+    /// test sent changed, and an accepted request is not proposed again until
+    /// the next view.
     #[test]
-    fn committed_view_updates_match_model(inputs in prop::collection::vec(input(), 1..40)) {
+    fn committed_views_and_requests_keep_every_property(inputs in prop::collection::vec(input(), 1..40)) {
         let now = Instant::now();
         let mut state = reactor_state(0, 20);
-        let mut model = Model {
-            spec: None,
-            pending: false,
-            hint_refresh: false,
-            accepted_restart: None,
-            accepted_retry: None,
-            evidence: Vec::new(),
-        };
+        let mut sent = Sent::default();
         for input in inputs {
             match input {
                 Input::View(step) => {
-                    let spec = model.next_spec(&step);
-                    let previous = state.committed_view().cloned();
-                    let actual = observe(&mut state, &spec, time::Instant::now());
-                    let expected = model.observe(&spec);
-                    let current = committed(&spec);
-                    check_update(
-                        &actual,
-                        previous.as_ref(),
-                        &current,
-                        &expected,
-                        state.queries.hint_refresh().is_some(),
-                    )?;
-                    prop_assert_eq!(state.committed_view(), Some(&current));
-                    prop_assert_eq!(state.body_work_scope(), Some(BodyWorkAuthority::for_view(&current)));
-                    prop_assert_eq!(state.progress.best_header_tip.0, spec.header);
-                    prop_assert_eq!(state.progress.best_header_hash, header_hash_of(&spec));
+                    let spec = sent.next_spec(&step);
+                    let update = observe(&mut state, &spec, time::Instant::now());
+                    check_view(&state, &update, sent.spec.as_ref(), &spec)?;
+                    sent.spec = Some(spec);
+                    sent.accepted_restart = None;
+                    sent.accepted_retry = None;
                 }
                 Input::Refill { accept } => {
-                    if let Refill::Accepted(_) = committed_refill(&mut state, accept, now) {
-                        model.pending = true;
-                    }
+                    let _ = committed_refill(&mut state, accept, now);
                 }
                 Input::Restart { bits, accept } => {
                     let actual = state.propose_supplier_restart(&sources(bits), wall(9));
-                    let expected = model.restart(bits);
-                    prop_assert_eq!(actual.is_some(), expected.is_some(), "restart {:?}", actual);
-                    if let (Some(request), Some(key)) = (actual, expected) {
-                        let BlockSyncAction::RestartBodyAvailability { expected_version, discovery } =
-                            request.action()
-                        else {
-                            panic!("a supplier restart proposes RestartBodyAvailability");
-                        };
-                        let alarm = model.spec.as_ref().and_then(|spec| spec.alarm).expect("alarmed");
-                        prop_assert_eq!(expected_version.get(), key.0);
-                        prop_assert_eq!(discovery.hash, key.1);
-                        prop_assert_eq!(discovery.availability.supplier_set_digest, key.2);
-                        prop_assert_eq!(discovery.availability.suppliers, sources(bits).len() as u32);
-                        prop_assert_eq!(discovery.availability.attempts, alarm.attempts);
-                        prop_assert_eq!(discovery.availability.started_at, wall(0));
-                        prop_assert_eq!(discovery.availability.next_probe_at, wall(9));
-                        prop_assert!(discovery.availability.alarmed);
-                        model.check_evidence(0, key, discovery.evidence)?;
-                        if accept {
-                            state.alarm_request_accepted(request);
-                            model.accepted_restart = Some(key);
-                        }
+                    let alarm = sent.spec.as_ref().and_then(|spec| spec.alarm);
+                    prop_assert!(alarm.is_some() || actual.is_none(), "a restart needs an alarm");
+                    prop_assert!(
+                        sent.accepted_restart != Some(bits) || actual.is_none(),
+                        "an accepted restart is not proposed again"
+                    );
+                    let Some(request) = actual else { continue };
+                    let spec = sent.spec.as_ref().expect("an alarm has a view");
+                    let alarm = alarm.expect("checked above");
+                    let action = request.action();
+                    let BlockSyncAction::RestartBodyAvailability { expected_version, discovery } =
+                        action.clone()
+                    else {
+                        panic!("a supplier restart proposes RestartBodyAvailability");
+                    };
+                    let key = (
+                        spec.version,
+                        header_hash_of(spec),
+                        BodyUnavailableSummary::supplier_set_digest(&sources(bits)),
+                    );
+                    prop_assert_eq!(expected_version.get(), key.0);
+                    prop_assert_eq!(discovery.hash, key.1);
+                    prop_assert_eq!(discovery.availability.supplier_set_digest, key.2);
+                    prop_assert_eq!(discovery.availability.suppliers, sources(bits).len() as u32);
+                    prop_assert_eq!(discovery.availability.attempts, alarm.attempts);
+                    prop_assert_eq!(discovery.availability.started_at, wall(0));
+                    prop_assert_eq!(discovery.availability.next_probe_at, wall(9));
+                    prop_assert!(discovery.availability.alarmed);
+                    sent.check_evidence(0, key, discovery.evidence)?;
+                    if accept {
+                        state.alarm_request_accepted(request);
+                        sent.accepted_restart = Some(bits);
+                    } else {
+                        // A refusal records nothing, so the same call proposes it again.
+                        let again = state.propose_supplier_restart(&sources(bits), wall(9));
+                        prop_assert_eq!(
+                            format!("{:?}", again.map(|request| request.action())),
+                            format!("{:?}", Some(action))
+                        );
                     }
                 }
                 Input::Retry { matching, bits, accept } => {
-                    let hash = match (matching, model.spec.as_ref()) {
+                    let hash = match (matching, sent.spec.as_ref()) {
                         (true, Some(spec)) => header_hash_of(spec),
                         _ => block::Hash([0xEE; 32]),
                     };
                     let actual = state.propose_operator_retry(hash, &sources(bits), wall(9));
-                    let expected = model.retry(matching, bits);
-                    prop_assert_eq!(actual.is_some(), expected.is_some(), "retry {:?}", actual);
-                    if let (Some(request), Some(key)) = (actual, expected) {
-                        let BlockSyncAction::RetryBodyAvailability { expected_version, retry } =
-                            request.action()
-                        else {
-                            panic!("an operator retry proposes RetryBodyAvailability");
-                        };
-                        prop_assert_eq!(expected_version.get(), key.0);
-                        prop_assert_eq!(retry.hash, key.1);
-                        prop_assert_eq!(retry.availability.supplier_set_digest, key.2);
-                        prop_assert_eq!(retry.availability.suppliers, sources(bits).len() as u32);
-                        prop_assert_eq!(retry.availability.attempts, 0);
-                        prop_assert_eq!(retry.availability.started_at, wall(9));
-                        prop_assert!(!retry.availability.alarmed);
-                        model.check_evidence(1, key, retry.evidence)?;
-                        if accept {
-                            state.alarm_request_accepted(request);
-                            model.accepted_retry = Some(key);
-                        }
+                    let alarmed = sent.spec.as_ref().is_some_and(|spec| spec.alarm.is_some());
+                    prop_assert!(
+                        (alarmed && matching && bits != 0) || actual.is_none(),
+                        "a retry needs the alarmed hash and a supplier"
+                    );
+                    prop_assert!(
+                        sent.accepted_retry != Some(bits) || actual.is_none(),
+                        "an accepted retry is not proposed again"
+                    );
+                    let Some(request) = actual else { continue };
+                    let spec = sent.spec.as_ref().expect("an alarm has a view");
+                    let action = request.action();
+                    let BlockSyncAction::RetryBodyAvailability { expected_version, retry } =
+                        action.clone()
+                    else {
+                        panic!("an operator retry proposes RetryBodyAvailability");
+                    };
+                    let key = (
+                        spec.version,
+                        header_hash_of(spec),
+                        BodyUnavailableSummary::supplier_set_digest(&sources(bits)),
+                    );
+                    prop_assert_eq!(expected_version.get(), key.0);
+                    prop_assert_eq!(retry.hash, key.1);
+                    prop_assert_eq!(retry.availability.supplier_set_digest, key.2);
+                    prop_assert_eq!(retry.availability.suppliers, sources(bits).len() as u32);
+                    prop_assert_eq!(retry.availability.attempts, 0);
+                    prop_assert_eq!(retry.availability.started_at, wall(9));
+                    prop_assert_eq!(retry.availability.next_probe_at, wall(9));
+                    prop_assert!(!retry.availability.alarmed);
+                    sent.check_evidence(1, key, retry.evidence)?;
+                    if accept {
+                        state.alarm_request_accepted(request);
+                        sent.accepted_retry = Some(bits);
+                    } else {
+                        let again = state.propose_operator_retry(hash, &sources(bits), wall(9));
+                        prop_assert_eq!(
+                            format!("{:?}", again.map(|request| request.action())),
+                            format!("{:?}", Some(action))
+                        );
                     }
                 }
             }
-            prop_assert_eq!(state.queries.pending().is_some(), model.pending);
-            prop_assert_eq!(state.queries.hint_refresh().is_some(), model.hint_refresh);
+            state.assert_invariants();
         }
     }
 }

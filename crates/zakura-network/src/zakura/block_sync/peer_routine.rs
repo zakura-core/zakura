@@ -779,6 +779,10 @@ impl PeerRoutine {
             return;
         }
         self.trace_wake("view_reset");
+        // Their responses may still arrive, and the reset may queue the same
+        // blocks again. The receive path then adopts them instead of downloading
+        // them twice.
+        self.state.note_reset_withdrawn();
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
@@ -1239,8 +1243,9 @@ impl PeerRoutine {
     /// Accept a wanted unmatched body whose height another published request
     /// reserves: the arrival ends that request's reservation
     /// (first-completion-wins). Pending work has no owner, so a body for it is
-    /// left to the caller's ignore path. A received body consumes no request
-    /// budget.
+    /// left to the caller's ignore path, unless a destructive view reset withdrew
+    /// this session's request for it (see [`Self::adopt_reset_withdrawn_body`]).
+    /// A received body consumes no request budget.
     fn accept_unmatched_queued_body(&mut self, body: ReceivedBody) -> bool {
         let (height, hash, serialized_bytes) = (body.height, body.hash, body.serialized_bytes);
         if self.io.work.hash_for_height(height) != Some(hash) {
@@ -1257,7 +1262,15 @@ impl PeerRoutine {
         // create an unowned completion, so the caller ignores it. The queue
         // rechecks `hash` under the transfer's lock: a reset and reissue since
         // the caller's lookup leaves the replacement funded.
-        let (owner, settlement) = match self.io.work.begin_unmatched_receipt(height, hash) {
+        let ended = match self.io.work.begin_unmatched_receipt(height, hash) {
+            Ok(Some(ended)) => {
+                metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+                Ok(Some(ended))
+            }
+            Ok(None) => self.adopt_reset_withdrawn_body(height, hash),
+            Err(error) => Err(error),
+        };
+        let (owner, settlement) = match ended {
             Ok(Some(ended)) => ended,
             Ok(None) => return false,
             Err(_) => {
@@ -1268,7 +1281,6 @@ impl PeerRoutine {
         self.io
             .trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
-        metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
         let (funding, admitted_estimate_bytes) = (settlement.funding, Some(settlement.charge));
 
         let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
@@ -1313,6 +1325,42 @@ impl PeerRoutine {
         self.io
             .send_under_receipt(body, owner, funding, admitted_estimate_bytes);
         true
+    }
+
+    /// Take pending work for a body that answers a request this session sent and
+    /// a destructive view reset withdrew. The reset queued the same block again,
+    /// and the peer was already sending it, so a new request would download it
+    /// twice. Pending work that no reset withdrew from this session stays with
+    /// the caller's ignore path.
+    fn adopt_reset_withdrawn_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<
+        Option<(
+            zakura_header_chain::BodyWorkOwner,
+            super::work_queue::EndedReservation,
+        )>,
+        crate::zakura::transport::ReservationError,
+    > {
+        if !self
+            .state
+            .was_reset_withdrawn(height, hash, self.io.download_floor())
+        {
+            return Ok(None);
+        }
+        let Some(request_id) = self.state.allocate_request_id() else {
+            return Ok(None);
+        };
+        let adopted =
+            self.io
+                .work
+                .begin_pending_receipt(height, hash, self.io.generation, request_id)?;
+        if adopted.is_some() {
+            self.state.forget_reset_withdrawn(height);
+            metrics::counter!("sync.block.response.reset_withdrawn_accepted").increment(1);
+        }
+        Ok(adopted)
     }
 
     /// Both endings close the whole original request. A short `BlocksDone`

@@ -387,6 +387,32 @@ impl WorkQueue {
         self.begin_receipt(|state| state.end_competing_reservation_at_receipt(height, hash))
     }
 
+    /// Take pending `height` for attempt `(session_id, request_id)`, which already
+    /// holds the body for `hash`. A destructive reset can withdraw a request whose
+    /// response is still arriving and queue the same block again. Adopting that
+    /// body avoids downloading it twice. The body needs no request funding, so
+    /// the receipt carries none. Returns `None` unless `height` is pending for
+    /// `hash`.
+    pub(super) fn begin_pending_receipt(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+        session_id: u64,
+        request_id: NonZeroU64,
+    ) -> Result<Option<(zakura_header_chain::BodyWorkOwner, EndedReservation)>, ReservationError>
+    {
+        let mut inner = self.lock();
+        let Some(owner) =
+            inner
+                .state
+                .adopt_pending_at_receipt(height, hash, (session_id, request_id))
+        else {
+            return Ok(None);
+        };
+        let funding = inner.funding.split(0)?;
+        Ok(Some((owner, EndedReservation { charge: 0, funding })))
+    }
+
     fn begin_receipt(
         &self,
         end: impl FnOnce(&mut WorkQueueState) -> Option<(zakura_header_chain::BodyWorkOwner, u64)>,

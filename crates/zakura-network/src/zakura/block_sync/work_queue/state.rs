@@ -754,6 +754,33 @@ impl WorkQueueState {
             .map(|charge| (owner, charge))
     }
 
+    /// Move pending `height` to `attempt` as an already received body, when that
+    /// attempt holds the body for `hash`. The item keeps its released ledger, so
+    /// the move charges nothing. Returns the new owner, or `None` unless `height`
+    /// is pending for `hash` and free to retry.
+    pub(in crate::zakura::block_sync) fn adopt_pending_at_receipt(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        attempt: (u64, std::num::NonZeroU64),
+    ) -> Option<BodyWorkOwner> {
+        let floor = self.floor;
+        self.pending.get(&height).filter(|item| {
+            item.hash == hash && !item.retry_after_tip.is_some_and(|tip| floor <= tip)
+        })?;
+        let mut item = self.pending.remove(&height)?;
+        if let Some(authority) = self.current_authority {
+            item.scope = authority;
+        }
+        let owner = item.scope.bind(attempt.0, attempt.1);
+        item.owner = Some(owner);
+        item.provisional = false;
+        item.answered_elsewhere = false;
+        debug_assert_eq!(item.budget, BlockBudgetLedger::Released);
+        self.in_flight.insert(height, item);
+        Some(owner)
+    }
+
     /// End any reservation `owner` holds on a received height. Returns the bytes
     /// that left the ledger, or `None` when `owner` does not hold the in-flight height.
     #[cfg(any(test, feature = "p2p-fuzz"))]

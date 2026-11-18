@@ -16,6 +16,7 @@ use super::scaling_tests::{deliver, probe, probe_in, Probe};
 use super::tests::shared_floor_routine;
 use super::*;
 use crate::zakura::{regulation::ReservationPool, transport::ByteBudget};
+use zakura_chain::serialization::ZcashDeserializeInto;
 
 fn one_request_probe() -> Probe {
     probe_in(1, ReservationPool::new(1).unwrap())
@@ -489,5 +490,92 @@ async fn accounting_failure_cancels_production_receipt() {
         drop(retained);
         assert_eq!(budget.reserved(), 0);
         assert!(budget.is_closed());
+    }
+}
+
+/// A destructive view reset withdraws a request whose body is already on its
+/// way, then queues the same block again. The routine adopts the body when it
+/// arrives instead of downloading it twice. Without the reset, a body for
+/// pending work still takes the ignore path.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_withdrawn_by_a_reset_and_queued_again_is_adopted() {
+    for reset in [true, false] {
+        let (out_send, mut outbound) = crate::zakura::framed_channel(16);
+        let config = ZakuraBlockSyncConfig {
+            request_timeout: Duration::from_secs(3600),
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let budget = ByteBudget::new(config.inflight_block_bytes());
+        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        work.set_estimate_floor_for_tests(100);
+        let (mut routine, mut ends) = super::tests::TestRoutine {
+            config,
+            work: Some(Arc::clone(&work)),
+            ..super::tests::TestRoutine::new(out_send)
+        }
+        .build();
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 1,
+            ..BlockSyncStatus::default()
+        });
+        let template: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block vector parses"),
+        );
+        let block = super::super::tests::fake_block_at_height(&template, block::Height(1));
+        let queue = || {
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(1),
+                    block.hash(),
+                    BlockSizeEstimate::Confirmed(100),
+                )],
+            )
+        };
+        queue();
+        assert_eq!(routine.try_fill().sent, 1);
+        outbound.recv().await.unwrap();
+
+        if reset {
+            // The Sequencer resets the queue, then the routine sees the new epoch.
+            work.reset_above(block::Height(0));
+            ends.view.send_modify(|view| view.reset_epoch += 1);
+            routine.on_view_changed();
+        } else {
+            let owner = work.owner_for_height(block::Height(1)).unwrap();
+            forget_request(&mut routine, block::Height(1));
+            work.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+        }
+        assert!(routine.state.window.outstanding.is_empty());
+        if reset {
+            assert_eq!(queue(), 1, "the reset left the height free to queue again");
+        }
+        assert!(work.pending_contains(block::Height(1)));
+
+        deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
+
+        assert_eq!(
+            ends.bodies.try_recv().is_ok(),
+            reset,
+            "only a body the reset withdrew reaches the sequencer"
+        );
+        assert_eq!(work.in_flight_contains(block::Height(1)), reset);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the adopted body holds no request charge"
+        );
+        if reset {
+            routine.try_fill();
+            assert!(
+                futures::poll!(Box::pin(outbound.recv())).is_pending(),
+                "the adopted block is not requested again"
+            );
+        }
     }
 }

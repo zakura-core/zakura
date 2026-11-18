@@ -64,6 +64,11 @@ pub(super) struct PeerState {
     /// download floor leave, so the download window above the floor bounds
     /// this map.
     pub(super) uncredited_timeouts: BTreeMap<block::Height, UncreditedTimeout>,
+    /// Unreceived bodies of requests that a destructive view reset withdrew
+    /// from this session, by height. Their responses can still arrive. Heights
+    /// at or below the download floor leave, so the download window above the
+    /// floor bounds this map.
+    reset_withdrawn: BTreeMap<block::Height, block::Hash>,
     /// Whether the last fill stopped because the node-wide request pool was
     /// empty, so the routine waits for a pool entry.
     pub(super) request_pool_waiting: bool,
@@ -143,6 +148,7 @@ impl PeerState {
             window,
             retry_avoid: BTreeMap::new(),
             uncredited_timeouts: BTreeMap::new(),
+            reset_withdrawn: BTreeMap::new(),
             request_pool_waiting: false,
             allow_no_progress_park,
             status_pacing: InboundStatusPacing {

@@ -18,6 +18,13 @@ const MIN_MARGIN: Duration = Duration::from_millis(20);
 const MARGIN_SHARE: u32 = 4;
 
 /// How long past its expected answer time a first request may run before it counts as stalled.
+///
+/// Measured from the expected time rather than from the request, so a far peer's normal download
+/// is not half a stall. A candidate clearly faster than the first peer is already asked by the
+/// prediction, so a stall only catches a request that has gone wrong. On the mainnet experiment
+/// nodes, first requests passed this point on 3.0% of blocks in Singapore and 0.1-0.3% in
+/// Amsterdam and New York; twice the expected time would have caught 2.6-13% of them, mostly
+/// nearby peers a few milliseconds late.
 const STALL_SLACK: Duration = Duration::from_millis(500);
 
 /// Why a second request was sent.
@@ -58,8 +65,7 @@ pub(super) fn second_request_reason(
     waited: Duration,
     best_candidate_score: Option<Duration>,
 ) -> Option<SecondRequestReason> {
-    let stall_after = (first_score * 2).max(first_score + STALL_SLACK);
-    if waited >= stall_after {
+    if waited >= first_score + STALL_SLACK {
         return Some(SecondRequestReason::Stalled);
     }
 
@@ -145,14 +151,20 @@ mod tests {
     #[test]
     fn without_a_measured_candidate_only_a_stall_sends_a_second_request() {
         assert_eq!(second_request_reason(ms(230), ms(100), None), None);
-        // A stall is the larger of twice the expected time and the expected time plus 500 ms.
+        // A stall is 500 ms past the expected time, however fast or slow the first peer.
         assert_eq!(second_request_reason(ms(230), ms(729), None), None);
         assert_eq!(
             second_request_reason(ms(230), ms(730), None),
             Some(SecondRequestReason::Stalled)
         );
+        assert_eq!(second_request_reason(ms(5), ms(504), None), None);
         assert_eq!(
-            second_request_reason(ms(800), ms(1600), None),
+            second_request_reason(ms(5), ms(505), None),
+            Some(SecondRequestReason::Stalled)
+        );
+        assert_eq!(second_request_reason(ms(800), ms(1299), None), None);
+        assert_eq!(
+            second_request_reason(ms(800), ms(1300), None),
             Some(SecondRequestReason::Stalled)
         );
     }

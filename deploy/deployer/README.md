@@ -225,7 +225,8 @@ across would silently reintroduce the stall.
 
 `asia-hedged` and `asia-scored` are legacy-only nodes in Singapore that each
 measure one experimental setting from an open PR: `[network.block_hedge]` from
-PR 2548 and `[network.block_source_score]` from PR 2558. Their configs enable those
+PR 2548 and `[network.block_source_score]` with `second_request` from PRs 2558
+and 2572. Their configs enable those
 settings, so each entry is pinned to the build the node runs instead of the
 deployed ref: a build from `main` would refuse the config. Unpin an entry when
 its PR merges, or remove it when the experiment ends.

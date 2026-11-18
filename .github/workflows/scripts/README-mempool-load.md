@@ -114,6 +114,20 @@ has no key to override it. So `--latest-upgrade` defaults to `nu7`, and
 blocks by it. NU6.3 closes Orchard to new value, so Kresko blasts Ironwood on
 this chain.
 
+The target doesn't set the block rate within a run, though. NU7 averages
+difficulty over 102 blocks, so a run of a few dozen blocks stays near the
+starting difficulty, and blocks come as fast as the internal miner finds them
+there: about 7 s on a c-16. Read figures that depend on the block interval,
+like confirm delay and how many nodes a transaction reaches, against that
+rate rather than Mainnet's 25 s.
+
+**Nodes write Zakura traces.** The node logs run at INFO and say nothing about
+block-sync requests, so the lab also sets each node's
+`[network.zakura] trace_dir` to `nodes/<name>/zakura-traces`. `collect` keeps
+the `block_sync`, `header_sync`, `chain_tip`, `mempool` and `ratelimit` tables,
+which show when each block was requested, committed and applied to the mempool,
+including the mempool resets that follow a two-block jump.
+
 **`up` is idempotent.** It skips seeding a node that already holds the chain.
 Resubmitting genesis to a node whose tip has moved past it returns a bare
 `rejected`, which reads like a chain failure rather than "this already ran".
@@ -195,6 +209,9 @@ and the input to `mempool-load-compare.py`.
   `workload_failures` and excluded from the graded reject rate — one of them in
   a 22-submission run is 4.35%, near enough the 5% threshold to fail a healthy
   PR.
+- **Failed verifications come with a reason.** The backpressure table shows a
+  `mempool_failed_verify_tasks_total{reason="..."}` row per reason, summed over
+  nodes. `samples.jsonl` keeps them per node.
 - **Reject rate is only graded above `--min-graded-submissions`** (default 50),
   for the same reason.
 - A run is `failed` on panics, zero submissions, missing traces, graded rejects

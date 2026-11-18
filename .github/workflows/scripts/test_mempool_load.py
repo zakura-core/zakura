@@ -323,6 +323,22 @@ class LabConfigRewrite(unittest.TestCase):
         text = lab.to_node_schema(self.KRESKO_NETWORK)
         self.assertEqual(lab.to_node_schema(text), text)
 
+    def test_each_node_traces_into_its_own_dir(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = Path(tmp)
+            node_dir = lab_dir / "nodes" / lab.node_name(0)
+            node_dir.mkdir(parents=True)
+            config = node_dir / "zakura.toml"
+            config.write_text('[network.zakura]\nlisten_addr = "127.0.0.101:18234"\n')
+            # Twice, as on a config an earlier run already rewrote: still one key.
+            lab.enable_zakura_traces(lab_dir, 1)
+            lab.enable_zakura_traces(lab_dir, 1)
+            text = config.read_text()
+        self.assertEqual(text.count("trace_dir = "), 1)
+        self.assertIn(f'[network.zakura]\ntrace_dir = "{node_dir / lab.ZAKURA_TRACE_DIR}"\n', text)
+
     def test_each_node_seeds_only_its_predecessor(self):
         import tempfile
 
@@ -507,6 +523,8 @@ mempool_queued_transactions_total 42
 zcash_mempool_size_transactions 7
 mempool_full_queue_per_peer_total{peer="1.2.3.4:8233"} 3
 mempool_full_queue_per_peer_total{peer="5.6.7.8:8233"} 4
+mempool_failed_verify_tasks_total{reason="in_state"} 5
+mempool_failed_verify_tasks_total{reason="timeout"} 2
 some_unrelated_metric 999
 malformed_metric not_a_number
 """
@@ -522,6 +540,14 @@ malformed_metric not_a_number
         # figure we grade is the total across peers.
         out = monitor.parse_prometheus(self.EXPOSITION, monitor.MEMPOOL_METRICS)
         self.assertEqual(out["mempool_full_queue_per_peer_total"], 7.0)
+
+    def test_keeps_each_failed_verify_reason(self):
+        # A run where downstream nodes failed most relayed transactions could
+        # not say why from the total alone.
+        out = monitor.parse_prometheus(self.EXPOSITION, monitor.MEMPOOL_METRICS)
+        self.assertEqual(out["mempool_failed_verify_tasks_total"], 7.0)
+        self.assertEqual(out['mempool_failed_verify_tasks_total{reason="in_state"}'], 5.0)
+        self.assertEqual(out['mempool_failed_verify_tasks_total{reason="timeout"}'], 2.0)
 
     def test_ignores_comments_and_malformed_values(self):
         out = monitor.parse_prometheus(self.EXPOSITION, ("malformed_metric",))

@@ -41,6 +41,11 @@ MEMPOOL_METRICS = (
     "mempool_full_queue_per_peer_total",
 )
 
+# Counters whose label says why they moved. Each value of the label is kept as
+# its own series as well as in the total, so a run shows why verification
+# failed, not just how often.
+BREAKDOWN_LABELS = {"mempool_failed_verify_tasks_total": "reason"}
+
 # Must match mempool-load-lab.py's NODE_IP_BASE.
 NODE_IP_BASE = 101
 
@@ -89,6 +94,11 @@ def parse_prometheus(text: str, wanted: tuple[str, ...]) -> dict[str, float]:
             continue
         # Sum across label sets (e.g. per-peer counters).
         out[base] = out.get(base, 0.0) + value
+        label = BREAKDOWN_LABELS.get(base)
+        match = label and re.search(rf'{label}="([^"]*)"', name)
+        if match:
+            key = f'{base}{{{label}="{match.group(1)}"}}'
+            out[key] = out.get(key, 0.0) + value
     return out
 
 
@@ -379,7 +389,7 @@ BACKPRESSURE_HINTS = {
     "mempool_queued_transactions_total": "Cumulative queued. Compare with submitted to see re-queues.",
     "mempool_gossiped_transactions_total": "Cumulative gossiped to peers. Should scale with submissions x peers.",
     "mempool_rejected_transaction_ids": "Size of the rejected-ID cache, NOT a count of rejected workload transactions.",
-    "mempool_failed_verify_tasks_total": "Verification tasks that failed. Non-zero deserves a look.",
+    "mempool_failed_verify_tasks_total": "Verification tasks that failed, with a row per reason below. Non-zero deserves a look.",
     "mempool_full_queue_per_peer_total": "Times a peer's queue was full. The clearest backpressure signal.",
 }
 

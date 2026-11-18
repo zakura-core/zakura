@@ -49,6 +49,13 @@ ZAKURA_P2P_PORT = 18234
 RPC_READY_TIMEOUT_SECS = 180
 
 
+# Each node's Zakura JSONL trace directory, under its node dir. The node logs
+# run at INFO and say nothing about block-sync requests, so these tables are
+# the only record of when a block was requested, committed and applied to the
+# mempool.
+ZAKURA_TRACE_DIR = "zakura-traces"
+ZAKURA_TRACE_TABLES = ("block_sync", "header_sync", "chain_tip", "mempool", "ratelimit")
+
 # Artifact allowlist. Collection copies exactly these globs -- never the lab dir
 # wholesale -- so a new secret file appearing in the payload cannot silently
 # start being uploaded. Kept here rather than in the workflow so the unit tests
@@ -57,6 +64,7 @@ COLLECTED_PATHS = (
     "nodes/*/run.log",
     "nodes/*/bootstrap.log",
     "nodes/*/zakura.toml",
+    *(f"nodes/*/{ZAKURA_TRACE_DIR}/{table}.jsonl" for table in ZAKURA_TRACE_TABLES),
     "traces/*.jsonl",
     "txblast.log",
     "config.json",
@@ -269,6 +277,7 @@ def localize_fleet(lab: Path, args) -> None:
     for config in sorted((lab / "nodes").glob("*/zakura*.toml")):
         config.write_text(to_node_schema(config.read_text()))
     pin_chain_topology(lab, args.node_count)
+    enable_zakura_traces(lab, args.node_count)
 
 
 def to_node_schema(text: str) -> str:
@@ -315,6 +324,27 @@ def pin_chain_topology(lab: Path, node_count: int) -> None:
         )
         if replaced != 1:
             raise RuntimeError(f"{config}: expected one initial_testnet_peers list")
+        config.write_text(text)
+
+
+def enable_zakura_traces(lab: Path, node_count: int) -> None:
+    """Points each run config's `[network.zakura] trace_dir` at its node's `ZAKURA_TRACE_DIR`.
+
+    A `trace_dir` line already right under the table header is replaced, so
+    the rewrite can run again on the same config.
+    """
+    for index in range(node_count):
+        node_dir = lab / "nodes" / node_name(index)
+        config = node_dir / "zakura.toml"
+        # json.dumps quotes the path as a valid TOML basic string.
+        line = f"trace_dir = {json.dumps(str(node_dir / ZAKURA_TRACE_DIR))}\n"
+        text, replaced = re.subn(
+            r"(?m)^\[network\.zakura\]\n(?:trace_dir = .*\n)?",
+            lambda _: "[network.zakura]\n" + line,
+            config.read_text(),
+        )
+        if replaced != 1:
+            raise RuntimeError(f"{config}: expected one [network.zakura] table")
         config.write_text(text)
 
 
@@ -796,13 +826,13 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--chain-id", default="mempool-load")
     gen.add_argument(
         "--latest-upgrade",
-        # NU7, like Mainnet. Main takes block spacing from the active upgrade
-        # (75 s from Blossom, 25 s from NU7) and has no key to override it, so
-        # an earlier upgrade runs a 75 s chain. From NU6.3 the blast spends
-        # Ironwood, because NU6.3 closes Orchard to new value.
+        # NU7, like Mainnet: its rules and its 25 s target spacing. Main has no
+        # key to override the spacing, so an earlier upgrade targets 75 s. The
+        # target doesn't set a short run's block rate, though (see the README).
+        # From NU6.3 the blast spends Ironwood, because NU6.3 closes Orchard to
+        # new value.
         default="nu7",
-        help="newest network upgrade the generated chain activates "
-        "(nu7 gives Mainnet's 25 s blocks)",
+        help="newest network upgrade the generated chain activates",
     )
     gen.add_argument("--experiment", default="mempool-load")
     # Kresko spaces the seeded blocks by this. The default matches NU7's 25 s

@@ -5,7 +5,7 @@
 # seed corpus because it fails by design.
 harness = "sync/wire"
 generator = 5
-sha256 = "76d83d066171d41d8d1aaef3043a4d2c5c213e5ba1d62afe0634db17101422e2"
+sha256 = "56ed925b06b04d06b32e1cb2fa21ba091ea67e65e99a588ec51618e2bcc76ee4"
 scenario_sha256 = "784be2ca7bbb2e844ea0896ccb491a7f08219c9bc7b14792e190661e6ccc3164"
 source = "crates/zakura-sim/tests/sync_wire.rs"
 

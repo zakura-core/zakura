@@ -180,6 +180,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved scenarios"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/sync_wire.rs"
+test = "regenerate_reset_mid_write"
+run = false
+reason = "a tool, not a test: it searches for and rewrites zakura#2378's committed input"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/sync_harness.rs"
 test = "regenerate_saved_scenarios"
 run = false
@@ -369,6 +375,25 @@ package = "sim"
 name = "header_sync_wire"
 smoke-secs = 60
 args = ["-len_control=0"]
+timeout-secs = 1800
+
+# `handshake/wire` runs the node's control handshake behind its real
+# transport on simulated QUIC. Its 32-byte prefix picks one of fifteen
+# scenario families, and the rest of the input picks the schedule.
+[[target]]
+package = "sim"
+name = "handshake_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
+# `handshake/counts` drives the production admission machine. Each
+# three-byte operation picks an action, an owner slot and an address.
+[[target]]
+package = "sim"
+name = "handshake_counts"
+smoke-secs = 60
+args = ["-max_len=512"]
 timeout-secs = 1800
 
 # `fixtures/all` picks any race fixture in any variant, so the target's runs

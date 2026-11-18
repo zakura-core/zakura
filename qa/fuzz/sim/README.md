@@ -37,6 +37,20 @@ about one input a second or slower. libFuzzer's default length control would
 hold their inputs at 4 bytes for a whole campaign, so their `qa/suite.toml`
 rows pass `-len_control=0`.
 
+- `handshake_wire` runs `handshake/wire` against the production QUIC endpoint
+  and protocol handler. Decoder v7's 32-byte prefix chooses control corruption,
+  prelude corruption, pacing, shared addresses, failed retries, capability flips,
+  inbound pressure during node dials, invalid stream-open churn, or partial and complete session offers.
+  The shared-address family can stagger attempts to reach the registered cap.
+  Retry cases can remove network delay, draw sixteen shared-address dialers, and pace
+  attempts at one second. Remaining bytes choose the schedule.
+- `handshake_counts` runs `handshake/counts` against production admission
+  decisions. Its three-byte operations choose an action, owner slot, and
+  address. Decoder v4 reads up to 1,536 bytes and tracks 128 owner slots.
+  A high first bit selects an address, pending, or connection burst before
+  the remaining operations. It also draws immediate failures, time advances,
+  and transport cancellations. The harness checks charges against the live owners
+  it tracks, and bounds cadence decisions by counts of charges and refunds.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of

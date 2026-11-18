@@ -119,6 +119,7 @@ pub struct WireWindows {
 /// behind its replacement's admission. The routine's drop then makes its
 /// generation-gated registry writes against the replacement's entry.
 ///
+/// The routine still runs while another task is parked on a lock it holds.
 /// The hold ends, for good, at that admission, or, with `until_claimed`,
 /// once the replacement's routine reports a published claim, or `steps`
 /// steps after the close. The routine also runs whenever nothing else can,
@@ -187,6 +188,14 @@ impl TaskHold for HeldSuperseded {
         self.routines
             .routine(task)
             .is_some_and(|(routine, generation)| routine == *peer && generation <= *superseded)
+    }
+
+    /// The routine runs while a task is parked on a lock it holds. Held
+    /// inside its writer fence's lock, it would keep the closed connection's
+    /// teardown from taking the fence, so the redial would never start and
+    /// the clock would run on until the other connections idle out.
+    fn holds_while_waited_on(&self) -> bool {
+        false
     }
 }
 
@@ -465,6 +474,7 @@ impl Subsystem for SyncWire {
                 net.sim(),
                 seed,
                 peer,
+                None,
                 observer,
                 dials,
                 move |supervisor, limits| {

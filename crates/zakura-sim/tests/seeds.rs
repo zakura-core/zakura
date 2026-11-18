@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::Serialize;
-use support::storage_witnesses;
+use support::{handshake_seeds, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -144,6 +144,65 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
     }
+    if let Some(curated) = handshake_seeds::handshake_seeds()
+        .into_iter()
+        .find(|curated| curated.stem == stem)
+    {
+        return value(curated.scenario);
+    }
+    if stem == "handshake-partial-session" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction, PeerSpec},
+        };
+        let mut peer = PeerSpec::dialing();
+        peer.capabilities |= 1 << 59;
+        peer.handshake = Some(HandshakeSpec::default());
+        peer.script = vec![
+            PeerAction::Offer {
+                kind: 902,
+                version: 1,
+                wire_id: 1,
+            },
+            PeerAction::Close,
+        ];
+        return value(Scenario {
+            peers: vec![peer; 3],
+            ..Scenario::default()
+        });
+    }
+    if stem == "handshake-stream-churn" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction},
+        };
+        let mut scenario = Scenario::default();
+        scenario.net.default_link.min_delay_ms = 0;
+        scenario.net.default_link.max_delay_ms = 0;
+        scenario.peers[0].handshake = Some(HandshakeSpec::default());
+        scenario.peers[0].script = vec![
+            PeerAction::Open {
+                kind: u16::MAX,
+                version: 1
+            };
+            64
+        ];
+        scenario.peers[0].script.push(PeerAction::Close);
+        return value(scenario);
+    }
+    if stem == "handshake-installed-services" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerSpec},
+        };
+        return value(Scenario {
+            peers: vec![PeerSpec {
+                handshake: Some(HandshakeSpec::default()),
+                ..PeerSpec::listening()
+            }],
+            ..Scenario::default()
+        });
+    }
     if let Some(plan) = SavedPlan::ALL
         .into_iter()
         .find(|plan| stem == format!("header-wire-{}", plan.name()))
@@ -193,6 +252,48 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
+        "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
+        }),
+        "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![128, 1, 128],
+        }),
+        "handshake-counts-cadence" => value(zakura_sim::record::machine::MachineScenario {
+            input: [8, 0, 0].repeat(32),
+        }),
+        "handshake-cadence-burst" | "handshake-cadence-conformant" => {
+            let conformant = stem == "handshake-cadence-conformant";
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.net.default_link.min_delay_ms = 0;
+            scenario.net.default_link.max_delay_ms = 0;
+            scenario.net.default_link.reorder = false;
+            scenario.peers = (0..if conformant { 16 } else { 1 })
+                .map(|index| {
+                    let mut peer = zakura_sim::peer::PeerSpec::dialing();
+                    peer.handshake = Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                        control: zakura_sim::peer::handshake::options::ControlFault::Network,
+                        bind_ip: Some("192.0.2.1".parse().unwrap()),
+                        retries: if conformant { 1 } else { 31 },
+                        retry_delay_ms: if conformant { 1_000 } else { 0 },
+                        dial_delay_ms: index * 60,
+                        ..Default::default()
+                    });
+                    peer
+                })
+                .collect();
+            value(scenario)
+        }
+        "handshake-slow-control" => {
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.peers[0].handshake =
+                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                    length_delay_ms: 9_000,
+                    payload_delay_ms: 9_000,
+                    ..Default::default()
+                });
+            value(scenario)
+        }
+
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],

@@ -77,3 +77,20 @@ its exact selector with `--list`, require one executed test, and compare the
 unchanged, patched, and restored runs. Only the declared assertion counts as
 detection. Native assertions do not acquire simulator property IDs through
 this mapping.
+
+## Handshake generator lanes
+
+The handshake harnesses register their scenario-family selectors with the
+generator. `handshake/wire` lists fifteen families. `handshake/counts` draws
+machine operations directly.
+
+Run searches and mutation campaigns on the droplet. For example:
+
+```sh
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generators
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generate \
+  --sim handshake/counts --seed 11 --runs 1000 --out results/handshake-counts
+cargo xtask planted loop --only session/capacity-conserved \
+  --generate-runs 100 --generate-seeds 11 --generate-harness handshake/wire \
+  --out results/handshake-capacity-loop
+```

@@ -51,8 +51,8 @@
 
 mod cadence;
 pub(crate) use cadence::{
-    ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, MeteredReady,
-    MeteredSender, RowSend,
+    Bucket, ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender,
+    MeteredReady, MeteredSender, RowSend,
 };
 
 mod serve;
@@ -77,7 +77,7 @@ pub(crate) use reservations::{
 mod session_capacity;
 pub(crate) use session_capacity::SessionCapacity;
 #[cfg(zakura_sim)]
-pub use session_capacity::{FreeSlots, SessionSlotsProbe};
+pub use session_capacity::{FreeSlots, SessionOwnership, SessionSlotsProbe};
 
 mod session_table;
 pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};

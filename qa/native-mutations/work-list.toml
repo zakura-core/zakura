@@ -326,6 +326,400 @@ witness = { planted = "qa/planted/discovery/late-response-admitted/revoke-on-tim
 property = "block-sync/reactor-query-lifecycle"
 reason = "Draft: the claim itself is under test, so its violation doesn't end a run."
 
+# One entry covers all control and prelude rows. A production guard gets one
+# patch even when several labels reach it; cases name every affected rule.
+
+[[entry]]
+id = "handshake-table"
+kind = "shared-definition"
+claim = "Control and prelude guards apply their declared consequence without registering or installing an invalid exchange."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/hello/bad-magic-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-version-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-protocol-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-path-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-role-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/wrong-network-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/wrong-chain-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/identity-mismatch-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/missing-capability-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-frame-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-message-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-stream-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-queue-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/bad-idle-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-initiator-nonce-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-responder-nonce-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/nonzero-native-transcript-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/oversize-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-magic-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-version-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-protocol-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-nonce-echo-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/unoffered-capability-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-frame-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-message-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-stream-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-queue-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/bad-idle-limit-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/limits-above-request-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/oversize-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs", "crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/bad-magic-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unknown-kind-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unnegotiated-capability-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unselected-version-resets"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/undersized-cap-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/unexpected-request-id-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/request-without-id-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/ineligible-opener-closes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "prelude_guards_apply_each_declared_consequence", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/hello/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/prelude/conformant-never-refused"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { test = "conformant_control_and_prelude_are_accepted", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-admission"
+kind = "shared-definition"
+claim = "Production admission counts and live permits preserve pending, address, and outbound-reserve bounds."
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/table/cadence_window.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/pending-bounded"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "inbound_control_pressure_preserves_a_wire_dial", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/connections-per-address-bounded"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "shared_address_registrations_stop_at_the_cap", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/counts-match-permits"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "counts_trace_replays_with_each_named_rule", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/dial-reserve-kept"
+code = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/ip.rs", "crates/zakura-quic/src/endpoint.rs"]
+witness = { test = "inbound_connection_pressure_preserves_a_wire_dial", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-release"
+kind = "shared-definition"
+claim = "A refused handshake returns every claim, permit, address charge and QUIC slot within shutdown drain."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/driver/connection.rs"]
+
+[[entry.instance]]
+property = "handshake/hello/refusal-releases-slot"
+code = []
+witness = { test = "hello_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/ack/refusal-releases-slot"
+code = []
+witness = { test = "ack_guards_refuse_each_corrupt_field", test_target = "handshake" }
+
+[[entry]]
+id = "session-installation"
+kind = "single"
+claim = "Installed sessions belong to the negotiated and enabled layout."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/installed-services-authorized"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/registry.rs", "crates/zakura-network/src/zakura/regulation/session_table.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-installed-services.bin" }
+
+[[entry]]
+id = "session-capacity"
+kind = "single"
+claim = "Every live session reservation accounts for its actual permits through the last owner."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/capacity-conserved"
+code = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs", "crates/zakura-network/src/zakura/regulation/session_table.rs", "crates/zakura-network/src/zakura/handler/service_session.rs"]
+witness = { test = "complete_session_transfers_setup_to_installed_owners", test_target = "handshake" }
+
+[[entry]]
+id = "session-setup"
+kind = "single"
+claim = "Partial offers preserve outbound setup capacity and expire within their deadline."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/setup-slot-bounded"
+code = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs", "crates/zakura-network/src/zakura/handler/service_session.rs", "crates/zakura-network/src/zakura/handler/service_session/state.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-partial-session.bin" }
+
+[[entry]]
+id = "session-stream-opens"
+kind = "single"
+claim = "Stream setup obeys concurrency and cadence bounds and releases refused permits."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/stream-opens-bounded"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/lifetime.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-stream-churn.bin" }
+
+[[entry]]
+id = "handshake-honest"
+kind = "single"
+claim = "Control validation and session setup never punish an honest peer."
+check = ["crates/zakura-sim/src/domain/session.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/honest-never-punished"
+code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+witness = { test = "honest_peer_never_punished", test_target = "header_wire_witness" }
+
+[[entry]]
+id = "handshake-quic"
+kind = "shared-definition"
+claim = "QUIC enforces source limits, Retry, TLS deadlines, supported ALPNs, and the dialed identity."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = ["crates/zakura-quic/src/endpoint.rs", "crates/zakura-quic/src/driver/endpoint.rs", "crates/zakura-quic/src/tls/verifier.rs", "crates/zakura-network/src/zakura/handshake.rs"]
+
+[[entry.instance]]
+property = "handshake/quic/pending-per-address-bounded"
+code = []
+witness = { test = "quic_pending_limit_refuses_another_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/retry-before-unvalidated-accept"
+code = []
+witness = { test = "quic_retry_validates_sources_before_tls", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/finishes-in-time"
+code = []
+witness = { test = "quic_deadline_ends_a_stalled_tls_attempt", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/alpn-required"
+code = []
+witness = { test = "quic_rejects_an_unsupported_alpn_before_control", test_target = "handshake" }
+
+[[entry.instance]]
+property = "handshake/quic/identity-required"
+code = []
+witness = { test = "quic_rejects_a_key_different_from_the_dialed_identity", test_target = "handshake" }
+
+[[entry]]
+id = "handshake-deadline"
+kind = "single"
+claim = "One deadline bounds the whole inbound control exchange."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "handshake/finishes-in-time"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-slow-control.bin" }
+
+
+[[entry]]
+id = "handshake-capability-generation"
+kind = "single"
+claim = "Registration rejects a capability snapshot that a concurrent change made obsolete."
+check = ["crates/zakura-sim/src/table/handshake.rs"]
+shared = []
+
+[[entry.instance]]
+property = "session/renegotiation-covers-inflight-handshakes"
+code = ["crates/zakura-network/src/zakura/handler.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-capability-before.bin" }
+
+
+[[entry]]
+id = "handshake-cadence"
+kind = "shared-definition"
+claim = "TLS attempts consume available address credit, and funded attempts receive neutral admission."
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/table/cadence_window.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+shared = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/regulation/cadence.rs", "crates/zakura-quic/src/endpoint.rs"]
+
+[[entry.instance]]
+property = "handshake/attempts-within-cadence"
+code = []
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-burst.bin" }
+
+[[entry.instance]]
+property = "handshake/cadence-never-refuses-conformant"
+code = ["crates/zakura-network/src/zakura/discovery/redial.rs"]
+witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-conformant.bin" }
+
 # Each `[[no-generator]]` names `Active` IDs that no generator harness can
 # reach, and why. A generator harness is one that reports the ID and doesn't
 # plant its bugs (`zakura-sim generators`); every ID here has one, but its
@@ -487,3 +881,338 @@ patch = "discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
 property = "discovery/s4v2/services/sender-within-owed"
 harness = "discovery/wire"
 families = ["get-header-sync-service"]
+
+# The handshake cases. Each family draws the test's scenario through
+# `handshake/wire`'s or `handshake/counts`'s decoder.
+
+[[drawn-witness]]
+patch = "teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch"
+property = "session/capacity-conserved"
+harness = "handshake/wire"
+families = ["partial-session"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-network-binding/skip-network-binding.patch"
+property = "handshake/hello/wrong-network-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-authenticated-identity/skip-authenticated-identity.patch"
+property = "handshake/hello/identity-mismatch-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/accept-unoffered-capability/accept-unoffered-capability.patch"
+property = "handshake/ack/unoffered-capability-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-nonce-echo/skip-nonce-echo.patch"
+property = "handshake/ack/bad-nonce-echo-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-magic/skip-hello-magic.patch"
+property = "handshake/hello/bad-magic-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-version/skip-hello-version.patch"
+property = "handshake/hello/bad-version-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-hello-protocol/skip-hello-protocol.patch"
+property = "handshake/hello/bad-protocol-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-handshake-path/skip-handshake-path.patch"
+property = "handshake/hello/bad-path-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-remote-role/skip-remote-role.patch"
+property = "handshake/hello/bad-role-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-chain-binding/skip-chain-binding.patch"
+property = "handshake/hello/wrong-chain-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-required-channel/skip-required-channel.patch"
+property = "handshake/hello/missing-capability-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-protocol/skip-ack-protocol.patch"
+property = "handshake/ack/bad-protocol-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-magic/skip-ack-magic.patch"
+property = "handshake/ack/bad-magic-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-ack-version/skip-ack-version.patch"
+property = "handshake/ack/bad-version-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-initiator-nonce/skip-native-initiator-nonce.patch"
+property = "handshake/hello/nonzero-initiator-nonce-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-responder-nonce/skip-native-responder-nonce.patch"
+property = "handshake/hello/nonzero-responder-nonce-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-native-transcript/skip-native-transcript.patch"
+property = "handshake/hello/nonzero-native-transcript-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/hello/bad-frame-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/ack/bad-frame-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-message-limits/skip-message-limits.patch"
+property = "handshake/hello/bad-message-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-message-limits/skip-message-limits.patch"
+property = "handshake/ack/bad-message-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-stream-limits/skip-stream-limits.patch"
+property = "handshake/hello/bad-stream-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-stream-limits/skip-stream-limits.patch"
+property = "handshake/ack/bad-stream-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-queue-limits/skip-queue-limits.patch"
+property = "handshake/hello/bad-queue-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-queue-limits/skip-queue-limits.patch"
+property = "handshake/ack/bad-queue-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-idle-limits/skip-idle-limits.patch"
+property = "handshake/hello/bad-idle-limit-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-idle-limits/skip-idle-limits.patch"
+property = "handshake/ack/bad-idle-limit-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-requested-limit-ceilings/skip-requested-limit-ceilings.patch"
+property = "handshake/ack/limits-above-request-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-magic/skip-prelude-magic.patch"
+property = "handshake/prelude/bad-magic-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/fallback-for-unknown-stream/fallback-for-unknown-stream.patch"
+property = "handshake/prelude/unknown-kind-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-capability/skip-prelude-capability.patch"
+property = "handshake/prelude/unnegotiated-capability-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-selected-stream-version/skip-selected-stream-version.patch"
+property = "handshake/prelude/unselected-version-resets"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-unexpected-request-id/allow-unexpected-request-id.patch"
+property = "handshake/prelude/unexpected-request-id-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-missing-request-id/allow-missing-request-id.patch"
+property = "handshake/prelude/request-without-id-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-prelude-frame-cap/skip-prelude-frame-cap.patch"
+property = "handshake/prelude/undersized-cap-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch"
+property = "handshake/prelude/ineligible-opener-closes"
+harness = "handshake/wire"
+families = ["prelude"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch"
+property = "handshake/hello/oversize-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch"
+property = "handshake/ack/oversize-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-admission/allow-one-extra-registration/allow-one-extra-registration.patch"
+property = "handshake/connections-per-address-bounded"
+harness = "handshake/wire"
+families = ["shared-addresses"]
+
+[[drawn-witness]]
+patch = "handshake-admission/retain-pending-charge/retain-pending-charge.patch"
+property = "handshake/counts-match-permits"
+harness = "handshake/counts"
+families = ["untagged"]
+
+[[drawn-witness]]
+patch = "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch"
+property = "handshake/pending-bounded"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+[[drawn-witness]]
+patch = "handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch"
+property = "handshake/dial-reserve-kept"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-hello/refuse-conformant-hello.patch"
+property = "handshake/hello/conformant-never-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-ack/refuse-conformant-ack.patch"
+property = "handshake/ack/conformant-never-refused"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-table/refuse-conformant-prelude/refuse-conformant-prelude.patch"
+property = "handshake/prelude/conformant-never-refused"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-release/retain-quic-slot/retain-quic-slot.patch"
+property = "handshake/hello/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["hello"]
+
+[[drawn-witness]]
+patch = "handshake-release/retain-quic-slot/retain-quic-slot.patch"
+property = "handshake/ack/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["ack"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-pending-address-limit/skip-pending-address-limit.patch"
+property = "handshake/quic/pending-per-address-bounded"
+harness = "handshake/wire"
+families = ["quic-pending"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-retry-threshold/skip-retry-threshold.patch"
+property = "handshake/quic/retry-before-unvalidated-accept"
+harness = "handshake/wire"
+families = ["quic-retry"]
+
+[[drawn-witness]]
+patch = "handshake-quic/skip-inbound-tls-deadline/skip-inbound-tls-deadline.patch"
+property = "handshake/quic/finishes-in-time"
+harness = "handshake/wire"
+families = ["quic-timeout"]
+
+[[drawn-witness]]
+patch = "handshake-quic/accept-unsupported-alpn/accept-unsupported-alpn.patch"
+property = "handshake/quic/alpn-required"
+harness = "handshake/wire"
+families = ["quic-alpn"]
+
+[[drawn-witness]]
+patch = "handshake-quic/accept-wrong-dialed-key/accept-wrong-dialed-key.patch"
+property = "handshake/quic/identity-required"
+harness = "handshake/wire"
+families = ["quic-identity"]
+
+[[drawn-witness]]
+patch = "handshake-admission/ignore-transport-reservations/ignore-transport-reservations.patch"
+property = "handshake/pending-bounded"
+harness = "handshake/wire"
+families = ["dial-reserve"]
+
+# `dial-reserve` draws the nine-second return path only under transport
+# pressure, and it adds listening peers the test leaves out.
+[[drawn-witness]]
+patch = "handshake-release/no-closing-deadline/no-closing-deadline.patch"
+property = "handshake/hello/refusal-releases-slot"
+harness = "handshake/wire"
+families = ["dial-reserve"]

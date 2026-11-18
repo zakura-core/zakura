@@ -7,6 +7,7 @@ use crate::record::machine::MachineStep;
 /// Header reactor policy: the production owner's invariants and the facts that
 /// follow from the inputs.
 pub const REACTOR: Machine = Machine {
+    rules: &[],
     name: "header/reactor-policy",
     identity: "header-reactor",
     claim: "The header reactor keeps its invariants after every input: each started \
@@ -25,6 +26,7 @@ pub const REACTOR_ENTRY: HarnessEntry = crate::machine_entry!(REACTOR);
 /// Header publisher policy: the production owner's invariants and the facts that
 /// follow from the inputs.
 pub const PUBLISHER: Machine = Machine {
+    rules: &[],
     name: "header/publisher-policy",
     identity: "header-publisher",
     claim: "The header publisher keeps its invariants after every input: it spends only \

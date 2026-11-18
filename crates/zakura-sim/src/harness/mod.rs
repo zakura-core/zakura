@@ -20,6 +20,8 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
+pub mod handshake_counts;
+pub mod handshake_wire;
 pub mod header_node;
 pub mod header_sync;
 pub mod header_work;
@@ -58,7 +60,7 @@ use crate::{
         BuildInfo, MetaRecord,
     },
     witness::{witness_into, Expect, WitnessError},
-    Observation, ObservationLog, PlanInput, RecordSink, RunConfig, RunReport, Sim,
+    Observation, ObservationLog, PlanInput, RecordSink, RunConfig, RunReport, Sim, Steer,
 };
 
 /// The property a run violates when a task panics. Every harness checks it.
@@ -247,6 +249,30 @@ pub fn run_prepared<S: Subsystem>(
     Ok(report)
 }
 
+/// [`run_prepared`] with `steer` making live picks in place of `input`.
+/// Also returns the Plan bytes that replay the run's choices with no steer
+/// ([`Sim::steer`]).
+pub fn run_steered<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> Result<(RunReport, Vec<u8>), HarnessError> {
+    let mut steered = None;
+    let (report, ()) = run_set_up::<S, ()>(
+        scenario,
+        prepared,
+        input,
+        sink,
+        None,
+        |sim| steered = Some(sim.steer(steer)),
+        |_, _, _, _| (),
+    )?;
+    let steered = steered.expect("run_set_up sets the Sim up before it runs");
+    Ok((report, steered.bytes()))
+}
+
 /// [`run_prepared`], also returning what `read` takes from the harness and
 /// the run's final end, reports and log, before the scheduler shuts down
 /// ([`Sim::on_end`]), since shutdown can resume suspended tasks.
@@ -258,11 +284,26 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     extra: Option<&mut dyn Checker>,
     read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
 ) -> Result<(RunReport, T), HarnessError> {
+    run_set_up(scenario, prepared, input, sink, extra, |_| {}, read)
+}
+
+/// [`run_reading`], with `set_up` called on the Sim before the harness
+/// builds on it.
+fn run_set_up<S: Subsystem, T: 'static>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+    set_up: impl FnOnce(&mut Sim),
+    read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
+) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
     let mut sim = Sim::new(config, input);
+    set_up(&mut sim);
     let this = Rc::new(S::build(&mut sim, scenario, prepared));
     let read_out = Rc::new(RefCell::new(None));
     sim.on_end({
@@ -549,6 +590,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     header_work::REACTOR_ENTRY,
     header_work::PUBLISHER_ENTRY,
     block_work::REACTOR_ENTRY,
+    handshake_counts::ENTRY,
+    entry::<handshake_wire::Wire>(),
     discovery_machine::BOOK_ENTRY,
     discovery_machine::STATE_ENTRY,
     entry::<discovery::VerificationCapacity>(),

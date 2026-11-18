@@ -1,0 +1,45 @@
+diff --git a/crates/zakurad/src/components/tracing/component.rs b/crates/zakurad/src/components/tracing/component.rs
+index b73bd1d0b9..1b2bf459ca 100644
+--- a/crates/zakurad/src/components/tracing/component.rs
++++ b/crates/zakurad/src/components/tracing/component.rs
+@@ -135,6 +135,18 @@ impl Tracing {
+                 .open(log_file)
+                 .map_err(io_error)?;
+             Box::new(log_file) as BoxWrite
++        } else if let Some(dir) = std::env::var_os("ZAKURA_PROBE_TEE_DIR") {
++            let path = std::path::Path::new(&dir).join(format!("zakurad-{}.log", std::process::id()));
++            let file = File::options().append(true).create(true).open(path).map_err(io_error)?;
++            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(10_000);
++            std::thread::spawn(move || {
++                let mut out = std::io::stdout();
++                for bytes in rx {
++                    let _ = out.write_all(&bytes);
++                    let _ = out.flush();
++                }
++            });
++            Box::new(ProbeTee { file, tx }) as BoxWrite
+         } else {
+             let stdout = std::io::stdout();
+             Box::new(stdout) as BoxWrite
+@@ -393,3 +405,21 @@ mod tests {
+         assert_eq!(level_for(&targets, "zakurad"), LevelFilter::ERROR);
+     }
+ }
++
++/// Probe only: writes every log line to a file, and to stdout when stdout keeps up.
++struct ProbeTee {
++    file: File,
++    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
++}
++
++impl Write for ProbeTee {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.file.write_all(buf)?;
++        let _ = self.tx.try_send(buf.to_vec());
++        Ok(buf.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        self.file.flush()
++    }
++}

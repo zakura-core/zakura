@@ -1,0 +1,81 @@
+name: Probe classic relay miss
+
+# Temporary probe: loops the NU7 zcashd-compat tests on the classic pool at
+# main before and after the pool-contract merge, keeping full zakurad logs.
+on:
+  push:
+    branches: [adam/probe-classic-relay-miss]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  probe:
+    name: probe (${{ matrix.label }} shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [before, after]
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          path: probe
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.label == 'before' && 'c2a8eebde7f2daaaa1e43a1e71d241c13410609b' || '0ac2023fb0ef46a9d01f57840e45a461f220d02f' }}
+          path: src
+      - name: Apply log tee
+        working-directory: src
+        run: git apply ../probe/.github/probe/tee.patch
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
+        with:
+          toolchain: stable
+          cache-key: zcashd-compat-regtest
+          cache-save-if: false
+          rust-src-dir: src
+          cache-workspaces: src
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 #v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: ./src/.github/actions/setup-zakura-build
+      - name: Loop the NU7 tests
+        working-directory: src
+        env:
+          TEST_ZCASHD_COMPAT: "1"
+          ZAKURA_MEMPOOL__IMPLEMENTATION: classic
+          ZAKURA_TRACING__FILTER: info,zakurad::components::mempool=debug,zakurad::components::inbound=debug
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/logs"
+          cargo nextest run --profile zcashd-compat-integration --run-ignored=only --no-run
+          fails=0
+          for i in $(seq 1 20); do
+            dir="$RUNNER_TEMP/logs/iter-$i"
+            mkdir -p "$dir"
+            if ZAKURA_PROBE_TEE_DIR="$dir" cargo nextest run --profile zcashd-compat-integration --run-ignored=only \
+                -E 'test(~zcashd_compat_nu7) | test(~zcashd_compat_transparent_tx)' > "$dir/nextest.out" 2>&1; then
+              echo "iter $i pass"
+              [ "$i" -le 2 ] || rm -rf "$dir"
+            else
+              fails=$((fails + 1))
+              echo "iter $i FAIL"
+              grep -E "FAIL \[|Error:" "$dir/nextest.out" | sed 's/\x1b\[[0-9;]*m//g' | sort -u | head -10
+              mv "$dir" "$RUNNER_TEMP/logs/FAIL-iter-$i"
+            fi
+          done
+          echo "label=${{ matrix.label }} shard=${{ matrix.shard }} fails=$fails/20" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        if: always()
+        with:
+          name: logs-${{ matrix.label }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/logs
+          retention-days: 7

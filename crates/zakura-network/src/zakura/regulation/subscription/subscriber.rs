@@ -485,6 +485,30 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         }
     }
 
+    /// Check that `key`'s unspent credit covers a page of `objects` and
+    /// `payload_len` bytes, without spending it. Run it before any per-object
+    /// work on the page, so a page above its credit costs none.
+    pub(crate) fn check_page(
+        &self,
+        key: &K,
+        objects: u32,
+        payload_len: usize,
+    ) -> Result<(), SubscriptionFault> {
+        let message_type = self.limits.message_type;
+        let subscribed = self
+            .live
+            .get(key)
+            .ok_or_else(|| SubscriptionFault::Unknown.counted(message_type))?;
+        if objects == 0 {
+            return Err(SubscriptionFault::OverCredit.counted(message_type));
+        }
+        // Widening usize to u64 is lossless on supported targets.
+        subscribed
+            .credit
+            .check(u64::from(objects), payload_len as u64)
+            .map_err(|_| SubscriptionFault::OverCredit.counted(message_type))
+    }
+
     /// Admit a decoded page whose linkage the reactor checked. Spend its exact
     /// credit and advance the receive cursor, before the handler starts.
     ///

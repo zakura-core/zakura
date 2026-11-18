@@ -346,7 +346,7 @@ impl MissedBlockRecord {
         if delivered_block(result) {
             return;
         }
-        self.request_slot.set_announced_block_missed(true);
+        self.request_slot.mark_announced_block_missed();
         if let Some(registry) = &self.registry {
             registry.trace_block_missed(self.second_request);
         }

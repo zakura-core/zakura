@@ -2293,9 +2293,10 @@ async fn request_slot_records_unanswered_block_requests() {
     connection_task.abort();
 }
 
-/// A missed announced block is cleared only by a delivered block, not by a "not found" reply.
+/// A missed announced block is cleared by a delivered block, not by a "not found" reply, and lapses
+/// after `ANNOUNCED_BLOCK_MISS_LIFETIME` without one.
 #[tokio::test(start_paused = true)]
-async fn only_a_delivered_block_clears_a_missed_announced_block() {
+async fn a_missed_announced_block_lasts_until_a_delivery_or_its_lifetime() {
     let _init_guard = zakura_test::init();
 
     let (mut peer_tx, peer_rx) = mpsc::channel(4);
@@ -2303,7 +2304,7 @@ async fn only_a_delivered_block_clears_a_missed_announced_block() {
     let slot = connection.request_slot.clone();
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let (_tx, block) = response_vectors();
-    slot.set_announced_block_missed(true);
+    slot.mark_announced_block_missed();
 
     let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
     client_tx.send(request).await.expect("connection is open");
@@ -2336,6 +2337,21 @@ async fn only_a_delivered_block_clears_a_missed_announced_block() {
     assert!(
         !slot.announced_block_missed(),
         "a delivered block clears it"
+    );
+
+    slot.mark_announced_block_missed();
+    tokio::time::advance(
+        crate::peer::client::ANNOUNCED_BLOCK_MISS_LIFETIME - Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        slot.announced_block_missed(),
+        "still marked just before it lapses"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        !slot.announced_block_missed(),
+        "a peer is passed over for at most the mark's lifetime"
     );
 
     connection_task.abort();

@@ -10,6 +10,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{
@@ -102,10 +103,19 @@ pub(crate) struct RequestSlot {
     /// requested block on this connection.
     block_request_unanswered: Arc<AtomicBool>,
 
-    /// True if the peer announced a block and then did not deliver it to a gossip block request,
+    /// When the peer last announced a block and then did not deliver it to a gossip block request,
     /// until the peer delivers a requested block on this connection.
-    announced_block_missed: Arc<AtomicBool>,
+    announced_block_missed_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
+
+/// How long block routing passes over a peer that announced a block and then did not deliver it,
+/// unless the peer delivers a block sooner.
+///
+/// Once the node follows the tip, a peer that is passed over is rarely asked for a block, so
+/// without a limit one honest miss could keep a good peer passed over for as long as it stays
+/// connected. Ten minutes matches the delivery score's time constant. A peer that keeps missing
+/// is marked again on its next miss.
+pub(crate) const ANNOUNCED_BLOCK_MISS_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 impl RequestSlot {
     /// Records whether the connection is handling a client request (or can no longer take one).
@@ -129,15 +139,27 @@ impl RequestSlot {
         self.block_request_unanswered.load(Ordering::Acquire)
     }
 
-    /// Records whether the peer announced a block and then did not deliver it.
-    pub(crate) fn set_announced_block_missed(&self, missed: bool) {
-        self.announced_block_missed.store(missed, Ordering::Release);
+    /// Records that the peer announced a block and then did not deliver it.
+    pub(crate) fn mark_announced_block_missed(&self) {
+        *self.missed_at() = Some(tokio::time::Instant::now());
     }
 
-    /// Returns true if the peer announced a block and then did not deliver it, and has not
-    /// delivered a requested block since.
+    /// Forgets a missed announced block, because the peer delivered a requested block.
+    pub(crate) fn clear_announced_block_missed(&self) {
+        *self.missed_at() = None;
+    }
+
+    /// Returns true if the peer announced a block and then did not deliver it within the last
+    /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and has not delivered a requested block since.
     pub(crate) fn announced_block_missed(&self) -> bool {
-        self.announced_block_missed.load(Ordering::Acquire)
+        self.missed_at()
+            .is_some_and(|missed_at| missed_at.elapsed() < ANNOUNCED_BLOCK_MISS_LIFETIME)
+    }
+
+    fn missed_at(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
+        self.announced_block_missed_at
+            .lock()
+            .expect("the missed-block mutex is never held across a panic")
     }
 }
 

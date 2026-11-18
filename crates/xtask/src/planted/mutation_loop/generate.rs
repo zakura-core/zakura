@@ -1455,6 +1455,8 @@ impl Runner {
                     name: &name,
                     seed: u32::try_from(seed)
                         .map_err(|_| format!("a libfuzzer seed fits a u32, and {seed} doesn't"))?,
+                    feedback: "on",
+                    libfuzzer_args: &[],
                     corpus: &lanes.corpus,
                 };
                 // One worker per campaign, so a lane's memory is one
@@ -1467,7 +1469,6 @@ impl Runner {
                     rss_limit_mb: cap.map_or(4096, |cap| cap >> 20),
                     max_restarts: 0,
                     abandon_limit: 1,
-                    feedback: "on".to_owned(),
                     sanitizer: "none".to_owned(),
                 };
                 // The cap bounds the campaign's runs, not the cargo fuzz

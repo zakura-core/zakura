@@ -773,8 +773,10 @@ jobs:
       # The report lives outside `target/`, which rust-cache restores. Its
       # cleanup keeps the empty seed and artifact directories a run leaves,
       # and the checker refuses an output directory that isn't empty.
+      # A sync_wire seed runs for over a minute in the AddressSanitizer
+      # build, past `targets`' default 60-second input timeout.
       - name: Check each fuzz target on its seeds
-        run: cargo +nightly-2026-07-15 xtask sim-targets --out "${RUNNER_TEMP}/sim-targets"
+        run: cargo +nightly-2026-07-15 xtask sim-targets --child-secs 180 --out "${RUNNER_TEMP}/sim-targets"
       - name: Upload the readiness report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2

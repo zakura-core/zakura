@@ -1939,7 +1939,7 @@ fn a_campaign_lane_gets_the_same_classes() {
         }}}},
     });
     assert_eq!(
-        campaign_facts(NAMED, None, &evidence, 0).incomplete_runs,
+        campaign_facts(NAMED, None, &evidence, 0, &[]).incomplete_runs,
         5,
         "a benign reason isn't incomplete"
     );
@@ -1997,7 +1997,7 @@ fn a_campaign_counts_only_active_violations() {
         {"path": "runs/r/workers/0/sim/inputs/draft/z/bb.bin"},
     ]});
     let evidence = json!({"status": "complete", "unapplied": [], "totals": {"runs": 9}});
-    let facts = campaign_facts(NAMED, Some(&end), &evidence, 0);
+    let facts = campaign_facts(NAMED, Some(&end), &evidence, 0, &[]);
     assert_eq!(
         facts.violated,
         ["x/y", "z"],
@@ -2014,7 +2014,8 @@ fn a_campaign_counts_only_active_violations() {
             end: Some(end),
             evidence,
             initial_inputs: 0,
-            identity: serde_json::Value::Null,
+            manifest: serde_json::Value::Null,
+            attempts: Vec::new(),
         })),
         millis: 10,
         dir: "/out/c".into(),
@@ -2065,7 +2066,8 @@ fn a_kills_confirmation_allows_its_co_violations() {
         ]})),
         evidence: json!({"status": "complete"}),
         initial_inputs: 0,
-        identity: serde_json::Value::Null,
+        manifest: serde_json::Value::Null,
+        attempts: Vec::new(),
     }));
     assert_eq!(co_violations(&campaign, "a"), ["b"]);
 }

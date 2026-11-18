@@ -35,7 +35,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read as _},
     path::{self, Path, PathBuf},
@@ -490,15 +490,7 @@ fn build_tools(
     fs::create_dir_all(&logs)?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let sim_target = builds.join("sim");
-    let mut build_sim = Command::new(&cargo);
-    build_sim
-        .env("RUSTFLAGS", SIM_RUSTFLAGS)
-        .env("CARGO_TARGET_DIR", &sim_target)
-        .arg("build")
-        .arg("--locked")
-        .arg("--manifest-path")
-        .arg(repo_root.join("Cargo.toml"))
-        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
+    let mut build_sim = sim_build(&cargo, repo_root, &sim_target);
     if let Err(stop) = build(&mut build_sim, &logs.join("build-sim.log"), interrupt)? {
         return Ok(Err(stop));
     }
@@ -535,6 +527,27 @@ fn build_tools(
     }))
 }
 
+/// `cargo build` of `repo_root`'s `zakura-sim` binary with the simulator's
+/// flags, in `target`.
+///
+/// `cargo xtask planted --targets` confirms through a patched checkout, and
+/// a bypass patch can leave the code it bypasses unused. So the build
+/// reports warnings but doesn't fail on them, even where the environment
+/// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
+fn sim_build(cargo: &OsStr, repo_root: &Path, target: &Path) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .env("RUSTFLAGS", SIM_RUSTFLAGS)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_BUILD_WARNINGS", "warn")
+        .arg("build")
+        .arg("--locked")
+        .arg("--manifest-path")
+        .arg(repo_root.join("Cargo.toml"))
+        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
+    command
+}
+
 /// The flags every `cargo fuzz` command of one build shares, so `tmin`
 /// runs the target `cargo fuzz build` built.
 #[derive(Clone)]
@@ -548,11 +561,13 @@ struct FuzzBuild {
 }
 
 impl FuzzBuild {
-    /// `cargo +<nightly> fuzz <verb>` with the build's flags.
+    /// `cargo +<nightly> fuzz <verb>` with the build's flags. Like
+    /// [`sim_build`], it warns rather than fails on warnings.
     fn command(&self, verb: &str) -> Command {
         let mut command = Command::new("cargo");
         command
             .env("RUSTFLAGS", SIM_RUSTFLAGS)
+            .env("CARGO_BUILD_WARNINGS", "warn")
             .arg(format!("+{PINNED_NIGHTLY}"))
             .arg("fuzz")
             .arg(verb)

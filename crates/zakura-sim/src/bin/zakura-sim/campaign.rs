@@ -65,9 +65,10 @@ complete process saw apply, and every worker, process and stats file whose
 counts fall short. --out also writes it as JSON.
 `start` and `resume` exit 0 for a complete run and 1 otherwise.
 `targets` checks each simulator fuzz target qa/suite.toml declares, or each
---target: it resolves the target's harness, runs the harness's admitted seeds,
+--target: it resolves the target's harness, loads the harness's admitted seeds,
 builds the target with the pinned nightly, and runs the target once on the
-seeds with --child-secs per input (default 60). It prints each target's status
+seeds with --child-secs per input (default 60). The target's run counts which
+of the harness's properties applied. It prints each target's status
 and the retained bypasses on its harness, then each harness no target runs with
 its missing-target reason. It writes readiness.json to --out, and exits 0 only
 if every target is ready.

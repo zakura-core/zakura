@@ -45,7 +45,7 @@ const FLOOR_LANE_RACE_INPUT: &[u8] = include_bytes!("fixtures/block-sync-floor-l
 
 /// The committed input that picks the stuck-floor scenario: the commit
 /// window fills while height 3 never arrives.
-const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stuck-floor.bin");
+const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-stuck-floor.bin");
 
 /// The committed input that picks the default scenario, whose routines hand
 /// charged bodies to the sequencer.
@@ -53,7 +53,7 @@ const HANDOFF_INPUT: &[u8] = include_bytes!("fixtures/block-sync-handoff.bin");
 
 /// The committed input that picks the above-window scenario: the node
 /// requests heights above the commit window that never arrive.
-const ABOVE_WINDOW_INPUT: &[u8] = include_bytes!("fixtures/block-sync-above-window.bin");
+const ABOVE_WINDOW_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-above-window.bin");
 
 /// The committed input that picks the peers-leave scenario: both mirrors
 /// leave while the node owes them requests.

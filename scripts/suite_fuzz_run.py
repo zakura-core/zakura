@@ -67,6 +67,9 @@ RUN_FAILURES = ("did-not-compile", "patch-does-not-apply", "baseline-fails", "ha
 # qa/fuzz/sim/README.md's example minimization budgets.
 MINIMIZE_RUNS = 64
 MINIMIZE_WALL_SECS = 300
+# A sync_wire seed runs for over a minute in the AddressSanitizer build, past
+# `sim-targets`' default 60-second input timeout. The nightly job passes the same.
+SMOKE_CHILD_SECS = 180
 
 
 class Ran(NamedTuple):
@@ -229,7 +232,8 @@ def prepare_target(fuzz, row, budget, versions):
     name, harness = row["name"], row["harness"]
     store = fuzz.state / "campaigns" / name
     record = {"id": row["id"], "target": name, "harness": harness, "store": str(store), "budget": budget, "steps": {}}
-    smoke = fuzz.call(xtask("sim-targets", "--out", fuzz.out / "suite-fuzz" / name / "smoke", "--target", name),
+    smoke = fuzz.call(xtask("sim-targets", "--out", fuzz.out / "suite-fuzz" / name / "smoke", "--target", name,
+                            "--child-secs", SMOKE_CHILD_SECS),
                       f"{name}/smoke.log")
     record["steps"]["smoke"] = smoke.code
     store.mkdir(parents=True, exist_ok=True)

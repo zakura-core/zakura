@@ -742,6 +742,7 @@ jobs:
           if node is None:
               raise SystemExit(f"unknown node: {node_name}")
 
+          uses_rpc_cookie = node_name in {"zakura-compat", "asia-hedged-simple"}
           values = {
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
@@ -749,7 +750,7 @@ jobs:
               "RPC_LISTEN_ADDR": node.get(
                   "rpc_listen_addr", defaults["rpc_listen_addr"]
               ),
-              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
+              "RPC_AUTH": "cookie" if uses_rpc_cookie else "",
               "RPC_CONFIG_PATH": (
                   "/root/.cache/zakura/.cookie"
                   if node_name == "zakura-compat"
@@ -938,14 +939,14 @@ jobs:
             deploy/profiler/peer_addresses.py "$dashboard_dir/"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
-          # auth for the compatibility node into this copy (not the deploy config).
+          # auth for nodes that require it into the dashboard copy.
           awk '
             { print }
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"/ { in_compat = 1 }
-            in_compat && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"(zakura-compat|asia-hedged-simple)"$/ { uses_cookie = 1 }
+            uses_cookie && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
-              in_compat = 0
+              uses_cookie = 0
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"

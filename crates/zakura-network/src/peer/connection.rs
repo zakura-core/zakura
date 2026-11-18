@@ -1284,7 +1284,11 @@ where
             match self.advertised_block_body(hash).await {
                 Some(block) => {
                     if !self
-                        .send_advert_message(Message::Block(block), hash, &mut result)
+                        .send_advert_message(
+                            Message::Block(HashedBlock::from(block)),
+                            hash,
+                            &mut result,
+                        )
                         .await
                     {
                         return;
@@ -1684,7 +1688,7 @@ where
                 Unused
             }
             Message::Block(ref block) => Request::PushBlock(
-                block.clone(),
+                block.clone().into_block(),
                 self.connection_info
                     .connected_addr
                     .get_transient_addr()

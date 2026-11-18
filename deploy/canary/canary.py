@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures
 import itertools
 import json
+import math
 import sqlite3
 import statistics
 import sys
@@ -191,17 +192,45 @@ def pair_overlap(rounds, a, b, max_skew):
 
 
 def quantile(values, q):
-    """Returns the `q` quantile of `values` by nearest rank."""
+    """Returns the `q` quantile of `values` by nearest rank: the smallest value
+    with at least a `q` share of the values at or below it."""
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
 
 
-def grade_overlap(rows, canary, max_skew, min_pairs, tolerance):
+def answered_shares(rounds, names, answered):
+    """Returns `{name: share}`, the share of `rounds` in which each node
+    answered, as `answered(row)` judges its row. A node with no row in a round
+    did not answer it."""
+    return {
+        name: round(sum(1 for nodes in rounds if name in nodes and answered(nodes[name]))
+                    / len(rounds), 4)
+        for name in names
+    } if rounds else {name: None for name in names}
+
+
+def missed_too_often(report, shares, canary, max_missed):
+    """Fails `report` when the canary answered less often than every
+    neighbour, by more than `max_missed`. Its other grades only use rounds
+    it answered, so without this a canary that stopped answering after
+    reaching the minimum would still pass. Returns whether it failed."""
+    report["answered"] = shares
+    floor = min(share for name, share in shares.items() if name != canary) - max_missed
+    if shares[canary] < floor:
+        report["verdict"] = "fail"
+        report["reason"] = (f"the canary answered {shares[canary]:.2%} of rounds, below "
+                            f"the neighbours' lowest less --max-missed, {floor:.2%}")
+        return True
+    return False
+
+
+def grade_overlap(rows, canary, max_skew, min_pairs, tolerance, max_missed=0.01):
     """Grades the canary's pool overlap against its neighbours' with each other.
 
     Passes when every canary pair's mean score is at least the lowest
     neighbour pair's mean minus `tolerance`. Any pair with fewer than
-    `min_pairs` valid pairs makes the result inconclusive.
+    `min_pairs` valid pairs makes the result inconclusive. A canary that
+    answered its pool reads less often fails. See `missed_too_often`.
     """
     rounds = by_round(rows)
     names = sorted({row["node"] for row in rows})
@@ -219,20 +248,25 @@ def grade_overlap(rows, canary, max_skew, min_pairs, tolerance):
         report["verdict"] = "inconclusive"
         report["reason"] = f"a pair has fewer than {min_pairs} valid pairs"
         return report
+    shares = answered_shares(list(rounds.values()), names, lambda row: "error" not in row)
+    if missed_too_often(report, shares, canary, max_missed):
+        return report
     floor = min(pair["mean"] for pair in neighbour_pairs) - tolerance
     report["floor"] = round(floor, 4)
     report["verdict"] = "pass" if all(p["mean"] >= floor for p in canary_pairs) else "fail"
     return report
 
 
-def grade_templates(rows, canary, min_pairs, tolerance):
+def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01):
     """Grades the canary's templates against each neighbour's at the same tip.
 
     For each neighbour it pairs rounds where both templates build on the same
     previous block, and compares transaction sets and total fees. Pairs where
     both templates are empty are counted apart, since they can't show a
-    canary leaving transactions out. Passes when the canary's median fee
-    ratio to every neighbour is at least `1 - tolerance`.
+    canary leaving transactions out. Passes when, over the pairs, the
+    canary's median fee total is at least `1 - tolerance` of every
+    neighbour's. A canary that answered template reads less often fails. See
+    `missed_too_often`.
     """
     rounds = by_round(rows)
     names = sorted({row["node"] for row in rows})
@@ -240,7 +274,7 @@ def grade_templates(rows, canary, min_pairs, tolerance):
         raise CanaryError(f"no rows for canary {canary!r}")
     report = {"canary": canary, "neighbours": {}}
     for neighbour in (name for name in names if name != canary):
-        ratios, scores, skipped, empty = [], [], 0, 0
+        fees, neighbour_fees, scores, skipped, empty = [], [], [], 0, 0
         for nodes in rounds.values():
             x = nodes.get(canary, {}).get("template")
             y = nodes.get(neighbour, {}).get("template")
@@ -253,20 +287,35 @@ def grade_templates(rows, canary, min_pairs, tolerance):
                 empty += 1
                 continue
             scores.append(len(set_x & set_y) / len(union))
-            # A neighbour template with no fees is matched by any canary one.
-            ratios.append(x["fees"] / y["fees"] if y["fees"] > 0 else 1.0)
+            fees.append(x["fees"])
+            neighbour_fees.append(y["fees"])
+        median, neighbour_median = (
+            (statistics.median(fees), statistics.median(neighbour_fees)) if fees else (None, None)
+        )
         report["neighbours"][neighbour] = {
             "pairs": len(scores),
             "empty_pairs": empty,
             "skipped": skipped,
             "exact": sum(1 for score in scores if score == 1.0),
             "mean_overlap": round(statistics.fmean(scores), 4) if scores else None,
-            "median_fee_ratio": round(statistics.median(ratios), 4) if ratios else None,
+            "median_fees": median,
+            "neighbour_median_fees": neighbour_median,
+            # A neighbour whose median template has no fees is matched by any.
+            "median_fee_ratio": (None if median is None
+                                 else round(median / neighbour_median, 4) if neighbour_median > 0
+                                 else 1.0),
         }
     results = report["neighbours"].values()
     if not results or any(result["pairs"] < max(1, min_pairs) for result in results):
         report["verdict"] = "inconclusive"
         report["reason"] = f"a neighbour has fewer than {min_pairs} template pairs"
+        return report
+    # Only rounds that asked for templates count, which is the rounds where
+    # some node has a template read.
+    asked = [nodes for nodes in rounds.values()
+             if any("template" in row or "template_error" in row for row in nodes.values())]
+    shares = answered_shares(asked, names, lambda row: "template" in row)
+    if missed_too_often(report, shares, canary, max_missed):
         return report
     good = all(result["median_fee_ratio"] >= 1 - tolerance for result in results)
     report["verdict"] = "pass" if good else "fail"
@@ -369,14 +418,14 @@ def finish(report, out):
 def cmd_overlap(args):
     """Runs `overlap` on a `sample` file."""
     report = grade_overlap(load_rows(args.samples), args.canary, args.max_skew,
-                           args.min_pairs, args.tolerance)
+                           args.min_pairs, args.tolerance, args.max_missed)
     return finish(report, args.out)
 
 
 def cmd_templates(args):
     """Runs `templates` on a `sample` file."""
     report = grade_templates(load_rows(args.samples), args.canary, args.min_pairs,
-                             args.tolerance)
+                             args.tolerance, args.max_missed)
     return finish(report, args.out)
 
 
@@ -419,6 +468,8 @@ def build_parser():
     overlap.add_argument("--min-pairs", type=int, default=100)
     overlap.add_argument("--tolerance", type=float, default=0.0,
                          help="how far below the neighbours' floor the canary may score")
+    overlap.add_argument("--max-missed", type=float, default=0.01,
+                         help="how much smaller a share of rounds the canary may answer")
     overlap.add_argument("--out")
     overlap.set_defaults(run=cmd_overlap)
 
@@ -428,6 +479,8 @@ def build_parser():
     templates.add_argument("--min-pairs", type=int, default=20)
     templates.add_argument("--tolerance", type=float, default=0.01,
                            help="how far below a neighbour's fees the canary's median may be")
+    templates.add_argument("--max-missed", type=float, default=0.01,
+                           help="how much smaller a share of rounds the canary may answer")
     templates.add_argument("--out")
     templates.set_defaults(run=cmd_templates)
 

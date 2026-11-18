@@ -73,6 +73,17 @@ class OverlapTests(unittest.TestCase):
 
         self.assertEqual(report["verdict"], "fail")
 
+    def test_a_canary_that_stops_answering_fails(self):
+        rows = self.rows({"a", "b"})
+        for r in range(4, 8):
+            rows += [row(r, "n1", "h", {"a", "b"}), row(r, "n2", "h", {"a", "b"}),
+                     {"round": r, "node": "can", "t": float(r), "error": "timed out"}]
+
+        report = canary.grade_overlap(rows, "can", 3.0, 4, 0.0)
+
+        self.assertEqual(report["answered"], {"can": 0.5, "n1": 1.0, "n2": 1.0})
+        self.assertEqual(report["verdict"], "fail")
+
     def test_too_few_pairs_is_inconclusive(self):
         report = canary.grade_overlap(self.rows({"a", "b"}), "can", 3.0, 5, 0.0)
 
@@ -138,6 +149,33 @@ class TemplateTests(unittest.TestCase):
 
     def test_lower_fees_fails(self):
         self.assertEqual(canary.grade_templates(self.rows(90), "can", 3, 0.01)["verdict"], "fail")
+
+    def test_fees_compare_median_totals_not_ratios(self):
+        rows = []
+        pairs = [(10, 10), (20, 20), (30, 30), (1, 1000), (2, 1000)]
+        for r, (fees, neighbour_fees) in enumerate(pairs):
+            rows += [
+                row(r, "n1", "h", set(),
+                    template={"prev": "p", "txids": ["a"], "fees": neighbour_fees}),
+                row(r, "can", "h", set(), template={"prev": "p", "txids": ["a"], "fees": fees}),
+            ]
+
+        report = canary.grade_templates(rows, "can", 3, 0.01)
+
+        # The per-round ratios' median is 1.0, but the medians are 10 and 30.
+        self.assertEqual(report["neighbours"]["n1"]["median_fee_ratio"], round(10 / 30, 4))
+        self.assertEqual(report["verdict"], "fail")
+
+    def test_a_canary_missing_template_reads_fails(self):
+        rows = self.rows(100)
+        for r in range(3, 6):
+            rows += [row(r, "n1", "h", set(), template={"prev": "p", "txids": ["a"], "fees": 100}),
+                     {**row(r, "can", "h", set()), "template_error": "timed out"}]
+
+        report = canary.grade_templates(rows, "can", 3, 0.01)
+
+        self.assertEqual(report["answered"], {"can": 0.5, "n1": 1.0})
+        self.assertEqual(report["verdict"], "fail")
 
     def test_empty_templates_are_counted_apart(self):
         rows = []
@@ -212,6 +250,16 @@ class TipLagTests(unittest.TestCase):
 
         self.assertEqual(report["nodes"]["can"]["p90_ms"], 0.0)
         self.assertEqual(report["verdict"], "pass")
+
+
+class QuantileTests(unittest.TestCase):
+    def test_nearest_rank(self):
+        values = [20.0] * 9 + [500.0]
+
+        self.assertEqual(canary.quantile(values, 0.9), 20.0)
+        self.assertEqual(canary.quantile(values, 0.95), 500.0)
+        self.assertEqual(canary.quantile(values, 0.0), 20.0)
+        self.assertEqual(canary.quantile([1.0, 2.0], 0.5), 1.0)
 
 
 class MainTests(unittest.TestCase):

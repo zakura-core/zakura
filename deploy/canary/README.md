@@ -34,6 +34,11 @@ common. Pairs where both pools are empty are counted apart. It passes when
 every pair with the canary scores at least the lowest pair of neighbours,
 less `--tolerance`.
 
+Both `overlap` and `templates` fail a canary that answered a smaller share
+of rounds than every neighbour, by more than `--max-missed` (default 0.01).
+Their scores use only rounds the canary answered, so this is what catches a
+canary that stops answering partway through a window.
+
 ```sh
 python3 canary.py overlap --samples samples.jsonl --canary canary --min-pairs 1000
 ```

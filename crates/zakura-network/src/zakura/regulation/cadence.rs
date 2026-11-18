@@ -29,6 +29,7 @@
 //! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
 //! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
 //! | Charges at explicit instants match an interval-stepping bucket | `the_ledger_matches_an_interval_stepping_bucket` |
+//! | A charge reports a low bucket below a quarter of its capacity | `a_charge_reports_a_low_bucket_below_a_quarter_of_capacity` |
 
 use std::time::Duration;
 
@@ -103,6 +104,23 @@ impl Bucket {
         );
         // `earned` intervals fit in `elapsed`, so the product fits a Duration.
         self.last_refill += interval.saturating_mul(earned);
+    }
+
+    /// Check the bucket's invariants right after a refill at `now`: less than
+    /// one interval of elapsed time, and less than one interval of pause
+    /// credit, remains unconverted into tokens.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    fn assert_invariants(&self, now: Instant) {
+        let interval = self.cadence.refill_interval;
+        assert!(self.last_refill <= now, "a bucket refilled in the future");
+        assert!(
+            now.saturating_duration_since(self.last_refill) < interval,
+            "a refill left a whole interval unconverted"
+        );
+        assert!(
+            self.paused < interval,
+            "pause credit left a whole interval unconverted"
+        );
     }
 
     /// Credit a local read pause: tokens accrue above `capacity` for it.
@@ -484,6 +502,22 @@ pub(crate) enum RowSend {
 }
 
 impl<M> Slot<M> {
+    /// Check the row's invariants: a frame waits for its write only after the
+    /// row sent it, and the sender's copy of the receiver's bucket never holds
+    /// more than its capacity, since the sender never credits a pause to it.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.unwritten.strong_count() == 0 || self.last_sent.is_some(),
+            "a row holds an unwritten frame it never sent"
+        );
+        assert!(
+            self.mirror.tokens <= self.mirror.cadence.capacity,
+            "the sender's bucket holds more than its capacity"
+        );
+        assert_eq!(self.mirror.paused, Duration::ZERO, "the sender paused");
+    }
+
     /// Why this row cannot queue its value at `now`, if it cannot.
     ///
     /// `unwritten` reports whether the row's previous frame still waits for

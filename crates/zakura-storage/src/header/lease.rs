@@ -102,6 +102,31 @@ pub(super) struct Cursor {
     leased_txn: Option<u64>,
 }
 
+impl Cursor {
+    /// Panics unless the position matches the last frontier and the target:
+    /// a retained cursor's next hash exists and the hashes left reach the
+    /// target, and a complete cursor's last frontier is the target.
+    fn assert_position(&self) {
+        let left =
+            u64::from(self.target.height.0).checked_sub(u64::from(self.last_frontier.height.0));
+        match self.position {
+            Position::Retained { next } => assert!(
+                next < self.retained_path.len()
+                    // usize always fits in u64 on supported targets.
+                    && left == Some((self.retained_path.len() - next) as u64),
+                "lease {} is at {next} of {} hashes, {left:?} below its target",
+                self.lease_id,
+                self.retained_path.len()
+            ),
+            Position::Complete => assert_eq!(
+                self.last_frontier, self.target,
+                "complete lease {} stops short of its target",
+                self.lease_id
+            ),
+        }
+    }
+}
+
 /// What a new lease covers.
 #[derive(Debug)]
 pub(super) struct Spec {
@@ -656,5 +681,66 @@ impl Registry {
     /// How many acquires continued from a cached cursor.
     pub(super) fn continuation_hits(&self) -> u64 {
         self.continuation_hits
+    }
+
+    /// Panics unless the registry keeps its invariants:
+    /// - at most [`MAX_RETAINED_PATH_LEASES`] live leases, of which all but
+    ///   one slot may be ordinary, and at most as many cached paths;
+    /// - a peer holds a live lease or a cached path, never both;
+    /// - every lease ID was issued, once;
+    /// - a lease in the reserve class has a path of at most one page;
+    /// - a cursor's position matches its last frontier and its target, and a
+    ///   cached path has headers left;
+    /// - a class waiter waits only while its class is full, since a slot
+    ///   that frees fires it at once.
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.by_peer.len() <= Capacity::Bounded.limit()
+                && self.general_count() <= Capacity::General.limit(),
+            "{} leases, {} ordinary",
+            self.by_peer.len(),
+            self.general_count()
+        );
+        assert!(
+            self.continuations.len() <= MAX_RETAINED_PATH_LEASES,
+            "{} cached paths",
+            self.continuations.len()
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for (peer, cursor) in self.by_peer.iter().chain(&self.continuations) {
+            assert!(
+                (1..=self.next_lease_id).contains(&cursor.lease_id) && ids.insert(cursor.lease_id),
+                "lease {} of {peer:?} wasn't issued once",
+                cursor.lease_id
+            );
+            cursor.assert_position();
+        }
+        for (peer, cursor) in &self.by_peer {
+            assert!(
+                !self.continuations.contains_key(peer),
+                "{peer:?} holds a lease and a cached path"
+            );
+            if cursor.capacity == Capacity::Bounded {
+                assert_eq!(
+                    Capacity::for_range(cursor.last_frontier, cursor.target),
+                    Capacity::Bounded,
+                    "a reserve lease of {peer:?} spans more than a page"
+                );
+            }
+        }
+        for (peer, cursor) in &self.continuations {
+            assert!(
+                matches!(cursor.position, Position::Retained { .. }),
+                "the cached path of {peer:?} has no header left"
+            );
+        }
+        assert!(
+            self.general_capacity.is_none() || self.general_count() >= Capacity::General.limit(),
+            "the ordinary waiter waits while an ordinary slot is free"
+        );
+        assert!(
+            self.fallback_capacity.is_none() || self.by_peer.len() >= Capacity::Bounded.limit(),
+            "the reserve waiter waits while a slot is free"
+        );
     }
 }

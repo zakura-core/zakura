@@ -31,6 +31,11 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # listen_addr     = "0.0.0.0:8234"          # NOT loopback (single QUIC socket)
 # dev_network     = "my-cohort"             # same string on every cohort node
 # bootstrap_peers = ["nodeid@1.2.3.4:8234"] # node_id@addr of the other peers
+# tx_relay        = { enabled = true }      # needs implementation = "core" below
+
+# Optional [mempool] settings, keys passed through verbatim.
+# [defaults.mempool]
+# implementation = "core"                   # default | classic | core
 
 [[nodes]]
 name       = "node-a"

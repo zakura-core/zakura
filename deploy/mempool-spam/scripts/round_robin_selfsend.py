@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -43,6 +44,9 @@ RUN_LOG = ROOT / "logs/round-robin.jsonl"
 STATUS_FILE = ROOT / "logs/round-robin-status.json"
 ZECD_RPC_URL = "http://127.0.0.1:18888"
 NETWORK = "test"
+# How long one first-seen poll may wait for a node. Nodes are polled in
+# parallel, so a dead node only costs its own poll, never another node's time.
+POLL_RPC_TIMEOUT = 2.0
 
 
 class RunDurationElapsed(TimeoutError):
@@ -123,30 +127,23 @@ def wait_next_block(
     raise TimeoutError(f"no new block after height {start_height}")
 
 
-def transaction_state(
-    node: dict, txid: str, deadline: float | None = None
-) -> tuple[bool, dict | None]:
+def transaction_state(node: dict, txid: str, timeout: float) -> str | None:
+    """Where `node` holds `txid`: "mempool", "block", or None.
+
+    None also covers a node that did not answer within `timeout`.
+    """
     try:
-        if txid in rpc_call(
-            node["rpc_url"], "getrawmempool", timeout=remaining_timeout(deadline, 10)
-        ):
-            return True, None
-    except RunDurationElapsed:
-        raise
+        if txid in rpc_call(node["rpc_url"], "getrawmempool", timeout=timeout):
+            return "mempool"
     except Exception:  # noqa: BLE001
         pass
     try:
-        tx = rpc_call(
-            node["rpc_url"],
-            "getrawtransaction",
-            [txid, 1],
-            timeout=remaining_timeout(deadline, 10),
-        )
-        return True, tx if isinstance(tx, dict) else None
-    except RunDurationElapsed:
-        raise
+        tx = rpc_call(node["rpc_url"], "getrawtransaction", [txid, 1], timeout=timeout)
     except Exception:  # noqa: BLE001
-        return False, None
+        return None
+    if isinstance(tx, dict) and int(tx.get("confirmations") or 0) > 0:
+        return "block"
+    return "mempool"
 
 
 def first_seen_matrix(
@@ -155,28 +152,38 @@ def first_seen_matrix(
     duration=30.0,
     interval=1.0,
     run_deadline: float | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Poll every node in parallel until each holds `txid` or the window closes.
+
+    Returns the seconds until each node held `txid` in its mempool, and, for
+    nodes that first found it already mined, the seconds until that. A node in
+    neither map never saw it.
+    """
     started = time.monotonic()
     deadline = started + duration
     if run_deadline is not None:
         deadline = min(deadline, run_deadline)
-    seen: dict[str, float] = {}
-    while time.monotonic() < deadline:
-        if STOP:
-            break
-        for node in nodes:
-            if node["name"] in seen:
-                continue
-            try:
-                known, _ = transaction_state(node, txid, deadline=deadline)
-            except RunDurationElapsed:
-                return seen
-            if known:
-                seen[node["name"]] = round(time.monotonic() - started, 3)
-        if len(seen) == len(nodes):
-            break
-        time.sleep(min(interval, max(0, deadline - time.monotonic())))
-    return seen
+
+    def poll(node: dict) -> tuple[str, float] | None:
+        """Where and when `node` first held `txid`, or None by the deadline."""
+        while not STOP:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            where = transaction_state(node, txid, timeout=min(POLL_RPC_TIMEOUT, remaining))
+            if where:
+                return where, round(time.monotonic() - started, 3)
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+        return None
+
+    in_mempool: dict[str, float] = {}
+    in_block: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        for node, result in zip(nodes, pool.map(poll, nodes)):
+            if result:
+                where, elapsed = result
+                (in_mempool if where == "mempool" else in_block)[node["name"]] = elapsed
+    return in_mempool, in_block
 
 
 def mined_state(nodes: list[dict], txid: str) -> tuple[int | None, int]:
@@ -521,13 +528,17 @@ def main() -> int:
                 node, args.amount, run_deadline=run_deadline
             )
             submitted_txids.append(txid)
-            seen = first_seen_matrix(
+            seen, seen_in_block = first_seen_matrix(
                 nodes,
                 txid,
                 duration=args.matrix_secs,
                 run_deadline=run_deadline,
             )
-            missing = [candidate["name"] for candidate in nodes if candidate["name"] not in seen]
+            missing = [
+                candidate["name"]
+                for candidate in nodes
+                if candidate["name"] not in seen and candidate["name"] not in seen_in_block
+            ]
             log_event(
                 {
                     "event": "submitted",
@@ -539,8 +550,9 @@ def main() -> int:
                     "inventory_pre": before,
                     "inventory_post": after,
                     "first_seen": seen,
+                    "seen_in_block": seen_in_block,
                     "missing": missing,
-                    "seen_count": len(seen),
+                    "seen_count": len(seen) + len(seen_in_block),
                     "seen_all": not missing,
                     "send_secs": round(time.monotonic() - started, 3),
                     "wait_block": args.wait_block,

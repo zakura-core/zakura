@@ -582,6 +582,31 @@ class ConfigKeyTests(unittest.TestCase):
                 nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
             )
 
+    def test_mempool_table_and_tx_relay_render_for_the_v2_setup(self):
+        # The testnet deploy workflow's `setup = v2` writes exactly these tables.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                network = "Testnet"
+
+                [defaults.zakura]
+                listen_addr = "0.0.0.0:8234"
+                tx_relay = { enabled = true }
+
+                [defaults.mempool]
+                implementation = "core"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            config = tomllib.loads(deploy.render_node_config(deploy.load_nodes(path, None)[0]))
+
+        self.assertEqual(config["mempool"], {"implementation": "core"})
+        self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": True})
+
     def test_internal_miner_requires_an_address_and_the_miner_build(self):
         for extra in ('build_features = ["internal-miner"]',
                       'miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"'):

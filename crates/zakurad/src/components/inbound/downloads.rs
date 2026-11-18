@@ -4,10 +4,7 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -861,10 +858,6 @@ where
 /// block sooner than the first request.
 const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How long after the first request a block download keeps asking. Later, a block that has not
-/// arrived waits for the first request alone, as without second requests.
-const SECOND_REQUEST_CHECK_WINDOW: Duration = Duration::from_secs(5);
-
 /// Sends `request` for the block `hash` and returns the first successful response.
 ///
 /// With `second_request`, it also asks the peer set every [`SECOND_REQUEST_CHECK_INTERVAL`]
@@ -886,10 +879,9 @@ where
         return network.oneshot(request).await;
     }
 
-    let first_sent = tokio::time::Instant::now();
-    let stop_checking = Arc::new(AtomicBool::new(false));
+    let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
     let mut first = network.clone().oneshot(request).boxed();
-    let mut second = request_block_again(network, hash, first_sent, stop_checking.clone()).boxed();
+    let mut second = request_block_again(network, hash, attempt.clone()).boxed();
 
     tokio::select! {
         biased;
@@ -897,7 +889,9 @@ where
             // A second request that was sent is still awaited or kept running, but no new one
             // is sent: the block is here, or a block the first peer failed to deliver is left to
             // later announcements, as without second requests.
-            stop_checking.store(true, Ordering::Relaxed);
+            if !attempt.close() {
+                return result;
+            }
             match result {
                 Ok(response) => {
                     tokio::spawn(second);
@@ -920,13 +914,11 @@ where
 /// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
 /// until it sends one, and returns that request's result.
 ///
-/// Fails with [`zn::NoFasterBlockSource`] without a request sent once `stop_checking` is set or
-/// [`SECOND_REQUEST_CHECK_WINDOW`] has passed since `first_sent`.
+/// Returns [`zn::NoFasterBlockSource`] once the dispatch window closes without a second request.
 async fn request_block_again<ZN>(
     network: ZN,
     hash: block::Hash,
-    first_sent: tokio::time::Instant,
-    stop_checking: Arc<AtomicBool>,
+    attempt: zn::BlockHedge,
 ) -> Result<zn::Response, BoxError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -934,16 +926,14 @@ where
 {
     loop {
         tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
-        if stop_checking.load(Ordering::Relaxed)
-            || first_sent.elapsed() >= SECOND_REQUEST_CHECK_WINDOW
-        {
+        if attempt.elapsed_if_open().is_none() {
             return Err(zn::NoFasterBlockSource.into());
         }
         let result = network
             .clone()
             .oneshot(zn::Request::BlockByHashHedge {
                 hash,
-                first_request_waited: first_sent.elapsed(),
+                attempt: attempt.clone(),
             })
             .await;
         match result {

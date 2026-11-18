@@ -1523,7 +1523,9 @@ async fn request_block_again(
         .expect("peer set is ready")
         .call(Request::BlockByHashHedge {
             hash: BLOCK_HASH,
-            first_request_waited: Duration::from_millis(waited_ms),
+            attempt: crate::BlockHedge::new(
+                tokio::time::Instant::now() - Duration::from_millis(waited_ms),
+            ),
         })
 }
 
@@ -1665,7 +1667,79 @@ async fn without_second_requests_a_check_asks_no_peer() {
     let (mut peer_set, _guard) =
         peer_set_with_block_advertisers(&mut [&mut far, &mut near], true).await;
 
-    assert_not_yet(request_block_again(&mut peer_set, 5_000).await).await;
+    assert_not_yet(request_block_again(&mut peer_set, 4_900).await).await;
     assert_eq!(far.written_now().await, None);
     assert_eq!(near.written_now().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_or_expired_checks_send_no_block_request() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(230)),
+        measured_peer(&mut near, &registry, Some(50)),
+    ];
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let _first = request_block(&mut peer_set).await;
+    assert_eq!(
+        far.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    announce_block(&mut peer_set, &mut guard, &near).await;
+
+    // Construct the check before simulating the wait between submission and routing.
+    for expires in [false, true] {
+        let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        let queued = Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt: attempt.clone(),
+        };
+        if expires {
+            tokio::time::advance(crate::BlockHedge::WINDOW).await;
+        } else {
+            assert!(!attempt.close(), "dispatch has not happened yet");
+        }
+        assert_not_yet(peer_set.ready().await.unwrap().call(queued)).await;
+        assert_eq!(near.written_now().await, None);
+    }
+
+    // A live check with the same eligible peers does dispatch.
+    let _response = request_block_again(&mut peer_set, 70).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_announcer_that_fails_a_second_request_scores_worse() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _far = measured_peer(&mut far, &registry, Some(230));
+    let (_near, updater) = measured_peer(&mut near, &registry, Some(50));
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let _first = request_block(&mut peer_set).await;
+    announce_block(&mut peer_set, &mut guard, &near).await;
+
+    let response = request_block_again(&mut peer_set, 70).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(response.await.is_err(), "the peer did not have the block");
+    assert!(
+        updater.delivery_score().expect("measured") > Duration::from_millis(500),
+        "a missed second request raises the peer's expected delivery time"
+    );
 }

@@ -8626,7 +8626,7 @@ mod tests {
             .await?
             .call(Request::BlockByHashHedge {
                 hash,
-                first_request_waited: Duration::from_millis(50),
+                attempt: crate::BlockHedge::new(tokio::time::Instant::now()),
             })
             .await?;
         assert!(matches!(

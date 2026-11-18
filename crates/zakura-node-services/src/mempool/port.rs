@@ -546,12 +546,16 @@ impl PoolSnapshot {
             by_mined_id: self.by_mined_id.clone(),
             spent: self.spent.clone(),
         };
-        for (id, now_pooled) in pooled_now {
-            if let Some(old) = next.by_mined_id.remove(&id) {
+        // Every old entry goes before any new one: a transaction that
+        // leaves can share an outpoint with one that arrives in its place.
+        for id in pooled_now.keys() {
+            if let Some(old) = next.by_mined_id.remove(id) {
                 for outpoint in old.transaction.transaction().spent_outpoints() {
                     next.spent.remove(&outpoint);
                 }
             }
+        }
+        for (id, now_pooled) in pooled_now {
             if now_pooled {
                 let tx = pooled(&id).expect("a transaction the log added and kept is pooled");
                 next.insert(Arc::new(tx.clone()));

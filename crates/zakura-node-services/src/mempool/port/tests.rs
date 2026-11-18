@@ -365,6 +365,11 @@ fn outpoint(n: u16) -> zakura_chain::transparent::OutPoint {
 
 /// A transaction that spends `outpoint(n)`, as a verifier passes it.
 fn spending(n: u16) -> zakura_chain::transaction::VerifiedUnminedTx {
+    spending_until(n, 1_000_000)
+}
+
+/// [`spending`] with expiry height `expiry`, so two can spend the same outpoint.
+fn spending_until(n: u16, expiry: u32) -> zakura_chain::transaction::VerifiedUnminedTx {
     use zakura_chain::{
         amount::Amount,
         transaction::{LockTime, Transaction, VerifiedUnminedTx},
@@ -378,7 +383,7 @@ fn spending(n: u16) -> zakura_chain::transaction::VerifiedUnminedTx {
         }],
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
-        expiry_height: Height(1_000_000),
+        expiry_height: Height(expiry),
         joinsplit_data: None,
         sapling_shielded_data: None,
     };
@@ -444,4 +449,42 @@ fn a_snapshot_after_changes_matches_one_built_from_scratch() {
     // The earlier snapshot still reads as it was published.
     assert!(before.transactions().eq([&a, &b]));
     assert!(before.spends(&outpoint(1)) && !before.spends(&outpoint(3)));
+}
+
+#[test]
+fn a_spender_replaced_in_one_step_keeps_its_outpoint_spent() {
+    let tip = ChainTip {
+        hash: zakura_chain::block::Hash([0; 32]),
+        height: Height(100),
+    };
+    let mined = |tx: &zakura_chain::transaction::VerifiedUnminedTx| tx.transaction.id().mined_id();
+    // `a` leaves and `b` arrives in one step, both spending `outpoint(1)`.
+    // Each id lands in a random place in the step's change map, so repeating
+    // the step covers both orders.
+    for _ in 0..32 {
+        let (a, b) = (spending_until(1, 1_000_000), spending_until(1, 1_000_001));
+        let before = PoolSnapshot::new(
+            tip,
+            ChangeSeq(1),
+            vec![a.clone()],
+            TransactionDependencies::default(),
+        );
+        let changes = [
+            Change::Removed {
+                id: a.transaction.id(),
+                reason: super::RemovalReason::Evicted,
+            },
+            Change::Added(b.transaction.id()),
+        ];
+        let after = before.after(
+            tip,
+            ChangeSeq(3),
+            &changes,
+            |id| (mined(&b) == *id).then_some(&b),
+            vec![mined(&b)],
+            TransactionDependencies::default(),
+        );
+        assert!(after.spends(&outpoint(1)), "b still spends the outpoint");
+        assert!(after.transaction(&mined(&a)).is_none());
+    }
 }

@@ -44,6 +44,7 @@ fn hedge_request(first_request_started: Option<tokio::time::Instant>) -> zn::Req
     zn::Request::BlockByHashHedge {
         hash: hash(),
         first_request_started,
+        first_request_failed_at: Default::default(),
     }
 }
 
@@ -175,12 +176,50 @@ async fn a_first_request_that_fails_early_is_hedged_at_once() {
     let first = next_sent(&mut sent).await;
     first.answer.send(Err("peer disconnected".into())).unwrap();
     let hedge = next_sent(&mut sent).await;
-    assert_eq!(
-        hedge.request,
-        hedge_request(None),
+    assert!(
+        matches!(
+            hedge.request,
+            zn::Request::BlockByHashHedge {
+                first_request_started: None,
+                ref first_request_failed_at,
+                ..
+            } if first_request_failed_at.get().is_some()
+        ),
         "a failed first request is no longer waiting"
     );
 
+    hedge.answer.send(Ok(from_hedge())).unwrap();
+    assert_eq!(download.await.unwrap().unwrap(), from_hedge());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_original_that_fails_after_the_hedge_starts_records_its_failure_time() {
+    let (network, mut sent) = network();
+    let started = tokio::time::Instant::now();
+    let download = tokio::spawn(request_block(network, first_request(), hash(), Some(DELAY)));
+    let first = next_sent(&mut sent).await;
+    tokio::time::sleep(DELAY).await;
+    let hedge = next_sent(&mut sent).await;
+    let zn::Request::BlockByHashHedge {
+        first_request_failed_at,
+        ..
+    } = hedge.request
+    else {
+        panic!("the delayed request is a block hedge");
+    };
+    assert!(first_request_failed_at.get().is_none());
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    first.answer.send(Err("peer disconnected".into())).unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        first_request_failed_at.get(),
+        Some(&(started + DELAY + Duration::from_millis(10)))
+    );
+    assert!(
+        !download.is_finished(),
+        "the hedge remains usable after the original fails"
+    );
     hedge.answer.send(Ok(from_hedge())).unwrap();
     assert_eq!(download.await.unwrap().unwrap(), from_hedge());
 }

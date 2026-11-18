@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -185,6 +189,14 @@ pub enum Request {
             proptest(strategy = "arbitrary_request_started()")
         )]
         first_request_started: Option<tokio::time::Instant>,
+        /// Shared completion state for the original request. The downloader records its
+        /// failure time once; the hedge's trace excludes that request if it failed before
+        /// the hedge completed, including a failure after this request was dispatched.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(value = "Default::default()")
+        )]
+        first_request_failed_at: Arc<OnceLock<tokio::time::Instant>>,
     },
 
     /// Request transactions by their unmined transaction ID.

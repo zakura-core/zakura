@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -827,7 +827,17 @@ where
     };
 
     let first_sent = tokio::time::Instant::now();
-    let mut first = network.clone().oneshot(request).boxed();
+    let first_request_failed_at = Arc::new(OnceLock::new());
+    let failure_time = first_request_failed_at.clone();
+    let mut first = network
+        .clone()
+        .oneshot(request)
+        .inspect(move |result| {
+            if result.is_err() {
+                let _ = failure_time.set(tokio::time::Instant::now());
+            }
+        })
+        .boxed();
     let first_error = tokio::select! {
         biased;
         result = &mut first => match result {
@@ -845,6 +855,7 @@ where
         .oneshot(zn::Request::BlockByHashHedge {
             hash,
             first_request_started,
+            first_request_failed_at,
         })
         .boxed();
 

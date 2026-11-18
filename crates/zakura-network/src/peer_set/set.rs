@@ -101,6 +101,7 @@ use std::{
     marker::PhantomData,
     net::IpAddr,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Instant,
 };
@@ -1515,6 +1516,7 @@ where
         &mut self,
         hash: block::Hash,
         first_request_started: Option<tokio::time::Instant>,
+        first_request_failed_at: Arc<OnceLock<tokio::time::Instant>>,
     ) -> <Self as tower::Service<Request>>::Future {
         let inventory = InventoryHash::from(hash);
         let peer = self
@@ -1542,16 +1544,23 @@ where
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
         let started = tokio::time::Instant::now();
-        // Measure at dispatch so the original wait includes this request's time in the queue.
-        let first_request_waited = first_request_started
-            .map(|first| started.saturating_duration_since(first))
-            .unwrap_or_default();
         let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
 
         let trace = self.legacy_peer_trace.clone();
         async move {
             let result = fut.await;
+            let finished = tokio::time::Instant::now();
+            // A request that failed before this response cannot start its download stage.
+            // Otherwise include the original wait through dispatch, including queue time.
+            let first_request_waited = first_request_started
+                .filter(|_| {
+                    !first_request_failed_at
+                        .get()
+                        .is_some_and(|failed| *failed <= finished)
+                })
+                .map(|first| started.saturating_duration_since(first))
+                .unwrap_or_default();
             trace.block_request_finish(
                 request_id,
                 trace_peer,
@@ -1559,7 +1568,7 @@ where
                 BlockRequestRoute::Hedge {
                     first_request_waited,
                 },
-                started.elapsed(),
+                finished.saturating_duration_since(started),
                 &result,
             );
             result.map_err(Into::into)
@@ -1976,7 +1985,8 @@ where
             Request::BlockByHashHedge {
                 hash,
                 first_request_started,
-            } => self.route_block_hedge(hash, first_request_started),
+                first_request_failed_at,
+            } => self.route_block_hedge(hash, first_request_started, first_request_failed_at),
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),

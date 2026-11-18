@@ -1396,6 +1396,7 @@ async fn block_hedge_goes_to_the_fastest_idle_advertiser() {
                 first_request_started: Some(
                     tokio::time::Instant::now() - Duration::from_millis(50),
                 ),
+                first_request_failed_at: Default::default(),
             });
 
     assert_eq!(
@@ -1428,6 +1429,7 @@ async fn block_hedge_without_an_idle_advertiser_fails_at_once() {
         .call(Request::BlockByHashHedge {
             hash: BLOCK_HASH,
             first_request_started: Some(tokio::time::Instant::now() - Duration::from_millis(50)),
+            first_request_failed_at: Default::default(),
         })
         .await;
 
@@ -1441,7 +1443,7 @@ async fn block_hedge_without_an_idle_advertiser_fails_at_once() {
 async fn block_hedge_trace_includes_dispatch_queue_time() {
     let _init_guard = zakura_test::init();
     tokio::time::timeout(Duration::from_secs(10), async {
-        for original_pending in [true, false] {
+        for (original_pending, fails_after_dispatch) in [(true, false), (false, false), (true, true)] {
             let directory = tempfile::tempdir().unwrap();
             let mut peer = TestPeer::spawn(1);
             let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1462,9 +1464,11 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
 
             let original_started = tokio::time::Instant::now();
             tokio::time::sleep(Duration::from_millis(50)).await;
+            let failed_at = Arc::new(std::sync::OnceLock::new());
             let mut response = tokio::spawn(network.clone().oneshot(Request::BlockByHashHedge {
                 hash,
                 first_request_started: original_pending.then_some(original_started),
+                first_request_failed_at: failed_at.clone(),
             }));
             // No peer exists yet: the real driver must hold this request in its queue.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1486,7 +1490,11 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
                     assert_eq!(message, Message::GetData(vec![hash.into()]));
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if fails_after_dispatch {
+                failed_at.set(tokio::time::Instant::now()).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
             peer.peer_inbound
                 .send(Ok(Message::Block(block.into())))
                 .await
@@ -1511,7 +1519,7 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
             assert_eq!(row["route"], "hedge");
             assert_eq!(row["result"], "available");
             let waited = row["first_request_waited_ms"].as_u64().unwrap();
-            if original_pending {
+            if original_pending && !fails_after_dispatch {
                 assert!(
                     waited >= 150,
                     "the original wait includes the dispatch queue: {row}"
@@ -1526,5 +1534,5 @@ async fn block_hedge_trace_includes_dispatch_queue_time() {
         }
     })
     .await
-    .expect("both queued hedge traces are flushed promptly");
+    .expect("queued hedge traces are flushed promptly");
 }

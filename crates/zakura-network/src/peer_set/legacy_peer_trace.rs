@@ -42,8 +42,8 @@ pub(super) enum BlockRequestRoute {
     Advertised,
     /// No ready peer had announced the block, so the peer may not have it.
     Maybe,
-    /// A second request for a slow block, sent once the first request had been waiting
-    /// `first_request_waited`, or zero when the first request had already failed.
+    /// A second request for a slow block. `first_request_waited` is the original wait through
+    /// dispatch, or zero if the original failed before this request completed.
     Hedge { first_request_waited: Duration },
 }
 

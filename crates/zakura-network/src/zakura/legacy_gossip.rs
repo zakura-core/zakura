@@ -8398,6 +8398,7 @@ mod tests {
                 first_request_started: Some(
                     tokio::time::Instant::now() - Duration::from_millis(50),
                 ),
+                first_request_failed_at: Default::default(),
             })
             .await?;
         assert!(matches!(

@@ -240,6 +240,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/block_table.rs"
+test = "regenerate_old_chain_plan"
+run = false
+reason = "a tool, not a test: it rewrites the committed old-chain Plan bytes"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"
 test = "regenerate_capacity_frontier_first_input"
 run = false

@@ -1,0 +1,12 @@
+# Releases every frame grant twice: the grant's drop returns its charge,
+# and then the grant's permit returns it again. Each gate's free bytes
+# pass its capacity once the input's first frame drops.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-saturated.bin"
+# Besides slots.rs and lifetime.rs, which the patch changes, the handler
+# admits each frame through its kind's gate, the stream's receive half
+# drops each frame's grant, and the probe reads each gate's free bytes.
+checks = [
+    "crates/zakura-network/src/zakura/handler.rs",
+    "crates/zakura-network/src/zakura/transport/io.rs",
+    "crates/zakura-network/src/zakura/transport/probe.rs",
+]

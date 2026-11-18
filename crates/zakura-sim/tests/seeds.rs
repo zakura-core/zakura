@@ -38,7 +38,14 @@ fn load(dirs: &[PathBuf], harness: Option<&str>) -> SeedReport {
     seed::load(dirs, harness).expect("the directories list")
 }
 
-/// Every committed seed passes validation, and none is left out.
+/// The committed seeds that fail by design, outside the seed corpus.
+fn known_failures() -> PathBuf {
+    fixtures().join("known-failures")
+}
+
+/// Every committed seed passes validation, and none is left out. No seed
+/// in the corpus expects a violation, since fuzz campaigns and target
+/// checks run each one as an input that passes.
 #[test]
 fn committed_seeds_validate() {
     let report = load(&[fixtures()], None);
@@ -63,6 +70,41 @@ fn committed_seeds_validate() {
     assert_eq!(report.admitted.len(), inputs);
     assert!(inputs > 0, "the S4.7 input is committed");
     assert!(report.admitted.iter().all(|seed| seed.sidecar.required));
+    let failing: Vec<&Path> = report
+        .admitted
+        .iter()
+        .filter(|seed| seed.sidecar.expects_violation())
+        .map(|seed| seed.path.as_path())
+        .collect();
+    assert!(
+        failing.is_empty(),
+        "these seeds fail by design, so they belong in {}: {failing:?}",
+        known_failures().display()
+    );
+}
+
+/// Every seed in the known-failure directory validates, and each carries a
+/// witness that expects a violation, which its own test checks.
+#[test]
+fn known_failures_validate_and_expect_violations() {
+    let report = load(&[known_failures()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "zakura#2378's input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            seed.sidecar.expects_violation(),
+            "{} expects no violation, so it belongs in the seed corpus",
+            seed.path.display()
+        );
+    }
 }
 
 /// The scenario each committed seed is meant to run, by its file's stem,
@@ -120,10 +162,6 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
-        // The fork while storage holds a submission, with every read stalled.
-        "sync-wire-reset-mid-write" => {
-            value(sync_wire::combined(&[sync_wire::COMBINED_TAG, 0b0001_0100]))
-        }
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],

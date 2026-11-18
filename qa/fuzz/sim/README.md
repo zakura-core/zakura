@@ -431,6 +431,15 @@ from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
 another generator than its harness's is rejected, even when the harness
 would draw a fallback scenario for it.
 
+The seed corpus is the fixture directory's own seeds. Campaigns, `cargo
+xtask sim-targets` and `--out` run each one as an input that passes, so no
+corpus seed carries a witness with `expect = "violated"` or
+`"violated-set"`. A seed that fails by design, such as a pinned repro of an
+open bug, sits in a subdirectory with that witness, and only its own test
+loads it: `known-failures/` holds open-bug repros, and `race-schedules/`
+holds the planted races' violating schedules. The seed tests fail on a
+corpus seed that expects a violation and on a known failure that doesn't.
+
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one
 whose prefix now decodes to another scenario, fails the command with the

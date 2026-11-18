@@ -160,10 +160,13 @@ pub(in crate::planted) fn start_deadline(bounds: &CampaignBounds) -> Duration {
 
 /// Builds `spec`'s fuzz target in `fuzz_target`, and runs one campaign on
 /// it with `bounds` and `spec`'s seed, from `spec`'s corpus, in a fresh
-/// store under `dir`, with `campaign start` under `deadline`. `sim` makes
-/// each child's `zakura-sim` command, such as one under a memory cap.
-/// Returns the records the run left.
+/// store under `dir`, with `campaign start` under `deadline`. `build`
+/// makes the `campaign build` child's `zakura-sim` command, and `sim` makes
+/// the `start` and `evidence` children's, such as one under a memory cap.
+/// A cap sized for one witness can kill a cargo build, so the build gets
+/// its own command. Returns the records the run left.
 pub(in crate::planted) fn campaign_lane(
+    build: &dyn Fn() -> Command,
     sim: &dyn Fn() -> Command,
     dir: &Path,
     fuzz_target: &Path,
@@ -176,7 +179,7 @@ pub(in crate::planted) fn campaign_lane(
         return Err(format!("{} isn't a fresh store", store.display()).into());
     }
     fs::create_dir_all(dir)?;
-    let mut build = sim();
+    let mut build = build();
     build
         .args(["campaign", "build", "--store"])
         .arg(&store)

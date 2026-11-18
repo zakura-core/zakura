@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/wire.rs b/crates/zakura-network/src/zakura/discovery/wire.rs
+index 6815bc64ef..d85611a983 100644
+--- a/crates/zakura-network/src/zakura/discovery/wire.rs
++++ b/crates/zakura-network/src/zakura/discovery/wire.rs
+@@ -381,7 +381,8 @@ impl WireMessage for DiscoveryMessage {
+ }
+ 
+ fn check_limit(limit: u16) -> Result<(), WireError> {
+-    if !(1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE).contains(&usize::from(limit)) {
++    // Mutation: the decoder admits a zero limit.
++    if usize::from(limit) > MAX_DISCOVERY_RECORDS_PER_RESPONSE {
+         return Err(WireError::OutOfRange("peer limit"));
+     }
+     Ok(())

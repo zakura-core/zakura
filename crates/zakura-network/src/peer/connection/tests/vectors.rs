@@ -2329,11 +2329,11 @@ async fn request_slot_records_unanswered_block_requests() {
 #[tokio::test(start_paused = true)]
 async fn legacy_deadline_charges_only_a_written_advertised_request() {
     for written in [false, true] {
-        let (_peer_tx, peer_rx) = mpsc::channel(4);
+        let (mut peer_tx, peer_rx) = mpsc::channel(4);
         let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
         let slot = connection.request_slot.clone();
         let task = tokio::spawn(connection.run(peer_rx));
-        let (_, block) = response_vectors();
+        let (tx, block) = response_vectors();
         let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
         let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
         request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::TimedPrimary(
@@ -2347,9 +2347,26 @@ async fn legacy_deadline_charges_only_a_written_advertised_request() {
             attempt.legacy_timeout();
             drop(response);
         } else {
+            let (busy, busy_response) = client_request(Request::TransactionsById([tx.id()].into()));
+            client_tx.send(busy).await.unwrap();
+            assert_eq!(
+                outbound.next().await,
+                Some(Message::GetData(vec![tx.id().into()]))
+            );
+            client_tx
+                .try_send(request)
+                .expect("block request fits in the queue");
+            settle().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
             attempt.legacy_timeout();
             drop(response);
-            client_tx.send(request).await.unwrap();
+            peer_tx.send(Ok(Message::Tx(tx))).await.unwrap();
+            busy_response.await.unwrap().unwrap();
+            settle().await;
+            assert!(
+                outbound.next().now_or_never().is_none(),
+                "the canceled block request was never written"
+            );
         }
         settle().await;
         assert_eq!(slot.announced_block_missed(), written);
@@ -3307,7 +3324,6 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
 /// peer's delivery samples, whatever the block's size. Block-hash and transaction answers are not.
 #[tokio::test(start_paused = true)]
 async fn block_answers_are_timed_as_delivery_samples() {
-    use zakura_chain::serialization::ZcashDeserializeInto;
     let _init_guard = zakura_test::init();
 
     let registry = crate::peer_registry::PeerRegistry::default();
@@ -3389,15 +3405,17 @@ async fn block_answers_are_timed_as_delivery_samples() {
     let (received, _) = blocks[0].available().unwrap();
     assert_eq!(delivery_samples.delivery_score(), None);
     tokio::time::advance(Duration::from_secs(1)).await;
-    let unrelated: Arc<zakura_chain::block::Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-    received.record_verified_copy(&unrelated.into());
+    let other_body: BlockHandle = Arc::new(block::Block {
+        header: block.header.clone(),
+        transactions: vec![],
+    })
+    .into();
+    assert_eq!(received.hash(), other_body.hash());
+    received.record_verified_copy(&other_body);
     assert_eq!(
         delivery_samples.delivery_score(),
         None,
-        "a different verified body provides no credit"
+        "an equal header does not confirm the body"
     );
     received.record_verified_copy(&block.into());
     received.record_verified();

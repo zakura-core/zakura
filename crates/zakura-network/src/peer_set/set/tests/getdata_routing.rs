@@ -2080,7 +2080,13 @@ async fn assert_late_miss_keeps_recovered_announcer(hedge: bool) {
         .send(Ok(Message::Block(block.into())))
         .await
         .unwrap();
-    assert!(matches!(recovery.await, Ok(Response::Blocks(_))));
+    let Response::Blocks(replies) = recovery.await.unwrap() else {
+        panic!("expected a block response");
+    };
+    let (delivered, _) = replies[0]
+        .available()
+        .expect("the requested body was delivered");
+    delivered.record_verified();
     assert!(miss.await.is_err());
 
     announce_hash(&mut set, &mut guard, &near, OTHER_BLOCK_HASH).await;
@@ -2093,7 +2099,7 @@ async fn assert_late_miss_keeps_recovered_announcer(hedge: bool) {
     assert_eq!(
         near.written_now().await,
         Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
-        "the faster peer delivered a block after its miss and is preferred again"
+        "the faster peer supplied a verified block after its miss and is preferred again"
     );
 }
 

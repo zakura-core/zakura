@@ -228,6 +228,24 @@ class TransactionStateTests(unittest.TestCase):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_no_node_is_first_sampled_after_the_window(self):
+        nodes = [{"name": "a"}, {"name": "b"}]
+        sampled = []
+
+        def state(node, _txid, deadline=None):
+            sampled.append(node["name"])
+            # The first sample outlasts the whole window.
+            time.sleep(0.1)
+            return round_robin_selfsend.ABSENT
+
+        with mock.patch.object(round_robin_selfsend, "transaction_state", state):
+            in_pool, _, unobserved = round_robin_selfsend.first_seen_matrix(
+                nodes, "t", duration=0.05, interval=0.01
+            )
+
+        self.assertEqual(sampled, ["a"])
+        self.assertEqual((in_pool, unobserved), ({}, ["b"]))
+
     def test_an_absence_in_a_window_the_run_cut_short_is_unobserved(self):
         nodes = [{"name": "a"}]
         with mock.patch.object(

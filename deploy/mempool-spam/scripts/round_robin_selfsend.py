@@ -214,6 +214,11 @@ def first_seen_matrix(
         for node in nodes:
             if node["name"] in in_pool or node["name"] in after_mined:
                 continue
+            # Nodes are sampled one after another, so a pass can outlast the
+            # window. A sample that would start after it shows nothing about
+            # the window.
+            if time.monotonic() >= deadline:
+                break
             try:
                 # A sample begun inside the window finishes, so the window's
                 # end never cuts its answer short. Only the run's own

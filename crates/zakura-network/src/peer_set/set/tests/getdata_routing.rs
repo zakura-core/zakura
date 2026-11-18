@@ -1550,6 +1550,45 @@ async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
     assert_eq!(missing.written_now().await, None);
 }
 
+/// With block source scoring off, an announcer that answers its block request with `notfound`
+/// is still offered for the next announced block, as without scoring.
+#[tokio::test(start_paused = true)]
+async fn without_scoring_an_announcer_that_missed_its_block_is_still_preferred() {
+    let _init_guard = zakura_test::init();
+    let mut missing = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+
+    let (mut peer_set, mut guard) =
+        peer_set_with_peers(&mut [&mut missing, &mut other], crate::Config::default());
+    announce_block(&mut peer_set, &mut guard, &missing).await;
+    let response = request_block(&mut peer_set).await;
+    assert_eq!(
+        missing.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    missing
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(response.await.is_err(), "the peer did not have the block");
+
+    peer_set.ready().await.expect("peer set is ready");
+    let missed = &peer_set.ready_services[&missing.addr];
+    assert!(
+        !missed.is_preferred_block_source(true),
+        "the miss is recorded, for when scoring is switched on"
+    );
+    assert!(missed.is_preferred_block_source(peer_set.block_source_score));
+    let (_, choice) = peer_set
+        .select_block_advertiser(&HashSet::from([missing.addr, other.addr]))
+        .expect("both announcers are idle");
+    assert_eq!(
+        choice.candidates, 2,
+        "both announcers are offered, including the one that missed"
+    );
+}
+
 /// A peer that announced a block and does not deliver it to a second request is not preferred
 /// for the next announced block either.
 #[tokio::test(start_paused = true)]

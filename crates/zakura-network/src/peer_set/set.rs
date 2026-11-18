@@ -1214,7 +1214,9 @@ where
             .filter(|key| {
                 self.ready_services
                     .get(*key)
-                    .is_some_and(|svc| svc.is_preferred_block_source())
+                    // Passing over a peer that missed an announced block is part of block
+                    // source scoring, so with scoring off routing matches the default.
+                    .is_some_and(|svc| svc.is_preferred_block_source(self.block_source_score))
             })
             .copied()
             .collect();
@@ -1647,7 +1649,8 @@ where
             .filter(|addr| Some(**addr) != first_peer)
             .filter_map(|addr| {
                 let svc = self.ready_services.get(addr)?;
-                if !svc.is_preferred_block_source() {
+                // Second requests run only with block source scoring on.
+                if !svc.is_preferred_block_source(true) {
                     return None;
                 }
                 Some((*addr, svc.block_gossip.delivery_score()?))

@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import re
 import signal
 import subprocess
@@ -272,7 +274,6 @@ def localize_fleet(lab: Path, args) -> None:
     )
     for config in sorted((lab / "nodes").glob("*/zakura*.toml")):
         config.write_text(to_node_schema(config.read_text()))
-    pin_chain_topology(lab, args.node_count)
 
 
 def to_node_schema(text: str) -> str:
@@ -292,34 +293,97 @@ def to_node_schema(text: str) -> str:
     return text.replace("[network.testnet_parameters", "[network.network")
 
 
-def chain_seed(index: int, node_count: int) -> str:
-    """Returns the one peer node `index` dials in the chain 0-1-...-(n-1).
+def topology_dials(node_count: int, topology: str, peers: int, seed: int) -> list[list[int]]:
+    """Returns, for each node, the earlier nodes it dials.
 
-    Node k dials node k-1. Node 0 gets the address one past the last node,
-    where nothing listens, so it dials no one but still has a seed.
+    `chain` gives 0-1-...-(n-1): node k dials node k-1. `graph` gives a fixed
+    random graph with about `peers` links per node: node k dials up to
+    ceil(peers / 2) distinct earlier nodes drawn with `seed`, so the same seed
+    always builds the same graph, and every node reaches node 0, where the
+    blaster submits. Nodes only dial earlier nodes because `up` starts them in
+    index order, and a dial to a node that isn't listening yet isn't retried
+    for about two minutes.
+
+    Seeding every node with every other one gave each run a random layout, a
+    star in one leg and a 3-hop chain in the next, which swamped the pool
+    difference in the propagation numbers.
     """
-    return f"{node_ip(index - 1 if index else node_count)}:{P2P_PORT}"
+    if topology == "chain":
+        return [[k - 1] if k else [] for k in range(node_count)]
+    rng = random.Random(seed)
+    per_node = max(1, math.ceil(peers / 2))
+    return [sorted(rng.sample(range(k), min(k, per_node))) for k in range(node_count)]
 
 
-def pin_chain_topology(lab: Path, node_count: int) -> None:
-    """Seeds each node with only its predecessor, so every run has the same chain.
+def expected_peer_counts(dials: list[list[int]]) -> list[int]:
+    """Returns each node's link count in `dials`, inbound and outbound together."""
+    counts = [len(targets) for targets in dials]
+    for targets in dials:
+        for target in targets:
+            counts[target] += 1
+    return counts
 
-    Seeding every node with every other one left each run a random 3- or 4-link
-    layout, a star in one leg and a 3-hop chain in the next, which swamped the
-    pool difference in the propagation numbers. The blaster submits to node 0,
-    so the chain measures relay over 1 to n-1 hops.
+
+# Pool, P2P stack and tx-relay for each `--node-modes` value. `legacy` is a node
+# that hasn't upgraded: today's pool on the legacy stack only.
+NODE_MODES = {
+    "classic": ("classic", None, False),
+    "legacy": ("classic", "legacy", False),
+    "core": ("core", None, False),
+    "core-txrelay": ("core", None, True),
+}
+
+
+def apply_node_mode(text: str, mode: str) -> str:
+    """Sets one node's pool implementation, P2P stack and tx-relay switch for `mode`."""
+    implementation, stack, tx_relay = NODE_MODES[mode]
+    if stack:
+        text, replaced = re.subn(r'(?m)^p2p_stack = ".*"$', f'p2p_stack = "{stack}"', text)
+        if replaced != 1:
+            raise RuntimeError("expected one p2p_stack line")
+    if "\n[mempool]\n" not in text or re.search(r"(?m)^implementation = ", text):
+        raise RuntimeError("expected a [mempool] table with no implementation key")
+    text = text.replace("\n[mempool]\n", f'\n[mempool]\nimplementation = "{implementation}"\n', 1)
+    if tx_relay:
+        text += "\n[network.zakura.tx_relay]\nenabled = true\n"
+    return text
+
+
+def pin_topology(lab: Path, dials: list[list[int]], modes: list[str]) -> None:
+    """Writes each node's dial list and mode into its run config.
+
+    Node 0 dials nothing, so it gets the address one past the last node, where
+    nothing listens. Every lab node dials out from 127.0.0.1, so a node with
+    more than one inbound link needs a per-IP limit above Kresko's 1.
     """
+    node_count = len(dials)
     # Only the run config peers; the bootstrap config runs with P2P off.
-    for index in range(node_count):
+    for index, targets in enumerate(dials):
         config = lab / "nodes" / node_name(index) / "zakura.toml"
+        seeds = [f"{node_ip(t)}:{P2P_PORT}" for t in targets] or [f"{node_ip(node_count)}:{P2P_PORT}"]
         text, replaced = re.subn(
             r"(?ms)^initial_testnet_peers = \[.*?\]$",
-            f'initial_testnet_peers = ["{chain_seed(index, node_count)}"]',
+            "initial_testnet_peers = [" + ", ".join(f'"{s}"' for s in seeds) + "]",
             config.read_text(),
         )
         if replaced != 1:
             raise RuntimeError(f"{config}: expected one initial_testnet_peers list")
-        config.write_text(text)
+        text, replaced = re.subn(
+            r"(?m)^max_connections_per_ip = 1$", f"max_connections_per_ip = {node_count}", text, count=1
+        )
+        if replaced != 1:
+            raise RuntimeError(f"{config}: expected Kresko's max_connections_per_ip = 1")
+        config.write_text(apply_node_mode(text, modes[index]))
+
+
+def parse_node_modes(value: str, node_count: int) -> list[str]:
+    """Expands `--node-modes`: one mode for every node, or one per node, comma-separated."""
+    modes = [m.strip() for m in value.split(",")]
+    if len(modes) == 1:
+        modes *= node_count
+    if len(modes) != node_count or any(m not in NODE_MODES for m in modes):
+        raise ValueError(f"--node-modes needs 1 or {node_count} of {sorted(NODE_MODES)}, got {value!r}")
+    return modes
 
 
 # ---------------------------------------------------------------------------- #
@@ -504,7 +568,12 @@ def cmd_up(args) -> int:
     """Seed every node, start them all, and leave them running."""
     lab = Path(args.lab_dir).resolve()
     assert_ports_free(args.node_count)
+    dials = topology_dials(args.node_count, args.topology, args.peers, args.graph_seed)
+    modes = parse_node_modes(args.node_modes, args.node_count)
     localize_fleet(lab, args)
+    pin_topology(lab, dials, modes)
+    # Read by mempool-load-probe.py to group nodes by mode and by hops from node 0.
+    (lab / "topology.json").write_text(json.dumps({"dials": dials, "modes": modes}) + "\n")
     for i in range(args.node_count):
         seed_node(lab, args, i)
 
@@ -514,7 +583,7 @@ def cmd_up(args) -> int:
         # Recorded after each spawn, not once at the end: if a later spawn
         # raises, the nodes already started must still be visible to `down`.
         write_pidfile(lab, procs)
-        # Node i+1 dials only node i. A refused dial isn't retried for about two
+        # Nodes dial only earlier nodes. A refused dial isn't retried for about two
         # minutes, so one node starting 2 ms early cut the chain in 9 of 21 runs.
         # zakurad binds its P2P listener before it starts RPC, so an answering RPC
         # means node i is listening. Probing the P2P port itself would take the
@@ -523,7 +592,7 @@ def cmd_up(args) -> int:
             print(f"{node_name(i)} never came up", file=sys.stderr)
             return 1
 
-    if args.node_count > 1 and not wait_for_peers(args.node_count):
+    if args.node_count > 1 and not wait_for_peers(expected_peer_counts(dials)):
         # A network whose nodes never find each other still runs, still mines,
         # and still accepts transactions -- it just measures nothing, because
         # nothing propagates. Failing here beats discovering it in the verdict.
@@ -579,14 +648,14 @@ def wait_for_chain_convergence(
     return False
 
 
-def wait_for_peers(node_count: int, timeout_secs: int = 120, poll_secs: float = 5.0) -> bool:
-    """Wait until every node's peer count matches the chain `pin_chain_topology` set.
+def wait_for_peers(want: list[int], timeout_secs: int = 120, poll_secs: float = 5.0) -> bool:
+    """Wait until every node's `getpeerinfo` count equals its link count in `want`.
 
-    `getpeerinfo` lists inbound and outbound connections, so the chain's ends
-    report 1 and every inner node reports 2. Any other count means a link is
-    missing or an extra one formed, and the run would measure a different layout.
+    `getpeerinfo` lists inbound and outbound connections. Any other count means a
+    link is missing or an extra one formed, and the run would measure a different
+    layout.
     """
-    want = [1] + [2] * (node_count - 2) + [1]
+    node_count = len(want)
     deadline = time.monotonic() + timeout_secs
     counts: list[int] = []
     while True:
@@ -604,7 +673,7 @@ def wait_for_peers(node_count: int, timeout_secs: int = 120, poll_secs: float = 
             break
         time.sleep(poll_secs)
     print(
-        f"peer counts {counts} after {timeout_secs}s, want the chain's {want}",
+        f"peer counts {counts} after {timeout_secs}s, want the topology's {want}",
         file=sys.stderr,
     )
     return False
@@ -667,7 +736,7 @@ def stop_pid(pid: int, name: str) -> bool:
 
 
 def cmd_blast(args) -> int:
-    """Run the funded Orchard transaction blast against node 0's RPC."""
+    """Run the funded Orchard or transparent transaction blast against node 0's RPC."""
     lab = Path(args.lab_dir).resolve()
     trace_dir = lab / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -696,6 +765,9 @@ def cmd_blast(args) -> int:
         "--orchard-fanout-outputs",
         str(orchard["fanout_outputs"]),
     ]
+    # Passed only when asked for, so an older Kresko still runs the Orchard load.
+    if args.load == "transparent":
+        cmd += ["--load", "transparent", "--transparent-lanes", str(args.transparent_lanes)]
     print(f"+ {' '.join(cmd)}", flush=True)
     # Same upgrade the chain was generated with -- see cmd_genesis.
     upgrade_file = lab / "latest-upgrade"
@@ -823,6 +895,14 @@ def build_parser() -> argparse.ArgumentParser:
     gen.set_defaults(func=cmd_genesis)
 
     up = sub.add_parser("up", help="seed and start every node")
+    up.add_argument("--topology", choices=("chain", "graph"), default="chain")
+    up.add_argument("--peers", type=int, default=6, help="links per node for --topology graph")
+    up.add_argument("--graph-seed", type=int, default=1)
+    up.add_argument(
+        "--node-modes",
+        default="classic",
+        help=f"one of {sorted(NODE_MODES)} for every node, or one per node, comma-separated",
+    )
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="stop every node")
@@ -831,6 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
     blast = sub.add_parser("blast", help="run txblast against node 0")
     blast.add_argument("--tx-rate", type=int, default=10)
     blast.add_argument("--duration-secs", type=int, default=300)
+    blast.add_argument("--load", choices=("orchard", "transparent"), default="orchard")
+    blast.add_argument("--transparent-lanes", type=int, default=20_000)
     blast.set_defaults(func=cmd_blast)
 
     collect = sub.add_parser("collect", help="copy allowlisted artifacts to --out")

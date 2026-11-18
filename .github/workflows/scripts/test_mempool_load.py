@@ -33,6 +33,7 @@ def load_module(name: str, path: Path):
 lab = load_module("mempool_load_lab", SCRIPTS / "mempool-load-lab.py")
 monitor = load_module("mempool_load_monitor", SCRIPTS / "mempool-load-monitor.py")
 compare = load_module("mempool_load_compare", SCRIPTS / "mempool-load-compare.py")
+probe = load_module("mempool_load_probe", SCRIPTS / "mempool-load-probe.py")
 
 
 class NodeAddressing(unittest.TestCase):
@@ -267,19 +268,19 @@ class PeeringCheck(unittest.TestCase):
 
     def test_the_pinned_chain_passes(self):
         self.with_peer_counts([1, 2, 2, 1])
-        self.assertTrue(lab.wait_for_peers(4, timeout_secs=5, poll_secs=0.01))
+        self.assertTrue(lab.wait_for_peers([1, 2, 2, 1], timeout_secs=5, poll_secs=0.01))
 
     def test_an_extra_link_is_rejected(self):
         # A real run: seeding every node with every other one formed a star in
         # one leg and a chain in the next, so legs measured different layouts.
         self.with_peer_counts([3, 1, 1, 1])
-        self.assertFalse(lab.wait_for_peers(4, timeout_secs=0.5, poll_secs=0.01))
+        self.assertFalse(lab.wait_for_peers([1, 2, 2, 1], timeout_secs=0.5, poll_secs=0.01))
 
     def test_isolated_nodes_are_reported(self):
         # The exact bug a real run hit: a stale peer list produced three live,
         # mining, transaction-accepting nodes that never found each other.
         self.with_peer_counts([0, 0, 0])
-        self.assertFalse(lab.wait_for_peers(3, timeout_secs=0.5, poll_secs=0.01))
+        self.assertFalse(lab.wait_for_peers([1, 2, 1], timeout_secs=0.5, poll_secs=0.01))
 
     def test_rpc_failure_counts_as_unpeered(self):
         def boom(url, method, params=None, timeout=15):
@@ -288,7 +289,7 @@ class PeeringCheck(unittest.TestCase):
         original = lab.rpc_call
         lab.rpc_call = boom
         self.addCleanup(lambda: setattr(lab, "rpc_call", original))
-        self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
+        self.assertFalse(lab.wait_for_peers([1, 1], timeout_secs=0.5, poll_secs=0.01))
 
 
 class LabConfigRewrite(unittest.TestCase):
@@ -298,7 +299,9 @@ class LabConfigRewrite(unittest.TestCase):
         "[network]\n"
         'initial_testnet_peers = [\n    "127.0.0.102:18233",\n    "127.0.0.103:18233",\n]\n'
         'listen_addr = "127.0.0.101:18233"\n'
+        "max_connections_per_ip = 1\n"
         'network = "Testnet"\n'
+        'p2p_stack = "default"\n'
         "[network.testnet_parameters]\n"
         "disable_pow = true\n"
         "post_blossom_pow_target_spacing = 5\n"
@@ -306,6 +309,8 @@ class LabConfigRewrite(unittest.TestCase):
         "NU5 = 130\n"
         "[network.testnet_parameters.pre_nu6_funding_streams]\n"
         "recipients = []\n"
+        "\n[mempool]\n"
+        "eviction_memory_time = \"1h\"\n"
     )
 
     def test_custom_parameters_move_to_the_explicit_network_table(self):
@@ -323,20 +328,24 @@ class LabConfigRewrite(unittest.TestCase):
         text = lab.to_node_schema(self.KRESKO_NETWORK)
         self.assertEqual(lab.to_node_schema(text), text)
 
-    def test_each_node_seeds_only_its_predecessor(self):
+    def write_lab(self, tmp, node_count):
+        lab_dir = Path(tmp)
+        for i in range(node_count):
+            node_dir = lab_dir / "nodes" / lab.node_name(i)
+            node_dir.mkdir(parents=True)
+            (node_dir / "zakura.toml").write_text(self.KRESKO_NETWORK)
+        return lab_dir
+
+    def read_config(self, lab_dir, index):
+        return (lab_dir / "nodes" / lab.node_name(index) / "zakura.toml").read_text()
+
+    def test_each_chain_node_seeds_only_its_predecessor(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            lab_dir = Path(tmp)
-            for i in range(3):
-                node_dir = lab_dir / "nodes" / lab.node_name(i)
-                node_dir.mkdir(parents=True)
-                (node_dir / "zakura.toml").write_text(self.KRESKO_NETWORK)
-            lab.pin_chain_topology(lab_dir, 3)
-            seeds = [
-                (lab_dir / "nodes" / lab.node_name(i) / "zakura.toml").read_text().split("\n")[1]
-                for i in range(3)
-            ]
+            lab_dir = self.write_lab(tmp, 3)
+            lab.pin_topology(lab_dir, lab.topology_dials(3, "chain", 2, 1), ["classic"] * 3)
+            seeds = [self.read_config(lab_dir, i).split("\n")[1] for i in range(3)]
         self.assertEqual(
             seeds,
             [
@@ -345,6 +354,72 @@ class LabConfigRewrite(unittest.TestCase):
                 f'initial_testnet_peers = ["{lab.node_ip(1)}:18233"]',
             ],
         )
+
+    def test_the_graph_is_fixed_by_its_seed_and_reaches_node_0(self):
+        dials = lab.topology_dials(16, "graph", 6, 7)
+        self.assertEqual(dials, lab.topology_dials(16, "graph", 6, 7))
+        self.assertNotEqual(dials, lab.topology_dials(16, "graph", 6, 8))
+        # Each node dials only earlier nodes, so following any dial leads to node 0.
+        for k, targets in enumerate(dials[1:], start=1):
+            self.assertTrue(targets and all(t < k for t in targets))
+
+    def test_a_node_with_several_inbound_links_lifts_the_per_ip_limit(self):
+        import tempfile
+
+        # Every lab node dials from 127.0.0.1, so Kresko's limit of 1 would
+        # refuse a node's second inbound link.
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = self.write_lab(tmp, 3)
+            lab.pin_topology(lab_dir, [[], [0], [0, 1]], ["classic"] * 3)
+            self.assertIn("max_connections_per_ip = 3", self.read_config(lab_dir, 0))
+
+    def test_each_node_gets_its_own_mode(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = self.write_lab(tmp, 3)
+            modes = lab.parse_node_modes("legacy,core,core-txrelay", 3)
+            lab.pin_topology(lab_dir, [[], [0], [1]], modes)
+            legacy, core, relay = (self.read_config(lab_dir, i) for i in range(3))
+        self.assertIn('p2p_stack = "legacy"', legacy)
+        self.assertIn('implementation = "classic"', legacy)
+        self.assertIn('implementation = "core"', core)
+        self.assertNotIn("tx_relay", core)
+        self.assertIn("[network.zakura.tx_relay]\nenabled = true", relay)
+
+    def test_node_modes_take_one_value_or_one_per_node(self):
+        self.assertEqual(lab.parse_node_modes("core", 3), ["core"] * 3)
+        with self.assertRaises(ValueError):
+            lab.parse_node_modes("core,classic", 3)
+        with self.assertRaises(ValueError):
+            lab.parse_node_modes("fast", 1)
+
+
+class ProbeMath(unittest.TestCase):
+    """The probe's numbers come from first sightings stamped per node."""
+
+    def test_hops_follow_links_in_both_directions(self):
+        # Node 3 dials node 1, which dials node 0; node 2 dials node 0.
+        self.assertEqual(probe.hops_from_node_0([[], [0], [0], [1]]), [0, 1, 1, 2])
+
+    def test_reach_times_run_from_the_first_sighting(self):
+        firsts = [{"a": 10.0, "b": 20.0}, {"a": 10.5}, {"a": 12.0, "b": 21.0}, {"a": 11.0}]
+        reach = probe.reach_times(firsts, 4)
+        self.assertEqual(reach["to_50pct"]["p50_s"], 0.5)
+        self.assertEqual(reach["to_100pct"]["max_s"], 2.0)
+        # "b" never reached nodes 1 and 3 before it was mined.
+        self.assertEqual(reach["reached_all"], 1)
+
+    def test_delays_are_grouped_by_mode(self):
+        firsts = [{"a": 10.0}, {"a": 13.0}]
+        delays = probe.delays_by_group(firsts, ["core-txrelay", "legacy"])
+        self.assertEqual(delays["legacy"]["p50_s"], 3.0)
+        self.assertEqual(delays["core-txrelay"]["p50_s"], 0.0)
+
+    def test_block_spread_counts_only_tips_every_node_saw(self):
+        tips = [{"x": 1.0, "y": 5.0}, {"x": 1.2}]
+        spread = probe.block_spreads(tips, 2)
+        self.assertEqual((spread["tips"], spread["reached_all"], spread["max_s"]), (2, 1, 0.2))
 
 
 class NodeEnvironment(unittest.TestCase):

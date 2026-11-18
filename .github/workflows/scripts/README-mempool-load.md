@@ -17,6 +17,7 @@ funds, and no public peers. No Mainnet state and no real value are involved.
 | --- | --- |
 | `mempool-load-lab.py` | Generates the chain, starts/stops nodes, runs the blast, collects artifacts (per-node config localization and chain seeding are delegated to `kresko localize-fleet` / `kresko seed-local`) |
 | `mempool-load-monitor.py` | Samples every node, derives the numbers, writes `summary.json` / `summary.md`, sets the verdict |
+| `mempool-load-probe.py` | Times transaction and block propagation per node, by mode and by hop, and block fullness (`probe.json`) |
 | `mempool-load-compare.py` | Renders a baseline-vs-target regression table |
 | `mempool-load-run.sh` | Droplet entrypoint used by `zakura-mempool-load.yml` |
 | `test_mempool_load.py` | Unit tests (`python3 test_mempool_load.py`) |
@@ -88,12 +89,31 @@ fails to bind leaves the lab talking to whatever else owns the port — which in
 practice meant submitting blocks to an unrelated node and getting a confusing
 `rejected`.
 
-**Every run uses the same chain layout.** Seeding every node with every other
-one gave each run a random 3- or 4-link layout (a star in one leg, a 3-hop chain
-in the next), so "reached every node" compared layouts, not pools. After
-`localize-fleet`, the lab seeds node k with node k-1 only, so the nodes form the
-chain 0-1-...-(n-1) and the blaster's node 0 sits at one end. Propagation is
-then measured over 1 to n-1 hops every run.
+**Every run uses a fixed layout.** Seeding every node with every other one gave
+each run a random 3- or 4-link layout (a star in one leg, a 3-hop chain in the
+next), so "reached every node" compared layouts, not pools. After
+`localize-fleet`, `up` seeds each node with only the earlier nodes it should
+dial. `--topology chain` (the default) gives 0-1-...-(n-1), with the blaster's
+node 0 at one end. `--topology graph --peers K --graph-seed S` gives a random
+graph with about K links per node that the same seed always rebuilds. Every lab
+node dials out from 127.0.0.1, so `up` raises Kresko's `max_connections_per_ip
+= 1` to the node count, or a node would refuse its second inbound link.
+
+**Each node can run its own mode.** `up --node-modes` takes one of `classic`,
+`legacy` (today's pool on the legacy stack only, a node that hasn't upgraded),
+`core` and `core-txrelay`, for every node or one per node. `up` writes the
+layout and modes to `topology.json`.
+
+**`mempool-load-probe.py` times propagation per node.** It gives each node its
+own poller (tips every 50 ms, the mempool every 250 ms) and reports how long
+transactions take to reach 50%, 90% and 100% of nodes, delays by mode and by
+hops from node 0, how long blocks take to reach every node, and how full the
+blocks were. The sequential monitor takes seconds per round on a 16-node lab
+with block-sized pools.
+
+**`blast --load transparent`** sends 1-in-1-out P2PKH transactions from
+`--transparent-lanes` lanes instead of Orchard ones, so the load isn't capped by
+proving and can fill blocks.
 
 **`up` gates on peering before returning.** A network whose nodes never find
 each other still runs, still mines, and still accepts transactions — it just

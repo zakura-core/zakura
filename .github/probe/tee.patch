@@ -6,7 +6,7 @@ index b73bd1d0b9..1b2bf459ca 100644
                  .open(log_file)
                  .map_err(io_error)?;
              Box::new(log_file) as BoxWrite
-+        } else if let Some(dir) = std::env::var_os("ZAKURA_PROBE_TEE_DIR") {
++        } else if let Some(dir) = std::env::var_os("PROBE_TEE_DIR") {
 +            let path = std::path::Path::new(&dir).join(format!("zakurad-{}.log", std::process::id()));
 +            let file = File::options().append(true).create(true).open(path).map_err(io_error)?;
 +            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(10_000);

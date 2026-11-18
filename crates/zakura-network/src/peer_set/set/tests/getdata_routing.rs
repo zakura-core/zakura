@@ -1479,44 +1479,91 @@ async fn unscored_block_routing_ignores_answer_times() {
     assert!(slow_was_asked, "load-based routing does not read scores");
 }
 
-/// An announcer that answers its block request with `notfound` is expected to answer slowly.
+/// Another block, for checking how a peer is treated after it missed `BLOCK_HASH`.
+const OTHER_BLOCK_HASH: block::Hash = block::Hash([0x78; 32]);
+
+/// Makes `peer` announce `hash` to `peer_set`.
+async fn announce_hash(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    guard: &mut PeerSetGuard,
+    peer: &TestPeer,
+    hash: block::Hash,
+) {
+    guard
+        .inventory_sender()
+        .as_mut()
+        .expect("guard has an inventory sender")
+        .send(InventoryStatus::new_available(
+            InventoryHash::Block(hash),
+            peer.addr,
+        ))
+        .expect("peer set receives inventory");
+    peer_set.ready().await.expect("peer set is ready");
+}
+
+/// An announcer that answers its block request with `notfound` keeps its score, but is not
+/// preferred for the next announced block until it delivers one.
 #[tokio::test(start_paused = true)]
-async fn an_announcer_that_does_not_deliver_its_block_scores_worse() {
+async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
     let _init_guard = zakura_test::init();
     let registry = crate::peer_registry::PeerRegistry::default();
-    let mut peer = TestPeer::spawn(1);
-    let (_registry_guard, updater) = measured_peer(&mut peer, &registry, Some(10));
+    let mut missing = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let (_missing_guard, missing_score) = measured_peer(&mut missing, &registry, Some(10));
+    let _other = measured_peer(&mut other, &registry, Some(100));
 
-    let (mut peer_set, _guard) = peer_set_with_block_advertisers(&mut [&mut peer], true).await;
+    let mut config = crate::Config::default();
+    config.block_source_score.enabled = true;
+    let (mut peer_set, mut guard) = peer_set_with_peers(&mut [&mut missing, &mut other], config);
+    announce_block(&mut peer_set, &mut guard, &missing).await;
     let response = request_block(&mut peer_set).await;
     assert_eq!(
-        peer.written_now().await,
+        missing.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()]))
     );
-    peer.peer_inbound
+    missing
+        .peer_inbound
         .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
         .await
         .expect("connection is open");
     assert!(response.await.is_err(), "the peer did not have the block");
-
-    let score = updater.delivery_score().expect("measured");
-    assert!(
-        score > Duration::from_millis(500),
-        "a missed block raises the score: {score:?}"
+    assert_eq!(
+        missing_score.delivery_score(),
+        Some(Duration::from_millis(10)),
+        "a missed block leaves the score alone"
     );
+
+    announce_hash(&mut peer_set, &mut guard, &missing, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peer_set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(
+            iter::once(OTHER_BLOCK_HASH).collect(),
+        ));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the slower announcer is asked, because the faster one missed its last block"
+    );
+    assert_eq!(missing.written_now().await, None);
 }
 
-/// A peer that announced a block and does not deliver it to a second request is penalised as
-/// for a first request.
+/// A peer that announced a block and does not deliver it to a second request is not preferred
+/// for the next announced block either.
 #[tokio::test(start_paused = true)]
-async fn an_announcer_that_does_not_deliver_a_second_request_scores_worse() {
+async fn an_announcer_that_does_not_deliver_a_second_request_is_not_preferred_next() {
     let _init_guard = zakura_test::init();
     let registry = crate::peer_registry::PeerRegistry::default();
     let mut far = TestPeer::spawn(1);
     let mut near = TestPeer::spawn(2);
-    let (_far_guard, _far) = measured_peer(&mut far, &registry, Some(230));
+    let mut other = TestPeer::spawn(3);
+    let _far = measured_peer(&mut far, &registry, Some(230));
     let (_near_guard, near_score) = measured_peer(&mut near, &registry, Some(10));
-    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    let _other = measured_peer(&mut other, &registry, Some(100));
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut far, &mut near, &mut other]);
 
     announce_block(&mut peer_set, &mut guard, &far).await;
     let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
@@ -1533,12 +1580,27 @@ async fn an_announcer_that_does_not_deliver_a_second_request_scores_worse() {
         .await
         .expect("connection is open");
     assert!(second.await.is_err(), "the peer did not have the block");
-
-    let score = near_score.delivery_score().expect("measured");
-    assert!(
-        score > Duration::from_millis(500),
-        "a missed second request raises the score: {score:?}"
+    assert_eq!(
+        near_score.delivery_score(),
+        Some(Duration::from_millis(10)),
+        "a missed block leaves the score alone"
     );
+
+    announce_hash(&mut peer_set, &mut guard, &near, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peer_set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(
+            iter::once(OTHER_BLOCK_HASH).collect(),
+        ));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the near announcer that missed its last block is passed over"
+    );
+    assert_eq!(near.written_now().await, None);
 }
 
 /// A peer set with block source scores and second block requests on, built from `peers`.

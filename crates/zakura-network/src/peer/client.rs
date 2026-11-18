@@ -91,7 +91,8 @@ pub struct Client {
 /// what [`Client::poll_ready`](Service::poll_ready) reports, does not mean a newly sent request will
 /// be written now.
 ///
-/// The [`Connection`](super::Connection) task owns the writes. Clients and the peer set only read it.
+/// The [`Connection`](super::Connection) task owns the writes, except that the peer set marks a
+/// connection whose peer announced a block and then did not deliver it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
@@ -100,6 +101,10 @@ pub(crate) struct RequestSlot {
     /// True if the connection's last block request ended unanswered, until a peer delivers a
     /// requested block on this connection.
     block_request_unanswered: Arc<AtomicBool>,
+
+    /// True if the peer announced a block and then did not deliver it to a gossip block request,
+    /// until the peer delivers a requested block on this connection.
+    announced_block_missed: Arc<AtomicBool>,
 }
 
 impl RequestSlot {
@@ -122,6 +127,17 @@ impl RequestSlot {
     /// Returns true if the connection's last block request ended unanswered.
     pub(crate) fn block_request_unanswered(&self) -> bool {
         self.block_request_unanswered.load(Ordering::Acquire)
+    }
+
+    /// Records whether the peer announced a block and then did not deliver it.
+    pub(crate) fn set_announced_block_missed(&self, missed: bool) {
+        self.announced_block_missed.store(missed, Ordering::Release);
+    }
+
+    /// Returns true if the peer announced a block and then did not deliver it, and has not
+    /// delivered a requested block since.
+    pub(crate) fn announced_block_missed(&self) -> bool {
+        self.announced_block_missed.load(Ordering::Acquire)
     }
 }
 

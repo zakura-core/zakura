@@ -2011,6 +2011,11 @@ where
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
             }
+            if matches!(&response, Ok(Response::Blocks(blocks))
+                if blocks.iter().any(|block| block.available().is_some()))
+            {
+                self.request_slot.set_announced_block_missed(false);
+            }
 
             if let (Some(delivery_samples), Some(started_at), Ok(response)) = (
                 &self.delivery_samples,

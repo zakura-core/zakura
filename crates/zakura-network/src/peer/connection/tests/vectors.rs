@@ -2293,6 +2293,54 @@ async fn request_slot_records_unanswered_block_requests() {
     connection_task.abort();
 }
 
+/// A missed announced block is cleared only by a delivered block, not by a "not found" reply.
+#[tokio::test(start_paused = true)]
+async fn only_a_delivered_block_clears_a_missed_announced_block() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (_tx, block) = response_vectors();
+    slot.set_announced_block_missed(true);
+
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    peer_tx
+        .send(Ok(Message::NotFound(vec![block.hash().into()])))
+        .await
+        .expect("connection is open");
+    let _ = response.await.expect("connection responds");
+    settle().await;
+    assert!(
+        slot.announced_block_missed(),
+        "a reply without the block clears nothing"
+    );
+
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    settle().await;
+    assert!(
+        !slot.announced_block_missed(),
+        "a delivered block clears it"
+    );
+
+    connection_task.abort();
+}
+
 /// Returns a block advert for `hash`, and the receiver for its write result.
 fn block_advert(
     hash: block::Hash,

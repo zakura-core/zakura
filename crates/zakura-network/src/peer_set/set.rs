@@ -132,7 +132,7 @@ use crate::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
         LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
-    peer_registry::{DeliverySampleKind, MISSED_BLOCK_PENALTY},
+    peer_registry::PeerRegistryUpdater,
     peer_set::{
         legacy_peer_trace::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
@@ -326,6 +326,31 @@ where
 fn delivered_block(result: &Result<Response, SharedPeerError>) -> bool {
     matches!(result, Ok(Response::Blocks(blocks))
         if blocks.iter().any(|block| block.available().is_some()))
+}
+
+/// Where to record that a peer announced a block and then did not deliver it to a gossip block
+/// request.
+struct MissedBlockRecord {
+    /// The connection's request slot, which makes block routing stop preferring the peer until
+    /// it next delivers a block.
+    request_slot: crate::peer::RequestSlot,
+    /// The connection's delivery trace, when the node keeps a peer registry.
+    registry: Option<PeerRegistryUpdater>,
+    /// Whether the request was a second request for the block.
+    second_request: bool,
+}
+
+impl MissedBlockRecord {
+    /// Records a miss when `result` did not deliver the block.
+    fn record_if_undelivered(&self, result: &Result<Response, SharedPeerError>) {
+        if delivered_block(result) {
+            return;
+        }
+        self.request_slot.set_announced_block_missed(true);
+        if let Some(registry) = &self.registry {
+            registry.trace_block_missed(self.second_request);
+        }
+    }
 }
 
 impl<D, C> Drop for PeerSet<D, C>
@@ -1469,7 +1494,11 @@ where
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
-                    svc.block_gossip.registry.clone(),
+                    MissedBlockRecord {
+                        request_slot: svc.request_slot(),
+                        registry: svc.block_gossip.registry.clone(),
+                        second_request: false,
+                    },
                 )),
                 _ => None,
             };
@@ -1477,22 +1506,12 @@ where
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
             };
-            if let Some((request_id, peer, hash, started, delivery_samples)) = trace_context {
+            if let Some((request_id, peer, hash, started, missed)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 let choice = choice.unwrap_or_default();
                 return async move {
                     let result = fut.await;
-                    // A peer that announced the block and then did not deliver it should be
-                    // expected to answer slowly.
-                    if let Some(delivery_samples) =
-                        delivery_samples.filter(|_| !delivered_block(&result))
-                    {
-                        delivery_samples.record_delivery_sample(
-                            DeliverySampleKind::MissedBlock,
-                            MISSED_BLOCK_PENALTY,
-                            Instant::now(),
-                        );
-                    }
+                    missed.record_if_undelivered(&result);
                     trace.block_request_finish(
                         request_id,
                         peer,
@@ -1692,7 +1711,11 @@ where
         };
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
-        let delivery_samples = svc.block_gossip.registry.clone();
+        let missed = MissedBlockRecord {
+            request_slot: svc.request_slot(),
+            registry: svc.block_gossip.registry.clone(),
+            second_request: true,
+        };
         let started = Instant::now();
         let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
@@ -1700,15 +1723,7 @@ where
         let trace = self.legacy_peer_trace.clone();
         async move {
             let result = fut.await;
-            // Like a first request, a second request to a peer that announced the block and then
-            // did not deliver it makes the peer expected to answer slowly.
-            if let Some(delivery_samples) = delivery_samples.filter(|_| !delivered_block(&result)) {
-                delivery_samples.record_delivery_sample(
-                    DeliverySampleKind::MissedSecondBlock,
-                    MISSED_BLOCK_PENALTY,
-                    Instant::now(),
-                );
-            }
+            missed.record_if_undelivered(&result);
             trace.block_request_finish(
                 request_id,
                 trace_peer,

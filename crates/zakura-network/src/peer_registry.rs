@@ -13,7 +13,6 @@ mod delivery;
 mod delivery_trace;
 
 use delivery::DeliveryEstimate;
-pub(crate) use delivery::MISSED_BLOCK_PENALTY;
 pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
 
 use crate::{
@@ -328,8 +327,7 @@ impl PeerRegistryUpdater {
     }
 
     /// Records how long the peer took, measured at `now`, to answer a ping, a transaction
-    /// request or a small block request, or [`MISSED_BLOCK_PENALTY`] when it failed to deliver a
-    /// block it announced.
+    /// request or a small block request.
     ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.
@@ -366,6 +364,12 @@ impl PeerRegistryUpdater {
             .expect("an estimate that just recorded a sample has a score");
         self.delivery_trace
             .sample(kind, sample, score_before, score, estimate.weight());
+    }
+
+    /// Traces that the peer announced a block and did not deliver it to a first request, or to a
+    /// second request when `second_request` is set. The score does not change.
+    pub(crate) fn trace_block_missed(&self, second_request: bool) {
+        self.delivery_trace.block_missed(second_request);
     }
 
     /// The expected time for this peer to answer a block request, from its recent answers, or
@@ -492,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_delivery_sample_is_traced_with_the_score_it_leaves() {
+    async fn delivery_samples_and_missed_blocks_are_traced() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
         let registry = PeerRegistry::default();
@@ -504,7 +508,8 @@ mod tests {
 
         let now = Instant::now();
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
-        updater.record_delivery_sample(DeliverySampleKind::MissedBlock, MISSED_BLOCK_PENALTY, now);
+        updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
+        updater.trace_block_missed(true);
         drop(updater);
         guard.shutdown().await;
 
@@ -514,7 +519,7 @@ mod tests {
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
                 .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["event"], "delivery_sample");
         assert_eq!(rows[0]["connection_id"], 7);
         assert_eq!(rows[0]["kind"], "ping");
@@ -525,14 +530,21 @@ mod tests {
         );
         assert_eq!(rows[0]["score_ms"], 10);
         assert_eq!(rows[0]["weight"], 1.0);
-        assert_eq!(rows[1]["kind"], "missed_block");
-        assert_eq!(rows[1]["sample_ms"], 2000);
+        assert_eq!(rows[1]["kind"], "block");
+        assert_eq!(rows[1]["sample_ms"], 30);
         assert_eq!(rows[1]["score_before_ms"], 10);
         assert_eq!(
-            rows[1]["score_ms"], 1005,
+            rows[1]["score_ms"], 20,
             "two equal-weight samples are averaged"
         );
         assert_eq!(rows[1]["weight"], 2.0);
+        assert_eq!(rows[2]["event"], "block_missed");
+        assert_eq!(rows[2]["connection_id"], 7);
+        assert_eq!(rows[2]["request"], "second");
+        assert!(
+            rows[2].get("score_ms").is_none(),
+            "a missed block leaves the score alone"
+        );
     }
 
     #[test]

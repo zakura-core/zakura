@@ -1,17 +1,14 @@
 //! An estimate of how long one legacy peer takes to answer a block request.
 //!
 //! The estimate is a time-weighted average of the peer's measured answer times: heartbeat pings,
-//! transaction replies, small block replies, and a fixed penalty when it fails to deliver a block
-//! it announced. Older samples count for less, so a peer that slows down loses its good estimate
-//! within minutes.
+//! transaction replies and small block replies. Older samples count for less, so a peer that slows
+//! down loses its good estimate within minutes. A peer that announces a block and then does not
+//! deliver it is not penalised here: block routing stops preferring it until it delivers one.
 
 use std::time::{Duration, Instant};
 
 /// How quickly old samples stop counting. A sample this old has `1/e` of a new sample's weight.
 const TIME_CONSTANT: Duration = Duration::from_secs(10 * 60);
-
-/// The sample recorded when a peer that announced a block fails to deliver it.
-pub(crate) const MISSED_BLOCK_PENALTY: Duration = Duration::from_secs(2);
 
 /// One connection's time-weighted average answer time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,18 +94,5 @@ mod tests {
             score < ms(40),
             "a sample three time constants old barely counts: {score:?}"
         );
-    }
-
-    #[test]
-    fn a_missed_block_raises_the_score() {
-        let now = Instant::now();
-        let mut estimate = DeliveryEstimate::default();
-        for _ in 0..4 {
-            estimate.record(ms(10), now);
-        }
-        estimate.record(MISSED_BLOCK_PENALTY, now);
-
-        let score = estimate.score().expect("measured");
-        assert!(score > ms(300), "one missed block of five: {score:?}");
     }
 }

@@ -129,11 +129,20 @@ impl LoadTrackedClient {
 
     /// Returns true if block routing should prefer this advertiser over its busy advertisers.
     ///
-    /// A connection can write a request now, and the peer did not leave its last block request
-    /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
-    /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
+    /// A connection can write a request now, the peer did not leave its last block request
+    /// unanswered, and it has delivered a block since it last announced one it did not deliver.
+    /// Otherwise routing only offers this advertiser through ordinary load balancing, so a peer
+    /// that withholds blocks can't win every retry while other advertisers are busy.
     pub(crate) fn is_preferred_block_source(&self) -> bool {
-        self.can_send_request_now() && !self.has_unanswered_block_request()
+        self.can_send_request_now()
+            && !self.has_unanswered_block_request()
+            && !self.request_slot.announced_block_missed()
+    }
+
+    /// The connection's request slot, for marking that the peer announced a block it then did
+    /// not deliver.
+    pub(crate) fn request_slot(&self) -> super::client::RequestSlot {
+        self.request_slot.clone()
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

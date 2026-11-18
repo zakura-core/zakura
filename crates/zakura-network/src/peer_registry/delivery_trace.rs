@@ -1,11 +1,17 @@
-//! A trace row for every sample that changes a legacy connection's delivery score.
+//! A trace row for every sample that changes a legacy connection's delivery score, and for every
+//! announced block the peer did not deliver.
 //!
 //! Each `delivery_sample` row says what was measured (`kind`), the measured time (`sample_ms`),
 //! the score before and after (`score_before_ms`, `score_ms`), and `weight`, the decayed number of
-//! samples the new score rests on. Together they show why a peer's score is what it is: how far a
-//! missed block moved it, how quickly it recovered, and how much of it comes from pings and
-//! transaction replies rather than blocks. `connection_id` is the number the connection's
-//! `legacy_gossip` and `legacy_peer_request` rows carry, so the tables join.
+//! samples the new score rests on. Together they show why a peer's score is what it is, and how
+//! much of it comes from pings and transaction replies rather than blocks.
+//!
+//! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
+//! a second gossip block request (`request`). It does not change the score: block routing stops
+//! preferring the peer until it next delivers a block.
+//!
+//! `connection_id` is the number the connection's `legacy_gossip` and `legacy_peer_request` rows
+//! carry, so the tables join.
 
 use std::time::Duration;
 
@@ -23,10 +29,6 @@ pub(crate) enum DeliverySampleKind {
     Transaction,
     /// A reply to a block request whose blocks were all small.
     Block,
-    /// A first block request to a peer that announced the block, which it did not deliver.
-    MissedBlock,
-    /// A second block request to a peer that announced the block, which it did not deliver.
-    MissedSecondBlock,
 }
 
 impl DeliverySampleKind {
@@ -35,8 +37,6 @@ impl DeliverySampleKind {
             Self::Ping => "ping",
             Self::Transaction => "transaction",
             Self::Block => "block",
-            Self::MissedBlock => "missed_block",
-            Self::MissedSecondBlock => "missed_second_block",
         }
     }
 }
@@ -54,6 +54,17 @@ struct DeliverySampleEvent {
 }
 
 impl JsonlTraceEvent for DeliverySampleEvent {
+    const TABLE: JsonlTraceTable = TABLE;
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename = "block_missed")]
+struct BlockMissedEvent {
+    connection_id: u64,
+    request: &'static str,
+}
+
+impl JsonlTraceEvent for BlockMissedEvent {
     const TABLE: JsonlTraceTable = TABLE;
 }
 
@@ -91,6 +102,15 @@ impl DeliveryTrace {
             score_ms: saturating_millis(score),
             // Two decimals are enough to see how many recent samples a score rests on.
             weight: (weight * 100.0).round() / 100.0,
+        });
+    }
+
+    /// Records that the peer announced a block and did not deliver it to a first request, or to
+    /// a second request when `second_request` is set.
+    pub(crate) fn block_missed(&self, second_request: bool) {
+        self.emitter.emit_event(|| BlockMissedEvent {
+            connection_id: self.connection_id,
+            request: if second_request { "second" } else { "first" },
         });
     }
 }

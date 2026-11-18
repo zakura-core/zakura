@@ -889,7 +889,32 @@ jobs:
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
           # The block propagation page and the module that joins the nodes' reports for it.
           sudo install -m 644 deploy/runner/propagation.py deploy/runner/propagation.html \
-            deploy/profiler/peer_addresses.py "$dashboard_dir/"
+            deploy/runner/peer_location.py deploy/profiler/peer_addresses.py "$dashboard_dir/"
+          # Where outside peers are, looked up on this host: DB-IP's free City Lite
+          # database, refreshed until the installed copy is this month's. Locations
+          # are optional, so a failure here only warns and the page shows none.
+          geo_dir=/var/lib/zakura-mainnet-dashboard/geo
+          geo_db="$geo_dir/dbip-city-lite.mmdb"
+          dpkg -s python3-maxminddb >/dev/null 2>&1 \
+            || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-maxminddb; } \
+            || echo "::warning::python3-maxminddb could not be installed; peers will have no location" >&2
+          if [ ! -f "$geo_db" ] || [ "$(cat "$geo_dir/month" 2>/dev/null || true)" != "$(date -u +%Y-%m)" ]; then
+            geo_fetched=""
+            # A month's file appears a few days into it, so try last month's too.
+            for month in "$(date -u +%Y-%m)" "$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m)"; do
+              if curl --fail --silent --show-error --location --max-time 180 \
+                  "https://download.db-ip.com/free/dbip-city-lite-${month}.mmdb.gz" -o "$RUNNER_TEMP/geo.mmdb.gz" \
+                && gunzip -f "$RUNNER_TEMP/geo.mmdb.gz"; then
+                sudo install -d -m 755 "$geo_dir"
+                sudo install -m 644 "$RUNNER_TEMP/geo.mmdb" "$geo_db"
+                printf '%s\n' "$month" | sudo install -m 644 /dev/stdin "$geo_dir/month"
+                geo_fetched="$month"
+                break
+              fi
+            done
+            [ -n "$geo_fetched" ] && echo "peer location database: DB-IP City Lite $geo_fetched" \
+              || echo "::warning::could not download the DB-IP City Lite database; keeping $( [ -f "$geo_db" ] && echo the old copy || echo no locations )" >&2
+          fi
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
           # auth for the compatibility node into this copy (not the deploy config).
@@ -935,7 +960,7 @@ jobs:
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
           EnvironmentFile=/etc/zakura-mainnet-dashboard/dashboard.env
-          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 127.0.0.1 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 127.0.0.1 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json --geo-db /var/lib/zakura-mainnet-dashboard/geo/dbip-city-lite.mmdb
           Restart=always
           RestartSec=5
 

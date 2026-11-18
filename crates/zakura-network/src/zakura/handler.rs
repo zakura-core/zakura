@@ -8645,6 +8645,7 @@ mod tests {
     mod handshake_cost;
     mod quic_progress;
     mod read_close_cause;
+    mod teardown;
     mod transport_observer;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;

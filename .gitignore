@@ -171,6 +171,7 @@ $RECYCLE.BIN/
 
 # Python pycache
 __pycache__/
+.venv/
 
 # Lychee link checker cache
 .lycheecache

@@ -158,6 +158,16 @@ bitflags! {
         /// This experimental storage-mode hint accompanies `NODE_NETWORK` for compatibility
         /// with older peers. It promises no particular retention window or current tip height.
         const NODE_PRUNED = 1 << 25;
+
+        /// NODE_BLOCK_PUSH means that the node verifies a block that a peer sends it
+        /// without a request.
+        ///
+        /// A node pushes the blocks it mines, and relayed blocks if configured, only to peers
+        /// that advertise this bit. Other peers drop unrequested blocks, so they get only the
+        /// block's `inv`.
+        ///
+        /// This bit is in the temporary experiment range until a permanent service bit is assigned.
+        const NODE_BLOCK_PUSH = 1 << 26;
     }
 }
 
@@ -371,5 +381,6 @@ mod test {
             PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 27));
         assert_eq!(decoded, PeerServices::NODE_NETWORK);
         assert_eq!(PeerServices::NODE_PRUNED.bits(), 1 << 25);
+        assert_eq!(PeerServices::NODE_BLOCK_PUSH.bits(), 1 << 26);
     }
 }

@@ -128,7 +128,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("environment: crates-io-assets", publish)
         self.assertNotIn("RELEASE_STATE_R2_SECRET", publish)
         self.assertIn("environment: release-state-storage", promotion)
-        self.assertIn("needs: [resolve, validate, publish-assets]", promotion)
+        self.assertIn("needs: [resolve, validate, publish-assets, python-security]", promotion)
         self.assertNotIn("id-token: write", promotion)
         self.assertIn("!inputs.dry_run", promotion)
 

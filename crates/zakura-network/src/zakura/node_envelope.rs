@@ -25,7 +25,9 @@
 //! before producing it, and hold it until the last frame is written. Their frames
 //! are guarded, so they skip the transport output gate, and the retained bound adds
 //! the serving bound once. Each family's budget funds one session per connection
-//! that can serve at once, not per configured session slot.
+//! that can serve at once, not per configured session slot. `tx-relay`, while it
+//! is registered, builds a served body before it waits for its output grant and
+//! keeps one guarded `Inv` unwritten, so the bound adds both for each connection.
 
 use std::num::NonZeroU64;
 
@@ -192,5 +194,20 @@ fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
     ]
     .into_iter()
     .map(u128::from)
-    .sum()
+    .sum::<u128>()
+        + tx_relay_held_output_bytes(config, limits)
+}
+
+/// What `tx-relay` holds for the transport outside its output gates on a node
+/// with `limits`' admitted connections, or nothing while it is off. See
+/// [`SESSION_HELD_OUTPUT_BYTES`](crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES).
+fn tx_relay_held_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
+    if !config.zakura.tx_relay.enabled {
+        return 0;
+    }
+    u128::try_from(limits.max_connections)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(u128::from(
+            crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES,
+        ))
 }

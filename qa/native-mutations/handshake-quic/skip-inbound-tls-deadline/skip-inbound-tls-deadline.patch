@@ -1,0 +1,11 @@
+--- a/crates/zakura-quic/src/endpoint.rs
++++ b/crates/zakura-quic/src/endpoint.rs
+@@ -791,7 +791,7 @@
+     let started = Instant::now();
+     let remote = connecting.remote;
+     let shared = connecting.conn.shared.clone();
+-    let result = establish(connecting, deadline).await;
++    let result = establish(connecting, None).await;
+     #[cfg(zakura_sim)]
+     pending.table.record(HandshakeEvent::Finished {
+         remote,

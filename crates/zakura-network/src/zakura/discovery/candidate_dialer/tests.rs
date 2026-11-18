@@ -1,19 +1,20 @@
-//! Machine tests for [`CandidateDialerState`]: worked scenarios, the backoff
-//! rules, and a proptest against an independent model.
+//! Machine tests for [`CandidateDialerState`]: named scenarios for the
+//! backoff and round rules, the `discovery_candidate` machine target, and the
+//! real dialer loop.
 //!
-//! The model restates the documented rules. It never calls the code it
-//! checks.
+//! [`replay_candidate_dial_bytes`] drives the production state and checks its
+//! invariants after every operation (see `replay.rs`). The scenarios pin each
+//! rule with literal inputs and outputs.
 
 use std::net::{IpAddr, SocketAddr};
 
-use proptest::prelude::*;
 use zakura_quic::NodeId;
 
-use super::model::*;
+use super::replay::*;
 use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
 use super::state::{CandidateAddress, CandidateDialerState};
 use super::*;
-use crate::zakura::canonical_ip;
+use crate::zakura::{canonical_ip, machine_test::machine_target_tests};
 
 const DIAL_BACKOFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3_600));
 
@@ -355,94 +356,33 @@ async fn success_clears_backoff_only_for_the_admitted_ip() {
     assert!(state.is_backed_off(node, decoy, now));
 }
 
-fn dial_result() -> impl Strategy<Value = DiscoveryDialResult> {
-    prop_oneof![
-        Just(DiscoveryDialResult::Registered),
-        Just(DiscoveryDialResult::ConnectedElsewhere),
-        Just(DiscoveryDialResult::ShortLivedRegistered),
-        Just(DiscoveryDialResult::Failed),
-        Just(DiscoveryDialResult::AlpnMismatch),
-        Just(DiscoveryDialResult::LocalResourceLimit),
-    ]
-}
-
-fn dialer_op() -> impl Strategy<Value = DialerOp> {
-    prop_oneof![
-        2 => (0u64..25_000).prop_map(DialerOp::Advance),
-        2 => Just(DialerOp::Round),
-        4 => (
-            0..MODEL_NODES,
-            prop::collection::vec(0..MODEL_ADDRESSES.len(), 0..6),
-            prop::array::uniform3(prop::bool::weighted(0.2)),
-        )
-            .prop_map(|(node, addresses, refused)| DialerOp::Dial {
-                node,
-                addresses,
-                refused,
-            }),
-        4 => (
-            any::<usize>(),
-            dial_result(),
-            prop::option::of(0..MODEL_ADDRESSES.len()),
-        )
-            .prop_map(|(pick, result, admitted)| DialerOp::Complete {
-                pick,
-                result,
-                admitted,
-            }),
-        1 => (any::<usize>(), dial_result())
-            .prop_map(|(pick, result)| DialerOp::Duplicate { pick, result }),
-    ]
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn candidate_dialer_matches_independent_model(ops in prop::collection::vec(dialer_op(), 1..80)) {
-        run(ops, |_, _, _| {});
-    }
-
-    #[test]
-    fn candidate_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_candidate_dial_bytes(&bytes);
-    }
-}
-
+/// A dial of one node fails and its completion repeats. Three seconds later a
+/// round opens and the node's next dial hits a local limit, which holds the
+/// next round for one dial interval.
 const WITNESS: &[u8] = &[
     2, 7, 0, 3, 0, 3, 4, 0, 3, 0, 30, 0, 1, 0, 0, 2, 7, 0, 3, 0, 5, 1, 0, 0, 0, 10, 0, 1, 0, 0,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn candidate_witness_exercises_identity_backoff_and_local_limits() {
-    let summary = replay_candidate_dial_bytes(WITNESS);
-    assert_eq!(
-        summary,
-        CandidateDialReplaySummary {
-            attempts: 2,
-            completions: 2,
-            duplicates: 1,
-            local_limits: 1,
-            failures: 1,
-            rounds: 3,
-        }
-    );
-    assert_eq!(
-        replay_candidate_dial_bytes(&[]),
-        CandidateDialReplaySummary::default()
-    );
-    println!("tier=Machine target=discovery_candidate decoder=1 {summary:?}");
+machine_target_tests! {
+    replay: replay_candidate_dial_bytes,
+    target: "discovery_candidate",
+    decoder: 1,
+    witness: WITNESS => CandidateDialReplaySummary {
+        attempts: 2,
+        completions: 2,
+        duplicates: 1,
+        local_limits: 1,
+        failures: 1,
+        rounds: 3,
+    },
 }
 
 #[test]
 #[should_panic(expected = "discovery/dial-attempts")]
 fn candidate_witness_rejects_premature_reservation_release() {
-    run(decode(WITNESS), |state, model, now| {
-        if let Some(attempt) = model.in_flight.first() {
-            state.complete(attempt.key, DiscoveryDialResult::Registered, None, now);
+    run(decode(WITNESS), |state, sent| {
+        if let Some(attempt) = sent.in_flight.first() {
+            state.complete(attempt.key, DiscoveryDialResult::Registered, None, sent.now);
         }
     });
 }
@@ -450,8 +390,8 @@ fn candidate_witness_rejects_premature_reservation_release() {
 #[test]
 #[should_panic(expected = "discovery/dial-attempts")]
 fn candidate_witness_rejects_lost_backoff() {
-    run(decode(WITNESS), |state, _, now| {
-        state.begin_round(now + Duration::from_secs(120));
+    run(decode(WITNESS), |state, sent| {
+        state.begin_round(sent.now + Duration::from_secs(120));
     });
 }
 

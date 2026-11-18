@@ -1236,7 +1236,9 @@ fn codec_builds_every_row_from_outside_the_crate() {
 /// admission and its session's lifecycle are each observed, keyed as the
 /// identity rules say: the handshake by the remote address, the rest by the
 /// registered connection. The peer opened the session, so its generation names
-/// no local attempt.
+/// no local attempt. The handshake's stage, cadence and stream-setup events
+/// have their own tests in the handler's `transport_observer` tests, so this
+/// one reads only the kinds above.
 #[test]
 fn a_connection_is_observed_from_handshake_to_admission() {
     // Kind 4 is discovery, which this node doesn't register.
@@ -1248,7 +1250,20 @@ fn a_connection_is_observed_from_handshake_to_admission() {
         },
     );
     wire.run_until(Duration::from_secs(5));
-    let events = wire.events();
+    let events: Vec<TransportEvent> = wire
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TransportEvent::Negotiated { .. }
+                    | TransportEvent::Registered { .. }
+                    | TransportEvent::StreamRefused { .. }
+                    | TransportEvent::SessionLifecycle { .. }
+                    | TransportEvent::Admitted { .. }
+            )
+        })
+        .collect();
     let (conn_id, quic_stream) = header_stream(&events);
     let limits = ZakuraLocalLimits::from_config(&regtest_config());
     let TransportEvent::StreamRefused {

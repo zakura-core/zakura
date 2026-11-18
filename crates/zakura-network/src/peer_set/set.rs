@@ -383,7 +383,10 @@ where
             block_gossip_peers_changed: false,
             block_gossip_fanout: AdvertFanout::from_config(config),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
-            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
+            legacy_peer_trace: LegacyPeerTrace::new(
+                config.zakura.trace_dir.clone(),
+                config.expose_peer_addresses,
+            ),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -1236,8 +1239,9 @@ where
         svc: &D::Service,
     ) -> PeerTraceContext {
         PeerTraceContext {
-            peer_id: svc.trace_id(),
+            connection_id: svc.connection_id(),
             peer,
+            user_agent: svc.remote_user_agent(),
             peer_start_height: svc.remote_start_height(),
             local_tip_height: self.minimum_peer_version.chain_tip().best_tip_height(),
         }
@@ -1569,12 +1573,9 @@ where
 
     /// Schedule legacy inventory by block size, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (block, early) = match req {
-            Request::AdvertiseBlock(block, _)
-            | Request::AdvertiseBlockToAll(block)
-            | Request::AdvertiseMinedBlock(block) => (block, false),
-            Request::AdvertiseEarlyBlock(block) => (block, true),
-            _ => unreachable!("block routing only accepts block advertisements"),
+        let early = matches!(req, Request::AdvertiseEarlyBlock(_));
+        let Ok((block, push)) = self.block_gossip_fanout.advertised_block(req) else {
+            unreachable!("block routing only accepts block advertisements");
         };
         self.prune_block_gossip_peers();
         // A minimum version increase cancels busy outdated peers only after their current work.
@@ -1593,6 +1594,7 @@ where
             block.hash,
             self.block_gossip_fanout.window(block.size),
             tokio::time::Instant::now() + self.block_gossip_fanout.delay(),
+            push,
         )
     }
 

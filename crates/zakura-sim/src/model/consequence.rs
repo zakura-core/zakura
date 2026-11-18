@@ -29,7 +29,8 @@ pub const fn consequence(label: Label) -> Consequence {
         | Label::OverLive
         | Label::OverCredit
         | Label::AfterClose
-        | Label::BadCursor => Consequence::FaultClose,
+        | Label::BadCursor
+        | Label::OverRate => Consequence::FaultClose,
         Label::BadContent => Consequence::FamilyContent,
         Label::Conformant => Consequence::NoPunishment,
     }
@@ -48,6 +49,16 @@ pub const FAULT_CAUSES: &[&str] = &[
     "ordered_read_rejected",
     "request_read_rejected",
     "undersized_frame_cap",
+    // A metered row's bucket already holds every byte a conformant sender
+    // can have buffered, so an overrun is the sender's fault.
+    "ordered_byte_rate_overrun",
+    // tx-relay's own wire checks. A request past its `Hello`'s limit, or
+    // for an id already outstanding, closes too, but whether it is one
+    // depends on when the node's writer freed the earlier request's place,
+    // which no peer sees, so those closes stay neutral.
+    "tx-relay: protocol violation",
+    "tx-relay: malformed frame",
+    "tx-relay: undecodable transaction",
 ];
 
 /// True if a close with first recorded cause `cause` assigns the peer a

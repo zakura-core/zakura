@@ -397,6 +397,30 @@ impl DiscoveryState {
         )
     }
 
+    /// Checks the state's invariants: the admitted sessions of each direction
+    /// fit its cap, each retained hint holds its record or a live summary, and
+    /// the book keeps its own invariants.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        const PROPERTY: &str = "discovery/session-installation";
+        let limits = &self.config.peer_limits;
+        let (inbound, outbound) = (
+            self.admitted_in(ServicePeerDirection::Inbound),
+            self.admitted_in(ServicePeerDirection::Outbound),
+        );
+        assert!(
+            inbound <= limits.max_inbound_peers && outbound <= limits.max_outbound_peers,
+            "{PROPERTY}: {inbound} inbound and {outbound} outbound sessions exceed a direction cap"
+        );
+        assert!(
+            self.active_services
+                .values()
+                .all(|entry| entry.record.is_some() || !entry.live_summaries.is_empty()),
+            "{PROPERTY}: a retained hint holds nothing"
+        );
+        self.book.assert_invariants();
+    }
+
     fn admitted_in(&self, direction: ServicePeerDirection) -> usize {
         self.admitted_peers
             .values()

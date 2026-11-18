@@ -43,7 +43,10 @@ use serde_json::Value;
 pub use process::{
     classify_process, ProcessClassified, ProcessExit, ProcessFailure, ProcessResult,
 };
-pub use save::{input_path, save_failure, save_input, traces_root, SavedFailure, INPUTS_DIR};
+pub use save::{
+    has_saved_input, input_path, save_failure, save_input, traces_root, violated_property,
+    violation_panic, SavedFailure, INPUTS_DIR,
+};
 pub use worker::{
     abandon_limit, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT,
 };

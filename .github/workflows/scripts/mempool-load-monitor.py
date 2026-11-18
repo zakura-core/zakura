@@ -502,7 +502,8 @@ def render_markdown(result: dict) -> str:
     ]
 
     lines += [
-        f"`{meta.get('sha', 'unknown')}` | {meta.get('node_count')} nodes | "
+        f"`{meta.get('sha', 'unknown')}` | {meta.get('profile', 'default')} setup | "
+        f"{meta.get('node_count')} nodes | "
         f"{meta.get('duration_secs')}s | target {meta.get('tx_rate')} tx/s",
         "",
         "| Metric | Value | How to read it |",

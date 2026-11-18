@@ -54,7 +54,22 @@ RPC_READY_TIMEOUT_SECS = 180
 # the only record of when a block was requested, committed and applied to the
 # mempool.
 ZAKURA_TRACE_DIR = "zakura-traces"
-ZAKURA_TRACE_TABLES = ("block_sync", "header_sync", "chain_tip", "mempool", "ratelimit")
+ZAKURA_TRACE_TABLES = (
+    "block_sync",
+    "header_sync",
+    "legacy_gossip",
+    "chain_tip",
+    "mempool",
+    "ratelimit",
+)
+
+# The node setups a run compares. `legacy` is what Mainnet runs today. `v2`
+# moves blocks and transactions to P2P v2 (`dual` upgrades every lab peer) and
+# swaps in the pool core, which tx-relay needs.
+NODE_PROFILES = {
+    "legacy": {"p2p_stack": "legacy", "implementation": "classic", "tx_relay": "false"},
+    "v2": {"p2p_stack": "dual", "implementation": "core", "tx_relay": "true"},
+}
 
 # Artifact allowlist. Collection copies exactly these globs -- never the lab dir
 # wholesale -- so a new secret file appearing in the payload cannot silently
@@ -278,6 +293,7 @@ def localize_fleet(lab: Path, args) -> None:
         config.write_text(to_node_schema(config.read_text()))
     pin_chain_topology(lab, args.node_count)
     enable_zakura_traces(lab, args.node_count)
+    apply_node_profile(lab, args.node_count, args.profile)
 
 
 def to_node_schema(text: str) -> str:
@@ -345,6 +361,37 @@ def enable_zakura_traces(lab: Path, node_count: int) -> None:
         )
         if replaced != 1:
             raise RuntimeError(f"{config}: expected one [network.zakura] table")
+        config.write_text(text)
+
+
+def apply_node_profile(lab: Path, node_count: int, profile: str) -> None:
+    """Sets each run config's P2P stack, mempool implementation and tx-relay switch.
+
+    The values come from `NODE_PROFILES[profile]`. Rerunning on a rewritten
+    config replaces them rather than adding keys.
+    """
+    settings = NODE_PROFILES[profile]
+    relay = f"[network.zakura.tx_relay]\nenabled = {settings['tx_relay']}\n"
+    for index in range(node_count):
+        config = lab / "nodes" / node_name(index) / "zakura.toml"
+        text, stacks = re.subn(
+            r'(?m)^p2p_stack = ".*"$',
+            f'p2p_stack = "{settings["p2p_stack"]}"',
+            config.read_text(),
+        )
+        text, pools = re.subn(
+            r"(?m)^\[mempool\]\n(?:implementation = .*\n)?",
+            f'[mempool]\nimplementation = "{settings["implementation"]}"\n',
+            text,
+        )
+        if stacks != 1 or pools != 1:
+            raise RuntimeError(f"{config}: expected one p2p_stack key and one [mempool] table")
+        text, relays = re.subn(
+            r"(?m)^\[network\.zakura\.tx_relay\]\n(?:enabled = .*\n)?", relay, text
+        )
+        if relays == 0:
+            # Kresko's pinned zakura predates tx-relay, so it renders no table.
+            text = text.rstrip("\n") + "\n\n" + relay
         config.write_text(text)
 
 
@@ -847,6 +894,12 @@ def build_parser() -> argparse.ArgumentParser:
     gen.set_defaults(func=cmd_genesis)
 
     up = sub.add_parser("up", help="seed and start every node")
+    up.add_argument(
+        "--profile",
+        choices=sorted(NODE_PROFILES),
+        default="legacy",
+        help="node setup: legacy (legacy P2P, classic pool) or v2 (P2P v2, tx-relay, pool core)",
+    )
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="stop every node")

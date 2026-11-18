@@ -50,7 +50,7 @@ BINS="--zakurad-binary target/release/zakurad --kresko-binary /tmp/kresko/target
 
 python3 $S/mempool-load-lab.py --lab-dir $LAB $BINS --node-count 3 \
   genesis --orchard-lanes-per-miner 24
-python3 $S/mempool-load-lab.py --lab-dir $LAB $BINS --node-count 3 up
+python3 $S/mempool-load-lab.py --lab-dir $LAB $BINS --node-count 3 up --profile v2
 python3 $S/mempool-load-lab.py --lab-dir $LAB $BINS --node-count 3 \
   blast --tx-rate 5 --duration-secs 900 &
 python3 $S/mempool-load-monitor.py --lab-dir $LAB --node-count 3 \
@@ -120,6 +120,22 @@ starting difficulty, and blocks come as fast as the internal miner finds them
 there: about 7 s on a c-16. Read figures that depend on the block interval,
 like confirm delay and how many nodes a transaction reaches, against that
 rate rather than Mainnet's 25 s.
+
+**Each leg runs one node setup.** `up --profile` sets the P2P stack, the
+mempool implementation and tx-relay in every run config. `legacy` is what
+Mainnet runs today, legacy P2P and the classic pool. `v2` is P2P v2 (`dual`,
+which upgrades every lab peer), tx-relay and the pool core, which tx-relay
+needs. By default (`setups: legacy-vs-v2`) the workflow runs a legacy baseline
+leg and a v2 target leg on the same commit.
+
+The two setups don't relay blocks the same way at the lab's block rate. P2P
+v2's block-sync status allows a burst of 22 messages and earns one more every
+15 s, and a new block goes out early only while more than 11 are left. At about
+7 s per block the spare ones run out after about 20 blocks. From then on a v2
+node announces new blocks once per 15 s, two to five at a time, and each batch
+resets the next node's mempool. Legacy nodes announce every block at once. Until
+blocks slow past 15 s or that limit changes, a v2 deficit in reach or confirm
+delay comes from block relay first.
 
 **Nodes write Zakura traces.** The node logs run at INFO and say nothing about
 block-sync requests, so the lab also sets each node's

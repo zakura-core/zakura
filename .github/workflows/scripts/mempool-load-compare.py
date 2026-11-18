@@ -132,9 +132,9 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     lines = [
         "## Zakura mempool load: baseline vs target",
         "",
-        f"baseline `{base_meta.get('sha', 'unknown')}` "
+        f"baseline `{base_meta.get('sha', 'unknown')}` {base_meta.get('profile', 'default')} "
         f"({baseline.get('verdict', 'unknown')}) "
-        f"vs target `{target_meta.get('sha', 'unknown')}` "
+        f"vs target `{target_meta.get('sha', 'unknown')}` {target_meta.get('profile', 'default')} "
         f"({target.get('verdict', 'unknown')})",
         "",
         f"{target_meta.get('node_count', '?')} nodes | "

@@ -339,6 +339,34 @@ class LabConfigRewrite(unittest.TestCase):
         self.assertEqual(text.count("trace_dir = "), 1)
         self.assertIn(f'[network.zakura]\ntrace_dir = "{node_dir / lab.ZAKURA_TRACE_DIR}"\n', text)
 
+    def test_profiles_set_the_p2p_stack_pool_and_tx_relay(self):
+        import tempfile
+        import tomllib
+
+        # The run config's layout: Kresko renders `p2p_stack` and `[mempool]`,
+        # but its pinned zakura predates tx-relay, so there is no relay table.
+        run_config = (
+            "[mempool]\ntx_cost_limit = 80000000\n\n"
+            '[network]\np2p_stack = "default"\n\n'
+            '[network.zakura]\nlisten_addr = "127.0.0.101:18234"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = Path(tmp)
+            config = lab_dir / "nodes" / lab.node_name(0) / "zakura.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(run_config)
+            parsed = {}
+            # legacy over v2 also checks a rewritten config gets new values, not new keys.
+            for profile in ("v2", "legacy"):
+                lab.apply_node_profile(lab_dir, 1, profile)
+                parsed[profile] = tomllib.loads(config.read_text())
+        self.assertEqual(parsed["v2"]["network"]["p2p_stack"], "dual")
+        self.assertEqual(parsed["v2"]["mempool"]["implementation"], "core")
+        self.assertIs(parsed["v2"]["network"]["zakura"]["tx_relay"]["enabled"], True)
+        self.assertEqual(parsed["legacy"]["network"]["p2p_stack"], "legacy")
+        self.assertEqual(parsed["legacy"]["mempool"]["implementation"], "classic")
+        self.assertIs(parsed["legacy"]["network"]["zakura"]["tx_relay"]["enabled"], False)
+
     def test_each_node_seeds_only_its_predecessor(self):
         import tempfile
 

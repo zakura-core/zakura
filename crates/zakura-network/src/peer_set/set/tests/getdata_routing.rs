@@ -1703,6 +1703,84 @@ async fn a_later_announcer_expected_to_deliver_sooner_gets_one_second_request() 
         None,
         "a block gets at most one second request"
     );
+    assert!(attempt.close(), "native fallback keeps a dispatched hedge");
+    assert!(attempt.close(), "the downloader can still await that hedge");
+}
+
+/// A faster legacy announcer arriving during native fallback must not race a legacy
+/// request that already returned notfound.
+#[tokio::test(start_paused = true)]
+async fn native_fallback_closes_the_legacy_hedge_window() -> Result<(), BoxError> {
+    use crate::zakura::{
+        ZakuraDualStackService, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
+    };
+    use tokio::time::timeout;
+
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut later = TestPeer::spawn(2);
+    let _measurements = [
+        measured_peer(&mut first, &registry, Some(230)),
+        measured_peer(&mut later, &registry, Some(5)),
+    ];
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut later]);
+    announce_block(&mut peers, &mut guard, &first).await;
+
+    let supervisor = ZakuraSupervisorHandle::new(1);
+    let (sender, mut native_requests) = tokio::sync::mpsc::channel(1);
+    supervisor
+        .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(
+            ZakuraPeerId::new(vec![1; 32])?,
+            sender,
+        ))
+        .await;
+    let legacy = tower::buffer::Buffer::new(peers, 4);
+    let router = ZakuraDualStackService::new(legacy, supervisor, true);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let primary = tokio::spawn(router.clone().oneshot(Request::BlockByHashPrimary {
+        hash: BLOCK_HASH,
+        source: None,
+        attempt: attempt.clone(),
+    }));
+    let limit = Duration::from_millis(100);
+    assert_eq!(
+        timeout(limit, first.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    first
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await?;
+    let _native_request = timeout(limit, native_requests.recv())
+        .await?
+        .expect("native fallback was dispatched");
+
+    guard
+        .inventory_sender()
+        .as_mut()
+        .unwrap()
+        .send(InventoryStatus::new_available(
+            InventoryHash::Block(BLOCK_HASH),
+            later.addr,
+        ))?;
+    let check = router.oneshot(Request::BlockByHashHedge {
+        hash: BLOCK_HASH,
+        attempt: attempt.clone(),
+    });
+    let result = timeout(limit, check).await;
+    assert_eq!(
+        later.written_now().await,
+        None,
+        "a late announcer must receive no getdata after the primary switched to native"
+    );
+    let error = result?.expect_err("native fallback closed the window");
+    assert!(error.is::<crate::NoFasterBlockSource>());
+    assert!(
+        !attempt.close(),
+        "the downloader has no dispatched hedge to drain"
+    );
+    primary.abort();
+    Ok(())
 }
 
 /// A later announcer that is not clearly faster than the first request's remaining time is not

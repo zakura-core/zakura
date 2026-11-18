@@ -37,8 +37,16 @@ pub struct BlockHedge {
 #[derive(Debug, Default)]
 struct BlockDownloadState {
     first: Option<FirstDispatch>,
-    window_closed: bool,
+    hedge: HedgeDispatch,
     satisfied: bool,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+enum HedgeDispatch {
+    #[default]
+    Open,
+    Closed,
+    Dispatched,
 }
 
 /// The first handoff of this download to a peer. Native peers have no legacy address or score.
@@ -67,26 +75,35 @@ impl BlockHedge {
             .expect("block download state is never poisoned")
     }
 
-    /// Close the window when the first request finishes. Returns whether the second
-    /// request already claimed dispatch. Call once.
+    /// Stop new legacy hedges when the primary switches to native or finishes.
+    /// Repeated calls report the same outcome: whether a hedge was already dispatched.
     pub fn close(&self) -> bool {
         let mut state = self.state();
-        std::mem::replace(&mut state.window_closed, true)
+        if state.hedge == HedgeDispatch::Open {
+            state.hedge = HedgeDispatch::Closed;
+        }
+        state.hedge == HedgeDispatch::Dispatched
     }
 
     /// Return the age of the download while another request may still be dispatched.
     pub fn elapsed_if_open(&self) -> Option<Duration> {
         let state = self.state();
         let age = self.started.elapsed();
-        (!state.window_closed && !state.satisfied && age < Self::WINDOW).then_some(age)
+        (state.hedge == HedgeDispatch::Open && !state.satisfied && age < Self::WINDOW)
+            .then_some(age)
     }
 
     /// Claim dispatch at most once, unless completion or expiry has closed the window.
     pub fn claim_dispatch(&self) -> bool {
         let mut state = self.state();
-        !state.satisfied
-            && self.started.elapsed() < Self::WINDOW
-            && !std::mem::replace(&mut state.window_closed, true)
+        if state.hedge != HedgeDispatch::Open
+            || state.satisfied
+            || self.started.elapsed() >= Self::WINDOW
+        {
+            return false;
+        }
+        state.hedge = HedgeDispatch::Dispatched;
+        true
     }
 
     /// Record that a reply contained the requested block. Already-dispatched exchanges can drain.

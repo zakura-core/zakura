@@ -2205,6 +2205,9 @@ impl Service<Request> for LegacyRequestAdapter {
     fn call(&mut self, request: Request) -> Self::Future {
         let mut client = self.client.clone();
         if let Request::BlockByHashPrimary { attempt, .. } = &request {
+            // The primary is now using native peers. Its former legacy peer's score
+            // no longer predicts its arrival, but a hedge already sent can still win.
+            attempt.close();
             client.block_attempt = Some(attempt.clone());
         }
         Box::pin(async move {

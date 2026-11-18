@@ -43,8 +43,10 @@ COMPARISONS = (
      "Tail gossip spread. **The number to watch for advertisement/retry changes.**"),
     ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), False,
      "Full-network reach. A drop means transactions are not getting everywhere."),
-    ("Peak mempool depth", ("peak_mempool_txs",), False,
-     "Higher can mean slower draining, or simply more submitted; read with the rows above."),
+    # A shallower peak can mean faster draining or fewer submitted, so it
+    # never decides a run on its own.
+    ("Peak mempool depth", ("peak_mempool_txs",), None,
+     "Higher can mean slower draining, or simply more submitted; informational, not graded."),
 )
 
 # Below this, run-to-run noise dominates and a delta is not worth flagging.
@@ -128,20 +130,28 @@ def build_rows(baseline: dict, target: dict) -> list[dict]:
 
 
 def gate(baseline: dict, target: dict, rows: list[dict]) -> tuple[str, list[str]]:
-    """Return the comparison's status, `pass`, `fail` or `inconclusive`, and why."""
+    """Return the comparison's status, `pass`, `fail` or `inconclusive`, and why.
+
+    A failed leg or a missing graded metric fails the run. A leg too thin to
+    grade makes it inconclusive before any delta is read, since a thin leg's
+    deltas are noise. Only then does a regressed metric fail it.
+    """
     reasons = []
     verdicts = {"baseline": baseline.get("verdict"), "target": target.get("verdict")}
     for leg, verdict in verdicts.items():
         if verdict not in ("ok", "degraded", "inconclusive"):
             reasons.append(f"the {leg} leg's verdict is {verdict or 'missing'}")
     for row in rows:
-        if row["verdict"] in ("WORSE", "MISSING"):
-            reasons.append(f"{row['metric']}: {row['verdict']}")
+        if row["verdict"] == "MISSING":
+            reasons.append(f"{row['metric']}: MISSING")
     if reasons:
         return "fail", reasons
     thin = [leg for leg, verdict in verdicts.items() if verdict != "ok"]
     if thin:
         return "inconclusive", [f"the {leg} leg is {verdicts[leg]}" for leg in thin]
+    worse = [f"{row['metric']}: WORSE" for row in rows if row["verdict"] == "WORSE"]
+    if worse:
+        return "fail", worse
     return "pass", []
 
 

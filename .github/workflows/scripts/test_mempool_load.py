@@ -1186,6 +1186,20 @@ class Comparison(unittest.TestCase):
         thin = self.leg(verdict="degraded")
         self.assertEqual(compare.gate(self.leg(), thin, rows)[0], "inconclusive")
 
+    def test_a_thin_leg_is_not_graded_on_its_deltas(self):
+        baseline = self.leg(verdict="degraded", throughput={"reject_rate": 0.0})
+        target = self.leg(verdict="degraded", throughput={"reject_rate": 0.05})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Reject rate")["verdict"], "WORSE")
+        self.assertEqual(compare.gate(baseline, target, rows)[0], "inconclusive")
+
+    def test_a_shallower_peak_alone_does_not_fail(self):
+        target = self.leg()
+        target["peak_mempool_txs"] = target["peak_mempool_txs"] * 8 // 10
+        rows = compare.build_rows(self.leg(), target)
+        self.assertEqual(self.row_for(rows, "Peak mempool depth")["verdict"], "info")
+        self.assertEqual(compare.gate(self.leg(), target, rows), ("pass", []))
+
     def test_main_fails_without_a_summary(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

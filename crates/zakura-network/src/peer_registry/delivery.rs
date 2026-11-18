@@ -3,7 +3,8 @@
 //! The estimate is a time-weighted average of the peer's measured answer times: heartbeat pings
 //! and block replies of any size. Older samples count for less, so a peer that slows
 //! down loses its good estimate within minutes. A peer that announces a block and then does not
-//! deliver it is not penalised here: block routing stops preferring it until it delivers one.
+//! deliver it keeps its score. With scoring enabled, routing passes over it until a later
+//! delivery verifies or the miss expires.
 
 use std::time::{Duration, Instant};
 

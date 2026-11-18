@@ -103,12 +103,12 @@ pub(crate) struct RequestSlot {
     block_request_unanswered: Arc<AtomicBool>,
 
     /// When the peer last announced a block and then did not deliver it to a gossip block request,
-    /// until the peer delivers a requested block on this connection.
+    /// retained until a subsequent verified delivery clears it. Scored routing checks its age.
     announced_block_missed_at: Arc<std::sync::Mutex<Option<Arc<tokio::time::Instant>>>>,
 }
 
-/// How long block routing passes over a peer that announced a block and then did not deliver it,
-/// unless the peer delivers a block sooner.
+/// How long scored routing passes over a peer that failed to deliver an announced block,
+/// unless a subsequent delivery from that connection verifies sooner.
 ///
 /// Once the node follows the tip, a peer that is passed over is rarely asked for a block, so
 /// without a limit one honest miss could keep a good peer passed over for as long as it stays
@@ -143,7 +143,7 @@ impl RequestSlot {
         *self.missed_at() = Some(Arc::new(tokio::time::Instant::now()));
     }
 
-    /// Forgets a missed announced block, because the peer delivered a requested block.
+    /// Clears the miss that preceded a delivery once that body has verified.
     pub(crate) fn clear_miss_at_receipt(&self, at_receipt: &Arc<tokio::time::Instant>) {
         let mut missed = self.missed_at();
         if missed
@@ -155,7 +155,7 @@ impl RequestSlot {
     }
 
     /// Returns true if the peer announced a block and then did not deliver it within the last
-    /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and has not delivered a requested block since.
+    /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and no subsequent verified delivery cleared the miss.
     pub(crate) fn announced_block_missed(&self) -> bool {
         self.missed_at()
             .as_ref()

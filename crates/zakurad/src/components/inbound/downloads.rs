@@ -633,8 +633,8 @@ where
 
     /// Lets an advertised block that has not arrived yet also be requested from another peer that
     /// announced it, when the peer set expects that peer to deliver it sooner (see
-    /// [`zn::Request::BlockByHashHedge`]). The first copy to arrive is used. Parent recoveries
-    /// only ever send one request.
+    /// [`zn::Request::BlockByHashHedge`]). The first eligible copy goes to verification. A
+    /// body-specific rejection can use the other dispatched copy. Parent recoveries send one request.
     pub fn with_second_block_request(mut self, enabled: bool) -> Self {
         self.spawner.second_block_request = enabled;
         self

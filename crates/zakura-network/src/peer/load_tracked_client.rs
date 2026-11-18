@@ -153,7 +153,7 @@ impl LoadTrackedClient {
     ///
     /// A connection can write a request now, and the peer did not leave its last block request
     /// unanswered. With `skip_missed_announcers`, which block source scoring sets, the peer must
-    /// also have delivered a block since it last announced one it did not deliver. Otherwise
+    /// also be free of a recent miss. A subsequent verified delivery clears that miss. Otherwise
     /// routing only offers this advertiser through ordinary load balancing, so a peer that
     /// withholds blocks can't win every retry while other advertisers are busy.
     pub(crate) fn is_preferred_block_source(&self, skip_missed_announcers: bool) -> bool {

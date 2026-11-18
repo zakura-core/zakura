@@ -7,14 +7,16 @@ use serde::{Deserialize, Serialize};
 /// When a block is announced by more than one idle peer, the node draws two of them at random
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled,
 /// it asks the one expected to answer sooner, from how long each peer has recently taken to
-/// answer pings and block requests. A peer that announced a block and then did not deliver
-/// it is passed over until a later delivered body verifies, for at most 10 minutes.
+/// answer pings and block requests. The node records missed announcements in either mode.
+/// Only with scoring enabled does it pass over an announcer that missed, until a later body
+/// from the same connection verifies or 10 minutes elapse.
 ///
 /// With `second_request` also on, a block that the first request has not delivered yet is also
 /// requested from one other idle peer that announced it, but only when that peer is expected to
 /// deliver it clearly sooner than the first, or when the first request has run well past its
 /// expected time. Both peers must have measured answer times. The first reply that passes the
-/// requested-hash and tip-child height checks wins. Each download may send one second request.
+/// requested-hash and tip-child height checks goes to the verifier. If it rejects the body for
+/// a commitment mismatch or duplicate transactions, the other copy can be tried once.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockSourceScoreConfig {

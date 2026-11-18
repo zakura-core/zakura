@@ -104,6 +104,15 @@ class SecondRequestTest(unittest.TestCase):
 
 
 class PenaltyTest(unittest.TestCase):
+    def test_restoring_a_score_is_counted_without_another_measurement_or_penalty(self):
+        restored = sample(30, 2, "carried_over", None, 1000, weight=2.0)
+        del restored["sample_ms"]
+        summary = sources_at(100, [sample(20, 1, "missed_block", 5, 1000), restored]).summary(1)
+        self.assertEqual(summary["samples"]["counts"]["carried_over"], 1)
+        self.assertEqual(summary["samples"]["weight"]["p50"], 1.0)
+        self.assertEqual(summary["penalties"]["missed_block"]["count"], 1)
+        self.assertEqual(summary["penalties"]["missed_second_block"]["count"], 0)
+
     def test_a_penalty_reports_its_jump_and_when_the_score_came_back(self):
         sources = sources_at(2000, [
             sample(10, 1, "ping", None, 5),

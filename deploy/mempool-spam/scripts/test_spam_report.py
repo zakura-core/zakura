@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -194,6 +195,20 @@ class TransactionStateTests(unittest.TestCase):
         with mock.patch.object(round_robin_selfsend, "rpc_call", rpc_call):
             return round_robin_selfsend.transaction_state({"rpc_url": "http://node"}, "t")
 
+    def test_no_lookup_starts_after_the_window(self):
+        asked = []
+
+        def rpc_call(_url, method, params=None, timeout=30, auth=None):
+            asked.append(method)
+            return [] if method == "getrawmempool" else {"txid": "t"}
+
+        with mock.patch.object(round_robin_selfsend, "rpc_call", rpc_call):
+            state = round_robin_selfsend.transaction_state(
+                {"rpc_url": "http://node"}, "t", start_by=time.monotonic() - 1
+            )
+
+        self.assertEqual((state, asked), (None, ["getrawmempool"]))
+
     def test_a_pooled_transaction_is_in_the_pool(self):
         self.assertEqual(self.state(["t"], None), round_robin_selfsend.IN_POOL)
         self.assertEqual(self.state([], {"txid": "t"}), round_robin_selfsend.IN_POOL)
@@ -228,23 +243,29 @@ class TransactionStateTests(unittest.TestCase):
 
 
 class MatrixTests(unittest.TestCase):
-    def test_no_node_is_first_sampled_after_the_window(self):
-        nodes = [{"name": "a"}, {"name": "b"}]
-        sampled = []
+    def test_a_slow_pass_still_resamples_every_node_in_the_window(self):
+        nodes = [{"name": n} for n in "abcde"]
+        samples = {n: 0 for n in "abcde"}
+        lock = threading.Lock()
 
-        def state(node, _txid, deadline=None):
-            sampled.append(node["name"])
-            # The first sample outlasts the whole window.
-            time.sleep(0.1)
+        def state(node, _txid, deadline=None, start_by=None):
+            with lock:
+                samples[node["name"]] += 1
+                count = samples[node["name"]]
+            time.sleep(0.03)
+            # Node a gets the transaction after its first sample.
+            if node["name"] == "a" and count > 1:
+                return round_robin_selfsend.IN_POOL
             return round_robin_selfsend.ABSENT
 
         with mock.patch.object(round_robin_selfsend, "transaction_state", state):
-            in_pool, _, unobserved = round_robin_selfsend.first_seen_matrix(
-                nodes, "t", duration=0.05, interval=0.01
+            in_pool, _, _ = round_robin_selfsend.first_seen_matrix(
+                nodes, "t", duration=0.1, interval=0.0
             )
 
-        self.assertEqual(sampled, ["a"])
-        self.assertEqual((in_pool, unobserved), ({}, ["b"]))
+        # One after another, five 30 ms samples outlast the 100 ms window
+        # before a is sampled again.
+        self.assertIn("a", in_pool)
 
     def test_an_absence_in_a_window_the_run_cut_short_is_unobserved(self):
         nodes = [{"name": "a"}]
@@ -262,7 +283,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}]
         deadlines = []
 
-        def state(_node, _txid, deadline=None):
+        def state(_node, _txid, deadline=None, start_by=None):
             deadlines.append(deadline)
             return round_robin_selfsend.ABSENT
 
@@ -279,7 +300,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}]
         answers = iter([round_robin_selfsend.ABSENT])
 
-        def state(_node, _txid, deadline=None):
+        def state(_node, _txid, deadline=None, start_by=None):
             answer = next(answers, None)
             if answer is None:
                 raise round_robin_selfsend.RunDurationElapsed("deadline")
@@ -296,7 +317,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}, {"name": "b"}]
         answers = {"a": round_robin_selfsend.IN_POOL, "b": round_robin_selfsend.ABSENT}
 
-        def state(node, _txid, deadline=None):
+        def state(node, _txid, deadline=None, start_by=None):
             return answers[node["name"]]
 
         with mock.patch.object(round_robin_selfsend, "transaction_state", state):
@@ -311,7 +332,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}, {"name": "b"}]
         answers = {"a": round_robin_selfsend.IN_CHAIN, "b": None}
 
-        def state(node, _txid, deadline=None):
+        def state(node, _txid, deadline=None, start_by=None):
             return answers[node["name"]]
 
         with mock.patch.object(round_robin_selfsend, "transaction_state", state):

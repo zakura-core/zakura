@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import signal
@@ -143,14 +144,18 @@ RPC_NOT_FOUND = -5
 EXIT_INCONCLUSIVE = 3
 
 
-def transaction_state(node: dict, txid: str, deadline: float | None = None) -> str | None:
+def transaction_state(
+    node: dict, txid: str, deadline: float | None = None, start_by: float | None = None
+) -> str | None:
     """Where `node` holds `txid`: IN_POOL, IN_CHAIN once mined, ABSENT, or None
     if its answers do not settle it.
 
     A node that only knows the transaction from a block never showed it held
     the transaction in its pool, so the two are told apart. ABSENT needs a
     definite answer: the pool listing without the transaction, and the
-    lookup's "not found" error. A failed or unclear answer is None.
+    lookup's "not found" error. A failed or unclear answer is None, and so is
+    a pool listing without it that answered after `start_by`, since the
+    lookup would then start too late to say anything about the window.
     """
     try:
         if txid in rpc_call(
@@ -162,6 +167,8 @@ def transaction_state(node: dict, txid: str, deadline: float | None = None) -> s
         raise
     except Exception:  # noqa: BLE001
         listed = False
+    if start_by is not None and time.monotonic() >= start_by:
+        return None
     try:
         tx = rpc_call(
             node["rpc_url"],
@@ -210,28 +217,34 @@ def first_seen_matrix(
     after_mined: dict[str, float] = {}
     last: dict[str, str | None] = {}
     run_elapsed = False
+
+    def sample(node: dict) -> tuple[str | None, float | None]:
+        """One node's state and when it answered, or `(None, None)` if the
+        run's deadline cut the sample short."""
+        try:
+            # A sample begun inside the window finishes its first read, so the
+            # window's end never cuts that answer short. Only the run's own
+            # deadline does.
+            state = transaction_state(node, txid, deadline=run_deadline, start_by=deadline)
+        except RunDurationElapsed:
+            return None, None
+        return state, round(time.monotonic() - started, 3)
+
     while time.monotonic() < deadline and not STOP:
-        for node in nodes:
-            if node["name"] in in_pool or node["name"] in after_mined:
-                continue
-            # Nodes are sampled one after another, so a pass can outlast the
-            # window. A sample that would start after it shows nothing about
-            # the window.
-            if time.monotonic() >= deadline:
-                break
-            try:
-                # A sample begun inside the window finishes, so the window's
-                # end never cuts its answer short. Only the run's own
-                # deadline does.
-                state = transaction_state(node, txid, deadline=run_deadline)
-            except RunDurationElapsed:
-                # The interrupted sample settles nothing, whatever came before.
-                last[node["name"]] = None
-                run_elapsed = True
-                break
+        pending = [
+            node for node in nodes
+            if node["name"] not in in_pool and node["name"] not in after_mined
+        ]
+        # Every unsettled node is sampled at once, so each pass starts inside
+        # the window and lasts one sample, however many nodes there are.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as pool:
+            answers = list(pool.map(sample, pending))
+        for node, (state, elapsed) in zip(pending, answers):
             last[node["name"]] = state
-            elapsed = round(time.monotonic() - started, 3)
-            if state == IN_POOL:
+            if elapsed is None:
+                # The interrupted sample settles nothing, whatever came before.
+                run_elapsed = True
+            elif state == IN_POOL:
                 in_pool[node["name"]] = elapsed
             elif state == IN_CHAIN:
                 after_mined[node["name"]] = elapsed

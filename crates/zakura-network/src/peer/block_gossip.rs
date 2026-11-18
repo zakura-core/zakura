@@ -410,7 +410,12 @@ impl BlockGossipPeer {
     /// An announcement may suppress a new advert but cannot replace an active upload's outcome
     /// or one this connection already delivered. A retry after a joined upload failed still
     /// advertises: the peer's claim does not satisfy the delivery this broadcast owes.
-    async fn advertise_outcome(self, hash: block::Hash, push: bool, pending_send: Option<PendingBlockSendPermit>) -> AdvertOutcome {
+    async fn advertise_outcome(
+        self,
+        hash: block::Hash,
+        push: bool,
+        pending_send: Option<PendingBlockSendPermit>,
+    ) -> AdvertOutcome {
         if self.can_skip_advert(hash) {
             metrics::counter!("peer.block_gossip.advert_skipped", "when" => "fan_out").increment(1);
             return AdvertOutcome::Skipped;
@@ -441,7 +446,12 @@ impl BlockGossipPeer {
             retried = true;
         };
         let (result, written) = oneshot::channel();
-        let advert = BlockAdvert { hash, push, result, pending_send };
+        let advert = BlockAdvert {
+            hash,
+            push,
+            result,
+            pending_send,
+        };
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
         // Other connections have a shorter inventory-write timeout.
         let inventory_wait = if self.sidecar {
@@ -668,7 +678,16 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .cloned()
                     .collect();
                 if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, delayed_at, push, block.pending_send.clone()).await {
+                    match broadcast_block(
+                        candidates,
+                        block.hash,
+                        window,
+                        delayed_at,
+                        push,
+                        block.pending_send.clone(),
+                    )
+                    .await
+                    {
                         Ok(response) => return Ok(response),
                         Err(error) => tracing::debug!(
                             hash = ?block.hash,
@@ -1150,7 +1169,8 @@ mod tests {
                 let hash = block::Hash([39; 32]);
 
                 let (peer, mut receiver) = peer();
-                let mut early = broadcast_block(vec![peer.clone()], hash, 1, Instant::now(), false, None);
+                let mut early =
+                    broadcast_block(vec![peer.clone()], hash, 1, Instant::now(), false, None);
                 assert!((&mut early).now_or_never().is_none());
                 accept(&mut receiver, hash).await;
                 assert!((&mut early).now_or_never().is_none());
@@ -1193,7 +1213,8 @@ mod tests {
         assert!((&mut early).now_or_never().is_none());
         peer.uploads.requested(hash);
         peer.announced.record([hash]);
-        let mut committed = broadcast_block(vec![peer.clone()], hash, 1, Instant::now(), false, None);
+        let mut committed =
+            broadcast_block(vec![peer.clone()], hash, 1, Instant::now(), false, None);
         assert!((&mut committed).now_or_never().is_none());
         peer.uploads.unavailable(hash);
         assert!(early.await.is_err());
@@ -1660,7 +1681,14 @@ mod tests {
         let hash = block::Hash([0xd5; 32]);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(500);
-        let first = tokio::spawn(broadcast_block(peers.clone(), hash, 32, deadline, false, None));
+        let first = tokio::spawn(broadcast_block(
+            peers.clone(),
+            hash,
+            32,
+            deadline,
+            false,
+            None,
+        ));
         for _ in 0..32 {
             writes.recv().await.unwrap();
             assert_eq!(start.elapsed(), Duration::ZERO);
@@ -2526,7 +2554,14 @@ mod tests {
         let (peers, mut writes) = connected_peers(1);
         peers[0].announced.record([hash]);
         let (early, committed) = tokio::join!(
-            broadcast_block(peers.clone(), hash, TEST_WINDOW, Instant::now(), false, None),
+            broadcast_block(
+                peers.clone(),
+                hash,
+                TEST_WINDOW,
+                Instant::now(),
+                false,
+                None
+            ),
             broadcast_block(peers, hash, TEST_WINDOW, Instant::now(), false, None),
         );
         assert!(early.is_ok());
@@ -2599,7 +2634,14 @@ mod tests {
         let hash = block::Hash([42; 32]);
 
         let (delivered, mut receiver) = peer();
-        let early = broadcast_block(vec![delivered.clone()], hash, 1, Instant::now(), false, None);
+        let early = broadcast_block(
+            vec![delivered.clone()],
+            hash,
+            1,
+            Instant::now(),
+            false,
+            None,
+        );
         let early = tokio::spawn(early);
         accept(&mut receiver, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT).await;
@@ -2610,9 +2652,16 @@ mod tests {
         let (failed, failed_receiver) = peer();
         drop(failed_receiver);
         assert!(
-            broadcast_block(vec![delivered, failed], hash, 1, Instant::now(), false, None)
-                .await
-                .is_ok(),
+            broadcast_block(
+                vec![delivered, failed],
+                hash,
+                1,
+                Instant::now(),
+                false,
+                None
+            )
+            .await
+            .is_ok(),
             "an echo turned a delivered advert into a failed broadcast"
         );
         assert!(receiver.try_recv().is_err(), "no duplicate inventory");
@@ -2625,11 +2674,16 @@ mod tests {
         announcer.announced.record([hash]);
         let (failed, failed_receiver) = peer();
         drop(failed_receiver);
-        assert!(
-            broadcast_block(vec![announcer, failed], hash, 1, Instant::now(), false, None)
-                .await
-                .is_err()
-        );
+        assert!(broadcast_block(
+            vec![announcer, failed],
+            hash,
+            1,
+            Instant::now(),
+            false,
+            None
+        )
+        .await
+        .is_err());
         assert!(receiver.try_recv().is_err());
     }
 

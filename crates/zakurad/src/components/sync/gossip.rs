@@ -178,7 +178,10 @@ where
             }
             // block broadcasts inform other nodes about new blocks,
             // so our internal Grow or Reset state doesn't matter to them
-            let request = if is_block_submission {
+            let trusted_early = early.as_ref().is_some_and(|event| {
+                matches!(event.relay, zakura_rpc::EarlyBlockRelay::TrustedSubmission)
+            });
+            let request = if is_block_submission && !trusted_early {
                 zn::Request::AdvertiseMinedBlock(block.clone())
             } else {
                 zn::Request::AdvertiseBlock(block.clone(), None)

@@ -16,7 +16,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::{
+    block_memory::BlockHandle,
+    block_relay::{PendingBlockSendPermit, ServedBlock},
+};
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
@@ -56,6 +59,23 @@ use crate::{
 };
 
 use InventoryResponse::*;
+
+/// Frame temporary bodies with an attempt-local checksum and keep their write permission.
+fn legacy_block_message(
+    served: ServedBlock,
+) -> (Message, block::Hash, Option<PendingBlockSendPermit>) {
+    let ServedBlock {
+        block,
+        pending_send,
+    } = served;
+    let block = HashedBlock::from(block);
+    let hash = block.hash();
+    let message = match &pending_send {
+        Some(permit) => Message::UncachedBlock(block, permit.body_checksum()),
+        None => Message::Block(block),
+    };
+    (message, hash, pending_send)
+}
 
 mod peer_tx;
 
@@ -1303,18 +1323,29 @@ where
         )
         .increment(1);
 
-        let BlockAdvert { hash, push, result, pending_send } = advert;
+        let BlockAdvert {
+            hash,
+            push,
+            result,
+            pending_send,
+        } = advert;
         let mut result = Some(result);
 
         if push {
             match self.advertised_block_body(hash).await {
                 Some(block) => {
+                    let (message, _, body_permit) = legacy_block_message(block);
+                    if matches!((&pending_send, &body_permit), (Some(advert), Some(body)) if advert != body)
+                    {
+                        // A newer attempt has replaced the body. It owns its own delivery.
+                        return;
+                    }
                     if !self
                         .send_advert_message(
-                            Message::Block(HashedBlock::from(block)),
+                            message,
                             hash,
                             &mut result,
-                            pending_send.clone(),
+                            body_permit.or_else(|| pending_send.clone()),
                         )
                         .await
                     {
@@ -1334,7 +1365,10 @@ where
         }
 
         let inv = Message::Inv(vec![InventoryHash::Block(hash)]);
-        if self.send_advert_message(inv, hash, &mut result, pending_send).await {
+        if self
+            .send_advert_message(inv, hash, &mut result, pending_send)
+            .await
+        {
             // Mark the write before reading the peer's next message, which can be its getdata.
             self.block_uploads.advertised(hash);
             self.gossip_trace.block_inv_sent(hash);
@@ -1366,7 +1400,7 @@ where
         msg: Message,
         hash: block::Hash,
         result: &mut Option<tokio::sync::oneshot::Sender<Result<(), BlockAdvertError>>>,
-        pending_send: Option<zakura_node_services::block_relay::PendingBlockSendPermit>,
+        pending_send: Option<PendingBlockSendPermit>,
     ) -> bool {
         let address = self.connection_info.connected_addr.get_transient_addr();
         let version = self.connection_info.remote.version;
@@ -1374,12 +1408,16 @@ where
         let bans = &self.bans;
         let delivery = self
             .peer_tx
-            .send_authorized(msg, || {
-                // Validation can withdraw the advert while writer readiness is pending.
-                result.as_ref().is_some_and(|result| !result.is_closed())
-                    && version >= minimum.current()
-                    && !address.is_some_and(|addr| bans.contains(addr.ip()))
-            }, pending_send.clone())
+            .send_authorized(
+                msg,
+                || {
+                    // Validation can withdraw the advert while writer readiness is pending.
+                    result.as_ref().is_some_and(|result| !result.is_closed())
+                        && version >= minimum.current()
+                        && !address.is_some_and(|addr| bans.contains(addr.ip()))
+                },
+                pending_send.clone(),
+            )
             .await;
         match delivery {
             Ok(true) => true,
@@ -1416,7 +1454,7 @@ where
     ///
     /// The inbound service serves a mined block before it commits, and a relayed block from
     /// state. Returns `None` if the service fails, or no longer has the block.
-    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<BlockHandle> {
+    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<ServedBlock> {
         let request = Request::BlocksByHash(std::iter::once(hash).collect());
         // The inbound service has its own timeout layer.
         let response = self.svc.ready().await.ok()?.call(request).await.ok()?;
@@ -1424,7 +1462,7 @@ where
             return None;
         };
         let (block, _) = blocks.first()?.available()?;
-        Some(block.into_block())
+        Some(block.into_served())
     }
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
@@ -2158,16 +2196,11 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
-                            let zakura_node_services::block_relay::ServedBlock {
-                                block,
-                                pending_send,
-                            } = block.into_served();
-                            // The message hashes the block once, for the encoder and for us.
-                            let block = HashedBlock::from(block);
-                            let hash = block.hash();
+                            let (message, hash, pending_send) =
+                                legacy_block_message(block.into_served());
                             match self
                                 .peer_tx
-                                .send_authorized(Message::Block(block), || true, pending_send)
+                                .send_authorized(message, || true, pending_send)
                                 .await
                             {
                                 Ok(true) => {}

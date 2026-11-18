@@ -446,7 +446,9 @@ impl Node {
             let relay_tx = relay_tx.clone();
             let peers = relay_peers.clone();
             async move {
-                if let Request::AdvertiseMinedBlock(block) = &request {
+                if let Request::AdvertiseMinedBlock(block) | Request::AdvertiseBlock(block, None) =
+                    &request
+                {
                     if held {
                         let (release, released) = oneshot::channel();
                         let (finished, cancelled) = oneshot::channel();

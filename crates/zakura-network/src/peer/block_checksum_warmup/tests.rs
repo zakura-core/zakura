@@ -159,3 +159,26 @@ async fn small_or_known_blocks_are_not_looked_up() {
     assert_eq!(adverts.load(Ordering::SeqCst), 2);
     assert_eq!(lookups.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn warmup_ignores_a_body_still_owned_by_a_submission() {
+    use zakura_node_services::block_relay::{PendingBlockSendPermit, ServedBlock};
+
+    let block = large_block();
+    let hash = block.hash();
+    let (_resolution, pending_send) = PendingBlockSendPermit::channel();
+    let inbound = tower::service_fn(move |request| {
+        assert_eq!(request, Request::BlocksByHash(IndexSet::from([hash])));
+        let body = ServedBlock {
+            block: block.clone().into(),
+            pending_send: Some(pending_send.clone()),
+        };
+        async move {
+            Ok(Response::Blocks(vec![InventoryResponse::Available((
+                body.into(), None,
+            ))]))
+        }
+    });
+
+    assert!(lookup_block(inbound, hash).await.is_none());
+}

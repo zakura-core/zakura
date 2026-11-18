@@ -831,7 +831,7 @@ impl LegacyResponseCodec {
                             // A withdrawn temporary body is reported missing, as on legacy TCP.
                             // Encoding is this transport's write start: frames are queued to the
                             // stream only after it.
-                            let encoded = match &block.pending_send {
+                            let encoded = match block.pending_send() {
                                 Some(permit) => {
                                     permit.try_start_write(|| block.zcash_serialize_to_vec())
                                 }
@@ -7850,7 +7850,8 @@ mod tests {
                     ServedBlock {
                         block: block.clone().into(),
                         pending_send: Some(permit),
-                    },
+                    }
+                    .into(),
                     None,
                 ))]),
                 cap,

@@ -239,7 +239,8 @@ async fn queued_body_rechecks_rejection_and_preserves_committed_delivery() {
                             block: block.clone().into(),
                             push: false,
                             pending_send: Some(permit),
-                        },
+                        }
+                        .into(),
                         None,
                     ))]));
                 writing.await.unwrap();

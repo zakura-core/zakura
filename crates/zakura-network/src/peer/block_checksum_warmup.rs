@@ -81,7 +81,7 @@ where
         let block = match request {
             Request::AdvertiseBlock(block, _)
             | Request::AdvertiseBlockToAll(block)
-            | Request::AdvertiseMinedBlock(block) => *block,
+            | Request::AdvertiseMinedBlock(block) => block,
             _ => return,
         };
         // An unknown size is checked once the block is found.
@@ -165,8 +165,10 @@ where
         return None;
     };
     blocks.into_iter().find_map(|block| match block {
-        InventoryResponse::Available((block, _)) if block.hash() == hash => {
-            Some(block.into_block())
+        InventoryResponse::Available((body, _))
+            if body.pending_send().is_none() && body.hash() == hash =>
+        {
+            Some(body.into_block())
         }
         _ => None,
     })

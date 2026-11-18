@@ -22,22 +22,20 @@ pub(crate) struct DeliveryEstimate {
 }
 
 impl DeliveryEstimate {
-    /// Mixes in one answer time measured at `now`.
-    ///
-    /// Earlier samples are first decayed by the time since the last sample, so recent samples
-    /// count for more.
-    pub(crate) fn record(&mut self, sample: Duration, now: Instant) {
-        let previous_weight = match self.updated_at {
-            Some(updated_at) => {
-                let age = now.saturating_duration_since(updated_at).as_secs_f64();
-                self.weight * (-age / TIME_CONSTANT.as_secs_f64()).exp()
-            }
-            None => 0.0,
-        };
-        let weight = previous_weight + 1.0;
-        self.mean_secs = (self.mean_secs * previous_weight + sample.as_secs_f64()) / weight;
+    /// Weighs a sample by when the answer arrived. Verification can confirm older block
+    /// deliveries after a newer heartbeat has already updated the estimate.
+    pub(crate) fn record(&mut self, sample: Duration, received_at: Instant) {
+        let previous = self.updated_at.unwrap_or(received_at);
+        let latest = previous.max(received_at);
+        let decay =
+            |at: Instant| (-(latest - at).as_secs_f64() / TIME_CONSTANT.as_secs_f64()).exp();
+        let existing_weight = self.weight * decay(previous);
+        let sample_weight = decay(received_at);
+        let weight = existing_weight + sample_weight;
+        self.mean_secs =
+            (self.mean_secs * existing_weight + sample.as_secs_f64() * sample_weight) / weight;
         self.weight = weight;
-        self.updated_at = Some(now);
+        self.updated_at = Some(latest);
     }
 
     /// The decayed number of samples the estimate rests on, as of the last sample.
@@ -59,6 +57,20 @@ mod tests {
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn late_verification_uses_the_original_receipt_time() {
+        let early = Instant::now();
+        let late = early + TIME_CONSTANT;
+        let mut chronological = DeliveryEstimate::default();
+        chronological.record(ms(200), early);
+        chronological.record(ms(10), late);
+        let mut delayed = DeliveryEstimate::default();
+        delayed.record(ms(10), late);
+        delayed.record(ms(200), early);
+        assert_eq!(delayed.score(), chronological.score());
+        assert_eq!(delayed.weight(), chronological.weight());
     }
 
     #[test]

@@ -1707,6 +1707,49 @@ async fn a_later_announcer_expected_to_deliver_sooner_gets_one_second_request() 
     assert!(attempt.close(), "the downloader can still await that hedge");
 }
 
+/// The three-second fallback is visible to the connection that actually wrote the request.
+#[tokio::test(start_paused = true)]
+async fn dual_stack_inventory_deadline_passes_over_the_silent_advertiser() -> Result<(), BoxError> {
+    use crate::zakura::{ZakuraDualStackService, ZakuraSupervisorHandle};
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut fast = TestPeer::spawn(1);
+    let mut slow = TestPeer::spawn(2);
+    let _scores = [
+        measured_peer(&mut fast, &registry, Some(10)),
+        measured_peer(&mut slow, &registry, Some(100)),
+    ];
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut fast, &mut slow]);
+    announce_block(&mut peers, &mut guard, &fast).await;
+    announce_hash(&mut peers, &mut guard, &fast, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peers, &mut guard, &slow, OTHER_BLOCK_HASH).await;
+    let router = ZakuraDualStackService::new(
+        tower::buffer::Buffer::new(peers, 4),
+        ZakuraSupervisorHandle::new(1),
+        true,
+    );
+    let primary = tokio::spawn(
+        router
+            .clone()
+            .oneshot(Request::block_by_hash(BLOCK_HASH, None)),
+    );
+    let limit = Duration::from_millis(100);
+    assert_eq!(
+        tokio::time::timeout(limit, fast.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert_eq!(fast.written_now().await, None);
+    let next = tokio::spawn(router.oneshot(Request::block_by_hash(OTHER_BLOCK_HASH, None)));
+    assert_eq!(
+        tokio::time::timeout(limit, slow.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()]))
+    );
+    assert_eq!(fast.written_now().await, None);
+    primary.abort();
+    next.abort();
+    Ok(())
+}
+
 /// A faster legacy announcer arriving during native fallback must not race a legacy
 /// request that already returned notfound.
 #[tokio::test(start_paused = true)]
@@ -1814,6 +1857,39 @@ async fn a_later_announcer_that_is_not_clearly_faster_is_asked_only_after_a_stal
     );
 }
 
+/// A stall can use a measured peer that announces after an unmeasured one.
+#[tokio::test(start_paused = true)]
+async fn a_stall_waits_for_a_measured_second_announcer() {
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut unknown = TestPeer::spawn(2);
+    let mut measured = TestPeer::spawn(3);
+    let _scores = [
+        measured_peer(&mut first, &registry, Some(50)),
+        measured_peer(&mut unknown, &registry, None),
+        measured_peer(&mut measured, &registry, Some(100)),
+    ];
+    let (mut peers, mut guard) =
+        peer_set_with_second_requests(&mut [&mut first, &mut unknown, &mut measured]);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    assert!(
+        attempt.elapsed_if_open().is_some(),
+        "queueing does not fix the first score"
+    );
+    announce_block(&mut peers, &mut guard, &first).await;
+    let _primary = request_primary(&mut peers, &attempt).await;
+    announce_block(&mut peers, &mut guard, &unknown).await;
+    assert_not_yet(request_block_again(&mut peers, &attempt, 550).await).await;
+    assert_eq!(unknown.written_now().await, None);
+    announce_block(&mut peers, &mut guard, &measured).await;
+    let _hedge = request_block_again(&mut peers, &attempt, 10).await;
+    assert_eq!(
+        measured.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(unknown.written_now().await, None);
+}
+
 /// A first peer whose answers have not been measured gets no second request, even from a much
 /// faster announcer and long after a measured peer's request would have stalled.
 #[tokio::test(start_paused = true)]
@@ -1832,6 +1908,10 @@ async fn an_unmeasured_first_peer_gets_no_second_request() {
     announce_block(&mut peer_set, &mut guard, &unmeasured).await;
     let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
     let _first = request_primary(&mut peer_set, &attempt).await;
+    assert!(
+        attempt.elapsed_if_open().is_none(),
+        "the downloader stops polling after the unmeasured primary is dispatched"
+    );
     announce_block(&mut peer_set, &mut guard, &near).await;
 
     assert_not_yet(request_block_again(&mut peer_set, &attempt, 10).await).await;

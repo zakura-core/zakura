@@ -199,7 +199,10 @@ pub use crate::{
     peer_set::init_with_zakura,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
-        internal::{AdvertisedBlock, BlockHedge, InventoryResponse, PeerSource, Request, Response},
+        internal::{
+            AdvertisedBlock, BlockHedge, DeliveredBlock, InventoryResponse, PeerSource, Request,
+            Response,
+        },
     },
 };
 

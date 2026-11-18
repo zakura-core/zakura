@@ -57,6 +57,25 @@ fn body(bytes: &[u8]) -> Arc<Block> {
     bytes.zcash_deserialize_into().expect("valid block vector")
 }
 
+async fn test_download<ZN>(
+    network: ZN,
+    hash: block::Hash,
+    source: Option<zn::PeerSource>,
+    hedge: bool,
+) -> Result<BlockCandidate, DownloadError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    let (_, tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
+    let checks = CandidateChecks {
+        tip,
+        misbehavior: crate::components::test_misbehavior::reporter(),
+        kind: DownloadKind::Advertised,
+    };
+    download_block(network, hash, source, hedge, checks, oneshot::channel().1).await
+}
+
 fn hash() -> block::Hash {
     body(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES).hash()
 }
@@ -76,7 +95,7 @@ fn available(bytes: &[u8], peer: PeerSocketAddr) -> zn::Response {
     ))])
 }
 
-fn assert_copy((block, source): (BlockHandle, Option<PeerSocketAddr>), peer: PeerSocketAddr) {
+fn assert_copy((block, source, _): BlockCandidate, peer: PeerSocketAddr) {
     assert_eq!(block.hash(), hash());
     assert_eq!(source, Some(peer));
 }
@@ -126,7 +145,7 @@ async fn assert_nothing_more_sent(sent: &mut mpsc::UnboundedReceiver<Sent>, why:
 #[tokio::test(start_paused = true)]
 async fn without_second_requests_only_the_first_request_is_sent() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, false));
+    let download = tokio::spawn(test_download(network, hash(), None, false));
 
     let first = next_sent(&mut sent).await;
     assert_eq!(first.request, first_request());
@@ -139,7 +158,7 @@ async fn without_second_requests_only_the_first_request_is_sent() {
 #[tokio::test(start_paused = true)]
 async fn the_peer_set_is_asked_again_until_the_first_request_answers() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     for checks in 1..=3 {
@@ -164,7 +183,7 @@ async fn the_peer_set_is_asked_again_until_the_first_request_answers() {
 #[tokio::test(start_paused = true)]
 async fn a_second_request_that_answers_first_wins() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     next_sent(&mut sent).await.not_yet();
@@ -184,7 +203,7 @@ async fn a_second_request_that_answers_first_wins() {
 #[tokio::test(start_paused = true)]
 async fn after_a_second_request_is_sent_no_more_checks_are_made() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     let second = next_dispatched(&mut sent).await;
@@ -201,7 +220,7 @@ async fn after_a_second_request_is_sent_no_more_checks_are_made() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_second_request_waits_for_the_first() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     let second = next_dispatched(&mut sent).await;
@@ -222,7 +241,7 @@ async fn a_failed_second_request_waits_for_the_first() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_first_request_stops_the_checks_and_returns_its_error() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     let check = next_sent(&mut sent).await;
@@ -242,7 +261,7 @@ async fn a_failed_first_request_stops_the_checks_and_returns_its_error() {
 #[tokio::test(start_paused = true)]
 async fn checks_stop_after_the_check_window() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
     let mut checks = 0;
@@ -263,7 +282,7 @@ async fn checks_stop_after_the_check_window() {
 #[tokio::test(start_paused = true)]
 async fn completing_the_first_request_closes_an_already_submitted_check() {
     let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let download = tokio::spawn(test_download(network, hash(), None, true));
     let first = next_sent(&mut sent).await;
     let queued = next_sent(&mut sent).await;
     let zn::Request::BlockByHashHedge { ref attempt, .. } = queued.request else {
@@ -281,7 +300,7 @@ async fn completing_the_first_request_closes_an_already_submitted_check() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_first_request_waits_for_an_already_dispatched_second_request() {
     let (network, mut sent) = network();
-    let mut download = tokio::spawn(download_block(network, hash(), None, true));
+    let mut download = tokio::spawn(test_download(network, hash(), None, true));
     let first = next_sent(&mut sent).await;
     let second = next_dispatched(&mut sent).await;
 
@@ -308,7 +327,7 @@ async fn a_reply_without_the_requested_body_cannot_win() {
         zn::Response::Nil,
     ] {
         let (network, mut sent) = network();
-        let mut download = tokio::spawn(download_block(network, hash(), None, true));
+        let mut download = tokio::spawn(test_download(network, hash(), None, true));
         let first = next_sent(&mut sent).await;
         let second = next_dispatched(&mut sent).await;
         first.answer.send(Ok(response)).unwrap();
@@ -321,10 +340,65 @@ async fn a_reply_without_the_requested_body_cannot_win() {
     }
 }
 
+/// Exercise candidate admission with a moving local tip and an ordinary immutable body.
+#[tokio::test(start_paused = true)]
+async fn a_height_rejection_leaves_the_other_dispatch_eligible() {
+    let block = body(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let parent = block.header.previous_block_hash;
+    for first_rejected in [true, false] {
+        let (mut tip_sender, tip) = super::tests::chain_tip_at(block::Height(5), parent);
+        let reporter = crate::components::test_misbehavior::reporter();
+        let checks = CandidateChecks {
+            tip,
+            misbehavior: reporter.clone(),
+            kind: DownloadKind::Advertised,
+        };
+        let (network, mut sent) = network();
+        let mut download = tokio::spawn(download_block(
+            network,
+            block.hash(),
+            None,
+            true,
+            checks,
+            oneshot::channel().1,
+        ));
+        let first = next_sent(&mut sent).await;
+        let second = next_dispatched(&mut sent).await;
+        let ((early, early_addr), (late, late_addr)) = if first_rejected {
+            ((first, first_peer()), (second, second_peer()))
+        } else {
+            ((second, second_peer()), (first, first_peer()))
+        };
+        early
+            .answer
+            .send(Ok(available(
+                &zakura_test::vectors::BLOCK_MAINNET_1_BYTES,
+                early_addr,
+            )))
+            .unwrap();
+        assert!(tokio::time::timeout(CHECK, &mut download).await.is_err());
+        assert!(reporter.is_banned(early_addr.ip()));
+        super::tests::set_tip(&mut tip_sender, block::Height(6), block::Hash([6; 32]));
+        late.answer
+            .send(Ok(available(
+                &zakura_test::vectors::BLOCK_MAINNET_1_BYTES,
+                late_addr,
+            )))
+            .unwrap();
+        let (accepted, source, height) = download.await.unwrap().unwrap();
+        assert_eq!(
+            (accepted.hash(), source, height),
+            (block.hash(), Some(late_addr), block::Height(1))
+        );
+        assert!(!reporter.is_banned(late_addr.ip()));
+        assert_nothing_more_sent(&mut sent, "the other dispatch supplied the block").await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_missing_second_reply_leaves_the_first_peer_eligible() {
     let (network, mut sent) = network();
-    let mut download = tokio::spawn(download_block(network, hash(), None, true));
+    let mut download = tokio::spawn(test_download(network, hash(), None, true));
     let first = next_sent(&mut sent).await;
     let second = next_dispatched(&mut sent).await;
     second
@@ -337,6 +411,7 @@ async fn a_missing_second_reply_leaves_the_first_peer_eligible() {
         tokio::time::timeout(CHECK, &mut download).await.is_err(),
         "the other request can still deliver"
     );
+    assert_nothing_more_sent(&mut sent, "a miss spends the single hedge").await;
     first.answer.send(Ok(from_first())).unwrap();
     assert_copy(download.await.unwrap().unwrap(), first_peer());
 }
@@ -345,7 +420,7 @@ async fn a_missing_second_reply_leaves_the_first_peer_eligible() {
 async fn two_failed_replies_preserve_the_first_peers_hash_error() {
     for first_finishes_first in [true, false] {
         let (network, mut sent) = network();
-        let mut download = tokio::spawn(download_block(network, hash(), None, true));
+        let mut download = tokio::spawn(test_download(network, hash(), None, true));
         let first = next_sent(&mut sent).await;
         let second = next_dispatched(&mut sent).await;
         let wrong = available(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES, first_peer());
@@ -408,7 +483,7 @@ async fn native_fallback_only_runs_while_the_download_needs_a_body() -> Result<(
             }
         });
         let buffered = tower::buffer::Buffer::new(service, 4);
-        let download = tokio::spawn(download_block(buffered, hash(), None, true));
+        let download = tokio::spawn(test_download(buffered, hash(), None, true));
         let first = tokio::time::timeout(TEST_NET_TIMEOUT, requests.recv())
             .await?
             .unwrap();
@@ -438,7 +513,7 @@ async fn native_fallback_only_runs_while_the_download_needs_a_body() -> Result<(
                 .unwrap(),
         }
         if let Some(download) = download {
-            let (body, _) = tokio::time::timeout(TEST_NET_TIMEOUT, download)
+            let (body, _, _) = tokio::time::timeout(TEST_NET_TIMEOUT, download)
                 .await??
                 .map_err(|(error, _)| error)?;
             assert_eq!(body.hash(), hash());

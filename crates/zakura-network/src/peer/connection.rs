@@ -46,7 +46,7 @@ use crate::{
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
-    peer_registry::{DeliverySampleKind, PeerRegistryUpdater},
+    peer_registry::PeerRegistryUpdater,
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, HashedBlock, InventoryHash, Message},
@@ -365,7 +365,7 @@ impl Handler {
                     // If we got everything we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     Handler::Finished(Ok(Response::Blocks(available.collect())))
                 } else {
                     // Keep on waiting for all the blocks we wanted, until we get them or time out.
@@ -411,7 +411,7 @@ impl Handler {
                     // If we got some of what we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     let missing = pending_hashes.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Blocks(available.chain(missing).collect())))
@@ -1084,6 +1084,11 @@ where
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
+                            let timed_out = matches!(&tx.advertised_block,
+                                Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) if attempt.timed_out_after_write());
+                            if timed_out {
+                                self.record_advertised_block_miss(Some(&super::AdvertisedBlockRequest::Primary));
+                            }
                             self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
                             continue;
@@ -1111,7 +1116,7 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
-                                    self.record_advertised_block_miss(tx.advertised_block);
+                                    self.record_advertised_block_miss(tx.advertised_block.as_ref());
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -1407,7 +1412,7 @@ where
             return None;
         };
         let (block, _) = blocks.first()?.available()?;
-        Some(block)
+        Some(block.into_block())
     }
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
@@ -1630,6 +1635,11 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
+                if let Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) =
+                    &tx.advertised_block
+                {
+                    attempt.legacy_request_written();
+                }
                 self.state = AwaitingResponse { handler, span, tx };
                 self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
             }
@@ -1957,7 +1967,7 @@ where
         let tmp_state = std::mem::replace(&mut self.state, State::Failed);
 
         if let State::AwaitingResponse {
-            handler: Handler::Finished(response),
+            handler: Handler::Finished(mut response),
             tx,
             span,
         } = tmp_state
@@ -1982,27 +1992,18 @@ where
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
             }
-            // A reply with a requested block, of any size, both clears a missed announced
-            // block and times how long the peer takes to deliver one. Pings are timed by the
-            // heartbeat. Other replies (transactions, block hashes, headers, addresses, "not
-            // found" alone) are not counted: a peer chooses how many transactions it announces,
-            // and the rest take the peer a different amount of work.
-            let delivered_block = matches!(&response, Ok(Response::Blocks(blocks))
-                if blocks.iter().any(|block| block.available().is_some()));
-            let started_at = self.request_started_at.take();
-            if delivered_block {
-                self.request_slot.clear_announced_block_missed();
-                if let (Some(delivery_samples), Some(started_at)) =
-                    (&self.delivery_samples, started_at)
-                {
-                    delivery_samples.record_delivery_sample(
-                        DeliverySampleKind::Block,
-                        started_at.elapsed(),
-                        Instant::now(),
+            // Capture transfer time here. Only the verifier can credit this particular body.
+            let started = self.request_started_at.take();
+            if let Ok(reply @ Response::Blocks(_)) = &mut response {
+                if let Some(started) = started {
+                    reply.observe_block_delivery(
+                        &self.request_slot,
+                        self.delivery_samples.clone(),
+                        started.elapsed(),
                     );
                 }
             } else {
-                self.record_advertised_block_miss(tx.advertised_block);
+                self.record_advertised_block_miss(tx.advertised_block.as_ref());
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -2145,7 +2146,7 @@ where
                     match block {
                         Available((block, _)) => {
                             // The message hashes the block once, for the encoder and for us.
-                            let block = HashedBlock::from(block);
+                            let block = HashedBlock::from(block.into_block());
                             let hash = block.hash();
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
@@ -2346,11 +2347,11 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Record a dispatched advertiser's miss before another request can update the same slot.
-    fn record_advertised_block_miss(&self, advertised: Option<super::AdvertisedBlockRequest>) {
+    fn record_advertised_block_miss(&self, advertised: Option<&super::AdvertisedBlockRequest>) {
         if let Some(route) = advertised {
             self.request_slot.mark_announced_block_missed();
             if let Some(registry) = &self.delivery_samples {
-                registry.trace_block_missed(route == super::AdvertisedBlockRequest::Hedge);
+                registry.trace_block_missed(*route == super::AdvertisedBlockRequest::Hedge);
             }
         }
     }
@@ -2470,7 +2471,7 @@ where
             // can block the current async task thread. We briefly lock the mutex
             // to clone the error.
             if !tx.is_canceled() {
-                self.record_advertised_block_miss(tx.advertised_block);
+                self.record_advertised_block_miss(tx.advertised_block.as_ref());
             }
             let _ = tx.send(Err(error.clone()));
         }

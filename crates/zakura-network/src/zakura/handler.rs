@@ -13701,10 +13701,11 @@ mod tests {
             assert_eq!(assembled, response);
             match assembled {
                 Response::Blocks(blocks) => {
-                    let InventoryResponse::Available((BlockHandle::Shared(block), None)) =
-                        &blocks[0]
-                    else {
+                    let InventoryResponse::Available((block, None)) = &blocks[0] else {
                         panic!("the available block remains shared");
+                    };
+                    let BlockHandle::Shared(block) = &**block else {
+                        panic!("decoded block is shared");
                     };
                     assert!(Arc::ptr_eq(block, &decoded_block.unwrap()));
                 }

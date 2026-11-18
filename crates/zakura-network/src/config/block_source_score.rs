@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled,
 /// it asks the one expected to answer sooner, from how long each peer has recently taken to
 /// answer pings and block requests. A peer that announced a block and then did not deliver
-/// it is passed over until it delivers one, for at most 10 minutes.
+/// it is passed over until a later delivered body verifies, for at most 10 minutes.
 ///
 /// With `second_request` also on, a block that the first request has not delivered yet is also
 /// requested from one other idle peer that announced it, but only when that peer is expected to
 /// deliver it clearly sooner than the first, or when the first request has run well past its
-/// expected time. The first copy to arrive is used. A block is never requested more than twice
-/// this way, and never when the first peer's answer times have not been measured yet.
+/// expected time. Both peers must have measured answer times. The first reply that passes the
+/// requested-hash and tip-child height checks wins. Each download may send one second request.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockSourceScoreConfig {

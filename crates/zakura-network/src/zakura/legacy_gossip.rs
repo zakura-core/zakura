@@ -2416,10 +2416,39 @@ where
                     // even when it has no ready peer (e.g. every legacy peer was
                     // upgraded to Zakura). Bound the legacy attempt so we fall
                     // back to the Zakura path instead of blocking forever.
-                    let legacy_attempt = timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, async {
-                        legacy.ready().await?.call(request.clone()).await
-                    })
-                    .await;
+                    let (legacy_request, deadline) = match &request {
+                        Request::BlockByHashPrimary { attempt, .. } => {
+                            (request.clone(), Some(attempt.clone()))
+                        }
+                        Request::BlocksByHash(hashes)
+                        | Request::BlocksByHashFrom { hashes, .. }
+                            if hashes.len() == 1 =>
+                        {
+                            let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+                            attempt.close();
+                            (
+                                Request::BlockByHashPrimary {
+                                    hash: hashes[0],
+                                    source: request.inventory_source(),
+                                    attempt: attempt.clone(),
+                                },
+                                Some(attempt),
+                            )
+                        }
+                        _ => (request.clone(), None),
+                    };
+                    let legacy_attempt = {
+                        let pending = async { legacy.ready().await?.call(legacy_request).await };
+                        tokio::pin!(pending);
+                        let outcome =
+                            timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, &mut pending).await;
+                        if outcome.is_err() {
+                            if let Some(deadline) = deadline {
+                                deadline.legacy_timeout();
+                            }
+                        }
+                        outcome
+                    };
                     match legacy_attempt {
                         Ok(Ok(response)) if !all_inventory_missing(&response) => {
                             Ok(record_source(response, BlockBodySource::Legacy))
@@ -4089,7 +4118,10 @@ mod tests {
                     )
                 }
                 // The legacy peer set answers a hedge with the block, like `BlocksByHash`.
-                Request::BlockByHashHedge { hash, .. } if hash == self.block.hash() => {
+                Request::BlockByHashHedge { hash, .. }
+                | Request::BlockByHashPrimary { hash, .. }
+                    if hash == self.block.hash() =>
+                {
                     Response::Blocks(vec![InventoryResponse::Available((
                         self.block.clone().into(),
                         None,
@@ -8569,6 +8601,14 @@ mod tests {
                     }
                     Response::Blocks(hashes.into_iter().map(InventoryResponse::Missing).collect())
                 }
+                Request::BlockByHashPrimary { hash, .. } => match self.inventory {
+                    StubInventory::Error => {
+                        return std::future::ready(Err("legacy inventory unavailable".into()))
+                    }
+                    StubInventory::Missing => {
+                        Response::Blocks(vec![InventoryResponse::Missing(hash)])
+                    }
+                },
                 _ => Response::Nil,
             };
             std::future::ready(Ok(response))

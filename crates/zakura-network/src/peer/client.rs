@@ -104,7 +104,7 @@ pub(crate) struct RequestSlot {
 
     /// When the peer last announced a block and then did not deliver it to a gossip block request,
     /// until the peer delivers a requested block on this connection.
-    announced_block_missed_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    announced_block_missed_at: Arc<std::sync::Mutex<Option<Arc<tokio::time::Instant>>>>,
 }
 
 /// How long block routing passes over a peer that announced a block and then did not deliver it,
@@ -140,22 +140,34 @@ impl RequestSlot {
 
     /// Records that the peer announced a block and then did not deliver it.
     pub(crate) fn mark_announced_block_missed(&self) {
-        *self.missed_at() = Some(tokio::time::Instant::now());
+        *self.missed_at() = Some(Arc::new(tokio::time::Instant::now()));
     }
 
     /// Forgets a missed announced block, because the peer delivered a requested block.
-    pub(crate) fn clear_announced_block_missed(&self) {
-        *self.missed_at() = None;
+    pub(crate) fn clear_miss_at_receipt(&self, at_receipt: &Arc<tokio::time::Instant>) {
+        let mut missed = self.missed_at();
+        if missed
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, at_receipt))
+        {
+            *missed = None;
+        }
     }
 
     /// Returns true if the peer announced a block and then did not deliver it within the last
     /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and has not delivered a requested block since.
     pub(crate) fn announced_block_missed(&self) -> bool {
         self.missed_at()
+            .as_ref()
             .is_some_and(|missed_at| missed_at.elapsed() < ANNOUNCED_BLOCK_MISS_LIFETIME)
     }
 
-    fn missed_at(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
+    /// Identifies the miss preceding this reply, including two misses within the same clock tick.
+    pub(crate) fn miss_at_receipt(&self) -> Option<Arc<tokio::time::Instant>> {
+        self.missed_at().clone()
+    }
+
+    fn missed_at(&self) -> std::sync::MutexGuard<'_, Option<Arc<tokio::time::Instant>>> {
         self.announced_block_missed_at
             .lock()
             .expect("the missed-block mutex is never held across a panic")
@@ -170,10 +182,12 @@ impl RequestSlot {
 pub struct CancelHeartbeatTask;
 
 /// Why the peer set chose this advertiser for a single-block request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdvertisedBlockRequest {
     /// The ordinary request to an announcer.
     Primary,
+    /// A primary whose dual-stack caller can report its legacy deadline.
+    TimedPrimary(crate::BlockHedge),
     /// The competing request to a later announcer.
     Hedge,
 }

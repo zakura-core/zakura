@@ -39,6 +39,8 @@ struct BlockDownloadState {
     first: Option<FirstDispatch>,
     hedge: HedgeDispatch,
     satisfied: bool,
+    legacy_timed_out: bool,
+    legacy_written_before_timeout: bool,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -119,6 +121,21 @@ impl BlockHedge {
         self.state().first
     }
 
+    /// Publish the dual-stack deadline before the legacy future is dropped.
+    pub(crate) fn legacy_timeout(&self) {
+        self.state().legacy_timed_out = true;
+    }
+
+    pub(crate) fn legacy_request_written(&self) {
+        let mut state = self.state();
+        state.legacy_written_before_timeout = !state.legacy_timed_out;
+    }
+
+    pub(crate) fn timed_out_after_write(&self) -> bool {
+        let state = self.state();
+        state.legacy_timed_out && state.legacy_written_before_timeout
+    }
+
     /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
     /// The closure only enqueues work in a ready service or reserved channel slot.
     pub(crate) fn dispatch_if_needed<T>(
@@ -128,8 +145,16 @@ impl BlockHedge {
         dispatch: impl FnOnce() -> T,
     ) -> Result<T, crate::BoxError> {
         let mut state = self.state();
+        if peer.is_some() && state.legacy_timed_out {
+            return Err("legacy block request expired".into());
+        }
         if state.satisfied {
             return Err("block already delivered".into());
+        }
+        if state.first.is_none() && score.is_none() && state.hedge == HedgeDispatch::Open {
+            metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
+            // The first dispatch fixes the score used by every later comparison.
+            state.hedge = HedgeDispatch::Closed;
         }
         state.first.get_or_insert_with(|| FirstDispatch {
             at: Instant::now(),

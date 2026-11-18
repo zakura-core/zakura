@@ -1471,7 +1471,10 @@ where
                 svc,
                 req,
                 attempt.as_ref(),
-                matches!(hash, InventoryHash::Block(_)).then_some(AdvertisedBlockRequest::Primary),
+                matches!(hash, InventoryHash::Block(_)).then(|| match &attempt {
+                    Some(attempt) => AdvertisedBlockRequest::TimedPrimary(attempt.clone()),
+                    None => AdvertisedBlockRequest::Primary,
+                }),
             ) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
@@ -1632,41 +1635,31 @@ where
             return not_yet();
         };
         let first_peer = first.legacy_peer;
-        // A first peer with no measured answers leaves nothing to compare a candidate with, so
-        // its request is left to the normal request timeout. Scored announcers are asked first,
-        // so this happens only when none of them was idle.
         let Some(first_score) = first.score else {
-            metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
             return not_yet();
         };
-        let candidates: Vec<(D::Key, Option<Duration>)> = self
+        if attempt.elapsed_if_open().is_none() {
+            return not_yet();
+        }
+        let candidates: Vec<_> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
             .filter(|addr| Some(**addr) != first_peer)
             .filter_map(|addr| {
                 let svc = self.ready_services.get(addr)?;
-                svc.is_preferred_block_source()
-                    .then(|| (*addr, svc.block_gossip.delivery_score()))
+                if !svc.is_preferred_block_source() {
+                    return None;
+                }
+                Some((*addr, svc.block_gossip.delivery_score()?))
             })
             .collect();
-        // A measured peer comes before an unmeasured one.
-        let best = candidates
-            .iter()
-            .min_by_key(|(_, score)| (score.is_none(), *score))
-            .copied();
-
-        if attempt.elapsed_if_open().is_none() {
-            return not_yet();
-        }
-        let first_request_waited = first.at.elapsed();
-        let Some(reason) =
-            second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
-        else {
-            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+        let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {
+            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
             return not_yet();
         };
-        let Some((peer, score)) = best else {
-            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+        let first_request_waited = first.at.elapsed();
+        let Some(reason) = second_request_reason(first_score, first_request_waited, score) else {
+            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
             return not_yet();
         };
         if !attempt.claim_dispatch() {
@@ -1681,7 +1674,7 @@ where
             first_request_waited,
             reason,
             candidates: candidates.len(),
-            score,
+            score: Some(score),
             first_score,
         };
         let request_id = self.legacy_peer_trace.next_request_id();

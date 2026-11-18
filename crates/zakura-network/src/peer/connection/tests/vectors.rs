@@ -2325,6 +2325,39 @@ async fn request_slot_records_unanswered_block_requests() {
     connection_task.abort();
 }
 
+/// Only a dual-stack deadline that interrupts a written advertiser request counts as a miss.
+#[tokio::test(start_paused = true)]
+async fn legacy_deadline_charges_only_a_written_advertised_request() {
+    for written in [false, true] {
+        let (_peer_tx, peer_rx) = mpsc::channel(4);
+        let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+        let slot = connection.request_slot.clone();
+        let task = tokio::spawn(connection.run(peer_rx));
+        let (_, block) = response_vectors();
+        let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+        request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::TimedPrimary(
+            attempt.clone(),
+        ));
+        if written {
+            client_tx.send(request).await.unwrap();
+            outbound.next().await.unwrap();
+            settle().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
+            attempt.legacy_timeout();
+            drop(response);
+        } else {
+            attempt.legacy_timeout();
+            drop(response);
+            client_tx.send(request).await.unwrap();
+        }
+        settle().await;
+        assert_eq!(slot.announced_block_missed(), written);
+        assert!(!slot.block_request_unanswered());
+        task.abort();
+    }
+}
+
 /// A missed announced block is cleared by a delivered block, not by a "not found" reply, and lapses
 /// after `ANNOUNCED_BLOCK_MISS_LIFETIME` without one.
 #[tokio::test(start_paused = true)]
@@ -2361,14 +2394,42 @@ async fn a_missed_announced_block_lasts_until_a_delivery_or_its_lifetime() {
         .send(Ok(Message::Block(block.clone().into())))
         .await
         .expect("connection is open");
-    response
+    let Response::Blocks(blocks) = response
         .await
         .expect("connection responds")
-        .expect("peer sent the block");
-    settle().await;
+        .expect("peer sent the block")
+    else {
+        panic!("expected a block response");
+    };
+    let (delivered, _) = blocks[0].available().unwrap();
+    assert!(
+        slot.announced_block_missed(),
+        "receipt alone cannot restore preference"
+    );
+    delivered.record_verified();
     assert!(
         !slot.announced_block_missed(),
-        "a delivered block clears it"
+        "verification clears the miss seen at receipt"
+    );
+
+    // A reply can be collected after the same connection has already missed a later request.
+    slot.mark_announced_block_missed();
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.unwrap();
+    outbound.next().await.unwrap();
+    peer_tx
+        .send(Ok(Message::Block(block.into())))
+        .await
+        .unwrap();
+    let Response::Blocks(blocks) = response.await.unwrap().unwrap() else {
+        panic!("expected a block response");
+    };
+    let (older, _) = blocks[0].available().unwrap();
+    slot.mark_announced_block_missed();
+    older.record_verified();
+    assert!(
+        slot.announced_block_missed(),
+        "an older receipt cannot clear a newer miss"
     );
 
     slot.mark_announced_block_missed();
@@ -3246,6 +3307,7 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
 /// peer's delivery samples, whatever the block's size. Block-hash and transaction answers are not.
 #[tokio::test(start_paused = true)]
 async fn block_answers_are_timed_as_delivery_samples() {
+    use zakura_chain::serialization::ZcashDeserializeInto;
     let _init_guard = zakura_test::init();
 
     let registry = crate::peer_registry::PeerRegistry::default();
@@ -3317,11 +3379,28 @@ async fn block_answers_are_timed_as_delivery_samples() {
         .send(Ok(Message::Block(BlockHandle::from(block.clone()).into())))
         .await
         .expect("connection is open");
-    response
+    let Response::Blocks(blocks) = response
         .await
         .expect("connection responds")
-        .expect("peer sent the block");
-    settle().await;
+        .expect("peer sent the block")
+    else {
+        panic!("expected a block response");
+    };
+    let (received, _) = blocks[0].available().unwrap();
+    assert_eq!(delivery_samples.delivery_score(), None);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let unrelated: Arc<zakura_chain::block::Block> =
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+    received.record_verified_copy(&unrelated.into());
+    assert_eq!(
+        delivery_samples.delivery_score(),
+        None,
+        "a different verified body provides no credit"
+    );
+    received.record_verified_copy(&block.into());
+    received.record_verified();
     assert_eq!(
         delivery_samples.delivery_score(),
         Some(Duration::from_millis(10))

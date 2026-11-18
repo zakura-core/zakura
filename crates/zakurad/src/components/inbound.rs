@@ -492,6 +492,7 @@ impl Service<zn::Request> for Inbound {
 
                     let block_downloads = Box::pin(
                         BlockDownloads::new(
+                            misbehavior.clone(),
                             full_verify_concurrency_limit,
                             self.expose_peer_addresses,
                             Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
@@ -557,26 +558,10 @@ impl Service<zn::Request> for Inbound {
                         continue;
                     };
 
-                    // A rewritten coinbase height on a tip child is rejected before the block
-                    // reaches the verifier, so it is never a `RouterError` or a
-                    // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
-                    // a rejection that must re-request the block: the poisoned response
-                    // held the per-hash dedupe slot while it was outstanding, so honest peers'
-                    // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
-                    // the re-request the block waits for the syncer's next round, which is the
-                    // delay the attack is trying to cause.
-                    // Failed pushes separately retain one concurrent announcement and transfer
-                    // their queue slot to its download, regardless of the rejection reason.
-                    //
-                    // Scoring and re-requesting are kept together here rather than split across
-                    // `block_misbehavior`, because the re-request needs `block_downloads` and
-                    // the two decisions are the same decision.
+                    // Each candidate's height was checked and attributed at receipt. A mismatch
+                    // reaches this stream only if the download ended without an eligible body.
+                    // Retry because announcements for this hash were deduplicated while it ran.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
-                        if let Some(advertiser_addr) = advertiser_addr {
-                            misbehavior
-                                .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
-                        }
-
                         // A failed parent recovery is left to the syncer. A re-request would
                         // leave the recovery bounds, because it is an ordinary download.
                         if !mismatch.parent_recovery {
@@ -690,7 +675,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(zn::DeliveredBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();
@@ -740,7 +725,7 @@ impl Service<zn::Request> for Inbound {
                             Some((block, size)) => {
                                 total_size += size;
 
-                                blocks.push(Available((block, None)))
+                                blocks.push(Available((block.into(), None)))
                             },
                             // We don't need to limit the size of the missing block IDs list,
                             // because it is already limited to the size of the getdata request

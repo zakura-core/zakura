@@ -571,7 +571,7 @@ jobs:
           name       = "asia-hedged-simple"
           ssh_string = "root@143.198.222.9"
           monitor    = { profiler_url = "http://127.0.0.1:8111" }
-          commit     = "d144f3c81ad7672180242ea99d68d06e4ed9b0e2"
+          commit     = "6885fa105c0c30501135ee17a5a3f03c8a3b7639"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

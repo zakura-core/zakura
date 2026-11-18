@@ -432,7 +432,9 @@ impl DiscoveryPeer {
             }
         };
         let label = sent.last().map(record_label);
-        if label != Some(act.label()) {
+        // The models already labelled the frames, so a lenient peer sends
+        // them as labelled rather than leave the models ahead of the wire.
+        if label != Some(act.label()) && !self.lenient {
             return Err(format!(
                 "{act:?}'s frame is labelled {label:?}, not {}",
                 act.label()

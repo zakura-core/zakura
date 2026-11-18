@@ -424,6 +424,10 @@ pub(crate) struct DiscoveryPeer {
     relays: Vec<NodeSecretKey>,
     content: DiscoveryContent,
     models: Option<Models>,
+    /// Whether an act whose frame the models label otherwise than its own
+    /// label still sends, with the models' labels, rather than failing.
+    /// A composed script's peer sets it ([`super::PeerSpec::skip_stale_acts`]).
+    pub(crate) lenient: bool,
 }
 
 impl DiscoveryPeer {
@@ -457,6 +461,7 @@ impl DiscoveryPeer {
             relays,
             content,
             models: None,
+            lenient: false,
         })
     }
 

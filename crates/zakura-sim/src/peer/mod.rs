@@ -210,13 +210,15 @@ pub struct PeerSpec {
     /// Whether a discovery act that isn't ready within [`STALE_ACT_WAIT`]
     /// of becoming the script's next action is offered anyway, and skipped
     /// once picked if it still isn't ready, as is one whose precondition
-    /// ended after its offer. A skip logs `ActSkipped` on the discovery
-    /// stream. The script also ends with its connection, unless a `Redial`
-    /// comes next. Without it, such an act stalls the script or fails the
-    /// run, as does any step after a close but a `Redial`. A composed
-    /// script sets it, since its acts aren't tuned to their scenario. Left
-    /// out of a serialized scenario when false, so saved ones keep their
-    /// form.
+    /// ended after its offer or that its state can't build. A skip logs
+    /// `ActSkipped` on the discovery stream. An act whose frame the models
+    /// label otherwise than the act's own label still sends, with the
+    /// models' labels. The script also ends with its connection, unless a
+    /// `Redial` comes next. Without it, such an act stalls the script or
+    /// fails the run, as does any step after a close but a `Redial`. A
+    /// composed script sets it, since its acts aren't tuned to their
+    /// scenario. Left out of a serialized scenario when false, so saved
+    /// ones keep their form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_stale_acts: bool,
 }
@@ -1417,7 +1419,10 @@ impl PeerTask {
             (Some(script), Some(stream)) => {
                 let secret = SeededInputs::node_key(self.seed, key_index(self.index));
                 match DiscoveryPeer::new(stream, script, secret, peer_addr(self.index, 0)) {
-                    Ok(peer) => Some(peer),
+                    Ok(mut peer) => {
+                        peer.lenient = self.spec.skip_stale_acts;
+                        Some(peer)
+                    }
                     Err(why) => {
                         self.fail(why);
                         return std::future::pending().await;
@@ -1641,7 +1646,12 @@ impl PeerTask {
                     Ended::Closed
                 }
             };
+            // A script that skips stale acts ends with its connection, as a
+            // dialer's does, so it takes no steps on the node's redials.
             if let Ended::Failed = ended {
+                return;
+            }
+            if self.spec.skip_stale_acts {
                 return;
             }
         }
@@ -2065,19 +2075,21 @@ impl PeerTask {
                                     act.name()
                                 ));
                             };
+                            let stream = discovery
+                                .as_ref()
+                                .expect("the act's script runs on a discovery stream")
+                                .id;
+                            let skip = RecordBody::ActSkipped { act: act.name() };
                             if self.spec.skip_stale_acts && !script.ready(act) {
-                                let stream = discovery
-                                    .as_ref()
-                                    .expect("the act's script runs on a discovery stream")
-                                    .id;
-                                self.record(
-                                    remote,
-                                    stream,
-                                    RecordBody::ActSkipped { act: act.name() },
-                                );
+                                self.record(remote, stream, skip);
                             } else {
                                 match script.act(act) {
                                     Ok(acted) => answers = acted,
+                                    // An act its state can't build sends
+                                    // nothing, so a composed script skips it.
+                                    Err(_) if self.spec.skip_stale_acts => {
+                                        self.record(remote, stream, skip);
+                                    }
                                     Err(why) => return self.fail(why),
                                 }
                             }

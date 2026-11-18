@@ -916,10 +916,12 @@ impl Routine {
             TxRelayMessage::Tx { id, body } => {
                 // A frame's body is at most the data stream's cap.
                 let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
-                // The body is judged at the time it arrived, before and after
-                // it decodes, so a body on time when it came is not late
-                // because its decode took time.
+                // The body is judged as of when it arrived, before and after
+                // it decodes. A body on time when it came is not late because
+                // its decode took time, and its supplier keeps the exemption
+                // it had then.
                 let arrived = self.now();
+                let exempt = self.exempt();
                 let read = self.step(|machine, shared, pool, _| {
                     machine.tx_arrived(shared, pool, id, size, arrived)
                 });
@@ -943,7 +945,6 @@ impl Routine {
                 };
                 match decoded {
                     Some(body) => {
-                        let exempt = self.exempt();
                         self.step(|machine, shared, pool, _| {
                             machine.tx(shared, pool, id, body, exempt, arrived);
                         });

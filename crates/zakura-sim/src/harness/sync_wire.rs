@@ -42,6 +42,7 @@ use zakura_scheduler::{At, TaskId};
 
 use super::{
     block_node::{
+        control::Fork,
         policy::{self as block_policy, Trigger},
         tap::TapRoutines,
         view::BlockSyncView,
@@ -526,24 +527,9 @@ impl Subsystem for SyncWire {
         }
     }
 
-    /// [`sync_properties`] that the wire tier can run, then the session
-    /// properties the shared connection reaches, then the connection
-    /// properties a run with sampling taps reaches. A property that reads
-    /// frames or closes, which the wire tier excludes ([`Self::sources`]),
-    /// runs on `block-sync/storage` and `sync/storage` instead, and so does
-    /// block sync's teardown rule, since no wire scenario stops the node.
+    /// [`wire_harness_properties`].
     fn properties() -> Vec<Property<Self>> {
-        let sources = Self::sources();
-        let mut properties: Vec<Property<Self>> = sync_properties()
-            .into_iter()
-            .filter(|property| {
-                sources.observes_all(property.needs)
-                    && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
-            })
-            .collect();
-        properties.extend(session::wire_properties());
-        properties.extend(connection::wire_properties());
-        properties
+        wire_harness_properties()
     }
 
     /// `sync/storage`'s sources ([`storage_sources`](super::block_sync::storage_sources))
@@ -929,5 +915,282 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
         sync,
         windows: None,
         superseded_hold: None,
+    }
+}
+
+/// [`sync_properties`] that the wire tier can run, then the session
+/// properties the shared connection reaches, then the connection properties
+/// a run with sampling taps reaches. A property that reads frames or closes,
+/// which the wire tier excludes ([`SyncWire::sources`]), runs on
+/// `block-sync/storage` and `sync/storage` instead, and so does block
+/// sync's teardown rule, since the wire tier's teardown isn't judged.
+fn wire_harness_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
+    let sources = SyncWire::sources();
+    let mut properties: Vec<Property<S>> = sync_properties()
+        .into_iter()
+        .filter(|property| {
+            sources.observes_all(property.needs)
+                && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
+        })
+        .collect();
+    properties.extend(session::wire_properties());
+    properties.extend(connection::wire_properties());
+    properties
+}
+
+/// The event slots of a `sync/composed` prefix.
+pub const SYNC_COMPOSED_SLOTS: usize = 8;
+
+/// The first byte of every `sync/composed` prefix that [`sync_composed`]
+/// reads: [`SyncComposed`]'s generator. Any other first byte draws
+/// [`SavedWire::Honest`], as `header-sync/storage`'s grammar does.
+pub const SYNC_COMPOSED_VERSION: u8 = 1;
+
+/// The length of a `sync/composed` prefix: its version byte, a topology
+/// byte, a chain byte, then three bytes per event slot.
+pub const SYNC_COMPOSED_BYTES: usize = 3 + 3 * SYNC_COMPOSED_SLOTS;
+
+/// When a composed hold opens, in milliseconds from the run's start
+/// ([`Trigger::VirtualTime`]): from a short stall to past block sync's
+/// 8-second request timeout for an operation taken early in the run.
+const HOLD_UNTIL_MS: [u64; 8] = [1_000, 3_000, 6_000, 9_000, 10_000, 12_000, 16_000, 24_000];
+
+/// The scenario the bytes after a `sync/composed` prefix's version byte
+/// encode, in fixed slots so a change to one byte changes one choice
+/// (fuzz-11). Counting from the byte after the version:
+///
+/// - Byte 0, the topology: 1, 2, 2 or 3 mirrors (bits 0 and 1), whether
+///   the node dials mirror `i` rather than the mirror dialing it (bit
+///   `2 + i`), and the links' delays (bits 5 and 6: 0 to 100 ms, 1 to 5
+///   ms, 50 to 400 ms, or 0 to 1,000 ms).
+/// - Byte 1, the chain: 6 to 13 blocks (bits 0 to 2), of 2,000, 8,000,
+///   32,000 or 64,000 bytes each (bits 3 and 4).
+/// - Then [`SYNC_COMPOSED_SLOTS`] events of three bytes, a kind, `a` and
+///   `b`, each read in order until one ends the list. By the kind's value
+///   modulo 8: 0 ends it; 1 and 2 close mirror `a`'s connection, which its
+///   dialer redials; 3 grows every mirror's chain by 1 to 4 blocks; 4
+///   resets every mirror to a fork below the tip that ends above it; 5 and
+///   6 hold block operations ([`composed_hold`]); 7 tears the node down
+///   and ends the list. A control step's trigger comes from `b`
+///   ([`composed_trigger`]), and control steps run in order.
+///
+/// A close waits until its mirror has one more link than it has had
+/// composed closes, since no relink runs on the wire tier and a dialer
+/// makes at most [`MAX_INCARNATIONS`] connections. It is a
+/// [`SyncAction::CloseIfLinked`], since the node may have closed the
+/// connection itself first.
+pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
+    let byte = |index: usize| grammar.get(index).copied().unwrap_or(0);
+    let (topology, chain) = (byte(0), byte(1));
+    let mirrors = [1, 2, 2, 3][usize::from(topology & 3)];
+    let mut net = NetScenario::default();
+    (net.default_link.min_delay_ms, net.default_link.max_delay_ms) = match (topology >> 5) & 3 {
+        0 => (0, 100),
+        1 => (1, 5),
+        2 => (50, 400),
+        _ => (0, 1_000),
+    };
+    let blocks = 6 + u32::from(chain & 7);
+    let mut sync = SyncScenario {
+        blocks,
+        body_bytes: [2_000, 8_000, 32_000, 64_000][usize::from((chain >> 3) & 3)],
+        mirrors: (0..mirrors)
+            .map(|index| SyncMirror {
+                dialer: if topology & (4 << index) != 0 {
+                    Dialer::Node
+                } else {
+                    Dialer::Mirror
+                },
+            })
+            .collect(),
+        ..SyncScenario::default()
+    };
+    let mut tip = blocks;
+    let mut closes = vec![0u32; mirrors];
+    let mut branch = 0u8;
+    for slot in 0..SYNC_COMPOSED_SLOTS {
+        let at = 2 + 3 * slot;
+        let (kind, a, b) = (byte(at), byte(at + 1), byte(at + 2));
+        let when = composed_trigger(b);
+        match kind % 8 {
+            0 => break,
+            1 | 2 => {
+                let mirror = usize::from(a) % mirrors;
+                closes[mirror] += 1;
+                let peer = format!("mirror-{mirror}");
+                let live = Trigger::Count(closes[mirror], Box::new(Trigger::Linked(peer.clone())));
+                sync.control.push(SyncStep {
+                    action: SyncAction::CloseIfLinked { peer },
+                    when: Some(match when {
+                        Some(when) => Trigger::All(vec![live, when]),
+                        None => live,
+                    }),
+                });
+            }
+            3 => {
+                let len = 1 + u32::from(a % 4);
+                tip += len;
+                sync.control.push(SyncStep {
+                    action: SyncAction::Grow { len },
+                    when,
+                });
+            }
+            4 => {
+                branch += 1;
+                let at = 1 + u32::from(a) % (tip - 1);
+                let len = tip - at + 1 + u32::from(a >> 6);
+                tip = at + len;
+                sync.control.push(SyncStep {
+                    action: SyncAction::Reset {
+                        fork: Fork { branch, at, len },
+                    },
+                    when,
+                });
+            }
+            5 | 6 => sync.block_policy.holds.push(composed_hold(a, b)),
+            _ => {
+                sync.control.push(SyncStep {
+                    action: SyncAction::Teardown,
+                    when,
+                });
+                break;
+            }
+        }
+    }
+    SyncWireScenario {
+        net,
+        sync,
+        windows: None,
+        superseded_hold: None,
+    }
+}
+
+/// A control step's trigger from its slot's `b`: none, or the first to
+/// fourth (bits 0 and 1) admission, mirror range read, needed-block query
+/// or apply submitted, or that many seconds into the run (bits 2 and up,
+/// modulo 6).
+fn composed_trigger(b: u8) -> Option<Trigger> {
+    let nth = 1 + u32::from(b & 3);
+    let submitted = |kind| Some(Trigger::Submitted(block_policy::Select::nth(kind, nth)));
+    match (b >> 2) % 6 {
+        0 => None,
+        1 => Some(super::sync::admitted(nth)),
+        2 => submitted(block_policy::BlockKind::MirrorRead),
+        3 => submitted(block_policy::BlockKind::Query),
+        4 => submitted(block_policy::BlockKind::Apply),
+        _ => Some(Trigger::VirtualTime(1_000 * u64::from(nth))),
+    }
+}
+
+/// A block hold from its slot's `a` and `b`: it holds mirror range reads,
+/// needed-block queries, admissions or applies (`a` bits 0 and 1), each
+/// one or only the first to fourth (bit 2 clear, then bits 3 and 4), until
+/// [`HOLD_UNTIL_MS`] at `b` modulo 8, then offers the operation's ordinary
+/// outcome.
+fn composed_hold(a: u8, b: u8) -> block_policy::Hold {
+    use block_policy::{BlockAllow, BlockKind, Select};
+    let (kind, then) = match a & 3 {
+        0 => (BlockKind::MirrorRead, BlockAllow::Serve),
+        1 => (BlockKind::Query, BlockAllow::Answer),
+        2 => (BlockKind::Admit, BlockAllow::Admit),
+        _ => (BlockKind::Apply, BlockAllow::Committed),
+    };
+    let select = if a & 4 != 0 {
+        Select {
+            kind: Some(kind),
+            ..Select::default()
+        }
+    } else {
+        Select::nth(kind, 1 + u32::from((a >> 3) & 3))
+    };
+    block_policy::Hold {
+        select,
+        until: Trigger::VirtualTime(HOLD_UNTIL_MS[usize::from(b & 7)]),
+        then: vec![then],
+        deadline_ms: None,
+    }
+}
+
+/// `sync/wire`'s node, mirrors and properties with the chain, topology,
+/// links, control steps and block holds a prefix composes
+/// ([`sync_composed`]), so the fuzzer chooses how many reorgs, closes,
+/// stalls and growths a run takes and in what order, where `sync/wire`
+/// picks one saved scenario or one combined byte.
+pub struct SyncComposed(SyncWire);
+
+impl HasView for SyncComposed {
+    type View = SyncView;
+
+    /// [`SyncWire`]'s.
+    fn ended(&self, end: &crate::RunEnd) {
+        self.0.ended(end);
+    }
+
+    /// [`SyncWire`]'s.
+    fn end_violations(&self, log: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+        self.0.end_violations(log)
+    }
+
+    /// [`SyncWire`]'s.
+    fn view(&self) -> SyncView {
+        self.0.view()
+    }
+
+    /// [`SyncWire`]'s.
+    fn captured(&self) -> Capture {
+        self.0.captured()
+    }
+}
+
+impl Subsystem for SyncComposed {
+    const NAME: &'static str = "sync/composed";
+    // A u8 always fits in a u32.
+    const GENERATOR: u32 = SYNC_COMPOSED_VERSION as u32;
+    const SCENARIO_BYTES: usize = SYNC_COMPOSED_BYTES;
+    type Scenario = SyncWireScenario;
+    type Prepared = SyncPorts;
+
+    /// [`wire_config`].
+    fn config(scenario: &SyncWireScenario) -> RunConfig {
+        wire_config(scenario)
+    }
+
+    /// [`SyncWire`]'s.
+    fn prepare(scenario: &SyncWireScenario) -> SyncPorts {
+        SyncWire::prepare(scenario)
+    }
+
+    /// [`SyncWire`]'s.
+    fn build(sim: &mut Sim, scenario: &SyncWireScenario, ports: SyncPorts) -> Self {
+        SyncComposed(SyncWire::build(sim, scenario, ports))
+    }
+
+    /// [`wire_harness_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        wire_harness_properties()
+    }
+
+    /// [`SyncWire`]'s.
+    fn sources() -> Sources {
+        SyncWire::sources()
+    }
+
+    /// One family, the grammar, whose tag is [`SYNC_COMPOSED_VERSION`].
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("composed", [SYNC_COMPOSED_VERSION])]
+    }
+
+    /// Whether `prefix` starts with [`SYNC_COMPOSED_VERSION`].
+    fn accepts(prefix: &[u8]) -> bool {
+        prefix.first() == Some(&SYNC_COMPOSED_VERSION)
+    }
+
+    /// [`sync_composed`] of the bytes after [`SYNC_COMPOSED_VERSION`], or
+    /// [`SavedWire::Honest`] for a prefix with another first byte.
+    fn draw(prefix: &[u8]) -> SyncWireScenario {
+        match prefix.split_first() {
+            Some((&SYNC_COMPOSED_VERSION, grammar)) => sync_composed(grammar),
+            _ => SavedWire::Honest.scenario(),
+        }
     }
 }

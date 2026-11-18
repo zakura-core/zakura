@@ -1308,3 +1308,868 @@ async fn tx_getdata_routing_ignores_request_slot() {
         "the transaction request is written after the earlier response",
     );
 }
+
+/// Registers `peer` in `registry`, and records one answer of `answer_ms` for it if given.
+fn measured_peer(
+    peer: &mut TestPeer,
+    registry: &crate::peer_registry::PeerRegistry,
+    answer_ms: Option<u64>,
+) -> (
+    crate::peer_registry::PeerRegistryGuard,
+    crate::peer_registry::PeerRegistryUpdater,
+) {
+    let (guard, updater) = registry.register_legacy(crate::peer_registry::ConnectedPeer {
+        addr: peer.addr,
+        user_agent: "test".into(),
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        start_height: block::Height(0),
+        is_inbound: false,
+        rtt: None,
+        ping_sent_at: None,
+    });
+    if let Some(answer_ms) = answer_ms {
+        updater.record_delivery_sample(
+            crate::peer_registry::DeliverySampleKind::Block,
+            Duration::from_millis(answer_ms),
+            std::time::Instant::now(),
+        );
+    }
+    peer.client
+        .as_mut()
+        .expect("peer is not yet in the peer set")
+        .block_gossip
+        .registry = Some(updater.clone());
+    (guard, updater)
+}
+
+/// Builds a peer set from `peers`, each of which announced `BLOCK_HASH`, with
+/// `[network.block_source_score]` set to `scored`.
+async fn peer_set_with_block_advertisers(
+    peers: &mut [&mut TestPeer],
+    scored: bool,
+) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
+    let mut config = crate::Config::default();
+    config.block_source_score.enabled = scored;
+    let (mut peer_set, mut guard) = peer_set_with_peers(peers, config);
+    for peer in peers.iter() {
+        announce_block(&mut peer_set, &mut guard, peer).await;
+    }
+    (peer_set, guard)
+}
+
+/// Builds a peer set from `peers` with `config`. No peer has announced anything yet.
+fn peer_set_with_peers(
+    peers: &mut [&mut TestPeer],
+    config: crate::Config,
+) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
+    let (minimum_peer_version, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    PeerSetBuilder::new()
+        .with_config(config)
+        .with_discover(discover(
+            peers.iter_mut().map(|peer| peer.discovered()).collect(),
+        ))
+        .with_minimum_peer_version(minimum_peer_version)
+        .max_conns_per_ip(peers.len())
+        .build()
+}
+
+/// Makes `peer` announce `BLOCK_HASH` to `peer_set`.
+///
+/// The test inventory channel holds one change, so each announcement is registered before the
+/// next is sent.
+async fn announce_block(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    guard: &mut PeerSetGuard,
+    peer: &TestPeer,
+) {
+    guard
+        .inventory_sender()
+        .as_mut()
+        .expect("guard has an inventory sender")
+        .send(InventoryStatus::new_available(
+            InventoryHash::Block(BLOCK_HASH),
+            peer.addr,
+        ))
+        .expect("peer set receives inventory");
+    peer_set.ready().await.expect("peer set is ready");
+}
+
+/// Requests `BLOCK_HASH` through `peer_set`, and returns the response future.
+async fn request_block(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+) -> impl std::future::Future<Output = Result<Response, BoxError>> {
+    peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(iter::once(BLOCK_HASH).collect()))
+}
+
+/// With scoring on, of two idle announcers the one expected to answer sooner is asked.
+#[tokio::test(start_paused = true)]
+async fn scored_block_routing_asks_the_announcer_expected_to_answer_sooner() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut slow = TestPeer::spawn(1);
+    let mut fast = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut slow, &registry, Some(200)),
+        measured_peer(&mut fast, &registry, Some(10)),
+    ];
+
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut slow, &mut fast], true).await;
+    let _response = request_block(&mut peer_set).await;
+
+    assert_eq!(
+        fast.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(slow.written_now().await, None);
+}
+
+/// With scoring on, an announcer whose answers have not been measured loses to one whose have,
+/// however slow.
+#[tokio::test(start_paused = true)]
+async fn scored_block_routing_prefers_a_measured_announcer() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut unmeasured = TestPeer::spawn(1);
+    let mut measured = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut unmeasured, &registry, None),
+        measured_peer(&mut measured, &registry, Some(900)),
+    ];
+
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut unmeasured, &mut measured], true).await;
+    let _response = request_block(&mut peer_set).await;
+
+    assert_eq!(
+        measured.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(unmeasured.written_now().await, None);
+}
+
+/// With scoring off, the choice between equally loaded announcers ignores their scores, so the
+/// slower one is still sometimes asked.
+#[tokio::test(start_paused = true)]
+async fn unscored_block_routing_ignores_answer_times() {
+    let _init_guard = zakura_test::init();
+    let mut slow_was_asked = false;
+    // Each trial asks the slower peer with probability 1/2.
+    for _ in 0..20 {
+        let registry = crate::peer_registry::PeerRegistry::default();
+        let mut slow = TestPeer::spawn(1);
+        let mut fast = TestPeer::spawn(2);
+        let _measured = [
+            measured_peer(&mut slow, &registry, Some(200)),
+            measured_peer(&mut fast, &registry, Some(10)),
+        ];
+        let (mut peer_set, _guard) =
+            peer_set_with_block_advertisers(&mut [&mut slow, &mut fast], false).await;
+        let _response = request_block(&mut peer_set).await;
+
+        if slow.written_now().await.is_some() {
+            slow_was_asked = true;
+            break;
+        }
+    }
+    assert!(slow_was_asked, "load-based routing does not read scores");
+}
+
+/// Another block, for checking how a peer is treated after it missed `BLOCK_HASH`.
+const OTHER_BLOCK_HASH: block::Hash = block::Hash([0x78; 32]);
+
+/// Makes `peer` announce `hash` to `peer_set`.
+async fn announce_hash(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    guard: &mut PeerSetGuard,
+    peer: &TestPeer,
+    hash: block::Hash,
+) {
+    guard
+        .inventory_sender()
+        .as_mut()
+        .expect("guard has an inventory sender")
+        .send(InventoryStatus::new_available(
+            InventoryHash::Block(hash),
+            peer.addr,
+        ))
+        .expect("peer set receives inventory");
+    peer_set.ready().await.expect("peer set is ready");
+}
+
+/// With scoring enabled, an announcer that replied `notfound` keeps its score and loses
+/// preference until a subsequent delivery verifies or the miss expires.
+#[tokio::test(start_paused = true)]
+async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut missing = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let (_missing_guard, missing_score) = measured_peer(&mut missing, &registry, Some(10));
+    let _other = measured_peer(&mut other, &registry, Some(100));
+
+    let mut config = crate::Config::default();
+    config.block_source_score.enabled = true;
+    let (mut peer_set, mut guard) = peer_set_with_peers(&mut [&mut missing, &mut other], config);
+    announce_block(&mut peer_set, &mut guard, &missing).await;
+    let response = request_block(&mut peer_set).await;
+    assert_eq!(
+        missing.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    missing
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(response.await.is_err(), "the peer did not have the block");
+    assert_eq!(
+        missing_score.delivery_score(),
+        Some(Duration::from_millis(10)),
+        "a missed block leaves the score alone"
+    );
+
+    announce_hash(&mut peer_set, &mut guard, &missing, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peer_set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(
+            iter::once(OTHER_BLOCK_HASH).collect(),
+        ));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the slower announcer is asked, because the faster one missed its last block"
+    );
+    assert_eq!(missing.written_now().await, None);
+}
+
+/// With block source scoring off, an announcer that answers its block request with `notfound`
+/// is still offered for the next announced block, as without scoring.
+#[tokio::test(start_paused = true)]
+async fn without_scoring_an_announcer_that_missed_its_block_is_still_preferred() {
+    let _init_guard = zakura_test::init();
+    let mut missing = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+
+    let (mut peer_set, mut guard) =
+        peer_set_with_peers(&mut [&mut missing, &mut other], crate::Config::default());
+    announce_block(&mut peer_set, &mut guard, &missing).await;
+    let response = request_block(&mut peer_set).await;
+    assert_eq!(
+        missing.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    missing
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(response.await.is_err(), "the peer did not have the block");
+
+    peer_set.ready().await.expect("peer set is ready");
+    let missed = &peer_set.ready_services[&missing.addr];
+    assert!(
+        !missed.is_preferred_block_source(true),
+        "the miss is recorded, for when scoring is switched on"
+    );
+    assert!(missed.is_preferred_block_source(peer_set.block_source_score));
+    let (_, choice) = peer_set
+        .select_block_advertiser(&HashSet::from([missing.addr, other.addr]))
+        .expect("both announcers are idle");
+    assert_eq!(
+        choice.candidates, 2,
+        "both announcers are offered, including the one that missed"
+    );
+}
+
+/// A peer that announced a block and does not deliver it to a second request is not preferred
+/// for the next announced block either.
+#[tokio::test(start_paused = true)]
+async fn an_announcer_that_does_not_deliver_a_second_request_is_not_preferred_next() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let mut other = TestPeer::spawn(3);
+    let _far = measured_peer(&mut far, &registry, Some(230));
+    let (_near_guard, near_score) = measured_peer(&mut near, &registry, Some(10));
+    let _other = measured_peer(&mut other, &registry, Some(100));
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut far, &mut near, &mut other]);
+
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_primary(&mut peer_set, &attempt).await;
+    assert!(far.written_now().await.is_some(), "the first peer is asked");
+    announce_block(&mut peer_set, &mut guard, &near).await;
+    let second = request_block_again(&mut peer_set, &attempt, 30).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(second.await.is_err(), "the peer did not have the block");
+    assert_eq!(
+        near_score.delivery_score(),
+        Some(Duration::from_millis(10)),
+        "a missed block leaves the score alone"
+    );
+
+    announce_hash(&mut peer_set, &mut guard, &near, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peer_set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = peer_set
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::BlocksByHash(
+            iter::once(OTHER_BLOCK_HASH).collect(),
+        ));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the near announcer that missed its last block is passed over"
+    );
+    assert_eq!(near.written_now().await, None);
+}
+
+/// A peer set with block source scores and second block requests on, built from `peers`.
+fn peer_set_with_second_requests(
+    peers: &mut [&mut TestPeer],
+) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
+    let mut config = crate::Config::default();
+    config.block_source_score.enabled = true;
+    config.block_source_score.second_request = true;
+    peer_set_with_peers(peers, config)
+}
+
+/// Start the primary with the same download state that subsequent checks will use.
+async fn request_primary(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    attempt: &crate::BlockHedge,
+) -> impl std::future::Future<Output = Result<Response, BoxError>> {
+    peer_set
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashPrimary {
+            hash: BLOCK_HASH,
+            source: None,
+            attempt: attempt.clone(),
+        })
+}
+
+/// Advance the paused clock and ask whether another announcer should be contacted.
+async fn request_block_again(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    attempt: &crate::BlockHedge,
+    advance_ms: u64,
+) -> impl std::future::Future<Output = Result<Response, BoxError>> {
+    tokio::time::advance(Duration::from_millis(advance_ms)).await;
+    peer_set
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt: attempt.clone(),
+        })
+}
+
+/// Asserts that a second-request check returned at once without asking any peer.
+async fn assert_not_yet(response: impl std::future::Future<Output = Result<Response, BoxError>>) {
+    let error = response
+        .now_or_never()
+        .expect("a check that sends nothing answers at once")
+        .expect_err("no block was requested");
+    assert!(
+        error.is::<crate::NoFasterBlockSource>(),
+        "the check says no faster peer was found: {error}"
+    );
+}
+
+/// A peer that announces a block after the first request went out is asked too, once, when it
+/// should deliver clearly sooner.
+#[tokio::test(start_paused = true)]
+async fn a_later_announcer_expected_to_deliver_sooner_gets_one_second_request() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let mut also_near = TestPeer::spawn(3);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(230)),
+        measured_peer(&mut near, &registry, Some(50)),
+        measured_peer(&mut also_near, &registry, Some(60)),
+    ];
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut far, &mut near, &mut also_near]);
+
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_primary(&mut peer_set, &attempt).await;
+    assert_eq!(
+        far.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+
+    announce_block(&mut peer_set, &mut guard, &near).await;
+    announce_block(&mut peer_set, &mut guard, &also_near).await;
+    let _second = request_block_again(&mut peer_set, &attempt, 70).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the announcer expected to answer soonest is asked"
+    );
+    assert_eq!(
+        far.written_now().await,
+        None,
+        "the first peer is not asked again"
+    );
+
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 10).await).await;
+    assert_eq!(
+        also_near.written_now().await,
+        None,
+        "a block gets at most one second request"
+    );
+    assert!(attempt.close(), "native fallback keeps a dispatched hedge");
+    assert!(attempt.close(), "the downloader can still await that hedge");
+}
+
+/// The three-second fallback is visible to the connection that actually wrote the request.
+#[tokio::test(start_paused = true)]
+async fn dual_stack_inventory_deadline_passes_over_the_silent_advertiser() -> Result<(), BoxError> {
+    use crate::zakura::{ZakuraDualStackService, ZakuraSupervisorHandle};
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut fast = TestPeer::spawn(1);
+    let mut slow = TestPeer::spawn(2);
+    let _scores = [
+        measured_peer(&mut fast, &registry, Some(10)),
+        measured_peer(&mut slow, &registry, Some(100)),
+    ];
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut fast, &mut slow]);
+    announce_block(&mut peers, &mut guard, &fast).await;
+    announce_hash(&mut peers, &mut guard, &fast, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut peers, &mut guard, &slow, OTHER_BLOCK_HASH).await;
+    let router = ZakuraDualStackService::new(
+        tower::buffer::Buffer::new(peers, 4),
+        ZakuraSupervisorHandle::new(1),
+        true,
+    );
+    let primary = tokio::spawn(
+        router
+            .clone()
+            .oneshot(Request::block_by_hash(BLOCK_HASH, None)),
+    );
+    let limit = Duration::from_millis(100);
+    assert_eq!(
+        tokio::time::timeout(limit, fast.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert_eq!(fast.written_now().await, None);
+    let next = tokio::spawn(router.oneshot(Request::block_by_hash(OTHER_BLOCK_HASH, None)));
+    assert_eq!(
+        tokio::time::timeout(limit, slow.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()]))
+    );
+    assert_eq!(fast.written_now().await, None);
+    primary.abort();
+    next.abort();
+    Ok(())
+}
+
+/// A faster legacy announcer arriving during native fallback must not race a legacy
+/// request that already returned notfound.
+#[tokio::test(start_paused = true)]
+async fn native_fallback_closes_the_legacy_hedge_window() -> Result<(), BoxError> {
+    use crate::zakura::{
+        ZakuraDualStackService, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
+    };
+    use tokio::time::timeout;
+
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut later = TestPeer::spawn(2);
+    let _measurements = [
+        measured_peer(&mut first, &registry, Some(230)),
+        measured_peer(&mut later, &registry, Some(5)),
+    ];
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut later]);
+    announce_block(&mut peers, &mut guard, &first).await;
+
+    let supervisor = ZakuraSupervisorHandle::new(1);
+    let (sender, mut native_requests) = tokio::sync::mpsc::channel(1);
+    supervisor
+        .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(
+            ZakuraPeerId::new(vec![1; 32])?,
+            sender,
+        ))
+        .await;
+    let legacy = tower::buffer::Buffer::new(peers, 4);
+    let router = ZakuraDualStackService::new(legacy, supervisor, true);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let primary = tokio::spawn(router.clone().oneshot(Request::BlockByHashPrimary {
+        hash: BLOCK_HASH,
+        source: None,
+        attempt: attempt.clone(),
+    }));
+    let limit = Duration::from_millis(100);
+    assert_eq!(
+        timeout(limit, first.peer_outbound.next()).await?,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    first
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await?;
+    let _native_request = timeout(limit, native_requests.recv())
+        .await?
+        .expect("native fallback was dispatched");
+
+    guard
+        .inventory_sender()
+        .as_mut()
+        .unwrap()
+        .send(InventoryStatus::new_available(
+            InventoryHash::Block(BLOCK_HASH),
+            later.addr,
+        ))?;
+    let check = router.oneshot(Request::BlockByHashHedge {
+        hash: BLOCK_HASH,
+        attempt: attempt.clone(),
+    });
+    let result = timeout(limit, check).await;
+    assert_eq!(
+        later.written_now().await,
+        None,
+        "a late announcer must receive no getdata after the primary switched to native"
+    );
+    let error = result?.expect_err("native fallback closed the window");
+    assert!(error.is::<crate::NoFasterBlockSource>());
+    assert!(
+        !attempt.close(),
+        "the downloader has no dispatched hedge to drain"
+    );
+    primary.abort();
+    Ok(())
+}
+
+/// A later announcer that is not clearly faster than the first request's remaining time is not
+/// asked, until the first request stalls.
+#[tokio::test(start_paused = true)]
+async fn a_later_announcer_that_is_not_clearly_faster_is_asked_only_after_a_stall() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(230)),
+        measured_peer(&mut other, &registry, Some(120)),
+    ];
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut other]);
+
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_primary(&mut peer_set, &attempt).await;
+    announce_block(&mut peer_set, &mut guard, &other).await;
+
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 70).await).await;
+    assert_eq!(other.written_now().await, None);
+
+    // 730 ms is the stall point for a peer expected to answer in 230 ms.
+    let _second = request_block_again(&mut peer_set, &attempt, 660).await;
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "a stalled first request gets a second one"
+    );
+}
+
+/// A stall can use a measured peer that announces after an unmeasured one.
+#[tokio::test(start_paused = true)]
+async fn a_stall_waits_for_a_measured_second_announcer() {
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut unknown = TestPeer::spawn(2);
+    let mut measured = TestPeer::spawn(3);
+    let _scores = [
+        measured_peer(&mut first, &registry, Some(50)),
+        measured_peer(&mut unknown, &registry, None),
+        measured_peer(&mut measured, &registry, Some(100)),
+    ];
+    let (mut peers, mut guard) =
+        peer_set_with_second_requests(&mut [&mut first, &mut unknown, &mut measured]);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    assert!(
+        attempt.elapsed_if_open().is_some(),
+        "queueing does not fix the first score"
+    );
+    announce_block(&mut peers, &mut guard, &first).await;
+    let _primary = request_primary(&mut peers, &attempt).await;
+    announce_block(&mut peers, &mut guard, &unknown).await;
+    assert_not_yet(request_block_again(&mut peers, &attempt, 550).await).await;
+    assert_eq!(unknown.written_now().await, None);
+    announce_block(&mut peers, &mut guard, &measured).await;
+    let _hedge = request_block_again(&mut peers, &attempt, 10).await;
+    assert_eq!(
+        measured.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(unknown.written_now().await, None);
+}
+
+/// A first peer whose answers have not been measured gets no second request, even from a much
+/// faster announcer and long after a measured peer's request would have stalled.
+#[tokio::test(start_paused = true)]
+async fn an_unmeasured_first_peer_gets_no_second_request() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut unmeasured = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut unmeasured, &registry, None),
+        measured_peer(&mut near, &registry, Some(5)),
+    ];
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut unmeasured, &mut near]);
+
+    announce_block(&mut peer_set, &mut guard, &unmeasured).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_primary(&mut peer_set, &attempt).await;
+    assert!(
+        attempt.elapsed_if_open().is_none(),
+        "the downloader stops polling after the unmeasured primary is dispatched"
+    );
+    announce_block(&mut peer_set, &mut guard, &near).await;
+
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 10).await).await;
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 2_000).await).await;
+    assert_eq!(
+        near.written_now().await,
+        None,
+        "nothing says the near announcer is faster than an unmeasured first peer"
+    );
+}
+
+/// With second requests off, a check never asks a peer, however slow the first request.
+#[tokio::test(start_paused = true)]
+async fn without_second_requests_a_check_asks_no_peer() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(230)),
+        measured_peer(&mut near, &registry, Some(50)),
+    ];
+    let (mut peer_set, _guard) =
+        peer_set_with_block_advertisers(&mut [&mut far, &mut near], true).await;
+
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 4_900).await).await;
+    assert_eq!(far.written_now().await, None);
+    assert_eq!(near.written_now().await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_or_expired_checks_send_no_block_request() {
+    let _init_guard = zakura_test::init();
+    for (closed, age, should_send) in [(true, 10, false), (false, 5000, false), (false, 4999, true)]
+    {
+        let registry = crate::peer_registry::PeerRegistry::default();
+        let mut far = TestPeer::spawn(1);
+        let mut near = TestPeer::spawn(2);
+        let _measured = [
+            measured_peer(&mut far, &registry, Some(230)),
+            measured_peer(&mut near, &registry, Some(50)),
+        ];
+        let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+        announce_block(&mut peer_set, &mut guard, &far).await;
+        let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        let _primary = request_primary(&mut peer_set, &attempt).await;
+        assert!(far.written_now().await.is_some());
+        announce_block(&mut peer_set, &mut guard, &near).await;
+        if closed {
+            assert!(!attempt.close());
+        }
+        let response = request_block_again(&mut peer_set, &attempt, age).await;
+        if !should_send {
+            assert_not_yet(response).await;
+        }
+        assert_eq!(
+            near.written_now().await,
+            should_send.then(|| Message::GetData(vec![BLOCK_HASH.into()]))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn queue_time_does_not_make_a_just_dispatched_request_stall() {
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut slower = TestPeer::spawn(2);
+    let _measurements = [
+        measured_peer(&mut first, &registry, Some(100)),
+        measured_peer(&mut slower, &registry, Some(200)),
+    ];
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut slower]);
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace = zakura_jsonl_trace::JsonlTracer::spawn_guard(trace_dir.path().to_owned());
+    peer_set.legacy_peer_trace =
+        crate::peer_set::legacy_peer_trace::LegacyPeerTrace::for_tests(&trace, false);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    tokio::time::advance(Duration::from_millis(650)).await;
+    announce_block(&mut peer_set, &mut guard, &first).await;
+    let _first = request_primary(&mut peer_set, &attempt).await;
+    announce_block(&mut peer_set, &mut guard, &slower).await;
+    let check = Request::BlockByHashHedge {
+        hash: BLOCK_HASH,
+        attempt,
+    };
+    assert_not_yet(peer_set.ready().await.unwrap().call(check.clone())).await;
+    tokio::time::advance(Duration::from_millis(599)).await;
+    assert_not_yet(peer_set.ready().await.unwrap().call(check.clone())).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let second = peer_set.ready().await.unwrap().call(check);
+    assert_eq!(
+        slower.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    slower
+        .peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+    assert!(second.await.is_err());
+    trace.shutdown().await;
+    let rows = std::fs::read_to_string(trace_dir.path().join("legacy_peer_request.jsonl")).unwrap();
+    let row = rows
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["route"] == "hedge")
+        .expect("the dispatched second request was traced");
+    assert_eq!(row["first_request_waited_ms"], 600);
+}
+
+/// The connection processes replies in order even if the downloader reads them in reverse.
+async fn assert_late_miss_keeps_recovered_announcer(hedge: bool) {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut near = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let mut far = TestPeer::spawn(3);
+    let _scores = [
+        measured_peer(&mut near, &registry, Some(10)),
+        measured_peer(&mut other, &registry, Some(100)),
+        measured_peer(&mut far, &registry, Some(230)),
+    ];
+    let (mut set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut near, &mut other, &mut far]);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _primary;
+    let miss = if hedge {
+        announce_block(&mut set, &mut guard, &far).await;
+        _primary = request_primary(&mut set, &attempt).await;
+        assert_eq!(
+            far.written_now().await,
+            Some(Message::GetData(vec![BLOCK_HASH.into()]))
+        );
+        announce_block(&mut set, &mut guard, &near).await;
+        request_block_again(&mut set, &attempt, 30).await.boxed()
+    } else {
+        announce_block(&mut set, &mut guard, &near).await;
+        request_block(&mut set).await.boxed()
+    };
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+
+    // Keep the miss future alive and unpolled until this same connection delivers a block.
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    announce_hash(&mut set, &mut guard, &near, hash).await;
+    let recovery = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(hash));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![hash.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::Block(block.into())))
+        .await
+        .unwrap();
+    let Response::Blocks(replies) = recovery.await.unwrap() else {
+        panic!("expected a block response");
+    };
+    let (delivered, _) = replies[0]
+        .available()
+        .expect("the requested body was delivered");
+    let probe: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let probe_hash = probe.hash();
+    announce_hash(&mut set, &mut guard, &near, probe_hash).await;
+    announce_hash(&mut set, &mut guard, &other, probe_hash).await;
+    let before_verification = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(probe_hash));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![probe_hash.into()])),
+        "receiving a body leaves the faster announcer deprioritized until verification"
+    );
+    other
+        .peer_inbound
+        .send(Ok(Message::Block(probe.into())))
+        .await
+        .unwrap();
+    assert!(matches!(before_verification.await, Ok(Response::Blocks(_))));
+    delivered.record_verified();
+    assert!(miss.await.is_err());
+
+    announce_hash(&mut set, &mut guard, &near, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(OTHER_BLOCK_HASH));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the faster peer supplied a verified block after its miss and is preferred again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_primary_miss_keeps_recovered_announcer() {
+    assert_late_miss_keeps_recovered_announcer(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_hedge_miss_keeps_recovered_announcer() {
+    assert_late_miss_keeps_recovered_announcer(true).await;
+}

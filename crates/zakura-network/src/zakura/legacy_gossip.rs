@@ -509,6 +509,9 @@ impl LegacyRequestFrame {
     /// Convert a legacy network request into an inventory request frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
+            Request::BlockByHashPrimary { hash, .. } => {
+                Ok(Self::BlocksByHash(std::iter::once(hash).collect()))
+            }
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 let hashes = truncate_to_inventory_cap(hashes)?;
                 Ok(Self::BlocksByHash(hashes))
@@ -2200,7 +2203,13 @@ impl Service<Request> for LegacyRequestAdapter {
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let client = self.client.clone();
+        let mut client = self.client.clone();
+        if let Request::BlockByHashPrimary { attempt, .. } = &request {
+            // The primary is now using native peers. Its former legacy peer's score
+            // no longer predicts its arrival, but a hedge already sent can still win.
+            attempt.close();
+            client.block_attempt = Some(attempt.clone());
+        }
         Box::pin(async move {
             let source = request.inventory_source();
             let retry_source_missing = source.is_some();
@@ -2223,6 +2232,10 @@ enum DualStackRoute {
     /// legacy peer set and stalls (its syncer can never obtain tips or fetch
     /// blocks). The set mirrors `LegacyRequestFrame::from_request`.
     LegacyFirstThenZakura,
+    /// A second request for a slow legacy block download: legacy peer set only, because the
+    /// peer set picks a legacy peer that announced the block. A block it returns counts as
+    /// received over legacy.
+    LegacyBlockHedge,
     /// Anything the Zakura adapter cannot serve (e.g. peer-address discovery):
     /// legacy peer set only.
     Passthrough,
@@ -2323,7 +2336,8 @@ where
             | Request::AdvertiseBlockToAll(..)
             | Request::AdvertiseMinedBlock(..)
             | Request::AdvertiseTransactionIds(..) => DualStackRoute::Advertise,
-            Request::BlocksByHash(..)
+            Request::BlockByHashPrimary { .. }
+            | Request::BlocksByHash(..)
             | Request::BlocksByHashFrom { .. }
             | Request::TransactionsById(..)
             | Request::TransactionsByIdFrom { .. }
@@ -2331,6 +2345,7 @@ where
             | Request::FindHeaders { .. }
             | Request::MempoolTransactionIds
             | Request::PushTransaction(..) => DualStackRoute::LegacyFirstThenZakura,
+            Request::BlockByHashHedge { .. } => DualStackRoute::LegacyBlockHedge,
             _ => DualStackRoute::Passthrough,
         };
 
@@ -2338,6 +2353,9 @@ where
         let requested_block_hashes = match &request {
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 Some(hashes.clone())
+            }
+            Request::BlockByHashHedge { hash, .. } | Request::BlockByHashPrimary { hash, .. } => {
+                Some(IndexSet::from([*hash]))
             }
             _ => None,
         };
@@ -2398,10 +2416,39 @@ where
                     // even when it has no ready peer (e.g. every legacy peer was
                     // upgraded to Zakura). Bound the legacy attempt so we fall
                     // back to the Zakura path instead of blocking forever.
-                    let legacy_attempt = timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, async {
-                        legacy.ready().await?.call(request.clone()).await
-                    })
-                    .await;
+                    let (legacy_request, deadline) = match &request {
+                        Request::BlockByHashPrimary { attempt, .. } => {
+                            (request.clone(), Some(attempt.clone()))
+                        }
+                        Request::BlocksByHash(hashes)
+                        | Request::BlocksByHashFrom { hashes, .. }
+                            if hashes.len() == 1 =>
+                        {
+                            let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+                            attempt.close();
+                            (
+                                Request::BlockByHashPrimary {
+                                    hash: hashes[0],
+                                    source: request.inventory_source(),
+                                    attempt: attempt.clone(),
+                                },
+                                Some(attempt),
+                            )
+                        }
+                        _ => (request.clone(), None),
+                    };
+                    let legacy_attempt = {
+                        let pending = async { legacy.ready().await?.call(legacy_request).await };
+                        tokio::pin!(pending);
+                        let outcome =
+                            timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, &mut pending).await;
+                        if outcome.is_err() {
+                            if let Some(deadline) = deadline {
+                                deadline.legacy_timeout();
+                            }
+                        }
+                        outcome
+                    };
                     match legacy_attempt {
                         Ok(Ok(response)) if !all_inventory_missing(&response) => {
                             Ok(record_source(response, BlockBodySource::Legacy))
@@ -2423,6 +2470,12 @@ where
                             .map(|response| record_source(response, BlockBodySource::Zakura)),
                     }
                 }
+                DualStackRoute::LegacyBlockHedge => legacy
+                    .ready()
+                    .await?
+                    .call(request)
+                    .await
+                    .map(|response| record_source(response, BlockBodySource::Legacy)),
                 DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
             }
         })
@@ -2461,6 +2514,8 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    /// Set only on the per-call clone for a block with a competing download.
+    block_attempt: Option<crate::BlockHedge>,
 }
 
 impl ZakuraRequestClient {
@@ -2499,6 +2554,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            block_attempt: None,
         }
     }
 
@@ -2520,12 +2576,24 @@ impl ZakuraRequestClient {
         *next_request_at = request_at + self.request_interval;
     }
 
+    fn ensure_still_needed(&self) -> Result<(), BoxError> {
+        if self
+            .block_attempt
+            .as_ref()
+            .is_some_and(crate::BlockHedge::is_satisfied)
+        {
+            return Err("block already delivered".into());
+        }
+        Ok(())
+    }
+
     async fn request(
         &self,
         frame: LegacyRequestFrame,
         source: Option<PeerSource>,
         retry_source_missing: bool,
     ) -> Result<Response, BoxError> {
+        self.ensure_still_needed()?;
         let preferred = match source {
             Some(PeerSource::Zakura(peer_id)) => Some(peer_id),
             _ => None,
@@ -2583,6 +2651,7 @@ impl ZakuraRequestClient {
     ) -> Result<Response, BoxError> {
         let mut last_response = initial_response;
         for _ in 0..SOURCE_INVENTORY_MISSING_RETRIES {
+            self.ensure_still_needed()?;
             sleep(SOURCE_INVENTORY_MISSING_RETRY_DELAY).await;
             match self
                 .request_one(handle.clone(), frame.clone(), request_kind)
@@ -2621,7 +2690,9 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        self.ensure_still_needed()?;
         self.wait_for_request_slot().await;
+        self.ensure_still_needed()?;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
         // so the response can be bound to IDs we actually asked for.
@@ -2652,13 +2723,12 @@ impl ZakuraRequestClient {
             }
             _ => (None, None),
         };
-        let exchange = handle.request(
+        let exchange = handle.request_frame(
             ZAKURA_STREAM_LEGACY_REQUESTS,
             request_id,
-            frame.message_type,
-            frame.flags,
-            frame.payload,
+            frame,
             started,
+            self.block_attempt.as_ref(),
         );
         // A transaction attempt is also cut off `LEGACY_TRANSACTION_ATTEMPT_TIMEOUT`
         // after the connection starts its exchange. It yields `None` when that
@@ -4047,6 +4117,16 @@ mod tests {
                             .collect(),
                     )
                 }
+                // The legacy peer set answers a hedge with the block, like `BlocksByHash`.
+                Request::BlockByHashHedge { hash, .. }
+                | Request::BlockByHashPrimary { hash, .. }
+                    if hash == self.block.hash() =>
+                {
+                    Response::Blocks(vec![InventoryResponse::Available((
+                        self.block.clone().into(),
+                        None,
+                    ))])
+                }
                 request => {
                     return std::future::ready(Err(format!(
                         "unexpected block inventory request: {request:?}"
@@ -4378,6 +4458,87 @@ mod tests {
         assert_eq!(least_available, LEGACY_CLIENT_INVENTORY_SLOTS - 1);
         assert!(all_inventory_missing(&retried.await??));
         assert_eq!(inventory.available_permits(), LEGACY_CLIENT_INVENTORY_SLOTS);
+        Ok(())
+    }
+
+    /// A native peer handoff competes with completion even after the client has
+    /// selected the peer and is waiting for its outbound queue.
+    #[tokio::test(start_paused = true)]
+    async fn native_block_dispatch_rechecks_completion_after_queue_capacity() -> Result<(), BoxError>
+    {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let occupied = sender.clone().reserve_owned().await?;
+        let handle = ZakuraPeerHandle::new_for_tests(ZakuraPeerId::new(vec![1; 32])?, sender);
+        let mut client = ZakuraRequestClient::new(ZakuraSupervisorHandle::new(1));
+        let attempt = crate::BlockHedge::new(Instant::now());
+        client.block_attempt = Some(attempt.clone());
+        let request = client.request_one(
+            handle,
+            LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+            LegacyRequestKind::Blocks,
+        );
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        // Drive the pacing timer before checking the blocked send.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(attempt.first_dispatch().is_none());
+        attempt.mark_satisfied();
+        drop(occupied);
+        assert!(request
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already delivered"));
+        assert!(receiver.try_recv().is_err());
+        assert!(attempt.first_dispatch().is_none());
+        Ok(())
+    }
+
+    /// A native exchange already handed to a peer drains, but its missing reply
+    /// cannot trigger another attempt once the legacy peer supplied the block.
+    #[tokio::test(start_paused = true)]
+    async fn completed_download_drains_native_exchange_without_retrying_source(
+    ) -> Result<(), BoxError> {
+        let hash = block_hash(1);
+        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let supervisor = ZakuraSupervisorHandle::new(8);
+        let (sender, mut outbound) = mpsc::channel(2);
+        supervisor
+            .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(peer.clone(), sender))
+            .await;
+        let attempt = crate::BlockHedge::new(Instant::now());
+        let mut client = ZakuraRequestClient::new(supervisor);
+        client.block_attempt = Some(attempt.clone());
+        let result = tokio::spawn(async move {
+            client
+                .request(
+                    LegacyRequestFrame::BlocksByHash(vec![hash]),
+                    Some(PeerSource::Zakura(peer)),
+                    true,
+                )
+                .await
+        });
+        let crate::zakura::ZakuraOutboundFrame::Request {
+            request_id,
+            completion,
+            ..
+        } = timeout(Duration::from_secs(1), outbound.recv())
+            .await?
+            .unwrap();
+        assert!(attempt.first_dispatch().is_some());
+        attempt.mark_satisfied();
+        let missing = Response::Blocks(vec![InventoryResponse::Missing(hash)]);
+        let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let frames = LegacyResponseCodec::encode_response(request_id, missing, cap, cap)?;
+        assert!(
+            completion
+                .send(Ok(ResponseFrames::with_zero_grant_for_tests(frames).await))
+                .is_ok(),
+            "the exchange can still hand off its response"
+        );
+        assert!(timeout(Duration::from_secs(1), result).await??.is_err());
+        assert!(outbound.try_recv().is_err());
         Ok(())
     }
 
@@ -8440,6 +8601,14 @@ mod tests {
                     }
                     Response::Blocks(hashes.into_iter().map(InventoryResponse::Missing).collect())
                 }
+                Request::BlockByHashPrimary { hash, .. } => match self.inventory {
+                    StubInventory::Error => {
+                        return std::future::ready(Err("legacy inventory unavailable".into()))
+                    }
+                    StubInventory::Missing => {
+                        Response::Blocks(vec![InventoryResponse::Missing(hash)])
+                    }
+                },
                 _ => Response::Nil,
             };
             std::future::ready(Ok(response))
@@ -8577,6 +8746,48 @@ mod tests {
         assert_eq!(
             trace.first_block_body_source(hash),
             Some(BlockBodySource::Legacy)
+        );
+
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_stack_block_hedge_counts_its_block_as_received_over_legacy(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let requester = ZakuraTestNode::builder(9221).spawn().await?;
+
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
+            BlockInventoryResponder { block },
+            requester.supervisor(),
+            true,
+            trace.clone(),
+            1,
+        );
+
+        let response = composite
+            .ready()
+            .await?
+            .call(Request::BlockByHashHedge {
+                hash,
+                attempt: crate::BlockHedge::new(tokio::time::Instant::now()),
+            })
+            .await?;
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Legacy),
+            "a later answer to the first request must not count as the first arrival"
         );
 
         requester.shutdown().await;

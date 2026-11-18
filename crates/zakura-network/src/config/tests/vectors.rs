@@ -2809,3 +2809,40 @@ trace_peer_names = { "not-an-ip" = "us-0" }
     )
     .is_err());
 }
+
+#[test]
+fn block_source_score_is_off_by_default_and_rejects_unknown_keys() {
+    let _init_guard = zakura_test::init();
+
+    assert!(!Config::default().block_source_score.enabled);
+    let config: Config = toml::from_str("").expect("an empty config parses");
+    assert!(!config.block_source_score.enabled);
+
+    let config: Config =
+        toml::from_str("[block_source_score]\nenabled = true").expect("the setting parses");
+    assert!(config.block_source_score.enabled);
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).expect("config serializes"))
+        .expect("serialized config parses");
+    assert_eq!(roundtrip.block_source_score, config.block_source_score);
+
+    assert!(
+        toml::from_str::<Config>("[block_source_score]\nenabeld = true").is_err(),
+        "a misspelled key is rejected"
+    );
+}
+
+#[test]
+fn a_second_block_request_needs_block_source_scores() {
+    let _init_guard = zakura_test::init();
+
+    assert!(!Config::default().block_source_score.second_request);
+    let config: Config =
+        toml::from_str("[block_source_score]\nenabled = true\nsecond_request = true")
+            .expect("both settings parse");
+    assert!(config.block_source_score.second_request);
+
+    assert!(
+        toml::from_str::<Config>("[block_source_score]\nsecond_request = true").is_err(),
+        "a second request without scores is rejected"
+    );
+}

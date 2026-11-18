@@ -613,8 +613,9 @@ fn scripted_host(ip: std::net::IpAddr) -> std::net::IpAddr {
 }
 
 /// Bounds each address's cadence charges by counts, per instance and
-/// validation state. The rate property also requires every TLS start to
-/// spend an admitted charge.
+/// validation state. The rate property counts TLS starts as its charges, so
+/// a start that skips admission still counts. The conformance property
+/// counts admitted charges.
 fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     use std::collections::BTreeMap;
     use zakura_network::zakura::DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF;
@@ -643,8 +644,7 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let mut now = 0u64;
     let mut limits = BTreeMap::new();
     let mut windows = BTreeMap::new();
-    // Admitted charges that haven't yet started TLS or been cancelled.
-    let mut unspent = BTreeMap::<_, u64>::new();
+    let charge = if rate { "started" } else { "admitted" };
     for entry in cx.log.entries() {
         if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
             now = to_ns;
@@ -722,10 +722,8 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         let window = windows
             .entry(key)
             .or_insert_with(|| CadenceWindow::new(cap, interval));
-        let unspent = unspent.entry(key).or_default();
         match action {
-            "admitted" => {
-                *unspent += 1;
+            _ if action == charge => {
                 if !window.charge(now) && rate {
                     return cx.violated(
                         "an address started more TLS attempts than its cadence pays for",
@@ -733,18 +731,9 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     );
                 }
             }
-            "started" if rate => {
-                if *unspent == 0 {
-                    return cx.violated("TLS requires an admitted charge", remote.to_string());
-                }
-                *unspent -= 1;
-            }
-            "cancelled" => {
-                *unspent = unspent.saturating_sub(1);
-                window.refund(now);
-            }
-            // Registration and a local refusal after TLS refund the attempt.
-            "registered" | "refused" => window.refund(now),
+            // Registration, a local refusal after TLS, and a cancelled
+            // admission refund the attempt.
+            "registered" | "refused" | "cancelled" => window.refund(now),
             "exhausted" if !rate && !window.refusal_earned(now) => {
                 return cx.violated(
                     "an address with a token is never exhausted",

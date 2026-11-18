@@ -2086,6 +2086,28 @@ async fn assert_late_miss_keeps_recovered_announcer(hedge: bool) {
     let (delivered, _) = replies[0]
         .available()
         .expect("the requested body was delivered");
+    let probe: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let probe_hash = probe.hash();
+    announce_hash(&mut set, &mut guard, &near, probe_hash).await;
+    announce_hash(&mut set, &mut guard, &other, probe_hash).await;
+    let before_verification = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(probe_hash));
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![probe_hash.into()])),
+        "receiving a body leaves the faster announcer deprioritized until verification"
+    );
+    other
+        .peer_inbound
+        .send(Ok(Message::Block(probe.into())))
+        .await
+        .unwrap();
+    assert!(matches!(before_verification.await, Ok(Response::Blocks(_))));
     delivered.record_verified();
     assert!(miss.await.is_err());
 

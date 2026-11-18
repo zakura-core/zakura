@@ -263,23 +263,28 @@ def note_download(seen, download):
         downloads.append(download)
 
 
-def note_legacy_download(seen, when, elapsed_ms, result, first_request_waited_ms=None):
-    """Record one legacy request for a block, finished at `when` after `elapsed_ms`.
+def note_legacy_download(seen, when, row):
+    """Time the first delivery from dispatch, including the primary's lead over a winning hedge.
 
-    The download stage runs from the earliest request that was still waiting when the first copy
-    arrived, until that arrival. A request that failed before then does not count; one that
-    failed after it does, since it was still waiting.
-
-    With `[network.block_source_score] second_request`, a slow block can get a second request.
-    Its row gives the time from first to second dispatch (`first_request_waited_ms`), excluding
-    time spent queued before the first dispatch. The first request's answer can come
-    later, fail, or come after this block's record was published; none of that changes the time.
-    Rows are read in the order they were written, which is the order the requests finished.
+    Older hedge rows omit that lead. Recover it when the trace shows a primary outstanding
+    at hedge dispatch, even if the primary failed before the hedge delivered.
     """
-    start = when - round((elapsed_ms + (first_request_waited_ms or 0)) * 1000)
+    start = when - round(row["elapsed_ms"] * 1000)
     if "arrived" not in seen:
-        if result != "available":
+        if row.get("result") != "available":
             return
+        if row.get("route") == "hedge":
+            waited = row.get("first_request_waited_ms")
+            if isinstance(waited, (int, float)):
+                start -= round(waited * 1000)
+            else:
+                hedge_start = start
+                for attempt in seen.get("downloads", []):
+                    if (attempt["stack"] == PATH_LEGACY and attempt.get("route") != "hedge"
+                            and isinstance(attempt.get("ms"), (int, float))):
+                        primary_start = attempt["when"] - round(attempt["ms"] * 1000)
+                        if primary_start <= hedge_start <= attempt["when"]:
+                            start = min(start, primary_start)
         seen["arrived"] = when
         seen["request_start"] = start
     elif start < seen["request_start"]:
@@ -496,11 +501,7 @@ class BlockStages:
             if isinstance(row.get("elapsed_ms"), (int, float)):
                 # Before the failure check below: a request that fails after the block arrived
                 # was still waiting when it did, so it can start the download stage.
-                waited = row.get("first_request_waited_ms")
-                note_legacy_download(
-                    self._by_hash.setdefault((process, requested), {}), when, row["elapsed_ms"],
-                    row.get("result"), waited if isinstance(waited, (int, float)) else None,
-                )  # fmt: skip
+                note_legacy_download(self._by_hash.setdefault((process, requested), {}), when, row)
         if event == "block_body_received" and type(row.get("height")) is int:
             note_download(
                 self._by_height.setdefault((process, row["height"]), {}),

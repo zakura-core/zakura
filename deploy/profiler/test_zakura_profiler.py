@@ -1070,6 +1070,23 @@ class TraceFollowingTests(unittest.TestCase):
 
         self.assertEqual(record["ms"]["body_download"], 70)
 
+    def test_a_hedge_inherits_the_start_of_a_primary_that_failed_during_the_race(self):
+        for timing in [{}, {"first_request_waited_ms": 50}]:
+            with self.subTest(timing=timing):
+                stages = blocks.BlockStages()
+                for row in [
+                    trace_row("block_request_finish", 590_000, result="error",
+                              requested_hash=BLOCK_HASH, elapsed_ms=400, route="advertised"),
+                    trace_row("block_request_finish", 660_000, result="error",
+                              requested_hash=BLOCK_HASH, elapsed_ms=60, route="advertised"),
+                    trace_row("block_request_finish", 670_000, result="available",
+                              requested_hash=BLOCK_HASH, returned_hash=BLOCK_HASH,
+                              returned_height=10, elapsed_ms=20, route="hedge", **timing),
+                    tip_row(680_000), tip_row(9_000_000, height=11, block_hash="ef" * 32),
+                ]:
+                    stages.feed(row)
+                self.assertEqual(stages.finished()[0]["ms"]["body_download"], 70)
+
     def test_a_hedged_block_s_download_is_timed_before_the_first_request_answers(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
         self.append("legacy_gossip", trace_row("block_inv_received", 100_000, hash=BLOCK_HASH))

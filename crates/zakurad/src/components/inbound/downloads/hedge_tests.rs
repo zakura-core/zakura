@@ -73,7 +73,9 @@ where
         misbehavior: crate::components::test_misbehavior::reporter(),
         kind: DownloadKind::Advertised,
     };
-    download_block(network, hash, source, hedge, checks, oneshot::channel().1).await
+    download_block(network, hash, source, hedge, checks)
+        .await
+        .map(|candidates| candidates.first)
 }
 
 fn hash() -> block::Hash {
@@ -116,6 +118,111 @@ fn from_second() -> zn::Response {
         &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES,
         second_peer(),
     )
+}
+
+/// Both copies were requested before the verifier judged the first arrival. A payload
+/// mismatch permits the other supplier's copy to commit, while a service failure does not.
+#[tokio::test(start_paused = true)]
+async fn verification_can_commit_the_already_requested_copy_after_a_payload_rejection() {
+    use futures::StreamExt;
+    for (hedge_first, payload_mismatch) in [(false, true), (true, true), (false, false)] {
+        let (network, mut sent) = network();
+        let (commits, mut verification) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request| {
+            let (reply, decision) = oneshot::channel::<Result<block::Hash, BoxError>>();
+            commits.send((request, reply)).unwrap();
+            async { decision.await.unwrap() }
+        });
+        let state = service_fn(|request| async move {
+            assert!(matches!(request, zs::Request::AnyChainBlock(_)));
+            Ok(zs::Response::Block(None))
+        });
+        let (_tip_sender, tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
+        let reporter = crate::components::test_misbehavior::reporter();
+        let mut downloads = Downloads::new(
+            reporter.clone(),
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            state,
+            tip,
+            Network::Mainnet,
+        )
+        .with_second_block_request(true);
+        assert_eq!(
+            downloads.download_and_verify(hash(), None),
+            DownloadAction::AddedToQueue
+        );
+        let primary = next_sent(&mut sent).await;
+        let secondary = next_dispatched(&mut sent).await;
+        let (early, early_peer, late, late_peer) = if hedge_first {
+            (secondary, second_peer(), primary, first_peer())
+        } else {
+            (primary, first_peer(), secondary, second_peer())
+        };
+        let bytes = &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
+        let reply = |block: &Arc<Block>, peer| {
+            zn::Response::Blocks(vec![zn::InventoryResponse::Available((
+                block.clone().into(),
+                Some(peer),
+            ))])
+        };
+        let first_body = body(bytes);
+        let other_body = body(bytes);
+        early
+            .answer
+            .send(Ok(reply(&first_body, early_peer)))
+            .unwrap();
+        let (request, reject) = tokio::time::timeout(CHECK, verification.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(request, zakura_consensus::Request::Commit(BlockHandle::Shared(body))
+                if Arc::ptr_eq(&body, &first_body))
+        );
+        late.answer.send(Ok(reply(&other_body, late_peer))).unwrap();
+        tokio::task::yield_now().await;
+        assert!(verification.try_recv().is_err());
+        if payload_mismatch {
+            let error = zakura_consensus::VerifyBlockError::Block {
+                source: zakura_consensus::BlockError::BadMerkleRoot {
+                    actual: block::merkle::Root([0; 32]),
+                    expected: block::merkle::Root([1; 32]),
+                },
+            };
+            reject
+                .send(Err(zakura_consensus::RouterError::Block {
+                    source: Box::new(error),
+                }
+                .into()))
+                .unwrap();
+            let (request, accept) = tokio::time::timeout(CHECK, verification.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(request, zakura_consensus::Request::Commit(BlockHandle::Shared(body))
+                    if Arc::ptr_eq(&body, &other_body))
+            );
+            accept.send(Ok(hash())).unwrap();
+            assert_eq!(downloads.next().await.unwrap().unwrap(), hash());
+            assert!(reporter.is_banned(early_peer.ip()));
+            assert!(!reporter.is_banned(late_peer.ip()));
+        } else {
+            reject.send(Err("verifier unavailable".into())).unwrap();
+            let (error, source) = downloads.next().await.unwrap().unwrap_err();
+            assert_eq!(error.to_string(), "verifier unavailable");
+            assert_eq!(source, Some(early_peer));
+        }
+        assert!(verification.try_recv().is_err());
+        assert_nothing_more_sent(
+            &mut sent,
+            "verification uses only the two original requests",
+        )
+        .await;
+    }
 }
 
 /// Waits for the next request, at most two check intervals on the paused clock.
@@ -354,14 +461,7 @@ async fn a_height_rejection_leaves_the_other_dispatch_eligible() {
             kind: DownloadKind::Advertised,
         };
         let (network, mut sent) = network();
-        let mut download = tokio::spawn(download_block(
-            network,
-            block.hash(),
-            None,
-            true,
-            checks,
-            oneshot::channel().1,
-        ));
+        let mut download = tokio::spawn(download_block(network, block.hash(), None, true, checks));
         let first = next_sent(&mut sent).await;
         let second = next_dispatched(&mut sent).await;
         let ((early, early_addr), (late, late_addr)) = if first_rejected {
@@ -385,7 +485,7 @@ async fn a_height_rejection_leaves_the_other_dispatch_eligible() {
                 late_addr,
             )))
             .unwrap();
-        let (accepted, source, height) = download.await.unwrap().unwrap();
+        let (accepted, source, height) = download.await.unwrap().unwrap().first;
         assert_eq!(
             (accepted.hash(), source, height),
             (block.hash(), Some(late_addr), block::Height(1))

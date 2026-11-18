@@ -981,6 +981,154 @@ where
         ParentRecovery::Requested
     }
 
+    /// Applies gossip admission and submits one candidate to the verifier. A successful commit
+    /// credits the connection that delivered this body.
+    async fn verify_candidate(
+        self,
+        (block, advertiser_addr, block_height): BlockCandidate,
+        hash: block::Hash,
+        download_source: Option<zn::PeerSource>,
+        kind: DownloadKind,
+        source_lock: Option<Arc<Mutex<()>>>,
+    ) -> Result<(block::Hash, block::Height), DownloadError> {
+        let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let chain_network = self.chain_network.clone();
+        // # Security & Performance
+        //
+        // Reject blocks that are too far ahead of our tip,
+        // and blocks that are behind the finalized tip.
+        //
+        // Avoids denial of service attacks. Also reduces wasted work on high blocks
+        // that will timeout before being verified, and low blocks that can never be finalized.
+        let tip_height = self.latest_chain_tip.best_tip_height();
+
+        let max_lookahead_height =
+            max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
+
+        // Get the finalized tip height, assuming we're using the non-finalized state.
+        //
+        // It doesn't matter if we're a few blocks off here, because blocks this low
+        // are part of a fork with much less work. So they would be rejected anyway.
+        //
+        // And if we're still checkpointing, the checkpointer will reject blocks behind
+        // the finalized tip anyway.
+        //
+        // TODO: get the actual finalized tip height
+        let min_accepted_height = tip_height
+            .map(|tip_height| {
+                block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
+            })
+            .unwrap_or(block::Height(0));
+
+        if block_height > max_lookahead_height {
+            debug!(
+                ?hash,
+                ?block_height,
+                ?tip_height,
+                ?max_lookahead_height,
+                lookahead_limit = full_verify_concurrency_limit,
+                "gossiped block height too far ahead of the tip: dropped downloaded block",
+            );
+            metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
+
+            Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
+        } else if block_height < min_accepted_height {
+            debug!(
+                ?hash,
+                ?block_height,
+                ?tip_height,
+                ?min_accepted_height,
+                behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                "gossiped block height behind the finalized tip: dropped downloaded block",
+            );
+            metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+            Err("gossiped block height behind the finalized tip").map_err(|e| (e.into(), None))?;
+        }
+
+        if !has_sufficient_work(
+            &chain_network,
+            tip_height,
+            block_height,
+            block.header().difficulty_threshold,
+        ) {
+            metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
+            return Err((
+                "gossiped block target is easier than the Mainnet admission floor".into(),
+                advertiser_addr,
+            ));
+        }
+
+        // The parent is checked after the height policies, so only blocks this node would
+        // verify can start a recovery, and before the source lock, so a recovery is not
+        // delayed by earlier blocks from the same source.
+        if kind == DownloadKind::Advertised {
+            let parent = block.header().previous_block_hash;
+            let one_hop_from_tip = tip_height
+                .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
+                .is_some_and(|max_height| block_height <= max_height);
+
+            // A failed read only skips the recovery: the verifier still waits for the
+            // parent as before.
+            let parent_is_missing = one_hop_from_tip
+                && matches!(
+                    self.state
+                        .clone()
+                        .oneshot(zs::Request::KnownBlock(parent))
+                        .await,
+                    Ok(zs::Response::KnownBlock(None))
+                );
+
+            if parent_is_missing {
+                let header = *block.header();
+                let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
+                    zakura_consensus::proof_of_work_is_valid(
+                        &header,
+                        &chain_network,
+                        &block_height,
+                        &hash,
+                    )
+                })
+                .await
+                .unwrap_or(false);
+
+                let recovery = if proof_of_work_is_valid {
+                    self.recover_parent(parent, download_source)
+                } else {
+                    ParentRecovery::InvalidProofOfWork
+                };
+                debug!(
+                    ?hash,
+                    ?parent,
+                    ?block_height,
+                    ?recovery,
+                    "gossiped block's parent is missing",
+                );
+                metrics::counter!(
+                    "gossip.missing.parent.count",
+                    "outcome" => recovery.metric_label(),
+                )
+                .increment(1);
+            }
+        }
+
+        let _source_guard = match source_lock {
+            Some(source_lock) => Some(source_lock.lock_owned().await),
+            None => None,
+        };
+
+        self.verifier
+            .oneshot(zakura_consensus::Request::Commit(
+                block.clone().into_block(),
+            ))
+            .await
+            .map(|hash| {
+                block.record_verified();
+                (hash, block_height)
+            })
+            .map_err(|e| (e, advertiser_addr))
+    }
+
     /// Spawns the download and verify task for `download`, and records it in `admission`.
     fn spawn_download_task(
         &self,
@@ -1018,12 +1166,6 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let spawner = self.clone();
-        let network = self.network.clone();
-        let chain_network = self.chain_network.clone();
-        let verifier = self.verifier.clone();
-        let state = self.state.clone();
-        let latest_chain_tip = self.latest_chain_tip.clone();
-        let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
         let second_request = self.second_block_request && kind == DownloadKind::Advertised;
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
@@ -1032,7 +1174,8 @@ where
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
-            match state
+            match spawner
+                .state
                 .clone()
                 .oneshot(zs::Request::AnyChainBlock(hash.into()))
                 .await
@@ -1044,29 +1187,27 @@ where
             }
             .map_err(|e| (e, None))?;
 
-            let (notify_verified, verified) = oneshot::channel();
             let checks = CandidateChecks {
-                tip: latest_chain_tip.clone(),
+                tip: spawner.latest_chain_tip.clone(),
                 misbehavior: spawner.misbehavior.clone(),
                 kind,
             };
-            let (block, advertiser_addr, block_height) = match pushed {
+            let candidates = match pushed {
                 Some(block) => {
                     metrics::counter!("gossip.pushed.block.count").increment(1);
                     let pusher_addr = match &download_source {
                         Some(zn::PeerSource::LegacySocket(addr)) => Some(*addr),
                         _ => None,
                     };
-                    checks.check(block.into(), pusher_addr)?
+                    DownloadedCandidates::single(checks.check(block.into(), pusher_addr)?)
                 }
                 None => {
                     let downloaded = download_block(
-                        network,
+                        spawner.network.clone(),
                         hash,
                         download_source.clone(),
                         second_request,
                         checks,
-                        verified,
                     )
                     .await?;
                     metrics::counter!("gossip.downloaded.block.count").increment(1);
@@ -1074,139 +1215,52 @@ where
                 }
             };
 
-            // # Security & Performance
-            //
-            // Reject blocks that are too far ahead of our tip,
-            // and blocks that are behind the finalized tip.
-            //
-            // Avoids denial of service attacks. Also reduces wasted work on high blocks
-            // that will timeout before being verified, and low blocks that can never be finalized.
-            let tip_height = latest_chain_tip.best_tip_height();
-
-            let max_lookahead_height =
-                max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
-
-            // Get the finalized tip height, assuming we're using the non-finalized state.
-            //
-            // It doesn't matter if we're a few blocks off here, because blocks this low
-            // are part of a fork with much less work. So they would be rejected anyway.
-            //
-            // And if we're still checkpointing, the checkpointer will reject blocks behind
-            // the finalized tip anyway.
-            //
-            // TODO: get the actual finalized tip height
-            let min_accepted_height = tip_height
-                .map(|tip_height| {
-                    block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
-                })
-                .unwrap_or(block::Height(0));
-
-            if block_height > max_lookahead_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?max_lookahead_height,
-                    lookahead_limit = full_verify_concurrency_limit,
-                    "gossiped block height too far ahead of the tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
-            } else if block_height < min_accepted_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?min_accepted_height,
-                    behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                    "gossiped block height behind the finalized tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height behind the finalized tip")
-                    .map_err(|e| (e.into(), None))?;
-            }
-
-            if !has_sufficient_work(
-                &chain_network,
-                tip_height,
-                block_height,
-                block.header().difficulty_threshold,
-            ) {
-                metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
-                return Err((
-                    "gossiped block target is easier than the Mainnet admission floor".into(),
-                    advertiser_addr,
-                ));
-            }
-
-            // The parent is checked after the height policies, so only blocks this node would
-            // verify can start a recovery, and before the source lock, so a recovery is not
-            // delayed by earlier blocks from the same source.
-            if kind == DownloadKind::Advertised {
-                let parent = block.header().previous_block_hash;
-                let one_hop_from_tip = tip_height
-                    .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
-                    .is_some_and(|max_height| block_height <= max_height);
-
-                // A failed read only skips the recovery: the verifier still waits for the
-                // parent as before.
-                let parent_is_missing = one_hop_from_tip
-                    && matches!(
-                        state.oneshot(zs::Request::KnownBlock(parent)).await,
-                        Ok(zs::Response::KnownBlock(None))
-                    );
-
-                if parent_is_missing {
-                    let header = *block.header();
-                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
-                        zakura_consensus::proof_of_work_is_valid(
-                            &header,
-                            &chain_network,
-                            &block_height,
-                            &hash,
-                        )
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
-                    } else {
-                        ParentRecovery::InvalidProofOfWork
-                    };
-                    debug!(
-                        ?hash,
-                        ?parent,
-                        ?block_height,
-                        ?recovery,
-                        "gossiped block's parent is missing",
-                    );
-                    metrics::counter!(
-                        "gossip.missing.parent.count",
-                        "outcome" => recovery.metric_label(),
-                    )
-                    .increment(1);
-                }
-            }
-
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
+            let first = candidates.first;
+            let Some(other) = candidates.other else {
+                return spawner
+                    .verify_candidate(first, hash, download_source, kind, source_lock)
+                    .await;
             };
+            let winner = first.0.clone();
+            let first_result = spawner
+                .clone()
+                .verify_candidate(
+                    first,
+                    hash,
+                    download_source.clone(),
+                    kind,
+                    source_lock.clone(),
+                )
+                .await;
 
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(
-                    block.clone().into_block(),
-                ))
-                .await
-                .map(|hash| {
-                    block.record_verified();
-                    let _ = notify_verified.send(());
-                    (hash, block_height)
-                })
-                .map_err(|e| (e, advertiser_addr))
+            match first_result {
+                Ok(accepted) => {
+                    tokio::spawn(async move {
+                        if let Ok(Ok((body, _, _))) = other.await {
+                            body.record_verified_copy(&winner);
+                        }
+                    });
+                    Ok(accepted)
+                }
+                Err((error, source))
+                    if matches!(
+                        crate::commands::start::zakura::block_verify_error_class(&error),
+                        zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
+                    ) =>
+                {
+                    // The header can still have a valid body. Use only the copy already requested.
+                    let Ok(Ok(candidate)) = other.await else {
+                        return Err((error, source));
+                    };
+                    if let Some((addr, score)) = super::block_misbehavior(error, source) {
+                        spawner.misbehavior.report(addr, score);
+                    }
+                    spawner
+                        .verify_candidate(candidate, hash, download_source, kind, source_lock)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
         }
         .map_ok(move |(hash, height)| {
             match kind {
@@ -1330,16 +1384,16 @@ impl CandidateChecks {
     }
 }
 
-/// Drain a dispatched exchange. Only an exact copy of the verified body earns credit.
-async fn drain_competitor(
-    other: impl std::future::Future<Output = Result<BlockCandidate, DownloadError>>,
-    winner: zn::DeliveredBlock,
-    verified: oneshot::Receiver<()>,
-) {
-    if let Ok((body, _, _)) = other.await {
-        if verified.await.is_ok() {
-            body.record_verified_copy(&winner);
-        }
+/// The first usable reply and the other exchange if both requests were dispatched.
+#[derive(Debug)]
+struct DownloadedCandidates {
+    first: BlockCandidate,
+    other: Option<JoinHandle<Result<BlockCandidate, DownloadError>>>,
+}
+
+impl DownloadedCandidates {
+    fn single(first: BlockCandidate) -> Self {
+        Self { first, other: None }
     }
 }
 
@@ -1357,8 +1411,7 @@ async fn download_block<ZN>(
     download_source: Option<zn::PeerSource>,
     second_request: bool,
     checks: CandidateChecks,
-    verified: oneshot::Receiver<()>,
-) -> Result<BlockCandidate, DownloadError>
+) -> Result<DownloadedCandidates, DownloadError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
@@ -1369,7 +1422,7 @@ where
     };
     if !second_request {
         let request = zn::Request::block_by_hash(hash, download_source);
-        return validate(network.oneshot(request).await);
+        return validate(network.oneshot(request).await).map(DownloadedCandidates::single);
     }
 
     let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
@@ -1397,27 +1450,23 @@ where
             // A queued check can be dropped. A dispatched request can still supply or
             // finish transferring the block.
             if !attempt.close() {
-                return result;
+                return result.map(DownloadedCandidates::single);
             }
             match result {
-                Ok(response) => {
-                    tokio::spawn(drain_competitor(second, response.0.clone(), verified));
-                    Ok(response)
-                }
+                Ok(first) => Ok(DownloadedCandidates { first, other: Some(tokio::spawn(second)) }),
                 Err(first_error) => {
                     let block = second.await.map_err(|second_error| race_error(first_error, second_error))?;
                     metrics::counter!("gossip.hedge.won.count").increment(1);
-                    Ok(block)
+                    Ok(DownloadedCandidates::single(block))
                 }
             }
         }
         result = &mut second => match result {
             Ok(response) => {
                 metrics::counter!("gossip.hedge.won.count").increment(1);
-                tokio::spawn(drain_competitor(first, response.0.clone(), verified));
-                Ok(response)
+                Ok(DownloadedCandidates { first: response, other: Some(tokio::spawn(first)) })
             }
-            Err(second_error) => first.await.map_err(|first_error| race_error(first_error, second_error)),
+            Err(second_error) => first.await.map(DownloadedCandidates::single).map_err(|first_error| race_error(first_error, second_error)),
         },
     }
 }

@@ -96,6 +96,16 @@ impl PeerIO {
         outstanding: &OutstandingBlockRange,
         write: WriteOutcome,
     ) {
+        if write == WriteOutcome::Skipped {
+            self.work.forget_reset_range(
+                self.generation,
+                outstanding
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .map(|block| block.height),
+            );
+        }
         self.requester.retire(
             outstanding.request.start_height,
             write == WriteOutcome::Skipped,

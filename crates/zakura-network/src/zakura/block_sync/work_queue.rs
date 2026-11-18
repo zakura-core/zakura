@@ -387,6 +387,30 @@ impl WorkQueue {
         self.begin_receipt(|state| state.end_competing_reservation_at_receipt(height, hash))
     }
 
+    /// Whether the reset removed this session's reservation for the arriving body.
+    pub(super) fn was_reset_withdrawn(
+        &self,
+        session: u64,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> bool {
+        self.lock().state.was_reset_withdrawn(session, height, hash)
+    }
+
+    /// An ending or skipped write closes the session's response rights for this range.
+    pub(super) fn forget_reset_range(
+        &self,
+        session: u64,
+        heights: impl Iterator<Item = block::Height>,
+    ) {
+        self.lock().state.forget_reset_range(session, heights);
+    }
+
+    /// A disconnected session cannot deliver any more withdrawn bodies.
+    pub(super) fn forget_reset_session(&self, session: u64) {
+        self.lock().state.forget_reset_session(session);
+    }
+
     /// Take pending `height` for attempt `(session_id, request_id)`, which already
     /// holds the body for `hash`. A destructive reset can withdraw a request whose
     /// response is still arriving and queue the same block again. Adopting that

@@ -241,6 +241,10 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(in crate::zakura::block_sync) struct WorkQueueState {
     pending: BTreeMap<block::Height, WorkItem>,
     in_flight: BTreeMap<block::Height, WorkItem>,
+    /// Bodies still owed by a session whose published reservation was removed by
+    /// a reset. A wire range cannot overlap another range on the same session.
+    /// Endings, replacement publications, floor progress and disconnects expire it.
+    reset_withdrawn: BTreeMap<(block::Height, u64), block::Hash>,
     floor: block::Height,
     current_authority: Option<BodyWorkAuthority>,
     /// Floor clamp for size estimates (overridable for tests).
@@ -291,6 +295,7 @@ impl WorkQueueState {
         Self {
             pending: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            reset_withdrawn: BTreeMap::new(),
             floor,
             current_authority: None,
             floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
@@ -691,6 +696,10 @@ impl WorkQueueState {
             item.provisional = false;
             let charge = item.estimated_bytes;
             let owner = item.owner;
+            if let Some(owner) = owner {
+                // Publication starts a different exchange, even for the same block.
+                self.reset_withdrawn.remove(&(*height, owner.session_id));
+            }
             self.charge_in_flight(owner, charge);
             transferred = self.add_to_total(transferred, charge);
         }
@@ -754,6 +763,42 @@ impl WorkQueueState {
             .map(|charge| (owner, charge))
     }
 
+    pub(super) fn was_reset_withdrawn(
+        &self,
+        session: u64,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> bool {
+        self.reset_withdrawn.get(&(height, session)) == Some(&hash)
+    }
+
+    pub(super) fn forget_reset_range(
+        &mut self,
+        session: u64,
+        heights: impl Iterator<Item = block::Height>,
+    ) {
+        if !self.reset_withdrawn.is_empty() {
+            for height in heights {
+                self.reset_withdrawn.remove(&(height, session));
+            }
+        }
+    }
+
+    pub(super) fn forget_reset_session(&mut self, session: u64) {
+        self.reset_withdrawn
+            .retain(|(_, owner), _| *owner != session);
+    }
+
+    fn forget_resets_through(&mut self, floor: block::Height) {
+        while self
+            .reset_withdrawn
+            .first_key_value()
+            .is_some_and(|((height, _), _)| *height <= floor)
+        {
+            self.reset_withdrawn.pop_first();
+        }
+    }
+
     /// Move pending `height` to `attempt` as an already received body, when that
     /// attempt holds the body for `hash`. The item keeps its released ledger, so
     /// the move charges nothing. Returns the new owner, or `None` unless `height`
@@ -764,11 +809,15 @@ impl WorkQueueState {
         hash: block::Hash,
         attempt: (u64, std::num::NonZeroU64),
     ) -> Option<BodyWorkOwner> {
+        if !self.was_reset_withdrawn(attempt.0, height, hash) {
+            return None;
+        }
         let floor = self.floor;
         self.pending.get(&height).filter(|item| {
             item.hash == hash && !item.retry_after_tip.is_some_and(|tip| floor <= tip)
         })?;
         let mut item = self.pending.remove(&height)?;
+        self.reset_withdrawn.remove(&(height, attempt.0));
         if let Some(authority) = self.current_authority {
             item.scope = authority;
         }
@@ -952,6 +1001,7 @@ impl WorkQueueState {
     ) -> WorkDelta {
         self.floor = self.floor.max(floor);
         let floor = self.floor;
+        self.forget_resets_through(floor);
         // Pop only the committed `<= floor` prefix from each map. `pending` can hold
         // the entire header-ahead lag (100k+ heights), so a `retain` over the whole
         // map on every floor advance is O(total) and serializes the work-queue lock;
@@ -998,6 +1048,7 @@ impl WorkQueueState {
     /// IO resets the affected request writes under the same lock first.
     pub(in crate::zakura::block_sync) fn reset_above(&mut self, floor: block::Height) -> WorkDelta {
         self.floor = floor;
+        self.forget_resets_through(floor);
         // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
         // note in `advance_floor` on why a full-map `retain` is too expensive here.
         let mut released = 0u64;
@@ -1016,10 +1067,16 @@ impl WorkQueueState {
             if height <= floor {
                 break;
             }
-            let (_, mut item) = self
+            let (height, mut item) = self
                 .in_flight
                 .pop_last()
                 .expect("last_key_value returned Some");
+            if item.budget.is_reserved() {
+                if let Some(owner) = item.owner {
+                    self.reset_withdrawn
+                        .insert((height, owner.session_id), item.hash);
+                }
+            }
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
             self.settle_in_flight(item.owner, charge);

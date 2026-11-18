@@ -111,6 +111,20 @@ fn heights_of(items: &[(block::Height, WorkItem)]) -> BTreeSet<block::Height> {
 }
 
 #[test]
+fn advancing_the_floor_discards_reset_history_without_a_late_receipt() {
+    let mut state = new_state();
+    for raw in 1..=10 {
+        extend(&mut state, authority(0), &[(raw, 100)]);
+        let request = take(&mut state, raw, raw, 7, u64::from(raw));
+        publish(&mut state, &request);
+        state.reset_above(height(raw - 1));
+        assert!(state.was_reset_withdrawn(7, height(raw), hash(raw)));
+        state.advance_floor(height(raw));
+        assert!(state.reset_withdrawn.is_empty());
+    }
+}
+
+#[test]
 fn stale_unpublished_return_after_reset_keeps_the_replacement() {
     let mut state = new_state();
     extend(&mut state, authority(0), &[(1, 100), (2, 100)]);

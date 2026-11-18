@@ -318,42 +318,6 @@ impl PeerState {
             .map(OutstandingBlockRange::is_complete)
     }
 
-    /// Remember the unreceived bodies of every outstanding request, which a
-    /// destructive view reset is about to withdraw.
-    pub(in super::super) fn note_reset_withdrawn(&mut self) {
-        for (_, outstanding) in self.window.outstanding.entries() {
-            for height in unreceived_heights(outstanding) {
-                if let Some(hash) = outstanding.request.expected_hash(height) {
-                    self.reset_withdrawn.insert(height, hash);
-                }
-            }
-        }
-    }
-
-    /// Whether a destructive view reset withdrew this session's request for
-    /// `hash` at `height`, which is above `download_floor`.
-    pub(in super::super) fn was_reset_withdrawn(
-        &mut self,
-        height: block::Height,
-        hash: block::Hash,
-        download_floor: block::Height,
-    ) -> bool {
-        let kept_from = block::Height(download_floor.0.saturating_add(1));
-        if self
-            .reset_withdrawn
-            .first_key_value()
-            .is_some_and(|(height, _)| *height < kept_from)
-        {
-            self.reset_withdrawn = self.reset_withdrawn.split_off(&kept_from);
-        }
-        self.reset_withdrawn.get(&height) == Some(&hash)
-    }
-
-    /// Forget a withdrawn body once the session has received it.
-    pub(in super::super) fn forget_reset_withdrawn(&mut self, height: block::Height) {
-        self.reset_withdrawn.remove(&height);
-    }
-
     /// Record a wanted body `hash` at `height` that matches no outstanding
     /// request, typically one that arrived just after its request timed out.
     /// It proves progress. It offsets the reliability charge of the timed-out

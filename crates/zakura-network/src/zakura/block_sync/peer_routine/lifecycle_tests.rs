@@ -579,3 +579,93 @@ async fn a_body_withdrawn_by_a_reset_and_queued_again_is_adopted() {
         }
     }
 }
+
+/// The queue can reset while the peer is waiting for a sequencer slot. The
+/// local outstanding record still describes the original download at receipt.
+#[tokio::test]
+async fn reset_during_decode_admission_keeps_the_requeued_body() {
+    let mut probe = probe(1);
+    let height = block::Height(1);
+    let block = &probe.blocks[0];
+    let work = probe.routine.io.work.clone();
+    assert_eq!(probe.routine.try_fill().sent, 1);
+    probe.outbound.recv().await.unwrap();
+
+    let (sender, mut receiver) = mpsc::channel(1);
+    let occupied = sender.clone().reserve_owned().await.unwrap();
+    probe.routine.io.sequencer_input = sender;
+    let mut guard = block_sync_guard();
+    let frame = BlockSyncMessage::Block(block.clone())
+        .encode_frame()
+        .unwrap();
+    let mut receipt = Box::pin(probe.routine.handle_frame(&mut guard, frame));
+    assert!(futures::poll!(&mut receipt).is_pending());
+    work.reset_above(block::Height(0));
+    work.extend(
+        super::super::test_work_scope(),
+        [(height, block.hash(), BlockSizeEstimate::Confirmed(100))],
+    );
+    drop(occupied);
+    receipt.await.unwrap();
+
+    let received = receiver
+        .try_recv()
+        .expect("the original response reaches the sequencer");
+    assert_eq!(received.hash, block.hash());
+    assert_eq!(Some(received.owner), work.owner_for_height(height));
+    assert_eq!(probe.budget.reserved(), 0);
+    assert_eq!(probe.routine.try_fill().sent, 0);
+}
+
+/// Once the peer closes its reset-withdrawn exchange, the same block can be
+/// requested again. A timeout on the retry must follow ordinary timeout policy.
+#[tokio::test]
+async fn a_timed_out_retry_cannot_use_an_ended_exchanges_reset() {
+    let mut probe = probe(1);
+    let height = block::Height(1);
+    let hash = probe.blocks[0].hash();
+    let work = probe.routine.io.work.clone();
+    let session = probe.routine.io.generation;
+    let (view, receiver) = watch::channel(*probe.routine.io.sequencer_view.borrow());
+    probe.routine.io.sequencer_view = receiver;
+    assert_eq!(probe.routine.try_fill().sent, 1);
+    probe.outbound.recv().await.unwrap();
+
+    work.reset_above(block::Height(0));
+    probe.routine.gc_obsolete_outstanding();
+    view.send_modify(|view| view.reset_epoch += 1);
+    probe.routine.on_view_changed();
+    assert!(work.was_reset_withdrawn(session, height, hash));
+    deliver(
+        &mut probe.routine,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: height,
+            count: 1,
+        },
+    )
+    .await;
+    assert!(!work.was_reset_withdrawn(session, height, hash));
+
+    work.extend(
+        super::super::test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(100))],
+    );
+    assert_eq!(probe.routine.try_fill().sent, 1);
+    probe.outbound.recv().await.unwrap();
+    let deadline = probe
+        .routine
+        .state
+        .window
+        .outstanding
+        .earliest_deadline()
+        .unwrap();
+    assert!(probe.routine.expire_due_timeouts(deadline));
+    deliver(
+        &mut probe.routine,
+        BlockSyncMessage::Block(probe.blocks[0].clone()),
+    )
+    .await;
+    assert!(work.pending_contains(height));
+    assert!(probe.bodies.try_recv().is_err());
+    assert_eq!(probe.budget.reserved(), 0);
+}

@@ -2080,7 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn finalized_body_sizes_follow_the_state_reply_and_drop_zero_sizes() {
         let genesis = regtest_genesis_block().header.clone();
-        let mut sibling = *genesis;
+        let mut sibling = genesis.as_ref().clone();
         sibling.nonce.0[0] = sibling.nonce.0[0].wrapping_add(1);
         let headers: Vec<Arc<block::Header>> = vec![genesis, Arc::new(sibling)];
         let expected_hashes: Vec<block::Hash> =

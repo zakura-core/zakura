@@ -360,6 +360,10 @@ class DownloadTests(unittest.TestCase):
         self.assertIsNone(unknown["slowest_downloads"][0]["size"])
 
 
+class InvalidDatabaseError(RuntimeError):
+    """Matches the optional reader's exception for corrupt databases and records."""
+
+
 class FakeReader:
     """Stands in for a `maxminddb` reader over a database holding `records`."""
 
@@ -380,7 +384,7 @@ class LocatorTests(unittest.TestCase):
     }
 
     def locator(self, reader):
-        module = types.SimpleNamespace(open_database=lambda path: reader)
+        module = types.SimpleNamespace(open_database=lambda path: reader, InvalidDatabaseError=InvalidDatabaseError)
         with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": module}):
             return peer_location.open_locator(database.name)
 
@@ -411,6 +415,26 @@ class LocatorTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": None}):
             with self.assertLogs(level="WARNING"):
                 self.assertIsNone(peer_location.open_locator(database.name)("203.0.113.5"))
+
+    def test_a_corrupt_database_disables_locations(self):
+        module = types.SimpleNamespace(
+            open_database=mock.Mock(side_effect=InvalidDatabaseError("invalid database")),
+            InvalidDatabaseError=InvalidDatabaseError,
+        )
+        with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": module}):
+            with self.assertLogs(level="WARNING"):
+                locate = peer_location.open_locator(database.name)
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertIsNone(locate("203.0.113.6"))
+
+    def test_a_corrupt_record_is_unknown_and_other_peers_can_still_be_located(self):
+        reader = mock.Mock()
+        reader.get.side_effect = [InvalidDatabaseError("invalid record"), self.FRANKFURT]
+        locate = self.locator(reader)
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertEqual(locate("203.0.113.6")["country"], "DE")
+        self.assertEqual(reader.get.call_args_list, [mock.call("203.0.113.5"), mock.call("203.0.113.6")])
 
 
 if __name__ == "__main__":

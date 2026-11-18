@@ -27,8 +27,9 @@ def open_locator(path):
     """`locate(ip)` from the database at `path`: `{"country", "country_name", "city"}` or `None`.
 
     `country` is the two-letter ISO code. `None` comes back for an address the database
-    does not place, and for every address when `path` is empty, missing, unreadable, or
-    the reader is not installed (said once in the log).
+    does not place or whose record is corrupt, and for every address when `path` is
+    empty, missing, unreadable, corrupt, or the reader is not installed (said once in
+    the log).
     """
     if not path:
         return no_location
@@ -42,7 +43,7 @@ def open_locator(path):
         return no_location
     try:
         reader = maxminddb.open_database(path)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, maxminddb.InvalidDatabaseError) as error:
         logging.warning("peer locations are off: cannot read %s: %s", path, error)
         return no_location
 
@@ -50,7 +51,7 @@ def open_locator(path):
     def locate(ip):
         try:
             found = reader.get(ip)
-        except ValueError:
+        except (ValueError, maxminddb.InvalidDatabaseError):
             return None
         return location_of(found)
 

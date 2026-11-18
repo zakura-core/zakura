@@ -47,17 +47,17 @@ const STALLED_RESET_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stalled-r
 /// sequencer stalls, and the mirror keeps delivering 2 MB bodies after the
 /// input queue's decoded bytes fill the cap.
 const DECODED_INPUT_STALL_INPUT: &[u8] =
-    include_bytes!("fixtures/block-sync-decoded-input-stall.bin");
+    include_bytes!("fixtures/slow-seeds/block-sync-decoded-input-stall.bin");
 
 /// The committed input that picks the capacity-release scenario, under a
 /// plan where block sync handles the detached commit's tip before its reply.
 const CAPACITY_FRONTIER_FIRST_INPUT: &[u8] =
-    include_bytes!("fixtures/block-sync-capacity-frontier-first.bin");
+    include_bytes!("fixtures/slow-seeds/block-sync-capacity-frontier-first.bin");
 
 /// The committed input that picks the capacity-release scenario, under a
 /// plan where block sync handles the detached commit's reply before its tip.
 const CAPACITY_REPLY_FIRST_INPUT: &[u8] =
-    include_bytes!("fixtures/block-sync-capacity-reply-first.bin");
+    include_bytes!("fixtures/slow-seeds/block-sync-capacity-reply-first.bin");
 
 /// The scenario and Plan that `zakura-sim record --input` runs for `input`.
 fn committed(input: &[u8]) -> WitnessScenario<Storage> {
@@ -209,10 +209,10 @@ fn regenerate_reset_mid_flight_input() {
     );
 }
 
-/// Rewrites the committed input `name` under `tests/fixtures` with the
-/// first of [`REGENERATE_CANDIDATES`] fuzz inputs, after the scenario tag
-/// `tag`, for which `shortfall` finds nothing, and its sidecar's SHA-256 to
-/// match. It runs `width` candidates at once, and still picks the first in
+/// Rewrites the committed input `name`, a path under `tests/fixtures`
+/// without its extension, with the first of [`REGENERATE_CANDIDATES`] fuzz
+/// inputs, after the scenario tag `tag`, for which `shortfall` finds
+/// nothing, and its sidecar's SHA-256 to match. It runs `width` candidates at once, and still picks the first in
 /// order, so the result doesn't depend on `width`. It prints each
 /// candidate's shortfall, and panics if every candidate falls short.
 #[allow(clippy::print_stdout)]
@@ -387,7 +387,7 @@ fn regenerate_capacity_frontier_first_input() {
     // Under `--profile planted`, a capacity-release run takes a few minutes
     // and peaks near 1.5 GB, so four candidates at once stay near 6 GB.
     regenerate(
-        "block-sync-capacity-frontier-first",
+        "slow-seeds/block-sync-capacity-frontier-first",
         CAPACITY_RELEASE_TAG,
         4,
         capacity_frontier_first_shortfall,

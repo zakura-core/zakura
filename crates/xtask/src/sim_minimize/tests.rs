@@ -867,9 +867,9 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
              block_decoded_retention, block_reactor_policy, block_sync_storage, \
              block_work_funding, block_work_ownership, discovery_record_book, \
              discovery_session_installation, discovery_verification_capacity, \
-             discovery_wait_complete, discovery_wire, header_publisher_policy, \
-             header_reactor_policy, header_sync_storage, header_sync_wire, race_fixtures, \
-             sync_storage, sync_wire",
+             discovery_wait_complete, discovery_wire, handshake_counts, handshake_wire, \
+             header_publisher_policy, header_reactor_policy, header_sync_storage, \
+             header_sync_wire, race_fixtures, sync_storage, sync_wire",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (
@@ -1179,4 +1179,26 @@ fn an_exited_child_leaves_no_descendant() {
         gone(),
         "descendant {pid} still runs after run_child returned"
     );
+}
+
+/// Both builds of a confirmation warn rather than fail on warnings, so a
+/// bypass patch that leaves code unused still builds where the environment
+/// sets `CARGO_BUILD_WARNINGS=deny`.
+#[test]
+fn confirmation_builds_override_denied_warnings() {
+    let warnings = |command: &Command| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
+            .and_then(|(_, value)| value)
+            .map(OsStr::to_owned)
+    };
+    let sim = sim_build(OsStr::new("cargo"), Path::new("repo"), Path::new("target"));
+    assert_eq!(warnings(&sim), Some("warn".into()));
+    let fuzz = FuzzBuild {
+        fuzz_dir: PathBuf::from("fuzz"),
+        target_dir: PathBuf::from("target"),
+        sanitizer: Sanitizer::Address,
+    };
+    assert_eq!(warnings(&fuzz.command("build")), Some("warn".into()));
 }

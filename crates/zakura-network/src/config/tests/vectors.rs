@@ -2702,6 +2702,18 @@ fn advert_delay_roundtrips_and_validates() {
     assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
 }
 
+#[test]
+fn push_relayed_blocks_defaults_off_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+    let default: Config = toml::from_str("").unwrap();
+    assert!(!default.push_relayed_blocks);
+    let config: Config = toml::from_str("push_relayed_blocks = true").unwrap();
+    assert!(config.push_relayed_blocks);
+    let serialized = toml::to_string(&config).unwrap();
+    let reloaded: Config = toml::from_str(&serialized).unwrap();
+    assert!(reloaded.push_relayed_blocks, "{serialized}");
+}
+
 /// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
 /// the maximum becomes the delay, and the minimum is ignored.
 #[test]

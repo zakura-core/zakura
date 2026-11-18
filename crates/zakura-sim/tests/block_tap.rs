@@ -642,6 +642,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 BlockSyncFact::Holder { .. } => "holder",
                 BlockSyncFact::StaleScope { .. } => "stale-scope",
                 BlockSyncFact::StaleRegistryWrite { .. } => "stale-registry-write",
+                BlockSyncFact::StaleRegistryChange { .. } => "stale-registry-change",
                 BlockSyncFact::EpochApplied { .. } => "epoch-applied",
                 BlockSyncFact::ServingLease { .. } => "serving-lease",
                 BlockSyncFact::ServingAdmission { .. } => "serving-admission",

@@ -262,10 +262,17 @@ impl QueryState {
         Some(Ok(AdmittedAnswer { asked }))
     }
 
-    /// Live queries.
+    /// Checks the state's invariant: each live query sits under its own
+    /// kind, so a session holds at most one live query of each kind.
     #[cfg(any(test, feature = "p2p-fuzz"))]
-    fn len(&self) -> usize {
-        self.live.len()
+    fn assert_invariants(&self) {
+        for (kind, query) in &self.live {
+            assert_eq!(
+                query.asked.kind(),
+                *kind,
+                "discovery/query-ownership: a live query under another kind"
+            );
+        }
     }
 }
 
@@ -524,6 +531,31 @@ impl Queries {
         })
     }
 
+    /// Checks the session's invariants: it holds at most one unsettled answer
+    /// of each kind, no query is live beside its kind's unsettled answer, and
+    /// each live query holds its reservation.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    fn assert_invariants(&self) {
+        let live = self.lock();
+        live.state.assert_invariants();
+        let settling = *self.settling.borrow();
+        assert!(
+            settling.peers <= 1 && settling.services <= 1,
+            "discovery/answer-settlement: a kind stacked two answers: {settling:?}"
+        );
+        for kind in QUERY_KINDS {
+            assert!(
+                !(live.state.live.contains_key(&kind) && settling.holds(kind)),
+                "discovery/answer-settlement: a {kind:?} query is live beside its unsettled answer"
+            );
+        }
+        assert_eq!(
+            live.state.live.len(),
+            live.reservations.len(),
+            "discovery/answer-settlement: a live query without its reservation"
+        );
+    }
+
     /// Counts one `Hello` in verification until the returned hold drops.
     pub(super) fn verifying_hello(&self) -> SettlingHold {
         SettlingHold::new(Held::Hello, &self.settling)
@@ -586,12 +618,12 @@ impl ResponsePrecheck for QueriesPrecheck {
 }
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-mod model;
+mod replay;
 #[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{
+pub use replay::{
     replay_discovery_query_bytes, replay_discovery_settlement_bytes, DiscoveryQueryReplaySummary,
     DiscoverySettlementReplaySummary,
 };

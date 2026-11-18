@@ -42,8 +42,9 @@ use crate::{
     Observation, ObservationLog, RunConfig, Sim,
 };
 
-/// The variable that turns a fuzz target's semantic feedback `on`, the
-/// default, or `off`. The fuzz package reads it, and a campaign's manifest
+/// The variable that turns a fuzz target's semantic feedback `on` or `off`.
+/// Unset means `on` on Linux, the only platform where libFuzzer reads the
+/// feedback, and `off` elsewhere. The fuzz package reads it, and a campaign's manifest
 /// sets it.
 pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
 
@@ -65,7 +66,9 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 /// - 3: adds fuzz-12's hold, header lease level, fork work and recovery
 ///   conditions features.
 /// - 4: adds fuzz-13's conformant crossing feature.
-pub const FEEDBACK_VERSION: u32 = 4;
+/// - 5: adds the `over-rate` frame label, a metered row's frame past the
+///   receiver's byte bucket.
+pub const FEEDBACK_VERSION: u32 = 5;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;

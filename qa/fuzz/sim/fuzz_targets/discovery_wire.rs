@@ -1,3 +1,6 @@
 #![no_main]
 
-zakura_sim_fuzz::sim_target!(zakura_sim::harness::discovery_service::DiscoveryWire);
+zakura_sim_fuzz::sim_target!(
+    zakura_sim::harness::discovery_service::DiscoveryWire,
+    zakura_sim::explore::state::collector
+);

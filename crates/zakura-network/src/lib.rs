@@ -183,6 +183,9 @@ pub use crate::{
     protocol::external::canonical_peer_addr,
 };
 
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::{Codec, HashedBlock, Message};
+
 pub use crate::{
     address_book::{AddressBook, BannedIps, MisbehaviorReporter},
     address_book_peers::AddressBookPeers,
@@ -199,6 +202,9 @@ pub use crate::{
         internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},
     },
 };
+
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::codec::checksum_bench;
 
 /// Types used in the definition of [`Request`], [`Response`], and [`VersionMessage`].
 pub mod types {

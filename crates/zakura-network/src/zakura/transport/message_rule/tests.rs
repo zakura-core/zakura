@@ -306,6 +306,45 @@ fn a_request_response_stream_carries_no_announcement() {
 }
 
 #[test]
+fn a_metered_row_refills_and_pays_for_its_largest_payload() {
+    let metered = |bytes_per_second, opening_allowance, sender_allowance| MessageRule {
+        role: MessageRole::Metered {
+            rate: ByteRate {
+                bytes_per_second,
+                opening_allowance,
+                sender_allowance,
+            },
+        },
+        payload: PayloadLen::between(1, 1_000),
+        ..STATUS
+    };
+    assert_eq!(
+        check(&[persistent(64, leak(&[metered(10_000, 1_000, 1_000)]))]),
+        Ok(())
+    );
+    for broken in [
+        metered(0, 1_000, 1_000),
+        metered(10_000, 999, 1_000),
+        metered(10_000, 1_000, 999),
+    ] {
+        assert_eq!(
+            check(&[persistent(64, leak(&[broken]))]),
+            Err(LayoutError::ByteRateBelowPayload { message_type: 1 })
+        );
+    }
+    assert_eq!(
+        check(&[request_response(
+            66,
+            leak(&[GET, DONE, metered(10_000, 1_000, 1_000)])
+        )]),
+        Err(LayoutError::AnnouncementOnRequestResponse {
+            kind: 66,
+            message_type: 1,
+        })
+    );
+}
+
+#[test]
 fn a_request_allows_an_exchange_in_flight() {
     let closed = MessageRule {
         role: MessageRole::Request {

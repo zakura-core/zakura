@@ -50,7 +50,8 @@ lane is `baseline-fails`. A property that no generator harness reaches has a
 
 Every lane that survived, or that another rule killed, needs a triage record
 in `triage.toml`: the case's patch and property, the lane (`witness` or the
-generator harness), the class it explains (`survived` or
+generator harness), a generator lane's mode (`inproc` unless the record says
+`libfuzzer`), the class it explains (`survived` or
 `killed-by-other-rule`), the other rule's ID for a kill by another rule
 (`other`, required there and forbidden otherwise), the causal-chain stage
 where the bug stopped (`generator`, `schedule`, `observation`, `property` or
@@ -76,3 +77,20 @@ its exact selector with `--list`, require one executed test, and compare the
 unchanged, patched, and restored runs. Only the declared assertion counts as
 detection. Native assertions do not acquire simulator property IDs through
 this mapping.
+
+## Handshake generator lanes
+
+The handshake harnesses register their scenario-family selectors with the
+generator. `handshake/wire` lists fifteen families. `handshake/counts` draws
+machine operations directly.
+
+Run searches and mutation campaigns on the droplet. For example:
+
+```sh
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generators
+RUSTFLAGS='--cfg zakura_sim' cargo run -p zakura-sim --bin zakura-sim -- generate \
+  --sim handshake/counts --seed 11 --runs 1000 --out results/handshake-counts
+cargo xtask planted loop --only session/capacity-conserved \
+  --generate-runs 100 --generate-seeds 11 --generate-harness handshake/wire \
+  --out results/handshake-capacity-loop
+```

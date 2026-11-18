@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -4390,7 +4390,7 @@
+                 return None;
+             }
+ 
+-            if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
++            if false && stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
+                 debug!("rejecting non-request Zakura stream with request id");
+                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                 let rejection = super::handshake::PreludeRejection::UnexpectedRequestId;

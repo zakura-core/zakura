@@ -28,14 +28,14 @@ use zakura_sim::{
         session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
     },
     harness::{
-        run_prepared,
+        run_prepared, run_steered,
         sync::SyncPorts,
-        sync_wire::{SavedWire, SyncWire, CURATED, STALL_GROWTH, STALL_MS},
+        sync_wire::{combined, SavedWire, SyncWire, COMBINED_TAG, CURATED, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
-    seed, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome,
-    RunReport,
+    seed, Category, Identity, MemorySink, NullSink, Observation, ObservationLog, Outcome, Plan,
+    PlanInput, PropertyOutcome, RunReport, Steer,
 };
 
 /// Runs `saved` under `input`, and returns the report with its records and
@@ -231,6 +231,91 @@ fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
                     .all(|generation| superseded.values().flatten().any(|g| g == generation)),
             "the superseded routine's gated writes met its replacement's entry: \
              {attempts:?} {superseded:?}"
+        );
+        assert!(
+            matches!(
+                outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION),
+                PropertyOutcome::Held { applicable } if *applicable > 0
+            ),
+            "{:?}",
+            outcome(&report, REPLACEMENT_PRESERVES_AUTHORIZATION)
+        );
+    }
+}
+
+/// For each routine that ended after block sync admitted a newer generation
+/// for its peer, the claims its peer's newest routine reported last before
+/// that end.
+fn replacement_claims_at_superseded_end(log: &ObservationLog) -> Vec<usize> {
+    let mut newest: BTreeMap<String, u64> = BTreeMap::new();
+    let mut claims: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    let mut met = Vec::new();
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::SessionAdmitted {
+                        peer, generation, ..
+                    },
+                ..
+            } => {
+                newest.insert(peer.clone(), *generation);
+            }
+            Observation::BlockSync {
+                event:
+                    BlockSyncFact::Routine {
+                        peer,
+                        generation,
+                        claims: published,
+                        ended,
+                        ..
+                    },
+                ..
+            } => {
+                let replacement = newest
+                    .get(peer)
+                    .copied()
+                    .filter(|newest| newest > generation);
+                if let (true, Some(replacement)) = (*ended, replacement) {
+                    met.push(
+                        claims
+                            .get(&(peer.clone(), replacement))
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
+                claims.insert((peer.clone(), *generation), published.len());
+            }
+            _ => {}
+        }
+    }
+    met
+}
+
+/// The node's connection to its one mirror closes once it has asked
+/// storage to admit four bodies, and the node redials. The mirror's chain
+/// grows after the redial, so the replacement's routine requests the new
+/// bodies. The scenario holds the closed connection's block-sync routine
+/// until the replacement's routine reports a claim, so the superseded
+/// routine's drop meets an entry with claims. The gates refuse its writes,
+/// and the registry's fingerprints of the entry show no change. Both of the
+/// node's tips still reach the mirror's tip.
+#[test]
+fn a_superseded_routine_drops_beside_its_replacements_claims() {
+    let committed = Plan::from_fuzz(&[]);
+    for input in std::iter::once(committed).chain(inputs(2, 256)) {
+        let (report, _, ports) = run(SavedWire::ReplaceClaims, input);
+        let tip = ports.mirror_tip();
+        assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
+        let met = replacement_claims_at_superseded_end(&report.log);
+        assert!(
+            met.len() == 1 && met[0] > 0,
+            "exactly one routine ended after its replacement's admission, beside \
+             the replacement's claims: {met:?}"
+        );
+        assert!(
+            !refused_stale_writes(&report.log).is_empty(),
+            "the superseded routine's gated writes met its replacement's entry"
         );
         assert!(
             matches!(
@@ -495,13 +580,89 @@ fn curated_combined_actions_sync_both_tips() {
     }
 }
 
-/// The committed input, `sync-wire-reset-mid-write.bin`, that reaches
-/// zakura#2378. Its prefix picks fuzz-13's combined actions `FB 14`: the
-/// fork while storage holds a submission, with every read stalled. Its Plan
-/// picks each block request's writer last among the ready actions while its
-/// frame write is under way, as a slow thread would. The fork's tip reset
-/// then retires request 1/30 while its frame is partly written.
+/// The committed input, `known-failures/sync-wire-reset-mid-write.bin`,
+/// that reaches zakura#2378. Its prefix, [`RESET_MID_WRITE_PREFIX`], picks
+/// fuzz-13's combined actions `FB 14`: the fork while storage holds a
+/// submission, with every read stalled. Its Plan replays a random Plan's
+/// run that [`WriterLast`] steered, so each block request's writer runs last
+/// among the ready actions while its frame write is under way, as a slow
+/// thread would. The fork's tip reset then retires a request while its frame
+/// is partly written. It sits outside the seed corpus because it fails by design.
+/// `regenerate_reset_mid_write` rebuilds it.
 const RESET_MID_WRITE: &str = "reset-mid-write";
+
+/// [`RESET_MID_WRITE`]'s scenario prefix.
+const RESET_MID_WRITE_PREFIX: [u8; 2] = [COMBINED_TAG, 0b0001_0100];
+
+/// A steer that picks each block request's writer last among the ready
+/// actions while its frame write is under way, as a slow thread would.
+/// Otherwise it lets the Plan pick.
+///
+/// A writer is the task whose step logged the request's `started` step, and
+/// its write is under way until the request's next step. Among the other
+/// ready actions, the steer takes the first that sorts after its previous
+/// pick, wrapping to the start.
+#[derive(Default)]
+struct WriterLast {
+    /// How many log entries the steer has read.
+    read: usize,
+    /// Each block request, as `(session, request)`, that started at the step
+    /// being read and has no writer yet.
+    started: Vec<(u64, u64)>,
+    /// Each block request whose write is under way, and its writer's name.
+    writing: BTreeMap<(u64, u64), String>,
+    /// The steer's previous pick.
+    last: Option<Identity>,
+}
+
+impl WriterLast {
+    /// Reads the log entries after the ones already read.
+    fn catch_up(&mut self, log: &ObservationLog) {
+        for entry in &log.entries()[self.read..] {
+            if let Some(task) = entry.obs.ran_task() {
+                for request in self.started.drain(..) {
+                    self.writing.insert(request, task.to_owned());
+                }
+            }
+            if let Observation::BlockSync {
+                event: BlockSyncFact::Request { owner, step, .. },
+                ..
+            } = &entry.obs
+            {
+                let request = (owner.session_id, owner.request_id);
+                if step == "started" {
+                    self.started.push(request);
+                } else {
+                    self.writing.remove(&request);
+                }
+            }
+        }
+        self.read = log.entries().len();
+    }
+}
+
+impl Steer for WriterLast {
+    fn pick(&mut self, options: &[Identity], log: &ObservationLog) -> Option<usize> {
+        self.catch_up(log);
+        let writing = |option: &Identity| {
+            option.category == Category::Task && self.writing.values().any(|w| *w == option.key)
+        };
+        if !options.iter().any(writing) {
+            return None;
+        }
+        let rest: Vec<usize> = (0..options.len())
+            .filter(|&index| !writing(&options[index]))
+            .collect();
+        let after_last = |&&index: &&usize| {
+            self.last.as_ref().is_none_or(|last| {
+                (options[index].category, &options[index].key) > (last.category, &last.key)
+            })
+        };
+        let index = *rest.iter().find(after_last).or(rest.first())?;
+        self.last = Some(options[index].clone());
+        Some(index)
+    }
+}
 
 /// The steps at which a reset retired a block request whose frame write
 /// had started and not finished.
@@ -532,16 +693,41 @@ fn mid_write_resets(log: &ObservationLog) -> Vec<u64> {
 /// honest connection with `unfinished_exchange` while the session's other
 /// requests wait, which [`STALLED_SERVICE_ISOLATED`] forbids.
 ///
-/// [`RESET_MID_WRITE`]'s run must reset a request mid-write and then end in
-/// exactly that violation. The test fails with "fixed: remove this
-/// expectation (zakura#2378)" once the reset no longer closes the
-/// connection, and asks for a new input if the schedule stops reaching the
-/// mid-write reset at all.
+/// [`RESET_MID_WRITE`]'s input must validate as a seed of `sync/wire`
+/// whose only witness expects that violation, and decode to its combined
+/// actions. Its run must reset a request mid-write and then end in exactly
+/// that violation. The test fails with "fixed: remove this expectation
+/// (zakura#2378)" once the reset no longer closes the connection, and asks
+/// for a new input if the schedule stops reaching the mid-write reset at
+/// all.
 #[test]
 fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
-    let input = fs::read(fixtures().join(format!("sync-wire-{RESET_MID_WRITE}.bin")))
-        .expect("the input is committed");
-    let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES);
+    let report = seed::load(&[known_failures()], Some(SyncWire::NAME))
+        .expect("the known-failure directory lists");
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    let seed = report
+        .admitted
+        .iter()
+        .find(|seed| seed.path == reset_mid_write().with_extension("bin"))
+        .expect("the input is a committed seed");
+    let witnesses: Vec<(&str, &str)> = seed
+        .sidecar
+        .witness
+        .iter()
+        .map(|witness| (witness.property.as_str(), witness.expect.as_str()))
+        .collect();
+    assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "violated")]);
+    let (prefix, plan) = seed.input.split_at(SyncWire::SCENARIO_BYTES);
+    assert_eq!(
+        SyncWire::draw(prefix),
+        combined(&RESET_MID_WRITE_PREFIX),
+        "the fork while storage holds a submission, with every read stalled"
+    );
     let (report, _, _) =
         run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
     assert!(
@@ -569,6 +755,16 @@ fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
 /// The committed fixture directory.
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// The committed seeds that fail by design, outside the seed corpus.
+fn known_failures() -> PathBuf {
+    fixtures().join("known-failures")
+}
+
+/// [`RESET_MID_WRITE`]'s fixture path, without an extension.
+fn reset_mid_write() -> PathBuf {
+    known_failures().join(format!("sync-wire-{RESET_MID_WRITE}"))
 }
 
 /// Saved scenario `saved`'s fixture path, without an extension.
@@ -739,8 +935,87 @@ fn regenerate_saved_scenarios() {
         );
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
-    // The input is a search's result, so only its sidecar is rewritten.
-    let base = fixtures().join(format!("sync-wire-{RESET_MID_WRITE}"));
+    // `regenerate_reset_mid_write` builds the input, so only its sidecar is
+    // rewritten here.
+    write_reset_mid_write_sidecar();
+}
+
+/// How many Plans `regenerate_reset_mid_write` tries.
+const RESET_MID_WRITE_SEARCH: u64 = 200;
+
+/// Rebuilds [`RESET_MID_WRITE`]'s input and sidecar. It searches for a Plan
+/// that reaches zakura#2378. Each try runs [`RESET_MID_WRITE_PREFIX`]'s
+/// scenario on [`search_plan`]'s bytes for a seed, under [`WriterLast`]. The
+/// first try that resets a request mid-write and ends in the
+/// [`STALLED_SERVICE_ISOLATED`] violation wins. It saves the prefix and the
+/// Plan bytes that replay that run with no steer, and fails unless they do.
+/// The steer is what reaches the reset: random Plans alone rarely leave a
+/// request mid-write when the fork's reset lands. Run it with
+/// `RUSTFLAGS="--cfg zakura_sim" cargo test --manifest-path
+/// crates/zakura-sim/Cargo.toml --test sync_wire -- --ignored
+/// regenerate_reset_mid_write`.
+#[test]
+#[ignore = "a tool, not a test: it rewrites the committed zakura#2378 input"]
+fn regenerate_reset_mid_write() {
+    let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
+    let (steered, plan) = (0..RESET_MID_WRITE_SEARCH)
+        .find_map(|seed| {
+            let ports = SyncWire::prepare(&scenario);
+            let input = Plan::from_fuzz(&search_plan(seed));
+            let steer = Box::new(WriterLast::default());
+            let (report, plan) =
+                match run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer) {
+                    Ok(steered) => steered,
+                    Err(HarnessError::Run { failure, report }) => {
+                        panic!("seed {seed}: {failure}: {:?}", report.end)
+                    }
+                    Err(error) => panic!("seed {seed}: {error}"),
+                };
+            let reaches = !mid_write_resets(&report.log).is_empty()
+                && report.end.violation.as_ref().is_some_and(|violation| {
+                    violation.property == STALLED_SERVICE_ISOLATED
+                        && violation.actual.contains("with cause unfinished_exchange")
+                });
+            reaches.then_some((report, plan))
+        })
+        .unwrap_or_else(|| {
+            panic!("none of {RESET_MID_WRITE_SEARCH} steered Plans reached zakura#2378")
+        });
+    let (replayed, _, _) = run_scenario_judged_by_caller(&scenario, Plan::from_fuzz(&plan));
+    assert!(
+        replayed.picks == steered.picks,
+        "the recorded bytes don't replay the steered run: {:?} {:?}",
+        steered.end,
+        replayed.end
+    );
+    fs::write(
+        reset_mid_write().with_extension("bin"),
+        [&RESET_MID_WRITE_PREFIX[..], &plan].concat(),
+    )
+    .expect("the fixture directory exists");
+    write_reset_mid_write_sidecar();
+}
+
+/// Seed `seed`'s Plan bytes for `regenerate_reset_mid_write`: enough
+/// xorshift64 output that no run exhausts it.
+fn search_plan(seed: u64) -> Vec<u8> {
+    // An odd state is never zero, and xorshift64 never reaches zero from a
+    // nonzero state.
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..400_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Truncation keeps the low byte, which is all a byte needs.
+            state as u8
+        })
+        .collect()
+}
+
+/// Writes [`RESET_MID_WRITE`]'s sidecar for its committed input.
+fn write_reset_mid_write_sidecar() {
+    let base = reset_mid_write();
     let input = fs::read(base.with_extension("bin")).expect("the input is committed");
     let scenario = serde_json::to_value(SyncWire::draw(&input[..SyncWire::SCENARIO_BYTES]))
         .expect("scenarios serialize");
@@ -748,12 +1023,17 @@ fn regenerate_saved_scenarios() {
         "# The committed fuzz input `sync-wire-{RESET_MID_WRITE}.bin`: the harness that\n\
          # runs it, the generator version it was built for, and its SHA-256. Its\n\
          # two bytes pick a combination of fuzz-13's actions, and its Plan resets a\n\
-         # block request mid-write, zakura#2378's known failure.\n\
+         # block request mid-write, zakura#2378's known failure. It sits outside the\n\
+         # seed corpus because it fails by design.\n\
          harness = \"{harness}\"\n\
          generator = {generator}\n\
          sha256 = \"{digest}\"\n\
          scenario_sha256 = \"{scenario}\"\n\
-         source = \"crates/zakura-sim/tests/sync_wire.rs\"\n",
+         source = \"crates/zakura-sim/tests/sync_wire.rs\"\n\
+         \n\
+         [[witness]]\n\
+         property = \"{STALLED_SERVICE_ISOLATED}\"\n\
+         expect = \"violated\"\n",
         harness = SyncWire::NAME,
         generator = SyncWire::GENERATOR,
         digest = seed::sha256(&input),

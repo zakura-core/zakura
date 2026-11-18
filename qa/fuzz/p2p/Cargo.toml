@@ -23,7 +23,7 @@ block_sequencer_order = { decoder = 1, properties = ["block/contiguous-submissio
 block_sequencer_reset = { decoder = 1, properties = ["block/retired-apply-isolation"] }
 block_sequencer_evidence = { decoder = 1, properties = ["block/required-evidence"] }
 discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
-discovery_redial = { decoder = 1, properties = ["discovery/redial-policy"] }
+discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
 discovery_candidate = { decoder = 1, properties = ["discovery/dial-attempts"] }
 

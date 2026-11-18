@@ -10,3 +10,6 @@ input = "crates/zakura-sim/tests/fixtures/header-wire-honest-progress.bin"
 # decides whether the successor is offered, located and prepared. A change
 # there can move the input off its prepare.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The property is `Draft`, and a fuzz target fails only on an `Active`
+# property, so header_sync_wire runs the patched input clean.
+no_target = "header-sync/honest-progress is Draft, and a fuzz target fails only on an Active property"

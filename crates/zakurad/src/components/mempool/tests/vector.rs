@@ -3894,7 +3894,7 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
 /// reset boundary is at NU5. Because [`ChainTipChange::action`] resets when the *next* height
 /// (`tip + 1`) is an activation height, committing the block at height
 /// `NU5_ACTIVATION_TEST_HEIGHT - 1` produces a [`TipAction::Reset`].
-const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
+pub(super) const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
 
 /// Build a configured Testnet that activates NU5 at [`NU5_ACTIVATION_TEST_HEIGHT`].
 ///
@@ -3903,7 +3903,7 @@ const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
 /// `NU5_ACTIVATION_TEST_HEIGHT - 1` yields a [`TipAction::Reset`], because the next height is the
 /// NU5 activation height. The temporary Orchard-disabling soft fork is disabled so the only
 /// non-genesis reset boundary is the NU5 activation.
-fn nu_activation_test_network() -> Network {
+pub(super) fn nu_activation_test_network() -> Network {
     use zakura_chain::parameters::testnet::{
         ConfiguredActivationHeights, Parameters as TestnetParameters,
     };
@@ -3930,7 +3930,7 @@ fn nu_activation_test_network() -> Network {
 ///
 /// The blocks have valid commitments, so they can be committed to a state service via
 /// [`zakura_state::Request::CommitCheckpointVerifiedBlock`].
-fn generate_test_chain(network: &Network, count: usize) -> Vec<Arc<Block>> {
+pub(super) fn generate_test_chain(network: &Network, count: usize) -> Vec<Arc<Block>> {
     use proptest::{
         strategy::{Strategy, ValueTree},
         test_runner::TestRunner,
@@ -4171,4 +4171,43 @@ async fn cancel_handles_drained_after_verification_timeout() {
         leaked, 0,
         "regression GHSA-65jj-fmw8-468q: cancel_handles must be drained after timeout"
     );
+}
+
+/// tx-relay serves a body its pool hides for revalidation, because the
+/// receiver checks it against its own tip and charges nothing for a failure
+/// that depends on the tip. A body that passed once can fail on a new tip
+/// only through its declared upgrade: a v5 or later body as a wrong branch
+/// id, which the verifier checks before every upgrade-dependent rule, and a
+/// v4 body, which declares no upgrade, through an upgrade-dependent rule
+/// within the grace window after an activation. Neither draws a Ban, and
+/// neither starts a cooldown.
+#[test]
+fn a_body_that_passed_once_draws_no_charge_on_a_new_tip() {
+    use zakura_chain::parameters::NetworkUpgrade;
+    use zakura_consensus::error::TransactionError;
+
+    use crate::components::mempool::{failure_bans, failure_cools_down};
+
+    // A v5 body built for the upgrade before the receiver's tip.
+    let wrong_branch = TransactionError::WrongConsensusBranchId;
+    assert!(!failure_bans(&wrong_branch, 5));
+    assert!(!failure_cools_down(
+        &wrong_branch,
+        5,
+        Some(NetworkUpgrade::Nu6),
+        NetworkUpgrade::Nu6_1,
+        None,
+    ));
+
+    // A v4 body whose signature or proof fails under the receiver's new
+    // upgrade, inside the grace window after it activated.
+    let upgrade_dependent = TransactionError::SaplingVerificationFailed;
+    assert!(!failure_bans(&upgrade_dependent, 4));
+    assert!(!failure_cools_down(
+        &upgrade_dependent,
+        4,
+        None,
+        NetworkUpgrade::Nu6_1,
+        Some(NetworkUpgrade::Nu6),
+    ));
 }

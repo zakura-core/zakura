@@ -53,6 +53,7 @@ ready_max_tip_age = "5m"
 
 [mempool]
 eviction_memory_time = "1h"
+implementation = "default"
 max_datacarrier_bytes = 83
 max_transaction_bytes = 250000
 tx_cost_limit = 80000000
@@ -97,6 +98,7 @@ network = "Mainnet"
 #   releases. Currently "legacy" on Mainnet, and "dual" everywhere else.
 p2p_stack = "default"
 peerset_initial_target_size = 100
+push_relayed_blocks = false
 unconditional_peers = []
 
 # Warm each new legacy TCP connection with a few padded pings, so that its first

@@ -46,7 +46,7 @@ use crate::{
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
     },
-    peer_registry::PeerRegistry,
+    peer_registry::{trace_user_agent, PeerRegistry},
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
         external::{
@@ -530,6 +530,7 @@ where
     latest_chain_tip: C,
     misbehavior: Option<MisbehaviorReporter>,
     tcp_warmup: Option<TcpWarmup>,
+    block_checksums: Option<BlockChecksums>,
 }
 
 impl<S, C> Builder<S, C>
@@ -616,6 +617,7 @@ where
             protected_peer_ips: self.protected_peer_ips,
             misbehavior: self.misbehavior,
             tcp_warmup: self.tcp_warmup,
+            block_checksums: self.block_checksums,
         }
     }
 
@@ -660,6 +662,15 @@ where
     /// If this is unset or `None`, connections are not warmed.
     pub fn with_tcp_warmup(mut self, tcp_warmup: Option<TcpWarmup>) -> Self {
         self.tcp_warmup = tcp_warmup;
+        self
+    }
+
+    /// Share `block_checksums` with the connections this handshake creates, so they reuse
+    /// checksums that block advertisement precomputed. Optional.
+    ///
+    /// If this is unset, the connections share checksums only with each other.
+    pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
+        self.block_checksums = Some(block_checksums);
         self
     }
 
@@ -715,7 +726,7 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
-            block_checksums: BlockChecksums::default(),
+            block_checksums: self.block_checksums.unwrap_or_default(),
             bans: misbehavior.bans(),
             misbehavior,
             tcp_warmup: self.tcp_warmup,
@@ -749,6 +760,7 @@ where
             latest_chain_tip: NoChainTip,
             misbehavior: None,
             tcp_warmup: None,
+            block_checksums: None,
         }
     }
 }
@@ -1103,6 +1115,7 @@ where
             &connector,
             peer_registry,
             address_book_updater,
+            node_config.expose_peer_addresses,
         );
         return Ok(outcome);
     }
@@ -1193,6 +1206,7 @@ where
         &connector,
         peer_registry,
         address_book_updater,
+        node_config.expose_peer_addresses,
     );
 
     Ok(outcome)
@@ -1206,10 +1220,20 @@ fn record_zakura_upgrade(
     connector: &ZakuraHandshakeConnector,
     peer_registry: Option<&PeerRegistry>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+    expose_peer_addresses: bool,
 ) {
     let ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id } = outcome else {
         return;
     };
+
+    // Zakura trace rows name a peer only by its label, so this is where its address and
+    // software version are tied to that label.
+    connector.trace_upgraded_peer(
+        peer_id,
+        &connected_addr.addr_label(expose_peer_addresses),
+        &trace_user_agent(&connection_info.remote.user_agent),
+        connected_addr.is_inbound(),
+    );
 
     if let (Some(peer_registry), Some(peer)) = (
         peer_registry,
@@ -1815,6 +1839,7 @@ where
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
+            let connection_id = gossip_trace.connection_id();
             let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
@@ -1977,6 +2002,7 @@ where
                 request_slot,
                 peer_registry_updater: client_peer_registry_updater,
                 connection_info,
+                connection_id,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,
                 block_advert_tx,

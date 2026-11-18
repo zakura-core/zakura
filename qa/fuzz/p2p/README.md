@@ -1,8 +1,8 @@
 # P2P machine fuzzing
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member.
-Each target drives one pure P2P machine from fuzz bytes and checks it against
-an independent model after every input. A target panics with the property ID
+Each target drives one pure P2P machine from fuzz bytes and checks its
+properties after every input. A target panics with the property ID
 that the machine broke.
 
 Run a target from this directory with a pinned nightly toolchain. Pass
@@ -18,11 +18,15 @@ to the service-session state in
 `crates/zakura-network/src/zakura/handler/service_session/state.rs` and checks
 `session/offer-assembly`, `session/one-active-generation`, and
 `session/legal-reopen`. Its first input byte selects the opening policy and
-connection roles; the rest selects inputs.
+connection roles; the rest selects inputs. Decoder version 1 reads at most 512
+bytes. The replay checks both machines' invariants after every input, and
+checks each result against what the connection loop recorded from earlier
+results. Named tests pin which result each rule picks.
 
-The input decoding, the model, and the checks live in `zakura-network` behind
-the `p2p-fuzz` feature, so the machine types stay private to the crate. A unit
-test there runs the same entry over fixed seeds in every test run.
+The input decoding and the checks live in `zakura-network` behind the
+`p2p-fuzz` feature, so the machine types stay private to the crate. Unit tests
+there run the same entry on two witnesses and random histories in every test
+run.
 
 `cargo-fuzz` creates and updates each target's local `corpus/` and `artifacts/`
 directories; both are intentionally ignored by Git.
@@ -40,19 +44,22 @@ Do not commit raw or minimized corpus files.
 ## Cadence target
 
 `cadence` calls the production sender's hold decision and synchronous send path
-for two rows sharing one queue. Its independent ledger checks `cadence/hold`
-and `cadence/settlement`. A receive settles the real frame guard. This boundary
-does not exercise scheduled transport writes.
+for two rows sharing one queue. It records each row's latest value, last send
+and queued frames, and checks `cadence/hold` and `cadence/settlement` against
+those records: each result names a hold the records show, and a queued frame
+carries the row's latest value. Named tests pin which hold a row reports first.
+A receive settles the real frame guard. This boundary does not exercise
+scheduled transport writes.
 
 Decoder version 1 reads at most 512 bytes. Each byte chooses update, elapsed
 seconds, send or settlement. The fixed witness exercises pacing, an unwritten
 frame, a full queue and settlement. Planted failures break pacing and ownership.
 Proptest and cargo-fuzz call `replay_cadence_bytes`.
 
-Run the applicability witnesses with `cargo test -p zakura-network --lib
-cadence_witness -- --nocapture` from the repository root. Their printed counters
-are witness evidence; they do not claim applicability for every fuzz input.
-An empty input has zero applicability.
+Run the applicability witness with `cargo test -p zakura-network --lib
+regulation::cadence::fuzz -- --nocapture` from the repository root. Its printed
+counters are witness evidence; they do not claim applicability for every fuzz
+input. An empty input has zero applicability.
 
 `p2p-fuzz.yml` schedules this target and the machine targets below. It runs each
 one nightly and for longer on Sunday, or on a manual dispatch. No fuzz campaign
@@ -80,8 +87,8 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> path/to/artifact -- -ru
 ## Block machine targets
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member. Each
-target drives one pure P2P machine from fuzz bytes and checks it against an
-independent model after every input. A target panics with the property ID that
+target drives one pure P2P machine from fuzz bytes and checks its properties
+after every input. A target panics with the property ID that
 the machine broke. The targets do not start QUIC or the simulator step loop.
 
 Each owning PR adds its targets as `[[bin]]` entries, with a row in the table
@@ -96,8 +103,12 @@ below.
 | `block_fill` | `block/fill-retry-run`, `block/fill-retained-funding`, `block/fill-commit-window` | 1 |
 | `block_request_lifecycle` | `block/request-lifecycle` | 1 |
 
-`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` model through
+`qa/fuzz/sim/block_work_ownership` drives the `block/work-ownership` owner through
 trace and replay, so it needs no target here.
+
+The retry target checks the supplier and alarm owners' invariants and compares
+each lookup only with the deferrals it wrote. The peer-table target keeps a
+small bookkeeping model of generations, close flags and published claims.
 
 The input decoding, the model and the checks live in `zakura-network` behind the
 `p2p-fuzz` feature, so the machine types stay private to the crate.
@@ -130,11 +141,13 @@ The registry and retry targets preserve the drivers from PR #1679, change
 `d4fc17f468487d03b3b554dade009bf2538be95b`. The head's later witness-message
 correction remains intact. Decoder 1 keeps the original byte interpretation.
 `block_query` and `block_reactor` preserve the query portion of PR #1677 and the
-reactor model from PR #1683. `block_query` generates accepted and refused
+reactor target from PR #1683. `block_query` generates accepted and refused
 proposals, exact and stale replies, resets, authority changes, and retry expiry.
-Its identity ledger calls no production policy helper. `block_reactor` shares the
-reactor policy model with proptest and covers view mirrors, reaction epochs, reset
-refills, query refusal, retry expiry, and authority changes. Decoder 2 of
+Its identity ledger calls no production policy helper. `block_reactor` shares its
+byte decoder with proptest, checks the reactor's invariants after every input,
+and compares each query and mirror with the inputs it sent. It covers view
+mirrors, reaction epochs, reset refills, query refusal, retry expiry, and
+authority changes. Decoder 2 of
 `block_reactor` added a closed-channel refusal to bit 16 of the refill byte. Decoder
 3 delivers an authority byte as a committed view, which retires the pending query,
 and reads bit 4 of a refill's byte as the first view's arrival. No committed corpus
@@ -145,8 +158,9 @@ the action channel and storage waits.
 `7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and
 its funding check now runs through queue admission. The driver takes up to 30
 items, which the one-block production cap does not reach.
-`block_request_lifecycle` comes from PR #1679 and tracks requests,
-transport-start facts, and no-progress charges. Its witness expires one written
+`block_request_lifecycle` comes from PR #1679. Its ledger tracks the requests
+it issued, the writes it started, and the requests sent since the last body,
+and it checks the request state's invariants after every input. Its witness expires one written
 request and one unwritten request, matches a replacement request, and resets the
 remaining window. Other machine
 targets follow their owning delivery packets.
@@ -160,8 +174,9 @@ targets follow their owning delivery packets.
 | `block_sequencer_evidence` | `block/required-evidence` | 1 |
 
 These targets preserve PR #1680 at
-`3bc8261c6d1a0c1ec1daf55d361f5a33e34b5a8d`. Each target uses the independent
-model from its proptest driver. Ordering and evidence consume three-byte
+`3bc8261c6d1a0c1ec1daf55d361f5a33e34b5a8d`. Each target checks the sequencer's
+invariants and compares its outputs with bookkeeping of the heights it
+delivered and the driver accepted. Ordering and evidence consume three-byte
 operations. Reset consumes one byte for the retired-apply count, then three-byte
 operations. Each decoder reads at most 512 bytes. Empty input reports zero
 applicability. Setup transitions do not count as generated coverage.
@@ -169,28 +184,34 @@ applicability. Setup transitions do not count as generated coverage.
 The ordering witness retries a refused contiguous submission. The reset witness
 completes a retired apply while current work remains. The evidence witness holds
 required evidence through modeled backpressure, then delivers it. Planted state
-corruption must fail the intended model check. These checks do not establish
+corruption must fail the intended check. These checks do not establish
 production-mutation detection, decoded-memory retention, actual channel delivery,
 or fresh-process semantic replay. The block fixture copies public mainnet block
 1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.
 
 ## Discovery targets
 
-`discovery_session` drives `Hello`, admitted answers and operation outcomes, and
-its model checks exchange completion, single settlement and the ownership
-recheck before a close.
+Each discovery target drives the production machine, checks its invariants
+after every operation, and compares outputs only with what the replay sent.
+Named scenarios beside each machine pin its rules.
 
-`discovery_redial` drives attempt and registration lifetimes, and its model
-checks local limits, backoff growth, registration upgrades, resets and stopping.
+`discovery_session` drives `Hello`, admitted answers and operation outcomes
+under decoder 1. It checks exchange completion, single settlement and the
+ownership recheck before a close.
+
+`discovery_redial` drives attempt and registration lifetimes under decoder 2.
+Its header byte chooses a maintained or a bounded policy. It checks local
+limits, the backoff bounds, registration upgrades, resets and stopping.
 
 `discovery_query` replays each input under both decoders, so its corpus keeps its
-decoder-1 meaning: decoder 1 checks pure query ownership and wire caps, and
-decoder 2 checks the real `Queries` ledger of successive sessions on one pool,
-without a reader to take the `Hello` hold.
+decoder-1 meaning: decoder 1 checks pure query ownership and each query's own
+cap, and decoder 2 checks the real `Queries` ledger of successive sessions on
+one pool, without a reader to take the `Hello` hold.
 
-`discovery_candidate` drives dial, completion, round and logical-time operations,
-and its model checks canonical IP reservations and per-node backoff, not an
-asynchronous worker's admission permit.
+`discovery_candidate` drives dial, completion, round and logical-time
+operations under decoder 1. It checks canonical IP reservations, the bounds of
+per-node backoff and the round interval, not an asynchronous worker's
+admission permit.
 
 These targets check pure policies. They do not check worker cancellation or
 connection ownership across scheduled IO.

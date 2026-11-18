@@ -13,7 +13,7 @@ import sys
 # `zakura-quic`, `zakura-rt` and `zakura-mmr-tree` have no stable crates.io
 # release yet, so they have no baseline to check against. Remove each after its
 # first stable publish; their dependents remain checked.
-SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic", "zakura-rt", "zakura-mmr-tree"}
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic", "zakura-rt", "zakura-mmr-tree", "zakura-mempool"}
 
 
 def is_publishable(package):

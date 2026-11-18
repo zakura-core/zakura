@@ -258,10 +258,6 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        queue_depths: Some(super::StreamQueueDepths {
-            inbound: 8,
-            outbound: 256,
-        }),
         ..Stream::PERSISTENT
     },
     Stream {

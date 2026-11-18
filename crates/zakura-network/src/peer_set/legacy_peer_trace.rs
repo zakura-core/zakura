@@ -11,7 +11,7 @@
 //! (see `[network.block_source_score] second_request`). `hedge_reason` says why it was sent:
 //! `predicted` when another announcer was expected to deliver clearly sooner, `stalled` when the
 //! first request ran well past its expected time. `first_request_waited_ms` is how long the first
-//! request had been outstanding, so the download is timed from the first request, and
+//! request had been outstanding since dispatch to a peer, excluding local routing queue time, and
 //! `first_score_ms` is the first peer's expected answer time.
 //! A delivered block's row has `block_bytes`, its decoded size, so answer times can be compared
 //! with expected ones by block size.
@@ -216,6 +216,18 @@ impl LegacyPeerTrace {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn for_tests(
+        guard: &zakura_jsonl_trace::JsonlTraceGuard,
+        expose_peer_addresses: bool,
+    ) -> LegacyPeerTrace {
+        LegacyPeerTrace {
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            expose_peer_addresses,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     pub(super) fn next_request_id(&self) -> u64 {
         // Wrap-around is unreachable for a process-local u64 counter.
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
@@ -400,17 +412,6 @@ mod tests {
         block::Hash([byte; 32])
     }
 
-    fn test_trace(
-        guard: &zakura_jsonl_trace::JsonlTraceGuard,
-        expose_peer_addresses: bool,
-    ) -> LegacyPeerTrace {
-        LegacyPeerTrace {
-            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
-            expose_peer_addresses,
-            next_request_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
     fn test_peer() -> PeerTraceContext {
         PeerTraceContext {
             connection_id: 7,
@@ -436,7 +437,7 @@ mod tests {
     async fn writes_attributed_find_blocks_and_notfound_events() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = test_trace(&guard, false);
+        let trace = LegacyPeerTrace::for_tests(&guard, false);
         let peer = test_peer();
 
         trace.find_blocks_finish(
@@ -530,7 +531,7 @@ mod tests {
     async fn names_the_peer_address_only_when_the_node_exposes_peer_addresses() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = test_trace(&guard, true);
+        let trace = LegacyPeerTrace::for_tests(&guard, true);
 
         trace.block_request_finish(
             1,
@@ -558,7 +559,7 @@ mod tests {
     async fn an_advertised_row_says_how_its_peer_was_chosen() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = test_trace(&guard, false);
+        let trace = LegacyPeerTrace::for_tests(&guard, false);
         let missing = || {
             Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
                 InventoryHash::Block(hash(2)),
@@ -609,7 +610,7 @@ mod tests {
     async fn a_hedge_row_says_why_it_was_sent_and_how_long_the_first_request_waited() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = test_trace(&guard, false);
+        let trace = LegacyPeerTrace::for_tests(&guard, false);
 
         trace.block_request_finish(
             1,
@@ -648,7 +649,7 @@ mod tests {
     async fn omits_hashes_from_maximum_find_blocks_response() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let trace = test_trace(&guard, false);
+        let trace = LegacyPeerTrace::for_tests(&guard, false);
         let peer = test_peer();
         let hash_count = MAX_RECEIVED_BLOCK_HASHES;
         let hashes: Vec<_> = (0..hash_count)

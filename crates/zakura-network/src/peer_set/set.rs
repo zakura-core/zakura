@@ -138,7 +138,7 @@ use crate::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
             SecondRequestChoice,
         },
-        second_request::{second_request_reason, FirstBlockRequests},
+        second_request::second_request_reason,
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -318,9 +318,6 @@ where
     /// sooner. See [`crate::config::BlockSourceScoreConfig`].
     block_second_request: bool,
 
-    /// The recent first requests for gossiped blocks, which a second request is measured against.
-    first_block_requests: FirstBlockRequests<D::Key>,
-
     /// The network of this peer set.
     network: Network,
 }
@@ -430,7 +427,6 @@ where
             expose_peer_addresses: config.expose_peer_addresses,
             block_source_score: config.block_source_score.enabled,
             block_second_request: config.block_source_score.second_request,
-            first_block_requests: FirstBlockRequests::default(),
 
             network: config.network.clone(),
         }
@@ -1269,6 +1265,27 @@ where
         peer
     }
 
+    /// Hand one inventory request to a ready peer and return the client to the peer set.
+    /// For a racing block download this records the peer and dispatch time on that attempt.
+    fn dispatch_inventory(
+        &mut self,
+        peer: PeerSocketAddr,
+        mut svc: LoadTrackedClient,
+        req: Request,
+        attempt: Option<&crate::BlockHedge>,
+    ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
+        let response = match attempt {
+            Some(attempt) => {
+                attempt.dispatch_if_needed(Some(peer), svc.block_gossip.delivery_score(), || {
+                    svc.call(req)
+                })
+            }
+            None => Ok(svc.call(req)),
+        };
+        self.push_unready(peer, svc);
+        response
+    }
+
     /// Randomly chooses `max_peers` ready services, ignoring service load.
     ///
     /// The chosen peers are unique, but their order is not fully random.
@@ -1414,6 +1431,7 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
+        attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
         let advertising_peer_list = self
             .inventory_registry
@@ -1437,7 +1455,7 @@ where
             _ => (self.select_p2c_peer_from_list(&advertising_peer_list), None),
         };
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1455,16 +1473,10 @@ where
                 )),
                 _ => None,
             };
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
-            if let (true, InventoryHash::Block(block_hash)) = (self.block_second_request, hash) {
-                self.first_block_requests.insert(
-                    block_hash,
-                    peer,
-                    choice.and_then(|choice| choice.score),
-                    Instant::now(),
-                );
-            }
+            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref()) {
+                Ok(fut) => fut,
+                Err(error) => return async { Err(error) }.boxed(),
+            };
             if let Some((request_id, peer, hash, started, delivery_samples)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 let choice = choice.unwrap_or_default();
@@ -1531,7 +1543,7 @@ where
             self.select_p2c_peer_from_list(&maybe_peer_list)
         };
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1548,8 +1560,10 @@ where
                 )),
                 _ => None,
             };
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
+            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref()) {
+                Ok(fut) => fut,
+                Err(error) => return async { Err(error) }.boxed(),
+            };
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 return async move {
@@ -1626,11 +1640,11 @@ where
             return not_yet();
         }
 
-        let (first_peer, first_score) = match self.first_block_requests.get_mut(&hash) {
-            Some(first) if first.second_sent => return not_yet(),
-            Some(first) => (Some(first.peer), first.score),
-            None => (None, None),
+        let Some(first) = attempt.first_dispatch() else {
+            return not_yet();
         };
+        let first_peer = first.legacy_peer;
+        let first_score = first.score;
         let candidates: Vec<(D::Key, Option<Duration>)> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
@@ -1647,9 +1661,10 @@ where
             .min_by_key(|(_, score)| (score.is_none(), *score))
             .copied();
 
-        let Some(first_request_waited) = attempt.elapsed_if_open() else {
+        if attempt.elapsed_if_open().is_none() {
             return not_yet();
-        };
+        }
+        let first_request_waited = first.at.elapsed();
         let Some(reason) =
             second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
         else {
@@ -1666,9 +1681,6 @@ where
         let mut svc = self
             .take_ready_service(&peer)
             .expect("the selected candidate is still in the ready set");
-        if let Some(first) = self.first_block_requests.get_mut(&hash) {
-            first.second_sent = true;
-        }
 
         metrics::counter!("pool.route_inv.hedge.count", "reason" => reason.label()).increment(1);
         let choice = SecondRequestChoice {
@@ -2104,15 +2116,24 @@ where
                 if hashes.len() == 1 =>
             {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
             }
+            Request::BlockByHashPrimary {
+                hash,
+                source,
+                attempt,
+            } => self.route_inv(
+                Request::block_by_hash(hash, source),
+                InventoryHash::from(hash),
+                Some(attempt),
+            ),
             Request::BlockByHashHedge { hash, attempt } => self.route_block_hedge(hash, attempt),
             Request::TransactionsById(ref hashes)
             | Request::TransactionsByIdFrom {
                 ids: ref hashes, ..
             } if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
             }
 
             // Broadcast advertisements to lots of peers

@@ -1331,27 +1331,28 @@ where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
-    let request_hashes = std::iter::once(hash).collect();
-    let request = match download_source {
-        Some(source) => zn::Request::BlocksByHashFrom {
-            hashes: request_hashes,
-            source,
-        },
-        None => zn::Request::BlocksByHash(request_hashes),
-    };
-
     if !second_request {
+        let request = zn::Request::block_by_hash(hash, download_source);
         return requested_block(hash, network.oneshot(request).await);
     }
 
     let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
+    let primary = zn::Request::BlockByHashPrimary {
+        hash,
+        source: download_source,
+        attempt: attempt.clone(),
+    };
+    let validate = {
+        let attempt = attempt.clone();
+        move |result| requested_block(hash, result).inspect(|_| attempt.mark_satisfied())
+    };
     let mut first = network
         .clone()
-        .oneshot(request)
-        .map(move |result| requested_block(hash, result))
+        .oneshot(primary)
+        .map(validate.clone())
         .boxed();
     let mut second = request_block_again(network, hash, attempt.clone())
-        .map(move |result| requested_block(hash, result))
+        .map(validate)
         .boxed();
 
     tokio::select! {

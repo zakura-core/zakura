@@ -270,9 +270,9 @@ def note_legacy_download(seen, when, elapsed_ms, result, first_request_waited_ms
     arrived, until that arrival. A request that failed before then does not count; one that
     failed after it does, since it was still waiting.
 
-    With `[network.block_hedge]` a slow block gets a second request. Its row says how long the
-    first request had been waiting when it was sent (`first_request_waited_ms`), so when it wins,
-    its own row times the download from the first request. The first request's answer can come
+    With `[network.block_source_score] second_request`, a slow block can get a second request.
+    Its row gives the time from first to second dispatch (`first_request_waited_ms`), excluding
+    time spent queued before the first dispatch. The first request's answer can come
     later, fail, or come after this block's record was published; none of that changes the time.
     Rows are read in the order they were written, which is the order the requests finished.
     """

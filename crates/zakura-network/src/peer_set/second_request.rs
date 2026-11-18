@@ -6,16 +6,9 @@
 //! now, is clearly shorter than what is left of the first request's. Otherwise the second copy
 //! would only cost bandwidth, because a legacy block request cannot be cancelled.
 //!
-//! [`FirstBlockRequests`] remembers who each first request went to and how fast that peer was
-//! expected to answer, and [`second_request_reason`] applies the rule.
+//! The downloader shares the first dispatch with the peer set for each individual attempt.
 
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    time::{Duration, Instant},
-};
-
-use zakura_chain::block;
+use std::time::Duration;
 
 /// The least a candidate must be expected to beat the first request by, so that small errors
 /// in the expected answer times do not send second requests that lose.
@@ -31,13 +24,6 @@ const STALL_SLACK: Duration = Duration::from_millis(500);
 /// typical download from a far peer. Assuming nothing would let any measured announcer, however
 /// far, replace it.
 const UNSCORED_FIRST_SCORE: Duration = Duration::from_millis(250);
-
-/// How long a first request is remembered. Block downloads time out well before this.
-const FIRST_REQUEST_LIFETIME: Duration = Duration::from_secs(60);
-
-/// The most first requests remembered at once. The block downloader limits how many gossiped
-/// blocks it fetches at a time to far fewer.
-const MAX_FIRST_REQUESTS: usize = 64;
 
 /// Why a second request was sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,79 +87,6 @@ pub(super) fn second_request_reason(
     };
     let margin = MIN_MARGIN.max(first_score / MARGIN_SHARE);
     (candidate + margin < remaining).then_some(SecondRequestReason::Predicted)
-}
-
-/// A first request for a gossiped block.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct FirstBlockRequest<K> {
-    /// The peer it went to.
-    pub(super) peer: K,
-    /// That peer's expected answer time when it was asked, if measured.
-    pub(super) score: Option<Duration>,
-    /// When it was sent.
-    sent_at: Instant,
-    /// Whether a second request has already been sent for the same block.
-    pub(super) second_sent: bool,
-}
-
-/// The recent first requests for gossiped blocks, by block hash.
-#[derive(Debug)]
-pub(super) struct FirstBlockRequests<K> {
-    requests: HashMap<block::Hash, FirstBlockRequest<K>>,
-}
-
-impl<K> Default for FirstBlockRequests<K> {
-    fn default() -> Self {
-        Self {
-            requests: HashMap::new(),
-        }
-    }
-}
-
-impl<K: Copy + Eq + Hash> FirstBlockRequests<K> {
-    /// Remembers that `hash` was just requested from `peer`, replacing any earlier request for
-    /// the same block. Forgets requests older than [`FIRST_REQUEST_LIFETIME`], and the oldest
-    /// one if [`MAX_FIRST_REQUESTS`] are still remembered.
-    pub(super) fn insert(
-        &mut self,
-        hash: block::Hash,
-        peer: K,
-        score: Option<Duration>,
-        now: Instant,
-    ) {
-        self.requests.retain(|_, request| {
-            now.saturating_duration_since(request.sent_at) < FIRST_REQUEST_LIFETIME
-        });
-        if self.requests.len() >= MAX_FIRST_REQUESTS && !self.requests.contains_key(&hash) {
-            let oldest = self
-                .requests
-                .iter()
-                .min_by_key(|(_, request)| request.sent_at)
-                .map(|(hash, _)| *hash);
-            if let Some(oldest) = oldest {
-                self.requests.remove(&oldest);
-            }
-        }
-        self.requests.insert(
-            hash,
-            FirstBlockRequest {
-                peer,
-                score,
-                sent_at: now,
-                second_sent: false,
-            },
-        );
-    }
-
-    /// The first request for `hash`, if it is still remembered.
-    pub(super) fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut FirstBlockRequest<K>> {
-        self.requests.get_mut(hash)
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.requests.len()
-    }
 }
 
 #[cfg(test)]
@@ -273,34 +186,6 @@ mod tests {
         assert_eq!(
             second_request_reason(None, ms(750), None),
             Some(SecondRequestReason::Stalled)
-        );
-    }
-
-    #[test]
-    fn first_requests_are_forgotten_when_old_or_too_many() {
-        let start = Instant::now();
-        let hash = |n: u8| block::Hash([n; 32]);
-        let mut requests = FirstBlockRequests::default();
-
-        requests.insert(hash(0), 0u8, None, start);
-        requests.insert(hash(1), 1u8, None, start + FIRST_REQUEST_LIFETIME);
-        assert!(
-            requests.get_mut(&hash(0)).is_none(),
-            "a request older than its lifetime"
-        );
-
-        let later = start + FIRST_REQUEST_LIFETIME;
-        for n in 2..=(MAX_FIRST_REQUESTS as u8 + 1) {
-            requests.insert(hash(n), n, None, later + Duration::from_millis(n.into()));
-        }
-        assert_eq!(requests.len(), MAX_FIRST_REQUESTS);
-        assert!(
-            requests.get_mut(&hash(1)).is_none(),
-            "the oldest request makes room"
-        );
-        assert_eq!(
-            requests.get_mut(&hash(2)).map(|request| request.peer),
-            Some(2)
         );
     }
 }

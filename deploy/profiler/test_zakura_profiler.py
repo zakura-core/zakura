@@ -1072,9 +1072,10 @@ class TraceFollowingTests(unittest.TestCase):
 
     def test_a_hedged_block_s_download_is_timed_before_the_first_request_answers(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append("legacy_gossip", trace_row("block_inv_received", 100_000, hash=BLOCK_HASH))
         self.append(
             "legacy_peer_request",
-            # Asked at 0.6 s; the hedge went out at 0.65 s, when the first request had waited
+            # Announced at 0.1 s and dispatched at 0.6 s; the hedge went out at 0.65 s, when the first request had waited
             # 50 ms, and won at 0.67 s.
             trace_row("block_request_finish", 670_000, result="available", requested_hash=BLOCK_HASH,
                       returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
@@ -1093,6 +1094,7 @@ class TraceFollowingTests(unittest.TestCase):
         follower.poll()
 
         self.assertEqual(record["ms"]["body_download"], 70)
+        self.assertAlmostEqual(record["wall"]["asked"], blocks.process_started(NODE_RUN) + 0.6)
 
     def test_the_first_outside_announcer_is_named_from_its_connection_s_request_rows(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)

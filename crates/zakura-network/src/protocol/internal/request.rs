@@ -1,10 +1,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -34,7 +31,22 @@ fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
 #[derive(Clone, Debug)]
 pub struct BlockHedge {
     started: Instant,
-    closed: Arc<AtomicBool>,
+    state: Arc<Mutex<BlockDownloadState>>,
+}
+
+#[derive(Debug, Default)]
+struct BlockDownloadState {
+    first: Option<FirstDispatch>,
+    window_closed: bool,
+    satisfied: bool,
+}
+
+/// The first handoff of this download to a peer. Native peers have no legacy address or score.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FirstDispatch {
+    pub(crate) at: Instant,
+    pub(crate) legacy_peer: Option<PeerSocketAddr>,
+    pub(crate) score: Option<Duration>,
 }
 
 impl BlockHedge {
@@ -45,31 +57,75 @@ impl BlockHedge {
     pub fn new(started: Instant) -> Self {
         Self {
             started,
-            closed: Arc::new(AtomicBool::new(false)),
+            state: Arc::default(),
         }
     }
 
-    /// Close the window when the first request finishes. Returns whether dispatch already won
-    /// the claim, in which case the second request must be allowed to finish. Call once.
-    pub fn close(&self) -> bool {
-        self.closed.swap(true, Ordering::Relaxed)
+    fn state(&self) -> std::sync::MutexGuard<'_, BlockDownloadState> {
+        self.state
+            .lock()
+            .expect("block download state is never poisoned")
     }
 
-    /// Return how long the download has waited if a second request can still be dispatched.
+    /// Close the window when the first request finishes. Returns whether the second
+    /// request already claimed dispatch. Call once.
+    pub fn close(&self) -> bool {
+        let mut state = self.state();
+        std::mem::replace(&mut state.window_closed, true)
+    }
+
+    /// Return the age of the download while another request may still be dispatched.
     pub fn elapsed_if_open(&self) -> Option<Duration> {
-        let elapsed = self.started.elapsed();
-        (!self.closed.load(Ordering::Relaxed) && elapsed < Self::WINDOW).then_some(elapsed)
+        let state = self.state();
+        let age = self.started.elapsed();
+        (!state.window_closed && !state.satisfied && age < Self::WINDOW).then_some(age)
     }
 
     /// Claim dispatch at most once, unless completion or expiry has closed the window.
     pub fn claim_dispatch(&self) -> bool {
-        self.started.elapsed() < Self::WINDOW && !self.closed.swap(true, Ordering::Relaxed)
+        let mut state = self.state();
+        !state.satisfied
+            && self.started.elapsed() < Self::WINDOW
+            && !std::mem::replace(&mut state.window_closed, true)
+    }
+
+    /// Record that a reply contained the requested block. Already-dispatched exchanges can drain.
+    pub fn mark_satisfied(&self) {
+        self.state().satisfied = true;
+    }
+
+    pub(crate) fn is_satisfied(&self) -> bool {
+        self.state().satisfied
+    }
+
+    pub(crate) fn first_dispatch(&self) -> Option<FirstDispatch> {
+        self.state().first
+    }
+
+    /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
+    /// The closure only enqueues work in a ready service or reserved channel slot.
+    pub(crate) fn dispatch_if_needed<T>(
+        &self,
+        peer: Option<PeerSocketAddr>,
+        score: Option<Duration>,
+        dispatch: impl FnOnce() -> T,
+    ) -> Result<T, crate::BoxError> {
+        let mut state = self.state();
+        if state.satisfied {
+            return Err("block already delivered".into());
+        }
+        state.first.get_or_insert_with(|| FirstDispatch {
+            at: Instant::now(),
+            legacy_peer: peer,
+            score,
+        });
+        Ok(dispatch())
     }
 }
 
 impl PartialEq for BlockHedge {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.closed, &other.closed)
+        Arc::ptr_eq(&self.state, &other.state)
     }
 }
 
@@ -209,6 +265,20 @@ pub enum Request {
         hashes: IndexSet<block::Hash>,
         /// Peer that advertised the inventory.
         source: PeerSource,
+    },
+
+    /// First request for an advertised block with a shared second-request window.
+    BlockByHashPrimary {
+        /// The block to request.
+        hash: block::Hash,
+        /// Preferred source when known.
+        source: Option<PeerSource>,
+        /// Shared with the downloader and the optional second request.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(value = "BlockHedge::new(Instant::now())")
+        )]
+        attempt: BlockHedge,
     },
 
     /// Request one block a legacy peer announced, as a second request while a first request for
@@ -444,6 +514,7 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::BlockByHashPrimary { .. } => "BlockByHashPrimary".to_string(),
             Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
@@ -485,6 +556,7 @@ impl Request {
 
             Request::BlocksByHash(_)
             | Request::BlocksByHashFrom { .. }
+            | Request::BlockByHashPrimary { .. }
             | Request::BlockByHashHedge { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
@@ -510,6 +582,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::BlockByHashPrimary { .. }
                 | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
@@ -524,7 +597,9 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
-            Request::BlockByHashHedge { hash, .. } => HashSet::from([*hash]),
+            Request::BlockByHashPrimary { hash, .. } | Request::BlockByHashHedge { hash, .. } => {
+                HashSet::from([*hash])
+            }
             _ => HashSet::new(),
         }
     }
@@ -541,11 +616,21 @@ impl Request {
         }
     }
 
+    /// Ordinary single-block inventory sent to a peer once a route is selected.
+    pub fn block_by_hash(hash: block::Hash, source: Option<PeerSource>) -> Self {
+        let hashes = std::iter::once(hash).collect();
+        match source {
+            Some(source) => Self::BlocksByHashFrom { hashes, source },
+            None => Self::BlocksByHash(hashes),
+        }
+    }
+
     /// Returns the source attached to a source-aware inventory request.
     pub fn inventory_source(&self) -> Option<PeerSource> {
         match self {
             Request::BlocksByHashFrom { source, .. }
             | Request::TransactionsByIdFrom { source, .. } => Some(source.clone()),
+            Request::BlockByHashPrimary { source, .. } => source.clone(),
             _ => None,
         }
     }

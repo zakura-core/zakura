@@ -366,3 +366,94 @@ async fn two_failed_replies_preserve_the_first_peers_hash_error() {
         assert_eq!(source, Some(first_peer()));
     }
 }
+
+/// Drive the downloader through a buffered dual-stack router. Wait for its original
+/// composite request to finish before counting what the native peer actually received.
+#[tokio::test]
+async fn native_fallback_only_runs_while_the_download_needs_a_body() -> Result<(), BoxError> {
+    use zn::zakura::{
+        testkit::{ZakuraTestNode, TEST_NET_TIMEOUT},
+        LegacyGossipSink,
+    };
+    let (observed, mut native_requests) = mpsc::unbounded_channel();
+    let native = ZakuraTestNode::builder(2191)
+        .service_from_supervisor(move |supervisor| {
+            Arc::new(LegacyGossipSink::spawn(
+                service_fn(move |req: zn::Request| {
+                    observed.send(req).unwrap();
+                    std::future::ready(Ok::<_, BoxError>(from_first()))
+                }),
+                supervisor,
+            ))
+        })
+        .spawn()
+        .await?;
+    let node = ZakuraTestNode::builder(2192).spawn().await?;
+    node.connect_native(&native, TEST_NET_TIMEOUT).await?;
+
+    for outcome in ["fallback needed", "missing", "error", "timeout"] {
+        let (legacy, mut requests) = network();
+        let composite = node.dual_stack_inventory(legacy);
+        let (finished, mut completions) = mpsc::unbounded_channel();
+        let service = service_fn(move |req| {
+            let primary = !matches!(req, zn::Request::BlockByHashHedge { .. });
+            let response = composite.clone().oneshot(req);
+            let finished = finished.clone();
+            async move {
+                let result = response.await;
+                if primary {
+                    finished.send(()).unwrap();
+                }
+                result
+            }
+        });
+        let buffered = tower::buffer::Buffer::new(service, 4);
+        let download = tokio::spawn(download_block(buffered, hash(), None, true));
+        let first = tokio::time::timeout(TEST_NET_TIMEOUT, requests.recv())
+            .await?
+            .unwrap();
+        let mut download = Some(download);
+        if outcome != "fallback needed" {
+            let later = tokio::time::timeout(TEST_NET_TIMEOUT, requests.recv())
+                .await?
+                .unwrap();
+            let zn::Request::BlockByHashHedge { ref attempt, .. } = later.request else {
+                panic!("expected a second request");
+            };
+            assert!(attempt.claim_dispatch());
+            later.answer.send(Ok(from_second())).unwrap();
+            let result = tokio::time::timeout(TEST_NET_TIMEOUT, download.take().unwrap())
+                .await??
+                .map_err(|(error, _)| error)?;
+            assert_copy(result, second_peer());
+        }
+        match outcome {
+            "error" => first.answer.send(Err("peer disconnected".into())).unwrap(),
+            "timeout" => {}
+            _ => first
+                .answer
+                .send(Ok(zn::Response::Blocks(vec![
+                    zn::InventoryResponse::Missing(hash()),
+                ])))
+                .unwrap(),
+        }
+        if let Some(download) = download {
+            let (body, _) = tokio::time::timeout(TEST_NET_TIMEOUT, download)
+                .await??
+                .map_err(|(error, _)| error)?;
+            assert_eq!(body.hash(), hash());
+        }
+        tokio::time::timeout(TEST_NET_TIMEOUT, completions.recv())
+            .await?
+            .unwrap();
+        assert_eq!(
+            native_requests.try_recv().is_ok(),
+            outcome == "fallback needed",
+            "{outcome}"
+        );
+        assert!(native_requests.try_recv().is_err());
+    }
+    node.shutdown().await;
+    native.shutdown().await;
+    Ok(())
+}

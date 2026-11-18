@@ -117,9 +117,9 @@ fn advancing_the_floor_discards_reset_history_without_a_late_receipt() {
         extend(&mut state, authority(0), &[(raw, 100)]);
         let request = take(&mut state, raw, raw, 7, u64::from(raw));
         publish(&mut state, &request);
-        state.reset_above(height(raw - 1));
+        assert_eq!(state.reset_above(height(raw - 1)).released_bytes, 100);
         assert!(state.was_reset_withdrawn(7, height(raw), hash(raw)));
-        state.advance_floor(height(raw));
+        assert_eq!(state.advance_floor(height(raw)).released_bytes, 0);
         assert!(state.reset_withdrawn.is_empty());
     }
 }

@@ -52,6 +52,11 @@ COMPARISONS = (
 # Below this, run-to-run noise dominates and a delta is not worth flagging.
 NOISE_FLOOR_PCT = 10.0
 
+# Spreads measured by polling. A change smaller than the coarser leg's
+# sampling resolution (the monitor's median gap between two samples of one
+# node) is below what either leg can see, so it is no change.
+POLLED_SPREADS = {("propagation", "spread_p50_secs"), ("propagation", "spread_p95_secs")}
+
 
 def dig(data: dict, path: tuple[str, ...]):
     for key in path:
@@ -111,18 +116,32 @@ def fmt_delta(delta_pct: float | None) -> str:
 
 
 def build_rows(baseline: dict, target: dict) -> list[dict]:
+    """One row per comparison, with its delta and verdict. See `POLLED_SPREADS`."""
+    resolutions = [
+        value
+        for value in (dig(leg, ("propagation", "resolution_secs")) for leg in (baseline, target))
+        if isinstance(value, (int, float))
+    ]
+    resolution = max(resolutions, default=0.0)
     rows = []
     for label, path, lower_is_better, hint in COMPARISONS:
         base_value = dig(baseline, path)
         target_value = dig(target, path)
         delta = pct_delta(base_value, target_value)
+        verdict = classify(delta, lower_is_better, base_value, target_value)
+        if (
+            path in POLLED_SPREADS
+            and verdict in ("WORSE", "better")
+            and abs(target_value - base_value) < resolution
+        ):
+            verdict = "="
         rows.append(
             {
                 "metric": label,
                 "baseline": base_value,
                 "target": target_value,
                 "delta_pct": delta,
-                "verdict": classify(delta, lower_is_better, base_value, target_value),
+                "verdict": verdict,
                 "hint": hint,
             }
         )

@@ -1193,6 +1193,17 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.row_for(rows, "Reject rate")["verdict"], "WORSE")
         self.assertEqual(compare.gate(baseline, target, rows)[0], "inconclusive")
 
+    def test_a_spread_change_below_the_resolution_is_no_change(self):
+        baseline = self.leg(propagation={"spread_p95_secs": 0.010, "resolution_secs": 1.1})
+        target = self.leg(propagation={"spread_p95_secs": 0.012, "resolution_secs": 1.1})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "=")
+        self.assertEqual(compare.gate(baseline, target, rows), ("pass", []))
+        # A change past the resolution still counts.
+        target = self.leg(propagation={"spread_p95_secs": 3.0, "resolution_secs": 1.1})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "WORSE")
+
     def test_a_shallower_peak_alone_does_not_fail(self):
         target = self.leg()
         target["peak_mempool_txs"] = target["peak_mempool_txs"] * 8 // 10

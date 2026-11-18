@@ -395,6 +395,20 @@ def port_owner(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def wait_for_listener(
+    host: str, port: int, proc: subprocess.Popen, timeout_secs: int = RPC_READY_TIMEOUT_SECS
+) -> bool:
+    """Wait for our node `proc` to listen on host:port, failing fast if it exits."""
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if port_owner(host, port):
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def assert_ports_free(node_count: int) -> None:
     """Refuse to start if any port the lab needs is already taken.
 
@@ -514,6 +528,11 @@ def cmd_up(args) -> int:
         # Recorded after each spawn, not once at the end: if a later spawn
         # raises, the nodes already started must still be visible to `down`.
         write_pidfile(lab, procs)
+        # Node i+1 dials only node i. A refused dial isn't retried for about two
+        # minutes, so one node starting 2 ms early cut the chain in 9 of 21 runs.
+        if not wait_for_listener(node_ip(i), P2P_PORT, procs[node_name(i)]):
+            print(f"{node_name(i)} never opened its P2P listener", file=sys.stderr)
+            return 1
 
     failed = []
     for i in range(args.node_count):

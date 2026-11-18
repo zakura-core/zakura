@@ -1704,8 +1704,13 @@ static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
+    /// Each peer's current registration generation.
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     ip_slots: IpSlots,
+    /// The [`admission_host`] each live registration charged in `ip_slots`.
+    /// A replaced registration keeps its charge until its own cleanup
+    /// deregisters it, because its connection still runs until then.
+    ip_charges: HashMap<ZakuraConnId, IpAddr>,
     next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
     next_registration_id: ZakuraConnId,
@@ -1719,26 +1724,32 @@ struct ZakuraPeerConnectionEntry {
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
     registered_at: Instant,
-    /// The [`admission_host`] this connection is charged to, if its IP is
-    /// known.
-    host: Option<IpAddr>,
 }
 
 impl ZakuraSupervisorState {
-    fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
-        if let Some(remote_ip) = remote_ip {
-            self.ip_slots.add_registered(remote_ip);
+    /// The [`admission_host`] that `conn_id` is charged to, if its IP is known.
+    fn host(&self, conn_id: ZakuraConnId) -> Option<IpAddr> {
+        self.ip_charges.get(&conn_id).copied()
+    }
+
+    /// Charges registration `conn_id` to `host` until [`Self::release_ip`].
+    fn charge_ip(&mut self, conn_id: ZakuraConnId, host: Option<IpAddr>) {
+        if let Some(host) = host {
+            self.ip_charges.insert(conn_id, host);
+            self.ip_slots.add_registered(host);
         }
     }
 
-    fn decrement_ip(&mut self, remote_ip: Option<IpAddr>) {
-        if let Some(remote_ip) = remote_ip {
-            self.ip_slots.remove_registered(remote_ip);
+    /// Returns the per-IP charge of registration `conn_id`, whether or not it
+    /// is still its peer's current generation. A second call releases nothing.
+    fn release_ip(&mut self, conn_id: ZakuraConnId) {
+        if let Some(host) = self.ip_charges.remove(&conn_id) {
+            self.ip_slots.remove_registered(host);
         }
     }
 
-    /// Checks that the per-IP registered totals match the active peer
-    /// registrations with known IPs, in debug builds.
+    /// Checks, in debug builds, that the per-IP registered totals match the
+    /// live registrations with known IPs.
     ///
     /// Simulator builds skip it. Its `IpSlots` lock is a scheduler point
     /// there, so a debug-only lock would give debug and release builds
@@ -1747,11 +1758,8 @@ impl ZakuraSupervisorState {
     fn debug_assert_accounting(&self) {
         debug_assert_eq!(
             self.ip_slots.registered_total(),
-            self.active_by_peer
-                .values()
-                .filter(|entry| entry.host.is_some())
-                .count(),
-            "Zakura per-IP registered totals must match active peer registrations with known IPs",
+            self.ip_charges.len(),
+            "Zakura per-IP registered totals must match live registrations with known IPs",
         );
     }
 
@@ -1916,6 +1924,7 @@ impl ZakuraSupervisorHandle {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 ip_slots: ip_slots.clone(),
+                ip_charges: HashMap::new(),
                 next_handoff_id: 1,
                 max_connections_per_ip,
                 next_registration_id: 1,
@@ -2102,7 +2111,7 @@ impl ZakuraSupervisorHandle {
         let same_ip_duplicate_redial = state
             .active_by_peer
             .get(&peer_id)
-            .is_some_and(|entry| entry.host == host);
+            .is_some_and(|entry| state.host(entry.conn_id) == host);
         if let Some(host) = host {
             if !state.ip_slots.counts().can_register(
                 host,
@@ -2134,14 +2143,15 @@ impl ZakuraSupervisorHandle {
                     outbound_handle,
                     disconnect_token,
                     registered_at: Instant::now(),
-                    host,
                 };
+                // The replaced registration keeps its per-IP charge until its
+                // own cleanup guard deregisters it, because its connection
+                // still runs until then.
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
-                    state.decrement_ip(old_entry.host);
                     old_entry.disconnect_token.cancel();
                     metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
-                state.increment_ip(host);
+                state.charge_ip(conn_id, host);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
@@ -2201,21 +2211,20 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Releases registration `conn_id`'s per-IP charge, and removes it from
+    /// `peer_id`'s current generation if it still is that generation.
     async fn deregister(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let mut state = self.inner.lock().await;
-        let Some(entry) = state.active_by_peer.get(peer_id) else {
-            state.debug_assert_accounting();
-            return;
-        };
-        if entry.conn_id != conn_id {
+        state.release_ip(conn_id);
+        if state
+            .active_by_peer
+            .get(peer_id)
+            .is_none_or(|entry| entry.conn_id != conn_id)
+        {
             state.debug_assert_accounting();
             return;
         }
-        let entry = state
-            .active_by_peer
-            .remove(peer_id)
-            .expect("peer entry exists because it was just checked");
-        state.decrement_ip(entry.host);
+        state.active_by_peer.remove(peer_id);
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
@@ -2272,6 +2281,10 @@ enum ZakuraRegistration {
     Rejected(ZakuraRejectReason),
 }
 
+/// Ends one registration when its connection ends: it cancels the connection,
+/// removes its service admissions and deregisters it. Deregistration returns
+/// the registration's per-IP charge even after a replacement took its peer's
+/// current generation.
 #[derive(Debug)]
 struct RegisteredPeerCleanupGuard {
     supervisor: ZakuraSupervisorHandle,
@@ -8632,6 +8645,7 @@ mod tests {
     mod handshake_cost;
     mod quic_progress;
     mod read_close_cause;
+    mod teardown;
     mod transport_observer;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;
@@ -9464,7 +9478,7 @@ mod tests {
                 .get(&peer)
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
-            assert_eq!(entry.host, Some(remote_ip));
+            assert_eq!(state.host(entry.conn_id), Some(remote_ip));
             assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }

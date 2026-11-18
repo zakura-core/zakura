@@ -674,6 +674,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery_service::DiscoveryComposed>(),
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
+    entry::<sync_wire::SyncComposed>(),
 ];
 
 /// The harness named `name`.

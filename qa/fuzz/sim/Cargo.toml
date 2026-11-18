@@ -24,6 +24,7 @@ block_reactor_policy = "block/reactor-policy"
 header_publisher_policy = "header/publisher-policy"
 sync_storage = "sync/storage"
 sync_wire = "sync/wire"
+sync_composed = "sync/composed"
 handshake_wire = "handshake/wire"
 handshake_counts = "handshake/counts"
 block_sync_storage = "block-sync/storage"
@@ -164,6 +165,13 @@ bench = false
 [[bin]]
 name = "sync_wire"
 path = "fuzz_targets/sync_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_composed"
+path = "fuzz_targets/sync_composed.rs"
 test = false
 doc = false
 bench = false

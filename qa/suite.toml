@@ -341,6 +341,17 @@ smoke-secs = 60
 args = ["-len_control=0"]
 timeout-secs = 1800
 
+# `sync/composed` runs `sync/wire`'s node and mirrors with the topology,
+# chain, closes, growths, reorgs, block holds and teardown its 27-byte
+# prefix composes, so the target fuzzes how many of each a run takes and in
+# what order.
+[[target]]
+package = "sim"
+name = "sync_composed"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
 # `block-sync/storage`'s two-byte prefix picks a saved scenario or the
 # default one. A generated run takes about 96 s and needs about 7 GB, so the
 # row raises the RSS limit to 8 GiB, and its smoke and scheduled campaign run

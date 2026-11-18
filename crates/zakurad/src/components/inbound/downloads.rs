@@ -4,10 +4,7 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -861,72 +858,14 @@ where
 /// block sooner than the first request.
 const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How long after the first request a block download keeps asking. Later, a block that has not
-/// arrived waits for the first request alone, as without second requests.
-const SECOND_REQUEST_CHECK_WINDOW: Duration = Duration::from_secs(5);
-
-/// Sends `request` for the block `hash` and returns the first successful response.
-///
-/// With `second_request`, it also asks the peer set every [`SECOND_REQUEST_CHECK_INTERVAL`]
-/// whether another peer that announced the block should deliver it sooner, and if so the peer
-/// set sends that peer a second request. At most one second request is sent. Whichever request
-/// loses keeps running in its own task until the peer answers or the network service times it
-/// out, so the peer set's trace records both download times; its response is discarded.
-async fn request_block<ZN>(
-    network: ZN,
-    request: zn::Request,
-    hash: block::Hash,
-    second_request: bool,
-) -> Result<zn::Response, BoxError>
-where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
-{
-    if !second_request {
-        return network.oneshot(request).await;
-    }
-
-    let first_sent = tokio::time::Instant::now();
-    let stop_checking = Arc::new(AtomicBool::new(false));
-    let mut first = network.clone().oneshot(request).boxed();
-    let mut second = request_block_again(network, hash, first_sent, stop_checking.clone()).boxed();
-
-    tokio::select! {
-        biased;
-        result = &mut first => {
-            // A second request that was sent is still awaited or kept running, but no new one
-            // is sent: the block is here, or a block the first peer failed to deliver is left to
-            // later announcements, as without second requests.
-            stop_checking.store(true, Ordering::Relaxed);
-            match result {
-                Ok(response) => {
-                    tokio::spawn(second);
-                    Ok(response)
-                }
-                Err(first_error) => second.await.map_err(|_| first_error),
-            }
-        }
-        result = &mut second => match result {
-            Ok(response) => {
-                metrics::counter!("gossip.hedge.won.count").increment(1);
-                tokio::spawn(first);
-                Ok(response)
-            }
-            Err(_) => first.await,
-        },
-    }
-}
-
 /// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
 /// until it sends one, and returns that request's result.
 ///
-/// Fails with [`zn::NoFasterBlockSource`] without a request sent once `stop_checking` is set or
-/// [`SECOND_REQUEST_CHECK_WINDOW`] has passed since `first_sent`.
+/// Returns [`zn::NoFasterBlockSource`] once the dispatch window closes without a second request.
 async fn request_block_again<ZN>(
     network: ZN,
     hash: block::Hash,
-    first_sent: tokio::time::Instant,
-    stop_checking: Arc<AtomicBool>,
+    attempt: zn::BlockHedge,
 ) -> Result<zn::Response, BoxError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -934,16 +873,14 @@ where
 {
     loop {
         tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
-        if stop_checking.load(Ordering::Relaxed)
-            || first_sent.elapsed() >= SECOND_REQUEST_CHECK_WINDOW
-        {
+        if attempt.elapsed_if_open().is_none() {
             return Err(zn::NoFasterBlockSource.into());
         }
         let result = network
             .clone()
             .oneshot(zn::Request::BlockByHashHedge {
                 hash,
-                first_request_waited: first_sent.elapsed(),
+                attempt: attempt.clone(),
             })
             .await;
         match result {
@@ -1112,7 +1049,11 @@ where
                     (block, pusher_addr)
                 }
                 None => {
-                    download_block(network, hash, download_source.clone(), second_request).await?
+                    let downloaded =
+                        download_block(network, hash, download_source.clone(), second_request)
+                            .await?;
+                    metrics::counter!("gossip.downloaded.block.count").increment(1);
+                    downloaded
                 }
             };
 
@@ -1375,7 +1316,8 @@ where
 /// Downloads the block `hash` from `download_source`, or from any peer without a source.
 ///
 /// With `second_request`, another peer that announced the block may also be asked while the first
-/// request is outstanding (see [`request_block`]).
+/// request is outstanding. Only a reply carrying the requested block wins. An already-sent
+/// request can finish even after the other peer delivers the block.
 ///
 /// Returns the block and the address of the peer that sent it. Fails unless the peer sends
 /// exactly the block `hash`.
@@ -1398,36 +1340,75 @@ where
         None => zn::Request::BlocksByHash(request_hashes),
     };
 
-    let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-        request_block(network, request, hash, second_request)
-            .await
-            .map_err(|e| (e, None))?
-    {
-        // A peer must answer a single-hash block request with exactly one
-        // block entry. A malformed or empty response is a peer fault (e.g.
-        // a Zakura peer that tore its connection down mid-response), not a
-        // local invariant, so fail the download gracefully rather than
-        // panicking the task.
-        if blocks.len() != 1 {
-            return Err((
-                format!(
-                    "wrong number of blocks in response to a single hash: got {}",
-                    blocks.len()
-                )
-                .into(),
-                None,
-            ));
-        }
+    if !second_request {
+        return requested_block(hash, network.oneshot(request).await);
+    }
 
-        let Some(available) = blocks.first().expect("just checked length").available() else {
-            return Err((
-                "unexpected missing block status: single block failures should be errors".into(),
-                None,
-            ));
-        };
-        available
-    } else {
-        unreachable!("wrong response to block request");
+    let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
+    let mut first = network
+        .clone()
+        .oneshot(request)
+        .map(move |result| requested_block(hash, result))
+        .boxed();
+    let mut second = request_block_again(network, hash, attempt.clone())
+        .map(move |result| requested_block(hash, result))
+        .boxed();
+
+    tokio::select! {
+        biased;
+        result = &mut first => {
+            // A queued check can be dropped. A dispatched request can still supply or
+            // finish transferring the block.
+            if !attempt.close() {
+                return result;
+            }
+            match result {
+                Ok(response) => {
+                    tokio::spawn(second);
+                    Ok(response)
+                }
+                Err(first_error) => {
+                    let block = second.await.map_err(|_| first_error)?;
+                    metrics::counter!("gossip.hedge.won.count").increment(1);
+                    Ok(block)
+                }
+            }
+        }
+        result = &mut second => match result {
+            Ok(response) => {
+                metrics::counter!("gossip.hedge.won.count").increment(1);
+                tokio::spawn(first);
+                Ok(response)
+            }
+            Err(_) => first.await,
+        },
+    }
+}
+
+/// Extracts the one requested block before a response can win the download race. A wrong hash
+/// retains the supplying peer's address so the caller can attribute the error.
+fn requested_block(
+    hash: block::Hash,
+    result: Result<zn::Response, BoxError>,
+) -> Result<(BlockHandle, Option<PeerSocketAddr>), (BoxError, Option<PeerSocketAddr>)> {
+    let zn::Response::Blocks(blocks) = result.map_err(|e| (e, None))? else {
+        return Err(("wrong response to block request".into(), None));
+    };
+    let [entry] = blocks.as_slice() else {
+        return Err((
+            format!(
+                "wrong number of blocks in response to a single hash: got {}",
+                blocks.len()
+            )
+            .into(),
+            None,
+        ));
+    };
+    let Some((block, advertiser_addr)) = entry.available() else {
+        return Err((
+            format!("peer reported requested block {hash} missing").into(),
+            None,
+        ));
     };
 
     // Bind the delivered block to the hash we requested. A peer that
@@ -1445,7 +1426,6 @@ where
             advertiser_addr,
         ));
     }
-    metrics::counter!("gossip.downloaded.block.count").increment(1);
     Ok((block, advertiser_addr))
 }
 

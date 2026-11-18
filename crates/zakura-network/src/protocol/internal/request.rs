@@ -1,4 +1,14 @@
-use std::{collections::HashSet, fmt, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use tokio::time::Instant;
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -19,6 +29,51 @@ use proptest_derive::Arbitrary;
 fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
     vec(any::<block::Hash>(), 0..100).prop_map(|hashes| hashes.into_iter().collect())
 }
+
+/// The lifetime of a possible second block request, shared by the downloader and peer set.
+#[derive(Clone, Debug)]
+pub struct BlockHedge {
+    started: Instant,
+    closed: Arc<AtomicBool>,
+}
+
+impl BlockHedge {
+    /// How long after starting a download the peer set may dispatch a second request.
+    pub const WINDOW: Duration = Duration::from_secs(5);
+
+    /// Open a second-request window for the download started at `started`.
+    pub fn new(started: Instant) -> Self {
+        Self {
+            started,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Close the window when the first request finishes. Returns whether dispatch already won
+    /// the claim, in which case the second request must be allowed to finish. Call once.
+    pub fn close(&self) -> bool {
+        self.closed.swap(true, Ordering::Relaxed)
+    }
+
+    /// Return how long the download has waited if a second request can still be dispatched.
+    pub fn elapsed_if_open(&self) -> Option<Duration> {
+        let elapsed = self.started.elapsed();
+        (!self.closed.load(Ordering::Relaxed) && elapsed < Self::WINDOW).then_some(elapsed)
+    }
+
+    /// Claim dispatch at most once, unless completion or expiry has closed the window.
+    pub fn claim_dispatch(&self) -> bool {
+        self.started.elapsed() < Self::WINDOW && !self.closed.swap(true, Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for BlockHedge {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.closed, &other.closed)
+    }
+}
+
+impl Eq for BlockHedge {}
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -174,11 +229,12 @@ pub enum Request {
     BlockByHashHedge {
         /// The block to request.
         hash: block::Hash,
-        /// How long the first request had been waiting for an answer when this one was sent, or
-        /// zero when the first request had already failed. The legacy peer trace writes it with
-        /// this request's own time, so a download this request wins is timed from the first
-        /// request without waiting for the first request's answer.
-        first_request_waited: Duration,
+        /// Shared dispatch window, checked by the peer set after any queue wait.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(value = "BlockHedge::new(Instant::now())")
+        )]
+        attempt: BlockHedge,
     },
 
     /// Request transactions by their unmined transaction ID.

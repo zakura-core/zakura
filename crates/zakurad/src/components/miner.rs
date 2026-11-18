@@ -60,14 +60,23 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
-/// Returns `true` if `new_header` should replace the internal miner's current
-/// block template.
+/// Returns `true` if `new` should replace the internal miner's current block template.
+///
+/// A mempool-only update (`submit_old` is `true`) keeps the current work, except when that work
+/// holds only its coinbase and the update brings transactions. The first template after a new
+/// tip is often coinbase-only, so keeping it would mine an empty block on every tip.
 fn should_replace_mining_template(
-    current_header: Option<block::Header>,
-    new_header: block::Header,
+    current: Option<&Block>,
+    new: &Block,
     submit_old: Option<bool>,
 ) -> bool {
-    current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
+    let Some(current) = current else {
+        return true;
+    };
+    if current.header == new.header {
+        return false;
+    }
+    submit_old != Some(true) || (current.transactions.len() == 1 && new.transactions.len() > 1)
 }
 
 /// Cancels mining when the current template changes or becomes unavailable.
@@ -339,11 +348,7 @@ where
         // Mempool-only updates set `submit_old` to true, so cancelling for them
         // would discard useful solver work.
         let template_replaced = template_sender.send_if_modified(|old_block| {
-            if !should_replace_mining_template(
-                old_block.as_ref().map(|block| *block.header),
-                *block.header,
-                submit_old,
-            ) {
+            if !should_replace_mining_template(old_block.as_deref(), &block, submit_old) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
@@ -608,35 +613,64 @@ mod tests {
 
     use super::*;
 
+    /// Returns mainnet block 1, which holds only its coinbase, with its header's `nonce` byte 0
+    /// set to `nonce`, so each call can make a distinct header.
+    fn coinbase_only_block(nonce: u8) -> Block {
+        let mut block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block 1 deserializes");
+        Arc::make_mut(&mut block.header).nonce.0[0] = nonce;
+        block
+    }
+
     #[test]
     fn mining_template_updates_respect_submit_old() {
-        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into::<Arc<Block>>()
-            .expect("block 1 deserializes");
-        let current_header = *block.header;
-        let mut changed_header = current_header;
-        changed_header.nonce.0[0] ^= 1;
+        let current = coinbase_only_block(0);
+        let changed = coinbase_only_block(1);
 
-        assert!(should_replace_mining_template(None, current_header, None));
+        assert!(should_replace_mining_template(None, &current, None));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            current_header,
+            Some(&current),
+            &current,
             Some(false),
         ));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             Some(true),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             Some(false),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             None,
+        ));
+    }
+
+    /// A mempool-only update replaces coinbase-only work once it brings transactions, but keeps
+    /// work that already has them.
+    #[test]
+    fn mempool_update_replaces_coinbase_only_work() {
+        let empty = coinbase_only_block(0);
+        let mut filled = coinbase_only_block(1);
+        filled.transactions.push(filled.transactions[0].clone());
+        let mut more = coinbase_only_block(2);
+        more.transactions = filled.transactions.clone();
+        more.transactions.push(filled.transactions[0].clone());
+
+        assert!(should_replace_mining_template(
+            Some(&empty),
+            &filled,
+            Some(true),
+        ));
+        assert!(!should_replace_mining_template(
+            Some(&filled),
+            &more,
+            Some(true),
         ));
     }
 
@@ -645,22 +679,20 @@ mod tests {
     fn mining_template_replaces_harder_work_at_testnet_switch() {
         use zakura_chain::work::difficulty::ParameterDifficulty;
 
-        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into::<Arc<Block>>()
-            .expect("block 1 deserializes");
-        let mut standard = *block.header;
         let limit = Network::new_default_testnet().target_difficulty_limit();
-        standard.difficulty_threshold = (limit / 4_u32).to_compact();
-        let mut minimum = standard;
-        minimum.time += chrono::Duration::seconds(1);
-        minimum.difficulty_threshold = limit.to_compact();
+        let mut standard = coinbase_only_block(0);
+        Arc::make_mut(&mut standard.header).difficulty_threshold = (limit / 4_u32).to_compact();
+        let mut minimum = standard.clone();
+        let minimum_header = Arc::make_mut(&mut minimum.header);
+        minimum_header.time += chrono::Duration::seconds(1);
+        minimum_header.difficulty_threshold = limit.to_compact();
 
         // The GBT time-range change sets submitold=false on the same parent.
         // It must replace the harder header even though that fixed header would
         // still be valid to submit.
         assert!(should_replace_mining_template(
-            Some(standard),
-            minimum,
+            Some(&standard),
+            &minimum,
             Some(false),
         ));
     }

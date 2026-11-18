@@ -967,7 +967,7 @@ fn sixteen_failed_redialers_fit_the_handshake_cadence() {
         let mut next = None;
         for dialer in &mut dialers {
             assert_eq!(
-                counts.admit_cadence(host, cap, 1, now),
+                counts.admit_cadence(host, true, cap, 1, now),
                 HandshakeCadenceAdmission::Admit
             );
             let RedialNext::RetryAfter(delay) = dialer.record(DialResult::Failed) else {

@@ -3238,14 +3238,14 @@ impl ZakuraProtocolHandler {
 
     /// Returns an inbound attempt's cadence token. `action` names the reason in
     /// the sim's cadence observation.
-    fn refund_cadence(&self, remote: SocketAddr, action: &'static str) {
+    fn refund_cadence(&self, remote: SocketAddr, validated: bool, action: &'static str) {
         let mut counts = self.supervisor.ip_slots.counts();
-        counts.refund_cadence(remote.ip(), Instant::now());
+        counts.refund_cadence(remote.ip(), validated, Instant::now());
         #[cfg(any(test, zakura_sim))]
-        let hosts = counts.cadence_hosts();
+        let hosts = counts.cadence_hosts(validated);
         drop(counts);
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(remote, action, false, hosts);
+        self.observe_handshake_cadence(remote, validated, action, false, hosts);
         #[cfg(not(any(test, zakura_sim)))]
         let _ = action;
     }
@@ -3257,6 +3257,7 @@ impl ZakuraProtocolHandler {
     fn observe_handshake_cadence(
         &self,
         remote: SocketAddr,
+        validated: bool,
         action: &'static str,
         fresh: bool,
         hosts: usize,
@@ -3266,6 +3267,7 @@ impl ZakuraProtocolHandler {
             self.transport_observer,
             super::TransportEvent::HandshakeCadence {
                 remote,
+                validated,
                 action,
                 fresh,
                 capacity: cadence.capacity,
@@ -4841,7 +4843,11 @@ impl ZakuraProtocolHandler {
         if matches!(registration, ZakuraRegistration::Registered { .. })
             && context.direction == ServicePeerDirection::Inbound
         {
-            self.refund_cadence(connection.admitted_addr(), "registered");
+            self.refund_cadence(
+                connection.admitted_addr(),
+                connection.source_validated(),
+                "registered",
+            );
         }
         if let ZakuraRegistration::Registered {
             conn_id,
@@ -5051,10 +5057,15 @@ impl Acceptor for ZakuraProtocolHandler {
                 "zakura.p2p.conn.rejected.pending_handshake",
             );
         }
+        // Each source validation state has its own ledger, so a spoofed
+        // Initial, which is never validated, can't take a validated source's
+        // tokens. An unvalidated source that runs out gets a stateless Retry
+        // below, which an honest peer answers with a validated Initial.
         #[cfg(any(test, zakura_sim))]
-        let fresh = !counts.has_cadence_host(incoming.remote.ip());
+        let fresh = !counts.has_cadence_host(incoming.remote.ip(), incoming.validated);
         let cadence = counts.admit_cadence(
             incoming.remote.ip(),
+            incoming.validated,
             self.supervisor.max_connections_per_ip,
             self.limits
                 .max_connections
@@ -5065,11 +5076,12 @@ impl Acceptor for ZakuraProtocolHandler {
             counts.release_transport();
         }
         #[cfg(any(test, zakura_sim))]
-        let hosts = counts.cadence_hosts();
+        let hosts = counts.cadence_hosts(incoming.validated);
         drop(counts);
         #[cfg(any(test, zakura_sim))]
         self.observe_handshake_cadence(
             incoming.remote,
+            incoming.validated,
             match cadence {
                 super::HandshakeCadenceAdmission::Admit => "admitted",
                 super::HandshakeCadenceAdmission::Exhausted => "exhausted",
@@ -5091,7 +5103,7 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
         self.finish_admission(false);
-        self.refund_cadence(incoming.remote, "cancelled");
+        self.refund_cadence(incoming.remote, incoming.validated, "cancelled");
     }
 
     fn finish_admission(&self, handed_off: bool) {
@@ -5116,7 +5128,11 @@ impl Acceptor for ZakuraProtocolHandler {
         if claim.is_err() {
             handler.finish_admission(false);
             // Dials took the room during TLS, so the refusal is local.
-            handler.refund_cadence(connection.admitted_addr(), "refused");
+            handler.refund_cadence(
+                connection.admitted_addr(),
+                connection.source_validated(),
+                "refused",
+            );
         }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
@@ -14559,6 +14575,60 @@ mod tests {
         Ok(())
     }
 
+    /// Spoofed Initials carry unvalidated sources. Draining a victim's
+    /// unvalidated cadence, or filling the unvalidated ledger with other
+    /// addresses, earns the spoofed sources a stateless Retry, never a
+    /// refusal, and leaves a validated Initial from the victim its own
+    /// cadence (zakura#2337 review).
+    #[test]
+    fn spoofed_initials_never_lock_out_a_validated_source() {
+        let victim: IpAddr = "203.0.113.9".parse().expect("test ip parses");
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let attempt = |ip: IpAddr, validated: bool| IncomingInfo {
+            remote: SocketAddr::new(ip, 8234),
+            validated,
+            pending_total: 0,
+            pending_from_ip: 0,
+        };
+        // Each spoofed attempt fails at once and returns its transport
+        // reservation, with no cadence refund.
+        let spoof = |ip: IpAddr| {
+            let admitted = handler.admit(&attempt(ip, false));
+            if admitted == Admit::Accept {
+                handler.finish_admission(false);
+            }
+            admitted
+        };
+        for _ in 0..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+            assert_eq!(spoof(victim), Admit::Accept);
+        }
+        assert_eq!(spoof(victim), Admit::Retry);
+        assert_eq!(handler.admit(&attempt(victim, true)), Admit::Accept);
+        handler.finish_admission(false);
+
+        let ledger = limits
+            .max_connections
+            .saturating_add(limits.max_pending_handshakes);
+        for host in 0..ledger {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(
+                0x0a00_0000 + u32::try_from(host).expect("the ledger fits u32"),
+            ));
+            for _ in 0..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+                spoof(ip);
+            }
+        }
+        let fresh: IpAddr = "198.51.100.3".parse().expect("test ip parses");
+        assert_eq!(spoof(fresh), Admit::Retry, "the unvalidated ledger is full");
+        assert_eq!(handler.admit(&attempt(fresh, true)), Admit::Accept);
+        handler.finish_admission(false);
+    }
+
     #[test]
     fn last_per_ip_slot_requires_validation() {
         let ip = "203.0.113.9".parse().unwrap();
@@ -15048,12 +15118,14 @@ mod tests {
             .await?
             .expect("the capture acceptor sends the accepted connection");
         let ip = inbound.admitted_ip();
+        let validated = inbound.source_validated();
         let max_hosts = limits
             .max_connections
             .saturating_add(limits.max_pending_handshakes);
         let charge = |handler: &ZakuraProtocolHandler| {
             handler.supervisor.ip_slots.counts().admit_cadence(
                 ip,
+                validated,
                 handler.supervisor.max_connections_per_ip,
                 max_hosts,
                 Instant::now(),

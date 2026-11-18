@@ -480,6 +480,7 @@ struct Buffer {
 enum Reported {
     QuicHandshakeStarted {
         remote: SocketAddr,
+        validated: bool,
     },
     /// Node-wide admission counts changed.
     HandshakeLoad(TransportFact),
@@ -636,9 +637,9 @@ impl TransportObserver for TapObserver {
         if self.0.handshake_sampling.load(Ordering::Relaxed) {
             probe.record_events();
             let state = Arc::downgrade(&self.0);
-            probe.observe_attempts(move |remote| {
+            probe.observe_attempts(move |remote, validated| {
                 if let Some(state) = state.upgrade() {
-                    state.push(Reported::QuicHandshakeStarted { remote });
+                    state.push(Reported::QuicHandshakeStarted { remote, validated });
                 }
             });
         }
@@ -1037,8 +1038,12 @@ impl TransportTap {
                     },
                 ))
             }
-            Reported::QuicHandshakeStarted { remote } => {
-                return Ok((None, remote, TransportFact::QuicHandshakeStarted));
+            Reported::QuicHandshakeStarted { remote, validated } => {
+                return Ok((
+                    None,
+                    remote,
+                    TransportFact::QuicHandshakeStarted { validated },
+                ));
             }
             Reported::Event(event) => event,
             Reported::DialStarted { remote } => {
@@ -1089,6 +1094,7 @@ impl TransportTap {
             ),
             TransportEvent::HandshakeCadence {
                 remote,
+                validated,
                 action,
                 fresh,
                 capacity,
@@ -1099,6 +1105,7 @@ impl TransportTap {
                 None,
                 remote,
                 TransportFact::HandshakeCadence {
+                    validated,
                     action: action.into(),
                     fresh,
                     capacity,

@@ -780,7 +780,7 @@ fn fast_fail_handshakes_exhaust_the_address_cadence() {
             .filter(|entry| matches!(
                 &entry.obs,
                 zakura_sim::Observation::Transport {
-                    event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                    event: zakura_sim::observe::TransportFact::QuicHandshakeStarted { .. },
                     ..
                 }
             ))
@@ -822,7 +822,7 @@ fn sixteen_conformant_dialers_share_an_address_cadence() {
         if matches!(
             &entry.obs,
             zakura_sim::Observation::Transport {
-                event: zakura_sim::observe::TransportFact::QuicHandshakeStarted,
+                event: zakura_sim::observe::TransportFact::QuicHandshakeStarted { .. },
                 ..
             }
         ) {

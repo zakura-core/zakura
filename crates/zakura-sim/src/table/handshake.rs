@@ -560,16 +560,18 @@ fn cadence_burst_reached(log: &crate::ObservationLog) -> bool {
         else {
             continue;
         };
-        if !matches!(event, TransportFact::QuicHandshakeStarted)
-            && !matches!(event, TransportFact::HandshakeCadence { action, .. } if action == "exhausted")
-        {
-            continue;
-        }
+        let validated = match event {
+            TransportFact::QuicHandshakeStarted { validated } => *validated,
+            TransportFact::HandshakeCadence {
+                action, validated, ..
+            } if action == "exhausted" => *validated,
+            _ => continue,
+        };
         let remote: std::net::SocketAddr = remote
             .parse()
             .expect("transport addresses use socket syntax");
         let times = attempts
-            .entry((*instance, scripted_host(remote.ip())))
+            .entry((*instance, scripted_host(remote.ip()), validated))
             .or_default();
         while times.front().is_some_and(|at| now - at >= 1_000_000_000) {
             times.pop_front();
@@ -628,7 +630,7 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             && matches!(
                 obs,
                 Observation::Transport {
-                    event: TransportFact::QuicHandshakeStarted,
+                    event: TransportFact::QuicHandshakeStarted { .. },
                     ..
                 }
             ))
@@ -662,7 +664,7 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
         if !matches!(
             event,
-            TransportFact::HandshakeCadence { .. } | TransportFact::QuicHandshakeStarted
+            TransportFact::HandshakeCadence { .. } | TransportFact::QuicHandshakeStarted { .. }
         ) {
             continue;
         }
@@ -675,9 +677,10 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         let cap = u32::try_from(address_cap).unwrap();
         let interval = u64::try_from(DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF.as_nanos()).unwrap()
             / u64::from(cap);
-        let (action, fresh) = match event {
-            TransportFact::QuicHandshakeStarted => ("started", false),
+        let (action, fresh, validated) = match event {
+            TransportFact::QuicHandshakeStarted { validated } => ("started", false, *validated),
             TransportFact::HandshakeCadence {
+                validated,
                 action,
                 fresh,
                 capacity,
@@ -702,15 +705,16 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     }
                     continue;
                 }
-                (action.as_str(), *fresh)
+                (action.as_str(), *fresh, *validated)
             }
             _ => unreachable!("only cadence and QUIC attempt events pass the filter"),
         };
         let remote: std::net::SocketAddr = remote
             .parse()
             .expect("transport addresses use socket syntax");
+        // Each validation state has its own ledger.
         let (tokens, last) = balances
-            .entry((*instance, scripted_host(remote.ip())))
+            .entry((*instance, scripted_host(remote.ip()), validated))
             .or_insert((cap, now));
         let earned = now.saturating_sub(*last) / interval;
         *tokens = tokens

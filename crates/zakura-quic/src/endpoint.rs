@@ -155,9 +155,10 @@ pub(crate) struct SocketSlot {
     pub(crate) stopped: AtomicBool,
 }
 
-/// The simulator's callback for each admitted QUIC attempt's remote address.
+/// The simulator's callback for each admitted QUIC attempt's remote address
+/// and whether that address was validated.
 #[cfg(zakura_sim)]
-type AdmissionObserver = Arc<dyn Fn(SocketAddr) + Send + Sync>;
+type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 
 /// State the handles and every endpoint task share. It holds no command
 /// sender, so it never keeps an endpoint task alive.
@@ -181,14 +182,14 @@ pub(crate) struct Shared {
 
 impl Shared {
     #[cfg(zakura_sim)]
-    pub(crate) fn observe_handshake_attempt(&self, remote: SocketAddr) {
+    pub(crate) fn observe_handshake_attempt(&self, remote: SocketAddr, validated: bool) {
         let observer = self
             .admission_observer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(observer) = observer {
-            observer(remote);
+            observer(remote, validated);
         }
     }
 
@@ -792,7 +793,7 @@ fn finish_dial(
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected, target, alpn))
+    Ok(Conn::new(conn, expected, target, true, alpn))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -815,6 +816,7 @@ async fn establish(
 /// Finishes one inbound handshake and hands the connection to the acceptor.
 pub(crate) async fn inbound_handshake(
     connecting: Connecting,
+    source_validated: bool,
     deadline: Option<Duration>,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
@@ -848,7 +850,7 @@ pub(crate) async fn inbound_handshake(
     // `handle` runs before the pending count drops, so an acceptor that moves
     // the connection into its own accounting there leaves no gap (ADM-7).
     let pending = pending.handoff();
-    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, alpn));
+    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, source_validated, alpn));
     drop(pending);
     handled.await;
 }
@@ -1085,9 +1087,10 @@ impl AdmissionProbe {
         events.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    /// Reports each Initial that reaches cryptographic handshake processing.
-    /// The callback runs without adding a scheduler preemption point.
-    pub fn observe_attempts(&self, observer: impl Fn(SocketAddr) + Send + Sync + 'static) {
+    /// Reports each Initial that reaches cryptographic handshake processing,
+    /// with whether its source address was validated. The callback runs
+    /// without adding a scheduler preemption point.
+    pub fn observe_attempts(&self, observer: impl Fn(SocketAddr, bool) + Send + Sync + 'static) {
         if let Some(shared) = self.0.upgrade() {
             *shared
                 .admission_observer

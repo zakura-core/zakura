@@ -289,9 +289,13 @@ impl CadenceOracle {
         failures: &mut Vec<(String, MachineFailure)>,
     ) -> bool {
         self.refill(host);
-        let admitted =
-            counts.admit_cadence(ip, ADDRESS_CAP, CONNECTION_CAP + PENDING_CAP, self.now())
-                == HandshakeCadenceAdmission::Admit;
+        let admitted = counts.admit_cadence(
+            ip,
+            false,
+            ADDRESS_CAP,
+            CONNECTION_CAP + PENDING_CAP,
+            self.now(),
+        ) == HandshakeCadenceAdmission::Admit;
         if admitted && self.tokens[host] == 0 {
             failure(
                 failures,
@@ -311,7 +315,7 @@ impl CadenceOracle {
     fn refund(&mut self, counts: &mut HandshakeCounts, host: usize, ip: IpAddr) {
         self.refill(host);
         self.tokens[host] = (self.tokens[host] + 1).min(16);
-        counts.refund_cadence(ip, self.now());
+        counts.refund_cadence(ip, false, self.now());
     }
 }
 

@@ -2092,9 +2092,14 @@ pub enum TransportFact {
         rate: u32,
     },
     /// An accepted Initial reached the production QUIC cryptographic handshake.
-    QuicHandshakeStarted,
+    QuicHandshakeStarted {
+        /// Whether QUIC validated the source address first.
+        validated: bool,
+    },
     /// The receiver admitted, refused, or refunded a handshake attempt.
     HandshakeCadence {
+        /// Whether the source address was validated, which picks the ledger.
+        validated: bool,
         /// Admitted, exhausted, capacity, registered, or cancelled.
         action: String,
         /// The production ledger created this address bucket for the charge.

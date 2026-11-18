@@ -521,7 +521,8 @@ impl<F: SocketFactory> EndpointTask<F> {
                         // ADM-7: count the handshake from Accept until it finishes.
                         let pending = self.shared.pending.enter(pending_group, acceptor.clone());
                         #[cfg(zakura_sim)]
-                        self.shared.observe_handshake_attempt(remote);
+                        self.shared
+                            .observe_handshake_attempt(remote, info.validated);
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
@@ -534,6 +535,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                             "quic.inbound_handshake",
                             inbound_handshake(
                                 connecting,
+                                info.validated,
                                 self.shared.config.handshake_timeout(),
                                 pending,
                                 acceptor,

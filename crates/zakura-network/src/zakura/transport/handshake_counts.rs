@@ -50,31 +50,40 @@ pub struct HandshakeCounts {
     inbound_reservations: usize,
     connections: usize,
     inbound_connections: usize,
-    cadence: HashMap<IpAddr, Bucket>,
+    /// Charges of attempts whose source address was validated, by a Retry
+    /// token, before TLS.
+    validated_cadence: HashMap<IpAddr, Bucket>,
+    /// Charges of attempts from unvalidated source addresses. A spoofed
+    /// Initial can only charge this ledger, so it never takes a validated
+    /// source's tokens or ledger room.
+    unvalidated_cadence: HashMap<IpAddr, Bucket>,
 }
 
 impl HandshakeCounts {
-    /// Charges an attempt while retaining every depleted address bucket.
-    /// Full buckets can be discarded because a new bucket starts full.
+    /// Charges an attempt to the ledger of its source's validation state,
+    /// `validated`, while retaining every depleted address bucket. Full
+    /// buckets can be discarded because a new bucket starts full. Each
+    /// ledger holds at most `max_hosts` addresses.
     pub fn admit_cadence(
         &mut self,
         ip: IpAddr,
+        validated: bool,
         max_connections_per_ip: usize,
         max_hosts: usize,
         now: Instant,
     ) -> HandshakeCadenceAdmission {
         let host = admission_host(ip);
-        if !self.cadence.contains_key(&host) && self.cadence.len() >= max_hosts {
-            self.cadence.retain(|_, bucket| {
+        let cadence = self.cadence_mut(validated);
+        if !cadence.contains_key(&host) && cadence.len() >= max_hosts {
+            cadence.retain(|_, bucket| {
                 bucket.refill(now);
                 !bucket.is_full()
             });
-            if self.cadence.len() >= max_hosts {
+            if cadence.len() >= max_hosts {
                 return HandshakeCadenceAdmission::Capacity;
             }
         }
-        let bucket = self
-            .cadence
+        let bucket = cadence
             .entry(host)
             .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
         bucket.refill(now);
@@ -86,9 +95,10 @@ impl HandshakeCounts {
     }
 
     /// Refunds a registered connection, an attempt QUIC never started, or an
-    /// attempt the node refused for its own capacity after TLS.
-    pub fn refund_cadence(&mut self, ip: IpAddr, now: Instant) {
-        if let Some(bucket) = self.cadence.get_mut(&admission_host(ip)) {
+    /// attempt the node refused for its own capacity after TLS, to the
+    /// ledger [`Self::admit_cadence`] charged for `validated`.
+    pub fn refund_cadence(&mut self, ip: IpAddr, validated: bool, now: Instant) {
+        if let Some(bucket) = self.cadence_mut(validated).get_mut(&admission_host(ip)) {
             bucket.refill(now);
             bucket.refund();
         }
@@ -96,13 +106,30 @@ impl HandshakeCounts {
 
     /// Reports bucket creation to the simulator without exposing its token balance.
     #[cfg(any(test, zakura_sim))]
-    pub(crate) fn has_cadence_host(&self, ip: IpAddr) -> bool {
-        self.cadence.contains_key(&admission_host(ip))
+    pub(crate) fn has_cadence_host(&self, ip: IpAddr, validated: bool) -> bool {
+        self.cadence(validated).contains_key(&admission_host(ip))
     }
 
-    /// Counts the bounded address ledger, including depleted idle buckets.
-    pub fn cadence_hosts(&self) -> usize {
-        self.cadence.len()
+    /// Counts the bounded address ledger for `validated` sources, including
+    /// depleted idle buckets.
+    pub fn cadence_hosts(&self, validated: bool) -> usize {
+        self.cadence(validated).len()
+    }
+
+    fn cadence(&self, validated: bool) -> &HashMap<IpAddr, Bucket> {
+        if validated {
+            &self.validated_cadence
+        } else {
+            &self.unvalidated_cadence
+        }
+    }
+
+    fn cadence_mut(&mut self, validated: bool) -> &mut HashMap<IpAddr, Bucket> {
+        if validated {
+            &mut self.validated_cadence
+        } else {
+            &mut self.unvalidated_cadence
+        }
     }
 
     /// Reads both address ledgers for a simulator boundary sample.
@@ -378,33 +405,79 @@ mod tests {
         let alias = "::ffff:192.0.2.1".parse().unwrap();
         for _ in 0..16 {
             assert_eq!(
-                counts.admit_cadence(ip, 16, 124, now),
+                counts.admit_cadence(ip, true, 16, 124, now),
                 HandshakeCadenceAdmission::Admit
             );
         }
         assert_eq!(
-            counts.admit_cadence(alias, 16, 124, now),
+            counts.admit_cadence(alias, true, 16, 124, now),
             HandshakeCadenceAdmission::Exhausted
         );
         let now = now + Duration::from_micros(62_500);
         assert_eq!(
-            counts.admit_cadence(alias, 16, 124, now),
+            counts.admit_cadence(alias, true, 16, 124, now),
             HandshakeCadenceAdmission::Admit
         );
         assert_eq!(
-            counts.admit_cadence(ip, 16, 124, now),
+            counts.admit_cadence(ip, true, 16, 124, now),
             HandshakeCadenceAdmission::Exhausted
         );
-        counts.refund_cadence(ip, now);
+        counts.refund_cadence(ip, true, now);
         assert_eq!(
-            counts.admit_cadence(alias, 16, 124, now),
+            counts.admit_cadence(alias, true, 16, 124, now),
             HandshakeCadenceAdmission::Admit
         );
         assert_eq!(
-            counts.admit_cadence(ip, 16, 124, now),
+            counts.admit_cadence(ip, true, 16, 124, now),
             HandshakeCadenceAdmission::Exhausted
         );
-        assert_eq!(counts.cadence_hosts(), 1);
+        assert_eq!(counts.cadence_hosts(true), 1);
+    }
+
+    /// A spoofed Initial carries an unvalidated source, so it charges only
+    /// the unvalidated ledger: draining that ledger, or filling it with
+    /// other addresses, leaves a validated source from the same address
+    /// its own tokens and ledger room.
+    #[test]
+    fn unvalidated_charges_leave_validated_sources_their_cadence() {
+        let mut counts = HandshakeCounts::default();
+        let now = Instant::now();
+        let victim = "192.0.2.1".parse().unwrap();
+        let spoofed = "192.0.2.2".parse().unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                counts.admit_cadence(victim, false, 16, 1, now),
+                HandshakeCadenceAdmission::Admit
+            );
+        }
+        assert_eq!(
+            counts.admit_cadence(victim, false, 16, 1, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        assert_eq!(
+            counts.admit_cadence(spoofed, false, 16, 1, now),
+            HandshakeCadenceAdmission::Capacity
+        );
+        assert_eq!(
+            counts.admit_cadence(victim, true, 16, 1, now),
+            HandshakeCadenceAdmission::Admit,
+            "the validated ledger is untouched"
+        );
+        assert_eq!(
+            (counts.cadence_hosts(false), counts.cadence_hosts(true)),
+            (1, 1)
+        );
+        // A refund returns to the ledger the attempt was charged to.
+        counts.refund_cadence(victim, true, now);
+        assert_eq!(
+            counts.admit_cadence(victim, false, 16, 1, now),
+            HandshakeCadenceAdmission::Exhausted
+        );
+        counts.refund_cadence(victim, false, now);
+        assert_eq!(
+            counts.admit_cadence(victim, false, 16, 1, now),
+            HandshakeCadenceAdmission::Admit
+        );
     }
 
     #[test]
@@ -416,23 +489,23 @@ mod tests {
         let other = "2001:db8:2::1".parse().unwrap();
         for _ in 0..16 {
             assert_eq!(
-                counts.admit_cadence(first, 16, 1, now),
+                counts.admit_cadence(first, true, 16, 1, now),
                 HandshakeCadenceAdmission::Admit
             );
         }
         assert_eq!(
-            counts.admit_cadence(other, 16, 1, now),
+            counts.admit_cadence(other, true, 16, 1, now),
             HandshakeCadenceAdmission::Capacity
         );
         assert_eq!(
-            counts.admit_cadence(alias, 16, 1, now),
+            counts.admit_cadence(alias, true, 16, 1, now),
             HandshakeCadenceAdmission::Exhausted
         );
-        assert_eq!(counts.cadence_hosts(), 1);
+        assert_eq!(counts.cadence_hosts(true), 1);
         assert_eq!(
-            counts.admit_cadence(other, 16, 1, now + Duration::from_secs(1)),
+            counts.admit_cadence(other, true, 16, 1, now + Duration::from_secs(1)),
             HandshakeCadenceAdmission::Admit
         );
-        assert_eq!(counts.cadence_hosts(), 1);
+        assert_eq!(counts.cadence_hosts(true), 1);
     }
 }

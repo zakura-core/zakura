@@ -246,6 +246,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         assert_eq!(conn.remote_id(), server.endpoint.local_id());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(conn.source_validated(), "this node dialed the address");
 
         // Larger than the stream receive window, so flow control has to
         // extend credit as the reader consumes.
@@ -254,6 +255,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
 
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), client.local_id());
+        assert!(!inbound.source_validated(), "no Retry validated the source");
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -634,7 +636,8 @@ async fn retry_threshold_validates_before_accepting() {
         let mut server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
         let client = client();
         client.connect(server.addr(), &[ALPN]).await.unwrap();
-        server.handled.recv().await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert!(inbound.source_validated(), "the Retry token validated it");
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
         assert!(!seen[0].validated);

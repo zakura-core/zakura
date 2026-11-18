@@ -68,6 +68,10 @@ It cannot exhaust the production address ledger's default 124 entries.
 production machine with a one-entry ledger, including IPv6 aliases, refusal of
 a new address, debt retention, and reclamation after refill.
 That unit test does not establish generated ledger-exhaustion coverage.
+The counts generator charges only the unvalidated ledger. The production unit
+tests `unvalidated_charges_leave_validated_sources_their_cadence` and
+`spoofed_initials_never_lock_out_a_validated_source` cover the split between
+the validated and unvalidated ledgers.
 
 The native required-capability mask is zero under the production network policy.
 Deleting its mask check cannot change a native handshake under that policy.

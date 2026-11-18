@@ -118,6 +118,9 @@ pub enum TransportEvent {
     HandshakeCadence {
         /// The source address, including its connection's port.
         remote: SocketAddr,
+        /// Whether the source address was validated before TLS, which picks
+        /// the ledger charged or refunded.
+        validated: bool,
         /// Admitted, exhausted, capacity, registered, or cancelled.
         action: &'static str,
         /// This charge created a new full bucket.

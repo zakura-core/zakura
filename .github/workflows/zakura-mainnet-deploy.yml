@@ -377,7 +377,9 @@ jobs:
             159.203.113.196 \
             104.131.174.28 \
             68.183.178.89 \
-            206.189.45.15; do
+            206.189.45.15 \
+            165.227.220.111 \
+            188.166.118.152; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -494,11 +496,11 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
 
-          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # Legacy archive node: vct_fast_sync = false, so it holds per-height
           # commitment trees everywhere and never fast-synced. That is what makes it
           # the supported generator for the release-state historical frontier grid —
           # entries come from reads instead of replaying an absent band. Binary-only
-          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # like the rest of the fleet, so its vct_fast_sync = false config is not
           # rewritten by a deploy; that setting is the whole point of the node.
           [[nodes]]
           name       = "archive-vct-off"
@@ -509,22 +511,22 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           log_file   = "/var/log/zakura/zakura.log"
           # Metadata only under manage_config = false, but it records why this node
-          # differs. On `dual` its body tip wedged: the v2 coordinator logged
-          # `accepted block apply lost terminal observation; apply lifecycle is
-          # failed` and the header chain ran ~6,000 blocks ahead of the verified
-          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # differs. On dual its body tip wedged: the v2 coordinator logged
+          # "accepted block apply lost terminal observation; apply lifecycle is
+          # failed" and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Switching the node to legacy cleared it immediately. Do not flip
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # Two legacy-only nodes in Singapore that each measure one experimental
-          # setting from an open PR. Each is pinned to the build it runs, because
+          # Legacy-only nodes that measure experimental settings from open PRs.
+          # Each is pinned to the build it runs, because
           # its hand-written config enables a setting that main does not have yet:
           # a main build would refuse that config and fail to start. A fleet deploy
           # therefore reinstalls the pinned build and restarts the node; to change
           # the build, update the pin. Remove the pin (use "${REF}") once the PR
           # merges, or remove the entry when the experiment ends.
           #
-          # asia-hedged measures `[network.block_hedge]` (#2548).
+          # asia-hedged measures [network.block_hedge] (#2548).
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
@@ -533,13 +535,30 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored measures `[network.block_source_score]` (#2558) with its
-          # `second_request` setting (#2572).
+          # asia-scored measures [network.block_source_score] (#2558) with its
+          # second_request setting (#2572).
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
           commit     = "d964051fe2b697b0282728b06fab3b044d2c3d53"
+          rpc_listen_addr = "127.0.0.1:8232"
+          p2p_stack  = "legacy"
+
+          # Run the #2572 second-request experiment in New York and Amsterdam.
+          [[nodes]]
+          name       = "us-scored"
+          ssh_string = "root@165.227.220.111"
+          monitor    = { profiler_url = "http://127.0.0.1:8109" }
+          commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
+          rpc_listen_addr = "127.0.0.1:8232"
+          p2p_stack  = "legacy"
+
+          [[nodes]]
+          name       = "europe-central-scored"
+          ssh_string = "root@188.166.118.152"
+          monitor    = { profiler_url = "http://127.0.0.1:8110" }
+          commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

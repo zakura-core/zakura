@@ -117,6 +117,7 @@ tip_quiet = "2s"
 # instead of the less loaded one.
 [network.block_source_score]
 enabled = false
+second_request = false
 
 [network.zakura]
 bootstrap_peers = [

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -153,6 +153,31 @@ pub enum Request {
         hashes: IndexSet<block::Hash>,
         /// Peer that advertised the inventory.
         source: PeerSource,
+    },
+
+    /// Request one block a legacy peer announced, as a second request while a first request for
+    /// it is still outstanding.
+    ///
+    /// The legacy peer set considers only ready peers that announced the block, have no request
+    /// outstanding, and did not get the first request. It sends the request to the one expected
+    /// to answer soonest, but only if that peer should deliver the block clearly before the first
+    /// request does, or if the first request has run well past its expected time (see
+    /// `[network.block_source_score] second_request`). It sends at most one such request per
+    /// block.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks), or fails at once with
+    /// [`NoFasterBlockSource`](crate::NoFasterBlockSource) when no peer was asked, so the caller
+    /// can ask again later.
+    BlockByHashHedge {
+        /// The block to request.
+        hash: block::Hash,
+        /// How long the first request had been waiting for an answer when this one was sent, or
+        /// zero when the first request had already failed. The legacy peer trace writes it with
+        /// this request's own time, so a download this request wins is timed from the first
+        /// request without waiting for the first request's answer.
+        first_request_waited: Duration,
     },
 
     /// Request transactions by their unmined transaction ID.
@@ -336,6 +361,7 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
                 format!("TransactionsByIdFrom({})", ids.len())
@@ -373,7 +399,9 @@ impl Request {
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
+            Request::BlocksByHash(_)
+            | Request::BlocksByHashFrom { .. }
+            | Request::BlockByHashHedge { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -397,6 +425,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
         )
@@ -410,6 +439,7 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
+            Request::BlockByHashHedge { hash, .. } => HashSet::from([*hash]),
             _ => HashSet::new(),
         }
     }

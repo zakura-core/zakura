@@ -7,6 +7,12 @@
 //! peers that had announced the block, `score_ms` the chosen peer's expected answer time and
 //! `best_score_ms` the lowest among the candidates (see `[network.block_source_score]`). A score
 //! is missing for a peer whose answers have not been measured yet.
+//! A `hedge` row is a second request for a block whose first request had not delivered it yet
+//! (see `[network.block_source_score] second_request`). `hedge_reason` says why it was sent:
+//! `predicted` when another announcer was expected to deliver clearly sooner, `stalled` when the
+//! first request ran well past its expected time. `first_request_waited_ms` is how long the first
+//! request had been outstanding, so the download is timed from the first request, and
+//! `first_score_ms` is the first peer's expected answer time.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
 //! inventory guarantee. A connection's process-local
 //! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
@@ -31,6 +37,7 @@ use zakura_jsonl_trace::{
     JsonlTraceTable, JsonlTracer,
 };
 
+use super::second_request::SecondRequestReason;
 use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedPeerError};
 
 const TABLE: JsonlTraceTable =
@@ -50,6 +57,23 @@ pub(super) enum BlockRequestRoute {
     Advertised(BlockSourceChoice),
     /// No ready peer had announced the block, so the peer may not have it.
     Maybe,
+    /// A second request for a block the first request had not delivered yet.
+    Hedge(SecondRequestChoice),
+}
+
+/// Why and to whom a second request for a block was sent.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SecondRequestChoice {
+    /// How long the first request had been outstanding.
+    pub(super) first_request_waited: Duration,
+    /// Why the second request was sent.
+    pub(super) reason: SecondRequestReason,
+    /// The number of idle peers, other than the first one, that had announced the block.
+    pub(super) candidates: usize,
+    /// The chosen peer's expected answer time, if it has been measured.
+    pub(super) score: Option<Duration>,
+    /// The first peer's expected answer time when it was asked, if it had been measured.
+    pub(super) first_score: Option<Duration>,
 }
 
 /// The idle announcers a block request chose among, and their expected answer times.
@@ -111,6 +135,12 @@ enum LegacyPeerEvent<'a> {
         score_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         best_score_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hedge_reason: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_request_waited_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_score_ms: Option<u64>,
         #[serde(flatten)]
         result: BlockRequestResult<'a>,
     },
@@ -243,9 +273,22 @@ impl LegacyPeerTrace {
         elapsed: Duration,
         result: &Result<Response, SharedPeerError>,
     ) {
-        let choice = match route {
-            BlockRequestRoute::Advertised(choice) => Some(choice),
-            BlockRequestRoute::Maybe => None,
+        let (label, candidates, score, best_score, hedge) = match route {
+            BlockRequestRoute::Advertised(choice) => (
+                "advertised",
+                Some(choice.candidates),
+                choice.score,
+                choice.best_score,
+                None,
+            ),
+            BlockRequestRoute::Maybe => ("maybe", None, None, None, None),
+            BlockRequestRoute::Hedge(choice) => (
+                "hedge",
+                Some(choice.candidates),
+                choice.score,
+                None,
+                Some(choice),
+            ),
         };
         self.emitter.emit_event(|| {
             let result = match result {
@@ -294,16 +337,15 @@ impl LegacyPeerTrace {
                 local_tip_height: peer.local_tip_height.map(|height| height.0),
                 elapsed_ms: saturating_millis(elapsed),
                 requested_hash: JsonlDisplay(&requested_hash),
-                route: match route {
-                    BlockRequestRoute::Advertised(_) => "advertised",
-                    BlockRequestRoute::Maybe => "maybe",
-                },
-                candidates: choice.map(|choice| choice.candidates),
-                score_ms: choice
-                    .and_then(|choice| choice.score)
-                    .map(saturating_millis),
-                best_score_ms: choice
-                    .and_then(|choice| choice.best_score)
+                route: label,
+                candidates,
+                score_ms: score.map(saturating_millis),
+                best_score_ms: best_score.map(saturating_millis),
+                hedge_reason: hedge.map(|choice| choice.reason.label()),
+                first_request_waited_ms: hedge
+                    .map(|choice| saturating_millis(choice.first_request_waited)),
+                first_score_ms: hedge
+                    .and_then(|choice| choice.first_score)
                     .map(saturating_millis),
                 result,
             }
@@ -557,6 +599,45 @@ mod tests {
         assert_eq!(events[1]["route"], "maybe");
         assert!(events[1].get("candidates").is_none());
         assert!(events[1].get("score_ms").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hedge_row_says_why_it_was_sent_and_how_long_the_first_request_waited() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = test_trace(&guard, false);
+
+        trace.block_request_finish(
+            1,
+            test_peer(),
+            hash(2),
+            BlockRequestRoute::Hedge(SecondRequestChoice {
+                first_request_waited: Duration::from_millis(70),
+                reason: SecondRequestReason::Predicted,
+                candidates: 2,
+                score: Some(Duration::from_millis(50)),
+                first_score: Some(Duration::from_millis(230)),
+            }),
+            Duration::from_millis(48),
+            &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
+                InventoryHash::Block(hash(2)),
+            ]))),
+        );
+
+        drop(trace);
+        guard.shutdown().await;
+
+        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
+            .expect("legacy peer trace file is written");
+        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+
+        assert_eq!(event["route"], "hedge");
+        assert_eq!(event["hedge_reason"], "predicted");
+        assert_eq!(event["first_request_waited_ms"], 70);
+        assert_eq!(event["first_score_ms"], 230);
+        assert_eq!(event["candidates"], 2);
+        assert_eq!(event["score_ms"], 50);
+        assert!(event.get("best_score_ms").is_none());
     }
 
     #[tokio::test]

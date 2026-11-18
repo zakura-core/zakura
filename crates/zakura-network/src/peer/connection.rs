@@ -1411,6 +1411,10 @@ where
             (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
                 Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
             }
+            // The peer set picks the peer for a hedge and sends it an ordinary `BlocksByHash`.
+            (_, BlockByHashHedge { .. }) => {
+                Ok(Handler::Finished(Err(PeerError::HedgeRequiresPeerSet)))
+            }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,

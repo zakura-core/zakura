@@ -669,7 +669,8 @@ impl StartCmd {
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,
                 )
-                .with_pending_blocks(pending_blocks.clone()),
+                .with_pending_blocks(pending_blocks.clone())
+                .with_second_block_request(config.network.block_source_score.second_request),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,

@@ -130,13 +130,15 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
-        LoadTrackedClient, MinimumPeerVersion,
+        LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
     peer_registry::MISSED_BLOCK_PENALTY,
     peer_set::{
         legacy_peer_trace::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
+            SecondRequestChoice,
         },
+        second_request::{second_request_reason, FirstBlockRequests},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -312,6 +314,13 @@ where
     /// rather than the less loaded one. See [`crate::config::BlockSourceScoreConfig`].
     block_source_score: bool,
 
+    /// Whether a block can also be requested from a second announcer expected to deliver it
+    /// sooner. See [`crate::config::BlockSourceScoreConfig`].
+    block_second_request: bool,
+
+    /// The recent first requests for gossiped blocks, which a second request is measured against.
+    first_block_requests: FirstBlockRequests<D::Key>,
+
     /// The network of this peer set.
     network: Network,
 }
@@ -420,6 +429,8 @@ where
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
             block_source_score: config.block_source_score.enabled,
+            block_second_request: config.block_source_score.second_request,
+            first_block_requests: FirstBlockRequests::default(),
 
             network: config.network.clone(),
         }
@@ -1446,6 +1457,14 @@ where
             };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
+            if let (true, InventoryHash::Block(block_hash)) = (self.block_second_request, hash) {
+                self.first_block_requests.insert(
+                    block_hash,
+                    peer,
+                    choice.and_then(|choice| choice.score),
+                    Instant::now(),
+                );
+            }
             if let Some((request_id, peer, hash, started, delivery_samples)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 let choice = choice.unwrap_or_default();
@@ -1580,6 +1599,94 @@ where
             ])))
         }
         .map_err(Into::into)
+        .boxed()
+    }
+
+    /// Sends a second request for a gossiped block, if another announcer should deliver it
+    /// sooner than the first request, which has been outstanding for `first_request_waited`.
+    ///
+    /// The candidates are the idle peers that announced the block, other than the one the first
+    /// request went to, and the best is the one expected to answer soonest. It is asked when it
+    /// is expected to deliver clearly before the first request should, or when the first request
+    /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
+    /// this node, so a peer cannot claim a faster one.
+    ///
+    /// Otherwise, and for a block that already had a second request, fails at once with
+    /// [`NoFasterBlockSource`] without contacting any peer, so the caller can ask again later.
+    fn route_block_hedge(
+        &mut self,
+        hash: block::Hash,
+        first_request_waited: Duration,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let not_yet = || async { Err(NoFasterBlockSource.into()) }.boxed();
+        if !self.block_second_request {
+            return not_yet();
+        }
+
+        let (first_peer, first_score) = match self.first_block_requests.get_mut(&hash) {
+            Some(first) if first.second_sent => return not_yet(),
+            Some(first) => (Some(first.peer), first.score),
+            None => (None, None),
+        };
+        let candidates: Vec<(D::Key, Option<Duration>)> = self
+            .inventory_registry
+            .advertising_peers(InventoryHash::from(hash))
+            .filter(|addr| Some(**addr) != first_peer)
+            .filter_map(|addr| {
+                let svc = self.ready_services.get(addr)?;
+                svc.is_preferred_block_source()
+                    .then(|| (*addr, svc.block_gossip.delivery_score()))
+            })
+            .collect();
+        // A measured peer comes before an unmeasured one.
+        let best = candidates
+            .iter()
+            .min_by_key(|(_, score)| (score.is_none(), *score))
+            .copied();
+
+        let Some(reason) =
+            second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
+        else {
+            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+            return not_yet();
+        };
+        let Some((peer, score, mut svc)) =
+            best.and_then(|(peer, score)| Some((peer, score, self.take_ready_service(&peer)?)))
+        else {
+            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+            return not_yet();
+        };
+        if let Some(first) = self.first_block_requests.get_mut(&hash) {
+            first.second_sent = true;
+        }
+
+        metrics::counter!("pool.route_inv.hedge.count", "reason" => reason.label()).increment(1);
+        let choice = SecondRequestChoice {
+            first_request_waited,
+            reason,
+            candidates: candidates.len(),
+            score,
+            first_score,
+        };
+        let request_id = self.legacy_peer_trace.next_request_id();
+        let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+        let started = Instant::now();
+        let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
+        self.push_unready(peer, svc);
+
+        let trace = self.legacy_peer_trace.clone();
+        async move {
+            let result = fut.await;
+            trace.block_request_finish(
+                request_id,
+                trace_peer,
+                hash,
+                BlockRequestRoute::Hedge(choice),
+                started.elapsed(),
+                &result,
+            );
+            result.map_err(Into::into)
+        }
         .boxed()
     }
 
@@ -1981,6 +2088,10 @@ where
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
+            Request::BlockByHashHedge {
+                hash,
+                first_request_waited,
+            } => self.route_block_hedge(hash, first_request_waited),
             Request::TransactionsById(ref hashes)
             | Request::TransactionsByIdFrom {
                 ids: ref hashes, ..

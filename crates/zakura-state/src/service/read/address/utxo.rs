@@ -34,7 +34,7 @@ use crate::{
 ///
 /// The genesis coinbase transactions are ignored by a consensus rule,
 /// so they are not included in any address indexes.
-#[cfg(any(test, feature = "proptest-impl"))]
+#[cfg(test)]
 pub const ADDRESS_HEIGHTS_FULL_RANGE: RangeInclusive<Height> = Height(1)..=Height::MAX;
 
 /// A convenience wrapper that efficiently stores unspent transparent outputs,

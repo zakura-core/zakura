@@ -724,18 +724,18 @@ mod tests {
             .expect("block 1 deserializes");
         let old_header = *block.header;
         let (template_sender, template_receiver) = watch::channel(Some(block.clone()));
-        let mut template_receiver = WatchReceiver::new(template_receiver);
+        let template_receiver = WatchReceiver::new(template_receiver);
 
         template_sender
             .send(Some(block))
             .expect("template receiver remains open");
-        assert!(cancel_if_mining_template_changed(&mut template_receiver, old_header).is_ok());
+        assert!(cancel_if_mining_template_changed(&template_receiver, old_header).is_ok());
 
         template_sender
             .send(None)
             .expect("template receiver remains open");
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut template_receiver, old_header),
+            cancel_if_mining_template_changed(&template_receiver, old_header),
             Err(SolverCancelled)
         ));
     }
@@ -987,7 +987,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let old_header = *receiver.borrow_and_update().as_ref().unwrap().header;
-        let mut solver_receiver = WatchReceiver::new(receiver.clone());
+        let solver_receiver = WatchReceiver::new(receiver.clone());
         let preparation = verifier
             .expect_request_that(|request| {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
@@ -1011,7 +1011,7 @@ mod tests {
             .unwrap();
         assert!(receiver.borrow_and_update().is_none());
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut solver_receiver, old_header),
+            cancel_if_mining_template_changed(&solver_receiver, old_header),
             Err(SolverCancelled)
         ));
         let recovery = verifier

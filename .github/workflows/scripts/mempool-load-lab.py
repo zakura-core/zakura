@@ -181,6 +181,12 @@ def build_kresko_config(args) -> dict:
     network_kind is pinned to local-genesis: Kresko's require_local_genesis()
     gate then refuses every public-network command, so a misconfigured run
     cannot reach a real network.
+
+    mining_mode is `pow` so Kresko seeds the chain at a difficulty sized for
+    the target spacing (see `--miner-sol-per-sec`). `generate` seeds at the
+    easiest one, and NU7 averages difficulty over 102 blocks, too slowly to
+    move a short run, so its blocks came every ~7 s. zakurad's internal miner
+    solves (200, 9) on any testnet, hence `common` Equihash parameters.
     """
     miners = [
         {
@@ -205,9 +211,9 @@ def build_kresko_config(args) -> dict:
         "ssh_key_path": "",
         "provider": "digitalocean",
         "network_kind": "local-genesis",
-        "mining_mode": "generate",
+        "mining_mode": "pow",
         "block_time_secs": args.block_time_secs,
-        "equihash_params": "regtest",
+        "equihash_params": "common",
         "daa": {},
         "orchard_txblast": {
             "lanes_per_miner": args.orchard_lanes_per_miner,
@@ -240,6 +246,10 @@ def cmd_genesis(args) -> int:
             str(Path(args.kresko_binary).resolve()),
             "--maturity-padding-blocks",
             str(args.maturity_padding_blocks),
+            # Kresko multiplies this by every node in config.json, but only
+            # --miner-nodes nodes mine, with one solver thread each.
+            "--pow-sol-per-sec",
+            str(args.miner_sol_per_sec * args.miner_nodes / args.node_count),
             "--orchard-lanes-per-miner",
             str(args.orchard_lanes_per_miner),
             "--orchard-lane-value-zats",
@@ -301,15 +311,20 @@ def to_node_schema(text: str) -> str:
 
     Kresko renders configs for the zakura experiment branch it pins: custom
     parameters under `[network.testnet_parameters]` next to `network = "Testnet"`,
-    plus `post_blossom_pow_target_spacing`. Main takes custom parameters only as
-    the explicit `[network.network]` table and has no target-spacing key.
+    plus `post_blossom_pow_target_spacing`, and in `pow` mining mode
+    `pow_start_height` with `disable_pow = false`. Main takes custom parameters
+    only as the explicit `[network.network]` table and has neither key. Without
+    `pow_start_height` the unsolved seeded blocks only pass with proof of work
+    off, so `disable_pow` stays true. The internal miner still solves to the
+    template's difficulty, which is what sets the block rate.
     """
     if "[network.testnet_parameters" not in text:
         return text
     text, replaced = re.subn(r'(?m)^network = "Testnet"\n', "", text)
     if replaced != 1:
         raise RuntimeError('expected one `network = "Testnet"` line next to testnet_parameters')
-    text = re.sub(r"(?m)^post_blossom_pow_target_spacing = .*\n", "", text)
+    text = re.sub(r"(?m)^(post_blossom_pow_target_spacing|pow_start_height) = .*\n", "", text)
+    text = re.sub(r"(?m)^disable_pow = false$", "disable_pow = true", text)
     return text.replace("[network.testnet_parameters", "[network.network")
 
 
@@ -882,10 +897,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="newest network upgrade the generated chain activates",
     )
     gen.add_argument("--experiment", default="mempool-load")
-    # Kresko spaces the seeded blocks by this. The default matches NU7's 25 s
-    # target. A value off the chain's target skews its first difficulty
-    # adjustments.
+    # Kresko spaces the seeded blocks by this and sizes their difficulty for
+    # it. The default matches NU7's 25 s target. A value off the chain's target
+    # skews its first difficulty adjustments.
     gen.add_argument("--block-time-secs", type=int, default=25)
+    # Solutions per second of one internal-miner thread, which sets the chain's
+    # starting difficulty. One thread on a c-16 under the default blast managed
+    # about 2.3, measured as 2^256 / target_difficulty_limit / mean block
+    # interval. Kept a little low because the limit is the easiest difficulty
+    # the chain can use: too high a rate leaves every block slower than the
+    # target, too low only makes blocks faster.
+    gen.add_argument("--miner-sol-per-sec", type=float, default=2.0)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)
     # 32, not Kresko's 384: every lane is proved during bootstrap, so a large
     # inventory means a bounded run never reaches steady state.

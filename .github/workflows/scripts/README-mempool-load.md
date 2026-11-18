@@ -114,12 +114,18 @@ has no key to override it. So `--latest-upgrade` defaults to `nu7`, and
 blocks by it. NU6.3 closes Orchard to new value, so Kresko blasts Ironwood on
 this chain.
 
-The target doesn't set the block rate within a run, though. NU7 averages
-difficulty over 102 blocks, so a run of a few dozen blocks stays near the
-starting difficulty, and blocks come as fast as the internal miner finds them
-there: about 7 s on a c-16. Read figures that depend on the block interval,
-like confirm delay and how many nodes a transaction reaches, against that
-rate rather than Mainnet's 25 s.
+**The chain starts at a calibrated difficulty.** NU7 averages difficulty over
+102 blocks, so a run of a few dozen blocks stays near its starting difficulty,
+and blocks come as fast as the internal miner finds them there. Kresko's
+`generate` mode seeds at the easiest difficulty, which gave blocks about every
+7 s. The lab uses Kresko's `pow` mode instead, which seeds the chain at a
+difficulty sized for `--miner-sol-per-sec` at the 25 s target: 2.0 solutions a
+second by default, a little under the 2.3 one miner thread managed on a c-16
+under the default blast. That should give blocks about every 22 s. If a run's
+blocks drift, recompute the rate as 2^256 / `target_difficulty_limit` / mean
+block interval. Main has no `pow_start_height`, so the rewrite keeps
+`disable_pow = true`. Nodes then skip proof-of-work checks, but the internal
+miner still solves to the template's difficulty.
 
 **Each leg runs one node setup.** `up --profile` sets the P2P stack, the
 mempool implementation and tx-relay in every run config. `legacy` is what
@@ -128,14 +134,15 @@ which upgrades every lab peer), tx-relay and the pool core, which tx-relay
 needs. By default (`setups: legacy-vs-v2`) the workflow runs a legacy baseline
 leg and a v2 target leg on the same commit.
 
-The two setups don't relay blocks the same way at the lab's block rate. P2P
-v2's block-sync status allows a burst of 22 messages and earns one more every
-15 s, and a new block goes out early only while more than 11 are left. At about
-7 s per block the spare ones run out after about 20 blocks. From then on a v2
-node announces new blocks once per 15 s, two to five at a time, and each batch
-resets the next node's mempool. Legacy nodes announce every block at once. Until
-blocks slow past 15 s or that limit changes, a v2 deficit in reach or confirm
-delay comes from block relay first.
+P2P v2 can't announce blocks faster than about one per 15 s for long. Its
+block-sync status allows a burst of 22 messages and earns one more every 15 s,
+and a new block goes out early only while more than 11 are left. At 7 s blocks
+the spare ones ran out after about 20 blocks. From then on a v2 node announced
+new blocks once per 15 s, two to five at a time, and each batch reset the next
+node's mempool. Legacy nodes announce every block at once. The calibrated
+difficulty keeps blocks slower than that, but if a run's blocks come faster
+than one per 15 s, a v2 deficit in reach or confirm delay comes from block
+relay first.
 
 **Nodes write Zakura traces.** The node logs run at INFO and say nothing about
 block-sync requests, so the lab also sets each node's

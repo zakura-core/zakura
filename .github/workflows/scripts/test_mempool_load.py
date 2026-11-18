@@ -319,6 +319,17 @@ class LabConfigRewrite(unittest.TestCase):
         # back to public Testnet streams and panics on the short halving interval.
         self.assertIn("[network.network.pre_nu6_funding_streams]", text)
 
+    def test_pow_mode_keys_become_main_ones(self):
+        # Kresko's pow mode enforces proof of work from pow_start_height, a
+        # key main doesn't have, so main has to skip proof of work instead.
+        text = lab.to_node_schema(
+            self.KRESKO_NETWORK.replace(
+                "disable_pow = true\n", "disable_pow = false\npow_start_height = 130\n"
+            )
+        )
+        self.assertIn("[network.network]\ndisable_pow = true\n", text)
+        self.assertNotIn("pow_start_height", text)
+
     def test_a_current_schema_config_is_unchanged(self):
         text = lab.to_node_schema(self.KRESKO_NETWORK)
         self.assertEqual(lab.to_node_schema(text), text)
@@ -534,6 +545,31 @@ class KreskoConfigGeneration(unittest.TestCase):
         config = lab.build_kresko_config(self.make_args())
         self.assertEqual(config["ssh_key_path"], "")
         self.assertEqual(config["ssh_pub_key_path"], "")
+
+    def test_genesis_sizes_difficulty_for_the_mining_nodes(self):
+        # Kresko multiplies its rate by every node in config.json, but only
+        # --miner-nodes nodes mine, one solver thread each.
+        import tempfile
+
+        calls = []
+        original = lab.run
+        lab.run = lambda cmd, **kwargs: calls.append(cmd)
+        self.addCleanup(lambda: setattr(lab, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.cmd_genesis(
+                self.make_args(
+                    node_count=4,
+                    lab_dir=tmp,
+                    latest_upgrade="nu7",
+                    kresko_binary="kresko",
+                    zakurad_binary="zakurad",
+                    maturity_padding_blocks=125,
+                    miner_nodes=1,
+                    miner_sol_per_sec=2.0,
+                )
+            )
+        genesis = calls[0]
+        self.assertEqual(genesis[genesis.index("--pow-sol-per-sec") + 1], "0.5")
 
     def test_orchard_knobs_are_threaded_through(self):
         config = lab.build_kresko_config(

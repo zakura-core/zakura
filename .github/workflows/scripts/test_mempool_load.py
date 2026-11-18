@@ -252,35 +252,32 @@ class Teardown(unittest.TestCase):
 class PeeringCheck(unittest.TestCase):
     """A network that never peers measures nothing, so `up` must catch it."""
 
-    def with_peer_counts(self, sequence):
-        """Stub rpc_call to return successive peer lists per node."""
-        calls = {"n": 0}
+    def with_peer_counts(self, counts):
+        """Stub rpc_call so node i reports counts[i] peers."""
+        by_url = {f"http://{lab.node_ip(i)}:{lab.RPC_PORT}": n for i, n in enumerate(counts)}
 
         def fake(url, method, params=None, timeout=15):
             self.assertEqual(method, "getpeerinfo")
-            result = sequence[min(calls["n"], len(sequence) - 1)]
-            calls["n"] += 1
-            return result
+            return [{"addr": "x"}] * by_url[url]
 
         original = lab.rpc_call
         lab.rpc_call = fake
         self.addCleanup(lambda: setattr(lab, "rpc_call", original))
 
-    def test_peered_nodes_pass_immediately(self):
-        self.with_peer_counts([[{"addr": "x"}]])
-        self.assertTrue(lab.wait_for_peers(3, timeout_secs=5, poll_secs=0.01))
+    def test_the_pinned_chain_passes(self):
+        self.with_peer_counts([1, 2, 2, 1])
+        self.assertTrue(lab.wait_for_peers(4, timeout_secs=5, poll_secs=0.01))
 
-    def test_asymmetric_peer_counts_are_accepted(self):
-        # A healthy 3-node lab really does report 2/0/1: getpeerinfo lists a
-        # connection from the dialling side only. Grading per node would
-        # reject a fully connected network.
-        self.with_peer_counts([[{"a": 1}, {"a": 2}], [], [{"a": 3}]])
-        self.assertTrue(lab.wait_for_peers(3, timeout_secs=5, poll_secs=0.01))
+    def test_an_extra_link_is_rejected(self):
+        # A real run: seeding every node with every other one formed a star in
+        # one leg and a chain in the next, so legs measured different layouts.
+        self.with_peer_counts([3, 1, 1, 1])
+        self.assertFalse(lab.wait_for_peers(4, timeout_secs=0.5, poll_secs=0.01))
 
     def test_isolated_nodes_are_reported(self):
         # The exact bug a real run hit: a stale peer list produced three live,
         # mining, transaction-accepting nodes that never found each other.
-        self.with_peer_counts([[]])
+        self.with_peer_counts([0, 0, 0])
         self.assertFalse(lab.wait_for_peers(3, timeout_secs=0.5, poll_secs=0.01))
 
     def test_rpc_failure_counts_as_unpeered(self):
@@ -291,6 +288,62 @@ class PeeringCheck(unittest.TestCase):
         lab.rpc_call = boom
         self.addCleanup(lambda: setattr(lab, "rpc_call", original))
         self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
+
+
+class LabConfigRewrite(unittest.TestCase):
+    """Kresko's configs need main's schema and the pinned chain before a node starts."""
+
+    KRESKO_NETWORK = (
+        "[network]\n"
+        'initial_testnet_peers = [\n    "127.0.0.102:18233",\n    "127.0.0.103:18233",\n]\n'
+        'listen_addr = "127.0.0.101:18233"\n'
+        'network = "Testnet"\n'
+        "[network.testnet_parameters]\n"
+        "disable_pow = true\n"
+        "post_blossom_pow_target_spacing = 5\n"
+        "[network.testnet_parameters.activation_heights]\n"
+        "NU5 = 130\n"
+        "[network.testnet_parameters.pre_nu6_funding_streams]\n"
+        "recipients = []\n"
+    )
+
+    def test_custom_parameters_move_to_the_explicit_network_table(self):
+        text = lab.to_node_schema(self.KRESKO_NETWORK)
+        self.assertNotIn("testnet_parameters", text)
+        self.assertNotIn('network = "Testnet"', text)
+        self.assertNotIn("post_blossom_pow_target_spacing", text)
+        self.assertIn("[network.network]\ndisable_pow = true\n", text)
+        self.assertIn("[network.network.activation_heights]", text)
+        # The empty funding-stream tables stay: without them the node falls
+        # back to public Testnet streams and panics on the short halving interval.
+        self.assertIn("[network.network.pre_nu6_funding_streams]", text)
+
+    def test_a_current_schema_config_is_unchanged(self):
+        text = lab.to_node_schema(self.KRESKO_NETWORK)
+        self.assertEqual(lab.to_node_schema(text), text)
+
+    def test_each_node_seeds_only_its_predecessor(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = Path(tmp)
+            for i in range(3):
+                node_dir = lab_dir / "nodes" / lab.node_name(i)
+                node_dir.mkdir(parents=True)
+                (node_dir / "zakura.toml").write_text(self.KRESKO_NETWORK)
+            lab.pin_chain_topology(lab_dir, 3)
+            seeds = [
+                (lab_dir / "nodes" / lab.node_name(i) / "zakura.toml").read_text().split("\n")[1]
+                for i in range(3)
+            ]
+        self.assertEqual(
+            seeds,
+            [
+                f'initial_testnet_peers = ["{lab.node_ip(3)}:18233"]',
+                f'initial_testnet_peers = ["{lab.node_ip(0)}:18233"]',
+                f'initial_testnet_peers = ["{lab.node_ip(1)}:18233"]',
+            ],
+        )
 
 
 class NodeEnvironment(unittest.TestCase):

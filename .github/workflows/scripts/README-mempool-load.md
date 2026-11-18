@@ -88,19 +88,33 @@ fails to bind leaves the lab talking to whatever else owns the port — which in
 practice meant submitting blocks to an unrelated node and getting a confusing
 `rejected`.
 
+**Every run uses the same chain layout.** Seeding every node with every other
+one gave each run a random 3- or 4-link layout (a star in one leg, a 3-hop chain
+in the next), so "reached every node" compared layouts, not pools. After
+`localize-fleet`, the lab seeds node k with node k-1 only, so the nodes form the
+chain 0-1-...-(n-1) and the blaster's node 0 sits at one end. Propagation is
+then measured over 1 to n-1 hops every run.
+
 **`up` gates on peering before returning.** A network whose nodes never find
 each other still runs, still mines, and still accepts transactions — it just
-measures nothing. The gate is on *total* connections (`>= n-1`), not per node:
-`getpeerinfo` reports a connection from the dialling side, so a healthy 3-node
-lab routinely reads `2 / 0 / 1`.
+measures nothing. The gate checks each node's `getpeerinfo` count against the
+chain (`1 / 2 / ... / 2 / 1`), which lists inbound and outbound connections, so a
+missing or extra link fails `up` instead of skewing the run.
+
+**Kresko's configs are rewritten to main's schema.** Kresko renders configs for
+the zakura experiment branch it pins, with custom parameters under
+`[network.testnet_parameters]` next to `network = "Testnet"`. Main accepts custom
+parameters only as the explicit `[network.network]` table, so `localize-fleet` is
+followed by that rewrite, which also drops `post_blossom_pow_target_spacing`.
 
 **`up` is idempotent.** It skips seeding a node that already holds the chain.
 Resubmitting genesis to a node whose tip has moved past it returns a bare
 `rejected`, which reads like a chain failure rather than "this already ran".
 
-**`kresko localize-fleet` owns the peer list.** Kresko bakes peer addresses at
-genesis time. Regenerating them at localize time keeps `up` correct if the node
-count or address base changes; a stale list silently produces a 0-peer network.
+**The lab sets the peer list at `up` time.** Kresko bakes peer addresses at
+genesis time, and a stale list silently produces a 0-peer network. The chain
+seeds are derived from the node count and address base on every `up`, after
+`localize-fleet` regenerates its own list.
 
 **Config value rewrites are addressed by `section.key`.** The same key name
 recurs across sections — `cache_dir` is both the peer cache and the state DB,

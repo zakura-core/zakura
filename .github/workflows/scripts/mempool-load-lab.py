@@ -270,6 +270,56 @@ def localize_fleet(lab: Path, args) -> None:
             str(args.miner_nodes),
         ]
     )
+    for config in sorted((lab / "nodes").glob("*/zakura*.toml")):
+        config.write_text(to_node_schema(config.read_text()))
+    pin_chain_topology(lab, args.node_count)
+
+
+def to_node_schema(text: str) -> str:
+    """Rewrites Kresko's custom-network section into the form zakura main accepts.
+
+    Kresko renders configs for the zakura experiment branch it pins: custom
+    parameters under `[network.testnet_parameters]` next to `network = "Testnet"`,
+    plus `post_blossom_pow_target_spacing`. Main takes custom parameters only as
+    the explicit `[network.network]` table and has no target-spacing key.
+    """
+    if "[network.testnet_parameters" not in text:
+        return text
+    text, replaced = re.subn(r'(?m)^network = "Testnet"\n', "", text)
+    if replaced != 1:
+        raise RuntimeError('expected one `network = "Testnet"` line next to testnet_parameters')
+    text = re.sub(r"(?m)^post_blossom_pow_target_spacing = .*\n", "", text)
+    return text.replace("[network.testnet_parameters", "[network.network")
+
+
+def chain_seed(index: int, node_count: int) -> str:
+    """Returns the one peer node `index` dials in the chain 0-1-...-(n-1).
+
+    Node k dials node k-1. Node 0 gets the address one past the last node,
+    where nothing listens, so it dials no one but still has a seed.
+    """
+    return f"{node_ip(index - 1 if index else node_count)}:{P2P_PORT}"
+
+
+def pin_chain_topology(lab: Path, node_count: int) -> None:
+    """Seeds each node with only its predecessor, so every run has the same chain.
+
+    Seeding every node with every other one left each run a random 3- or 4-link
+    layout, a star in one leg and a 3-hop chain in the next, which swamped the
+    pool difference in the propagation numbers. The blaster submits to node 0,
+    so the chain measures relay over 1 to n-1 hops.
+    """
+    # Only the run config peers; the bootstrap config runs with P2P off.
+    for index in range(node_count):
+        config = lab / "nodes" / node_name(index) / "zakura.toml"
+        text, replaced = re.subn(
+            r"(?ms)^initial_testnet_peers = \[.*?\]$",
+            f'initial_testnet_peers = ["{chain_seed(index, node_count)}"]',
+            config.read_text(),
+        )
+        if replaced != 1:
+            raise RuntimeError(f"{config}: expected one initial_testnet_peers list")
+        config.write_text(text)
 
 
 # ---------------------------------------------------------------------------- #
@@ -531,34 +581,31 @@ def wait_for_chain_convergence(
 
 
 def wait_for_peers(node_count: int, timeout_secs: int = 120, poll_secs: float = 5.0) -> bool:
-    """Wait until the fleet has enough connections to form a connected graph.
+    """Wait until every node's peer count matches the chain `pin_chain_topology` set.
 
-    Graded on the total across nodes, not per node: `getpeerinfo` reports a
-    connection from the dialling side, so in a healthy 3-node lab the counts
-    are routinely 2/0/1. Requiring every node to report a peer would reject a
-    perfectly connected network. n-1 connections is the minimum that can span
-    n nodes, so anything less is definitely partitioned.
+    `getpeerinfo` lists inbound and outbound connections, so the chain's ends
+    report 1 and every inner node reports 2. Any other count means a link is
+    missing or an extra one formed, and the run would measure a different layout.
     """
-    needed = node_count - 1
+    want = [1] + [2] * (node_count - 2) + [1]
     deadline = time.monotonic() + timeout_secs
-    counts: dict[str, int] = {}
+    counts: list[int] = []
     while True:
-        counts = {}
+        counts = []
         for i in range(node_count):
             url = f"http://{node_ip(i)}:{RPC_PORT}"
             try:
-                counts[node_name(i)] = len(rpc_call(url, "getpeerinfo", timeout=5))
+                counts.append(len(rpc_call(url, "getpeerinfo", timeout=5)))
             except (urllib.error.URLError, OSError, RuntimeError, json.JSONDecodeError):
-                counts[node_name(i)] = 0
-        if sum(counts.values()) >= needed:
+                counts.append(0)
+        if counts == want:
             print(f"peer connections: {counts}", flush=True)
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(poll_secs)
     print(
-        f"only {sum(counts.values())} peer connection(s) after {timeout_secs}s, "
-        f"need {needed}: {counts}",
+        f"peer counts {counts} after {timeout_secs}s, want the chain's {want}",
         file=sys.stderr,
     )
     return False

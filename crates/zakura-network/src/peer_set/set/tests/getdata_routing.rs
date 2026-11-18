@@ -1752,3 +1752,163 @@ async fn completed_or_expired_checks_send_no_block_request() {
         Some(Message::GetData(vec![BLOCK_HASH.into()]))
     );
 }
+
+/// A check that sent nothing returns the subscriptions installed during candidate selection.
+async fn wait_for_candidate(
+    network: &mut tower::util::BoxCloneSyncService<Request, Response, BoxError>,
+    attempt: &crate::BlockHedge,
+) -> impl std::future::Future<Output = bool> {
+    let error = network
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt: attempt.clone(),
+        })
+        .await
+        .unwrap_err()
+        .downcast::<crate::NoFasterBlockSource>()
+        .unwrap();
+    error.wait_for_change()
+}
+
+#[tokio::test(start_paused = true)]
+async fn hedge_wakes_for_a_busy_announcers_transaction_reply_without_other_traffic() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _far = measured_peer(&mut far, &registry, Some(242));
+    let _near = measured_peer(&mut near, &registry, Some(5));
+    let tx = test_transaction();
+    let (reply, _) = near
+        .send_direct(Request::TransactionsById([tx.id()].into()))
+        .await;
+
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    announce_block(&mut peers, &mut guard, &far).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_block(&mut peers).await;
+    let (mut network, _advertiser) = crate::peer_set::driver::spawn(peers, Default::default());
+    let inventory = guard.inventory_sender().as_ref().unwrap();
+    let announced = wait_for_candidate(&mut network, &attempt).await;
+    inventory
+        .send(InventoryStatus::new_available(BLOCK_HASH.into(), near.addr))
+        .unwrap();
+    // The event can arrive before the downloader first polls its wait.
+    assert!(announced.await);
+    assert_eq!(attempt.elapsed_if_open(), Some(Duration::ZERO));
+
+    let idle = wait_for_candidate(&mut network, &attempt).await;
+    tokio::pin!(idle);
+    for hash in [BLOCK_HASH, block::Hash([3; 32])] {
+        inventory
+            .send(InventoryStatus::new_available(hash.into(), near.addr))
+            .unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            idle.as_mut().now_or_never().is_none(),
+            "duplicate and unrelated inventory leave the download asleep"
+        );
+    }
+    near.peer_inbound.send(Ok(Message::Tx(tx))).await.unwrap();
+    reply.await.unwrap();
+    assert!(idle.await);
+    let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+        hash: BLOCK_HASH,
+        attempt: attempt.clone(),
+    }));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        attempt.started(),
+        "no timer fired"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hedge_rechecks_at_the_overdue_and_stall_deadlines_without_polling() {
+    for (score, expected_ms) in [(Some(5), 242), (None, 742)] {
+        let _init_guard = zakura_test::init();
+        let registry = crate::peer_registry::PeerRegistry::default();
+        let mut far = TestPeer::spawn(1);
+        let mut near = TestPeer::spawn(2);
+        let _far = measured_peer(&mut far, &registry, Some(242));
+        let _near = measured_peer(&mut near, &registry, score);
+        let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+        announce_block(&mut peers, &mut guard, &far).await;
+        let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        let _first = request_block(&mut peers).await;
+        let (mut network, _advertiser) = crate::peer_set::driver::spawn(peers, Default::default());
+
+        let announced = wait_for_candidate(&mut network, &attempt).await;
+        tokio::pin!(announced);
+        tokio::time::advance(Duration::from_millis(195)).await;
+        assert!(announced.as_mut().now_or_never().is_none());
+        guard
+            .inventory_sender()
+            .as_ref()
+            .unwrap()
+            .send(InventoryStatus::new_available(BLOCK_HASH.into(), near.addr))
+            .unwrap();
+        assert!(announced.await);
+        for deadline in [242, 742].into_iter().take_while(|ms| *ms <= expected_ms) {
+            let change = wait_for_candidate(&mut network, &attempt).await;
+            tokio::pin!(change);
+            let elapsed = attempt.elapsed_if_open().unwrap();
+            tokio::time::advance(Duration::from_millis(deadline - 1) - elapsed).await;
+            assert!(
+                change.as_mut().now_or_never().is_none(),
+                "no wake between scoring deadlines"
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(change.await);
+        }
+        let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt: attempt.clone(),
+        }));
+        assert_eq!(
+            near.written_now().await,
+            Some(Message::GetData(vec![BLOCK_HASH.into()]))
+        );
+        assert_eq!(
+            attempt.started().elapsed(),
+            Duration::from_millis(expected_ms)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hedge_wakes_when_an_idle_announcer_acquires_a_fast_score() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _far = measured_peer(&mut far, &registry, Some(242));
+    let (_near, samples) = measured_peer(&mut near, &registry, None);
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    announce_block(&mut peers, &mut guard, &far).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first = request_block(&mut peers).await;
+    announce_block(&mut peers, &mut guard, &near).await;
+    let (mut network, _advertiser) = crate::peer_set::driver::spawn(peers, Default::default());
+    let changed = wait_for_candidate(&mut network, &attempt).await;
+    samples.record_response(Duration::from_millis(5));
+    assert!(changed.await);
+    let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+        hash: BLOCK_HASH,
+        attempt: attempt.clone(),
+    }));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_eq!(tokio::time::Instant::now(), attempt.started());
+}

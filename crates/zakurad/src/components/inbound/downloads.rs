@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use futures::{
@@ -854,14 +853,17 @@ where
     }
 }
 
-/// How often a block download asks the peer set whether another announcer should deliver the
-/// block sooner than the first request.
-const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+/// Close a queued check even if the entire download is cancelled.
+struct CloseHedgeOnDrop(zn::BlockHedge);
 
-/// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
-/// until it sends one, and returns that request's result.
-///
-/// Returns [`zn::NoFasterBlockSource`] once the dispatch window closes without a second request.
+impl Drop for CloseHedgeOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// Reconsider the second request on an announcer change or a scoring deadline. The
+/// five-second limit applies to waiting and queueing. A dispatched request may finish later.
 async fn request_block_again<ZN>(
     network: ZN,
     hash: block::Hash,
@@ -871,21 +873,32 @@ where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
-    loop {
-        tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
-        if attempt.elapsed_if_open().is_none() {
-            return Err(zn::NoFasterBlockSource.into());
+    let window = attempt.clone();
+    let checks = async move {
+        while attempt.elapsed_if_open().is_some() {
+            let result = network
+                .clone()
+                .oneshot(zn::Request::BlockByHashHedge {
+                    hash,
+                    attempt: attempt.clone(),
+                })
+                .await;
+            let error = match result {
+                Ok(response) => return Ok(response),
+                Err(error) => error.downcast::<zn::NoFasterBlockSource>()?,
+            };
+            if !error.wait_for_change().await {
+                break;
+            }
         }
-        let result = network
-            .clone()
-            .oneshot(zn::Request::BlockByHashHedge {
-                hash,
-                attempt: attempt.clone(),
-            })
-            .await;
-        match result {
-            Err(error) if error.is::<zn::NoFasterBlockSource>() => continue,
-            result => return result,
+        Err(zn::NoFasterBlockSource::default().into())
+    };
+    tokio::pin!(checks);
+    tokio::select! {
+        biased;
+        result = &mut checks => result,
+        _ = tokio::time::sleep_until(window.started() + zn::BlockHedge::WINDOW) => {
+            if window.close() { checks.await } else { Err(zn::NoFasterBlockSource::default().into()) }
         }
     }
 }
@@ -1345,6 +1358,7 @@ where
     }
 
     let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
+    let _close_on_drop = CloseHedgeOnDrop(attempt.clone());
     let mut first = network
         .clone()
         .oneshot(request)

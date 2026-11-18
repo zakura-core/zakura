@@ -15,9 +15,55 @@ use crate::{
 /// other peer that announced the block is expected to deliver it clearly sooner than the first
 /// request, and the first request has not stalled. No peer was contacted, so the caller can ask
 /// again later.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Default, Error)]
 #[error("no peer is expected to deliver the block sooner than the first request")]
-pub struct NoFasterBlockSource;
+pub struct NoFasterBlockSource {
+    retry: Option<BlockSourceWait>,
+}
+
+/// Everything that can change a declined decision. Dropping it unsubscribes the attempt.
+#[derive(Debug)]
+struct BlockSourceWait {
+    pub inventory: tokio::sync::oneshot::Receiver<()>,
+    pub connections: Vec<tokio::sync::watch::Receiver<()>>,
+    pub deadline: tokio::time::Instant,
+}
+
+impl NoFasterBlockSource {
+    /// Decline this check and tell the caller when to reconsider. Dropping the inventory
+    /// sender signals a routing change. Connection receivers retain changes since subscription.
+    pub fn waiting(
+        inventory: tokio::sync::oneshot::Receiver<()>,
+        connections: Vec<tokio::sync::watch::Receiver<()>>,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            retry: Some(BlockSourceWait {
+                inventory,
+                connections,
+                deadline,
+            }),
+        }
+    }
+
+    /// Wait for an announcement, a candidate connection change, or the next scoring deadline.
+    /// Returns false when the peer set has no further decisions for this download.
+    pub async fn wait_for_change(self) -> bool {
+        use futures::{stream::FuturesUnordered, StreamExt};
+
+        let Some(mut wait) = self.retry else {
+            return false;
+        };
+        let mut changes: FuturesUnordered<_> =
+            wait.connections.iter_mut().map(|rx| rx.changed()).collect();
+        tokio::select! {
+            _ = &mut wait.inventory => {}
+            _ = changes.next(), if !changes.is_empty() => {}
+            _ = tokio::time::sleep_until(wait.deadline) => {}
+        }
+        true
+    }
+}
 
 /// A wrapper around `Arc<PeerError>` that implements `Error`.
 ///

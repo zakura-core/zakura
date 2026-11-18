@@ -936,6 +936,9 @@ where
         );
 
         if svc.remote_version() >= self.minimum_peer_version.current() {
+            if was_unready {
+                self.inventory_registry.peer_became_ready(key);
+            }
             self.ready_services.insert(key, svc);
         } else {
             std::mem::drop(svc);
@@ -1458,6 +1461,7 @@ where
             let fut = svc.call(req);
             self.push_unready(peer, svc);
             if let (true, InventoryHash::Block(block_hash)) = (self.block_second_request, hash) {
+                self.inventory_registry.first_request_changed(block_hash);
                 self.first_block_requests.insert(
                     block_hash,
                     peer,
@@ -1606,7 +1610,7 @@ where
     }
 
     /// Sends a second request for a gossiped block, if another announcer should deliver it
-    /// sooner than the first request and the dispatch window is still open.
+    /// sooner than the first request, which has been outstanding for `first_request_waited`.
     ///
     /// The candidates are the idle peers that announced the block, other than the one the first
     /// request went to, and the best is the one expected to answer soonest. It is asked when it
@@ -1621,7 +1625,7 @@ where
         hash: block::Hash,
         attempt: crate::BlockHedge,
     ) -> <Self as tower::Service<Request>>::Future {
-        let not_yet = || async { Err(NoFasterBlockSource.into()) }.boxed();
+        let not_yet = || async { Err(NoFasterBlockSource::default().into()) }.boxed();
         if !self.block_second_request {
             return not_yet();
         }
@@ -1631,14 +1635,25 @@ where
             Some(first) => (Some(first.peer), first.score),
             None => (None, None),
         };
+        // Subscribe before reading each independent source. Changes between scoring and
+        // the downloader first polling its receiver are retained by the channel.
+        let inventory = self.inventory_registry.watch_block(hash, first_peer);
+        let mut connections = Vec::new();
         let candidates: Vec<(D::Key, Option<Duration>)> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
             .filter(|addr| Some(**addr) != first_peer)
             .filter_map(|addr| {
                 let svc = self.ready_services.get(addr)?;
-                svc.is_preferred_block_source()
-                    .then(|| (*addr, svc.block_gossip.delivery_score()))
+                let idle = svc.watch_idle();
+                if !svc.is_preferred_block_source() {
+                    connections.push(idle);
+                    return None;
+                }
+                if let Some(registry) = &svc.block_gossip.registry {
+                    connections.push(registry.faster.subscribe());
+                }
+                Some((*addr, svc.block_gossip.delivery_score()))
             })
             .collect();
         // A measured peer comes before an unmeasured one.
@@ -1650,22 +1665,29 @@ where
         let Some(first_request_waited) = attempt.elapsed_if_open() else {
             return not_yet();
         };
-        let Some(reason) =
-            second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
-        else {
-            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
-            return not_yet();
-        };
-        let Some((peer, score)) = best else {
-            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
-            return not_yet();
+        let reason =
+            second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s));
+        let (Some(reason), Some((peer, score))) = (reason, best) else {
+            if reason.is_none() {
+                metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+            } else {
+                metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+            }
+            let next = super::second_request::decision_times(first_score)
+                .into_iter()
+                .find(|time| *time > first_request_waited)
+                .unwrap_or(crate::BlockHedge::WINDOW)
+                .min(crate::BlockHedge::WINDOW);
+            let wait =
+                NoFasterBlockSource::waiting(inventory, connections, attempt.started() + next);
+            return async move { Err(wait.into()) }.boxed();
         };
         if !attempt.claim_dispatch() {
             return not_yet();
         }
         let mut svc = self
             .take_ready_service(&peer)
-            .expect("the selected candidate is still in the ready set");
+            .expect("candidate is still ready");
         if let Some(first) = self.first_block_requests.get_mut(&hash) {
             first.second_sent = true;
         }
@@ -1815,6 +1837,7 @@ where
         // Drain stall events first, so disconnects free up slots that
         // `poll_discover` can fill in the same poll cycle.
         self.drain_stall_events(cx);
+        self.inventory_registry.maintain_watches(cx)?;
 
         // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
         // can be infrequent if our connection slots are full, or we're connected to all

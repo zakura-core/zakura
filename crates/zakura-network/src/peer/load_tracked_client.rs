@@ -136,6 +136,11 @@ impl LoadTrackedClient {
         self.can_send_request_now() && !self.has_unanswered_block_request()
     }
 
+    /// Subscribes before reading the request slot so a concurrent completion is observed.
+    pub(crate) fn watch_idle(&self) -> tokio::sync::watch::Receiver<()> {
+        self.request_slot.idle.subscribe()
+    }
+
     /// Retrieve the peer's self-reported chain height from its handshake.
     pub(crate) fn remote_start_height(&self) -> zakura_chain::block::Height {
         self.connection_info.remote.start_height

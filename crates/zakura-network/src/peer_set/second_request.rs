@@ -58,6 +58,17 @@ impl SecondRequestReason {
     }
 }
 
+/// Elapsed times at which waiting alone can change the decision.
+pub(super) fn decision_times(score: Option<Duration>) -> [Duration; 2] {
+    let score = score.unwrap_or(UNSCORED_FIRST_SCORE);
+    [
+        score,
+        score
+            .saturating_mul(2)
+            .max(score.saturating_add(STALL_SLACK)),
+    ]
+}
+
 /// Decides whether to send a second request for a block.
 ///
 /// - `first_score` is the first peer's expected answer time when it was asked, if measured, or
@@ -76,8 +87,7 @@ pub(super) fn second_request_reason(
     waited: Duration,
     best_candidate_score: Option<Duration>,
 ) -> Option<SecondRequestReason> {
-    let first_score = first_score.unwrap_or(UNSCORED_FIRST_SCORE);
-    let stall_after = (first_score * 2).max(first_score + STALL_SLACK);
+    let [first_score, stall_after] = decision_times(first_score);
     if waited >= stall_after {
         return Some(SecondRequestReason::Stalled);
     }

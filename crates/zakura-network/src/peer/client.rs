@@ -97,6 +97,9 @@ pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
     busy: Arc<AtomicBool>,
 
+    /// Wakes downloads waiting for this connection to become usable.
+    pub(super) idle: tokio::sync::watch::Sender<()>,
+
     /// True if the connection's last block request ended unanswered, until a peer delivers a
     /// requested block on this connection.
     block_request_unanswered: Arc<AtomicBool>,
@@ -105,7 +108,9 @@ pub(crate) struct RequestSlot {
 impl RequestSlot {
     /// Records whether the connection is handling a client request (or can no longer take one).
     pub(crate) fn set_busy(&self, busy: bool) {
-        self.busy.store(busy, Ordering::Release);
+        if self.busy.swap(busy, Ordering::AcqRel) && !busy {
+            let _ = self.idle.send(());
+        }
     }
 
     /// Returns true if the connection is waiting for its next client request.
@@ -115,8 +120,13 @@ impl RequestSlot {
 
     /// Records whether the connection's last block request ended unanswered.
     pub(crate) fn set_block_request_unanswered(&self, unanswered: bool) {
-        self.block_request_unanswered
-            .store(unanswered, Ordering::Release);
+        if self
+            .block_request_unanswered
+            .swap(unanswered, Ordering::AcqRel)
+            && !unanswered
+        {
+            let _ = self.idle.send(());
+        }
     }
 
     /// Returns true if the connection's last block request ended unanswered.

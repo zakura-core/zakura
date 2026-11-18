@@ -165,6 +165,7 @@ impl PeerRegistry {
                 registry: self.clone(),
                 key,
                 delivery_trace: DeliveryTrace::default(),
+                faster: Default::default(),
             },
         )
     }
@@ -290,6 +291,8 @@ impl PeerRegistry {
 pub(crate) struct PeerRegistryUpdater {
     registry: PeerRegistry,
     key: ConnectionKey,
+    /// A first measurement or an improved estimate can make an idle announcer qualify.
+    pub(crate) faster: tokio::sync::watch::Sender<()>,
     /// Where this connection's delivery samples are traced.
     delivery_trace: DeliveryTrace,
 }
@@ -364,6 +367,9 @@ impl PeerRegistryUpdater {
         let score = estimate
             .score()
             .expect("an estimate that just recorded a sample has a score");
+        if score_before.is_none_or(|before| score < before) {
+            let _ = self.faster.send(());
+        }
         self.delivery_trace
             .sample(kind, sample, score_before, score, estimate.weight());
     }

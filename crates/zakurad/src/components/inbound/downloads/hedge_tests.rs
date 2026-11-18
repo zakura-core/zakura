@@ -16,26 +16,12 @@ use super::*;
 
 type TestNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
 
-const CHECK: Duration = SECOND_REQUEST_CHECK_INTERVAL;
+const PROMPT: Duration = Duration::from_millis(10);
 
 /// A request the network service received, and the channel that answers it.
 struct Sent {
     request: zn::Request,
     answer: oneshot::Sender<Result<zn::Response, BoxError>>,
-}
-
-impl Sent {
-    /// Answers a second-request check as a peer set that found no faster peer.
-    fn not_yet(self) {
-        assert!(
-            matches!(self.request, zn::Request::BlockByHashHedge { .. }),
-            "only a second-request check can be answered with not yet: {:?}",
-            self.request
-        );
-        self.answer
-            .send(Err(zn::NoFasterBlockSource.into()))
-            .expect("the check is waiting for its answer");
-    }
 }
 
 fn network() -> (TestNetwork, mpsc::UnboundedReceiver<Sent>) {
@@ -99,9 +85,9 @@ fn from_second() -> zn::Response {
     )
 }
 
-/// Waits for the next request, at most two check intervals on the paused clock.
+/// Waits for the next request, with a short timeout on the paused clock.
 async fn next_sent(sent: &mut mpsc::UnboundedReceiver<Sent>) -> Sent {
-    tokio::time::timeout(CHECK * 2, sent.recv())
+    tokio::time::timeout(PROMPT * 2, sent.recv())
         .await
         .expect("a request is sent promptly")
         .expect("the network service is alive")
@@ -119,7 +105,7 @@ async fn next_dispatched(sent: &mut mpsc::UnboundedReceiver<Sent>) -> Sent {
 
 /// Waits long enough for any further check to be sent, and asserts none was.
 async fn assert_nothing_more_sent(sent: &mut mpsc::UnboundedReceiver<Sent>, why: &str) {
-    tokio::time::sleep(CHECK * 10).await;
+    tokio::time::sleep(PROMPT * 10).await;
     assert!(sent.try_recv().is_err(), "{why}");
 }
 
@@ -137,37 +123,11 @@ async fn without_second_requests_only_the_first_request_is_sent() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_peer_set_is_asked_again_until_the_first_request_answers() {
-    let (network, mut sent) = network();
-    let download = tokio::spawn(download_block(network, hash(), None, true));
-
-    let first = next_sent(&mut sent).await;
-    for checks in 1..=3 {
-        let check = next_sent(&mut sent).await;
-        let zn::Request::BlockByHashHedge {
-            hash: requested,
-            ref attempt,
-        } = check.request
-        else {
-            panic!("expected a second-request check");
-        };
-        assert_eq!(requested, hash());
-        assert_eq!(attempt.elapsed_if_open(), Some(CHECK * checks));
-        check.not_yet();
-    }
-
-    first.answer.send(Ok(from_first())).unwrap();
-    assert_copy(download.await.unwrap().unwrap(), first_peer());
-    assert_nothing_more_sent(&mut sent, "an answered block is not checked again").await;
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_second_request_that_answers_first_wins() {
     let (network, mut sent) = network();
     let download = tokio::spawn(download_block(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
-    next_sent(&mut sent).await.not_yet();
     // The peer set sent this one, so it answers with the block.
     let second = next_dispatched(&mut sent).await;
 
@@ -228,7 +188,7 @@ async fn a_failed_first_request_stops_the_checks_and_returns_its_error() {
     let check = next_sent(&mut sent).await;
     first.answer.send(Err("peer disconnected".into())).unwrap();
 
-    let error = tokio::time::timeout(CHECK, download)
+    let error = tokio::time::timeout(PROMPT, download)
         .await
         .expect("the failed first request does not wait for a queued check")
         .unwrap()
@@ -245,16 +205,11 @@ async fn checks_stop_after_the_check_window() {
     let download = tokio::spawn(download_block(network, hash(), None, true));
 
     let first = next_sent(&mut sent).await;
-    let mut checks = 0;
-    while let Ok(Some(check)) = tokio::time::timeout(CHECK * 2, sent.recv()).await {
-        check.not_yet();
-        checks += 1;
-    }
-    let expected = zn::BlockHedge::WINDOW.as_millis() / CHECK.as_millis();
-    assert!(
-        (expected - 1..=expected).contains(&checks),
-        "about one check per interval during the window, got {checks}"
-    );
+    let check = next_sent(&mut sent).await;
+    tokio::time::advance(zn::BlockHedge::WINDOW).await;
+    tokio::task::yield_now().await;
+    assert!(check.answer.is_closed(), "an undispatched check expires");
+    assert!(sent.try_recv().is_err(), "no periodic checks");
 
     first.answer.send(Ok(from_first())).unwrap();
     assert_copy(download.await.unwrap().unwrap(), first_peer());
@@ -287,7 +242,7 @@ async fn a_failed_first_request_waits_for_an_already_dispatched_second_request()
 
     first.answer.send(Err("peer disconnected".into())).unwrap();
     assert!(
-        tokio::time::timeout(CHECK, &mut download).await.is_err(),
+        tokio::time::timeout(PROMPT, &mut download).await.is_err(),
         "the dispatched second request is still outstanding"
     );
 
@@ -313,7 +268,7 @@ async fn a_reply_without_the_requested_body_cannot_win() {
         let second = next_dispatched(&mut sent).await;
         first.answer.send(Ok(response)).unwrap();
         assert!(
-            tokio::time::timeout(CHECK, &mut download).await.is_err(),
+            tokio::time::timeout(PROMPT, &mut download).await.is_err(),
             "the other request can still deliver"
         );
         second.answer.send(Ok(from_second())).unwrap();
@@ -334,7 +289,7 @@ async fn a_missing_second_reply_leaves_the_first_peer_eligible() {
         ])))
         .unwrap();
     assert!(
-        tokio::time::timeout(CHECK, &mut download).await.is_err(),
+        tokio::time::timeout(PROMPT, &mut download).await.is_err(),
         "the other request can still deliver"
     );
     first.answer.send(Ok(from_first())).unwrap();
@@ -357,7 +312,7 @@ async fn two_failed_replies_preserve_the_first_peers_hash_error() {
         };
         early.0.answer.send(Ok(early.1)).unwrap();
         assert!(
-            tokio::time::timeout(CHECK, &mut download).await.is_err(),
+            tokio::time::timeout(PROMPT, &mut download).await.is_err(),
             "the other request can still deliver"
         );
         late.0.answer.send(Ok(late.1)).unwrap();
@@ -365,4 +320,70 @@ async fn two_failed_replies_preserve_the_first_peers_hash_error() {
         assert!(error.to_string().contains("peer returned block"));
         assert_eq!(source, Some(first_peer()));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_the_download_closes_a_queued_hedge() {
+    let (network, mut sent) = network();
+    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let _first = next_sent(&mut sent).await;
+    let queued = next_sent(&mut sent).await;
+    download.abort();
+    assert!(download.await.unwrap_err().is_cancelled());
+    let zn::Request::BlockByHashHedge { attempt, .. } = queued.request else {
+        panic!("expected hedge")
+    };
+    assert!(!attempt.claim_dispatch());
+}
+
+/// Drive the normal downloader entry point and count every call received by the network.
+#[tokio::test(start_paused = true)]
+async fn a_declined_check_retries_once_per_event_or_deadline() {
+    let (network, mut sent) = network();
+    let start = tokio::time::Instant::now();
+    let download = tokio::spawn(download_block(network, hash(), None, true));
+    let first = next_sent(&mut sent).await;
+    let (signal, changed) = oneshot::channel();
+    let (score, score_changed) = tokio::sync::watch::channel(());
+    let deadline = start + Duration::from_millis(242);
+    let initial = next_sent(&mut sent).await;
+    initial
+        .answer
+        .send(Err(zn::NoFasterBlockSource::waiting(
+            changed,
+            vec![score_changed],
+            deadline,
+        )
+        .into()))
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(195)).await;
+    tokio::task::yield_now().await;
+    assert!(sent.try_recv().is_err());
+    score.send(()).unwrap();
+    drop(signal);
+    let announced = next_sent(&mut sent).await;
+    let (_keep_open, changed) = oneshot::channel();
+    announced
+        .answer
+        .send(Err(zn::NoFasterBlockSource::waiting(
+            changed,
+            vec![],
+            deadline,
+        )
+        .into()))
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(46)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        sent.try_recv().is_err(),
+        "both concurrent events produced just one check"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let dispatched = next_dispatched(&mut sent).await;
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    tokio::time::advance(zn::BlockHedge::WINDOW).await;
+    dispatched.answer.send(Ok(from_second())).unwrap();
+    assert_copy(download.await.unwrap().unwrap(), second_peer());
+    first.answer.send(Ok(from_first())).unwrap();
+    assert!(sent.try_recv().is_err());
 }

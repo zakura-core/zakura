@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -34,10 +34,14 @@ fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
 #[derive(Clone, Debug)]
 pub struct BlockHedge {
     started: Instant,
-    closed: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 impl BlockHedge {
+    const OPEN: u8 = 0;
+    const DISPATCHED: u8 = 1;
+    const CLOSED: u8 = 2;
+
     /// How long after starting a download the peer set may dispatch a second request.
     pub const WINDOW: Duration = Duration::from_secs(5);
 
@@ -45,31 +49,51 @@ impl BlockHedge {
     pub fn new(started: Instant) -> Self {
         Self {
             started,
-            closed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(AtomicU8::new(Self::OPEN)),
         }
     }
 
+    /// When the download started, including any time spent waiting for network readiness.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
     /// Close the window when the first request finishes. Returns whether dispatch already won
-    /// the claim, in which case the second request must be allowed to finish. Call once.
+    /// the claim, in which case the second request must be allowed to finish.
     pub fn close(&self) -> bool {
-        self.closed.swap(true, Ordering::Relaxed)
+        self.state.compare_exchange(
+            Self::OPEN,
+            Self::CLOSED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) == Err(Self::DISPATCHED)
     }
 
     /// Return how long the download has waited if a second request can still be dispatched.
     pub fn elapsed_if_open(&self) -> Option<Duration> {
         let elapsed = self.started.elapsed();
-        (!self.closed.load(Ordering::Relaxed) && elapsed < Self::WINDOW).then_some(elapsed)
+        (self.state.load(Ordering::Relaxed) == Self::OPEN && elapsed < Self::WINDOW)
+            .then_some(elapsed)
     }
 
     /// Claim dispatch at most once, unless completion or expiry has closed the window.
     pub fn claim_dispatch(&self) -> bool {
-        self.started.elapsed() < Self::WINDOW && !self.closed.swap(true, Ordering::Relaxed)
+        self.started.elapsed() < Self::WINDOW
+            && self
+                .state
+                .compare_exchange(
+                    Self::OPEN,
+                    Self::DISPATCHED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
     }
 }
 
 impl PartialEq for BlockHedge {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.closed, &other.closed)
+        Arc::ptr_eq(&self.state, &other.state)
     }
 }
 

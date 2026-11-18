@@ -15,7 +15,8 @@ use tokio::{
 };
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
 
-use zakura_chain::serialization::AtLeastOne;
+use tokio::sync::oneshot;
+use zakura_chain::{block, serialization::AtLeastOne};
 
 use crate::{
     constants::INVENTORY_ROTATION_INTERVAL,
@@ -98,6 +99,9 @@ pub struct InventoryRegistry {
     /// Map tracking inventory statuses from the previous interval period.
     prev: IndexMap<InventoryHash, IndexMap<PeerSocketAddr, InventoryMarker>>,
 
+    /// One registration per waiting download. The owner prunes dropped receivers.
+    watches: Vec<BlockWatch>,
+
     /// Stream of incoming inventory statuses to register.
     inv_stream: Pin<
         Box<dyn Stream<Item = Result<InventoryChange, BroadcastStreamRecvError>> + Send + 'static>,
@@ -108,6 +112,12 @@ pub struct InventoryRegistry {
 
     /// Whether peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
+}
+
+struct BlockWatch {
+    hash: block::Hash,
+    first_peer: Option<PeerSocketAddr>,
+    wake: oneshot::Sender<()>,
 }
 
 impl std::fmt::Debug for InventoryRegistry {
@@ -220,10 +230,53 @@ impl InventoryRegistry {
         Self {
             current: Default::default(),
             prev: Default::default(),
+            watches: Vec::new(),
             inv_stream: BroadcastStream::new(inv_stream).boxed(),
             interval: IntervalStream::new(interval),
             expose_peer_addresses,
         }
+    }
+
+    pub(super) fn watch_block(
+        &mut self,
+        hash: block::Hash,
+        first_peer: Option<PeerSocketAddr>,
+    ) -> oneshot::Receiver<()> {
+        let (wake, rx) = oneshot::channel();
+        self.watches.push(BlockWatch {
+            hash,
+            first_peer,
+            wake,
+        });
+        rx
+    }
+
+    /// The owner must drain incoming inventory even when no routing request is queued.
+    pub(super) fn maintain_watches(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        self.watches
+            .retain_mut(|watch| watch.wake.poll_closed(cx).is_pending());
+        if !self.watches.is_empty() {
+            let _ = self.poll_inventory(cx)?;
+        }
+        Ok(())
+    }
+
+    /// Dropping the sender completes one coalesced wake for this block.
+    pub(super) fn first_request_changed(&mut self, hash: block::Hash) {
+        self.watches.retain(|watch| watch.hash != hash);
+    }
+
+    pub(super) fn peer_became_ready(&mut self, addr: PeerSocketAddr) {
+        self.watches.retain(|watch| {
+            let inv = InventoryHash::Block(watch.hash);
+            watch.first_peer == Some(addr)
+                || !self
+                    .current
+                    .get(&inv)
+                    .and_then(|peers| peers.get(&addr))
+                    .or_else(|| self.prev.get(&inv).and_then(|peers| peers.get(&addr)))
+                    .is_some_and(InventoryMarker::is_available)
+        });
     }
 
     /// Returns an iterator over addrs of peers that have recently advertised `hash` in their inventory.
@@ -413,6 +466,18 @@ impl InventoryRegistry {
             }
 
             let replaced_status = hash_peers.insert(addr, new_status);
+            if let Block(hash) = inv {
+                if !self.watches.is_empty()
+                    && new_status.is_available()
+                    && !replaced_status
+                        .as_ref()
+                        .or_else(|| self.prev.get(&inv).and_then(|peers| peers.get(&addr)))
+                        .is_some_and(InventoryMarker::is_available)
+                {
+                    self.watches
+                        .retain(|watch| watch.hash != hash || watch.first_peer == Some(addr));
+                }
+            }
 
             debug!(
                 ?new_status,

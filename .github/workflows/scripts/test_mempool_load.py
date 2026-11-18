@@ -744,7 +744,16 @@ class Verdict(unittest.TestCase):
         result["throughput"]["submitted"] = 12
         verdict, reasons = monitor.grade_run(result, self.make_args())
         self.assertEqual(verdict, "degraded")
-        self.assertTrue(any("12 submissions" in r for r in reasons))
+        self.assertTrue(any("attempts" in r for r in reasons))
+
+    def test_heavy_rejects_are_graded_on_attempts(self):
+        # 40 successes and 20 rejects is 60 attempts, past the minimum of 50,
+        # though the successes alone are not.
+        result = self.healthy_result()
+        result["throughput"].update({"submitted": 40, "node_rejects": 20, "reject_rate": 20 / 60})
+        verdict, reasons = monitor.grade_run(result, self.make_args())
+        self.assertEqual(verdict, "failed")
+        self.assertTrue(any("reject rate" in r for r in reasons))
 
     def test_a_frozen_chain_fails_the_run(self):
         # The headline "green run that measured nothing" case.

@@ -319,15 +319,18 @@ def grade_run(result: dict, args) -> tuple[str, list[str]]:
         reasons.append("txblast submitted zero transactions")
     # Guarded on sample count: throughput here is bounded by Orchard proving, so
     # a short run submits tens of transactions, where one reject is already
-    # several percent. Grading that rate would fail healthy runs on noise.
+    # several percent. Grading that rate would fail healthy runs on noise. The
+    # count is the rate's own denominator, successes plus node rejects, so a
+    # run the node rejected heavily is still graded.
+    attempts = throughput["submitted"] + throughput["node_rejects"]
     if (
         throughput["reject_rate"] is not None
-        and throughput["submitted"] >= args.min_graded_submissions
+        and attempts >= args.min_graded_submissions
         and throughput["reject_rate"] > args.max_reject_rate
     ):
         reasons.append(
-            f"reject rate {throughput['reject_rate']:.2%} over {throughput['submitted']} "
-            f"submissions exceeds the {args.max_reject_rate:.2%} threshold"
+            f"reject rate {throughput['reject_rate']:.2%} over {attempts} "
+            f"attempts exceeds the {args.max_reject_rate:.2%} threshold"
         )
     if not convergence["converged"]:
         reasons.append(
@@ -354,9 +357,9 @@ def grade_run(result: dict, args) -> tuple[str, list[str]]:
     if reasons:
         return "failed", reasons
     # A run can be clean but thin -- flag it rather than calling it a pass.
-    if throughput["submitted"] < args.min_graded_submissions:
+    if attempts < args.min_graded_submissions:
         return "degraded", [
-            f"only {throughput['submitted']} submissions, below the "
+            f"only {attempts} attempts, below the "
             f"{args.min_graded_submissions} needed to grade rejects"
         ]
     if result["propagation"]["txids_observed"] < args.min_txids_observed:

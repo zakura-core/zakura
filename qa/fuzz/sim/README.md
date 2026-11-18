@@ -97,7 +97,8 @@ or close a pool. Eight slots hold production handles. Two pools enforce equal
 pipeline byte limits, and a third pool enforces a count limit. The fixture uses the
 Regtest genesis payload. Each history drains its handles before pool destruction.
 
-The independent model derives charges from its handle graph. Weak probes read
+The model derives charges from its handle graph, and checks each admission the
+pools decide against the pool's closure and the blocks it holds. Weak probes read
 actual header and transaction references, the allocation's pool, and a
 fresh attributed-size traversal. They detect raw handles that escape the owner.
 These checks cover completed owner operations. They do not establish asynchronous
@@ -108,22 +109,28 @@ and incorrect release. A charge cannot change pool, so no wrong-owner settlement
 path exists for decoded blocks; this is an API check, not a runtime mutation.
 Campaigns run outside blocking PR CI.
 
-The funding property compares actual retention with the independent model at
-completed operations. It does not establish asynchronous cancellation races,
+The ownership property checks the queue's invariants after every input, that
+draining the queue releases exactly its ledger, and that each transition moves
+the ledger by the bytes it reports and touches only its owner's heights. The
+funding property checks at completed operations that the shared budget charges
+exactly the funding the driver's owners retain, that the pool funds exactly the
+queue's ledger until accounting closes, and that admission keeps each session
+within the owner cap. It does not establish asynchronous cancellation races,
 decoded-body retention, or backend-worker retention. Run long campaigns manually
 or nightly; this target adds no blocking PR fuzz campaign.
 
 `block_reactor_policy` uses the same pipeline for the reactor's query and view
 policy, with reactor decoder 3 read from at most 512 causal bytes. Each record
 holds the input, the exact identity of each accepted or refused query, and the
-production and model views. The target establishes pure transitions. The real
+production view. The target establishes pure transitions. The real
 action channel, reply routes, and shutdown have witnesses in `zakura-network`.
 
 `discovery_record_book` and `discovery_session_installation` use the shared trace
 and replay pipeline without starting QUIC. Each consumes at most 512 causal
 bytes, the record book under decoder v3 with two bytes per operation and the
-session owner under decoder v2 with four. They compare the real owner with its
-independent model after each completed operation. The tests
+session owner under decoder v2 with four. After each completed operation they
+check the real owner's invariants, and compare its results and reported changes
+with what the driver sent. The tests
 `book_trace_reports_exact_install_replacement_and_eviction` and
 `session_trace_separates_stale_results_and_retained_hints` show that each witness
 input reaches its rules, and that an empty input reaches none. They do not

@@ -1768,11 +1768,17 @@ async fn tcp_response_blocks_charge_until_handoff_without_refusing() {
         let ([first, second], mut response) = tcp.request_two_blocks().await;
         let first_bytes = first.decoded_bytes();
 
-        tcp.peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        tcp.peer_tx
+            .send(Ok(Message::Block(first.into())))
+            .await
+            .unwrap();
         budget_reaches(&tcp.budget, first_bytes).await;
         assert!(matches!(response.try_recv(), Ok(None)));
 
-        tcp.peer_tx.send(Ok(Message::Block(second))).await.unwrap();
+        tcp.peer_tx
+            .send(Ok(Message::Block(second.into())))
+            .await
+            .unwrap();
         assert!(matches!(
             response.await.unwrap().unwrap(),
             Response::Blocks(blocks) if blocks.len() == 2
@@ -1791,7 +1797,10 @@ async fn cancelling_a_tcp_request_ends_its_response_charge() {
         let ([first, _second], response) = tcp.request_two_blocks().await;
         let first_bytes = first.decoded_bytes();
 
-        tcp.peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        tcp.peer_tx
+            .send(Ok(Message::Block(first.into())))
+            .await
+            .unwrap();
         budget_reaches(&tcp.budget, first_bytes).await;
         drop(response);
         budget_reaches(&tcp.budget, 0).await;

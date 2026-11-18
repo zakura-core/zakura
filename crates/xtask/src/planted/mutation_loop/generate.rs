@@ -472,15 +472,33 @@ impl GeneratorReport {
         }
     }
 
-    /// The property finding this lane shows, if the unpatched build
-    /// violates the judged ID on one of the kill's traces too: the shrunk
-    /// trace's replay if it violates, as the smaller reproduction, else the
-    /// confirmed trace's.
-    pub(in crate::planted) fn finding(&self) -> Option<PropertyFinding> {
+    /// The property findings this lane shows: one for each ID that the
+    /// unpatched build violates on one of the kill's traces too. Each
+    /// finding names the shrunk trace's replay if it violates the ID, as the
+    /// smaller reproduction, else the confirmed trace's.
+    pub(in crate::planted) fn findings(&self) -> Vec<PropertyFinding> {
+        let mut properties: Vec<Option<&String>> = Vec::new();
+        for check in &self.unpatched {
+            if check.outcome == OnUnpatched::Violated
+                && !properties.contains(&check.property.as_ref())
+            {
+                properties.push(check.property.as_ref());
+            }
+        }
+        properties
+            .into_iter()
+            .filter_map(|property| self.finding_for(property))
+            .collect()
+    }
+
+    /// The finding for `property`'s violated checks, if any.
+    fn finding_for(&self, property: Option<&String>) -> Option<PropertyFinding> {
         let violated = |trace| {
-            self.unpatched
-                .iter()
-                .find(|check| check.trace == trace && check.outcome == OnUnpatched::Violated)
+            self.unpatched.iter().find(|check| {
+                check.trace == trace
+                    && check.outcome == OnUnpatched::Violated
+                    && check.property.as_ref() == property
+            })
         };
         let check = violated(KillTrace::Shrunk).or_else(|| violated(KillTrace::Confirmed))?;
         Some(PropertyFinding {
@@ -629,6 +647,28 @@ pub(super) fn co_violation_confirmed(
             result.detail
         ),
     )
+}
+
+/// A kill's class once the unpatched build ran its traces `runs`, and the
+/// checks to record on its lane. The class comes from [`unpatched_class`]
+/// on the checks of [`unpatched_id`]. When that ID isn't the killing ID
+/// `kill`, a named kill that stopped on an allowed co-violation, the runs
+/// judge `kill` too: an unpatched build that violates it shows a defect of
+/// the pinned revision, which [`GeneratorReport::findings`] reports as a
+/// property finding without changing the kill's class.
+pub(super) fn judge_kill_unpatched(
+    result: Classified,
+    property: &str,
+    kill: &str,
+    runs: &[UnpatchedRun],
+) -> (Classified, Vec<UnpatchedCheck>) {
+    let judged = unpatched_id(&result, property, kill);
+    let mut checks: Vec<UnpatchedCheck> = runs.iter().map(|run| run.judge(judged)).collect();
+    let result = unpatched_class(result, &checks);
+    if judged != kill {
+        checks.extend(runs.iter().map(|run| run.judge(kill)));
+    }
+    (result, checks)
 }
 
 /// A kill's class once the unpatched build ran its traces, each check
@@ -1884,10 +1924,9 @@ impl Runner {
                             &kill.id,
                             report.as_deref(),
                         );
-                        let judged = unpatched_id(&result, &case.property, &kill.id);
-                        let checks: Vec<UnpatchedCheck> =
-                            runs.iter().map(|run| run.judge(judged)).collect();
-                        result = unpatched_class(result, &checks);
+                        let checks;
+                        (result, checks) =
+                            judge_kill_unpatched(result, &case.property, &kill.id, runs);
                         lane.confirmation = Some(confirmation.clone());
                         lane.shrunk.clone_from(shrunk);
                         lane.unpatched = checks;

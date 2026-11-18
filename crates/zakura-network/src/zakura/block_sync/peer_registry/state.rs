@@ -828,6 +828,32 @@ impl SupplierRetryState {
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Check the deferral table after a transition: it stays within its
+    /// capacity, and every incompatibility from the current authority's epoch
+    /// sits under the current authority.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.entries.len() <= MAX_SUPPLIER_RETRIES,
+            "{} deferrals exceed the capacity",
+            self.entries.len()
+        );
+        let Some(current) = self.current else {
+            return;
+        };
+        for (_, key, reason) in self.entries.keys() {
+            if *reason == BodyRetryReason::Incompatible
+                && key.body_work_epoch == current.body_work_epoch
+            {
+                assert_eq!(
+                    *key,
+                    BodyRetryKey::new(current, key.hash),
+                    "an incompatibility from the current epoch is keyed under a stale authority"
+                );
+            }
+        }
+    }
 }
 
 /// The persisted all-supplier retry alarm. It holds at most one body.
@@ -854,6 +880,16 @@ impl BodyRetryAlarms {
     pub(super) fn next_deadline(&mut self, now: Instant) -> Option<Instant> {
         self.alarms.retain(|_, until| *until > now);
         self.alarms.values().copied().min()
+    }
+
+    /// Check that the alarm holds at most one body.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.alarms.len() <= 1,
+            "{} alarms are set",
+            self.alarms.len()
+        );
     }
 }
 

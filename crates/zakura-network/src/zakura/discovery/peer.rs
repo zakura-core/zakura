@@ -13,12 +13,12 @@
 //! delivered answers and `Hello`, which can be waiting for a verification slot.
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-mod model;
+mod replay;
 mod state;
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
+pub use replay::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 
 use std::{sync::Arc, time::Duration};
 

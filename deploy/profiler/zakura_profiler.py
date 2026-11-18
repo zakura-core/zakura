@@ -5,8 +5,8 @@ Runs beside the node and never inside it. In a loop it asks `perf` to sample whe
 node's threads are on the CPU for one window (a minute by default), turns the samples
 into a tree of functions and CPU time, and stores one small file per window and one per
 hour. A loopback HTTP server answers with flame graphs for a time range, a CPU timeline
-and the profiler's own status; the cluster status dashboard forwards those to the public
-page.
+and the profiler's own status; the cluster status dashboard forwards those to the CPU
+profile section of its node page.
 
 It is built to stay out of the node's way: the systemd unit runs it at idle priority
 under a hard CPU and memory ceiling, only the `perf record` child runs at normal
@@ -21,6 +21,7 @@ import gzip
 import json
 import operator
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -48,7 +49,13 @@ SAMPLE_BUDGET = 3000
 STACK_BYTES = 65528
 # perf stops a window early at this size, so a sudden burst of node activity cannot
 # fill the scratch directory before the rate has adapted.
-MAX_WINDOW_BYTES = "256M"
+MAX_WINDOW_BYTES = 256 * 1024 * 1024
+# Every window on disk at once (being recorded, waiting and being read) stays under
+# this. The scratch directory is a tmpfs, so its files count against the unit's 1 GiB
+# memory limit (zakura-profiler.service) alongside the profiler and `perf script`.
+SCRATCH_BUDGET_BYTES = 512 * 1024 * 1024
+# A window is not started with less room than this; waiting windows are dropped first.
+MIN_WINDOW_BYTES = 32 * 1024 * 1024
 # A sample counts as "while a block was processed" from this long before the block's
 # announcement until this long after it.
 BLOCK_LEAD_SECONDS = 0.25
@@ -66,6 +73,19 @@ MAX_STAGE_RECORDS = 10_000
 DEFAULT_TRACE_TABLE_CAP_MB = 200
 # What the page gets of each block's stage record.
 BLOCK_FIELDS = ("height", "hash", "t", "path", "size", "status_peers", "status_slowest_ms", "reorg", "ms")
+# What the cluster view needs of a block to join it with the same block on other nodes.
+PROPAGATION_FIELDS = (
+    "height", "hash", "t", "path", "reorg", "ms", "size", "wall", "heard_from", "heard_from_peer", "peers", "unnamed",
+    "downloads",
+)  # fmt: skip
+# How far this host's clock is from true time, as `chronyc tracking` prints it.
+CLOCK_OFFSET = re.compile(r"System time\s*:\s*([0-9.]+) seconds (slow|fast)")
+CLOCK_RMS = re.compile(r"RMS offset\s*:\s*([0-9.]+) seconds")
+# `timedatectl timesync-status` prints each as one number and a unit.
+TIMESYNC_OFFSET = re.compile(r"^\s*Offset:\s*([+-]?[0-9.]+)(us|ms|s)\s*$", re.MULTILINE)
+TIMESYNC_JITTER = re.compile(r"^\s*Jitter:\s*([0-9.]+)(us|ms|s)\s*$", re.MULTILINE)
+TIMESYNC_UNIT_MS = {"us": 0.001, "ms": 1.0, "s": 1000.0}
+CLOCK_CHECK_SECONDS = 60
 COMPUTE_WAIT_SECONDS = 20
 # Flame graphs that are not cached may use this much CPU time between them in any
 # minute. Past it the API answers "busy", so requests for many different ranges cannot
@@ -388,6 +408,65 @@ class Store:
         )
 
 
+def parse_clock_offset(tracking):
+    """`{"offset_ms", "rms_ms"}` from the output of `chronyc tracking`, else `None`.
+
+    `offset_ms` is how far the system clock is from true time right now, positive when
+    it is ahead; `rms_ms` is its typical distance over the recent past.
+    """
+    offset, rms = CLOCK_OFFSET.search(tracking), CLOCK_RMS.search(tracking)
+    if offset is None or rms is None:
+        return None
+    sign = 1 if offset.group(2) == "fast" else -1
+    return {
+        "offset_ms": round(sign * float(offset.group(1)) * 1000, 3),
+        "rms_ms": round(float(rms.group(1)) * 1000, 3),
+    }
+
+
+def parse_timesync_offset(status):
+    """The same from the output of `timedatectl timesync-status`, else `None`.
+
+    systemd-timesyncd reports the last measured offset, positive when the clock is
+    behind, and the jitter between measurements, which stands in for `rms_ms`.
+    """
+    offset, jitter = TIMESYNC_OFFSET.search(status), TIMESYNC_JITTER.search(status)
+    if offset is None or jitter is None:
+        return None
+    return {
+        "offset_ms": round(-float(offset.group(1)) * TIMESYNC_UNIT_MS[offset.group(2)], 3),
+        "rms_ms": round(float(jitter.group(1)) * TIMESYNC_UNIT_MS[jitter.group(2)], 3),
+    }
+
+
+# The time services a node may run, with how to read each one's answer.
+CLOCK_SOURCES = (
+    (("chronyc", "tracking"), parse_clock_offset),
+    (("timedatectl", "timesync-status"), parse_timesync_offset),
+)
+_clock = {"checked": 0.0, "offset": None}
+
+
+def clock_offset():
+    """This host's clock offset, asked of its time service at most once a minute.
+
+    `None` when the host runs neither chrony nor systemd-timesyncd.
+    """
+    now = time.monotonic()
+    if now - _clock["checked"] >= CLOCK_CHECK_SECONDS or not _clock["checked"]:
+        _clock["checked"] = now
+        _clock["offset"] = None
+        for command, parse in CLOCK_SOURCES:
+            try:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=2, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            _clock["offset"] = parse(done.stdout)
+            if _clock["offset"] is not None:
+                break
+    return _clock["offset"]
+
+
 def use_normal_scheduling():
     """Run the calling process at normal priority, for the child that takes samples.
 
@@ -426,6 +505,8 @@ class Profiler:
         self._perf = None
         self._jobs = collections.deque()
         self._job_ready = threading.Condition()
+        # The window `process_loop` is reading, whose file is still on disk.
+        self._processing = None
         self._cpu_mark = sum(os.times()[:4])
         self._trace_checked_at = None
 
@@ -483,6 +564,11 @@ class Profiler:
                 self.state = "waiting for node"
                 self._stop.wait(10)
                 continue
+            room = self.make_room()
+            if room < MIN_WINDOW_BYTES:
+                # Only the window being read is left, and it is large: wait for it.
+                self._stop.wait(5)
+                continue
             build = self.node_build(pid)
             rate = self.rate
             data_path = scratch / f"{int(time.time())}.data"
@@ -490,7 +576,7 @@ class Profiler:
             command = [
                 self.args.perf, "record", "-e", "cpu-clock", "-k", "CLOCK_REALTIME",
                 "-F", str(rate), "-g", "--call-graph", f"dwarf,{STACK_BYTES}",
-                "-p", str(pid), "-o", str(data_path), f"--max-size={MAX_WINDOW_BYTES}",
+                "-p", str(pid), "-o", str(data_path), f"--max-size={room}B",
                 "--", "sleep", str(self.args.window),
             ]  # fmt: skip
             try:
@@ -530,6 +616,26 @@ class Profiler:
                 self._jobs.append(job)
                 self._job_ready.notify()
 
+    def make_room(self):
+        """Bytes the next window may use within `SCRATCH_BUDGET_BYTES`, at most
+        `MAX_WINDOW_BYTES`, after dropping waiting windows, oldest first, while there is
+        less than `MIN_WINDOW_BYTES`. The window being read is never dropped."""
+
+        def size(job):
+            try:
+                return job["path"].stat().st_size
+            except OSError:
+                return 0
+
+        with self._job_ready:
+            while True:
+                on_disk = [job for job in (self._processing, *self._jobs) if job is not None]
+                room = SCRATCH_BUDGET_BYTES - sum(size(job) for job in on_disk)
+                if room >= MIN_WINDOW_BYTES or not self._jobs:
+                    return max(0, min(room, MAX_WINDOW_BYTES))
+                self._jobs.popleft()["path"].unlink(missing_ok=True)
+                self.dropped_windows += 1
+
     def process_loop(self):
         """Turn recorded windows into stored trees, one at a time."""
         while not self._stop.is_set():
@@ -539,6 +645,7 @@ class Profiler:
                 if self._stop.is_set():
                     return
                 job = self._jobs.popleft()
+                self._processing = job
             try:
                 self.process_window(job)
                 self.state = "ok"
@@ -546,7 +653,9 @@ class Profiler:
             except Exception as error:  # noqa: BLE001 - one bad window must not end profiling
                 self.fail(f"processing a window failed ({type(error).__name__})", str(error))
             finally:
-                job["path"].unlink(missing_ok=True)
+                with self._job_ready:
+                    job["path"].unlink(missing_ok=True)
+                    self._processing = None
             try:
                 self.store.roll_up_hours(time.time())
                 self.store.prune(time.time())
@@ -807,6 +916,23 @@ class Queries:
             "blocks": [{key: record[key] for key in BLOCK_FIELDS} for record in records],
         }
 
+    def propagation(self, limit):
+        """Recent blocks with the wall-clock times the cluster view joins across nodes.
+
+        `t` is when the node log announced the block, on the system clock: a second
+        reading of the tip time, which shows whether the trace clock can be trusted.
+        """
+        records = self.store.recent_block_stages(limit)
+        return {
+            "node": self.profiler.args.node_name,
+            "clock": clock_offset(),
+            "blocks": [
+                {key: record[key] for key in PROPAGATION_FIELDS if key in record}
+                for record in records
+                if record.get("wall")
+            ],
+        }
+
     def meta(self):
         """What the page needs before its first query: views, colours, ranges."""
         labels = {c["id"]: c["label"] for c in stacks.CATEGORIES}
@@ -819,7 +945,7 @@ class Queries:
         }
 
 
-def make_handler(queries, profiler, page_path):
+def make_handler(queries, profiler):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 15
@@ -844,8 +970,6 @@ def make_handler(queries, profiler, page_path):
             parsed = urllib.parse.urlparse(self.path)
             params = dict(urllib.parse.parse_qsl(parsed.query))
             try:
-                if parsed.path == "/":
-                    return self.reply(200, page_path.read_bytes(), "text/html; charset=utf-8")
                 if parsed.path == "/healthz":
                     return self.reply(200, b"ok\n", "text/plain; charset=utf-8")
                 if parsed.path == "/api/status":
@@ -863,6 +987,9 @@ def make_handler(queries, profiler, page_path):
                 if parsed.path == "/api/blocks":
                     limit = max(1, min(int(params.get("limit", "200")), 1000))
                     return self.reply_json(200, queries.block_stages(limit))
+                if parsed.path == "/api/propagation":
+                    limit = max(1, min(int(params.get("limit", "200")), 1000))
+                    return self.reply_json(200, queries.propagation(limit))
             except (KeyError, ValueError):
                 return self.reply_json(400, {"error": "bad request"})
             except TimeoutError:
@@ -899,8 +1026,7 @@ def main(argv=None):
     store = Store(args.data_dir)
     profiler = Profiler(args, store)
     queries = Queries(store, profiler)
-    page_path = Path(__file__).resolve().with_name("page.html")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(queries, profiler, page_path))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(queries, profiler))
     server.daemon_threads = True
 
     def shut_down(*_):

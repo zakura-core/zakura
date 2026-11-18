@@ -353,6 +353,38 @@ impl CandidateDialerState {
         true
     }
 
+    /// Checks the state's invariants: each admission host's count is the
+    /// number of in-flight attempts that reserved it, no attempt holds a
+    /// sequence the dialer will hand out again, and each backoff entry
+    /// counts at least one failure.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        let mut reserved: HashMap<IpAddr, usize> = HashMap::default();
+        for attempt in self.in_flight.values() {
+            for host in admission_hosts(&attempt.reserved_ips) {
+                *reserved.entry(host).or_default() += 1;
+            }
+            assert!(
+                attempt.sequence < self.next_sequence,
+                "discovery/dial-attempts: attempt {} at or past the next sequence {}",
+                attempt.sequence,
+                self.next_sequence
+            );
+        }
+        // Not `assert_eq!`: a map's `Debug` order varies between runs, and the
+        // simulator's replay compares failure messages exactly.
+        assert!(
+            self.in_flight_by_ip == reserved,
+            "discovery/dial-attempts: reservations disagree with the attempts in flight"
+        );
+        assert!(
+            self.backoff_by_node_ip
+                .values()
+                .all(|backoff| backoff.failure_count > 0),
+            "discovery/dial-attempts: a backoff entry counts no failure"
+        );
+    }
+
     fn apply_backoff(
         &mut self,
         node_id: NodeId,

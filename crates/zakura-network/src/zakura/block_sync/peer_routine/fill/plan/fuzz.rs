@@ -1,10 +1,13 @@
 //! Decoder v1 for fill filtering, funding and commit-window geometry.
 //!
-//! Each bounded case varies the probed floor, the items another peer took, and
-//! retry facts. Funding runs through the production queue's take, retained-range
-//! and admission path. The reference derives the charge from the retained run.
-//! Takes hold up to 30 items, so this driver exercises multi-item behavior that
-//! the one-block production cap does not reach.
+//! [`replay_block_fill_bytes`] is a machine target (see
+//! [`machine_test`](crate::zakura::machine_test)). Each bounded case varies the
+//! probed floor, the items another peer took, and retry facts.
+//! [`expected_retry_run`] recomputes the retry filter's run the slow, obvious
+//! way. Funding runs through the production queue's take, retained-range and
+//! admission path, and the checks compare its charge with the run the test
+//! retained. Takes hold up to 30 items, so this driver exercises multi-item
+//! behavior that the one-block production cap does not reach.
 
 use std::sync::Arc;
 
@@ -16,12 +19,13 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{
-        admission::{AdmissionSnapshot, RequestPriority},
+        admission::{floor_rescue_high, AdmissionSnapshot, RequestPriority},
         config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
         request::BlockSizeEstimate,
         work_queue::{WorkItem, WorkQueue},
         ZakuraBlockSyncConfig,
     },
+    machine_test::MAX_HISTORY_BYTES,
     transport::ByteBudget,
 };
 
@@ -72,7 +76,7 @@ fn fund_retained(
     fund_through_queue(&work, block::Height(floor), &rival, &wanted, keep)
 }
 
-/// Replay at most 512 bytes in cases of at most 32 bytes.
+/// Replay at most [`MAX_HISTORY_BYTES`] bytes in cases of at most 32 bytes.
 ///
 /// A case's first byte selects the floor. The second selects how many heights
 /// another peer already took. Remaining bytes select retry facts and estimates.
@@ -88,7 +92,7 @@ fn replay(
     mut after_plan: impl FnMut(&mut TakePlan),
 ) -> BlockFillReplaySummary {
     let mut summary = BlockFillReplaySummary::default();
-    for case in data[..data.len().min(512)].chunks(32) {
+    for case in data[..data.len().min(MAX_HISTORY_BYTES)].chunks(32) {
         let floor = u32::from(case[0]);
         let raced = u32::from(case.get(1).copied().unwrap_or(0) & 3);
         let facts: Vec<_> = case
@@ -127,7 +131,9 @@ fn replay(
                 fund_retained(floor, raced, &case[2..], run.clone(), u64::MAX / 2)
                     .expect("an ample budget funds any retained run");
             after_funding(&mut funding);
-            let floor_priority = start <= floor + 1;
+            // Only a run that starts in the floor-rescue window is floor work,
+            // wherever the probe or the rival take left the floor.
+            let floor_priority = block::Height(start) <= floor_rescue_high(block::Height(floor));
             assert_eq!(
                 fund_retained(floor, raced, &case[2..], run.clone(), 0).is_some(),
                 floor_priority,
@@ -208,34 +214,34 @@ fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
+    use crate::zakura::machine_test::machine_target_tests;
 
     // A peer took the floor; retry avoidance then removes another item.
     const WITNESS: &[u8] = &[10, 1, 2, 3, 6, 1, 0];
 
+    machine_target_tests! {
+        replay: replay_block_fill_bytes,
+        target: "block_fill",
+        decoder: 1,
+        witness: WITNESS => BlockFillReplaySummary {
+            takes: 1,
+            retained: 1,
+            above_floor: 1,
+            window_grants: 1,
+        },
+    }
+
+    /// A floor run that no peer raced funds as floor work.
     #[test]
-    #[allow(
-        clippy::print_stdout,
-        reason = "witnesses print applicability counters"
-    )]
-    fn fill_witness_uses_the_retained_run() {
-        println!(
-            "tier=Machine target=block_fill decoder=1 {:?}",
-            replay_block_fill_bytes(WITNESS)
-        );
+    fn an_unraced_floor_run_funds_as_floor_work() {
         assert_eq!(
-            replay_block_fill_bytes(WITNESS),
+            replay_block_fill_bytes(&[10, 0, 255, 255]),
             BlockFillReplaySummary {
                 takes: 1,
                 retained: 1,
-                above_floor: 1,
+                above_floor: 0,
                 window_grants: 1,
             }
-        );
-        replay_block_fill_bytes(&[10, 0, 255, 255]);
-        assert_eq!(
-            replay_block_fill_bytes(&[]),
-            BlockFillReplaySummary::default()
         );
     }
 
@@ -269,12 +275,5 @@ mod tests {
     #[should_panic(expected = "block/fill-commit-window")]
     fn fill_witness_rejects_taking_past_the_commit_window() {
         replay(WITNESS, |_, _| {}, |_| {}, |grant| grant.high.0 += 1);
-    }
-
-    proptest! {
-        #[test]
-        fn fill_cases_match_the_retained_run_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-            replay_block_fill_bytes(&bytes);
-        }
     }
 }

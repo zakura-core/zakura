@@ -18,10 +18,11 @@ use super::{
     },
     generate::{
         baseline_lane, campaign_class, co_violation_confirmed, co_violations, confirm_child,
-        confirmed, judge_unpatched, no_generator as no_generator_of, plan, shrink_wall,
-        unpatched_class, unpatched_id, write_exclusions, FollowUp, GenBaseline, GenerateConfig,
-        GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace, Lanes,
-        OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck, UnpatchedRun,
+        confirmed, judge_kill_unpatched, judge_unpatched, no_generator as no_generator_of, plan,
+        shrink_wall, unpatched_class, unpatched_id, write_exclusions, FollowUp, GenBaseline,
+        GenerateConfig, GenerateMode, GeneratorBaselineFailure, GeneratorReport, Kill, KillTrace,
+        Lanes, OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
+        UnpatchedRun,
     },
     merge_alone, parse_flags, planted_cases, selects, summarize, test_executables, triage,
     BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report,
@@ -1441,11 +1442,11 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
     let mut lane =
         GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
     lane.violated = Some(NAMED.to_owned());
-    assert_eq!(lane.finding(), None, "no replay ran");
+    assert_eq!(lane.findings(), Vec::new(), "no replay ran");
     lane.unpatched = vec![check(KillTrace::Confirmed, OnUnpatched::Holds)];
-    assert_eq!(lane.finding(), None);
+    assert_eq!(lane.findings(), Vec::new());
     lane.unpatched = shrunk_only.to_vec();
-    let finding = lane.finding().unwrap();
+    let [finding] = lane.findings().try_into().unwrap();
     assert_eq!(finding.property.as_deref(), Some(NAMED));
     assert_eq!(
         finding.log,
@@ -1456,7 +1457,7 @@ fn a_kill_that_fails_unpatched_is_a_property_finding() {
         check(KillTrace::Shrunk, OnUnpatched::Undecided),
     ];
     assert_eq!(
-        lane.finding().unwrap().log,
+        lane.findings()[0].log,
         std::path::PathBuf::from("mutants/x/unpatched-Confirmed-replay.log"),
         "an unshrunk violation is a finding too"
     );
@@ -3012,12 +3013,74 @@ fn the_unpatched_check_judges_a_named_kill_by_the_cases_property() {
         GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, failed);
     lane.violated = Some(NAMED.to_owned());
     lane.unpatched = vec![check];
+    let properties: Vec<_> = lane
+        .findings()
+        .into_iter()
+        .map(|finding| finding.property)
+        .collect();
+    assert_eq!(properties, [Some(OTHER.to_owned())]);
+}
+
+/// A named kill that stopped on an allowed co-violation keeps its class
+/// when the unpatched build holds the case's property. If that build
+/// violates the co-violation, the lane still reports it as a property
+/// finding: the pinned revision breaks it with no mutant.
+#[test]
+fn an_unpatched_co_violation_is_a_property_finding() {
+    let named = classify::Classified::new(Class::KilledByNamedRule, None, "the kill");
+    let run = |violated: &[&str], held: &[&str]| UnpatchedRun {
+        trace: KillTrace::Confirmed,
+        command: "record",
+        report: Some(full_report(violated, held)),
+        ended: "exited 0".to_owned(),
+        log: "mutants/x/unpatched-confirmed-record.log".into(),
+    };
+
+    let (result, checks) =
+        judge_kill_unpatched(named.clone(), NAMED, OTHER, &[run(&[OTHER], &[NAMED])]);
     assert_eq!(
-        lane.finding()
-            .and_then(|finding| finding.property)
-            .as_deref(),
-        Some(OTHER)
+        result, named,
+        "the case's property holds, so the kill stays"
     );
+    let judged: Vec<_> = checks
+        .iter()
+        .map(|check| (check.property.as_deref(), check.outcome))
+        .collect();
+    assert_eq!(
+        judged,
+        [
+            (Some(NAMED), OnUnpatched::Holds),
+            (Some(OTHER), OnUnpatched::Violated)
+        ]
+    );
+    let mut lane =
+        GeneratorReport::unsearched("block-sync/storage", 11, GenerateMode::Inproc, result);
+    lane.violated = Some(OTHER.to_owned());
+    lane.unpatched = checks;
+    let properties: Vec<_> = lane
+        .findings()
+        .into_iter()
+        .map(|finding| finding.property)
+        .collect();
+    assert_eq!(properties, [Some(OTHER.to_owned())]);
+
+    // Both violated on the unpatched build: the lane fails its baseline and
+    // reports each ID once.
+    let (result, checks) =
+        judge_kill_unpatched(named.clone(), NAMED, OTHER, &[run(&[NAMED, OTHER], &[])]);
+    assert_eq!(result.class, Class::BaselineFails);
+    lane.result = result;
+    lane.unpatched = checks;
+    let properties: Vec<_> = lane
+        .findings()
+        .into_iter()
+        .map(|finding| finding.property)
+        .collect();
+    assert_eq!(properties, [Some(NAMED.to_owned()), Some(OTHER.to_owned())]);
+
+    // A kill judged by its own ID runs one check per trace.
+    let (_, checks) = judge_kill_unpatched(named, NAMED, NAMED, &[run(&[], &[NAMED])]);
+    assert_eq!(checks.len(), 1);
 }
 
 /// A generator lane's record names its mode, `inproc` by default, so an

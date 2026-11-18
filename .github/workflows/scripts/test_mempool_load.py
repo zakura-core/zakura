@@ -153,20 +153,6 @@ class PortSafety(unittest.TestCase):
         # It must fail fast on the process check, not burn the full timeout.
         self.assertLess(__import__("time").monotonic() - started, 5)
 
-    def test_wait_for_listener_sees_a_listening_node(self):
-        # `up` starts node i+1 only once node i listens: a dial refused by a
-        # node 2 ms from listening isn't retried for two minutes.
-        import socket
-
-        class LiveProc:
-            def poll(self):
-                return None
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            sock.listen(1)
-            _, port = sock.getsockname()
-            self.assertTrue(lab.wait_for_listener("127.0.0.1", port, LiveProc(), timeout_secs=5))
 
 
 class Teardown(unittest.TestCase):

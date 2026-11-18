@@ -395,20 +395,6 @@ def port_owner(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def wait_for_listener(
-    host: str, port: int, proc: subprocess.Popen, timeout_secs: int = RPC_READY_TIMEOUT_SECS
-) -> bool:
-    """Wait for our node `proc` to listen on host:port, failing fast if it exits."""
-    deadline = time.monotonic() + timeout_secs
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return False
-        if port_owner(host, port):
-            return True
-        time.sleep(0.2)
-    return False
-
-
 def assert_ports_free(node_count: int) -> None:
     """Refuse to start if any port the lab needs is already taken.
 
@@ -530,18 +516,12 @@ def cmd_up(args) -> int:
         write_pidfile(lab, procs)
         # Node i+1 dials only node i. A refused dial isn't retried for about two
         # minutes, so one node starting 2 ms early cut the chain in 9 of 21 runs.
-        if not wait_for_listener(node_ip(i), P2P_PORT, procs[node_name(i)]):
-            print(f"{node_name(i)} never opened its P2P listener", file=sys.stderr)
+        # zakurad binds its P2P listener before it starts RPC, so an answering RPC
+        # means node i is listening. Probing the P2P port itself would take the
+        # node's one connection per IP (every lab node dials from 127.0.0.1).
+        if not wait_for_rpc(f"http://{node_ip(i)}:{RPC_PORT}", proc=procs[node_name(i)]):
+            print(f"{node_name(i)} never came up", file=sys.stderr)
             return 1
-
-    failed = []
-    for i in range(args.node_count):
-        url = f"http://{node_ip(i)}:{RPC_PORT}"
-        if not wait_for_rpc(url, proc=procs[node_name(i)]):
-            failed.append(node_name(i))
-    if failed:
-        print(f"nodes never came up: {', '.join(failed)}", file=sys.stderr)
-        return 1
 
     if args.node_count > 1 and not wait_for_peers(args.node_count):
         # A network whose nodes never find each other still runs, still mines,

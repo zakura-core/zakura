@@ -751,11 +751,7 @@ jobs:
                   "rpc_listen_addr", defaults["rpc_listen_addr"]
               ),
               "RPC_AUTH": "cookie" if uses_rpc_cookie else "",
-              "RPC_CONFIG_PATH": (
-                  "/root/.cache/zakura/.cookie"
-                  if node_name == "zakura-compat"
-                  else ""
-              ),
+              "RPC_CONFIG_PATH": "/root/.cache/zakura/.cookie" if uses_rpc_cookie else "",
           }
           for key, value in values.items():
               print(f"{key}={shlex.quote(str(value))}")

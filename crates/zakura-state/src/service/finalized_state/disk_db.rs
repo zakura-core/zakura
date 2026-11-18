@@ -1533,10 +1533,14 @@ impl DiskDb {
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
 
-            // The canonical paths are only used for the containment check below. On Windows,
-            // `fs::canonicalize` returns verbatim `\\?\` paths, which disable `/` separator
-            // normalization. RocksDB joins its file names with `/`, so it can't open a database
-            // at a verbatim path, and the old database would look missing.
+            // RocksDB reads `old_path`, never the canonical path: on Windows, `fs::canonicalize`
+            // returns verbatim `\\?\` paths, which disable `/` separator normalization. RocksDB
+            // joins its file names with `/`, so it can't open a database at a verbatim path, and
+            // the old database would look missing.
+            //
+            // The move uses the canonical path, so it moves the directory the containment check
+            // below approved. Moving `old_path` would move a symlink rather than its target, and a
+            // relative symlink resolves against its new parent once moved.
             let canonical_old_path = match fs::canonicalize(&old_path) {
                 Ok(canonicalized_old_path) => canonicalized_old_path,
                 Err(e) => {
@@ -1598,9 +1602,9 @@ impl DiskDb {
                     }
                 };
 
-                match fs::rename(&old_path, &new_path) {
+                match fs::rename(&canonical_old_path, &new_path) {
                     Ok(()) => {
-                        info!("moved state cache from {old_path:?} to {new_path:?}");
+                        info!("moved state cache from {canonical_old_path:?} to {new_path:?}");
 
                         let mut disk_version =
                             database_format_version_on_disk(config, db_kind, major_db_ver, network)
@@ -1645,7 +1649,10 @@ impl DiskDb {
                         return Some(disk_version);
                     }
                     Err(e) => {
-                        warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
+                        warn!(
+                            "could not move state cache from {canonical_old_path:?} to \
+                             {new_path:?}: {e}"
+                        );
                     }
                 };
             }

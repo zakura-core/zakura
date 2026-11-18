@@ -63,8 +63,8 @@ pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 /// Returns `true` if `new_header` should replace the internal miner's current
 /// block template.
 fn should_replace_mining_template(
-    current_header: Option<block::Header>,
-    new_header: block::Header,
+    current_header: Option<&block::Header>,
+    new_header: &block::Header,
     submit_old: Option<bool>,
 ) -> bool {
     current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
@@ -342,8 +342,8 @@ where
         // would discard useful solver work.
         let template_replaced = template_sender.send_if_modified(|old_block| {
             if !should_replace_mining_template(
-                old_block.as_ref().map(|block| *block.header),
-                *block.header,
+                old_block.as_ref().map(|block| block.header.as_ref()),
+                block.header.as_ref(),
                 submit_old,
             ) {
                 return false;
@@ -620,25 +620,25 @@ mod tests {
         let mut changed_header = current_header.clone();
         changed_header.nonce.0[0] ^= 1;
 
-        assert!(should_replace_mining_template(None, current_header, None));
+        assert!(should_replace_mining_template(None, &current_header, None));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            current_header,
+            Some(&current_header),
+            &current_header,
             Some(false),
         ));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current_header),
+            &changed_header,
             Some(true),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current_header),
+            &changed_header,
             Some(false),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current_header),
+            &changed_header,
             None,
         ));
     }
@@ -662,8 +662,8 @@ mod tests {
         // It must replace the harder header even though that fixed header would
         // still be valid to submit.
         assert!(should_replace_mining_template(
-            Some(standard),
-            minimum,
+            Some(&standard),
+            &minimum,
             Some(false),
         ));
     }

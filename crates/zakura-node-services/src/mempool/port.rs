@@ -364,6 +364,11 @@ pub enum Change {
     },
     /// A submitted transaction was rejected and never entered the pool.
     /// Today's change stream reports this as `Invalidated`.
+    ///
+    /// A fetch that its reservation's owner reports as failed is logged as
+    /// `Refused` for that id too, so a caller that was told another caller
+    /// is fetching it ([`Unreserved::Pending`]) learns the id is free
+    /// again. tx-relay ends such a wait when it reads this.
     Refused(UnminedTxId),
 }
 
@@ -437,7 +442,9 @@ impl ChangeLog {
         }
     }
 
-    /// Every entry after `cursor`.
+    /// Every entry after `cursor`. A read visits only those entries: the log
+    /// numbers its entries one after another, so the first one after
+    /// `cursor` sits at a known offset from the oldest.
     pub fn since(&self, cursor: ChangeSeq) -> ChangesSince {
         if cursor >= self.last {
             return ChangesSince::Entries(Vec::new());
@@ -446,13 +453,12 @@ impl ChangeLog {
         if cursor.0.saturating_add(1) < oldest.0 {
             return ChangesSince::Resync;
         }
-        ChangesSince::Entries(
-            self.entries
-                .iter()
-                .filter(|entry| entry.seq > cursor)
-                .copied()
-                .collect(),
-        )
+        // The checks above put `cursor + 1` in `oldest..=last`, and the log
+        // holds at most `CHANGE_LOG_CAPACITY` entries, so the offset fits.
+        let start = usize::try_from(cursor.0.saturating_add(1).saturating_sub(oldest.0))
+            .unwrap_or(self.entries.len())
+            .min(self.entries.len());
+        ChangesSince::Entries(self.entries.range(start..).copied().collect())
     }
 }
 
@@ -736,6 +742,54 @@ impl PoolHandle {
                 .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
         })
         .await
+    }
+
+    /// Submit as [`Self::submit`] does, but hand the body to the core's
+    /// queue now or not at all, so the caller holds no body once this
+    /// returns. With the queue full the body and the reservation are
+    /// dropped, which frees the slot, and the verdict is `NoRoom`. The
+    /// verdict is awaited until `deadline`. See [`PoolHandle`].
+    pub fn submit_now(
+        &self,
+        reservation: Reservation,
+        transaction: UnminedTx,
+        deadline: Instant,
+    ) -> impl std::future::Future<Output = Result<Verdict, Elapsed>> + Send + 'static {
+        /// What became of the command, without the body.
+        enum Sent {
+            Queued(oneshot::Receiver<Verdict>),
+            Answered(Verdict),
+        }
+        let sent = if transaction.id() != reservation.tx_id() {
+            Sent::Answered(Verdict::LocalFault(LocalFault::WrongTransaction))
+        } else {
+            let (reply, verdict) = oneshot::channel();
+            let command = PoolCommand::Submit {
+                reservation,
+                transaction,
+                reply,
+            };
+            match self.commands.try_send(command) {
+                Ok(()) => Sent::Queued(verdict),
+                Err(mpsc::error::TrySendError::Full(_)) => Sent::Answered(Verdict::NoRoom),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Sent::Answered(Verdict::LocalFault(LocalFault::Stopped))
+                }
+            }
+        };
+        async move {
+            match sent {
+                Sent::Queued(verdict) => {
+                    by(deadline, async {
+                        verdict
+                            .await
+                            .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
+                    })
+                    .await
+                }
+                Sent::Answered(verdict) => Ok(verdict),
+            }
+        }
     }
 
     /// Report that the fetch `reservation` was taken for ended without a

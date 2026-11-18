@@ -30,7 +30,7 @@ use zakura_mempool::io::{ChainFeed, MempoolIO};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::{
     mempool::{
-        port::{self, pool_port, ChainEvent, ConnectedBlock},
+        port::{self, pool_port, ChainEvent, ConnectedBlock, PoolHandle, PoolInbox},
         MempoolTxSubscriber, Request, Response,
     },
     task::{spawn_buffer, spawn_erased},
@@ -95,6 +95,48 @@ impl Exempt {
     }
 }
 
+/// The pool core's port, built before the network starts so `tx-relay` can
+/// hold a handle to it. The core takes the inbox when it starts, and fills in
+/// the cooldown rule `tx-relay` reads.
+pub(crate) struct TxRelayPort {
+    handle: PoolHandle,
+    inbox: PoolInbox,
+    may_cool: Arc<std::sync::OnceLock<Arc<dyn Fn(Height) -> bool + Send + Sync>>>,
+}
+
+impl TxRelayPort {
+    /// A new port, with no cooldown rule yet.
+    pub fn new() -> Self {
+        let (handle, inbox) = pool_port();
+        Self {
+            handle,
+            inbox,
+            may_cool: Arc::default(),
+        }
+    }
+
+    /// A handle for `tx-relay`.
+    pub fn handle(&self) -> PoolHandle {
+        self.handle.clone()
+    }
+
+    /// The cooldown rule for `tx-relay`. Until the core starts, no verdict
+    /// may start a cooldown.
+    pub fn may_cool(&self) -> zakura_network::zakura::MayCool {
+        let rule = self.may_cool.clone();
+        Arc::new(move |height| rule.get().is_some_and(|may_cool| may_cool(height)))
+    }
+
+    /// Hands the port to the core, filling in its cooldown rule.
+    fn into_port(
+        self,
+        may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync>,
+    ) -> (PoolHandle, PoolInbox) {
+        let _ = self.may_cool.set(may_cool);
+        (self.handle, self.inbox)
+    }
+}
+
 /// The pool core's settings, from the node's `[mempool]` section, read as
 /// today's pool reads them.
 pub(crate) fn core_config(config: &Config) -> zakura_mempool::Config {
@@ -121,6 +163,7 @@ pub(crate) fn start(
     misbehavior: zn::MisbehaviorReporter,
     exempt: Exempt,
     trace: JsonlEventEmitter,
+    tx_relay: Option<TxRelayPort>,
 ) -> CoreParts {
     let best_tip: Arc<dyn Fn() -> Option<block::Hash> + Send + Sync> = {
         let latest_chain_tip = latest_chain_tip.clone();
@@ -132,6 +175,11 @@ pub(crate) fn start(
         latest_chain_tip,
         chain_tip_change.clone(),
     );
+    let may_cool: Arc<dyn Fn(Height) -> bool + Send + Sync> = {
+        let currentness = activation.currentness();
+        Arc::new(move |height| currentness.may_cool(height))
+    };
+    let port = tx_relay.map(|tx_relay| tx_relay.into_port(may_cool.clone()));
     let (active_tx, active_rx) = tokio::sync::watch::channel(false);
     let Assembled {
         mempool,
@@ -147,14 +195,12 @@ pub(crate) fn start(
         read_state,
         chain_tip_change,
         tx_verifier,
-        {
-            let currentness = activation.currentness();
-            Arc::new(move |height| currentness.may_cool(height))
-        },
+        may_cool,
         best_tip,
         misbehavior,
         exempt,
         active_rx,
+        port,
     );
     // The same `mempool.jsonl` row today's pool writes for each tip it
     // applies.
@@ -235,8 +281,9 @@ pub(crate) fn assemble(
     misbehavior: zn::MisbehaviorReporter,
     exempt: Exempt,
     active: watch::Receiver<bool>,
+    port: Option<(PoolHandle, PoolInbox)>,
 ) -> Assembled {
-    let (handle, inbox) = pool_port();
+    let (handle, inbox) = port.unwrap_or_else(pool_port);
 
     let adapter_read_state = read_state.clone();
     let verifier = verifier::ConsensusVerifier::new(

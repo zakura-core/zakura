@@ -35,6 +35,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;
@@ -56,6 +57,9 @@ pub use trace::{
     LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
+pub use tx_relay::{
+    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, ZakuraTxRelayConfig,
+};
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use handler::run_native_initiator_handshake_without_trace as run_native_initiator_handshake;

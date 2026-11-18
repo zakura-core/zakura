@@ -288,6 +288,7 @@ def tip_convergence(samples: list[dict], nodes: list[dict]) -> dict:
     Convergence alone is not evidence of health: if block production dies
     mid-window every node freezes at the same height, which looks perfectly
     converged. `advanced` is what distinguishes a live chain from a dead one.
+    `blocks_mined` is how far the fastest node's tip moved during the window.
     """
     first: dict[str, int] = {}
     last: dict[str, int] = {}
@@ -303,14 +304,16 @@ def tip_convergence(samples: list[dict], nodes: list[dict]) -> dict:
             silent_tail[node] = silent_tail.get(node, 0) + 1
     heights = list(last.values())
     growth = {node: last[node] - first[node] for node in last}
+    blocks_mined = max(growth.values(), default=0)
     return {
         "heights": last,
         "height_growth": growth,
+        "blocks_mined": blocks_mined,
         "reporting_nodes": len(last),
         "expected_nodes": len(nodes),
         "unresponsive_at_end": sorted(n for n, c in silent_tail.items() if c > 0),
         "spread": (max(heights) - min(heights)) if heights else None,
-        "advanced": bool(growth) and max(growth.values()) > 0,
+        "advanced": blocks_mined > 0,
         "converged": bool(heights)
         and len(last) == len(nodes)
         and (max(heights) - min(heights)) <= 1,
@@ -415,7 +418,7 @@ def render_markdown(result: dict) -> str:
     # (label, rendered value, how to read it). The hints exist because several
     # of these numbers are easy to misread: `Confirmed` looks like a success
     # rate but is bounded by block production, and effective throughput looks
-    # like a shortfall against the target rate but is bounded by proving.
+    # like a shortfall against the target rate but follows blocks mined.
     rows = [
         (
             "Transactions submitted",
@@ -452,8 +455,14 @@ def render_markdown(result: dict) -> str:
         (
             "Effective throughput",
             f"{fmt_num(result['effective_tx_per_sec'])} tx/s",
-            "Bounded by Orchard proving, not the mempool. Compare legs against "
-            "each other, never against the requested rate.",
+            "Follows blocks mined, because each in-flight transaction waits for "
+            "a block. Never compare it with the requested rate.",
+        ),
+        (
+            "Blocks mined",
+            fmt_num(convergence["blocks_mined"]),
+            "How far the tip moved during the window. Swings with mining luck, "
+            "and throughput and confirm delay follow it.",
         ),
         (
             "Confirm delay p50 / p95",

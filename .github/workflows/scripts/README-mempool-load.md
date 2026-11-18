@@ -217,9 +217,13 @@ the throwaway chain. Three independent controls:
 `summary.md` carries the verdict; `summary.json` is the machine-readable form
 and the input to `mempool-load-compare.py`.
 
-- **Throughput** is bounded by Orchard proving, not by the mempool. Effective
-  tx/s runs well under `--tx-rate` on a small box (~0.2 tx/s for 3 nodes here);
-  compare legs against each other, never against the requested rate.
+- **Throughput follows blocks mined.** The blaster keeps `ORCHARD_LANES`
+  transactions in flight (32 by default), and each waits for a block before its
+  lane frees up. So effective tx/s tracks how many blocks land in the window,
+  which swings with mining luck. In one A/B with the same miner, the legacy leg
+  mined 14 blocks and the v2 leg 7, so v2 "submitted" 44% less. The comparison
+  shows a blocks-mined row and reports throughput without grading it. Never
+  compare it with `--tx-rate`.
 - **Propagation spread** (p50/p95 across nodes) is the figure that moves for
   gossip changes like #341 and #64. Read it against `resolution_secs`, the
   median sampling gap: spreads below one round are unresolvable. Measured p50

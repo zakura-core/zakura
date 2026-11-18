@@ -841,6 +841,7 @@ class Convergence(unittest.TestCase):
         out = monitor.tip_convergence(samples, self.NODES)
         self.assertTrue(out["advanced"])
         self.assertEqual(out["height_growth"]["miner-0"], 40)
+        self.assertEqual(out["blocks_mined"], 40)
 
     def test_a_node_that_stops_answering_is_reported(self):
         samples = [
@@ -941,9 +942,9 @@ class Verdict(unittest.TestCase):
         self.assertTrue(any("reject rate" in r for r in reasons))
 
     def test_reject_rate_is_not_graded_below_the_sample_floor(self):
-        # Throughput is proving-bound, so a short run submits tens of
-        # transactions where one reject is already several percent. Grading
-        # that would fail healthy runs on noise.
+        # Throughput is bounded by block production, so a short run submits
+        # tens of transactions where one reject is already several percent.
+        # Grading that would fail healthy runs on noise.
         result = self.healthy_result()
         result["throughput"]["submitted"] = 22
         result["throughput"]["reject_rate"] = 0.2
@@ -1011,7 +1012,7 @@ class Reporting(unittest.TestCase):
                 "spread_p50_secs": 0.4,
                 "spread_p95_secs": 1.2,
             },
-            "convergence": {"spread": 0, "heights": {}},
+            "convergence": {"spread": 0, "heights": {}, "blocks_mined": 12},
             "backpressure": {"mempool_full_queue_per_peer_total": 7.0},
             "peak_mempool_txs": 220,
             "panics": [],
@@ -1231,6 +1232,7 @@ class Comparison(unittest.TestCase):
             },
             "effective_tx_per_sec": 3.33,
             "peak_mempool_txs": 200,
+            "convergence": {"blocks_mined": 12},
         }
         for section, values in overrides.items():
             if isinstance(values, dict):
@@ -1251,20 +1253,18 @@ class Comparison(unittest.TestCase):
         cd = self.row_for(rows, "Confirm delay p95 (ms)")
         self.assertEqual(cd["verdict"], "info")
 
-    def test_throughput_drop_is_flagged_as_worse(self):
-        target = self.leg(throughput={"submitted": 500})
+    def test_throughput_is_reported_but_not_graded(self):
+        # A target leg that mined half the blocks submits about half as much.
+        # That is mining luck, so it must not read as a regression.
+        target = self.leg(throughput={"submitted": 500}, convergence={"blocks_mined": 6})
         rows = compare.build_rows(self.leg(), target)
         row = self.row_for(rows, "Transactions submitted")
-        self.assertEqual(row["verdict"], "WORSE")
+        self.assertEqual(row["verdict"], "info")
         self.assertAlmostEqual(row["delta_pct"], -50.0)
-
-    def test_throughput_gain_is_flagged_as_better(self):
-        target = self.leg(throughput={"submitted": 2000})
-        rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Transactions submitted")["verdict"], "better")
+        self.assertEqual(self.row_for(rows, "Blocks mined in window")["target"], 6)
 
     def test_latency_direction_is_inverted(self):
-        # Higher propagation latency is a regression, unlike higher throughput.
+        # Higher propagation latency is a regression, unlike higher reach.
         target = self.leg(propagation={"spread_p95_secs": 5.0})
         rows = compare.build_rows(self.leg(), target)
         self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "WORSE")
@@ -1274,14 +1274,14 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "better")
 
     def test_small_deltas_are_treated_as_noise(self):
-        target = self.leg(throughput={"submitted": 1050})  # +5%
+        target = self.leg(propagation={"txids_on_all_nodes": 945})  # +5%
         rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Transactions submitted")["verdict"], "=")
+        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "=")
 
     def test_zero_baseline_does_not_produce_infinity(self):
-        baseline = self.leg(throughput={"submitted": 0})
+        baseline = self.leg(propagation={"txids_on_all_nodes": 0})
         rows = compare.build_rows(baseline, self.leg())
-        row = self.row_for(rows, "Transactions submitted")
+        row = self.row_for(rows, "Txids reaching all nodes")
         self.assertIsNone(row["delta_pct"])
         # Unbounded, but unambiguously an improvement in direction.
         self.assertEqual(row["verdict"], "better")
@@ -1311,11 +1311,11 @@ class Comparison(unittest.TestCase):
         self.assertIsNone(self.row_for(rows, "Propagation p95 (s)")["delta_pct"])
 
     def test_report_names_the_regressed_metrics(self):
-        target = self.leg(throughput={"submitted": 400})
+        target = self.leg(propagation={"txids_on_all_nodes": 400})
         rows = compare.build_rows(self.leg(), target)
         report = compare.render(self.leg(), target, rows)
         self.assertIn("regressed beyond the noise floor", report)
-        self.assertIn("Transactions submitted", report)
+        self.assertIn("Txids reaching all nodes", report.split("regressed beyond")[-1])
         # Zero-baseline deltas must not render as a numeric infinity. Check the
         # delta cells specifically -- "info"/"informational" appear elsewhere.
         import re

@@ -42,8 +42,9 @@ use crate::{
     Observation, ObservationLog, RunConfig, Sim,
 };
 
-/// The variable that turns a fuzz target's semantic feedback `on`, the
-/// default, or `off`. The fuzz package reads it, and a campaign's manifest
+/// The variable that turns a fuzz target's semantic feedback `on` or `off`.
+/// Unset means `on` on Linux, the only platform where libFuzzer reads the
+/// feedback, and `off` elsewhere. The fuzz package reads it, and a campaign's manifest
 /// sets it.
 pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
 

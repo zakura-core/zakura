@@ -6,7 +6,7 @@
 # Seed 0 of the seeded `ff 06` search holds with the trigger history at
 # slots 3 to 6; `release-by-height.patch` must still violate it alone.
 harness = "block-sync/storage"
-generator = 2
+generator = 3
 sha256 = "94cad5c4fe37df07236237fb82de191d3d64f0fe995b3ad1e2d9e1008c440d2e"
 scenario_sha256 = "13f1c8625d6873bc5a9b0708d870f1f50f7a1ad47cc56261af6228044ba03a8f"
 source = "crates/zakura-sim/tests/block_semantic_properties.rs"

@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+index 2a6e606b45..0fe441cdf9 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -881,13 +881,6 @@ impl WorkQueueState {
+                 outcome.committed_count = outcome.committed_count.saturating_add(1);
+                 continue;
+             }
+-            match item.budget {
+-                BlockBudgetLedger::Released => {
+-                    outcome.released_count = outcome.released_count.saturating_add(1);
+-                    continue;
+-                }
+-                BlockBudgetLedger::Reserved(_) => {}
+-            }
+             let mut item = self
+                 .in_flight
+                 .remove(&height)

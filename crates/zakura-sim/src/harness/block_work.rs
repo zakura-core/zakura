@@ -19,15 +19,20 @@ const OWNERSHIP: Machine = Machine {
             .map(|step| (step.step, MachineStep::Work(step.into())))
             .collect()
     },
-    reached: |steps, _| {
-        // An item's nonzero charge proves the input reached resource-bearing
-        // work, including when a mutation drops the charge from the ledger total.
+    reached: |steps, expect| {
+        // An owned in-flight item is ownership's trigger. A violation needs no
+        // more: a mutant can break ownership on an item whose charge was
+        // already released or committed. A hold also needs the item's nonzero
+        // charge, which proves the input reached resource-bearing work,
+        // including when a mutation drops the charge from the ledger total.
         steps.iter().any(|step| {
             matches!(step, MachineStep::Work(work) if work
                 .actual
                 .items
                 .iter()
-                .any(|item| item.in_flight && item.owner.is_some() && item.charge > 0))
+                .any(|item| item.in_flight
+                    && item.owner.is_some()
+                    && (expect != Expect::Holds || item.charge > 0)))
         })
     },
 };

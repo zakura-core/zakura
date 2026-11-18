@@ -2775,7 +2775,7 @@ struct SessionOpenContext<'a> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum InboundMessageAdmission {
+pub(crate) enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
@@ -2812,39 +2812,37 @@ fn admit_inbound_message(
     // A stream with a table charges only the rows that declare a cadence.
     // Commitments bound requests and reservations bound responses.
     if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
-        let rule = MessageRule::find(rules, frame.message_type)
-            .expect("the frame filter admits only rows of the stream's table");
-        let charge = cadence
-            .buckets
-            .lock()
-            .expect("Zakura cadence bucket mutex is never poisoned")
-            .charge_frame(cadence.layout, rule, payload_len);
-        // A metered row's bucket already holds every byte a conformant sender
-        // can have buffered, so an overrun is a violation.
-        if charge == CadenceCharge::Overrun {
-            context.conn.trace_rate_limit(
-                "byte_rate.overrun",
-                context.stream_id,
-                stream_kind,
-                Some(u64::try_from(payload_len).unwrap_or(u64::MAX)),
-                None,
-                None,
-            );
-            return InboundMessageAdmission::ByteRateOverrun;
-        }
-        // A sibling stream can keep the connection alive during an unbounded
-        // transport stall. Exhaustion cannot prove a sender violation.
-        if charge == CadenceCharge::Exhausted {
-            context.conn.trace_rate_limit(
-                "cadence.exhausted",
-                context.stream_id,
-                stream_kind,
-                None,
-                None,
-                None,
-            );
-        }
-        return InboundMessageAdmission::Admit;
+        return admit_tabled_message(
+            frame,
+            rules,
+            |rule, payload_len| {
+                cadence
+                    .buckets
+                    .lock()
+                    .expect("Zakura cadence bucket mutex is never poisoned")
+                    .charge_frame(cadence.layout, rule, payload_len)
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "byte_rate.overrun",
+                    context.stream_id,
+                    stream_kind,
+                    Some(u64::try_from(payload_len).unwrap_or(u64::MAX)),
+                    None,
+                    None,
+                );
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "cadence.exhausted",
+                    context.stream_id,
+                    stream_kind,
+                    None,
+                    None,
+                    None,
+                );
+            },
+        );
     }
 
     let admitted = {
@@ -2872,6 +2870,61 @@ fn admit_inbound_message(
     }
 
     InboundMessageAdmission::Admit
+}
+
+/// Admits `frame` on a stream with the message table `rules`. It finds the
+/// frame's row and charges the row's bucket through `charge`, with the
+/// frame's payload length. If a metered row's frame overran its byte bucket,
+/// it calls `overrun` and refuses the frame. If the bucket was empty, it
+/// calls `exhausted`, and an empty bucket doesn't refuse the frame.
+///
+/// # Panics
+///
+/// If no row of `rules` has the frame's type. The frame filter admits only
+/// rows of the stream's table.
+pub(crate) fn admit_tabled_message(
+    frame: &Frame,
+    rules: &[MessageRule],
+    charge: impl FnOnce(&MessageRule, usize) -> CadenceCharge,
+    overrun: impl FnOnce(),
+    exhausted: impl FnOnce(),
+) -> InboundMessageAdmission {
+    let rule = MessageRule::find(rules, frame.message_type)
+        .expect("the frame filter admits only rows of the stream's table");
+    let charge = charge(rule, frame.payload.len());
+    // A metered row's bucket already holds every byte a conformant sender
+    // can have buffered, so an overrun is a violation.
+    if charge == CadenceCharge::Overrun {
+        overrun();
+        return InboundMessageAdmission::ByteRateOverrun;
+    }
+    // A sibling stream can keep the connection alive during an unbounded
+    // transport stall. Exhaustion cannot prove a sender violation.
+    if charge == CadenceCharge::Exhausted {
+        exhausted();
+    }
+    InboundMessageAdmission::Admit
+}
+
+impl InboundMessageAdmission {
+    /// The error an ordered stream's worker closes with for this result, or
+    /// `None` if it admits the frame.
+    pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
+        match self {
+            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
+            InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
+            InboundMessageAdmission::ByteRateOverrun => Some(ZakuraHandlerError::ByteRateOverrun),
+        }
+    }
+
+    /// The close cause the ordered stream reader records for this result,
+    /// or `None` if it admits the frame.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
+        self.ordered_error()
+            .map(|error| read_close_cause(ReadPath::Ordered, &error))
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -5832,8 +5885,10 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => {
+                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
+                        .ordered_error()
+                    {
+                        None => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
@@ -5868,11 +5923,7 @@ async fn persistent_stream_worker_with_policy(
                             .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
                             continue;
                         }
-                        InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-                        InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
-                        InboundMessageAdmission::ByteRateOverrun => {
-                            ZakuraHandlerError::ByteRateOverrun
-                        }
+                        Some(error) => error,
                     }
                 }
                 Err(error) => {

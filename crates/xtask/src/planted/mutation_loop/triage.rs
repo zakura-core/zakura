@@ -4,9 +4,11 @@
 //! the run counts as triaged. [`TRIAGE_FILE`] records each reason once, by
 //! the case's patch and property, the lane (`witness`, or the generator
 //! harness, which covers every seed), and the class it explains, with the
-//! other rule's ID for a kill by another rule. A record matches a lane, or
-//! a seed of a generator lane, only while that lane's class and other rule
-//! are the record's, so a lane whose result changed needs triage again. The
+//! other rule's ID for a kill by another rule. A generator lane's record
+//! also names its mode, `inproc` unless it says `libfuzzer`, since the two
+//! modes search differently. A record matches a lane, or a seed of a
+//! generator lane, only while that lane's class and other rule are the
+//! record's, so a lane whose result changed needs triage again. The
 //! loop reads the file from the checkout it runs from, and copies each
 //! record onto the lanes it matches, so every later report carries it too.
 //! A record that matches no lane is stale, and the loop lists it.
@@ -18,6 +20,7 @@ use serde_json::Value;
 
 use super::{
     classify::{Class, Classified},
+    generate::GenerateMode,
     CaseReport,
 };
 use crate::BoxError;
@@ -80,6 +83,10 @@ pub(in crate::planted) struct Record {
     pub(in crate::planted) property: String,
     /// `witness`, or a generator harness.
     pub(in crate::planted) lane: String,
+    /// A generator lane's mode, `inproc` if the record names none. A
+    /// witness lane's record names none.
+    #[serde(default)]
+    pub(in crate::planted) mode: Option<GenerateMode>,
     /// The lane's class that the record explains.
     pub(in crate::planted) class: TriagedClass,
     /// The other rule's ID, for `killed-by-other-rule` only.
@@ -101,15 +108,29 @@ impl Record {
     }
 
     /// True if the record explains `case`'s `lane`, whose result is
-    /// `result`.
-    fn names(&self, case: &CaseReport, lane: &str, result: &Classified) -> bool {
+    /// `result`. `mode` is a generator lane's, and `None` for the witness
+    /// lane.
+    fn names(
+        &self,
+        case: &CaseReport,
+        lane: &str,
+        mode: Option<GenerateMode>,
+        result: &Classified,
+    ) -> bool {
         (
             self.patch.as_str(),
             self.property.as_str(),
             self.lane.as_str(),
         ) == (case.patch.as_str(), case.property.as_str(), lane)
+            && self.lane_mode() == mode
             && self.class.class() == result.class
             && self.other == result.other
+    }
+
+    /// The mode of the lane the record names: `None` for the witness lane,
+    /// and the record's mode, `inproc` by default, for a generator lane.
+    fn lane_mode(&self) -> Option<GenerateMode> {
+        (self.lane != WITNESS_LANE).then(|| self.mode.unwrap_or_default())
     }
 
     /// The record's lane and class, in words.
@@ -122,15 +143,23 @@ impl Record {
             .other
             .as_ref()
             .map_or_else(String::new, |other| format!(" {other}"));
+        let mode = match self.lane_mode() {
+            Some(GenerateMode::Libfuzzer) => " libfuzzer",
+            _ => "",
+        };
         format!(
-            "{} {} {} {class}{other}",
+            "{} {} {}{mode} {class}{other}",
             self.patch, self.property, self.lane
         )
     }
 
     /// Why the record is malformed: `other` is required for a kill by
-    /// another rule and forbidden otherwise.
+    /// another rule and forbidden otherwise, and `mode` is forbidden for
+    /// the witness lane.
     fn malformed(&self) -> Option<&'static str> {
+        if self.lane == WITNESS_LANE && self.mode.is_some() {
+            return Some("names a `mode`, which only a generator lane takes");
+        }
         match (self.class, &self.other) {
             (TriagedClass::KilledByOtherRule, None) => {
                 Some("is `killed-by-other-rule` and names no `other` rule")
@@ -186,23 +215,24 @@ pub(super) fn read(root: &Path) -> Result<Vec<Record>, BoxError> {
 /// out isn't judged.
 pub(super) fn apply<'a>(cases: &mut [CaseReport], records: &'a [Record]) -> Vec<&'a Record> {
     let mut used = vec![false; records.len()];
-    let mut find = |case: &CaseReport, lane: &str, result: &Classified| {
-        let index = records
-            .iter()
-            .position(|record| record.names(case, lane, result))?;
-        used[index] = true;
-        Some(records[index].triage())
-    };
+    let mut find =
+        |case: &CaseReport, lane: &str, mode: Option<GenerateMode>, result: &Classified| {
+            let index = records
+                .iter()
+                .position(|record| record.names(case, lane, mode, result))?;
+            used[index] = true;
+            Some(records[index].triage())
+        };
     for case in cases.iter_mut() {
         case.triage = needs_triage(case.result.class)
-            .then(|| find(case, WITNESS_LANE, &case.result))
+            .then(|| find(case, WITNESS_LANE, None, &case.result))
             .flatten();
         let generator = std::mem::take(&mut case.generator);
         case.generator = generator
             .into_iter()
             .map(|mut lane| {
                 lane.triage = needs_triage(lane.result.class)
-                    .then(|| find(case, &lane.harness, &lane.result))
+                    .then(|| find(case, &lane.harness, Some(lane.mode), &lane.result))
                     .flatten();
                 lane
             })

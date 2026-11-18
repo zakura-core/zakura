@@ -249,10 +249,10 @@ shared = [
     "crates/zakura-network/src/zakura/handler.rs",
 ]
 # Each table's witness, which the runner runs once per shared-path patch.
-# The block-sync harness's relay checks each header but never runs
-# `admit_inbound_message` (handler.rs), so a break to that admission step
-# (its size check, cadence charge and row `expect`) reaches stream 6 only
-# in production. Its runs count only through discovery/s4v2.
+# The block-sync harness's relay runs the admission step's row `expect` and
+# cadence charge (`admit_tabled_message`, handler.rs) but not its size
+# check, which needs negotiated connection limits. A break to the size
+# check counts only through discovery/s4v2.
 tables = [
     { table = "block-sync/s6v3", witness = { test = "each_probe_fault_reaches_its_exact_id", test_target = "block_table" } },
     { table = "discovery/s4v2", witness = { test = "hello_acts_apply_in_their_witnesses", test_target = "discovery_wire_witness" } },
@@ -336,66 +336,154 @@ reason = "Draft: the claim itself is under test, so its violation doesn't end a 
 # here.
 
 [[no-generator]]
-reason = "Each ID applies only when a peer sends a frame that stream 6's table refuses. block-sync/storage, the only harness that reports these IDs, draws honest mirrors only. Its hostile frames come from `ProbeSend` control steps, which no drawn scenario carries: only typed scenarios and the `block_table` tests build them. A 50-run `zakura-sim generate` on seed 11 applied none of them."
+reason = "No block-sync scenario reaches these IDs, drawn or typed: every exchange owes room for its ending, and a conformant body leaves it, so an ending is never over-owed. `block_table`'s `ids_no_scenario_reaches_stay_not_applicable` holds them `NotApplicable` in every scenario. block-sync/storage draws stream 6's other refusals from `block_hostile::hostile_scenarios` (mut-6)."
 properties = [
-    "block-sync/s6v3/block/bad-content-closes",
-    "block-sync/s6v3/block/long-payload-closes",
-    "block-sync/s6v3/block/over-owed-closes",
-    "block-sync/s6v3/block/reserved-flags-closes",
-    "block-sync/s6v3/block/short-payload-closes",
-    "block-sync/s6v3/block/unsolicited-closes",
-    "block-sync/s6v3/blocks-done/bad-content-closes",
-    "block-sync/s6v3/blocks-done/long-payload-closes",
     "block-sync/s6v3/blocks-done/over-owed-closes",
-    "block-sync/s6v3/blocks-done/reserved-flags-closes",
-    "block-sync/s6v3/blocks-done/short-payload-closes",
-    "block-sync/s6v3/blocks-done/unsolicited-closes",
-    "block-sync/s6v3/get-blocks/bad-content-closes",
-    "block-sync/s6v3/get-blocks/long-payload-closes",
-    "block-sync/s6v3/get-blocks/over-margin-closes",
-    "block-sync/s6v3/get-blocks/reserved-flags-closes",
-    "block-sync/s6v3/get-blocks/short-payload-closes",
-    "block-sync/s6v3/range-unavailable/bad-content-closes",
-    "block-sync/s6v3/range-unavailable/long-payload-closes",
     "block-sync/s6v3/range-unavailable/over-owed-closes",
-    "block-sync/s6v3/range-unavailable/reserved-flags-closes",
-    "block-sync/s6v3/range-unavailable/short-payload-closes",
-    "block-sync/s6v3/range-unavailable/unsolicited-closes",
-    "block-sync/s6v3/status/bad-content-closes",
-    "block-sync/s6v3/status/long-payload-closes",
-    "block-sync/s6v3/status/reserved-flags-closes",
-    "block-sync/s6v3/status/short-payload-closes",
-    "block-sync/s6v3/undeclared-type-closes",
 ]
 
 [[no-generator]]
-reason = "Each ID applies only when a peer sends a frame that stream 4's table refuses. discovery/wire, the only harness that reports these IDs, draws only its honest saved Plans and the default honest peer. Its refused frames come from the `discovery_wire_witness` tests' act scenarios, which its grammar can't encode."
+reason = "No discovery scenario reaches this ID, drawn or typed: the node asks for every service, so its `GetServices` owes the row's largest `Services`, and a larger one is `long-payload`. A scripted bypass in `discovery_wire_witness` violates it instead (disc-3.2). discovery/wire draws stream 4's other refusals from `discovery_service::HOSTILE_ACTS` (mut-6)."
 properties = [
-    "discovery/s4v2/get-peers/bad-content-closes",
-    "discovery/s4v2/get-peers/long-payload-closes",
-    "discovery/s4v2/get-peers/over-margin-closes",
-    "discovery/s4v2/get-peers/reserved-flags-closes",
-    "discovery/s4v2/get-peers/short-payload-closes",
-    "discovery/s4v2/get-services/bad-content-closes",
-    "discovery/s4v2/get-services/long-payload-closes",
-    "discovery/s4v2/get-services/over-margin-closes",
-    "discovery/s4v2/get-services/reserved-flags-closes",
-    "discovery/s4v2/get-services/short-payload-closes",
-    "discovery/s4v2/hello/bad-content-closes",
-    "discovery/s4v2/hello/long-payload-closes",
-    "discovery/s4v2/hello/reserved-flags-closes",
-    "discovery/s4v2/hello/short-payload-closes",
-    "discovery/s4v2/peers/bad-content-closes",
-    "discovery/s4v2/peers/long-payload-closes",
-    "discovery/s4v2/peers/over-owed-closes",
-    "discovery/s4v2/peers/reserved-flags-closes",
-    "discovery/s4v2/peers/short-payload-closes",
-    "discovery/s4v2/peers/unsolicited-closes",
-    "discovery/s4v2/services/bad-content-closes",
-    "discovery/s4v2/services/long-payload-closes",
     "discovery/s4v2/services/over-owed-closes",
-    "discovery/s4v2/services/reserved-flags-closes",
-    "discovery/s4v2/services/short-payload-closes",
-    "discovery/s4v2/services/unsolicited-closes",
-    "discovery/s4v2/undeclared-type-closes",
 ]
+
+# Each `[[drawn-witness]]` names, for one `cases.json` case whose witness is
+# a hand-built test, the generator harness and the scenario families that
+# draw the test's scenario (mutation plan, mut-6): the families' tags draw
+# the same library scenario the test runs, or, for `untagged`, the default
+# draw. `crates/zakura-sim/tests/mutation_work_list.rs` checks that every
+# such case has a record or a `[[no-generator]]` reason, and that each
+# record's harness reports the property and lists the families.
+
+[[drawn-witness]]
+patch = "bounds/budget-ignores-charges/budget-ignores-charges.patch"
+property = "block-sync/reserved-byte-bound"
+harness = "block-sync/storage"
+families = ["paused-handoffs"]
+
+[[drawn-witness]]
+patch = "budget-ledgers-agree/receipt-keeps-pooled-charge/receipt-keeps-pooled-charge.patch"
+property = "block-sync/budget-ledgers-agree"
+harness = "block-sync/storage"
+families = ["untagged"]
+
+[[drawn-witness]]
+patch = "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+harness = "block-sync/storage"
+families = ["reset-mid-flight"]
+
+[[drawn-witness]]
+patch = "submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+harness = "block-sync/storage"
+families = ["reset-mid-flight"]
+
+[[drawn-witness]]
+patch = "wakes/notify-before-answer-record/notify-before-answer-record.patch"
+property = "discovery/wait-complete-wakes"
+harness = "discovery/wait-complete"
+families = ["untagged"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "block-sync/s6v3/status/bad-content-closes"
+harness = "block-sync/storage"
+families = ["status-bad-content"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/protocol-reject-keeps-connection/protocol-reject-keeps-connection.patch"
+property = "discovery/s4v2/hello/bad-content-closes"
+harness = "discovery/wire"
+families = ["hello-bad-content"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch"
+property = "block-sync/s6v3/status/reserved-flags-closes"
+harness = "block-sync/storage"
+families = ["status-reserved-flags", "status-flag-only"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/reserved-flags-ignored/reserved-flags-ignored.patch"
+property = "discovery/s4v2/hello/reserved-flags-closes"
+harness = "discovery/wire"
+families = ["hello-reserved-flags"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "block-sync/s6v3/status/cadence-never-closes"
+harness = "block-sync/storage"
+families = ["status-cadence-burst"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/cadence-exhaustion-throttles/cadence-exhaustion-throttles.patch"
+property = "discovery/s4v2/hello/cadence-never-closes"
+harness = "discovery/wire"
+families = ["hello-burst"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "block-sync/s6v3/undeclared-type-closes"
+harness = "block-sync/storage"
+families = ["undeclared-type"]
+
+[[drawn-witness]]
+patch = "shared-wire-path/undeclared-type-reaches-decoder/undeclared-type-reaches-decoder.patch"
+property = "discovery/s4v2/undeclared-type-closes"
+harness = "discovery/wire"
+families = ["undeclared-type"]
+
+[[drawn-witness]]
+patch = "block-sync-table/owe-largest-response/owe-largest-response.patch"
+property = "block-sync/s6v3/block/receiver-work-authorized"
+harness = "block-sync/storage"
+families = ["block-over-owed", "block-bad-content", "block-tampered", "blocks-done-bad-content", "range-unavailable-bad-content"]
+
+[[drawn-witness]]
+patch = "block-sync-table/accept-any-ending/accept-any-ending.patch"
+property = "block-sync/s6v3/blocks-done/bad-content-closes"
+harness = "block-sync/storage"
+families = ["blocks-done-bad-content"]
+
+[[drawn-witness]]
+patch = "block-sync-table/admit-overlapping-range/admit-overlapping-range.patch"
+property = "block-sync/s6v3/get-blocks/receiver-serving-bounded"
+harness = "block-sync/storage"
+families = ["get-blocks-overlap"]
+
+[[drawn-witness]]
+patch = "block-sync-table/enforce-double-limit/enforce-double-limit.patch"
+property = "block-sync/s6v3/get-blocks/receiver-serving-bounded"
+harness = "block-sync/storage"
+families = ["get-blocks-over-margin"]
+
+[[drawn-witness]]
+patch = "block-sync-table/ignore-peer-inflight-limit/ignore-peer-inflight-limit.patch"
+property = "block-sync/s6v3/get-blocks/sender-within-limit"
+harness = "block-sync/storage"
+families = ["block-over-owed", "block-bad-content", "block-tampered", "blocks-done-bad-content", "range-unavailable-bad-content"]
+
+[[drawn-witness]]
+patch = "discovery-table/admit-zero-peer-limit/admit-zero-peer-limit.patch"
+property = "discovery/s4v2/get-peers/bad-content-closes"
+harness = "discovery/wire"
+families = ["get-peers-bad-content"]
+
+[[drawn-witness]]
+patch = "discovery-table/admit-repeated-wanted-service/admit-repeated-wanted-service.patch"
+property = "discovery/s4v2/get-services/bad-content-closes"
+harness = "discovery/wire"
+families = ["get-services-bad-content"]
+
+[[drawn-witness]]
+patch = "discovery-table/wants-every-service/wants-every-service.patch"
+property = "discovery/s4v2/services/sender-within-owed"
+harness = "discovery/wire"
+families = ["get-header-sync-service"]
+
+[[drawn-witness]]
+patch = "discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
+property = "discovery/s4v2/services/sender-within-owed"
+harness = "discovery/wire"
+families = ["get-header-sync-service"]

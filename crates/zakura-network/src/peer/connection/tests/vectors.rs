@@ -241,6 +241,7 @@ async fn connection_run_loop_message_ok() {
     // Simulate a message send and receive
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
+        advertised_block: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -307,6 +308,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
+            advertised_block: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -325,6 +327,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (block_tx, block_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
+            advertised_block: None,
             request: Request::BlocksByHash(IndexSet::from([hash])),
             tx: block_tx,
             inv_collector: None,
@@ -366,6 +369,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
+            advertised_block: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -384,6 +388,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (find_tx, mut find_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
+            advertised_block: None,
             request: Request::FindBlocks {
                 known_blocks: Vec::new(),
                 stop: None,
@@ -744,6 +749,7 @@ async fn connection_run_loop_send_timeout_nil_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
+        advertised_block: None,
         request: Request::AdvertiseTransactionIds(HashSet::new(), None),
         tx: request_tx,
         inv_collector: None,
@@ -818,6 +824,7 @@ async fn connection_run_loop_send_timeout_expect_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
+        advertised_block: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -892,6 +899,7 @@ async fn connection_run_loop_receive_timeout() {
     // Simulate a message receive timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
+        advertised_block: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -1289,6 +1297,7 @@ async fn connection_ping_pong_round_trip() {
 
     client_tx
         .send(ClientRequest {
+            advertised_block: None,
             request: Request::Ping(nonce),
             tx: response_tx,
             inv_collector: None,
@@ -1748,6 +1757,7 @@ impl BudgetedConnection {
         let (tx, response) = oneshot::channel();
         self.client_tx
             .try_send(ClientRequest {
+                advertised_block: None,
                 request: Request::BlocksByHash(blocks.iter().map(|block| block.hash()).collect()),
                 tx,
                 inv_collector: None,
@@ -2028,6 +2038,7 @@ fn client_request(
 ) {
     let (tx, rx) = oneshot::channel();
     let request = ClientRequest {
+        advertised_block: None,
         request,
         tx,
         inv_collector: None,
@@ -2167,7 +2178,7 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
     let (connection, mut client_tx, _inbound, mut outbound, error_slot) = new_test_connection();
     let slot = connection.request_slot.clone();
     let connection_task = tokio::spawn(connection.run(peer_rx));
-    let (tx, _block) = response_vectors();
+    let (tx, block) = response_vectors();
     let txid = tx.id();
 
     // Cancelling the request frees the slot.
@@ -2200,11 +2211,12 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
     assert!(slot.is_free(), "a timeout frees the slot");
 
     // A disconnect fails the outstanding request and leaves the slot busy.
-    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
     client_tx.send(request).await.expect("connection is open");
     assert_eq!(
         outbound.next().await,
-        Some(Message::GetData(vec![txid.into()]))
+        Some(Message::GetData(vec![block.hash().into()]))
     );
     peer_tx.close_channel();
     let error = response
@@ -2215,6 +2227,10 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
     assert!(error_slot.try_get_error().is_some());
     assert!(!slot.is_free(), "a failed connection cannot write requests");
 
+    assert!(
+        slot.announced_block_missed(),
+        "the peer disconnected after the block request was written"
+    );
     let _ = connection_task.await;
 }
 
@@ -2243,24 +2259,34 @@ async fn request_slot_records_unanswered_block_requests() {
     assert!(!slot.block_request_unanswered());
 
     // An early cancellation says nothing about the peer.
-    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
     tokio::time::advance(half_timeout - Duration::from_secs(1)).await;
     drop(response);
     settle().await;
+    assert!(
+        !slot.announced_block_missed(),
+        "local cancellation is not a missed announcement"
+    );
     assert!(slot.is_free());
     assert!(!slot.block_request_unanswered());
 
     // A downloader's own timeout usually cancels just before the connection's timer fires.
-    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
     tokio::time::advance(half_timeout).await;
     drop(response);
     settle().await;
+    assert!(
+        !slot.announced_block_missed(),
+        "local cancellation is not a missed announcement"
+    );
     assert!(slot.is_free());
     assert!(slot.block_request_unanswered());
 
@@ -2281,7 +2307,8 @@ async fn request_slot_records_unanswered_block_requests() {
     assert!(!slot.block_request_unanswered());
 
     // The connection's own timeout also records the request.
-    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Hedge);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2289,6 +2316,11 @@ async fn request_slot_records_unanswered_block_requests() {
     assert!(response.await.expect("connection responds").is_err());
     settle().await;
     assert!(slot.block_request_unanswered());
+
+    assert!(
+        slot.announced_block_missed(),
+        "the dispatched hedge timed out"
+    );
 
     connection_task.abort();
 }
@@ -2467,6 +2499,7 @@ async fn block_advert_while_awaiting_response() {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
+                advertised_block: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![idle_hash],
                     stop: None,
@@ -2543,6 +2576,7 @@ async fn block_advert_as_ordinary_request_is_an_error() {
         let (request_tx, request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
+                advertised_block: None,
                 request: Request::AdvertiseBlock(block::Hash([5; 32]).into(), None),
                 tx: request_tx,
                 inv_collector: None,
@@ -2806,6 +2840,7 @@ async fn send_find_blocks(
     let (request_tx, request_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
+            advertised_block: None,
             request: Request::FindBlocks {
                 known_blocks: vec![block::Hash([1; 32])],
                 stop: None,
@@ -3046,6 +3081,7 @@ async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
             let (request_tx, request_rx) = oneshot::channel();
             client_tx
                 .try_send(ClientRequest {
+                    advertised_block: None,
                     request: Request::TransactionsById(HashSet::from([requested.id(), missing])),
                     tx: request_tx,
                     inv_collector: None,
@@ -3174,6 +3210,7 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
+                advertised_block: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![block::Hash([1; 32])],
                     stop: None,

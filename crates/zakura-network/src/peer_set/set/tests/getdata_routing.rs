@@ -1872,3 +1872,87 @@ async fn queue_time_does_not_make_a_just_dispatched_request_stall() {
         .expect("the dispatched second request was traced");
     assert_eq!(row["first_request_waited_ms"], 600);
 }
+
+/// The connection processes replies in order even if the downloader reads them in reverse.
+async fn assert_late_miss_keeps_recovered_announcer(hedge: bool) {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut near = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let mut far = TestPeer::spawn(3);
+    let _scores = [
+        measured_peer(&mut near, &registry, Some(10)),
+        measured_peer(&mut other, &registry, Some(100)),
+        measured_peer(&mut far, &registry, Some(230)),
+    ];
+    let (mut set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut near, &mut other, &mut far]);
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _primary;
+    let miss = if hedge {
+        announce_block(&mut set, &mut guard, &far).await;
+        _primary = request_primary(&mut set, &attempt).await;
+        assert_eq!(
+            far.written_now().await,
+            Some(Message::GetData(vec![BLOCK_HASH.into()]))
+        );
+        announce_block(&mut set, &mut guard, &near).await;
+        request_block_again(&mut set, &attempt, 30).await.boxed()
+    } else {
+        announce_block(&mut set, &mut guard, &near).await;
+        request_block(&mut set).await.boxed()
+    };
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+
+    // Keep the miss future alive and unpolled until this same connection delivers a block.
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    announce_hash(&mut set, &mut guard, &near, hash).await;
+    let recovery = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(hash));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![hash.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::Block(block.into())))
+        .await
+        .unwrap();
+    assert!(matches!(recovery.await, Ok(Response::Blocks(_))));
+    assert!(miss.await.is_err());
+
+    announce_hash(&mut set, &mut guard, &near, OTHER_BLOCK_HASH).await;
+    announce_hash(&mut set, &mut guard, &other, OTHER_BLOCK_HASH).await;
+    let _next = set
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request_for(OTHER_BLOCK_HASH));
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()])),
+        "the faster peer delivered a block after its miss and is preferred again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_primary_miss_keeps_recovered_announcer() {
+    assert_late_miss_keeps_recovered_announcer(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_hedge_miss_keeps_recovered_announcer() {
+    assert_late_miss_keeps_recovered_announcer(true).await;
+}

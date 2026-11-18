@@ -14,10 +14,32 @@ use tower::{
 
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
-    peer::{Client, ConnectedAddr, ConnectionInfo},
+    peer::{AdvertisedBlockRequest, Client, ConnectedAddr, ConnectionInfo},
     peer_registry::trace_user_agent,
     protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
+    Request,
 };
+
+/// Carries the peer set's routing decision through the load tracker to the client.
+#[derive(Debug)]
+struct RoutedClient(Client);
+
+impl Service<(Request, Option<AdvertisedBlockRequest>)> for RoutedClient {
+    type Response = <Client as Service<Request>>::Response;
+    type Error = <Client as Service<Request>>::Error;
+    type Future = <Client as Service<Request>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(
+        &mut self,
+        (request, advertised): (Request, Option<AdvertisedBlockRequest>),
+    ) -> Self::Future {
+        self.0.send_request(request, advertised)
+    }
+}
 
 /// A client service wrapper that keeps track of its load.
 ///
@@ -28,7 +50,7 @@ pub struct LoadTrackedClient {
     pub(crate) block_gossip: super::block_gossip::BlockGossipPeer,
 
     /// A service representing a connected peer, wrapped in a load tracker.
-    service: PeakEwma<Client>,
+    service: PeakEwma<RoutedClient>,
 
     /// Reports whether the connection can write a request as soon as it is sent.
     ///
@@ -68,7 +90,7 @@ impl From<Client> for LoadTrackedClient {
         let user_agent = trace_user_agent(&connection_info.remote.user_agent).into();
 
         let service = PeakEwma::new(
-            client,
+            RoutedClient(client),
             EWMA_DEFAULT_RTT,
             EWMA_DECAY_TIME_NANOS,
             tower::load::CompleteOnResponse::default(),
@@ -139,10 +161,13 @@ impl LoadTrackedClient {
             && !self.request_slot.announced_block_missed()
     }
 
-    /// The connection's request slot, for marking that the peer announced a block it then did
-    /// not deliver.
-    pub(crate) fn request_slot(&self) -> super::client::RequestSlot {
-        self.request_slot.clone()
+    /// Sends the request with the reason this particular peer was chosen.
+    pub(crate) fn call_routed(
+        &mut self,
+        request: Request,
+        advertised: Option<AdvertisedBlockRequest>,
+    ) -> <Self as Service<Request>>::Future {
+        self.service.call((request, advertised))
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.
@@ -172,10 +197,7 @@ impl LoadTrackedClient {
     }
 }
 
-impl<Request> Service<Request> for LoadTrackedClient
-where
-    Client: Service<Request>,
-{
+impl Service<Request> for LoadTrackedClient {
     type Response = <Client as Service<Request>>::Response;
     type Error = <Client as Service<Request>>::Error;
     type Future = <PeakEwma<Client> as Service<Request>>::Future;
@@ -185,7 +207,7 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        self.service.call(request)
+        self.call_routed(request, None)
     }
 }
 

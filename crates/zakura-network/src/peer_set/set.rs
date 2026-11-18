@@ -130,9 +130,8 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
-        LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
+        AdvertisedBlockRequest, LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
-    peer_registry::PeerRegistryUpdater,
     peer_set::{
         legacy_peer_trace::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
@@ -320,37 +319,6 @@ where
 
     /// The network of this peer set.
     network: Network,
-}
-
-/// Returns true if `result` delivered at least one block.
-fn delivered_block(result: &Result<Response, SharedPeerError>) -> bool {
-    matches!(result, Ok(Response::Blocks(blocks))
-        if blocks.iter().any(|block| block.available().is_some()))
-}
-
-/// Where to record that a peer announced a block and then did not deliver it to a gossip block
-/// request.
-struct MissedBlockRecord {
-    /// The connection's request slot, which makes block routing stop preferring the peer until
-    /// it next delivers a block.
-    request_slot: crate::peer::RequestSlot,
-    /// The connection's delivery trace, when the node keeps a peer registry.
-    registry: Option<PeerRegistryUpdater>,
-    /// Whether the request was a second request for the block.
-    second_request: bool,
-}
-
-impl MissedBlockRecord {
-    /// Records a miss when `result` did not deliver the block.
-    fn record_if_undelivered(&self, result: &Result<Response, SharedPeerError>) {
-        if delivered_block(result) {
-            return;
-        }
-        self.request_slot.mark_announced_block_missed();
-        if let Some(registry) = &self.registry {
-            registry.trace_block_missed(self.second_request);
-        }
-    }
 }
 
 impl<D, C> Drop for PeerSet<D, C>
@@ -1298,14 +1266,15 @@ where
         mut svc: LoadTrackedClient,
         req: Request,
         attempt: Option<&crate::BlockHedge>,
+        advertised: Option<AdvertisedBlockRequest>,
     ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
         let response = match attempt {
             Some(attempt) => {
                 attempt.dispatch_if_needed(Some(peer), svc.block_gossip.delivery_score(), || {
-                    svc.call(req)
+                    svc.call_routed(req, advertised)
                 })
             }
-            None => Ok(svc.call(req)),
+            None => Ok(svc.call_routed(req, advertised)),
         };
         self.push_unready(peer, svc);
         response
@@ -1494,24 +1463,24 @@ where
                     self.legacy_peer_trace_context(peer, &svc),
                     hash,
                     Instant::now(),
-                    MissedBlockRecord {
-                        request_slot: svc.request_slot(),
-                        registry: svc.block_gossip.registry.clone(),
-                        second_request: false,
-                    },
                 )),
                 _ => None,
             };
-            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref()) {
+            let fut = match self.dispatch_inventory(
+                peer,
+                svc,
+                req,
+                attempt.as_ref(),
+                matches!(hash, InventoryHash::Block(_)).then_some(AdvertisedBlockRequest::Primary),
+            ) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
             };
-            if let Some((request_id, peer, hash, started, missed)) = trace_context {
+            if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 let choice = choice.unwrap_or_default();
                 return async move {
                     let result = fut.await;
-                    missed.record_if_undelivered(&result);
                     trace.block_request_finish(
                         request_id,
                         peer,
@@ -1579,7 +1548,7 @@ where
                 )),
                 _ => None,
             };
-            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref()) {
+            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
             };
@@ -1711,19 +1680,16 @@ where
         };
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
-        let missed = MissedBlockRecord {
-            request_slot: svc.request_slot(),
-            registry: svc.block_gossip.registry.clone(),
-            second_request: true,
-        };
         let started = Instant::now();
-        let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
+        let fut = svc.call_routed(
+            Request::BlocksByHash(std::iter::once(hash).collect()),
+            Some(AdvertisedBlockRequest::Hedge),
+        );
         self.push_unready(peer, svc);
 
         let trace = self.legacy_peer_trace.clone();
         async move {
             let result = fut.await;
-            missed.record_if_undelivered(&result);
             trace.block_request_finish(
                 request_id,
                 trace_peer,

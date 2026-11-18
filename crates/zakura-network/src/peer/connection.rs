@@ -1141,6 +1141,7 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
+                                    self.record_advertised_block_miss(tx.advertised_block);
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -2015,6 +2016,8 @@ where
                 if blocks.iter().any(|block| block.available().is_some()))
             {
                 self.request_slot.clear_announced_block_missed();
+            } else {
+                self.record_advertised_block_miss(tx.advertised_block);
             }
 
             if let (Some(delivery_samples), Some(started_at), Ok(response)) = (
@@ -2371,6 +2374,16 @@ impl<S, Tx, C> Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
+    /// Record a dispatched advertiser's miss before another request can update the same slot.
+    fn record_advertised_block_miss(&self, advertised: Option<super::AdvertisedBlockRequest>) {
+        if let Some(route) = advertised {
+            self.request_slot.mark_announced_block_missed();
+            if let Some(registry) = &self.delivery_samples {
+                registry.trace_block_missed(route == super::AdvertisedBlockRequest::Hedge);
+            }
+        }
+    }
+
     /// Update the connection state metrics for this connection,
     /// using `extra_state_info` as additional state information.
     ///
@@ -2485,6 +2498,9 @@ where
             // Accessing the error slot locks a threaded std::sync::Mutex, which
             // can block the current async task thread. We briefly lock the mutex
             // to clone the error.
+            if !tx.is_canceled() {
+                self.record_advertised_block_miss(tx.advertised_block);
+            }
             let _ = tx.send(Err(error.clone()));
         }
 

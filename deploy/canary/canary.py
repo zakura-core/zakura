@@ -185,7 +185,8 @@ def pair_overlap(rounds, a, b, max_skew):
         "pairs": len(scores),
         "empty_pairs": empty,
         "skipped": skipped,
-        "mean": round(statistics.fmean(scores), 4) if scores else None,
+        # Exact, since the grade compares it with a floor.
+        "mean": statistics.fmean(scores) if scores else None,
         "p10": round(quantile(scores, 0.10), 4) if scores else None,
         "exact": sum(1 for score in scores if score == 1.0),
     }
@@ -203,8 +204,8 @@ def answered_shares(rounds, names, answered):
     answered, as `answered(row)` judges its row. A node with no row in a round
     did not answer it."""
     return {
-        name: round(sum(1 for nodes in rounds if name in nodes and answered(nodes[name]))
-                    / len(rounds), 4)
+        name: sum(1 for nodes in rounds if name in nodes and answered(nodes[name]))
+        / len(rounds)
         for name in names
     } if rounds else {name: None for name in names}
 
@@ -252,7 +253,7 @@ def grade_overlap(rows, canary, max_skew, min_pairs, tolerance, max_missed=0.01)
     if missed_too_often(report, shares, canary, max_missed):
         return report
     floor = min(pair["mean"] for pair in neighbour_pairs) - tolerance
-    report["floor"] = round(floor, 4)
+    report["floor"] = floor
     report["verdict"] = "pass" if all(p["mean"] >= floor for p in canary_pairs) else "fail"
     return report
 
@@ -302,7 +303,7 @@ def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01):
             "neighbour_median_fees": neighbour_median,
             # A neighbour whose median template has no fees is matched by any.
             "median_fee_ratio": (None if median is None
-                                 else round(median / neighbour_median, 4) if neighbour_median > 0
+                                 else median / neighbour_median if neighbour_median > 0
                                  else 1.0),
         }
     results = report["neighbours"].values()
@@ -383,7 +384,8 @@ def grade_tip_lag(blocks, times, nodes, reference, margin_ms, clock_bound_ms, mi
         report["nodes"][node] = {
             "n": len(lags),
             "p50_ms": round(quantile(lags, 0.5), 1) if lags else None,
-            "p90_ms": round(quantile(lags, 0.9), 1) if lags else None,
+            # Exact, since the grade compares it with the margin.
+            "p90_ms": quantile(lags, 0.9) if lags else None,
             "max_ms": round(max(lags), 1) if lags else None,
         }
     if missing or len(blocks) < min_blocks:

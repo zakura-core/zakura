@@ -163,7 +163,7 @@ class TemplateTests(unittest.TestCase):
         report = canary.grade_templates(rows, "can", 3, 0.01)
 
         # The per-round ratios' median is 1.0, but the medians are 10 and 30.
-        self.assertEqual(report["neighbours"]["n1"]["median_fee_ratio"], round(10 / 30, 4))
+        self.assertAlmostEqual(report["neighbours"]["n1"]["median_fee_ratio"], 10 / 30)
         self.assertEqual(report["verdict"], "fail")
 
     def test_a_canary_missing_template_reads_fails(self):
@@ -250,6 +250,31 @@ class TipLagTests(unittest.TestCase):
 
         self.assertEqual(report["nodes"]["can"]["p90_ms"], 0.0)
         self.assertEqual(report["verdict"], "pass")
+
+
+class ThresholdTests(unittest.TestCase):
+    def test_a_share_just_past_the_allowance_fails_unrounded(self):
+        # 989 of 999 rounds is 0.98999, which rounds to the 0.99 floor.
+        rounds = [{"n1": {}, "n2": {}, "can": {"error": "timed out"} if r < 10 else {}}
+                  for r in range(999)]
+        shares = canary.answered_shares(rounds, ["can", "n1", "n2"],
+                                        lambda row: "error" not in row)
+        report = {}
+
+        self.assertTrue(canary.missed_too_often(report, shares, "can", 0.01))
+        self.assertEqual(report["verdict"], "fail")
+
+    def test_a_p90_just_past_the_margin_fails_unrounded(self):
+        blocks = [(h, f"b{h}") for h in range(10)]
+        times = {}
+        for h, block in blocks:
+            times[("ref", block)] = 0
+            times[("can", block)] = 250_049 if h == 9 else 0
+        times[("can", "b8")] = 250_049
+
+        report = canary.grade_tip_lag(blocks, times, ["ref", "can"], "ref", 250.0, 0.0, 10)
+
+        self.assertEqual(report["verdict"], "fail")
 
 
 class QuantileTests(unittest.TestCase):

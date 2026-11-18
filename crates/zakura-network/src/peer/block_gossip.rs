@@ -30,7 +30,7 @@ use crate::{
     peer::{AnnouncedBlocks, MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
-    BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
+    AdvertisedBlock, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
 /// Pending block adverts per connection. Slow peers can catch up through later tip gossip.
@@ -63,8 +63,8 @@ pub(crate) enum BlockAdvertError {
     Connection(#[from] SharedPeerError),
 }
 
-/// Selects the initial peer count from the block size, and the delay before announcing to the
-/// remaining peers.
+/// Selects the initial peer count from the block size, the delay before announcing to the
+/// remaining peers, and which blocks the initial group receives as pushes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdvertFanout {
     full_block_window: usize,
@@ -72,6 +72,7 @@ pub(crate) struct AdvertFanout {
     small_size_bytes: u64,
     full_size_bytes: u64,
     delay: Duration,
+    push_relayed_blocks: bool,
 }
 
 impl AdvertFanout {
@@ -83,6 +84,25 @@ impl AdvertFanout {
             small_size_bytes: config.advert_window_small_size_bytes,
             full_size_bytes: config.advert_window_full_size_bytes,
             delay: config.advert_delay,
+            push_relayed_blocks: config.push_relayed_blocks,
+        }
+    }
+
+    /// Returns the block that `request` advertises, and whether the initial group's peers that
+    /// accept pushes receive the block itself.
+    ///
+    /// Mined blocks are always pushed. Relayed blocks are pushed only if the config enables it.
+    /// Returns `request` if it is not a block advertisement.
+    pub(crate) fn advertised_block(
+        &self,
+        request: Request,
+    ) -> Result<(AdvertisedBlock, bool), Request> {
+        match request {
+            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
+                Ok((block, self.push_relayed_blocks))
+            }
+            Request::AdvertiseMinedBlock(block) => Ok((block, true)),
+            other => Err(other),
         }
     }
 
@@ -595,12 +615,9 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         &mut self,
         request: Request,
     ) -> BoxFuture<'static, Result<Response, BoxError>> {
-        let (block, push) = match request {
-            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
-            }
-            Request::AdvertiseMinedBlock(block) => (block, true),
-            other => {
+        let (block, push) = match self.fanout.advertised_block(request) {
+            Ok(advert) => advert,
+            Err(other) => {
                 return futures::future::ready(Err(format!(
                     "block advertiser cannot send {}",
                     other.command()
@@ -1327,6 +1344,36 @@ mod tests {
         assert_eq!(fanout.delay(), Duration::from_millis(500));
     }
 
+    /// Mined blocks are always pushed. Relayed blocks are pushed only if the config enables it.
+    #[test]
+    fn only_mined_blocks_are_pushed_unless_relayed_pushes_are_enabled() {
+        let hash = block::Hash([7; 32]);
+        for push_relayed_blocks in [false, true] {
+            let fanout = AdvertFanout::from_config(&Config {
+                push_relayed_blocks,
+                ..Config::default()
+            });
+            for (request, push) in [
+                (Request::AdvertiseMinedBlock(hash.into()), true),
+                (
+                    Request::AdvertiseBlock(hash.into(), None),
+                    push_relayed_blocks,
+                ),
+                (
+                    Request::AdvertiseBlockToAll(hash.into()),
+                    push_relayed_blocks,
+                ),
+            ] {
+                let (block, pushed) = fanout
+                    .advertised_block(request)
+                    .expect("block advertisements are accepted");
+                assert_eq!(block.hash, hash);
+                assert_eq!(pushed, push, "push_relayed_blocks = {push_relayed_blocks}");
+            }
+            assert!(fanout.advertised_block(Request::Peers).is_err());
+        }
+    }
+
     /// The window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
     #[test]
     fn advert_window_follows_block_size() {
@@ -2001,11 +2048,11 @@ mod tests {
             .collect()
     }
 
-    /// A mined block is pushed only to the initial group's peers that accept pushes.
-    /// A relayed block is never pushed.
+    /// A pushing broadcast pushes only to the initial group's peers that accept pushes.
+    /// Any other broadcast pushes to no peer.
     #[tokio::test(start_paused = true)]
-    async fn mined_block_is_pushed_only_to_accepting_peers_in_the_initial_group() {
-        for mined in [true, false] {
+    async fn block_is_pushed_only_to_accepting_peers_in_the_initial_group() {
+        for push in [true, false] {
             let registry = PeerRegistry::default();
             let mut guards = Vec::new();
             let mut peers = Vec::new();
@@ -2034,7 +2081,7 @@ mod tests {
 
             let hash = block::Hash([90; 32]);
             let delayed_at = Instant::now() + Duration::from_secs(1);
-            let broadcast = tokio::spawn(broadcast_block(peers, hash, 2, delayed_at, mined));
+            let broadcast = tokio::spawn(broadcast_block(peers, hash, 2, delayed_at, push));
             let mut pushes = Vec::new();
             for receiver in &mut receivers {
                 let advert = receiver.recv().await.expect("every peer gets the block");
@@ -2042,7 +2089,7 @@ mod tests {
                 pushes.push(advert.push);
                 advert.result.send(Ok(())).unwrap();
             }
-            assert_eq!(pushes, [mined, false, false], "mined: {mined}");
+            assert_eq!(pushes, [push, false, false], "push: {push}");
             broadcast.abort();
         }
     }

@@ -257,8 +257,9 @@ pub enum Request {
     /// A block that a remote peer pushed to us, without advertising it first.
     ///
     /// Connections create this request from an unsolicited `block` message and send it to the
-    /// inbound service, which verifies the block as if it had downloaded it. Nodes push only
-    /// blocks they mined: see [`Request::AdvertiseMinedBlock`].
+    /// inbound service, which verifies the block as if it had downloaded it. Nodes push the
+    /// blocks they mine, as [`Request::AdvertiseMinedBlock`] describes. They push relayed blocks
+    /// only if [`crate::Config::push_relayed_blocks`] is set.
     ///
     /// The second field is the peer that pushed the block. Used by the inbound block
     /// downloader to enforce its per-peer queue cap.
@@ -315,6 +316,8 @@ pub enum Request {
     /// Legacy gossip progressively advertises to connected peers in random order.
     /// A bounded number of advertisements await block uploads at once. That window is sized
     /// from the block's serialized size, so the first peers receive a large block sooner.
+    /// If [`crate::Config::push_relayed_blocks`] is set, legacy gossip also pushes the block
+    /// to the initial group's peers that accept pushes, like [`Request::AdvertiseMinedBlock`].
     ///
     /// The second field is the source peer that sent us this `inv`:
     /// `Some(source)` when the advertisement was relayed from a remote peer,
@@ -327,7 +330,7 @@ pub enum Request {
     /// Returns [`Response::Nil`](super::Response::Nil).
     AdvertiseBlock(AdvertisedBlock, Option<PeerSource>),
 
-    /// Advertise a block to connected peers, paced like [`Request::AdvertiseBlock`].
+    /// Advertise a block to connected peers, paced and pushed like [`Request::AdvertiseBlock`].
     /// Tip gossip uses [`Request::AdvertiseBlock`] or [`Request::AdvertiseMinedBlock`].
     AdvertiseBlockToAll(AdvertisedBlock),
 

@@ -1281,7 +1281,7 @@ where
         let mut result = Some(result);
 
         if push {
-            match self.mined_block_body(hash).await {
+            match self.advertised_block_body(hash).await {
                 Some(block) => {
                     if !self
                         .send_advert_message(Message::Block(block), hash, &mut result)
@@ -1370,11 +1370,11 @@ where
         }
     }
 
-    /// Returns the body of the locally mined block `hash` from the inbound service.
+    /// Returns the body of the advertised block `hash` from the inbound service.
     ///
-    /// The inbound service serves a mined block before it commits. Returns `None` if the
-    /// service fails, or no longer has the block.
-    async fn mined_block_body(&mut self, hash: block::Hash) -> Option<BlockHandle> {
+    /// The inbound service serves a mined block before it commits, and a relayed block from
+    /// state. Returns `None` if the service fails, or no longer has the block.
+    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<BlockHandle> {
         let request = Request::BlocksByHash(std::iter::once(hash).collect());
         // The inbound service has its own timeout layer.
         let response = self.svc.ready().await.ok()?.call(request).await.ok()?;

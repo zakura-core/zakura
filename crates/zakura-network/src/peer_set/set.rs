@@ -1569,12 +1569,8 @@ where
 
     /// Schedule legacy inventory by block size, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (block, push) = match req {
-            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
-            }
-            Request::AdvertiseMinedBlock(block) => (block, true),
-            _ => unreachable!("block routing only accepts block advertisements"),
+        let Ok((block, push)) = self.block_gossip_fanout.advertised_block(req) else {
+            unreachable!("block routing only accepts block advertisements");
         };
         self.prune_block_gossip_peers();
         // A minimum version increase cancels busy outdated peers only after their current work.

@@ -488,6 +488,17 @@ pub struct Config {
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub advert_delay: Duration,
 
+    /// Whether to push relayed blocks to peers, as this node always pushes blocks it mines.
+    ///
+    /// A push writes the block before its `inv` to the initial group's peers that advertise
+    /// [`PeerServices::NODE_BLOCK_PUSH`](crate::types::PeerServices::NODE_BLOCK_PUSH), which saves
+    /// each of them the `getdata` round trip. A peer that already has the block but has not
+    /// announced it still receives a full copy, so every connected node that enables this
+    /// multiplies block upload bandwidth. Defaults to false.
+    ///
+    /// Experimental.
+    pub push_relayed_blocks: bool,
+
     /// Settings for warming new legacy TCP connections with padded pings.
     pub tcp_warmup: TcpWarmupConfig,
 }
@@ -1220,6 +1231,7 @@ impl Default for Config {
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
             advert_delay: DEFAULT_ADVERT_DELAY,
+            push_relayed_blocks: false,
             tcp_warmup: TcpWarmupConfig::default(),
         }
     }
@@ -1448,6 +1460,7 @@ struct DConfig {
     /// for small blocks.
     #[serde(skip_serializing)]
     advert_delay_min: Option<de::IgnoredAny>,
+    push_relayed_blocks: bool,
     tcp_warmup: TcpWarmupConfig,
 }
 
@@ -1480,6 +1493,7 @@ impl Default for DConfig {
             advert_delay: None,
             advert_delay_max: None,
             advert_delay_min: None,
+            push_relayed_blocks: config.push_relayed_blocks,
             tcp_warmup: config.tcp_warmup,
         }
     }
@@ -1556,6 +1570,7 @@ impl From<Config> for DConfig {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay,
+            push_relayed_blocks,
             tcp_warmup,
         }: Config,
     ) -> Self {
@@ -1606,6 +1621,7 @@ impl From<Config> for DConfig {
             advert_delay: Some(advert_delay),
             advert_delay_max: None,
             advert_delay_min: None,
+            push_relayed_blocks,
             tcp_warmup,
         }
     }
@@ -1642,6 +1658,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay,
             advert_delay_max,
             advert_delay_min: _,
+            push_relayed_blocks,
             tcp_warmup,
         } = DConfig::deserialize(deserializer)?;
 
@@ -1819,6 +1836,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay,
+            push_relayed_blocks,
             tcp_warmup,
         })
     }

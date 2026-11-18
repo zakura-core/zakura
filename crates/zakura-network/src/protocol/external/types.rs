@@ -155,8 +155,9 @@ bitflags! {
         /// NODE_BLOCK_PUSH means that the node verifies a block that a peer sends it
         /// without a request.
         ///
-        /// A node pushes the blocks it mines only to peers that advertise this bit. Other
-        /// peers drop unrequested blocks, so they get only the block's `inv`.
+        /// A node pushes the blocks it mines, and relayed blocks if configured, only to peers
+        /// that advertise this bit. Other peers drop unrequested blocks, so they get only the
+        /// block's `inv`.
         ///
         /// This bit is in the temporary experiment range until a permanent service bit is assigned.
         const NODE_BLOCK_PUSH = 1 << 26;

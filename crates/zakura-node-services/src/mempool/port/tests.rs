@@ -27,6 +27,11 @@ fn secs(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
 }
 
+/// A deadline no test reaches, for calls whose test is not about deadlines.
+fn far() -> zakura_rt::time::Instant {
+    zakura_rt::time::Instant::now() + secs(3600)
+}
+
 /// A unit transaction that the test only needs for its id.
 fn body(n: u8) -> zakura_chain::transaction::UnminedTx {
     use zakura_chain::{
@@ -138,8 +143,9 @@ async fn a_dropped_reservation_reaches_the_core() {
     });
 
     let reservation = handle
-        .reserve(id(1))
+        .reserve(id(1), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the test core grants it");
     let mut inbox = core.await.expect("the test core does not panic");
     assert_eq!(inbox.released(), None);
@@ -153,7 +159,10 @@ async fn a_stopped_core_answers_every_call() {
     let (handle, inbox) = pool_port();
     drop(inbox);
     assert!(matches!(
-        handle.reserve(id(1)).await,
+        handle
+            .reserve(id(1), far())
+            .await
+            .expect("the test's deadline is far off"),
         Err(Unreserved::Stopped)
     ));
     assert!(handle.snapshot().is_none());
@@ -169,12 +178,20 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
     // The command queue is full, so the submission waits to be sent.
     for _ in 0..COMMAND_QUEUE {
         handle
-            .fetch_failed(inbox.grant(ReservationId(9), tx_id, Default::default()))
+            .fetch_failed(
+                inbox.grant(ReservationId(9), tx_id, Default::default()),
+                far(),
+            )
             .await;
     }
     let caller = {
         let handle = handle.clone();
-        tokio::spawn(async move { handle.submit(reservation, transaction).await })
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, transaction, far())
+                .await
+                .expect("the test's deadline is far off")
+        })
     };
     tokio::task::yield_now().await;
     assert_eq!(inbox.released(), None);
@@ -196,14 +213,17 @@ async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
     let tx_id = transaction.id();
     for _ in 0..COMMAND_QUEUE {
         handle
-            .fetch_failed(inbox.grant(ReservationId(9), tx_id, Default::default()))
+            .fetch_failed(
+                inbox.grant(ReservationId(9), tx_id, Default::default()),
+                far(),
+            )
             .await;
     }
     let reservation = inbox.grant(ReservationId(7), tx_id, Default::default());
-    let verdict = handle.submit_now(reservation, transaction);
+    let verdict = handle.submit_now(reservation, transaction, far());
     // The reservation went with the body before the verdict was awaited.
     assert_eq!(inbox.released(), Some(ReservationId(7)));
-    assert!(matches!(verdict.await, Verdict::NoRoom));
+    assert!(matches!(verdict.await, Ok(Verdict::NoRoom)));
 
     // With room, the body reaches the core and its verdict comes back.
     while inbox.released().is_some() {}
@@ -215,12 +235,12 @@ async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
     }
     let transaction = body(2);
     let reservation = inbox.grant(ReservationId(8), transaction.id(), Default::default());
-    let verdict = handle.submit_now(reservation, transaction);
+    let verdict = handle.submit_now(reservation, transaction, far());
     let Some(PoolCommand::Submit { reply, .. }) = inbox.command().await else {
         panic!("with room, the body reaches the core");
     };
     let _ = reply.send(Verdict::Admitted);
-    assert!(matches!(verdict.await, Verdict::Admitted));
+    assert!(matches!(verdict.await, Ok(Verdict::Admitted)));
 }
 
 #[tokio::test]
@@ -230,7 +250,12 @@ async fn an_accepted_reservation_is_the_cores_and_a_dropped_command_is_not() {
     let reservation = inbox.grant(ReservationId(7), transaction.id(), Default::default());
     let caller = {
         let handle = handle.clone();
-        tokio::spawn(async move { handle.submit(reservation, transaction).await })
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, transaction, far())
+                .await
+                .expect("the test's deadline is far off")
+        })
     };
 
     let Some(PoolCommand::Submit {
@@ -254,7 +279,10 @@ async fn a_body_for_another_id_is_refused_and_frees_the_slot() {
     let (handle, mut inbox) = pool_port();
     let reservation = inbox.grant(ReservationId(9), body(1).id(), Default::default());
     assert!(matches!(
-        handle.submit(reservation, body(2)).await,
+        handle
+            .submit(reservation, body(2), far())
+            .await
+            .expect("the test's deadline is far off"),
         Verdict::LocalFault(LocalFault::WrongTransaction)
     ));
     assert_eq!(inbox.released(), Some(ReservationId(9)));

@@ -2261,6 +2261,76 @@ impl ZakuraDiscoveryBook {
             .map_or(0, |snapshot| snapshot.node_ids.len())
     }
 
+    /// Checks the book's invariants:
+    /// - each entry sits under its record's author;
+    /// - each relay's attribution counts exactly its third-party entries, and
+    ///   stays within the per-relay quota;
+    /// - the discovered entries stay within the record limit;
+    /// - an entry's confirmed addresses are ones its record lists, and its
+    ///   dialed addresses are confirmed;
+    /// - the sample snapshot repeats no id, and grows past one window only
+    ///   when its epoch starts.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        const PROPERTY: &str = "discovery/record-book";
+        let mut relayed: HashMap<NodeId, usize> = HashMap::new();
+        let mut statics = 0;
+        for (node_id, entry) in &self.entries {
+            assert_eq!(
+                entry.record.body.node_id, *node_id,
+                "{PROPERTY}: an entry under another node id"
+            );
+            if let Some(relay) = relay_of(entry.source, *node_id) {
+                *relayed.entry(relay).or_default() += 1;
+            }
+            statics += usize::from(entry.is_static);
+            assert!(
+                entry
+                    .confirmed_addrs
+                    .iter()
+                    .all(|addr| lists_addr(&entry.record, canonical_addr(*addr))),
+                "{PROPERTY}: a confirmed address the record does not list"
+            );
+            assert!(
+                entry.dialed_addrs.iter().all(|addr| entry
+                    .confirmed_addrs
+                    .iter()
+                    .any(|confirmed| canonical_addr(*confirmed) == *addr)),
+                "{PROPERTY}: a dialed address that is not confirmed"
+            );
+        }
+        // Not `assert_eq!`: a map's `Debug` order varies between runs, and the
+        // simulator's replay compares failure messages exactly.
+        assert!(
+            self.relayed == relayed,
+            "{PROPERTY}: relay attribution disagrees with the entries"
+        );
+        let busiest = relayed.values().copied().max().unwrap_or(0);
+        assert!(
+            busiest <= self.limits.max_records_per_source,
+            "{PROPERTY}: a relay holds {busiest} records, above its quota of {}",
+            self.limits.max_records_per_source
+        );
+        assert!(
+            self.discovered_len() <= self.limits.max_records,
+            "{PROPERTY}: {} discovered records above the limit",
+            self.discovered_len()
+        );
+        if let Some(snapshot) = &self.sample_snapshot {
+            let unique: HashSet<_> = snapshot.node_ids.iter().collect();
+            assert_eq!(
+                unique.len(),
+                snapshot.node_ids.len(),
+                "{PROPERTY}: the sample snapshot repeats an id"
+            );
+            assert!(
+                snapshot.node_ids.len()
+                    <= self.limits.max_records.max(self.sample_window()) + statics,
+                "{PROPERTY}: the sample snapshot exceeds the book"
+            );
+        }
+    }
+
     /// Returns each relay's attributed entries, in node id order.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn relayed_counts(&self) -> Vec<(NodeId, usize)> {

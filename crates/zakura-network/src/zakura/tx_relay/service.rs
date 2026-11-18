@@ -23,8 +23,9 @@ use zakura_chain::{
     transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_node_services::mempool::port::{
-    ChainTip, ChangeSeq, ChangesSince, PoolHandle, PoolReader, PoolSnapshot, PoolView as PortView,
-    Reservation, ReservationId, Unreserved as PortUnreserved, Verdict as PortVerdict,
+    ChainTip, ChangeSeq, ChangesSince, LocalFault, PoolHandle, PoolReader, PoolSnapshot,
+    PoolView as PortView, Reservation, ReservationId, Unreserved as PortUnreserved,
+    Verdict as PortVerdict,
 };
 use zakura_rt::{
     collections::HashMap,
@@ -150,6 +151,10 @@ type Owned = Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), Ownership>>>;
 /// transport can reopen the session before discovery retires the
 /// connection: past the transport's 8 second cap on its reopen backoff.
 const REOPEN_GAP: Duration = Duration::from_secs(10);
+
+/// How long a routine waits on the pool core for each answer: the 73 second
+/// deadline the node's own mempool gives each transaction.
+const POOL_ANSWER: Duration = Duration::from_secs(73);
 
 /// One connection's claim: its live sessions, counted since its next
 /// session can open before its last one has ended, and the end of the
@@ -1108,7 +1113,12 @@ impl Routine {
             RelayEffect::Reserve { call, id } => {
                 let pool = self.wiring.pool.clone();
                 self.calls.push(Box::pin(async move {
-                    let answer = pool.reserve(id).await;
+                    // A core that does not answer in time is busy, so the
+                    // machine tries again later.
+                    let answer = pool
+                        .reserve(id, Instant::now() + POOL_ANSWER)
+                        .await
+                        .unwrap_or(Err(PortUnreserved::NoRoom));
                     PoolResult::Reserved { call, answer }
                 }));
             }
@@ -1123,11 +1133,16 @@ impl Routine {
                 // The body goes into the core's queue now or is dropped
                 // with a `NoRoom` verdict, so the routine never holds a
                 // decoded body while it reads the next frame.
-                let verdict = self.wiring.pool.submit_now(reservation, body);
+                let verdict =
+                    self.wiring
+                        .pool
+                        .submit_now(reservation, body, Instant::now() + POOL_ANSWER);
                 self.calls.push(Box::pin(async move {
                     PoolResult::Verdict {
                         waiter,
-                        verdict: verdict.await,
+                        verdict: verdict
+                            .await
+                            .unwrap_or(PortVerdict::LocalFault(LocalFault::VerifyTimeout)),
                     }
                 }));
             }
@@ -1141,7 +1156,8 @@ impl Routine {
                 };
                 let pool = self.wiring.pool.clone();
                 self.calls.push(Box::pin(async move {
-                    pool.fetch_failed(reservation).await;
+                    pool.fetch_failed(reservation, Instant::now() + POOL_ANSWER)
+                        .await;
                     PoolResult::Done
                 }));
             }

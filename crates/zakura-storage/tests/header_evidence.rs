@@ -1,5 +1,10 @@
 //! The owner model's failures (storage.md ST3-B+2): each committed row of
 //! the plan's mutation table, with the exact failure it must give.
+//!
+//! The owner model replays each fact's recorded effect onto a copy of the
+//! owner state. It never decides what the port should have done, so each row
+//! forges the facts or the state and expects the replay to notice that they
+//! no longer explain each other.
 
 use std::{
     future::Future,
@@ -162,8 +167,8 @@ fn a_stolen_last_batch_is_stale() {
 }
 
 /// A required lease fact deleted and the later facts renumbered, so the
-/// numbering alone can't tell, is the fact the acquire's transaction
-/// lacks.
+/// numbering alone can't tell, leaves the acquire's result naming a lease
+/// its transaction never created.
 #[test]
 fn a_deleted_fact_is_a_missing_effect() {
     let (port, chain) = chain(1);
@@ -173,11 +178,37 @@ fn a_deleted_fact_is_a_missing_effect() {
         .position(|fact| matches!(fact.kind, FactKind::Lease(LeaseFact::Leased { .. })))
         .expect("the acquire records its lease");
     let removed = facts.remove(leased);
+    let FactKind::Lease(LeaseFact::Leased { lease, .. }) = removed.kind else {
+        unreachable!("the fact was matched above");
+    };
     assert_eq!(
         OwnerModel::new().apply(&renumbered(facts)),
         Err(ModelFailure::MissingEffect {
             txn: removed.txn,
-            expected: removed.kind,
+            owner: Owner::Lease(lease),
+        })
+    );
+}
+
+/// A release whose path end is deleted ends the lease's capability but
+/// leaves its retained path unaccounted for.
+#[test]
+fn a_capability_end_without_its_path_end_is_a_missing_effect() {
+    let (port, chain) = chain(1);
+    let mut facts = lease_and_release(&port, chain[0]);
+    let path_end = facts
+        .iter()
+        .position(|fact| matches!(fact.kind, FactKind::Lease(LeaseFact::RetentionEnded { .. })))
+        .expect("the release ends the path");
+    let removed = facts.remove(path_end);
+    let FactKind::Lease(LeaseFact::RetentionEnded { lease, .. }) = removed.kind else {
+        unreachable!("the fact was matched above");
+    };
+    assert_eq!(
+        OwnerModel::new().apply(&renumbered(facts)),
+        Err(ModelFailure::MissingEffect {
+            txn: removed.txn,
+            owner: Owner::Lease(lease),
         })
     );
 }

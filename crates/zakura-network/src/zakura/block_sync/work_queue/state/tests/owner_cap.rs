@@ -1,9 +1,11 @@
 //! The per-session owner cap over [`WorkQueueState`].
 //!
 //! The proptest drives legal take, admission, publication and settlement
-//! sequences. It reads each session's charge from the item maps, never from
-//! the state's tally, and checks after every step that the tally matches it
-//! and that no session holds more than the cap's floor total.
+//! sequences. After every step it checks the state's invariants, which
+//! include each session's tally, and that no session holds more than the
+//! cap's floor total. A named scenario pins the admission rule.
+
+use proptest::prelude::*;
 
 use super::*;
 
@@ -61,20 +63,6 @@ fn cap_op() -> impl Strategy<Value = CapOp> {
     ]
 }
 
-/// Each session's reserved bytes, read from the item maps.
-fn scanned(state: &WorkQueueState) -> BTreeMap<u64, u64> {
-    let mut sessions = BTreeMap::new();
-    for item in state.ownership() {
-        let Some(owner) = item.owner else {
-            continue;
-        };
-        if item.reserved_bytes > 0 {
-            *sessions.entry(owner.session_id).or_insert(0) += item.reserved_bytes;
-        }
-    }
-    sessions
-}
-
 /// The in-flight reserved heights of `session`, with their owners.
 fn reserved_heights(state: &WorkQueueState, session: u64) -> Vec<(block::Height, BodyWorkOwner)> {
     state
@@ -87,14 +75,9 @@ fn reserved_heights(state: &WorkQueueState, session: u64) -> Vec<(block::Height,
 }
 
 fn check_tally(state: &WorkQueueState) {
-    let scanned = scanned(state);
+    state.assert_invariants();
     for session in 0..SESSIONS {
-        let held = scanned.get(&session).copied().unwrap_or(0);
-        assert_eq!(
-            state.session_reserved(session),
-            held,
-            "session {session}'s tally matches its items"
-        );
+        let held = state.session_reserved(session);
         assert!(
             held <= CAP.floor,
             "session {session} holds {held} bytes, past the floor total {}",
@@ -137,13 +120,7 @@ fn apply_cap_op(state: &mut WorkQueueState, next_request: &mut u64, op: CapOp) {
                 RequestPriority::AboveFloor
             };
             let held = state.session_reserved(session);
-            let limit = if floor { CAP.floor } else { CAP.above_floor };
             let admitted = CAP.admits(held, bytes, priority);
-            assert_eq!(
-                admitted,
-                held + bytes <= limit,
-                "admission follows the limit"
-            );
             if floor && !admitted {
                 assert!(
                     !CAP.admits(held, bytes, RequestPriority::AboveFloor),

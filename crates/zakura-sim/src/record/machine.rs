@@ -30,21 +30,21 @@ pub enum MachineStep {
     /// [`crate::harness::fixtures`] tests the simulator. No production machine
     /// records it.
     Fixture(FixtureStep),
-    /// Logical block-work ownership and its independent model.
+    /// Logical block-work ownership read from the pure owner.
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
     WorkFunding(WorkFundingStep),
     /// Decoded allocations retained by block, header, and transaction owners.
     DecodedRetention(DecodedRetentionStep),
-    /// Header reactor scheduling and locator policy, with its independent model.
+    /// Header reactor scheduling and locator policy, checked by its invariants.
     HeaderReactor(HeaderReactorStep),
-    /// Reactor query and view policy and its independent model.
+    /// Reactor query and view policy, checked against the inputs it was sent.
     Reactor(ReactorStep),
-    /// The real discovery book, its independent model, and its signed samples.
+    /// The real discovery book's view and its signed samples.
     DiscoveryBook(BookStep),
-    /// Discovery's real session and hint owner and its independent model.
+    /// Discovery's real session and hint owner's view.
     DiscoveryState(DiscoverySessionStep),
-    /// Header publisher credit and terminal policy, with its independent model.
+    /// Header publisher credit and terminal policy, checked by its invariants.
     HeaderPublisher(HeaderPublisherStep),
 }
 
@@ -58,7 +58,7 @@ pub struct DecodedRetentionStep {
     pub drain: bool,
     /// Independent allocation reads and actual pool counters.
     pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
-    /// The independent model's retained handle graph and expected pool charges.
+    /// The model's retained handle graph and expected pool charges.
     pub expected: zakura_node_services::block_memory::model::RetentionView,
     /// The model's disagreement. An unavailable capture or a driver panic is
     /// marked as no property detection.
@@ -119,7 +119,7 @@ impl MachineStep {
 pub enum FailurePhase {
     /// Applying the input and checking its immediate outcome.
     Transition,
-    /// Comparing the resulting owner with the independent model.
+    /// Checking the resulting owner's invariants.
     Invariant,
 }
 
@@ -199,7 +199,7 @@ pub struct WorkView {
     pub authority: Option<BodyAuthority>,
     /// Entries sorted by height and location; duplicate heights remain visible.
     pub items: Vec<WorkItem>,
-    /// Maintained total, or independently summed model charges.
+    /// Maintained total.
     pub reserved: u64,
     /// Charges scanned from retained entries.
     pub scanned: u64,
@@ -215,8 +215,6 @@ pub struct WorkStep {
     pub input: Vec<u8>,
     /// State read from the production pure owner.
     pub actual: WorkView,
-    /// State derived independently by the model.
-    pub expected: WorkView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -295,7 +293,7 @@ pub struct ReactorReadView {
     pub call: CallRef,
 }
 
-/// A reactor state view, read from the machine or derived by its model.
+/// A header reactor state view, read from the machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderReactorView {
@@ -317,9 +315,7 @@ pub struct HeaderReactorView {
     pub stall: Option<ReactorStallView>,
     /// Whether a changed cached-pass key waits for its budget.
     pub cached_deferred: bool,
-    /// Milliseconds from the run's clock origin to the next deadline. A deferred
-    /// cached pass adds a refill the model bounds rather than predicts, so
-    /// then this holds `None` on both sides.
+    /// Milliseconds from the run's clock origin to the next deadline.
     pub next_deadline_millis: Option<u64>,
 }
 
@@ -331,8 +327,6 @@ pub struct HeaderReactorStep {
     pub input: Vec<u8>,
     /// State read from the production pure owner.
     pub actual: HeaderReactorView,
-    /// State derived independently by the model.
-    pub expected: HeaderReactorView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -357,7 +351,8 @@ pub struct PublisherSubscriptionView {
     pub closing: bool,
 }
 
-/// A publisher state view, read from the owner or derived by its model.
+/// What the publisher showed after one operation: its ledger and slots, and
+/// the outputs the test holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderPublisherView {
@@ -367,8 +362,8 @@ pub struct HeaderPublisherView {
     pub tombstones: usize,
     /// The subscription of the job in progress.
     pub job: Option<u64>,
-    /// Subscriptions whose terminal outcome waits to be written, in order.
-    pub terminals: Vec<u64>,
+    /// Terminal outcomes queued and not yet taken to write.
+    pub terminals: usize,
     /// Whether a terminal outcome is being written.
     pub writing: bool,
     /// Subscription slots held.
@@ -383,10 +378,8 @@ pub struct HeaderPublisherView {
 pub struct HeaderPublisherStep {
     /// Original causal bytes, including a short final operation.
     pub input: Vec<u8>,
-    /// State read from the production owner.
+    /// What the production owner showed after the operation.
     pub actual: HeaderPublisherView,
-    /// State derived independently by the model.
-    pub expected: HeaderPublisherView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -431,7 +424,6 @@ impl From<zakura_network::zakura::WorkOwnershipStep> for WorkStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -457,7 +449,7 @@ pub enum FundingRequestPhase {
     Dropped,
 }
 
-/// Actual or independently predicted request retention.
+/// Request retention read from its runtime owner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingRequest {
@@ -485,7 +477,7 @@ pub struct FundingReceipt {
     pub bytes: u64,
 }
 
-/// Resource reads or independent model predictions at a runtime boundary.
+/// Resource reads at a runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkFundingView {
@@ -515,10 +507,8 @@ pub struct WorkFundingStep {
     pub input: Vec<u8>,
     /// Whether the driver drains its owners before aggregate destruction.
     pub drain: bool,
-    /// Independent reads of actual runtime resources.
+    /// Reads of actual runtime resources.
     pub actual: WorkFundingView,
-    /// Independent model predictions.
-    pub expected: WorkFundingView,
     /// First transition or invariant failure.
     pub failure: Option<MachineFailure>,
 }
@@ -571,7 +561,6 @@ impl From<zakura_network::zakura::WorkFundingStep> for WorkFundingStep {
             input: value.input,
             drain: value.drain,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -716,7 +705,7 @@ pub enum ReactorAction {
     },
 }
 
-/// Reactor state, read from production or derived by the model.
+/// Reactor state, read from production.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReactorView {
@@ -736,8 +725,6 @@ pub struct ReactorStep {
     pub actions: Vec<ReactorAction>,
     /// State read from the production pure owner.
     pub actual: ReactorView,
-    /// State derived independently by the model.
-    pub expected: ReactorView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -909,7 +896,6 @@ impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -921,7 +907,6 @@ impl From<zakura_network::zakura::BlockReactorStep> for ReactorStep {
             input: value.input,
             actions: value.actions.into_iter().map(Into::into).collect(),
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }
@@ -958,7 +943,6 @@ impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
         Self {
             input: value.input,
             actual: value.actual.into(),
-            expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
     }

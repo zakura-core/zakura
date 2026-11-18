@@ -5138,7 +5138,7 @@ function renderTop() {
 }
 // ---- block sources: how well the legacy block source scores predict downloads ----
 const SOURCE_REASON = { predicted: "Another announcer expected sooner", stalled: "First request stalled", "fixed delay": "Fixed delay" };
-const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", carried_over: "scores restored on reconnect" };
+const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "blocks", carried_over: "scores restored on reconnect" };
 function signedMs(value) { return value == null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "") + ms(Math.abs(value)); }
 function seconds(value) { return value == null ? "–" : value >= 120 ? Math.round(value / 60) + " min" : Math.round(value) + " s"; }
 function share(part, whole) { return whole ? Math.round(100 * part / whole) + "%" : "–"; }

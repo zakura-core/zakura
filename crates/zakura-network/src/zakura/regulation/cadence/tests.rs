@@ -652,6 +652,8 @@ proptest! {
             u128::from(admitted) <= u128::from(METERED_RATE.receiver_depth(WINDOW)) + earned
         );
     }
+}
+
 #[test]
 fn a_charge_reports_a_low_bucket_below_a_quarter_of_capacity() {
     let cadence = Cadence {

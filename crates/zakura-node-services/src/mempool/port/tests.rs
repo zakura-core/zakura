@@ -213,14 +213,17 @@ async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
     let tx_id = transaction.id();
     for _ in 0..COMMAND_QUEUE {
         handle
-            .fetch_failed(inbox.grant(ReservationId(9), tx_id, Default::default()))
+            .fetch_failed(
+                inbox.grant(ReservationId(9), tx_id, Default::default()),
+                far(),
+            )
             .await;
     }
     let reservation = inbox.grant(ReservationId(7), tx_id, Default::default());
-    let verdict = handle.submit_now(reservation, transaction);
+    let verdict = handle.submit_now(reservation, transaction, far());
     // The reservation went with the body before the verdict was awaited.
     assert_eq!(inbox.released(), Some(ReservationId(7)));
-    assert!(matches!(verdict.await, Verdict::NoRoom));
+    assert!(matches!(verdict.await, Ok(Verdict::NoRoom)));
 
     // With room, the body reaches the core and its verdict comes back.
     while inbox.released().is_some() {}
@@ -232,12 +235,12 @@ async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
     }
     let transaction = body(2);
     let reservation = inbox.grant(ReservationId(8), transaction.id(), Default::default());
-    let verdict = handle.submit_now(reservation, transaction);
+    let verdict = handle.submit_now(reservation, transaction, far());
     let Some(PoolCommand::Submit { reply, .. }) = inbox.command().await else {
         panic!("with room, the body reaches the core");
     };
     let _ = reply.send(Verdict::Admitted);
-    assert!(matches!(verdict.await, Verdict::Admitted));
+    assert!(matches!(verdict.await, Ok(Verdict::Admitted)));
 }
 
 #[tokio::test]

@@ -747,12 +747,14 @@ impl PoolHandle {
     /// Submit as [`Self::submit`] does, but hand the body to the core's
     /// queue now or not at all, so the caller holds no body once this
     /// returns. With the queue full the body and the reservation are
-    /// dropped, which frees the slot, and the verdict is `NoRoom`.
+    /// dropped, which frees the slot, and the verdict is `NoRoom`. The
+    /// verdict is awaited until `deadline`. See [`PoolHandle`].
     pub fn submit_now(
         &self,
         reservation: Reservation,
         transaction: UnminedTx,
-    ) -> impl std::future::Future<Output = Verdict> + Send + 'static {
+        deadline: Instant,
+    ) -> impl std::future::Future<Output = Result<Verdict, Elapsed>> + Send + 'static {
         /// What became of the command, without the body.
         enum Sent {
             Queued(oneshot::Receiver<Verdict>),
@@ -777,10 +779,15 @@ impl PoolHandle {
         };
         async move {
             match sent {
-                Sent::Queued(verdict) => verdict
+                Sent::Queued(verdict) => {
+                    by(deadline, async {
+                        verdict
+                            .await
+                            .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
+                    })
                     .await
-                    .unwrap_or(Verdict::LocalFault(LocalFault::Stopped)),
-                Sent::Answered(verdict) => verdict,
+                }
+                Sent::Answered(verdict) => Ok(verdict),
             }
         }
     }

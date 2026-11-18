@@ -23,7 +23,9 @@ use zakura_sim::{
             policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
             PROBE,
         },
-        block_sync::{BlockScenario, HandoffPause, MirrorSpec, Ports, Storage},
+        block_sync::{
+            BlockScenario, HandoffPause, MirrorSpec, Ports, Storage, PEERS_LEAVE_SERVED_TAG,
+        },
         header_sync::Dialer,
         run_prepared, Subsystem,
     },
@@ -43,7 +45,7 @@ const FLOOR_LANE_RACE_INPUT: &[u8] = include_bytes!("fixtures/block-sync-floor-l
 
 /// The committed input that picks the stuck-floor scenario: the commit
 /// window fills while height 3 never arrives.
-const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stuck-floor.bin");
+const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-stuck-floor.bin");
 
 /// The committed input that picks the default scenario, whose routines hand
 /// charged bodies to the sequencer.
@@ -51,7 +53,7 @@ const HANDOFF_INPUT: &[u8] = include_bytes!("fixtures/block-sync-handoff.bin");
 
 /// The committed input that picks the above-window scenario: the node
 /// requests heights above the commit window that never arrive.
-const ABOVE_WINDOW_INPUT: &[u8] = include_bytes!("fixtures/block-sync-above-window.bin");
+const ABOVE_WINDOW_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-above-window.bin");
 
 /// The committed input that picks the peers-leave scenario: both mirrors
 /// leave while the node owes them requests.
@@ -403,12 +405,18 @@ const SERVED_SCENARIO: &str = include_str!(
 /// the run, and teardown settles with every one returned, so the
 /// session-slot charge applies and holds. With `kept-session-sender.patch`
 /// the server keeps a clone of one session's sender, so that session's slot
-/// never returns, and the same run violates the property.
+/// never returns, and the same run violates the property. The generator
+/// draws the same scenario by [`PEERS_LEAVE_SERVED_TAG`].
 #[test]
 fn teardown_returns_session_slots() {
     let scenario = BlockScenario::peers_leave_served();
     let committed: BlockScenario = serde_json::from_str(SERVED_SCENARIO).unwrap();
     assert_eq!(committed, scenario, "the planted case runs this scenario");
+    assert_eq!(
+        Storage::draw(&PEERS_LEAVE_SERVED_TAG),
+        scenario,
+        "the generator draws this scenario"
+    );
     let witness = WitnessScenario::<Storage> {
         scenario,
         input: Plan::from_fuzz(&[]),

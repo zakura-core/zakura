@@ -91,6 +91,22 @@ pub enum BlockEvent {
         /// for the write's.
         landed: bool,
     },
+    /// A peer-registry call from one routine generation changed the peer's
+    /// entry while another generation owned it. The registry fingerprints
+    /// the entry under its lock before and after each call that names a
+    /// generation or an owner, so this event reports the call's effect on
+    /// the entry, whether or not its writer reports itself.
+    StaleRegistryChange {
+        /// The entry's peer.
+        peer: ZakuraPeerId,
+        /// The registry call.
+        writer: RegistryWriter,
+        /// The generation the call came from: the one it names, or its
+        /// owner's.
+        generation: u64,
+        /// The generation that owned the entry.
+        entry_generation: u64,
+    },
     /// A routine took a frame from its stream and is about to judge it. Every
     /// check the routine, its regulated session and the sequencer run on the
     /// frame follows this event.
@@ -246,7 +262,8 @@ pub enum BlockEvent {
     SequencerClosed,
 }
 
-/// A generation-gated peer-registry writer.
+/// A peer-registry writer that a routine generation or a claim's owner
+/// gates.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RegistryWriter {
     /// Records a routine's outbound queue probe.
@@ -263,6 +280,8 @@ pub enum RegistryWriter {
     TakeOutstanding,
     /// Publishes slot diagnostics.
     PublishSlots,
+    /// Withdraws one claim by its exact owner.
+    ClearOutstandingHeight,
 }
 
 impl RegistryWriter {
@@ -276,6 +295,7 @@ impl RegistryWriter {
             RegistryWriter::RemoveOutstanding => "remove_outstanding_for_owner",
             RegistryWriter::TakeOutstanding => "take_outstanding",
             RegistryWriter::PublishSlots => "publish_slots",
+            RegistryWriter::ClearOutstandingHeight => "clear_outstanding_height_for_owner",
         }
     }
 }

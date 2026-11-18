@@ -1,18 +1,46 @@
-//! Machine tests for one discovery session's [`PeerState`], checked against an
-//! independent model.
+//! Machine tests for one discovery session's [`PeerState`]: named scenarios
+//! and the `discovery_session` machine target.
 //!
-//! The model restates the writer's documented steps. It never calls the code
-//! it checks. Answers come from a [`QueryState`] claim, the only way to mint
-//! an [`AdmittedAnswer`].
+//! [`replay_discovery_session_bytes`] drives the production state and checks
+//! its invariants after every input (see `replay.rs`). The scenarios pin each
+//! step with literal inputs and outputs. Answers come from a [`QueryState`]
+//! claim, the only way to mint an [`AdmittedAnswer`].
 
-use proptest::prelude::*;
-
-use super::super::requester::{Asked, QueryKind, QueryState};
-use super::model::*;
+use super::super::{
+    requester::{Asked, QueryKind, QueryState},
+    wire::SEND_INTERVAL,
+};
+use super::replay::*;
 use super::state::{
     Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep,
-    SessionCharge,
+    SessionCharge, DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
 };
+use crate::zakura::machine_test::machine_target_tests;
+
+fn then(next: PeerOutput) -> PeerStep {
+    PeerStep { charge: None, next }
+}
+
+fn charged(charge: SessionCharge, next: PeerOutput) -> PeerStep {
+    PeerStep {
+        charge: Some(charge),
+        next,
+    }
+}
+
+const WAIT_INITIAL: PeerOutput = PeerOutput::WaitInitial {
+    timeout: DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+};
+
+const REFRESH: PeerOutput = PeerOutput::Refresh {
+    interval: SEND_INTERVAL,
+};
+
+const WAIT_FOR_ANSWERS: PeerOutput = PeerOutput::WaitForAnswers {
+    deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
+};
+
+const END_OPEN: PeerOutput = PeerOutput::End { close: None };
 
 /// A session that sent its exchange and waits for its answers.
 fn waiting_session() -> PeerState {
@@ -274,52 +302,40 @@ fn a_broken_initial_exchange_is_charged() {
     );
 }
 
-fn event() -> impl Strategy<Value = Event> {
-    prop_oneof![
-        1 => Just(Event::Hello),
-        2 => proptest::sample::select(vec![QueryKind::Peers, QueryKind::Services])
-            .prop_map(Event::Answer),
-        5 => any::<u8>().prop_map(Event::Outcome),
-    ]
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    #[test]
-    fn sessions_match_independent_model(events in proptest::collection::vec(event(), 1..64)) {
-        run(events, |_, _| {});
-    }
-
-    #[test]
-    fn discovery_session_bytes_match_the_same_model(bytes in proptest::collection::vec(any::<u8>(), 0..=512)) {
-        replay_discovery_session_bytes(&bytes);
-    }
-}
-
+/// The peer sends `Hello`, `Peers` and `Services`. The exchange completes, the
+/// session is the connection's sole owner, its answers settle, and the last
+/// owner check closes the connection.
 const WITNESS: &[u8] = &[0, 1, 2, 7, 11, 7, 11, 3, 3, 11];
 
+machine_target_tests! {
+    replay: replay_discovery_session_bytes,
+    target: "discovery_session",
+    decoder: 1,
+    witness: WITNESS => DiscoverySessionReplaySummary {
+        transitions: 7,
+        charges: 1,
+        closing_owner_checks: 1,
+        closes: 1,
+    },
+}
+
+/// A timed-out session that never completes is charged a failure when its
+/// refresh finds the stream gone and it leaves the connection open.
 #[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn discovery_session_witness_reaches_close_after_recheck() {
-    let summary = replay_discovery_session_bytes(WITNESS);
+fn a_timed_out_session_that_ends_open_incomplete_is_charged() {
+    let mut state = waiting_session();
     assert_eq!(
-        summary,
-        DiscoverySessionReplaySummary {
-            transitions: 7,
-            charges: 1,
-            closing_owner_checks: 1,
-            closes: 1
-        }
+        settle_initial(&mut state, InitialWait::TimedOut),
+        then(PeerOutput::CheckSoleOwner)
     );
     assert_eq!(
-        replay_discovery_session_bytes(&[]),
-        DiscoverySessionReplaySummary::default()
+        state.on_input(PeerInput::Owners(Ownership::Shared)),
+        then(REFRESH)
     );
-    println!("tier=Machine target=discovery_session decoder=1 {summary:?}");
+    assert_eq!(
+        state.on_input(PeerInput::Refreshed { sent: false }),
+        charged(SessionCharge::Fail, END_OPEN)
+    );
 }
 
 fn closing_events() -> impl Iterator<Item = Event> {

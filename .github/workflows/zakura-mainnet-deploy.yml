@@ -290,6 +290,10 @@ jobs:
             echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
             exit 1
           fi
+          if [ "${NODE}" != "asia-hedged-simple" ]; then
+            echo "This deployment branch targets asia-hedged-simple." >&2
+            exit 1
+          fi
           if [ "${VALIDATE_START}" = "true" ] && [ -z "${NODE}" ]; then
             echo "validate_start requires one explicit node." >&2
             exit 1
@@ -379,7 +383,8 @@ jobs:
             68.183.178.89 \
             206.189.45.15 \
             165.227.220.111 \
-            188.166.118.152; do
+            188.166.118.152 \
+            143.198.222.9; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -561,6 +566,14 @@ jobs:
           commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
+
+          [[nodes]]
+          name       = "asia-hedged-simple"
+          ssh_string = "root@143.198.222.9"
+          monitor    = { profiler_url = "http://127.0.0.1:8111" }
+          commit     = "d144f3c81ad7672180242ea99d68d06e4ed9b0e2"
+          rpc_listen_addr = "127.0.0.1:8232"
+          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary
@@ -580,6 +593,19 @@ jobs:
           fi
 
           python3 deploy.py build "${args[@]}"
+
+      - name: Wait for Mainnet state restoration
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes \
+              root@143.198.222.9 'test -d /mnt/data/zakura-cache/state/v31/mainnet'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Mainnet state was not restored on asia-hedged-simple." >&2
+          exit 1
 
       - name: Suppress fleet watchdog alerts during deploy
         if: ${{ !inputs.no_restart }}
@@ -887,7 +913,7 @@ jobs:
           EOF
 
       - name: Install cluster status dashboard
-        if: always()
+        if: success()
         env:
           DASHBOARD_PASSWORD: ${{ secrets.ZAKURA_STATUS_DASHBOARD_PASSWORD }}
         run: |
@@ -969,14 +995,14 @@ jobs:
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
       - name: Install profiler tunnels
-        if: always()
+        if: success()
         run: |
           set -euo pipefail
           python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml \
             || echo "::warning::profiler tunnels could not be installed; see the step log" >&2
 
       - name: Install public broadcast gateway
-        if: always()
+        if: inputs.node != 'asia-hedged-simple' && always()
         run: |
           set -euo pipefail
 
@@ -1018,7 +1044,7 @@ jobs:
           echo
 
       - name: Install fleet watchdog
-        if: always()
+        if: inputs.node != 'asia-hedged-simple' && always()
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}

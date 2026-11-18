@@ -654,7 +654,14 @@ impl DiscoveryPeer {
                     .get_mut(&header.message_type)
                     .expect("every request row has a model");
                 if faults.is_conformant() {
-                    model.request_frame(SESSION)
+                    let labels = model.request_frame(SESSION);
+                    // The evidence settles an `OverMargin` request by the
+                    // node's count, which can admit it, so it counts toward
+                    // the requests after it either way.
+                    if labels.first() == Label::OverMargin {
+                        model.open_crossed(SESSION);
+                    }
+                    labels
                 } else {
                     model.clone().request_frame(SESSION)
                 }

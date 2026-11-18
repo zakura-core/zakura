@@ -3242,10 +3242,10 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     .expect("the revoked advert is answered before the request timeout");
 }
 
-/// Answers to small block requests are timed from when the request was written, and recorded as
-/// the peer's delivery samples. Block-hash and transaction answers are not.
+/// Answers to block requests are timed from when the request was written, and recorded as the
+/// peer's delivery samples, whatever the block's size. Block-hash and transaction answers are not.
 #[tokio::test(start_paused = true)]
-async fn small_block_answers_are_timed_as_delivery_samples() {
+async fn block_answers_are_timed_as_delivery_samples() {
     let _init_guard = zakura_test::init();
 
     let registry = crate::peer_registry::PeerRegistry::default();
@@ -3308,7 +3308,7 @@ async fn small_block_answers_are_timed_as_delivery_samples() {
     settle().await;
     assert_eq!(delivery_samples.delivery_score(), None);
 
-    // A small block answer 10 ms after the request is.
+    // A block answer 10 ms after the request is.
     let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
     client_tx.send(request).await.expect("connection is open");
     assert!(matches!(outbound.next().await, Some(Message::GetData(_))));

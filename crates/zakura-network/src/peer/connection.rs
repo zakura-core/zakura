@@ -749,35 +749,6 @@ where
     request_started_at: Option<tokio::time::Instant>,
 }
 
-/// The largest block, by decoded size, whose answer time counts as a delivery sample.
-///
-/// A larger block's answer time is mostly the time to send it, which says little about how
-/// quickly the peer answers the next request.
-const MAX_SAMPLED_BLOCK_BYTES: u64 = 256 * 1024;
-
-/// Returns what `response`'s answer time measures, if it says how quickly the peer answers a
-/// block request: a reply with blocks that are all small.
-///
-/// Pings are measured by the heartbeat. Transaction replies are not counted: a peer chooses how
-/// many transactions it announces, so it could add as many samples as it liked, and on a live
-/// node they matched the peer's pings and did not change any block prediction. Other replies
-/// (block hashes, headers, addresses, "not found" alone) take the peer a different amount of
-/// work, so they don't count either.
-fn delivery_sample_kind(response: &Response) -> Option<DeliverySampleKind> {
-    match response {
-        Response::Blocks(blocks) => {
-            let mut available = blocks
-                .iter()
-                .filter_map(InventoryResponse::available)
-                .peekable();
-            (available.peek().is_some()
-                && available.all(|(block, _)| block.decoded_bytes() <= MAX_SAMPLED_BLOCK_BYTES))
-            .then_some(DeliverySampleKind::Block)
-        }
-        _ => None,
-    }
-}
-
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
@@ -2011,26 +1982,27 @@ where
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
             }
-            if matches!(&response, Ok(Response::Blocks(blocks))
-                if blocks.iter().any(|block| block.available().is_some()))
-            {
+            // A reply with a requested block, of any size, both clears a missed announced
+            // block and times how long the peer takes to deliver one. Pings are timed by the
+            // heartbeat. Other replies (transactions, block hashes, headers, addresses, "not
+            // found" alone) are not counted: a peer chooses how many transactions it announces,
+            // and the rest take the peer a different amount of work.
+            let delivered_block = matches!(&response, Ok(Response::Blocks(blocks))
+                if blocks.iter().any(|block| block.available().is_some()));
+            let started_at = self.request_started_at.take();
+            if delivered_block {
                 self.request_slot.clear_announced_block_missed();
-            } else {
-                self.record_advertised_block_miss(tx.advertised_block);
-            }
-
-            if let (Some(delivery_samples), Some(started_at), Ok(response)) = (
-                &self.delivery_samples,
-                self.request_started_at.take(),
-                response.as_ref(),
-            ) {
-                if let Some(kind) = delivery_sample_kind(response) {
+                if let (Some(delivery_samples), Some(started_at)) =
+                    (&self.delivery_samples, started_at)
+                {
                     delivery_samples.record_delivery_sample(
-                        kind,
+                        DeliverySampleKind::Block,
                         started_at.elapsed(),
                         Instant::now(),
                     );
                 }
+            } else {
+                self.record_advertised_block_miss(tx.advertised_block);
             }
 
             let _ = tx.send(response.map_err(Into::into));

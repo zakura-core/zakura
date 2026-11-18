@@ -326,8 +326,7 @@ impl PeerRegistryUpdater {
         self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
     }
 
-    /// Records how long the peer took, measured at `now`, to answer a ping or a small block
-    /// request.
+    /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
     ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.

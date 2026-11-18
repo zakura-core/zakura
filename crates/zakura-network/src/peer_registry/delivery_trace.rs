@@ -25,7 +25,7 @@ const TABLE: JsonlTraceTable = JsonlTraceTable::new("delivery_score", "delivery_
 pub(crate) enum DeliverySampleKind {
     /// A heartbeat ping's round trip.
     Ping,
-    /// A reply to a block request whose blocks were all small.
+    /// A reply to a block request that held at least one requested block.
     Block,
 }
 

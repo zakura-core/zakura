@@ -3136,7 +3136,7 @@ async fn transaction_and_small_block_answers_are_timed_as_delivery_samples() {
     assert!(matches!(outbound.next().await, Some(Message::GetData(_))));
     tokio::time::advance(Duration::from_millis(10)).await;
     peer_tx
-        .send(Ok(Message::Block(BlockHandle::from(block.clone()))))
+        .send(Ok(Message::Block(BlockHandle::from(block.clone()).into())))
         .await
         .expect("connection is open");
     response

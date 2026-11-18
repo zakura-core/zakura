@@ -1615,27 +1615,38 @@ async fn a_later_announcer_that_is_not_clearly_faster_is_asked_only_after_a_stal
     );
 }
 
-/// When the first peer's answers have not been measured, a measured later announcer is asked.
+/// A first peer whose answers have not been measured is treated as a typical far peer: a later
+/// announcer about as far away is not asked, and a clearly faster one is.
 #[tokio::test(start_paused = true)]
-async fn a_measured_announcer_is_asked_when_the_first_peer_was_unmeasured() {
+async fn an_unmeasured_first_peer_is_replaced_only_by_a_clearly_faster_announcer() {
     let _init_guard = zakura_test::init();
     let registry = crate::peer_registry::PeerRegistry::default();
     let mut unmeasured = TestPeer::spawn(1);
-    let mut measured = TestPeer::spawn(2);
+    let mut far = TestPeer::spawn(2);
+    let mut near = TestPeer::spawn(3);
     let _measured = [
         measured_peer(&mut unmeasured, &registry, None),
-        measured_peer(&mut measured, &registry, Some(300)),
+        measured_peer(&mut far, &registry, Some(190)),
+        measured_peer(&mut near, &registry, Some(5)),
     ];
     let (mut peer_set, mut guard) =
-        peer_set_with_second_requests(&mut [&mut unmeasured, &mut measured]);
+        peer_set_with_second_requests(&mut [&mut unmeasured, &mut far, &mut near]);
 
     announce_block(&mut peer_set, &mut guard, &unmeasured).await;
     let _first = request_block(&mut peer_set).await;
-    announce_block(&mut peer_set, &mut guard, &measured).await;
+    announce_block(&mut peer_set, &mut guard, &far).await;
 
-    let _second = request_block_again(&mut peer_set, 10).await;
+    assert_not_yet(request_block_again(&mut peer_set, 10).await).await;
     assert_eq!(
-        measured.written_now().await,
+        far.written_now().await,
+        None,
+        "a far announcer is not asked"
+    );
+
+    announce_block(&mut peer_set, &mut guard, &near).await;
+    let _second = request_block_again(&mut peer_set, 20).await;
+    assert_eq!(
+        near.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()]))
     );
 }

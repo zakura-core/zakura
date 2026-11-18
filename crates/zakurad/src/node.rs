@@ -149,6 +149,7 @@ mod tests {
                 service: Arc::new(RegistrationProbe(service_registered.clone())),
                 provides: Vec::new(),
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
             CancellationToken::new(),
         ));

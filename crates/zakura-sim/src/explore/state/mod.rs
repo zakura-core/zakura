@@ -9,7 +9,7 @@
 //!
 //! # Index layout
 //!
-//! [`FEEDBACK_VERSION`] 4 fixes this layout. Each [`Family`] owns 4,096
+//! [`FEEDBACK_VERSION`] 5 fixes this layout. Each [`Family`] owns 4,096
 //! indices from `family × 4096`, in [`Family::ALL`]'s order. A family splits
 //! its span into blocks, one per [`StateFeature`] variant. A block's index is
 //! mixed-radix over the variant's fields, in field order, each field by its
@@ -679,6 +679,8 @@ vocabulary! {
         AfterClose = "after-close",
         /// `bad-cursor`.
         BadCursor = "bad-cursor",
+        /// `over-rate`.
+        OverRate = "over-rate",
         /// `bad-content`.
         BadContent = "bad-content",
         /// `conformant`.

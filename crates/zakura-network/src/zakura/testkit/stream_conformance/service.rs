@@ -324,7 +324,9 @@ impl<A: StreamConformance> LayoutSession<A> {
                 let index = shared.subscription_index(row.message_type);
                 self.publishers[index].apply(update)
             }
-            MessageRole::Announcement { .. } => decode::<A>(frame).map(drop),
+            MessageRole::Announcement { .. } | MessageRole::Metered { .. } => {
+                decode::<A>(frame).map(drop)
+            }
         }
     }
 }

@@ -1,5 +1,6 @@
 # Records a job as in progress and hands it to nobody, which stops the session's
-# serving. The input's first `NextJob` finds no job where the model expects one.
+# serving. After the input's first `NextJob`, state holds a job the task never
+# received.
 input = "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin"
 checks = [
     "crates/zakura-network/src/zakura/header_sync/v9/publisher",

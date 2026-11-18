@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "18.0.0"
+version = "19.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -138,6 +138,11 @@ harness = false
 required-features = ["internal-bench"]
 
 [[bench]]
+name = "legacy_encode"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
 name = "supervised_spawn"
 harness = false
 required-features = ["internal-bench"]
@@ -154,5 +159,10 @@ required-features = ["internal-bench"]
 
 [[bench]]
 name = "block_work_churn"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_checksum_threshold"
 harness = false
 required-features = ["internal-bench"]

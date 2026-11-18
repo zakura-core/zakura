@@ -9,20 +9,21 @@
 #![cfg(zakura_sim)]
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
 
 use zakura_sim::{
     campaign::{
-        bypasses, declared_targets, judge_run, max_len, own_applicability, resolve, run_seed,
-        SeedRun, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
+        applied_properties, bypasses, declared_targets, judge_run, max_len, own_applicability,
+        resolve, TargetStatus, FUZZ_PACKAGE, SHARED_PROPERTIES,
     },
     explore::{
         stats::{Counts, ProcessStats, STATS_VERSION},
         ProcessExit, Worker,
     },
-    harness::HARNESSES,
+    harness::{HarnessEntry, HARNESSES},
     seed,
     suite::{SuiteFile, SUITE_FILE},
 };
@@ -30,6 +31,27 @@ use zakura_sim::{
 /// The repository's root.
 fn root() -> PathBuf {
     seed::repo_root()
+}
+
+/// Runs `input` on `entry`'s harness on `worker`, and returns the
+/// explorer's outcome and the properties whose evaluation applied, as the
+/// fuzz target's stats count them.
+fn run_seed(
+    worker: &mut Worker,
+    entry: &'static HarnessEntry,
+    input: &[u8],
+) -> (String, BTreeSet<String>) {
+    worker.explore(entry, input, move |_, run, classified| {
+        let mut counts = Counts::for_harness(entry);
+        counts.record(run, classified, &[]);
+        let outcome = counts
+            .outcomes
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".to_owned());
+        (outcome, applied_properties(&counts))
+    })
 }
 
 /// `qa/suite.toml`.
@@ -47,18 +69,140 @@ fn fixtures() -> PathBuf {
     root().join("crates/zakura-sim/tests/fixtures")
 }
 
-/// The targets whose seeds don't apply every property of their harness.
-/// Their seeds run honest and single-fault scenarios, and the coverage
-/// manifest names the test where each other property applies, such as a
-/// frame-conformance property on a faulted frame. Each still needs a seed
-/// that applies one of its harness's own properties, as readiness does, and
-/// `zakura-sim targets` lists the rest as applied in no seed.
-const PARTIAL_SEEDS: [&str; 3] = ["block_sync_storage", "discovery_wire", "header_sync_wire"];
+/// Each target's own properties that no seed applies. These targets' seeds
+/// run honest and single-fault scenarios, and the coverage manifest names
+/// the test where each listed property applies, such as a frame-conformance
+/// property on a faulted frame. A target missing from the list has seeds
+/// that apply every own property. A listed property that a seed now applies
+/// fails the test until it leaves the list, so the list only shrinks.
+///
+/// `block-sync/capacity-release-wakes` applies only once the commit window
+/// fills, which only the capacity-release seeds in `fixtures/slow-seeds/`
+/// reach. Those run too long for a fuzz input, so they are outside the
+/// corpus, and their own tests apply the property.
+const UNAPPLIED: &[(&str, &[&str])] = &[
+    (
+        "block_sync_storage",
+        &[
+            "block-sync/capacity-release-wakes",
+            "block-sync/s6v3/block/bad-content-closes",
+            "block-sync/s6v3/block/long-payload-closes",
+            "block-sync/s6v3/block/over-owed-closes",
+            "block-sync/s6v3/block/reserved-flags-closes",
+            "block-sync/s6v3/block/sender-answers-open",
+            "block-sync/s6v3/block/sender-within-response-quantity",
+            "block-sync/s6v3/block/short-payload-closes",
+            "block-sync/s6v3/block/unsolicited-closes",
+            "block-sync/s6v3/blocks-done/bad-content-closes",
+            "block-sync/s6v3/blocks-done/long-payload-closes",
+            "block-sync/s6v3/blocks-done/over-owed-closes",
+            "block-sync/s6v3/blocks-done/receiver-work-authorized",
+            "block-sync/s6v3/blocks-done/reserved-flags-closes",
+            "block-sync/s6v3/blocks-done/sender-ends-once",
+            "block-sync/s6v3/blocks-done/sender-within-response-quantity",
+            "block-sync/s6v3/blocks-done/short-payload-closes",
+            "block-sync/s6v3/blocks-done/unsolicited-closes",
+            "block-sync/s6v3/get-blocks/bad-content-closes",
+            "block-sync/s6v3/get-blocks/long-payload-closes",
+            "block-sync/s6v3/get-blocks/over-margin-closes",
+            "block-sync/s6v3/get-blocks/receiver-serving-bounded",
+            "block-sync/s6v3/get-blocks/reserved-flags-closes",
+            "block-sync/s6v3/get-blocks/short-payload-closes",
+            "block-sync/s6v3/range-unavailable/bad-content-closes",
+            "block-sync/s6v3/range-unavailable/long-payload-closes",
+            "block-sync/s6v3/range-unavailable/over-owed-closes",
+            "block-sync/s6v3/range-unavailable/receiver-work-authorized",
+            "block-sync/s6v3/range-unavailable/reserved-flags-closes",
+            "block-sync/s6v3/range-unavailable/sender-ends-once",
+            "block-sync/s6v3/range-unavailable/sender-within-response-quantity",
+            "block-sync/s6v3/range-unavailable/short-payload-closes",
+            "block-sync/s6v3/range-unavailable/unsolicited-closes",
+            "block-sync/s6v3/status/bad-content-closes",
+            "block-sync/s6v3/status/cadence-never-closes",
+            "block-sync/s6v3/status/long-payload-closes",
+            "block-sync/s6v3/status/reserved-flags-closes",
+            "block-sync/s6v3/status/short-payload-closes",
+            "block-sync/s6v3/undeclared-type-closes",
+        ],
+    ),
+    (
+        "discovery_wire",
+        &[
+            "discovery/s4v2/get-peers/bad-content-closes",
+            "discovery/s4v2/get-peers/cadence-never-closes",
+            "discovery/s4v2/get-peers/long-payload-closes",
+            "discovery/s4v2/get-peers/over-margin-closes",
+            "discovery/s4v2/get-peers/reserved-flags-closes",
+            "discovery/s4v2/get-peers/short-payload-closes",
+            "discovery/s4v2/get-services/bad-content-closes",
+            "discovery/s4v2/get-services/cadence-never-closes",
+            "discovery/s4v2/get-services/long-payload-closes",
+            "discovery/s4v2/get-services/over-margin-closes",
+            "discovery/s4v2/get-services/reserved-flags-closes",
+            "discovery/s4v2/get-services/short-payload-closes",
+            "discovery/s4v2/hello/bad-content-closes",
+            "discovery/s4v2/hello/cadence-never-closes",
+            "discovery/s4v2/hello/long-payload-closes",
+            "discovery/s4v2/hello/reserved-flags-closes",
+            "discovery/s4v2/hello/short-payload-closes",
+            "discovery/s4v2/peers/bad-content-closes",
+            "discovery/s4v2/peers/long-payload-closes",
+            "discovery/s4v2/peers/over-owed-closes",
+            "discovery/s4v2/peers/reserved-flags-closes",
+            "discovery/s4v2/peers/sender-ends-once",
+            "discovery/s4v2/peers/sender-within-owed",
+            "discovery/s4v2/peers/short-payload-closes",
+            "discovery/s4v2/peers/unsolicited-closes",
+            "discovery/s4v2/services/bad-content-closes",
+            "discovery/s4v2/services/long-payload-closes",
+            "discovery/s4v2/services/over-owed-closes",
+            "discovery/s4v2/services/reserved-flags-closes",
+            "discovery/s4v2/services/sender-ends-once",
+            "discovery/s4v2/services/sender-within-owed",
+            "discovery/s4v2/services/short-payload-closes",
+            "discovery/s4v2/services/unsolicited-closes",
+            "discovery/s4v2/undeclared-type-closes",
+        ],
+    ),
+    (
+        "header_sync_wire",
+        &[
+            "header-sync/expected-chain-selected",
+            "header-sync/s5v9/headers-outcome/bad-content-closes",
+            "header-sync/s5v9/headers-outcome/long-payload-closes",
+            "header-sync/s5v9/headers-outcome/over-owed-closes",
+            "header-sync/s5v9/headers-outcome/reserved-flags-closes",
+            "header-sync/s5v9/headers-outcome/short-payload-closes",
+            "header-sync/s5v9/headers/long-payload-closes",
+            "header-sync/s5v9/headers/over-owed-closes",
+            "header-sync/s5v9/headers/reserved-flags-closes",
+            "header-sync/s5v9/headers/short-payload-closes",
+            "header-sync/s5v9/status/bad-content-closes",
+            "header-sync/s5v9/status/cadence-never-closes",
+            "header-sync/s5v9/subscribe-headers/bad-content-closes",
+            "header-sync/s5v9/subscribe-headers/long-payload-closes",
+            "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
+            "header-sync/s5v9/subscribe-headers/short-payload-closes",
+            "header-sync/state-publication-consistent",
+        ],
+    ),
+];
+
+/// The target's own properties that [`UNAPPLIED`] lists, sorted.
+fn unapplied_allowed(target: &str) -> Vec<String> {
+    let mut allowed: Vec<String> = UNAPPLIED
+        .iter()
+        .find(|(name, _)| *name == target)
+        .map(|(_, properties)| properties.iter().map(|id| (*id).to_owned()).collect())
+        .unwrap_or_default();
+    allowed.sort();
+    allowed
+}
 
 /// Each declared target resolves to its registered harness, its harness has
 /// admitted seeds and no rejected one, and the seeds apply each of the
 /// harness's own properties and those of every harness the target covers,
-/// except for a target in [`PARTIAL_SEEDS`]. A target without seeds, or
+/// except the properties [`UNAPPLIED`] lists. A target without seeds, or
 /// whose seeds reach only the properties every harness checks, fails here
 /// before the nightly job runs it.
 #[test]
@@ -67,6 +211,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let manifest = manifest();
     let declared = declared_targets(&suite);
     assert!(!declared.is_empty(), "{SUITE_FILE} declares sim targets");
+    let mut mismatched = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
         let loaded = seed::load(&[fixtures()], Some(entry.name)).unwrap();
@@ -94,27 +239,21 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             }
         }
         let mut worker = Worker::new();
-        let seeds: Vec<SeedRun> = loaded
+        let reached: BTreeSet<String> = loaded
             .admitted
             .iter()
-            .map(|seed| {
+            .flat_map(|seed| {
                 let (outcome, applied) = run_seed(&mut worker, entry, &seed.input);
                 assert_eq!(outcome, "clean", "{}", seed.path.display());
-                SeedRun {
-                    file: seed.path.clone(),
-                    sha256: seed::sha256(&seed.input),
-                    outcome,
-                    applied,
-                }
+                applied
             })
             .collect();
-        let (applied, unapplied) = own_applicability(entry, &seeds);
+        let (applied, mut unapplied) = own_applicability(entry, &reached);
         assert!(!applied.is_empty(), "{}", target.name);
-        assert!(
-            unapplied.is_empty() || PARTIAL_SEEDS.contains(&target.name.as_str()),
-            "{}: no seed applies {unapplied:?}",
-            target.name
-        );
+        unapplied.sort();
+        if unapplied != unapplied_allowed(&target.name) {
+            mismatched.push(format!("(\"{}\", &{unapplied:?}),", target.name));
+        }
         let row = suite
             .target
             .iter()
@@ -125,7 +264,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
                 .iter()
                 .find(|entry| entry.name == covered)
                 .unwrap();
-            let (_, unapplied) = own_applicability(covered, &seeds);
+            let (_, unapplied) = own_applicability(covered, &reached);
             assert!(
                 unapplied.is_empty(),
                 "{} covers {}, and no seed applies {unapplied:?}",
@@ -134,6 +273,11 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             );
         }
     }
+    assert!(
+        mismatched.is_empty(),
+        "the seeds' unapplied own properties differ from UNAPPLIED; these entries match the seeds:\n{}",
+        mismatched.join("\n")
+    );
 }
 
 /// A target the fuzz package doesn't map, or maps to an unregistered
@@ -218,18 +362,52 @@ fn shared_properties_never_count_as_applied() {
         .iter()
         .find(|entry| entry.name == "discovery/wait-complete")
         .unwrap();
-    let seeds = [SeedRun {
-        file: PathBuf::from("seed.bin"),
-        sha256: String::new(),
-        outcome: "clean".to_owned(),
-        applied: SHARED_PROPERTIES
-            .iter()
-            .map(|id| (*id).to_owned())
-            .collect(),
-    }];
-    let (applied, unapplied) = own_applicability(entry, &seeds);
+    let reached = SHARED_PROPERTIES
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect();
+    let (applied, unapplied) = own_applicability(entry, &reached);
     assert_eq!(applied, Vec::<String>::new());
     assert_eq!(unapplied, ["discovery/wait-complete-wakes"]);
+}
+
+/// A target's stats file counts a property as applied when it held with an
+/// applicable evaluation or was violated, not when it only ended not
+/// applicable.
+#[test]
+fn applied_properties_come_from_the_targets_counts() {
+    let entry = HARNESSES
+        .iter()
+        .find(|entry| entry.name == "discovery/wait-complete")
+        .unwrap();
+    let mut counts = Counts::for_harness(entry);
+    let held = counts
+        .properties
+        .get_mut("discovery/wait-complete-wakes")
+        .unwrap();
+    held.held = 1;
+    held.evaluations = 2;
+    let ids: Vec<String> = counts.properties.keys().cloned().collect();
+    let violated = ids
+        .iter()
+        .find(|id| id.as_str() != "discovery/wait-complete-wakes")
+        .unwrap()
+        .clone();
+    counts.properties.get_mut(&violated).unwrap().violated = 1;
+    let not_applicable = ids
+        .iter()
+        .find(|id| ![violated.as_str(), "discovery/wait-complete-wakes"].contains(&id.as_str()))
+        .unwrap();
+    counts
+        .properties
+        .get_mut(not_applicable)
+        .unwrap()
+        .not_applicable
+        .insert("never-applied".to_owned(), 1);
+    assert_eq!(
+        applied_properties(&counts),
+        BTreeSet::from(["discovery/wait-complete-wakes".to_owned(), violated])
+    );
 }
 
 /// A stats file of `harness` with `runs`, complete or not.

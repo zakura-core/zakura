@@ -1,7 +1,8 @@
 //! Transport-free execution of a pure machine's history.
 //!
-//! A [`Machine`] names a decoder that runs the real owner against its
-//! independent model and returns one [`MachineStep`] per operation. This module
+//! A [`Machine`] names a decoder that drives the production owner, checks its
+//! invariants and the facts its inputs fix after every operation, and returns
+//! one [`MachineStep`] per operation. This module
 //! runs that history under the shared registry, recorder, replay verifier and
 //! explorer. [`machine_entry!`](crate::machine_entry) makes a [`Machine`] a
 //! [`HarnessEntry`](super::HarnessEntry).
@@ -49,6 +50,9 @@ pub struct Machine {
     pub identity: &'static str,
     /// The property's claim, in one sentence.
     pub claim: &'static str,
+    /// Named rules for a machine with several independent invariants.
+    /// An empty slice keeps the single rule named by `name` and `claim`.
+    pub rules: &'static [(&'static str, &'static str, Status)],
     /// The decoder's version.
     pub generator: u32,
     /// The most operations the decoder returns.
@@ -135,16 +139,25 @@ impl HasView for Handle {
 }
 
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
-    vec![Property {
-        id: PropertyId::new(machine.name),
-        claim: machine.claim,
-        kind: Kind::Safety,
-        assumes: &[],
-        needs: &[Source::View],
-        status: Status::Active,
-        check,
-        witness: None,
-    }]
+    let fallback = [(machine.name, machine.claim, Status::Active)];
+    let rules = if machine.rules.is_empty() {
+        &fallback[..]
+    } else {
+        machine.rules
+    };
+    rules
+        .iter()
+        .map(|&(id, claim, status)| Property {
+            id: PropertyId::new(id),
+            claim,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status,
+            check,
+            witness: None,
+        })
+        .collect()
 }
 
 /// A step that fails is a violation, even before the run reaches the
@@ -156,7 +169,7 @@ fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         cx.missing_evidence("machine transition has no captured view");
         return Verdict::NotApplicable;
     };
-    let Some(failure) = step.failure() else {
+    let Some(failure) = step.failure_for(cx.id().as_str()) else {
         return if reached {
             Verdict::Holds
         } else {
@@ -171,7 +184,7 @@ fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         property: cx.id().to_string(),
         step: cx.step,
         witness: (1..=cx.step).collect(),
-        expected: "independent model agrees with the transition and retained state".into(),
+        expected: "the owner keeps its invariants and the facts its inputs fix".into(),
         actual: format!("{:?}: {}", failure.phase, failure.message),
     })
 }
@@ -456,16 +469,18 @@ pub fn witness(
     also_violates: &[String],
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    if property != machine.name {
-        return Err(WitnessError::Unregistered);
-    }
+    let status = registered(machine)
+        .into_iter()
+        .find(|rule| rule.id == property)
+        .ok_or(WitnessError::Unregistered)?
+        .status;
     let mut evidence = WitnessSink {
         sink,
         steps: Vec::new(),
     };
     let report = run(machine, value, input, &mut evidence)
         .map_err(|error| WitnessError::HarnessEnd(error.to_string()))?;
-    crate::witness::judge(&report, property, Status::Active, expect, also_violates)?;
+    crate::witness::judge(&report, property, status, expect, also_violates)?;
     if expect != Expect::Applicable && !(machine.reached)(&evidence.steps, expect) {
         return Err(WitnessError::LostTriggerHistory);
     }

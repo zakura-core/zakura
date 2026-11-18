@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -4270,6 +4270,7 @@
+         // unnegotiated capability): otherwise an authenticated peer could open
+         // such streams indefinitely without ever spending open-rate budget.
+         if !admission.open_limiter.try_take() {
++            std::mem::forget(permit);
+             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
+             metrics::counter!("zakura.p2p.stream.rejected.open_rate").increment(1);
+             admission

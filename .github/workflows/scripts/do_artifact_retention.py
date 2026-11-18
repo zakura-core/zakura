@@ -113,6 +113,10 @@ def main():
             )
         )
     ]
+    # DigitalOcean omits `regions` until an image or snapshot finishes, so one
+    # that a concurrent bake is still creating would otherwise crash the run.
+    for item in images + snapshots:
+        item.setdefault("regions", [])
     keep = retained_ids(images, snapshots, args.checkpoint)
     now = datetime.now(timezone.utc)
     stale = stale_regions(images, now)

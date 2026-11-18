@@ -35,7 +35,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read as _},
     path::{self, Path, PathBuf},
@@ -526,28 +526,6 @@ fn wrapper_failed(
     write_report(request, report, started).map_err(|_| error)
 }
 
-/// `cargo build` of `repo_root`'s `zakura-sim` binary, with the simulator's
-/// flags and the planted profile (`crate::planted::PROFILE`), in `target`.
-/// An unoptimized `zakura-sim confirm` of a `block-sync/storage` input can
-/// take six times as long, past the confirmation's child limit. Like
-/// [`FuzzBuild::command`], it warns rather than fails on warnings
-/// (`crate::planted::cargo_sim` says why).
-fn sim_build(repo_root: &Path, target: &Path) -> Command {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(cargo);
-    command
-        .env("RUSTFLAGS", SIM_RUSTFLAGS)
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_BUILD_WARNINGS", "warn")
-        .arg("build")
-        .arg("--locked")
-        .args(["--profile", PROFILE])
-        .arg("--manifest-path")
-        .arg(repo_root.join("Cargo.toml"))
-        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
-    command
-}
-
 /// A report for a run interrupted before its tools were ready.
 fn interrupted_before_start(request: &Request, original: Original, started: Instant) -> Report {
     Report::new(request, original, Status::Interrupted, started)
@@ -565,8 +543,9 @@ fn build_tools(
 ) -> Result<Result<Tools, Stop>, BoxError> {
     let logs = request.out.join(LOGS_DIR);
     fs::create_dir_all(&logs)?;
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let sim_target = builds.join("sim");
-    let mut build_sim = sim_build(repo_root, &sim_target);
+    let mut build_sim = sim_build(&cargo, repo_root, &sim_target);
     if let Err(stop) = build(&mut build_sim, &logs.join("build-sim.log"), interrupt)? {
         return Ok(Err(stop));
     }
@@ -611,6 +590,30 @@ fn build_tools(
     }))
 }
 
+/// `cargo build` of `repo_root`'s `zakura-sim` binary with the simulator's
+/// flags and the planted profile (`crate::planted::PROFILE`), in `target`.
+/// An unoptimized `zakura-sim confirm` of a `block-sync/storage` input can
+/// take six times as long, past the confirmation's child limit.
+///
+/// `cargo xtask planted --targets` confirms through a patched checkout, and
+/// a bypass patch can leave the code it bypasses unused. So the build
+/// reports warnings but doesn't fail on them, even where the environment
+/// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
+fn sim_build(cargo: &OsStr, repo_root: &Path, target: &Path) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .env("RUSTFLAGS", SIM_RUSTFLAGS)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_BUILD_WARNINGS", "warn")
+        .arg("build")
+        .arg("--locked")
+        .args(["--profile", PROFILE])
+        .arg("--manifest-path")
+        .arg(repo_root.join("Cargo.toml"))
+        .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
+    command
+}
+
 /// The flags every `cargo fuzz` command of one build shares, so `tmin`
 /// runs the target `cargo fuzz build` built.
 #[derive(Clone)]
@@ -624,9 +627,8 @@ struct FuzzBuild {
 }
 
 impl FuzzBuild {
-    /// `cargo +<nightly> fuzz <verb>` with the build's flags. It warns
-    /// rather than fails on warnings, so a planted patch that leaves code
-    /// unused still builds (`crate::planted::cargo_sim`).
+    /// `cargo +<nightly> fuzz <verb>` with the build's flags. Like
+    /// [`sim_build`], it warns rather than fails on warnings.
     fn command(&self, verb: &str) -> Command {
         let mut command = Command::new("cargo");
         command

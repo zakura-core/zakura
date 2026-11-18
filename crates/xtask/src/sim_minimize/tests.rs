@@ -868,9 +868,9 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
              block_decoded_retention, block_reactor_policy, block_sync_storage, \
              block_work_funding, block_work_ownership, discovery_record_book, \
              discovery_session_installation, discovery_verification_capacity, \
-             discovery_wait_complete, discovery_wire, header_publisher_policy, \
-             header_reactor_policy, header_sync_storage, header_sync_wire, race_fixtures, \
-             sync_storage, sync_wire",
+             discovery_wait_complete, discovery_wire, handshake_counts, handshake_wire, \
+             header_publisher_policy, header_reactor_policy, header_sync_storage, \
+             header_sync_wire, race_fixtures, sync_storage, sync_wire",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (
@@ -1182,28 +1182,33 @@ fn an_exited_child_leaves_no_descendant() {
     );
 }
 
-/// The confirmation's builds warn rather than fail on warnings, so a
-/// planted patch that leaves code unused still builds where CI's Rust setup
+/// Both builds of a confirmation warn rather than fail on warnings, so a
+/// bypass patch that leaves code unused still builds where the environment
 /// sets `CARGO_BUILD_WARNINGS=deny`.
 #[test]
-fn tool_builds_override_denied_warnings() {
+fn confirmation_builds_override_denied_warnings() {
     let warnings = |command: &Command| {
         command
             .get_envs()
             .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
             .and_then(|(_, value)| value)
-            .map(ToOwned::to_owned)
+            .map(OsStr::to_owned)
     };
+    let sim = sim_build(OsStr::new("cargo"), Path::new("repo"), Path::new("target"));
+    assert_eq!(warnings(&sim), Some("warn".into()));
     let fuzz = FuzzBuild {
         fuzz_dir: PathBuf::from("fuzz"),
         target_dir: PathBuf::from("target"),
         sanitizer: Sanitizer::Address,
     };
-    let sim = sim_build(Path::new("repo"), Path::new("target"));
-    for command in [&sim, &fuzz.command("build")] {
-        assert_eq!(warnings(command), Some(OsString::from("warn")));
-    }
-    // An unoptimized `zakura-sim` outruns the child limit.
+    assert_eq!(warnings(&fuzz.command("build")), Some("warn".into()));
+}
+
+/// The confirmation's `zakura-sim` is optimized, since an unoptimized one
+/// outruns the child limit.
+#[test]
+fn the_confirmation_builds_zakura_sim_with_the_planted_profile() {
+    let sim = sim_build(OsStr::new("cargo"), Path::new("repo"), Path::new("target"));
     let args: Vec<_> = sim.get_args().collect();
     assert!(args.windows(2).any(|pair| pair == ["--profile", PROFILE]));
 }
@@ -1241,10 +1246,7 @@ timeout-secs = 60
     let env: Vec<_> = command.get_envs().collect();
     assert_eq!(
         env,
-        [(
-            std::ffi::OsStr::new("ASAN_OPTIONS"),
-            Some(std::ffi::OsStr::new("detect_leaks=0"))
-        )]
+        [(OsStr::new("ASAN_OPTIONS"), Some(OsStr::new("detect_leaks=0")))]
     );
     // Another package's target of the same name isn't this one.
     assert_eq!(

@@ -7,6 +7,7 @@
 
 - Keep changes focused and avoid unrelated refactors.
 - Run formatting and the checks relevant to the code you changed.
+- Keep Python dependency manifests, lockfiles, and virtual environments under scripts/ rather than the repository root, and run the required Python dependency-security check whenever Python code changes.
 - For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
 ## Project Structure & Module Organization
@@ -160,7 +161,7 @@ S::Future: Send + 'static,
 - All external waits need timeouts (network, state, channels)
 - Prefer `tokio::sync::watch` over `Mutex` for shared async state
 - Prefer freshness tracking ("time since last change") to detect stalls
-- The v2 P2P code (`crates/zakura-network/src/zakura/`, except `legacy_gossip` and `testkit`) takes tasks, time, sync primitives, hashed collections and the thread RNG from `zakura_rt`, not from `tokio`, `std` or `rand`. `cargo xtask check-rt-imports` enforces this.
+- The v2 P2P code (`crates/zakura-network/src/zakura/`, except `legacy_gossip` and `testkit`) and the pool crate (`crates/zakura-mempool/`) take tasks, time, sync primitives, hashed collections and the thread RNG from `zakura_rt`, not from `tokio`, `std` or `rand`. `cargo xtask check-rt-imports` enforces this.
 
 ### Security
 

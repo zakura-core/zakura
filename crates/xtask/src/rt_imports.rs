@@ -2,7 +2,7 @@
 //! `zakura-rt`.
 //!
 //! The check parses every production module under `zakura-network`'s
-//! `zakura` module and in `zakura-quic`, and flags paths to tokio, the std mutex and atomics, std's
+//! `zakura` module, in `zakura-quic` and in `zakura-mempool`, and flags paths to tokio, the std mutex and atomics, std's
 //! hashed collections, and the thread RNG. It also flags the std blocking
 //! primitives and channels, `futures::select!` and `tokio_util::time`, which
 //! `zakura-rt` has no names for: under the simulator a blocking wait hangs the
@@ -74,12 +74,13 @@ use crate::BoxError;
 
 /// The root modules the check walks, each with the child modules under it
 /// that are not v2 production code.
-const ROOTS: [(&str, &[&str]); 2] = [
+const ROOTS: [(&str, &[&str]); 3] = [
     (
         "crates/zakura-network/src/zakura.rs",
         &["legacy_gossip", "testkit"],
     ),
     ("crates/zakura-quic/src/lib.rs", &[]),
+    ("crates/zakura-mempool/src/lib.rs", &[]),
 ];
 
 const RT_LIB: &str = "crates/zakura-rt/src/lib.rs";
@@ -130,7 +131,52 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 38] = [
+const ALLOWED: [(&str, &str, &str); 47] = [
+    (
+        "crates/zakura-network/src/zakura/regulation/session_capacity.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/regulation/session_capacity.rs",
+        "std::sync::Mutex",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/regulation/session_capacity.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/regulation/session_capacity.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Mutex",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Mutex::new",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Weak",
+        TRANSPORT_PROBE,
+    ),
+    (
+        "crates/zakura-quic/src/endpoint.rs",
+        "std::sync::Arc::downgrade",
+        TRANSPORT_PROBE,
+    ),
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",

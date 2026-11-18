@@ -33,13 +33,17 @@ pub fn feedback(collector: NewCollector) -> Feedback {
 ///
 /// # Panics
 ///
-/// If the variable holds anything but `on` or `off`.
+/// If the variable holds anything but `on` or `off`, or holds `on` off
+/// Linux.
 fn counters() -> &'static Counters {
     static PICKED: OnceLock<&'static Counters> = OnceLock::new();
     PICKED.get_or_init(|| {
-        // A value that isn't UTF-8 reaches the panic below, not `on`.
+        // Unset means `on` where libFuzzer reads the counters, and `off`
+        // elsewhere, so a target still starts off Linux. A value that isn't
+        // UTF-8 reaches the panic below, not the default.
+        let default = if cfg!(target_os = "linux") { "on" } else { "off" };
         let mode = env::var_os(FEEDBACK_VAR).map_or_else(
-            || "on".to_owned(),
+            || default.to_owned(),
             |value| value.to_string_lossy().into_owned(),
         );
         let counters = match mode.as_str() {

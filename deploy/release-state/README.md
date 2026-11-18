@@ -109,8 +109,9 @@ run once these workflows reach `main`.
    `MAINNET_RELEASE_STATE_PUBLICATION_ENABLED=true` and
    `MAINNET_RELEASE_STATE_ADOPTION_ENABLED=true` only after qualification.
 
-Local validation uses Python 3.12, the pinned client requirements in
-`.github/scripts/requirements-release-state.txt`, and
+Local validation uses Python 3.12 and `scripts/pyproject.toml` / `scripts/uv.lock`.
+From the repository root, run `uv sync --project scripts --locked --no-build --only-group test`,
+then activate `scripts/.venv` and run
 `python -m unittest discover -s .github/scripts -p 'test_*release_state*.py'`.
 The integration tests run actual Cargo publication, resolution, and lockfile
 updates against a loopback registry. Promotion runs against an in-memory store

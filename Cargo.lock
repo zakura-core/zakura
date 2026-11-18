@@ -2710,6 +2710,7 @@ dependencies = [
  "zakura-consensus",
  "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
@@ -3007,6 +3008,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-mempool"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "futures",
+ "metrics",
+ "proptest",
+ "proptest-derive",
+ "thiserror",
+ "tokio",
+ "zakura-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-script",
+ "zakura-test",
+ "zakura-zcash-script",
+]
+
+[[package]]
 name = "zakura-mmr-tree"
 version = "0.1.0"
 dependencies = [
@@ -3018,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "18.0.0"
+version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",

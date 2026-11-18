@@ -1762,11 +1762,11 @@ impl ZakuraSupervisorState {
     fn debug_assert_accounting(&self) {}
 }
 
-/// Shared ownership of the capacity reserved before a legacy request is read.
-/// Queueing or spawning service work must retain a clone until that work finishes.
-#[derive(Clone, Debug, Default)]
-pub struct ReceiveLease {
-    _permits: Option<Arc<(super::regulation::SlotPermit, super::regulation::SlotPermit)>>,
+/// The response capacity an outbound legacy exchange reserved before its response
+/// was read. The requester holds it until decoding finishes.
+#[derive(Debug, Default)]
+pub(crate) struct ReceiveLease {
+    _permits: Option<(super::regulation::SlotPermit, super::regulation::SlotPermit)>,
 }
 
 /// Queue-backed outbound send handle for one authenticated Zakura peer.
@@ -3091,25 +3091,23 @@ impl LegacyReceiveCapacity {
 struct LegacyRequestAdmission<'a> {
     capacity: &'a LegacyReceiveCapacity,
     peer: &'a ZakuraPeerId,
-    lease: StdMutex<Option<ReceiveLease>>,
+    slots: StdMutex<Option<(super::regulation::SlotPermit, super::regulation::SlotPermit)>>,
 }
 
 impl super::regulation::ResponsePrecheck for LegacyRequestAdmission<'_> {
     /// Reserve the request's payload allowance once for this one-shot stream.
     #[allow(clippy::unwrap_in_result)] // Poisoning is a local invariant failure, not peer overload.
     fn check(&self, _message_type: u16, _payload_len: usize) -> Result<(), FrameRejection> {
-        let mut lease = self
-            .lease
+        let mut slots = self
+            .slots
             .lock()
             .expect("request admission mutex is never poisoned");
-        if lease.is_none() {
-            let permits = self
-                .capacity
-                .reserve(self.peer)
-                .ok_or(FrameRejection::LocalCapacity)?;
-            *lease = Some(ReceiveLease {
-                _permits: Some(Arc::new(permits)),
-            });
+        if slots.is_none() {
+            *slots = Some(
+                self.capacity
+                    .reserve(self.peer)
+                    .ok_or(FrameRejection::LocalCapacity)?,
+            );
         }
         Ok(())
     }
@@ -4128,7 +4126,7 @@ impl ZakuraProtocolHandler {
                                 zakura_rt::select! {
                                     biased;
                                     _ = completion.closed() => continue,
-                                    permit = capacity.reserve_outbound(&peer) => ReceiveLease { _permits: Some(Arc::new(permit)) },
+                                    permit = capacity.reserve_outbound(&peer) => ReceiveLease { _permits: Some(permit) },
                                 }
                             }
                             _ => ReceiveLease::default(),
@@ -6872,7 +6870,7 @@ async fn request_stream_worker(
     let admission = LegacyRequestAdmission {
         capacity: &receive,
         peer: &context.peer_id,
-        lease: StdMutex::new(None),
+        slots: StdMutex::new(None),
     };
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
@@ -6911,7 +6909,7 @@ async fn request_stream_worker(
         frame = read => frame,
     };
 
-    // The raw frame stays funded until its service's call ends.
+    // The raw frame and its receive slot stay funded until its service's call ends.
     let (frame, raw_grant) = match frame {
         Ok(AdmittedFrame { frame, grant }) => (frame, grant),
         Err(ZakuraHandlerError::RejectedFrame {
@@ -6961,11 +6959,10 @@ async fn request_stream_worker(
         }
     }
 
-    let receive_capacity = admission
-        .lease
+    let receive_slots = admission
+        .slots
         .into_inner()
-        .expect("request admission mutex is never poisoned")
-        .unwrap_or_default();
+        .expect("request admission mutex is never poisoned");
     let response_frame_cap = context.outbound_frame_cap;
     // Fund the whole response before the service runs, so a full output gate stops
     // the request here and no result waits unfunded. The stream's permit and
@@ -7022,14 +7019,13 @@ async fn request_stream_worker(
     // connection or stopping the stream also ends.
     let Some(response) = call_until_stopped(
         &context.connection_token,
-        registry.request_with_lease(
+        registry.request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
-            receive_capacity,
         ),
         stopped,
     )
@@ -7037,7 +7033,7 @@ async fn request_stream_worker(
     else {
         return;
     };
-    drop(raw_grant);
+    drop((raw_grant, receive_slots));
     let response_frames = match response {
         Ok(frames) => frames,
         Err(SinkReject::Protocol(error)) => {
@@ -15680,26 +15676,23 @@ mod tests {
         ));
     }
 
-    /// Queue ownership and decoding retain the shared permits after the reader has exited.
+    /// A response keeps its receive slot through decoding, and a discarded one frees it.
     #[tokio::test]
-    async fn receive_capacity_follows_retained_work() {
+    async fn response_capacity_follows_decoding() {
         let capacity = LegacyReceiveCapacity::with_limits(4, 1);
-        let lease = ReceiveLease {
-            _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+        let mut response = ResponseFrames::with_zero_grant_for_tests(Vec::new()).await;
+        response.lease = ReceiveLease {
+            _permits: Some(capacity.reserve(&test_peer(1)).unwrap()),
         };
-        let queued = lease.clone();
-        drop(lease);
         assert_eq!(capacity.node.available(), 3);
         assert!(capacity.reserve(&test_peer(1)).is_none());
-        let mut response = ResponseFrames::with_zero_grant_for_tests(Vec::new()).await;
-        response.lease = queued;
         let (_items, funding) = response.into_parts();
         assert_eq!(capacity.node.available(), 3);
         drop(funding);
         assert_eq!(capacity.node.available(), 4);
         let mut discarded = ResponseFrames::with_zero_grant_for_tests(Vec::new()).await;
         discarded.lease = ReceiveLease {
-            _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+            _permits: Some(capacity.reserve(&test_peer(1)).unwrap()),
         };
         drop(discarded);
         assert_eq!(capacity.node.available(), 4);
@@ -15736,64 +15729,6 @@ mod tests {
             response.check_header(LEGACY_REQUEST_PING, 0, 0, 1024),
             Err(FrameRejection::UnknownMessageType)
         );
-    }
-    /// Real service work retains receive admission through queueing, cancellation, and timeout.
-    #[tokio::test(start_paused = true)]
-    async fn receive_lease_survives_service_queue_and_timeout() {
-        use crate::zakura::{
-            legacy_gossip::{LegacyGossipSink, LegacyRequestFrame},
-            transport::RequestResponseService,
-        };
-        for phase in 0..3 {
-            let capacity = LegacyReceiveCapacity::with_limits(1, 1);
-            let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
-            let sink = LegacyGossipSink::spawn(
-                tower::service_fn(move |_: crate::Request| {
-                    started.send(()).unwrap();
-                    std::future::pending::<Result<crate::Response, BoxError>>()
-                }),
-                ZakuraSupervisorHandle::new(1),
-            );
-            let lease = ReceiveLease {
-                _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
-            };
-            let mut response = sink.request_frame_with_lease(
-                test_peer(1),
-                LEGACY_REQUEST_STREAM_KIND,
-                1,
-                1024 * 1024,
-                2 * 1024 * 1024,
-                LegacyRequestFrame::MempoolTransactionIds
-                    .encode_frame()
-                    .unwrap(),
-                lease,
-            );
-            assert!(futures::poll!(response.as_mut()).is_pending());
-            assert_eq!(capacity.node.available(), 0);
-            if phase != 0 {
-                entered.recv().await.unwrap();
-                assert_eq!(capacity.node.available(), 0);
-            }
-            if phase == 2 {
-                tokio::time::advance(Duration::from_secs(60)).await;
-                assert!(response.await.is_err());
-            } else {
-                drop(response);
-                assert_eq!(
-                    capacity.node.available(),
-                    0,
-                    "queued/backend work still owns the lease until cancellation is observed"
-                );
-            }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while capacity.node.available() == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(capacity.reserve(&test_peer(1)).is_some());
-        }
     }
     /// A peer with a small negotiated frame cap can return a full-size block.
     #[test]

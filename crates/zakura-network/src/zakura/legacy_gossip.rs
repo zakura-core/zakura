@@ -3186,8 +3186,6 @@ impl LegacyGossipSink {
         LegacyRequestFrame::decode_borrowed(frame).map_err(SinkReject::protocol)
     }
 
-    /// Keep receive capacity attached to the work queued for the inbound service.
-    #[allow(clippy::too_many_arguments)]
     fn request<'a>(
         &'a self,
         peer_id: ZakuraPeerId,
@@ -3196,7 +3194,6 @@ impl LegacyGossipSink {
         max_frame_bytes: u32,
         max_message_bytes: u32,
         frame: Frame,
-        lease: crate::zakura::ReceiveLease,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
             let request = Self::decode_request(stream_kind, &frame)?;
@@ -3234,7 +3231,6 @@ impl LegacyGossipSink {
                     request_id,
                     frame: request,
                     response_tx,
-                    _receive_lease: lease,
                     _charge: charge,
                 })) {
                 Ok(()) => {}
@@ -3470,27 +3466,6 @@ impl RequestResponseService for LegacyGossipSink {
             max_frame_bytes,
             max_message_bytes,
             frame,
-            Default::default(),
-        )
-    }
-    fn request_frame_with_lease<'a>(
-        &'a self,
-        peer_id: ZakuraPeerId,
-        stream_kind: u16,
-        request_id: u64,
-        max_frame_bytes: u32,
-        max_message_bytes: u32,
-        frame: Frame,
-        lease: crate::zakura::ReceiveLease,
-    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
-        self.request(
-            peer_id,
-            stream_kind,
-            request_id,
-            max_frame_bytes,
-            max_message_bytes,
-            frame,
-            lease,
         )
     }
 
@@ -3520,7 +3495,6 @@ struct LegacyRequestInbound {
     request_id: u64,
     frame: LegacyRequestFrame,
     response_tx: oneshot::Sender<Result<Response, BoxError>>,
-    _receive_lease: crate::zakura::ReceiveLease,
     /// Funds `frame` until this item's handler ends.
     _charge: InboundCharge,
 }
@@ -3625,7 +3599,6 @@ async fn handle_legacy_request<Inbound>(
     Inbound: Service<Request, Response = Response, Error = BoxError> + Send + 'static,
     Inbound::Future: Send + 'static,
 {
-    let _receive_lease = request._receive_lease;
     let command = request.frame.to_string();
     let peer_id = request.peer_id.clone();
     let request_id = request.request_id;
@@ -4377,7 +4350,6 @@ mod tests {
                 1 << 20,
                 1 << 20,
                 request.clone(),
-                Default::default(),
             )
             .await;
         assert!(matches!(refused, Err(SinkReject::Local(_))));
@@ -4391,7 +4363,6 @@ mod tests {
                 request_id: 1,
                 frame: held,
                 response_tx,
-                _receive_lease: Default::default(),
                 _charge: InboundBudget::new(1).try_charge(0).expect("zero fits"),
             }))
             .expect("the queue has one slot");
@@ -4405,7 +4376,6 @@ mod tests {
                 1 << 20,
                 1 << 20,
                 request,
-                Default::default(),
             )
             .await;
         assert!(matches!(refused, Err(SinkReject::Local(_))));
@@ -4432,7 +4402,6 @@ mod tests {
                 1 << 20,
                 1 << 20,
                 frame,
-                Default::default(),
             );
             assert!(call.as_mut().poll(&mut context).is_pending());
             // The decoded request lives in the queued item, not in the call.
@@ -5295,7 +5264,6 @@ mod tests {
                     request_id,
                     frame: LegacyRequestFrame::MempoolTransactionIds,
                     response_tx,
-                    _receive_lease: Default::default(),
                     _charge: free_charge(),
                 }))
                 .await?;
@@ -5359,7 +5327,6 @@ mod tests {
             // A non-Ping request so the handler drives the inbound service.
             frame: LegacyRequestFrame::MempoolTransactionIds,
             response_tx,
-            _receive_lease: Default::default(),
             _charge: free_charge(),
         };
 
@@ -5946,7 +5913,6 @@ mod tests {
                 request_id: 1,
                 frame: LegacyRequestFrame::BlocksByHash(vec![block_hash(11)]),
                 response_tx: request_tx,
-                _receive_lease: Default::default(),
                 _charge: free_charge(),
             }))
             .await?;
@@ -9216,7 +9182,6 @@ mod tests {
             request_id: 1,
             frame: LegacyRequestFrame::Ping,
             response_tx,
-            _receive_lease: Default::default(),
             _charge: free_charge(),
         }))?;
         drop(running);

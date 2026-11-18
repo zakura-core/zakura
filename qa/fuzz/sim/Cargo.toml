@@ -28,6 +28,7 @@ handshake_wire = "handshake/wire"
 handshake_counts = "handshake/counts"
 block_sync_storage = "block-sync/storage"
 discovery_wire = "discovery/wire"
+discovery_composed = "discovery/composed"
 header_sync_wire = "header-sync/wire"
 
 [features]
@@ -177,6 +178,13 @@ bench = false
 [[bin]]
 name = "discovery_wire"
 path = "fuzz_targets/discovery_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_composed"
+path = "fuzz_targets/discovery_composed.rs"
 test = false
 doc = false
 bench = false

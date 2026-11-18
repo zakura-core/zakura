@@ -62,6 +62,15 @@ pub struct GossipedTipChildHeightMismatch {
     pub parent_recovery: bool,
 }
 
+/// The height claimed by this body is outside the local gossip admission window.
+#[derive(Debug, thiserror::Error)]
+enum GossipHeightWindowError {
+    #[error("gossiped block height too far ahead")]
+    Ahead,
+    #[error("gossiped block height behind the finalized tip")]
+    Behind,
+}
+
 /// Source key used for inbound block download ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AdvertiserSource {
@@ -1031,7 +1040,7 @@ where
             );
             metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
 
-            Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
+            return Err((GossipHeightWindowError::Ahead.into(), None));
         } else if block_height < min_accepted_height {
             debug!(
                 ?hash,
@@ -1043,7 +1052,7 @@ where
             );
             metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
 
-            Err("gossiped block height behind the finalized tip").map_err(|e| (e.into(), None))?;
+            return Err((GossipHeightWindowError::Behind.into(), None));
         }
 
         if !has_sufficient_work(
@@ -1507,10 +1516,14 @@ where
     }
 }
 
-/// A different body can satisfy the same header after a commitment mismatch or a duplicate
-/// transaction rejection. The latter has its own stable semantic and checkpoint rule IDs.
+/// Another body for this header can pass the local height window or correct a commitment
+/// mismatch or duplicate-transaction rejection.
 fn another_copy_can_verify(error: &BoxError) -> bool {
     use zakura_header_chain::BodyVerificationClass;
+    if error.is::<GossipHeightWindowError>() {
+        return true;
+    }
+
     match crate::commands::start::zakura::block_verify_error_class(error) {
         BodyVerificationClass::PayloadMismatch(_) => true,
         BodyVerificationClass::ConsensusInvalid(rule) => matches!(

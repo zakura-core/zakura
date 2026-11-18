@@ -548,6 +548,102 @@ async fn a_reply_without_the_requested_body_cannot_win() {
     }
 }
 
+/// Apply each local height limit to an ordinary, immutable block using a simulated tip.
+/// The alternate is dispatched before the rejection and must pass the window independently.
+#[tokio::test(start_paused = true)]
+async fn a_height_window_rejection_uses_the_retained_copy_once() {
+    use futures::StreamExt;
+
+    let bytes = &zakura_test::vectors::BLOCK_MAINNET_395_BYTES;
+    for (initial_tip, accept_other) in [
+        (0, true),
+        (396 + zs::MAX_BLOCK_REORG_HEIGHT, true),
+        (0, false),
+    ] {
+        let (network, mut sent) = network();
+        let (commits, mut committed) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request| {
+            let zakura_consensus::Request::Commit(block) = request else {
+                panic!("expected a commit")
+            };
+            let hash = block.hash();
+            commits.send(block).unwrap();
+            std::future::ready(Ok(hash))
+        });
+        let state = service_fn(|request| async move {
+            Ok(match request {
+                zs::Request::AnyChainBlock(_) => zs::Response::Block(None),
+                zs::Request::KnownBlock(_) => {
+                    zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain))
+                }
+                _ => panic!("unexpected state request"),
+            })
+        });
+        let (mut tip_sender, tip) =
+            super::tests::chain_tip_at(block::Height(initial_tip), block::Hash([1; 32]));
+        let reporter = crate::components::test_misbehavior::reporter();
+        let mut downloads = Downloads::new(
+            reporter.clone(),
+            MIN_CONCURRENCY_LIMIT,
+            false,
+            network,
+            verifier,
+            state,
+            tip,
+            Network::Mainnet,
+        )
+        .with_second_block_request(true);
+        let other_body = body(bytes);
+        let hash = other_body.hash();
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        let first = next_sent(&mut sent).await;
+        let other = next_dispatched(&mut sent).await;
+        first
+            .answer
+            .send(Ok(available(bytes, first_peer())))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(CHECK, downloads.next()).await.is_err(),
+            "the rejected first body leaves the alternate pending"
+        );
+        assert!(committed.try_recv().is_err());
+
+        if accept_other {
+            super::tests::set_tip(&mut tip_sender, block::Height(394), block::Hash([2; 32]));
+        }
+        other
+            .answer
+            .send(Ok(zn::Response::Blocks(vec![
+                zn::InventoryResponse::Available((other_body.clone().into(), Some(second_peer()))),
+            ])))
+            .unwrap();
+        let result = tokio::time::timeout(CHECK, downloads.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if accept_other {
+            assert_eq!(result.unwrap(), hash);
+            assert!(
+                matches!(committed.try_recv(), Ok(BlockHandle::Shared(block)) if Arc::ptr_eq(&block, &other_body))
+            );
+        } else {
+            let (error, source) = result.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<GossipHeightWindowError>(),
+                Some(GossipHeightWindowError::Ahead)
+            ));
+            assert!(source.is_none());
+        }
+        assert!(committed.try_recv().is_err());
+        assert!(!reporter.is_banned(first_peer().ip()));
+        assert!(!reporter.is_banned(second_peer().ip()));
+        assert_nothing_more_sent(&mut sent, "a height rejection adds no network request").await;
+    }
+}
+
 /// Exercise candidate admission with a moving local tip and an ordinary immutable body.
 #[tokio::test(start_paused = true)]
 async fn a_height_rejection_leaves_the_other_dispatch_eligible() {

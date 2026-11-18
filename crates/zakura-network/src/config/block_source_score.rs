@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 /// requested from one other idle peer that announced it, but only when that peer is expected to
 /// deliver it clearly sooner than the first, or when the first request has run well past its
 /// expected time. Both peers must have measured answer times. The first reply that passes the
-/// requested-hash and tip-child height checks goes to the verifier. If it rejects the body for
-/// a commitment mismatch or duplicate transactions, the other copy can be tried once.
+/// requested-hash and tip-child height checks is tried first. If its height falls outside the
+/// local window or verification rejects its commitments or duplicate transactions, the node
+/// tries the other already-requested copy once.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockSourceScoreConfig {

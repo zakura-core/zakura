@@ -7,8 +7,8 @@
 //! much of it comes from pings rather than blocks.
 //!
 //! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
-//! a second gossip block request (`request`). It does not change the score: block routing stops
-//! preferring the peer until it next delivers a block.
+//! a second gossip block request (`request`). The miss preserves the score. With scoring enabled,
+//! routing passes over the peer until a later body from that connection verifies or the miss expires.
 //!
 //! `connection_id` is the number the connection's `legacy_gossip` and `legacy_peer_request` rows
 //! carry, so the tables join.

@@ -2375,7 +2375,7 @@ async fn legacy_deadline_charges_only_a_written_advertised_request() {
     }
 }
 
-/// A missed announced block is cleared by a delivered block, not by a "not found" reply, and lapses
+/// A verified delivery clears a missed announcement, and an outstanding miss lapses
 /// after `ANNOUNCED_BLOCK_MISS_LIFETIME` without one.
 #[tokio::test(start_paused = true)]
 async fn a_missed_announced_block_lasts_until_a_delivery_or_its_lifetime() {

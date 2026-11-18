@@ -1501,8 +1501,8 @@ async fn announce_hash(
     peer_set.ready().await.expect("peer set is ready");
 }
 
-/// An announcer that answers its block request with `notfound` keeps its score, but is not
-/// preferred for the next announced block until it delivers one.
+/// With scoring enabled, an announcer that replied `notfound` keeps its score and loses
+/// preference until a subsequent delivery verifies or the miss expires.
 #[tokio::test(start_paused = true)]
 async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
     let _init_guard = zakura_test::init();

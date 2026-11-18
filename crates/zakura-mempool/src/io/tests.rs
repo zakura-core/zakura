@@ -45,6 +45,11 @@ use crate::{
 /// How long a test waits for the core to answer.
 const ANSWER: Duration = Duration::from_secs(5);
 
+/// A deadline no test reaches, for calls whose test is not about deadlines.
+fn far() -> zakura_rt::time::Instant {
+    zakura_rt::time::Instant::now() + Duration::from_secs(3600)
+}
+
 /// Run once while the verifier builds a transaction's future.
 type Hook = Box<dyn FnOnce() + Send>;
 
@@ -287,15 +292,18 @@ impl Harness {
     async fn submit(&self, tx: &Tx) -> Verdict {
         let reservation = self
             .handle
-            .reserve(tx.id())
+            .reserve(tx.id(), far())
             .await
+            .expect("the test's deadline is far off")
             .expect("the core grants a reservation");
         tokio::time::timeout(
             ANSWER,
-            self.handle.submit(reservation, tx.real.transaction.clone()),
+            self.handle
+                .submit(reservation, tx.real.transaction.clone(), far()),
         )
         .await
         .expect("the core answers in time")
+        .expect("the test's deadline is far off")
     }
 
     /// Mines `txs` in one new block on fork 0.
@@ -377,12 +385,18 @@ impl Harness {
     async fn submit_in_background(&self, tx: &Tx) -> tokio::task::JoinHandle<Verdict> {
         let reservation = self
             .handle
-            .reserve(tx.id())
+            .reserve(tx.id(), far())
             .await
+            .expect("the test's deadline is far off")
             .expect("the core grants a reservation");
         let handle = self.handle.clone();
         let body = tx.real.transaction.clone();
-        tokio::spawn(async move { handle.submit(reservation, body).await })
+        tokio::spawn(async move {
+            handle
+                .submit(reservation, body, far())
+                .await
+                .expect("the test's deadline is far off")
+        })
     }
 
     /// Waits until the published snapshot satisfies `done`.
@@ -409,7 +423,10 @@ impl Harness {
     /// Makes one round trip through the core, so every command sent before
     /// this has been handled.
     async fn round_trip(&self) {
-        self.handle.rejected_ids(HashSet::default()).await;
+        self.handle
+            .rejected_ids(HashSet::default(), far())
+            .await
+            .expect("the test's deadline is far off");
     }
 }
 
@@ -457,12 +474,18 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
     // The child first: its parent is missing, so it parks.
     let reservation = harness
         .handle
-        .reserve(child.id())
+        .reserve(child.id(), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
     let child_tx = child.real.transaction.clone();
-    let child_verdict = tokio::spawn(async move { handle.submit(reservation, child_tx).await });
+    let child_verdict = tokio::spawn(async move {
+        handle
+            .submit(reservation, child_tx, far())
+            .await
+            .expect("the test's deadline is far off")
+    });
 
     // The parent's admission wakes the child in the same step. If the core
     // started the child's job before it published that step, the child's
@@ -548,12 +571,18 @@ async fn turning_the_pool_off_answers_every_undecided_submission() {
 
     let reservation = harness
         .handle
-        .reserve(parent.id())
+        .reserve(parent.id(), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the core grants a reservation");
     let handle = harness.handle.clone();
     let tx = parent.real.transaction.clone();
-    let verdict = tokio::spawn(async move { handle.submit(reservation, tx).await });
+    let verdict = tokio::spawn(async move {
+        handle
+            .submit(reservation, tx, far())
+            .await
+            .expect("the test's deadline is far off")
+    });
     harness.round_trip().await;
 
     harness.active.send_replace(false);
@@ -574,8 +603,9 @@ async fn turning_the_pool_off_cancels_a_fetch_still_out() {
     let harness = Harness::start(std::slice::from_ref(&parent));
     let fetch = harness
         .handle
-        .reserve(parent.id())
+        .reserve(parent.id(), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the node has room");
     let cancel = fetch.cancellation();
     assert!(!cancel.is_cancelled());
@@ -615,21 +645,27 @@ async fn a_dropped_reservation_frees_its_slot() {
         held.push(
             harness
                 .handle
-                .reserve(tx.id())
+                .reserve(tx.id(), far())
                 .await
+                .expect("the test's deadline is far off")
                 .expect("the node has room"),
         );
     }
     assert!(matches!(
-        harness.handle.reserve(txs[5].id()).await,
+        harness
+            .handle
+            .reserve(txs[5].id(), far())
+            .await
+            .expect("the test's deadline is far off"),
         Err(Unreserved::NoRoom)
     ));
 
     drop(held.pop());
     let _granted = harness
         .handle
-        .reserve(txs[5].id())
+        .reserve(txs[5].id(), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the dropped reservation's slot is free again");
 }
 
@@ -668,8 +704,8 @@ async fn a_block_with_a_conflicting_transaction_removes_the_pooled_one() {
     assert!(matches!(
         harness
             .handle
-            .reserve(pooled.id())
-            .await,
+            .reserve(pooled.id(), far())
+            .await.expect("the test's deadline is far off"),
         Err(Unreserved::Rejected(rejection))
             if rejection.scope == RejectionScope::EffectsChain(ChainReason::DuplicateSpend)
     ));
@@ -758,7 +794,13 @@ async fn a_pooled_transaction_whose_check_panics_after_a_reset_is_dropped() {
     // The slot is free once the fault is handled, and the same bytes get in
     // when someone brings them again.
     tokio::time::timeout(ANSWER, async {
-        while harness.handle.reserve(parent.id()).await.is_err() {
+        while harness
+            .handle
+            .reserve(parent.id(), far())
+            .await
+            .expect("the test's deadline is far off")
+            .is_err()
+        {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -778,8 +820,9 @@ async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
         held.push(
             harness
                 .handle
-                .reserve(tx.id())
+                .reserve(tx.id(), far())
                 .await
+                .expect("the test's deadline is far off")
                 .expect("the node has room"),
         );
     }
@@ -787,14 +830,15 @@ async fn a_submission_cancelled_after_it_is_queued_frees_its_slot() {
     // before the core takes it.
     let reservation = held.pop().expect("five were reserved");
     let body = txs[4].real.transaction.clone();
-    let mut submit = Box::pin(harness.handle.submit(reservation, body));
+    let mut submit = Box::pin(harness.handle.submit(reservation, body, far()));
     assert!(poll!(&mut submit).is_pending(), "the command is queued");
     drop(submit);
 
     let _granted = harness
         .handle
-        .reserve(txs[5].id())
+        .reserve(txs[5].id(), far())
         .await
+        .expect("the test's deadline is far off")
         .expect("the cancelled submission's slot is free again");
 }
 
@@ -840,7 +884,11 @@ async fn a_pool_with_no_tip_stays_off_until_the_chain_names_one() {
     let harness = Harness::start_at(std::slice::from_ref(&parent), None);
     harness.snapshot_until(|snapshot| !snapshot.active).await;
     assert!(matches!(
-        harness.handle.reserve(parent.id()).await,
+        harness
+            .handle
+            .reserve(parent.id(), far())
+            .await
+            .expect("the test's deadline is far off"),
         Err(Unreserved::Inactive)
     ));
 

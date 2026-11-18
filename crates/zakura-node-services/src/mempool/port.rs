@@ -48,6 +48,7 @@ use zakura_chain::{
 use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError},
+    time::{self, error::Elapsed, Instant},
 };
 
 use super::TransactionDependencies;
@@ -595,6 +596,12 @@ struct Shared {
 }
 
 /// The callers' side of the port. Cheap to clone.
+///
+/// Every command takes an absolute `deadline` and answers `Err(Elapsed)` if
+/// the core has not taken the command and replied by then. The command is
+/// tried once first, so a core with room still answers at a passed deadline.
+/// A command the core already took still runs: the deadline only ends the
+/// caller's wait.
 #[derive(Clone, Debug)]
 pub struct PoolHandle {
     commands: mpsc::Sender<PoolCommand>,
@@ -678,38 +685,63 @@ pub fn pool_port() -> (PoolHandle, PoolInbox) {
     )
 }
 
+/// `wait`, unless `deadline` passes first. Tokio's timeout polls `wait`
+/// before its timer, so an answer that is ready still arrives.
+async fn by<T>(
+    deadline: Instant,
+    wait: impl std::future::Future<Output = T>,
+) -> Result<T, Elapsed> {
+    time::timeout(deadline.saturating_duration_since(Instant::now()), wait).await
+}
+
 impl PoolHandle {
     /// Reserve one of the node's slots for `tx_id` before fetching or
-    /// delivering its body.
-    pub async fn reserve(&self, tx_id: UnminedTxId) -> Result<Reservation, Unreserved> {
-        let (reply, answer) = oneshot::channel();
-        let command = PoolCommand::Reserve { tx_id, reply };
-        if self.commands.send(command).await.is_err() {
-            return Err(Unreserved::Stopped);
-        }
-        answer.await.unwrap_or(Err(Unreserved::Stopped))
+    /// delivering its body, waiting until `deadline`. See [`PoolHandle`].
+    pub async fn reserve(
+        &self,
+        tx_id: UnminedTxId,
+        deadline: Instant,
+    ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
+        by(deadline, async {
+            let (reply, answer) = oneshot::channel();
+            let command = PoolCommand::Reserve { tx_id, reply };
+            if self.commands.send(command).await.is_err() {
+                return Err(Unreserved::Stopped);
+            }
+            answer.await.unwrap_or(Err(Unreserved::Stopped))
+        })
+        .await
     }
 
-    /// Submit the body `reservation` was taken for, and wait for its verdict.
+    /// Submit the body `reservation` was taken for, and wait until
+    /// `deadline` for its verdict. See [`PoolHandle`].
     ///
     /// Cancelling this before the core takes the command frees the slot.
-    pub async fn submit(&self, reservation: Reservation, transaction: UnminedTx) -> Verdict {
+    pub async fn submit(
+        &self,
+        reservation: Reservation,
+        transaction: UnminedTx,
+        deadline: Instant,
+    ) -> Result<Verdict, Elapsed> {
         if transaction.id() != reservation.tx_id() {
             // Dropping the reservation frees its slot.
-            return Verdict::LocalFault(LocalFault::WrongTransaction);
+            return Ok(Verdict::LocalFault(LocalFault::WrongTransaction));
         }
-        let (reply, verdict) = oneshot::channel();
-        let command = PoolCommand::Submit {
-            reservation,
-            transaction,
-            reply,
-        };
-        if self.commands.send(command).await.is_err() {
-            return Verdict::LocalFault(LocalFault::Stopped);
-        }
-        verdict
-            .await
-            .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
+        by(deadline, async {
+            let (reply, verdict) = oneshot::channel();
+            let command = PoolCommand::Submit {
+                reservation,
+                transaction,
+                reply,
+            };
+            if self.commands.send(command).await.is_err() {
+                return Verdict::LocalFault(LocalFault::Stopped);
+            }
+            verdict
+                .await
+                .unwrap_or(Verdict::LocalFault(LocalFault::Stopped))
+        })
+        .await
     }
 
     /// Submit as [`Self::submit`] does, but hand the body to the core's
@@ -759,24 +791,35 @@ impl PoolHandle {
     ///
     /// A caller that only stops waiting, and may still get the body, drops
     /// the reservation and does not call this.
-    pub async fn fetch_failed(&self, reservation: Reservation) {
+    ///
+    /// If `deadline` passes first, the reservation is dropped, which still
+    /// frees the slot, and only the refusal goes unlogged. See [`PoolHandle`].
+    pub async fn fetch_failed(&self, reservation: Reservation, deadline: Instant) {
         // If the core is gone the reservation is dropped with the command.
-        let _ = self
-            .commands
-            .send(PoolCommand::FetchFailed(reservation))
-            .await;
+        let _ = by(
+            deadline,
+            self.commands.send(PoolCommand::FetchFailed(reservation)),
+        )
+        .await;
     }
 
-    /// The members of `ids` that a cached rejection covers. Takes no slot
-    /// and answers the same whether or not the core has room. Empty when the
-    /// core has stopped.
-    pub async fn rejected_ids(&self, ids: HashSet<UnminedTxId>) -> HashSet<UnminedTxId> {
-        let (reply, answer) = oneshot::channel();
-        let command = PoolCommand::RejectedIds { ids, reply };
-        if self.commands.send(command).await.is_err() {
-            return HashSet::new();
-        }
-        answer.await.unwrap_or_default()
+    /// The members of `ids` that a cached rejection covers, waiting until
+    /// `deadline`. Takes no slot and answers the same whether or not the core
+    /// has room. Empty when the core has stopped. See [`PoolHandle`].
+    pub async fn rejected_ids(
+        &self,
+        ids: HashSet<UnminedTxId>,
+        deadline: Instant,
+    ) -> Result<HashSet<UnminedTxId>, Elapsed> {
+        by(deadline, async {
+            let (reply, answer) = oneshot::channel();
+            let command = PoolCommand::RejectedIds { ids, reply };
+            if self.commands.send(command).await.is_err() {
+                return HashSet::new();
+            }
+            answer.await.unwrap_or_default()
+        })
+        .await
     }
 
     /// The latest snapshot, or `None` until the core has attached and

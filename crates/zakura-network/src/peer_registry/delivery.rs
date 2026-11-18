@@ -6,7 +6,7 @@
 //! deliver it is not penalised here: block routing stops preferring it until it delivers one.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -65,8 +65,8 @@ const MAX_CLOSED_SCORES: usize = 4096;
 /// The age index lets disconnects prune expired scores without scanning the cache.
 #[derive(Debug, Default)]
 pub(super) struct ClosedScores {
-    estimates: HashMap<IpAddr, DeliveryEstimate>,
-    by_age: BTreeSet<(Instant, IpAddr)>,
+    last_sample: HashMap<IpAddr, Instant>,
+    by_age: BTreeMap<(Instant, IpAddr), DeliveryEstimate>,
 }
 
 impl ClosedScores {
@@ -80,12 +80,10 @@ impl ClosedScores {
     /// Consumes the last closed estimate, including when it has expired.
     pub(super) fn take(&mut self, ip: IpAddr, now: Instant) -> Option<DeliveryEstimate> {
         let key = Self::key(ip);
-        let estimate = self.estimates.remove(&key)?;
-        let updated = estimate
-            .updated_at
-            .expect("only measured scores are remembered");
-        self.by_age.remove(&(updated, key));
-        (now.saturating_duration_since(updated) <= REMEMBER_FOR).then_some(estimate)
+        let updated = self.last_sample.remove(&key)?;
+        self.by_age
+            .remove(&(updated, key))
+            .filter(|_| now.saturating_duration_since(updated) <= REMEMBER_FOR)
     }
 
     pub(super) fn remember(&mut self, ip: IpAddr, estimate: DeliveryEstimate, now: Instant) {
@@ -94,22 +92,19 @@ impl ClosedScores {
         };
         let key = Self::key(ip);
         // Replace even if the last connection to close has an older sample.
-        if let Some(previous) = self.estimates.insert(key, estimate) {
-            let previous_time = previous
-                .updated_at
-                .expect("only measured scores are remembered");
-            self.by_age.remove(&(previous_time, key));
+        if let Some(previous) = self.last_sample.insert(key, updated) {
+            self.by_age.remove(&(previous, key));
         }
-        self.by_age.insert((updated, key));
+        self.by_age.insert((updated, key), estimate);
 
-        while let Some(&(oldest, address)) = self.by_age.first() {
-            if self.estimates.len() <= MAX_CLOSED_SCORES
+        while let Some((&(oldest, address), _)) = self.by_age.first_key_value() {
+            if self.by_age.len() <= MAX_CLOSED_SCORES
                 && now.saturating_duration_since(oldest) <= REMEMBER_FOR
             {
                 break;
             }
             self.by_age.pop_first();
-            self.estimates.remove(&address);
+            self.last_sample.remove(&address);
         }
     }
 }
@@ -135,15 +130,15 @@ mod tests {
             scores.remember(ip(n), recent, now);
         }
         scores.remember(ip(0), older, now);
-        assert_eq!(scores.estimates.len(), MAX_CLOSED_SCORES);
+        assert_eq!(scores.by_age.len(), MAX_CLOSED_SCORES);
         assert!(scores.take(ip(0), now).is_none());
 
         let later = now + REMEMBER_FOR + Duration::from_nanos(1);
         recent.record(ms(30), later);
         scores.remember(ip(0), recent, later);
-        assert_eq!(scores.estimates.len(), 1);
+        assert_eq!(scores.by_age.len(), 1);
         assert!(scores.take(ip(0), later).is_some());
-        assert!(scores.by_age.is_empty());
+        assert!(scores.last_sample.is_empty());
     }
 
     #[test]

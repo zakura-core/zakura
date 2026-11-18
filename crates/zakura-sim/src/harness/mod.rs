@@ -680,6 +680,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<header_sync::HeaderWire>(),
     entry::<discovery_service::DiscoveryWire>(),
     entry::<discovery_service::DiscoveryComposed>(),
+    entry::<discovery_service::DiscoverySpam>(),
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
     entry::<sync_wire::SyncComposed>(),

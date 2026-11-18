@@ -221,6 +221,14 @@ pub struct PeerSpec {
     /// ones keep their form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_stale_acts: bool,
+    /// Whether the peer spams: as a dialer it dials again after any close
+    /// while its script has steps left, so it keeps going after the node
+    /// refuses it, and a discovery scenario runs its actions as fast as the
+    /// schedule lets them, with no [`ADVERSARY_RATE`] limit and no
+    /// `BoundedAdversary` declared. Left out of a serialized scenario when
+    /// false, so saved ones keep their form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spams: bool,
 }
 
 /// How long a discovery act may wait to become ready before a peer with
@@ -254,6 +262,7 @@ impl PeerSpec {
             invalid_tip: false,
             discovery: None,
             skip_stale_acts: false,
+            spams: false,
         }
     }
 
@@ -535,13 +544,14 @@ impl PeerControl {
     }
 
     /// Adds peer `name`'s script, limited to [`ADVERSARY_RATE`] actions
-    /// per virtual second if it's an `adversary`. Returns the readiness its
-    /// task keeps, and the receiver it takes actions from, which holds one.
+    /// per virtual second if `limited`, as an adversary that doesn't spam
+    /// is. Returns the readiness its task keeps, and the receiver it takes
+    /// actions from, which holds one.
     pub(crate) fn add(
         &mut self,
         name: &str,
         script: Vec<PeerAction>,
-        adversary: bool,
+        limited: bool,
     ) -> (Readiness, mpsc::Receiver<PeerAction>) {
         let (to_task, commands) = mpsc::channel(1);
         let readiness = Readiness::default();
@@ -551,7 +561,7 @@ impl PeerControl {
             next: 0,
             readiness: readiness.clone(),
             to_task,
-            limit: adversary.then(|| RateLimit::new(ADVERSARY_RATE)),
+            limit: limited.then(|| RateLimit::new(ADVERSARY_RATE)),
         });
         (readiness, commands)
     }
@@ -1574,28 +1584,35 @@ impl PeerTask {
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
                 return;
             }
-            // Only a redial may follow a closed connection. A script that
-            // skips stale acts ends with its connection instead, since its
-            // steps aren't tuned to the connection's lifetime.
-            if self.spec.skip_stale_acts
-                && !matches!(self.spec.script.get(self.taken), Some(PeerAction::Redial))
-            {
-                return;
-            }
-            self.readiness.set(true);
-            let next = self.commands.recv().await;
-            self.readiness.taken();
-            self.taken += 1;
-            match next {
-                Some(PeerAction::Redial) => {}
-                Some(action) => {
-                    self.fail(format!(
-                        "can't {} after its connection closed",
-                        action.name()
-                    ));
+            // Only a redial may follow a closed connection, but a spammer
+            // dials again while it has steps left. A script that skips
+            // stale acts ends with its connection instead, since its steps
+            // aren't tuned to the connection's lifetime.
+            if self.spec.spams {
+                if self.taken >= self.spec.script.len() {
                     return;
                 }
-                None => return,
+            } else {
+                if self.spec.skip_stale_acts
+                    && !matches!(self.spec.script.get(self.taken), Some(PeerAction::Redial))
+                {
+                    return;
+                }
+                self.readiness.set(true);
+                let next = self.commands.recv().await;
+                self.readiness.taken();
+                self.taken += 1;
+                match next {
+                    Some(PeerAction::Redial) => {}
+                    Some(action) => {
+                        self.fail(format!(
+                            "can't {} after its connection closed",
+                            action.name()
+                        ));
+                        return;
+                    }
+                    None => return,
+                }
             }
             quic.shutdown().await;
             zakura_rt::time::sleep(REDIAL_SETTLE).await;

@@ -60,9 +60,9 @@ on:
         type: string
         default: ""
       operation:
-        description: "deploy builds and deploys nodes; monitoring only stages compatibility monitoring (node=zakura-compat, ref=full tested SHA)"
+        description: "deploy updates nodes; dashboard refreshes the status site and profiler tunnels; monitoring stages compatibility monitoring"
         type: choice
-        options: [deploy, monitoring]
+        options: [deploy, dashboard, monitoring]
         default: deploy
       monitoring_stage:
         description: "fleet-deploy refreshes active monitoring; initial cutover uses install, validate, cutover, soak, finalize"
@@ -259,7 +259,7 @@ jobs:
 
   deploy:
     if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'
-    name: "Deploy Zakura mainnet ${{ inputs.ref }}"
+    name: "${{ inputs.operation == 'dashboard' && 'Deploy Zakura mainnet dashboard' || format('Deploy Zakura mainnet {0}', inputs.ref) }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
     timeout-minutes: 600
     environment: zakura-mainnet
@@ -323,12 +323,14 @@ jobs:
           echo "DEPLOY_COMMIT=$(git rev-parse 'FETCH_HEAD^{commit}')" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
+        if: inputs.operation == 'deploy'
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: stable
           cache: false
 
       - name: Install build dependencies
+        if: inputs.operation == 'deploy'
         run: |
           set -euo pipefail
           sudo apt-get -qq update
@@ -379,7 +381,8 @@ jobs:
             68.183.178.89 \
             206.189.45.15 \
             165.227.220.111 \
-            188.166.118.152; do
+            188.166.118.152 \
+            143.198.222.9; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -561,9 +564,19 @@ jobs:
           commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
+
+          # Singapore comparison against the score-based experiment in #2572.
+          [[nodes]]
+          name       = "asia-hedged-simple"
+          ssh_string = "root@143.198.222.9"
+          monitor    = { profiler_url = "http://127.0.0.1:8111" }
+          commit     = "6885fa105c0c30501135ee17a5a3f03c8a3b7639"
+          rpc_listen_addr = "127.0.0.1:8232"
+          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary
+        if: inputs.operation == 'deploy'
         working-directory: deploy/deployer
         env:
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
@@ -582,7 +595,7 @@ jobs:
           python3 deploy.py build "${args[@]}"
 
       - name: Suppress fleet watchdog alerts during deploy
-        if: ${{ !inputs.no_restart }}
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart }}
         run: |
           set -euo pipefail
 
@@ -595,7 +608,7 @@ jobs:
         # predates suppression are still covered. The compatibility checker reports
         # this marker with every probe and the fleet watchdog's compatibility lane
         # honors it for at most 20 minutes; no service restart is needed.
-        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
         run: |
           set -euo pipefail
 
@@ -625,6 +638,7 @@ jobs:
           fi
 
       - name: Install profiler and prepare trace files
+        if: inputs.operation == 'deploy'
         # Verify retention before adding trace_dir. If installation fails, a node
         # without trace files keeps its original config; deployment can continue.
         # It also adds `expose_peer_addresses = true` to a config that does not set
@@ -655,6 +669,7 @@ jobs:
             || echo "::warning::fleet peer names could not be set on every node; see the step log" >&2
 
       - name: Deploy fleet
+        if: inputs.operation == 'deploy'
         working-directory: deploy/deployer
         env:
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
@@ -677,7 +692,7 @@ jobs:
           python3 deploy.py deploy "${args[@]}"
 
       - name: Show fleet status
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         working-directory: deploy/deployer
         env:
           NODE: ${{ inputs.node }}
@@ -692,7 +707,7 @@ jobs:
           python3 deploy.py status "${args[@]}"
 
       - name: Validate deployed node startup
-        if: ${{ inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
+        if: ${{ inputs.operation == 'deploy' && inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
         env:
           NODE: ${{ inputs.node }}
         run: |
@@ -716,6 +731,7 @@ jobs:
           if node is None:
               raise SystemExit(f"unknown node: {node_name}")
 
+          uses_rpc_cookie = node_name in {"zakura-compat", "asia-hedged-simple"}
           values = {
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
@@ -723,12 +739,8 @@ jobs:
               "RPC_LISTEN_ADDR": node.get(
                   "rpc_listen_addr", defaults["rpc_listen_addr"]
               ),
-              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
-              "RPC_CONFIG_PATH": (
-                  "/root/.cache/zakura/.cookie"
-                  if node_name == "zakura-compat"
-                  else ""
-              ),
+              "RPC_AUTH": "cookie" if uses_rpc_cookie else "",
+              "RPC_CONFIG_PATH": "/root/.cache/zakura/.cookie" if uses_rpc_cookie else "",
           }
           for key, value in values.items():
               print(f"{key}={shlex.quote(str(value))}")
@@ -887,7 +899,7 @@ jobs:
           EOF
 
       - name: Install cluster status dashboard
-        if: always()
+        if: (inputs.operation == 'deploy' && always()) || (inputs.operation == 'dashboard' && success())
         env:
           DASHBOARD_PASSWORD: ${{ secrets.ZAKURA_STATUS_DASHBOARD_PASSWORD }}
         run: |
@@ -912,14 +924,14 @@ jobs:
             deploy/profiler/peer_addresses.py "$dashboard_dir/"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
-          # auth for the compatibility node into this copy (not the deploy config).
+          # auth for nodes that require it into the dashboard copy.
           awk '
             { print }
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"/ { in_compat = 1 }
-            in_compat && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"(zakura-compat|asia-hedged-simple)"$/ { uses_cookie = 1 }
+            uses_cookie && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
-              in_compat = 0
+              uses_cookie = 0
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
@@ -969,14 +981,14 @@ jobs:
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
       - name: Install profiler tunnels
-        if: always()
+        if: (inputs.operation == 'deploy' && always()) || (inputs.operation == 'dashboard' && success())
         run: |
           set -euo pipefail
           python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml \
             || echo "::warning::profiler tunnels could not be installed; see the step log" >&2
 
       - name: Install public broadcast gateway
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         run: |
           set -euo pipefail
 
@@ -1018,7 +1030,7 @@ jobs:
           echo
 
       - name: Install fleet watchdog
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}
@@ -1054,7 +1066,7 @@ jobs:
           sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
 
       - name: Fetch recent logs on failure
-        if: failure()
+        if: inputs.operation == 'deploy' && failure()
         working-directory: deploy/deployer
         env:
           NODE: ${{ inputs.node }}
@@ -1069,7 +1081,7 @@ jobs:
           python3 deploy.py logs fetch "${args[@]}" || true
 
       - name: Upload failure logs
-        if: failure()
+        if: inputs.operation == 'deploy' && failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-mainnet-deploy-logs-${{ github.run_id }}

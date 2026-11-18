@@ -5138,7 +5138,7 @@ function renderTop() {
 }
 // ---- block sources: how well the legacy block source scores predict downloads ----
 const SOURCE_REASON = { predicted: "Another announcer expected sooner", stalled: "First request stalled", "fixed delay": "Fixed delay" };
-const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", missed_block: "missed blocks", missed_second_block: "missed second requests", carried_over: "scores restored on reconnect" };
+const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", carried_over: "scores restored on reconnect" };
 function signedMs(value) { return value == null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "") + ms(Math.abs(value)); }
 function seconds(value) { return value == null ? "–" : value >= 120 ? Math.round(value / 60) + " min" : Math.round(value) + " s"; }
 function share(part, whole) { return whole ? Math.round(100 * part / whole) + "%" : "–"; }
@@ -5168,19 +5168,18 @@ function renderSources() {
       + sources.second_requests.map(o => `<tr><td>${esc(SOURCE_REASON[o.reason] || o.reason)}</td><td class="pf-num">${o.sent}</td><td class="pf-num">${o.delivered}</td>`
         + `<td class="pf-num">${o.won} (${share(o.won, o.sent)})</td><td class="pf-num">${ms(o.saved_p50_ms)}</td><td class="pf-num">${ms(o.saved_p90_ms)}</td></tr>`).join("")
     : "";
-  const pens = sources.penalties;
-  el("src-pen").innerHTML = "<tr><th>Announced block not delivered</th><th>Times</th><th>Score before, median</th><th>Raised by, median</th><th>Samples behind the score, median</th><th>Back to normal</th><th>Time to recover, median</th><th>Still raised</th><th>Disconnected</th></tr>"
-    + [["missed_block", "First request"], ["missed_second_block", "Second request"]].map(([kind, label]) => {
-      const p = pens[kind];
-      return `<tr><td>${label}</td><td class="pf-num">${p.count}</td><td class="pf-num">${ms(p.score_before_ms.p50)}</td><td class="pf-num">${signedMs(p.jump_ms.p50)}</td>`
-        + `<td class="pf-num">${p.weight.p50 == null ? "–" : p.weight.p50.toFixed(1)}</td><td class="pf-num">${p.recovered}</td><td class="pf-num">${seconds(p.recovery_s.p50)}</td>`
-        + `<td class="pf-num">${p.still_raised}</td><td class="pf-num">${p.closed}</td></tr>`;
+  const missedBlocks = sources.missed_blocks || {};
+  el("src-pen").innerHTML = "<tr><th>Announced block not delivered</th><th>Times</th><th>Peer delivered a block again</th><th>Passed over for, median</th><th>p90</th><th>Not yet</th><th>Disconnected</th></tr>"
+    + [["first", "First request"], ["second", "Second request"]].filter(([kind]) => missedBlocks[kind]).map(([kind, label]) => {
+      const m = missedBlocks[kind];
+      return `<tr><td>${label}</td><td class="pf-num">${m.count}</td><td class="pf-num">${m.delivered_again}</td><td class="pf-num">${seconds(m.delivered_again_s.p50)}</td>`
+        + `<td class="pf-num">${seconds(m.delivered_again_s.p90)}</td><td class="pf-num">${m.waiting}</td><td class="pf-num">${m.closed}</td></tr>`;
     }).join("");
   const { carried_over = 0, ...counts } = sources.samples.counts;
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   el("src-mix").textContent = total
     ? "What the scores were made of: " + Object.entries(counts).filter(([, n]) => n).map(([kind, n]) => `${share(n, total)} ${SAMPLE_LABEL[kind] || kind}`).join(", ")
-      + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples, so one missed block (2 s) moves it by about 2 s divided by that.`
+      + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples. A peer that announces a block and does not deliver it keeps its score, but is passed over for announced blocks until it delivers one.`
     : "No new score measurements in this window.";
   if (carried_over) el("src-mix").textContent += ` ${carried_over} ${SAMPLE_LABEL.carried_over}.`;
 }

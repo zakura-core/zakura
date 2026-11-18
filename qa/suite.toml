@@ -327,6 +327,7 @@ timeout-secs = 1800
 package = "sim"
 name = "sync_storage"
 smoke-secs = 60
+args = ["-len_control=0"]
 timeout-secs = 1800
 
 # `sync/wire`'s two-byte prefix picks a saved scenario, fuzz-13's combined
@@ -337,6 +338,7 @@ timeout-secs = 1800
 package = "sim"
 name = "sync_wire"
 smoke-secs = 60
+args = ["-len_control=0"]
 timeout-secs = 1800
 
 # `block-sync/storage`'s two-byte prefix picks a saved scenario or the
@@ -352,7 +354,7 @@ name = "block_sync_storage"
 smoke-secs = 1
 campaign-seconds = 1
 campaign-weekly-seconds = 1
-args = ["-rss_limit_mb=8192"]
+args = ["-rss_limit_mb=8192", "-len_control=0"]
 timeout-secs = 3600
 
 # `discovery/wire` runs the discovery node behind its real transport on
@@ -362,6 +364,7 @@ timeout-secs = 3600
 package = "sim"
 name = "discovery_wire"
 smoke-secs = 60
+args = ["-len_control=0"]
 timeout-secs = 1800
 
 # `header-sync/wire` runs the header-sync node behind its real transport on
@@ -371,6 +374,7 @@ timeout-secs = 1800
 package = "sim"
 name = "header_sync_wire"
 smoke-secs = 60
+args = ["-len_control=0"]
 timeout-secs = 1800
 
 # `handshake/wire` runs the node's control handshake behind its real

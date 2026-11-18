@@ -6,7 +6,7 @@
 //! It also reads why a build failed ([`BuildFailure`]).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -26,6 +26,9 @@ use crate::{
 /// How long past its exploration budget a campaign's `start` may run, for
 /// its startup, snapshot and end record, before the runner kills it.
 const CAMPAIGN_GRACE: Duration = Duration::from_secs(300);
+
+/// The file `zakura-sim campaign evidence` writes in a lane directory.
+pub(in crate::planted) const EVIDENCE_FILE: &str = "evidence.json";
 
 /// The file `zakura-sim confirm` writes into its `--out`.
 pub(in crate::planted) const CONFIRMATION_FILE: &str = "confirmation.json";
@@ -55,7 +58,6 @@ pub(in crate::planted) struct CampaignBounds {
     pub(in crate::planted) rss_limit_mb: u64,
     pub(in crate::planted) max_restarts: u64,
     pub(in crate::planted) abandon_limit: u64,
-    pub(in crate::planted) feedback: String,
     pub(in crate::planted) sanitizer: String,
 }
 
@@ -69,6 +71,10 @@ pub(in crate::planted) struct LaneSpec<'a> {
     /// The campaign's name in its store.
     pub(in crate::planted) name: &'a str,
     pub(in crate::planted) seed: u32,
+    /// The semantic feedback mode, `on` or `off`.
+    pub(in crate::planted) feedback: &'a str,
+    /// Extra libFuzzer flags for the target, such as `-len_control=0`.
+    pub(in crate::planted) libfuzzer_args: &'a [String],
     /// The directory the campaign's initial inputs come from.
     pub(in crate::planted) corpus: &'a Path,
 }
@@ -128,20 +134,66 @@ impl std::fmt::Display for LaneError {
     }
 }
 
-/// The records one campaign left in its store.
+/// The records one campaign left in its lane directory, as
+/// [`campaign_lane`] leaves it: the store's one run, and the evidence
+/// `campaign evidence` wrote.
 #[derive(Clone, Debug)]
 pub(in crate::planted) struct Campaign {
+    /// The run's manifest.
+    pub(in crate::planted) manifest: Value,
     /// The run's end record, if it wrote one.
     pub(in crate::planted) end: Option<Value>,
+    /// Each worker's attempts, in order ([`read_attempts`]).
+    pub(in crate::planted) attempts: Vec<Vec<Value>>,
     /// What `zakura-sim campaign evidence` summed for the run.
     pub(in crate::planted) evidence: Value,
     /// Inputs in the run's initial snapshot.
     pub(in crate::planted) initial_inputs: usize,
-    /// The build identity the run's manifest records.
-    pub(in crate::planted) identity: Value,
 }
 
 impl Campaign {
+    /// Reads the records of the lane directory `dir`, whose store must hold
+    /// exactly one run.
+    pub(in crate::planted) fn read(dir: &Path) -> Result<Campaign, BoxError> {
+        let store = dir.join("store");
+        let manifest_file = only_entry(&store.join("manifests"))?
+            .ok_or_else(|| format!("{} holds no single run manifest", store.display()))?;
+        let run = manifest_file.trim_end_matches(".json");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(store.join("manifests").join(&manifest_file))?)?;
+        let initial = manifest
+            .get("initial_snapshot")
+            .and_then(Value::as_str)
+            .ok_or("the manifest names no initial snapshot")?;
+        let snapshot: Value = serde_json::from_slice(&fs::read(
+            store.join("snapshots").join(initial).join("snapshot.json"),
+        )?)?;
+        let initial_inputs = snapshot
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let run_dir = store.join("runs").join(run);
+        let end: Option<Value> = fs::read(run_dir.join("end.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let attempts = read_attempts(&run_dir, end.as_ref());
+        let evidence = serde_json::from_slice(&fs::read(dir.join(EVIDENCE_FILE))?)?;
+        Ok(Campaign {
+            manifest,
+            end,
+            attempts,
+            evidence,
+            initial_inputs,
+        })
+    }
+
+    /// The build identity the run's manifest records.
+    pub(in crate::planted) fn identity(&self) -> &Value {
+        self.manifest
+            .pointer("/build/identity")
+            .unwrap_or(&Value::Null)
+    }
+
     /// What the records show about `property` ([`campaign_facts`]).
     pub(in crate::planted) fn facts(&self, property: &str) -> CampaignFacts {
         campaign_facts(
@@ -149,8 +201,32 @@ impl Campaign {
             self.end.as_ref(),
             &self.evidence,
             self.initial_inputs,
+            &self.attempts,
         )
     }
+}
+
+/// Each worker's attempts, in order, from its `attempts.jsonl` in the run
+/// directory `run_dir`, for each worker the end record `end` lists. A
+/// missing file or line reads as no attempt.
+fn read_attempts(run_dir: &Path, end: Option<&Value>) -> Vec<Vec<Value>> {
+    end.and_then(|end| end.get("workers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| worker.get("index").and_then(Value::as_u64))
+        .map(|index| {
+            let path = run_dir
+                .join("workers")
+                .join(index.to_string())
+                .join("attempts.jsonl");
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .collect()
 }
 
 /// How long `campaign start` may run with `bounds`: its budget and a grace.
@@ -164,7 +240,7 @@ pub(in crate::planted) fn start_deadline(bounds: &CampaignBounds) -> Duration {
 /// makes the `campaign build` child's `zakura-sim` command, and `sim` makes
 /// the `start` and `evidence` children's, such as one under a memory cap.
 /// A cap sized for one witness can kill a cargo build, so the build gets
-/// its own command. Returns the records the run left.
+/// its own command. Returns the records the run left ([`Campaign::read`]).
 pub(in crate::planted) fn campaign_lane(
     build: &dyn Fn() -> Command,
     sim: &dyn Fn() -> Command,
@@ -192,7 +268,10 @@ pub(in crate::planted) fn campaign_lane(
         ])
         .arg(fuzz_target)
         // Uncolored diagnostics, which `fuzz_build_failure` reads.
-        .env("CARGO_TERM_COLOR", "never");
+        .env("CARGO_TERM_COLOR", "never")
+        // A bypass patch can leave code unused, so a mutant's fuzz build
+        // warns even where the environment denies warnings.
+        .env("CARGO_BUILD_WARNINGS", "warn");
     let log = dir.join("build.log");
     match run_lane_child(&mut build, &log, None)? {
         ChildEnd::Exited(0) => {}
@@ -212,15 +291,7 @@ pub(in crate::planted) fn campaign_lane(
         )));
     };
     let mut start = sim();
-    start.args(start_args(
-        bounds,
-        spec.name,
-        spec.harness,
-        &build_digest,
-        spec.seed,
-        spec.corpus,
-        &store,
-    ));
+    start.args(start_args(bounds, spec, &build_digest, &store));
     start.env_remove(EXPECT_VAR);
     for var in SANITIZER_VARS {
         start.env_remove(var);
@@ -252,32 +323,15 @@ pub(in crate::planted) fn campaign_lane(
         ))));
     };
     let run = manifest_file.trim_end_matches(".json").to_owned();
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(store.join("manifests").join(&manifest_file))?)?;
-    let initial = manifest
-        .get("initial_snapshot")
-        .and_then(Value::as_str)
-        .ok_or("the manifest names no initial snapshot")?;
-    let snapshot: Value = serde_json::from_slice(&fs::read(
-        store.join("snapshots").join(initial).join("snapshot.json"),
-    )?)?;
-    let initial_inputs = snapshot
-        .get("inputs")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let end: Option<Value> = fs::read(store.join("runs").join(&run).join("end.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let evidence_file = dir.join("evidence.json");
     let mut evidence = sim();
     evidence
         .args(["campaign", "evidence", "--store"])
         .arg(&store)
         .args(["--run", &run, "--out"])
-        .arg(&evidence_file);
+        .arg(dir.join(EVIDENCE_FILE));
     let log = dir.join("evidence.log");
-    let evidence = match run_lane_child(&mut evidence, &log, None)? {
-        ChildEnd::Exited(0) => serde_json::from_slice::<Value>(&fs::read(&evidence_file)?)?,
+    match run_lane_child(&mut evidence, &log, None)? {
+        ChildEnd::Exited(0) => {}
         end @ ChildEnd::Signaled(_) => {
             return Ok(Err(LaneError::Killed(format!(
                 "`zakura-sim campaign evidence` {end}; see {}",
@@ -290,28 +344,18 @@ pub(in crate::planted) fn campaign_lane(
                 log.display()
             ))))
         }
-    };
-    Ok(Ok(Campaign {
-        end,
-        evidence,
-        initial_inputs,
-        identity: manifest
-            .pointer("/build/identity")
-            .cloned()
-            .unwrap_or(Value::Null),
-    }))
+    }
+    Ok(Ok(Campaign::read(dir)?))
 }
 
-/// `campaign start`'s arguments for one lane: every bound comes from
-/// `bounds`, so paired campaigns with one seed differ only in `store`,
+/// `campaign start`'s arguments for `spec`'s lane: every bound comes from
+/// `bounds`, and the seed, feedback mode and libFuzzer flags from `spec`,
+/// so paired campaigns with one seed and mode differ only in `store`,
 /// `name` and `build`.
 pub(in crate::planted) fn start_args(
     bounds: &CampaignBounds,
-    name: &str,
-    harness: &str,
+    spec: &LaneSpec<'_>,
     build: &str,
-    seed: u32,
-    corpus: &Path,
     store: &Path,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["campaign", "start", "--store"]
@@ -320,29 +364,33 @@ pub(in crate::planted) fn start_args(
         .collect();
     args.push(store.into());
     for (flag, value) in [
-        ("--campaign", name.to_owned()),
-        ("--sim", harness.to_owned()),
+        ("--campaign", spec.name.to_owned()),
+        ("--sim", spec.harness.to_owned()),
         ("--build", build.to_owned()),
         ("--seconds", bounds.seconds_per_seed.to_string()),
         ("--workers", bounds.workers.to_string()),
-        ("--seed", seed.to_string()),
+        ("--seed", spec.seed.to_string()),
         ("--max-len", bounds.max_len.to_string()),
         ("--timeout", bounds.input_timeout_seconds.to_string()),
         ("--rss-limit-mb", bounds.rss_limit_mb.to_string()),
         ("--max-restarts", bounds.max_restarts.to_string()),
         ("--abandon-limit", bounds.abandon_limit.to_string()),
-        ("--feedback", bounds.feedback.clone()),
+        ("--feedback", spec.feedback.to_owned()),
     ] {
         args.push(flag.into());
         args.push(value.into());
     }
+    for arg in spec.libfuzzer_args {
+        args.push("--libfuzzer-arg".into());
+        args.push(arg.into());
+    }
     args.push("--fixtures".into());
-    args.push(corpus.into());
+    args.push(spec.corpus.into());
     args
 }
 
 /// What one campaign showed, from its store's records.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(in crate::planted) struct CampaignFacts {
     /// How the run ended: `complete`, `worker-stopped` or `interrupted`, or
     /// `none` without an end record.
@@ -378,12 +426,68 @@ pub(in crate::planted) struct CampaignFacts {
     pub(in crate::planted) incomplete_runs: u64,
     /// How long the workers ran, in milliseconds.
     pub(in crate::planted) millis: u64,
+    /// How long the longest worker ran, in seconds.
+    pub(in crate::planted) worker_secs: f64,
+    /// The unique abstract states the run reached: the distinct
+    /// protocol-state features its processes' runs hit.
+    pub(in crate::planted) features_reached: usize,
     /// The first saved input that violates the intended property, relative
     /// to the store.
     pub(in crate::planted) intended_input: Option<String>,
-    /// Why the run's fuzzer build doesn't pair with the catalogue's, if it
-    /// doesn't.
+    /// The seconds a worker had fuzzed when the process that saved the
+    /// first intended input ended, the earliest over the workers. `None`
+    /// without an intended input, or if no process's crash matches one.
+    pub(in crate::planted) first_intended_secs: Option<f64>,
+    /// Why the run's fuzzer build doesn't pair with the expected identity,
+    /// or its fuzzer with its arm, if it doesn't.
     pub(in crate::planted) unpaired: Option<String>,
+    /// For each other violated property, its first saved input, relative
+    /// to the store, and the seconds to that input's detection, as
+    /// [`CampaignFacts::first_intended_secs`] counts them.
+    #[serde(skip)]
+    pub(in crate::planted) co_violation_inputs: BTreeMap<String, (String, Option<f64>)>,
+}
+
+impl CampaignFacts {
+    /// The first saved input of a property in `also_violates`, if no saved
+    /// input violates the intended property. A target saves an input under
+    /// its run's first violation, so an input saved under a co-violation
+    /// may violate the intended property too, which only a confirmation
+    /// against that property shows.
+    pub(in crate::planted) fn co_violation_input(&self, also_violates: &[String]) -> Option<&str> {
+        if self.intended_input.is_some() {
+            return None;
+        }
+        also_violates
+            .iter()
+            .filter_map(|id| self.co_violation_inputs.get(id))
+            .map(|(input, _)| input.as_str())
+            .next()
+    }
+
+    /// Counts `input`, a saved co-violation input that a fresh process
+    /// confirmed against `property`, the intended property, as the run's
+    /// intended finding.
+    pub(in crate::planted) fn adopt_co_violation(&mut self, property: &str, input: &str) {
+        let Some((id, secs)) = self
+            .co_violation_inputs
+            .iter()
+            .find(|(_, (saved, _))| saved == input)
+            .map(|(id, (_, secs))| (id.clone(), *secs))
+        else {
+            return;
+        };
+        self.intended_input = Some(input.to_owned());
+        self.first_intended_secs = secs;
+        if !self.violated.iter().any(|id| id == property) {
+            self.violated.push(property.to_owned());
+            self.violated.sort();
+        }
+        if self.active.contains(&id) && !self.active.iter().any(|id| id == property) {
+            self.active.push(property.to_owned());
+            self.active.sort();
+        }
+    }
 }
 
 /// What a saved failure file is, from its path in the store.
@@ -485,29 +589,39 @@ pub(in crate::planted) fn left_failures(campaign: &CampaignFacts) -> Option<Stri
 }
 
 /// What a campaign's end record `end` and `evidence` show about
-/// `property`, for a run whose initial snapshot held `initial_inputs`.
+/// `property`, for a run whose initial snapshot held `initial_inputs` and
+/// whose workers made `attempts`, each worker's in order.
 pub(in crate::planted) fn campaign_facts(
     property: &str,
     end: Option<&Value>,
     evidence: &Value,
     initial_inputs: usize,
+    attempts: &[Vec<Value>],
 ) -> CampaignFacts {
     let mut violated = BTreeSet::new();
     let mut active = BTreeSet::new();
     let (mut failures, mut killed, mut crashes, mut intended_input) =
         (Vec::new(), Vec::new(), Vec::new(), None);
+    let mut intended_digests = BTreeSet::new();
+    let mut co_violations: BTreeMap<String, (String, BTreeSet<&str>)> = BTreeMap::new();
     let records = end
         .and_then(|end| end.get("failures"))
         .and_then(Value::as_array);
-    for path in records
-        .into_iter()
-        .flatten()
-        .filter_map(|record| record.get("path").and_then(Value::as_str))
-    {
+    for record in records.into_iter().flatten() {
+        let Some(path) = record.get("path").and_then(Value::as_str) else {
+            continue;
+        };
         match failure_kind(path) {
             Failure::Violation(violation) => {
-                if violation == property && intended_input.is_none() {
-                    intended_input = Some(path.to_owned());
+                let digest = record.get("sha256").and_then(Value::as_str);
+                if violation == property {
+                    intended_input.get_or_insert_with(|| path.to_owned());
+                    intended_digests.extend(digest);
+                } else {
+                    let (_, digests) = co_violations
+                        .entry(violation.clone())
+                        .or_insert_with(|| (path.to_owned(), BTreeSet::new()));
+                    digests.extend(digest);
                 }
                 if bucket(path) == Some("active") {
                     active.insert(violation.clone());
@@ -531,6 +645,13 @@ pub(in crate::planted) fn campaign_facts(
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
+    let worker_millis: Vec<u64> = end
+        .and_then(|end| end.get("workers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
+        .collect();
     CampaignFacts {
         status: evidence
             .get("status")
@@ -568,16 +689,55 @@ pub(in crate::planted) fn campaign_facts(
             .filter(|(reason, _)| !NaReason::is_benign_name(reason))
             .filter_map(|(_, runs)| runs.as_u64())
             .sum(),
-        millis: end
-            .and_then(|end| end.get("workers"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|worker| worker.get("millis").and_then(Value::as_u64))
-            .sum(),
+        millis: worker_millis.iter().sum(),
+        worker_secs: Duration::from_millis(worker_millis.iter().copied().max().unwrap_or(0))
+            .as_secs_f64(),
+        features_reached: evidence
+            .pointer("/totals/features")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        first_intended_secs: first_detection(attempts, &intended_digests),
         intended_input,
         unpaired: None,
+        co_violation_inputs: co_violations
+            .into_iter()
+            .map(|(id, (input, digests))| (id, (input, first_detection(attempts, &digests))))
+            .collect(),
     }
+}
+
+/// The seconds a worker had fuzzed when its first process that crashed on
+/// an input with one of `digests` ended, the earliest over the workers,
+/// each its `attempts` in order. A process stops at an `Active` violation
+/// once it records it, and libFuzzer saves the input as a crash, so the
+/// time bounds the detection from above. `None` if no crash matches.
+fn first_detection(attempts: &[Vec<Value>], digests: &BTreeSet<&str>) -> Option<f64> {
+    attempts
+        .iter()
+        .filter_map(|worker| {
+            let mut millis = 0u64;
+            for attempt in worker {
+                millis = millis
+                    .saturating_add(attempt.get("millis").and_then(Value::as_u64).unwrap_or(0));
+                let crashed = attempt
+                    .get("artifacts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|artifact| {
+                        let path = artifact.get("path").and_then(Value::as_str);
+                        let digest = artifact.get("sha256").and_then(Value::as_str);
+                        path.is_some_and(|path| failure_kind(path) == Failure::Crash)
+                            && digest.is_some_and(|digest| digests.contains(digest))
+                    });
+                if crashed {
+                    return Some(millis);
+                }
+            }
+            None
+        })
+        .min()
+        .map(|millis| Duration::from_millis(millis).as_secs_f64())
 }
 
 /// What a confirmation must show.

@@ -273,6 +273,7 @@ async fn pool_on(
                 crate::components::test_misbehavior::reporter(),
                 Exempt::default(),
                 active_rx,
+                None,
             );
             tokio::spawn(assembled.core.run());
             tokio::spawn(assembled.follower.run());

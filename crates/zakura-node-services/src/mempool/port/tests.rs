@@ -105,6 +105,32 @@ fn change_log_resyncs_a_reader_that_fell_off() {
     );
 }
 
+/// After the log has dropped its oldest entries, a read from any cursor it
+/// still covers returns exactly the entries after that cursor, in order:
+/// the offset it starts at matches the entries' own positions.
+#[test]
+fn change_log_reads_start_at_the_cursor_after_eviction() {
+    let mut log = ChangeLog::default();
+    let total = u16::try_from(CHANGE_LOG_CAPACITY + 100).expect("the capacity fits the test's ids");
+    for n in 0..total {
+        log.append([Change::Added(id(n))]);
+    }
+    let last = log.last().0;
+    let oldest = last - u64::try_from(CHANGE_LOG_CAPACITY).expect("the capacity fits a u64") + 1;
+    for cursor in [oldest - 1, oldest, oldest + 1, last - 2, last - 1, last] {
+        let ChangesSince::Entries(entries) = log.since(ChangeSeq(cursor)) else {
+            panic!("a cursor at {cursor} is still on the log");
+        };
+        let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq.0).collect();
+        assert_eq!(
+            seqs,
+            ((cursor + 1)..=last).collect::<Vec<_>>(),
+            "cursor {cursor}"
+        );
+    }
+    assert_eq!(log.since(ChangeSeq(oldest - 2)), ChangesSince::Resync);
+}
+
 #[tokio::test]
 async fn a_dropped_reservation_reaches_the_core() {
     let (handle, mut inbox) = pool_port();
@@ -178,6 +204,43 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
         .expect_err("the caller was aborted")
         .is_cancelled());
     assert_eq!(inbox.released(), Some(ReservationId(7)));
+}
+
+#[tokio::test]
+async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
+    let (handle, mut inbox) = pool_port();
+    let transaction = body(1);
+    let tx_id = transaction.id();
+    for _ in 0..COMMAND_QUEUE {
+        handle
+            .fetch_failed(
+                inbox.grant(ReservationId(9), tx_id, Default::default()),
+                far(),
+            )
+            .await;
+    }
+    let reservation = inbox.grant(ReservationId(7), tx_id, Default::default());
+    let verdict = handle.submit_now(reservation, transaction, far());
+    // The reservation went with the body before the verdict was awaited.
+    assert_eq!(inbox.released(), Some(ReservationId(7)));
+    assert!(matches!(verdict.await, Ok(Verdict::NoRoom)));
+
+    // With room, the body reaches the core and its verdict comes back.
+    while inbox.released().is_some() {}
+    for _ in 0..COMMAND_QUEUE {
+        assert!(matches!(
+            inbox.command().await,
+            Some(PoolCommand::FetchFailed(_))
+        ));
+    }
+    let transaction = body(2);
+    let reservation = inbox.grant(ReservationId(8), transaction.id(), Default::default());
+    let verdict = handle.submit_now(reservation, transaction, far());
+    let Some(PoolCommand::Submit { reply, .. }) = inbox.command().await else {
+        panic!("with room, the body reaches the core");
+    };
+    let _ = reply.send(Verdict::Admitted);
+    assert!(matches!(verdict.await, Ok(Verdict::Admitted)));
 }
 
 #[tokio::test]

@@ -7,6 +7,8 @@
 # tip before its reply, so the reply frees room past the frontier beside a
 # waiting body (#1523's order). Rerun it when a block-sync change moves the
 # input off that order.
+# Its run takes over 20 minutes in a target's AddressSanitizer build, too
+# long for a fuzz input, so it sits in `slow-seeds/`, outside the seed corpus.
 harness = "block-sync/storage"
 generator = 3
 sha256 = "ad8a54adb587b783132d3491c5cfe5078d8d5dd0ad41b0b9818c899a52599e79"

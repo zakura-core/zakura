@@ -43,6 +43,12 @@ fn known_failures() -> PathBuf {
     fixtures().join("known-failures")
 }
 
+/// The committed seeds that run too long for a fuzz input, outside the
+/// seed corpus.
+fn slow_seeds() -> PathBuf {
+    fixtures().join("slow-seeds")
+}
+
 /// Every committed seed passes validation, and none is left out. No seed
 /// in the corpus expects a violation, since fuzz campaigns and target
 /// checks run each one as an input that passes.
@@ -103,6 +109,31 @@ fn known_failures_validate_and_expect_violations() {
             seed.sidecar.expects_violation(),
             "{} expects no violation, so it belongs in the seed corpus",
             seed.path.display()
+        );
+    }
+}
+
+/// Every seed in the slow-seed directory validates, and none expects a
+/// violation: each runs clean, only too long for a fuzz input.
+#[test]
+fn slow_seeds_validate_and_expect_no_violation() {
+    let report = load(&[slow_seeds()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "the stuck-floor input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            !seed.sidecar.expects_violation(),
+            "{} expects a violation, so it belongs in {}",
+            seed.path.display(),
+            known_failures().display()
         );
     }
 }
@@ -346,7 +377,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
 /// in [`intended`].
 #[test]
 fn committed_seeds_record_their_intended_scenarios() {
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     for seed in &report.admitted {
         let stem = seed.path.file_stem().and_then(|s| s.to_str()).unwrap();
         let scenario = intended(stem).unwrap_or_else(|| panic!("{stem} has no intended scenario"));
@@ -368,7 +399,7 @@ fn committed_seeds_record_their_intended_scenarios() {
 fn planted_inputs_carry_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let catalogue = root.join(planted::PLANTED_DIR);
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     let reported: BTreeSet<String> = HARNESSES
         .iter()
         .flat_map(|entry| (entry.properties)())
@@ -408,7 +439,7 @@ fn planted_inputs_carry_their_witnesses() {
         let seed = report
             .admitted
             .iter()
-            .find(|seed| seed.path == fixtures().join(input.file_name().unwrap()))
+            .find(|seed| seed.path.canonicalize().ok() == input.canonicalize().ok())
             .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
         assert!(
             seed.sidecar

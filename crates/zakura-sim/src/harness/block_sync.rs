@@ -563,6 +563,8 @@ pub struct Ports {
 pub struct Storage {
     /// The node's owner state, as its tap folds it.
     view: Rc<RefCell<BlockSyncView>>,
+    /// The node's block storage's replies, cleared once the run ends.
+    replies: Arc<LateHandle>,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close unless a `Teardown` step drops the node's.
     _topology: Rc<Topology>,
@@ -576,6 +578,13 @@ impl HasView for Storage {
     /// only when it observes, which no check outlives.
     fn view(&self) -> Rc<RefCell<BlockSyncView>> {
         self.view.clone()
+    }
+
+    /// Drops the node's block-sync handle from its block storage's
+    /// replies. The handle reaches the storage again through the reactor's
+    /// range source, so the cycle would outlive the run.
+    fn ended(&self, _: &crate::RunEnd) {
+        let _ = self.replies.clear();
     }
 
     /// The step of the tap's last observation, or `Missing` before its
@@ -741,6 +750,7 @@ impl Subsystem for Storage {
                 over: Cell::new(false),
             }));
         }
+        let replies = ports.replies.clone();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -800,6 +810,7 @@ impl Subsystem for Storage {
         sim.add_source(Box::new(control));
         Storage {
             view,
+            replies,
             _topology: topology,
         }
     }

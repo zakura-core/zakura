@@ -140,6 +140,7 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(target["end_status"], "complete")
         smoke = tool.commands("sim-targets")[0]
         self.assertEqual(flag(smoke, "--target"), "sync_wire")
+        self.assertEqual(flag(smoke, "--child-secs"), "180")
         evidence = tool.commands("sim-campaign", "evidence")[0]
         self.assertEqual(flag(evidence, "--run"), first["targets"][0]["run"])
 

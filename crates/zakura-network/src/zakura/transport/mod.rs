@@ -62,7 +62,7 @@ pub use message_rule::{
     budget::{BudgetError, LocalRole, ReactorBudget},
     frame_filter::FrameRejection,
     layout::LayoutError,
-    Cadence, Credit, MessageRole, MessageRule, PayloadLen,
+    ByteRate, Cadence, Credit, MessageRole, MessageRule, PayloadLen,
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};

@@ -291,6 +291,15 @@ const fn row_receive(
     let payload = row.payload.max();
     match row.role {
         MessageRole::Announcement { cadence } => times(cadence.capacity, payload, message_type),
+        // A conformant sender has paid for at most its opening allowance and
+        // holds at most its sender allowance unwritten. The stream receive
+        // window, which flow control caps, is the connection's, not the row's.
+        MessageRole::Metered { rate } => add(
+            // Widening u32 to u64 is lossless.
+            rate.opening_allowance as u64,
+            rate.sender_allowance as u64,
+            message_type,
+        ),
         MessageRole::Request { max_in_flight, .. } => {
             let mut share = 0;
             if local.serves() {

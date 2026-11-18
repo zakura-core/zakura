@@ -102,7 +102,7 @@ use std::{
     net::IpAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -130,10 +130,14 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
-        LoadTrackedClient, MinimumPeerVersion,
+        AdvertisedBlockRequest, LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
     peer_set::{
-        legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
+        legacy_peer_trace::{
+            BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
+            SecondRequestChoice,
+        },
+        second_request::second_request_reason,
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -305,6 +309,14 @@ where
     /// Whether peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
+    /// Whether announced blocks are requested from the announcer expected to answer sooner,
+    /// rather than the less loaded one. See [`crate::config::BlockSourceScoreConfig`].
+    block_source_score: bool,
+
+    /// Whether a block can also be requested from a second announcer expected to deliver it
+    /// sooner. See [`crate::config::BlockSourceScoreConfig`].
+    block_second_request: bool,
+
     /// The network of this peer set.
     network: Network,
 }
@@ -406,6 +418,8 @@ where
 
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            block_source_score: config.block_source_score.enabled,
+            block_second_request: config.block_source_score.second_request,
 
             network: config.network.clone(),
         }
@@ -1120,22 +1134,7 @@ where
             ),
             len => {
                 // Choose 2 random peers, then return the least loaded of those 2 peers.
-                let (a, b) = {
-                    let idxs = rand_10::seq::index::sample(&mut rand_10::rng(), len, 2);
-                    let a = idxs.index(0);
-                    let b = idxs.index(1);
-
-                    let a = *ready_service_list
-                        .iter()
-                        .nth(a)
-                        .expect("sample returns valid indexes");
-                    let b = *ready_service_list
-                        .iter()
-                        .nth(b)
-                        .expect("sample returns valid indexes");
-
-                    (a, b)
-                };
+                let (a, b) = Self::sample_two(ready_service_list, len);
 
                 let a_load = self.query_load(&a).expect("supplied services are ready");
                 let b_load = self.query_load(&b).expect("supplied services are ready");
@@ -1157,30 +1156,100 @@ where
         }
     }
 
-    /// Performs P2C on the ready block `advertisers` that are preferred block sources.
+    /// Chooses two different random peers from `peers`, which has `len >= 2` entries.
+    fn sample_two(peers: &HashSet<D::Key>, len: usize) -> (D::Key, D::Key) {
+        let idxs = rand_10::seq::index::sample(&mut rand_10::rng(), len, 2);
+        let nth = |index| {
+            *peers
+                .iter()
+                .nth(index)
+                .expect("sample returns valid indexes")
+        };
+        (nth(idxs.index(0)), nth(idxs.index(1)))
+    }
+
+    /// The expected time for the ready peer `key` to answer a block request, if measured.
+    fn delivery_score(&self, key: &D::Key) -> Option<Duration> {
+        self.ready_services
+            .get(key)
+            .and_then(|svc| svc.block_gossip.delivery_score())
+    }
+
+    /// Draws two random peers from `peers` and returns the one expected to answer sooner.
+    ///
+    /// A peer whose answers have not been measured loses to one whose have. If neither has
+    /// been measured, the first drawn wins, which is already a random choice.
+    fn select_p2c_peer_by_delivery_score(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
+        match peers.len() {
+            0 => None,
+            1 => peers.iter().next().copied(),
+            len => {
+                let (a, b) = Self::sample_two(peers, len);
+                let selected = match (self.delivery_score(&a), self.delivery_score(&b)) {
+                    (Some(a_score), Some(b_score)) if b_score < a_score => b,
+                    (None, Some(_)) => b,
+                    _ => a,
+                };
+                Some(selected)
+            }
+        }
+    }
+
+    /// Chooses one of the ready block `advertisers`, and describes the choice for the trace.
+    ///
+    /// Among the advertisers that are preferred block sources, it draws two at random and takes
+    /// the less loaded one, or, with `[network.block_source_score]` enabled, the one expected to
+    /// answer sooner. Falls back to load-based P2C over all `advertisers` if none is preferred.
     ///
     /// A ready client only has space in its request channel. If its connection is awaiting a
     /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
     /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
     /// estimate can be less loaded even with a request outstanding.
-    ///
-    /// Falls back to P2C over all `advertisers` if none of them is preferred. If the selected
-    /// connection is busy, the block request still waits behind its current response.
-    fn select_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
+    fn select_block_advertiser(
+        &self,
+        advertisers: &HashSet<D::Key>,
+    ) -> Option<(D::Key, BlockSourceChoice)> {
         let preferred_advertisers: HashSet<D::Key> = advertisers
             .iter()
             .filter(|key| {
                 self.ready_services
                     .get(*key)
-                    .is_some_and(|svc| svc.is_preferred_block_source())
+                    // Passing over a peer that missed an announced block is part of block
+                    // source scoring, so with scoring off routing matches the default.
+                    .is_some_and(|svc| svc.is_preferred_block_source(self.block_source_score))
             })
             .copied()
             .collect();
 
-        if let Some(peer) = self.select_p2c_peer_from_list(&preferred_advertisers) {
-            return Some(peer);
+        let peer = if self.block_source_score {
+            self.select_p2c_peer_by_delivery_score(&preferred_advertisers)
+        } else {
+            self.select_p2c_peer_from_list(&preferred_advertisers)
         }
+        .or_else(|| self.select_busy_block_advertiser(advertisers))?;
 
+        let choice = BlockSourceChoice {
+            candidates: preferred_advertisers.len(),
+            score: self.delivery_score(&peer),
+            best_score: preferred_advertisers
+                .iter()
+                .filter_map(|key| self.delivery_score(key))
+                .min(),
+        };
+        if choice.candidates >= 2 {
+            metrics::counter!("pool.route_inv.score.choices.count").increment(1);
+            if choice.score.is_none() {
+                metrics::counter!("pool.route_inv.score.unscored.count").increment(1);
+            } else if choice.score == choice.best_score {
+                metrics::counter!("pool.route_inv.score.chosen_best.count").increment(1);
+            }
+        }
+        Some((peer, choice))
+    }
+
+    /// Performs P2C over all `advertisers`, for when none of them is a preferred block source.
+    /// If the selected connection is busy, the block request waits behind its current response.
+    fn select_busy_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
         let peer = self.select_p2c_peer_from_list(advertisers);
         let selected_busy_peer = peer
             .and_then(|key| self.ready_services.get(&key))
@@ -1189,6 +1258,28 @@ where
             metrics::counter!("pool.route_inv.advertiser.awaiting_response.count").increment(1);
         }
         peer
+    }
+
+    /// Hand one inventory request to a ready peer and return the client to the peer set.
+    /// For a racing block download this records the peer and dispatch time on that attempt.
+    fn dispatch_inventory(
+        &mut self,
+        peer: PeerSocketAddr,
+        mut svc: LoadTrackedClient,
+        req: Request,
+        attempt: Option<&crate::BlockHedge>,
+        advertised: Option<AdvertisedBlockRequest>,
+    ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
+        let response = match attempt {
+            Some(attempt) => {
+                attempt.dispatch_if_needed(Some(peer), svc.block_gossip.delivery_score(), || {
+                    svc.call_routed(req, advertised)
+                })
+            }
+            None => Ok(svc.call_routed(req, advertised)),
+        };
+        self.push_unready(peer, svc);
+        response
     }
 
     /// Randomly chooses `max_peers` ready services, ignoring service load.
@@ -1336,6 +1427,7 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
+        attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
         let advertising_peer_list = self
             .inventory_registry
@@ -1352,12 +1444,14 @@ where
         // peers would be able to influence our choice by switching addresses.
         // But we need the choice to be random,
         // so that a peer can't provide all our inventory responses.
-        let peer = match hash {
-            InventoryHash::Block(_) => self.select_block_advertiser(&advertising_peer_list),
-            _ => self.select_p2c_peer_from_list(&advertising_peer_list),
+        let (peer, choice) = match hash {
+            InventoryHash::Block(_) => self
+                .select_block_advertiser(&advertising_peer_list)
+                .map_or((None, None), |(peer, choice)| (Some(peer), Some(choice))),
+            _ => (self.select_p2c_peer_from_list(&advertising_peer_list), None),
         };
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1374,17 +1468,29 @@ where
                 )),
                 _ => None,
             };
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
+            let fut = match self.dispatch_inventory(
+                peer,
+                svc,
+                req,
+                attempt.as_ref(),
+                matches!(hash, InventoryHash::Block(_)).then(|| match &attempt {
+                    Some(attempt) => AdvertisedBlockRequest::TimedPrimary(attempt.clone()),
+                    None => AdvertisedBlockRequest::Primary,
+                }),
+            ) {
+                Ok(fut) => fut,
+                Err(error) => return async { Err(error) }.boxed(),
+            };
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
+                let choice = choice.unwrap_or_default();
                 return async move {
                     let result = fut.await;
                     trace.block_request_finish(
                         request_id,
                         peer,
                         hash,
-                        "advertised",
+                        BlockRequestRoute::Advertised(choice),
                         started.elapsed(),
                         &result,
                     );
@@ -1430,7 +1536,7 @@ where
             self.select_p2c_peer_from_list(&maybe_peer_list)
         };
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1447,8 +1553,10 @@ where
                 )),
                 _ => None,
             };
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
+            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
+                Ok(fut) => fut,
+                Err(error) => return async { Err(error) }.boxed(),
+            };
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
                 return async move {
@@ -1457,7 +1565,7 @@ where
                         request_id,
                         peer,
                         hash,
-                        "maybe",
+                        BlockRequestRoute::Maybe,
                         started.elapsed(),
                         &result,
                     );
@@ -1501,6 +1609,99 @@ where
             ])))
         }
         .map_err(Into::into)
+        .boxed()
+    }
+
+    /// Sends a second request for a gossiped block, if another announcer should deliver it
+    /// sooner than the first request and the dispatch window is still open.
+    ///
+    /// The candidates are the idle peers that announced the block, other than the one the first
+    /// request went to, and the best is the one expected to answer soonest. It is asked when it
+    /// is expected to deliver clearly before the first request should, or when the first request
+    /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
+    /// this node, so a peer cannot claim a faster one.
+    ///
+    /// Otherwise, and for a block that already had a second request, fails at once with
+    /// [`NoFasterBlockSource`] without contacting any peer, so the caller can ask again later.
+    fn route_block_hedge(
+        &mut self,
+        hash: block::Hash,
+        attempt: crate::BlockHedge,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let not_yet = || async { Err(NoFasterBlockSource.into()) }.boxed();
+        if !self.block_second_request {
+            return not_yet();
+        }
+
+        let Some(first) = attempt.first_dispatch() else {
+            return not_yet();
+        };
+        let first_peer = first.legacy_peer;
+        let Some(first_score) = first.score else {
+            return not_yet();
+        };
+        if attempt.elapsed_if_open().is_none() {
+            return not_yet();
+        }
+        let candidates: Vec<_> = self
+            .inventory_registry
+            .advertising_peers(InventoryHash::from(hash))
+            .filter(|addr| Some(**addr) != first_peer)
+            .filter_map(|addr| {
+                let svc = self.ready_services.get(addr)?;
+                // Second requests run only with block source scoring on.
+                if !svc.is_preferred_block_source(true) {
+                    return None;
+                }
+                Some((*addr, svc.block_gossip.delivery_score()?))
+            })
+            .collect();
+        let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {
+            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+            return not_yet();
+        };
+        let first_request_waited = first.at.elapsed();
+        let Some(reason) = second_request_reason(first_score, first_request_waited, score) else {
+            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+            return not_yet();
+        };
+        if !attempt.claim_dispatch() {
+            return not_yet();
+        }
+        let mut svc = self
+            .take_ready_service(&peer)
+            .expect("the selected candidate is still in the ready set");
+
+        metrics::counter!("pool.route_inv.hedge.count", "reason" => reason.label()).increment(1);
+        let choice = SecondRequestChoice {
+            first_request_waited,
+            reason,
+            candidates: candidates.len(),
+            score: Some(score),
+            first_score,
+        };
+        let request_id = self.legacy_peer_trace.next_request_id();
+        let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+        let started = Instant::now();
+        let fut = svc.call_routed(
+            Request::BlocksByHash(std::iter::once(hash).collect()),
+            Some(AdvertisedBlockRequest::Hedge),
+        );
+        self.push_unready(peer, svc);
+
+        let trace = self.legacy_peer_trace.clone();
+        async move {
+            let result = fut.await;
+            trace.block_request_finish(
+                request_id,
+                trace_peer,
+                hash,
+                BlockRequestRoute::Hedge(choice),
+                started.elapsed(),
+                &result,
+            );
+            result.map_err(Into::into)
+        }
         .boxed()
     }
 
@@ -1898,14 +2099,24 @@ where
                 if hashes.len() == 1 =>
             {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
             }
+            Request::BlockByHashPrimary {
+                hash,
+                source,
+                attempt,
+            } => self.route_inv(
+                Request::block_by_hash(hash, source),
+                InventoryHash::from(hash),
+                Some(attempt),
+            ),
+            Request::BlockByHashHedge { hash, attempt } => self.route_block_hedge(hash, attempt),
             Request::TransactionsById(ref hashes)
             | Request::TransactionsByIdFrom {
                 ids: ref hashes, ..
             } if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
             }
 
             // Broadcast advertisements to lots of peers

@@ -1236,6 +1236,9 @@ pub(crate) struct RelayMachine {
     shared: Shared,
     pool: Mirror,
     machines: BTreeMap<SessionId, PeerMachine>,
+    /// The sessions whose address is unconditional for their whole life. A
+    /// routine looks its address up for each body instead.
+    exempt: BTreeSet<SessionId>,
 }
 
 #[cfg(test)]
@@ -1252,17 +1255,22 @@ impl RelayMachine {
             shared: Shared::new(config),
             pool: Mirror::new(&snapshot, visible),
             machines: BTreeMap::new(),
+            exempt: BTreeSet::new(),
         }
     }
 
     // Inputs from peers.
 
-    /// A session of `peer` opened. See [`PeerMachine::connect`].
+    /// A session of `peer` opened, unconditional if `exempt`. See
+    /// [`PeerMachine::connect`].
     pub(crate) fn connect(&mut self, peer: PeerKey, exempt: bool, now: Time) -> SessionId {
         self.now = self.now.max(now);
         let marks = Marks::of(&self.shared);
-        let machine = PeerMachine::connect(&mut self.shared, &self.pool, peer, exempt, self.now);
+        let machine = PeerMachine::connect(&mut self.shared, &self.pool, peer, self.now);
         let session = machine.session();
+        if exempt {
+            self.exempt.insert(session);
+        }
         self.machines.insert(session, machine);
         let woken = self.owe(marks, Some(session));
         self.wake(woken);
@@ -1285,8 +1293,9 @@ impl RelayMachine {
 
     /// A `Tx` arrived answering the request for `id`, carrying `body`.
     pub(crate) fn tx(&mut self, session: SessionId, id: UnminedTxId, body: UnminedTx, now: Time) {
+        let exempt = self.exempt.contains(&session);
         self.on(session, now, |machine, shared, pool, now| {
-            machine.tx(shared, pool, id, body, now);
+            machine.tx(shared, pool, id, body, exempt, now);
         });
     }
 

@@ -6,10 +6,14 @@ use std::time::Duration;
 use zakura_chain::{
     block,
     parameters::Network,
+    serialization::ZcashSerialize,
     transaction::{UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_node_services::mempool::{
-    port::{pool_port, ChainTip, Change, PoolInbox, PoolSnapshot, RemovalReason},
+    port::{
+        pool_port, ChainTip, Change, Charge, PoolCommand, PoolInbox, PoolSnapshot, Rejection,
+        RejectionScope, RemovalReason,
+    },
     TransactionDependencies,
 };
 
@@ -166,8 +170,15 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
         record: TxRelaySessions::default(),
         inv_buckets: InvBuckets::default(),
         base: Instant::now(),
+        unconditional: UnconditionalPeers::default(),
     };
     (wiring, handed)
+}
+
+/// The address of every test session's peer. No test lists it as
+/// unconditional unless it says so.
+fn peer_ip() -> IpAddr {
+    IpAddr::from([192, 0, 2, 1])
 }
 
 /// One session's routine, driven step by step, whose writers' queues the
@@ -183,8 +194,8 @@ struct Session {
 }
 
 impl Session {
-    /// Opens a session of peer 1 on [`connection`], as `add_peer` does, and
-    /// lets it read the pool.
+    /// Opens a session of peer 1 on [`connection`] from [`peer_ip`], as
+    /// `add_peer` does, and lets it read the pool.
     fn open(wiring: &Wiring) -> Self {
         let (data, data_recv) = mpsc::channel(DATA_QUEUE);
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
@@ -195,7 +206,7 @@ impl Session {
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
-            false,
+            Some(peer_ip()),
             io,
             CancellationToken::new(),
         );
@@ -296,6 +307,109 @@ async fn an_id_requested_again_while_its_job_waits_closes_the_peer() {
     assert!(!session.cancel.is_cancelled());
     session.deliver(TxRelayMessage::GetTxs(id)).await;
     assert_eq!(session.cause.get(), Some("tx-relay: id requested twice"));
+}
+
+/// Applies `session`'s pool calls as its routine does, up to and including
+/// the first result that `last` picks.
+async fn apply_calls(session: &mut Session, last: fn(&PoolResult) -> bool) {
+    while let Some(result) = session.routine.calls.next().await {
+        let done = last(&result);
+        session.routine.pool_result(result);
+        session.routine.after_step();
+        if done {
+            return;
+        }
+    }
+    panic!("the routine ran out of calls");
+}
+
+/// A peer's address can join `network.unconditional_peers` after its
+/// session opened, as a pinned name's does once a connection proves the
+/// name's node ID. A body the peer supplies after that is never charged, so
+/// the rejection that bans an ordinary supplier leaves it connected.
+#[tokio::test]
+async fn a_body_supplied_after_its_address_became_unconditional_is_not_charged() {
+    for listed in [false, true] {
+        let mut pool = transactions(2);
+        let supplied = pool.pop().expect("two transactions").transaction;
+        let (id, size) = (
+            supplied.id(),
+            u32::try_from(supplied.size()).expect("a test body is small"),
+        );
+        let (handle, mut inbox) = pool_port();
+        publish(&inbox, vec![Change::Added(pool[0].transaction.id())], pool);
+        let (mut wiring, _handed) = wiring(handle);
+        let unconditional =
+            toml::from_str::<crate::config::Config>("unconditional_peers = ['a.example.com:8233']")
+                .expect("a valid config")
+                .unconditional_peers;
+        wiring.unconditional = unconditional.clone();
+        let mut session = Session::open(&wiring);
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
+        session.deliver(TxRelayMessage::Inv(vec![(id, size)])).await;
+
+        // The core grants the fetch.
+        let grant = async {
+            let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
+                panic!("the session reserves the id it was offered");
+            };
+            let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());
+            let _ = reply.send(Ok(reservation));
+        };
+        let reserved = apply_calls(&mut session, |result| {
+            matches!(result, PoolResult::Reserved { .. })
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join(reserved, grant),
+        )
+        .await
+        .expect("the reservation is granted");
+
+        // The address joins the list after the session opened.
+        if listed {
+            unconditional.set_resolved_ip(0, Some(peer_ip()));
+        }
+        let body = supplied
+            .transaction()
+            .zcash_serialize_to_vec()
+            .expect("a valid transaction serializes");
+        session.deliver(TxRelayMessage::Tx { id, body }).await;
+
+        // The core rejects the body with the charge that bans its supplier.
+        let reject = async {
+            let Some(PoolCommand::Submit { reply, .. }) = inbox.next().await else {
+                panic!("the session submits the body");
+            };
+            let _ = reply.send(PortVerdict::Rejected(Rejection {
+                scope: RejectionScope::Uncached,
+                charge: Charge::Ban,
+                tip: block::Height(0),
+                detail: Arc::new(std::io::Error::other("an invalid transaction")),
+            }));
+        };
+        let decided = apply_calls(&mut session, |result| {
+            matches!(result, PoolResult::Verdict { .. })
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join(decided, reject),
+        )
+        .await
+        .expect("the verdict arrives");
+
+        let cause = session.cause.get();
+        if listed {
+            assert_eq!(cause, None, "an unconditional supplier is never charged");
+        } else {
+            assert_eq!(cause, Some("tx-relay: banned transaction"));
+        }
+    }
 }
 
 /// A connection whose last session ended stays owned through the

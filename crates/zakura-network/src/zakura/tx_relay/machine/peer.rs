@@ -82,9 +82,6 @@ pub(crate) struct Request {
 pub(crate) struct PeerState {
     /// The peer.
     pub(crate) peer: PeerKey,
-    /// Whether the bodies it supplies are exempt from charges: its address
-    /// is one of `network.unconditional_peers`.
-    pub(crate) exempt: bool,
     /// The peer's `Hello`, once it arrived.
     pub(crate) hello: Option<Hello>,
     /// Ids it announced and its peer has not tried, oldest first. A
@@ -130,11 +127,10 @@ pub(crate) struct PeerState {
 }
 
 impl PeerState {
-    /// A new session of `peer`. See [`Self::exempt`].
-    pub(crate) fn new(peer: PeerKey, exempt: bool) -> Self {
+    /// A new session of `peer`.
+    pub(crate) fn new(peer: PeerKey) -> Self {
         Self {
             peer,
-            exempt,
             hello: None,
             pending: PendingSet::default(),
             reserving: IndexMap::new(),

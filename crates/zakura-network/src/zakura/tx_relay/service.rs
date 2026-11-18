@@ -14,7 +14,7 @@
 //! the reactor task, which applies them to the shared state. So all the
 //! rules live in the machines, and this file only moves data.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand_10::Rng;
@@ -110,8 +110,6 @@ pub struct TxRelayService {
     /// Keys the hash that names peers to the machine, so no peer can choose
     /// an identity that collides with another's.
     peer_key: blake2b_simd::Params,
-    /// The addresses whose sessions are never charged for a body.
-    unconditional: UnconditionalPeers,
 }
 
 /// What every routine shares, behind one lock that no routine holds across
@@ -194,10 +192,10 @@ impl fmt::Debug for TxRelayService {
 
 impl TxRelayService {
     /// Starts the reactor task on `pool` with `config`'s fan-out and returns
-    /// the service to register. A session whose address is in
-    /// `unconditional` is never charged for the bodies it supplies. Each
-    /// session is published in `sessions` from when its routine holds a view
-    /// of the pool until the session ends or the pool stops.
+    /// the service to register. A body whose supplier's address is in
+    /// `unconditional` when it arrives is never charged. Each session is
+    /// published in `sessions` from when its routine holds a view of the
+    /// pool until the session ends or the pool stops.
     pub fn spawn(
         pool: PoolHandle,
         may_cool: MayCool,
@@ -224,6 +222,7 @@ impl TxRelayService {
             record: sessions,
             inv_buckets: InvBuckets::default(),
             base: Instant::now(),
+            unconditional,
         };
         // The reactor task holds a reader, not a handle, so it does not keep
         // the core running, and it stops once the service, every routine
@@ -245,11 +244,7 @@ impl TxRelayService {
             .hash_length(8)
             .key(&key)
             .personal(b"Zakura_TxPeerKey");
-        Arc::new(Self {
-            wiring,
-            peer_key,
-            unconditional,
-        })
+        Arc::new(Self { wiring, peer_key })
     }
 
     /// The machine's name for `peer`, the same for every connection to it: a
@@ -315,9 +310,6 @@ impl Service for TxRelayService {
         let conn_cancel = peer.cancel_token();
         let session_cancel = peer.service_cancel_token();
         let close_cause = peer.close_cause();
-        let exempt = peer
-            .remote_ip
-            .is_some_and(|ip| self.unconditional.contains(ip));
         let close = Closer {
             conn_cancel,
             close_cause,
@@ -334,7 +326,7 @@ impl Service for TxRelayService {
         let routine = Routine::open(
             self.wiring.clone(),
             peer_key,
-            exempt,
+            peer.remote_ip,
             SessionIo::new(data, state, close, reports_rx, inv, connection),
             session_cancel,
         );
@@ -628,12 +620,17 @@ struct Wiring {
     record: TxRelaySessions,
     inv_buckets: InvBuckets,
     base: Instant,
+    /// Bodies from these addresses are never charged. See
+    /// [`Routine::exempt`].
+    unconditional: UnconditionalPeers,
 }
 
 /// One session's routine. See the module docs.
 struct Routine {
     machine: PeerMachine,
     wiring: Wiring,
+    /// The peer's address, which [`Self::exempt`] looks up.
+    remote_ip: Option<IpAddr>,
     /// Wakes this routine to look again: for its mail, a moved ring, or
     /// claims that opened up.
     wake: Arc<Notify>,
@@ -659,7 +656,7 @@ impl Routine {
     fn open(
         wiring: Wiring,
         peer: PeerKey,
-        exempt: bool,
+        remote_ip: Option<IpAddr>,
         io: SessionIo,
         cancel: CancellationToken,
     ) -> Self {
@@ -670,7 +667,7 @@ impl Routine {
             let mut node = wiring.node.lock().expect("the node is never poisoned");
             let node = &mut *node;
             let marks = Marks::of(&node.shared);
-            let machine = PeerMachine::connect(&mut node.shared, &view, peer, exempt, now);
+            let machine = PeerMachine::connect(&mut node.shared, &view, peer, now);
             node.sessions.insert(
                 machine.session(),
                 Handle {
@@ -699,6 +696,7 @@ impl Routine {
         let mut routine = Self {
             machine,
             wiring,
+            remote_ip,
             wake,
             io,
             cancel,
@@ -718,6 +716,14 @@ impl Routine {
     /// The machine's clock: time since the service started.
     fn now(&self) -> Time {
         Instant::now().saturating_duration_since(self.wiring.base)
+    }
+
+    /// Whether the peer's address is one of `network.unconditional_peers`
+    /// now. A pinned name's address joins the list only once a connection
+    /// proves the name's node ID, which can be after the session opened.
+    fn exempt(&self) -> bool {
+        self.remote_ip
+            .is_some_and(|ip| self.wiring.unconditional.contains(ip))
     }
 
     /// Runs the session until it ends: reads its frames, the pool's answers
@@ -937,8 +943,9 @@ impl Routine {
                 };
                 match decoded {
                     Some(body) => {
+                        let exempt = self.exempt();
                         self.step(|machine, shared, pool, _| {
-                            machine.tx(shared, pool, id, body, arrived);
+                            machine.tx(shared, pool, id, body, exempt, arrived);
                         });
                     }
                     None => {

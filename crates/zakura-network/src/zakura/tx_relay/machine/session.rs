@@ -42,7 +42,9 @@ pub(crate) struct Submitted {
     pub(crate) session: SessionId,
     /// The pool's tip in its snapshot at the check before submitting.
     pub(crate) tip: ChainTip,
-    /// Whether its supplier is exempt from charges, as its session was.
+    /// Whether its supplier's address was one of
+    /// `network.unconditional_peers` when the body arrived. Such a body is
+    /// never charged, even when its verdict comes after the session ended.
     pub(crate) exempt: bool,
 }
 
@@ -79,15 +81,13 @@ pub(crate) struct PeerMachine {
 }
 
 impl PeerMachine {
-    /// A session of `peer` opens. If `exempt`, the bodies it supplies are
-    /// never charged, even when their verdict comes after it ends. It gets
-    /// the go once every older session of the peer ended. While the peer's
-    /// park runs, it is parked at once and ends before it begins.
+    /// A session of `peer` opens. It gets the go once every older session
+    /// of the peer ended. While the peer's park runs, it is parked at once
+    /// and ends before it begins.
     pub(crate) fn connect(
         shared: &mut Shared,
         pool: &dyn PoolView,
         peer: PeerKey,
-        exempt: bool,
         now: Time,
     ) -> Self {
         let session = shared.new_session();
@@ -95,7 +95,7 @@ impl PeerMachine {
         let mut machine = Self {
             session,
             now,
-            state: PeerState::new(peer, exempt),
+            state: PeerState::new(peer),
             reservations: HashMap::default(),
             submitted_at: HashMap::default(),
             calls: HashMap::default(),
@@ -211,18 +211,21 @@ impl PeerMachine {
     }
 
     /// A `Tx` arrived answering the request for `id`, carrying `body`. Its
-    /// size on the wire is the body's own size.
+    /// size on the wire is the body's own size. `exempt` is whether the
+    /// peer's address is one of `network.unconditional_peers` now. See
+    /// [`Submitted::exempt`].
     pub(crate) fn tx(
         &mut self,
         shared: &mut Shared,
         pool: &dyn PoolView,
         id: UnminedTxId,
         body: UnminedTx,
+        exempt: bool,
         now: Time,
     ) {
         self.enter(shared, pool, now);
         if !self.ended {
-            self.receive(shared, pool, id, body);
+            self.receive(shared, pool, id, body, exempt);
         }
         self.settle(shared, pool);
     }
@@ -281,13 +284,15 @@ impl PeerMachine {
         true
     }
 
-    /// Checks the body of `id` and, if it passes, submits it.
+    /// Checks the body of `id` and, if it passes, submits it, exempt from
+    /// charges if `exempt`.
     fn receive(
         &mut self,
         shared: &mut Shared,
         pool: &dyn PoolView,
         id: UnminedTxId,
         body: UnminedTx,
+        exempt: bool,
     ) {
         let seq = pool.last_seq();
         let size = u32::try_from(body.size()).unwrap_or(u32::MAX);
@@ -311,7 +316,12 @@ impl PeerMachine {
         // The check before submitting passed: a request keeps its
         // reservation only while it holds the current claim. From here on
         // the body goes to the pool whatever is decided.
-        self.submit(shared, pool, id, request.generation, reservation, body);
+        let submitted = Submitted {
+            session: self.session,
+            tip: pool.tip(),
+            exempt,
+        };
+        self.submit(shared, id, request.generation, reservation, body, submitted);
     }
 
     /// A `NotFound` arrived.
@@ -916,15 +926,15 @@ impl PeerMachine {
     }
 
     /// This session's body of `id`, fetched for `generation` under
-    /// `reservation`, goes to the pool.
+    /// `reservation`, goes to the pool, as `submitted` records.
     fn submit(
         &mut self,
         shared: &mut Shared,
-        pool: &dyn PoolView,
         id: UnminedTxId,
         generation: EntryGen,
         reservation: ReservationId,
         body: UnminedTx,
+        submitted: Submitted,
     ) {
         self.reservations.remove(&reservation);
         if shared.stopped {
@@ -937,14 +947,7 @@ impl PeerMachine {
         }
         let waiter = shared.new_waiter();
         self.state.submissions.insert(waiter, (id, generation));
-        self.submitted_at.insert(
-            waiter,
-            Submitted {
-                session: self.session,
-                tip: pool.tip(),
-                exempt: self.state.exempt,
-            },
-        );
+        self.submitted_at.insert(waiter, submitted);
         shared.effects.push(RelayEffect::Submit {
             waiter,
             reservation,

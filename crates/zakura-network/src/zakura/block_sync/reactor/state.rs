@@ -99,6 +99,35 @@ impl ReactorState {
         self.committed_view.as_ref()
     }
 
+    /// Panic if the state breaks a rule it keeps: the query state keeps its
+    /// own invariants, the pending query carries the current body-work
+    /// authority, the needed heights are sorted and distinct, and this node
+    /// advertises exactly its verified tip.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        self.queries.assert_invariants();
+        if let Some(pending) = self.queries.pending() {
+            assert_eq!(
+                Some(pending.scope),
+                self.body_work_scope(),
+                "the pending query carries the current authority"
+            );
+        }
+        assert!(
+            self.needed_heights.windows(2).all(|pair| pair[0] < pair[1]),
+            "needed heights are sorted and distinct: {:?}",
+            self.needed_heights
+        );
+        assert_eq!(
+            (self.progress.servable_high, self.progress.servable_hash),
+            (
+                self.progress.verified_block_tip,
+                self.progress.verified_block_hash
+            ),
+            "this node advertises its verified tip"
+        );
+    }
+
     /// The body-work authority of the latest committed view.
     /// `None` until the reactor has a committed view.
     pub(super) fn body_work_scope(&self) -> Option<BodyWorkAuthority> {
@@ -489,6 +518,44 @@ impl QueryState {
 
     pub(super) fn pending(&self) -> Option<PendingNeededQuery> {
         self.pending
+    }
+
+    /// Panic if the state breaks a rule it keeps: the pending query consumed
+    /// an ID below the next one, asks for between one and
+    /// [`NEEDED_BLOCK_REFILL_LIMIT`] heights, and, as a refill, stays within
+    /// the header tip it asked about. A hint refresh covers at least one
+    /// height.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        if let Some(pending) = self.pending {
+            assert!(
+                self.next_id.is_none_or(|next| pending.query_id < next),
+                "the pending query {} consumed an ID below {:?}",
+                pending.query_id,
+                self.next_id
+            );
+            assert!(
+                (1..=NEEDED_BLOCK_REFILL_LIMIT).contains(&pending.limit),
+                "a query asks for {} heights",
+                pending.limit
+            );
+            if pending.hint_revision.is_none() {
+                assert!(
+                    pending.from <= pending.best_header_tip
+                        && pending.limit - 1 <= pending.best_header_tip.0 - pending.from.0,
+                    "a refill from {:?} for {} heights passes the header tip {:?}",
+                    pending.from,
+                    pending.limit,
+                    pending.best_header_tip
+                );
+            }
+        }
+        if let Some(refresh) = self.hint_refresh {
+            assert!(
+                refresh.from <= refresh.through,
+                "an empty hint refresh {refresh:?}"
+            );
+        }
     }
 
     /// The pending query, the retry gate, and the owed force.
@@ -1266,7 +1333,8 @@ impl ReactorState {
     }
 
     /// Propose restarting the alarmed body search because `eligible_sources`
-    /// for the alarmed header holds a supplier the alarm has not tried.
+    /// for the alarmed header holds a supplier the alarm has not tried: more
+    /// suppliers than the alarm recorded, or as many under another set digest.
     ///
     /// Returns `None` without an alarm, without a new supplier, or when the
     /// channel already accepted the same restart.

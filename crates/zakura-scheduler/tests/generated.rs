@@ -1,6 +1,12 @@
-//! Generated programs checked against small independent models of the
-//! scheduler: task readiness and worker ownership (S1.1, S1.2), and timers
-//! (S2.1).
+//! Generated programs that drive the real scheduler and check it after every
+//! step: task readiness and worker ownership (S1.1, S1.2), and timers (S2.1).
+//!
+//! Each generated task records where it handed control back and which wakes
+//! it fired. The readiness check compares the scheduler's ready set and each
+//! run's outcome with those records. It never steps a second copy of the
+//! scheduler. The timer check keeps the pending timers in a map ordered by
+//! deadline, then registration, and compares each advance's fired timers with
+//! the map's due prefix.
 
 #[allow(unused_imports)]
 mod support;
@@ -53,6 +59,56 @@ struct World {
     children: Vec<Vec<Act>>,
     /// The index of each task whose code ran, in order.
     log: Vec<usize>,
+    /// Per task: where its code last handed control back, recorded just
+    /// before it did. `None` until its first poll.
+    stops: Vec<Option<Stop>>,
+    /// Per task: a wake fired through its waker since its current or last
+    /// poll started.
+    woken: Vec<bool>,
+    /// Per task: the lock it is parked on, until the park returns.
+    parked_on: Vec<Option<usize>>,
+    /// Per task: whether the lock it parked on was released since it parked.
+    unparked: Vec<bool>,
+}
+
+/// Where a task's code handed control back to the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// At a preemption point.
+    Point,
+    /// By returning `Pending`.
+    Pending,
+    /// By parking on a held lock.
+    Park,
+    /// By returning `Ready`.
+    Done,
+}
+
+impl World {
+    /// Records that task `me` stops at `stop`.
+    fn stop(&mut self, me: usize, stop: Stop) {
+        self.stops[me] = Some(stop);
+    }
+
+    /// A task that needs no worker to resume: stopped at a point, or
+    /// parked on a lock that was released since.
+    fn resumable(&self, task: usize) -> bool {
+        match self.stops[task] {
+            Some(Stop::Point) => true,
+            Some(Stop::Park) => self.unparked[task],
+            _ => false,
+        }
+    }
+
+    /// A task that may start a poll: never polled, or woken since its last
+    /// poll returned `Pending`.
+    fn pollable(&self, task: usize) -> bool {
+        match self.stops[task] {
+            None => true,
+            Some(Stop::Pending) => self.woken[task],
+            _ => false,
+        }
+    }
 }
 
 /// A generated task's future. It records itself in the log each time its
@@ -68,22 +124,30 @@ fn task_future(
             let mut w = world.borrow_mut();
             w.log.push(me);
             w.wakers[me] = Some(cx.waker().clone());
+            // A poll consumes every wake that came before it.
+            w.woken[me] = false;
         }
         while let Some(&act) = acts.get(pc) {
             pc += 1;
             match act {
                 Act::Point => {
+                    world.borrow_mut().stop(me, Stop::Point);
                     hooks::preempt(Point::here(Op::Yield));
                     world.borrow_mut().log.push(me);
                 }
                 Act::Wake(j) => {
                     let waker = world.borrow().wakers[j].clone();
                     if let Some(waker) = waker {
+                        world.borrow_mut().woken[j] = true;
                         waker.wake();
                     }
                 }
-                Act::Pending => return Poll::Pending,
+                Act::Pending => {
+                    world.borrow_mut().stop(me, Stop::Pending);
+                    return Poll::Pending;
+                }
                 Act::Lock(m) => {
+                    world.borrow_mut().stop(me, Stop::Point);
                     hooks::preempt(Point::here(Op::Lock));
                     world.borrow_mut().log.push(me);
                     loop {
@@ -94,8 +158,16 @@ fn task_future(
                         match holder {
                             None => break,
                             Some(holder) => {
+                                {
+                                    let mut w = world.borrow_mut();
+                                    w.stop(me, Stop::Park);
+                                    w.parked_on[me] = Some(m);
+                                    w.unparked[me] = false;
+                                }
                                 assert!(hooks::park(obj, Some(holder)));
-                                world.borrow_mut().log.push(me);
+                                let mut w = world.borrow_mut();
+                                w.log.push(me);
+                                w.parked_on[me] = None;
                             }
                         }
                     }
@@ -105,6 +177,11 @@ fn task_future(
                     let obj = {
                         let mut w = world.borrow_mut();
                         w.holders[m] = None;
+                        for t in 0..w.parked_on.len() {
+                            if w.parked_on[t] == Some(m) {
+                                w.unparked[t] = true;
+                            }
+                        }
                         w.locks[m]
                     };
                     hooks::unpark_all(obj);
@@ -113,180 +190,21 @@ fn task_future(
                     let (child, acts) = {
                         let mut w = world.borrow_mut();
                         w.wakers.push(None);
+                        w.stops.push(None);
+                        w.woken.push(false);
+                        w.parked_on.push(None);
+                        w.unparked.push(false);
                         (w.wakers.len() - 1, w.children[c].clone())
                     };
                     let spawned = hooks::spawn("child", task_future(child, acts, world.clone()));
-                    // Task ids follow spawn order, so they match the model's.
+                    // Task ids follow spawn order, so the test's indexes match.
                     assert_eq!(spawned.task().index(), child);
                 }
             }
         }
+        world.borrow_mut().stop(me, Stop::Done);
         Poll::Ready(())
     })
-}
-
-/// Where the model has a task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    /// Ready at a poll boundary. Starting it needs a free worker.
-    Boundary,
-    /// Ready mid-poll. It holds a worker.
-    MidPoll,
-    /// Parked on a lock mid-poll. It holds a worker.
-    Parked(usize),
-    /// Returned `Pending` and waits for a wake.
-    Waiting,
-    /// Being run right now.
-    Running,
-    Done,
-}
-
-/// The independent model: what each task does next, from its script alone.
-struct ModelTask {
-    acts: Vec<Act>,
-    pc: usize,
-    phase: Phase,
-    /// Woken during the current poll.
-    woken: bool,
-    /// Has polled at least once, so other tasks hold its waker.
-    has_waker: bool,
-    /// Stopped at a lock's point, so it resumes by trying to take the lock.
-    taking: Option<usize>,
-}
-
-/// The kind of [`RunOutcome`] the model predicts.
-#[derive(Debug, PartialEq, Eq)]
-enum Kind {
-    Reached,
-    Waiting,
-    Parked,
-    Completed,
-}
-
-impl ModelTask {
-    /// A task that hasn't started, ready at its first poll.
-    fn new(acts: Vec<Act>) -> Self {
-        ModelTask {
-            acts,
-            pc: 0,
-            phase: Phase::Boundary,
-            woken: false,
-            has_waker: false,
-            taking: None,
-        }
-    }
-}
-
-/// Every task's state, indexed like [`TaskId::index`].
-struct Model {
-    tasks: Vec<ModelTask>,
-    children: Vec<Vec<Act>>,
-    holders: Vec<Option<usize>>,
-    workers: usize,
-}
-
-impl Model {
-    /// Tasks that hold a worker.
-    fn held(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|t| matches!(t.phase, Phase::MidPoll | Phase::Parked(_)))
-            .count()
-    }
-
-    /// The tasks `run` should accept, with whether each is mid-poll.
-    fn eligible(&self) -> Vec<(usize, bool)> {
-        let free = self.held() < self.workers;
-        self.tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| match t.phase {
-                Phase::MidPoll => Some((i, true)),
-                Phase::Boundary if free => Some((i, false)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A wake through task `j`'s waker.
-    fn wake(&mut self, j: usize) {
-        let t = &mut self.tasks[j];
-        if !t.has_waker {
-            return;
-        }
-        match t.phase {
-            Phase::Waiting => t.phase = Phase::Boundary,
-            Phase::MidPoll | Phase::Parked(_) | Phase::Running => t.woken = true,
-            Phase::Boundary | Phase::Done => {}
-        }
-    }
-
-    /// Runs task `i` to its next stop, as the scheduler should.
-    fn run(&mut self, i: usize) -> Kind {
-        if self.tasks[i].phase == Phase::Boundary {
-            self.tasks[i].has_waker = true;
-            self.tasks[i].woken = false;
-        }
-        self.tasks[i].phase = Phase::Running;
-        if let Some(m) = self.tasks[i].taking {
-            if let Some(kind) = self.take(i, m) {
-                return kind;
-            }
-        }
-        loop {
-            let t = &mut self.tasks[i];
-            let Some(&act) = t.acts.get(t.pc) else {
-                t.phase = Phase::Done;
-                return Kind::Completed;
-            };
-            t.pc += 1;
-            match act {
-                Act::Point => {
-                    t.phase = Phase::MidPoll;
-                    return Kind::Reached;
-                }
-                Act::Wake(j) => self.wake(j),
-                Act::Pending => {
-                    t.phase = if t.woken {
-                        Phase::Boundary
-                    } else {
-                        Phase::Waiting
-                    };
-                    t.woken = false;
-                    return Kind::Waiting;
-                }
-                Act::Lock(m) => {
-                    t.taking = Some(m);
-                    t.phase = Phase::MidPoll;
-                    return Kind::Reached;
-                }
-                Act::Unlock(m) => {
-                    self.holders[m] = None;
-                    for t in &mut self.tasks {
-                        if t.phase == Phase::Parked(m) {
-                            t.phase = Phase::MidPoll;
-                        }
-                    }
-                }
-                Act::Spawn(c) => {
-                    // Admitted when the step returns, ready at a poll boundary.
-                    let acts = self.children[c].clone();
-                    self.tasks.push(ModelTask::new(acts));
-                }
-            }
-        }
-    }
-
-    /// Task `i` tries to take lock `m`. Returns `Parked` if it's held.
-    fn take(&mut self, i: usize, m: usize) -> Option<Kind> {
-        if self.holders[m].is_some() {
-            self.tasks[i].phase = Phase::Parked(m);
-            return Some(Kind::Parked);
-        }
-        self.holders[m] = Some(i);
-        self.tasks[i].taking = None;
-        None
-    }
 }
 
 /// A random program: up to four root tasks of up to eight steps over two
@@ -331,9 +249,9 @@ fn program(walk: &mut Walk) -> Program {
     Program { roots, children }
 }
 
-/// Runs one generated program with `workers`, checking each step against
-/// the model.
-fn check_program(workers: u16, seed: u64) {
+/// Runs one generated program with `workers`, picking a random ready task at
+/// each step, and checks the scheduler against what the tasks recorded.
+fn check_readiness(workers: u16, seed: u64) {
     let mut walk = Walk(seed);
     let Program { roots, children } = program(&mut walk);
     let config = SchedulerConfig {
@@ -348,29 +266,55 @@ fn check_program(workers: u16, seed: u64) {
         locks: (0..2)
             .map(|_| hooks::new_object().expect("inside a run"))
             .collect(),
-        children: children.clone(),
+        children,
         log: Vec::new(),
+        stops: vec![None; roots.len()],
+        woken: vec![false; roots.len()],
+        parked_on: vec![None; roots.len()],
+        unparked: vec![false; roots.len()],
     }));
-    for (i, acts) in roots.iter().enumerate() {
-        let root = s.spawn_root("t", task_future(i, acts.clone(), world.clone()));
+    for (i, acts) in roots.into_iter().enumerate() {
+        let root = s.spawn_root("t", task_future(i, acts, world.clone()));
         assert_eq!(root.task().index(), i);
     }
-    let mut model = Model {
-        tasks: roots.into_iter().map(ModelTask::new).collect(),
-        children,
-        holders: vec![None; 2],
-        workers: usize::from(workers),
-    };
+    let workers = usize::from(workers);
     let ctx = |step: usize| format!("seed {seed}, workers {workers}, step {step}");
     for step in 0.. {
-        let want = model.eligible();
         let ready = s.ready();
-        let got: Vec<(usize, bool)> = ready.iter().map(|r| (r.task.index(), r.mid_poll)).collect();
-        assert_eq!(got, want, "eligible tasks, {}", ctx(step));
-        assert!(model.held() <= usize::from(workers), "{}", ctx(step));
-        if want.is_empty() {
+        let held = s.mid_poll().len();
+        {
+            let w = world.borrow();
+            assert!(held <= workers, "{held} tasks hold a worker, {}", ctx(step));
+            // S1.1: a task is ready exactly when it can make progress. A
+            // task stopped mid-poll keeps its worker and is always ready. A
+            // task at a poll boundary needs a free worker.
+            for task in 0..w.stops.len() {
+                let entry = ready.iter().find(|r| r.task.index() == task);
+                let want = if w.resumable(task) {
+                    Some(true)
+                } else if w.pollable(task) && held < workers {
+                    Some(false)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    entry.map(|r| r.mid_poll),
+                    want,
+                    "task {task} stopped at {:?}, woken {}, {}",
+                    w.stops[task],
+                    w.woken[task],
+                    ctx(step)
+                );
+            }
+        }
+        if ready.is_empty() {
             let status = s.status();
-            if model.tasks.iter().all(|t| t.phase == Phase::Done) {
+            let finished = world
+                .borrow()
+                .stops
+                .iter()
+                .all(|stop| *stop == Some(Stop::Done));
+            if finished {
                 assert_eq!(status, Status::Quiescent, "{}", ctx(step));
             } else {
                 assert!(
@@ -381,26 +325,23 @@ fn check_program(workers: u16, seed: u64) {
             }
             break;
         }
-        let (pick, _) = want[walk.pick(want.len())];
+        let pick = ready[walk.pick(ready.len())].task;
+        let me = pick.index();
         let before = world.borrow().log.len();
-        let task = ready
-            .iter()
-            .find(|r| r.task.index() == pick)
-            .expect("the model's pick is ready")
-            .task;
-        let outcome = s.run(task);
-        let kind = match outcome {
-            RunOutcome::Reached(_) => Kind::Reached,
-            RunOutcome::Waiting => Kind::Waiting,
-            RunOutcome::Parked(_) => Kind::Parked,
-            RunOutcome::Completed => Kind::Completed,
+        let outcome = s.run(pick);
+        let w = world.borrow();
+        let stop = match outcome {
+            RunOutcome::Reached(_) => Stop::Point,
+            RunOutcome::Waiting => Stop::Pending,
+            RunOutcome::Parked(_) => Stop::Park,
+            RunOutcome::Completed => Stop::Done,
             other => panic!("{other:?}, {}", ctx(step)),
         };
-        assert_eq!(kind, model.run(pick), "outcome, {}", ctx(step));
-        let ran = world.borrow().log[before..].to_vec();
+        assert_eq!(Some(stop), w.stops[me], "outcome, {}", ctx(step));
+        let ran = &w.log[before..];
         assert!(
-            !ran.is_empty() && ran.iter().all(|t| *t == pick),
-            "only task {pick} may run, but {ran:?} did, {}",
+            !ran.is_empty() && ran.iter().all(|t| *t == me),
+            "only task {me} may run, but {ran:?} did, {}",
             ctx(step)
         );
     }
@@ -408,10 +349,10 @@ fn check_program(workers: u16, seed: u64) {
 }
 
 #[test]
-fn generated_programs_match_the_readiness_model() {
+fn generated_programs_keep_the_readiness_invariants() {
     for workers in [1, 2, 3] {
         for seed in 0..1_000 {
-            check_program(workers, seed);
+            check_readiness(workers, seed);
         }
     }
 }
@@ -430,14 +371,15 @@ impl Wake for RecordFire {
 }
 
 /// Runs a random sequence of timer registrations, cancellations, and time
-/// advances against an ordered model of pending timers.
+/// advances, and checks each advance against the pending timers the test
+/// registered and did not cancel.
 fn check_timers(seed: u64) {
     let mut walk = Walk(seed);
     let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
     let fired = Arc::new(StdMutex::new(Vec::new()));
     // Pending timers by (deadline, registration order), as the scheduler
     // orders them.
-    let mut model: std::collections::BTreeMap<(SimInstant, usize), TimerId> = Default::default();
+    let mut pending: std::collections::BTreeMap<(SimInstant, usize), TimerId> = Default::default();
     let mut cancelled = Vec::new();
     let mut registered = 0;
     let ms = Duration::from_millis;
@@ -453,12 +395,12 @@ fn check_timers(seed: u64) {
                 }));
                 let id = hooks::register_timer(deadline, &waker);
                 assert_eq!(id.deadline(), deadline);
-                model.insert((deadline, registered), id);
+                pending.insert((deadline, registered), id);
                 registered += 1;
             }
-            2 if !model.is_empty() => {
-                let key = *model.keys().nth(walk.pick(model.len())).unwrap();
-                hooks::cancel_timer(model.remove(&key).unwrap());
+            2 if !pending.is_empty() => {
+                let key = *pending.keys().nth(walk.pick(pending.len())).unwrap();
+                hooks::cancel_timer(pending.remove(&key).unwrap());
                 cancelled.push(key.1);
             }
             _ => {
@@ -466,8 +408,8 @@ fn check_timers(seed: u64) {
                     (0, Some(next)) => next,
                     _ => now.checked_add(ms(walk.pick(3) as u64)).unwrap(),
                 };
-                let later = model.split_off(&(to, usize::MAX));
-                let due = std::mem::replace(&mut model, later);
+                let later = pending.split_off(&(to, usize::MAX));
+                let due = std::mem::replace(&mut pending, later);
                 fired.lock().unwrap().clear();
                 let ids = s.advance_to(to);
                 assert_eq!(s.now(), to, "seed {seed}");
@@ -482,7 +424,7 @@ fn check_timers(seed: u64) {
         }
         assert_eq!(
             s.next_deadline(),
-            model.keys().next().map(|(d, _)| *d),
+            pending.keys().next().map(|(d, _)| *d),
             "seed {seed}"
         );
         assert!(s.now() >= now, "time moved backwards, seed {seed}");
@@ -495,11 +437,11 @@ fn check_timers(seed: u64) {
         late.iter().all(|(i, _)| !cancelled.contains(i)),
         "seed {seed}"
     );
-    assert_eq!(late.len(), model.len(), "seed {seed}");
+    assert_eq!(late.len(), pending.len(), "seed {seed}");
 }
 
 #[test]
-fn generated_timer_sequences_match_the_ordered_model() {
+fn generated_timer_sequences_fire_in_deadline_order() {
     for seed in 0..2_000 {
         check_timers(seed);
     }

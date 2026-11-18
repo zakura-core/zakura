@@ -1,4 +1,9 @@
-//! Bounded protocol-model replay used by the header-pursuit fuzz target.
+//! Bounded replay of header pursuit through the production queue and ownership
+//! gate, used by the header-pursuit fuzz target.
+//!
+//! `PursuitHarness` records each peer's work from the queue's answers and checks
+//! the queue against that record. It never decides which work the queue admits
+//! or evicts.
 
 use std::{num::NonZeroU64, sync::Arc};
 
@@ -55,7 +60,7 @@ pub struct HeaderPursuitReplaySummary {
     pub explicit_outcomes: usize,
     /// Number of stale or mismatched operations with no state effect.
     pub refused_operations: usize,
-    /// Number of peer punishments, which must remain zero for modeled outcomes.
+    /// Number of peer punishments, which must remain zero for these outcomes.
     pub peer_punishments: usize,
     /// Prepared completions retained across later operations.
     pub held_completions: usize,
@@ -83,7 +88,7 @@ pub struct HeaderPursuitReplaySummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ModelWork {
+enum RecordedWork {
     Awaiting {
         session_id: u64,
         target: block::Hash,
@@ -117,7 +122,7 @@ enum HeldStateResult {
 
 struct PursuitHarness {
     queue: PeerWorkQueue,
-    model: HashMap<u8, ModelWork>,
+    work: HashMap<u8, RecordedWork>,
     held: HashMap<u8, HeldCompletion>,
     held_state: HashMap<u8, HeldStateResult>,
     pending: PendingOwners,
@@ -130,7 +135,7 @@ impl PursuitHarness {
         let anchor = frontier(10);
         Self {
             queue: PeerWorkQueue::default(),
-            model: HashMap::new(),
+            work: HashMap::new(),
             held: HashMap::new(),
             held_state: HashMap::new(),
             pending: PendingOwners::default(),
@@ -177,7 +182,7 @@ impl PursuitHarness {
             16 => self.check_page_partitions(),
             _ => unreachable!("the opcode is reduced modulo seventeen"),
         }
-        self.assert_matches_model();
+        self.assert_matches_record();
         assert_eq!(
             self.summary.peer_punishments, 0,
             "explicit outcomes and stale work are nonpunitive"
@@ -191,71 +196,69 @@ impl PursuitHarness {
         let scope = HeaderWorkAuthority::for_target(&self.snapshot, target);
         let advertised = advertisement(&self.snapshot, session_id, marker);
         let status = advertised.status.clone();
-        let actual = self.queue.stage(peer(peer_key), advertised, priority);
-        let expected = self.model_stage(peer_key, session_id, target, scope, priority, status);
-        assert_eq!(actual, expected, "queue admission diverged from the model");
+        let result = self.queue.stage(peer(peer_key), advertised, priority);
+        let awaiting = RecordedWork::Awaiting {
+            session_id,
+            target,
+            scope,
+            priority,
+            status,
+        };
+        self.record_stage(peer_key, result, awaiting, priority);
     }
 
-    fn model_stage(
+    /// Record the queue's answer to staging `target` for `peer_key`.
+    ///
+    /// The queue decides the result and which unstarted work makes room. This
+    /// checks only what any such decision must satisfy: started work keeps its
+    /// target, only a full queue refuses or evicts, it evicts at most one
+    /// peer's unstarted work, and only work below `priority`.
+    fn record_stage(
         &mut self,
         peer_key: u8,
-        session_id: u64,
-        target: block::Hash,
-        scope: HeaderWorkAuthority,
+        result: QueueWorkResult,
+        awaiting: RecordedWork,
         priority: PeerWorkPriority,
-        status: Status,
-    ) -> QueueWorkResult {
-        if let Some(work) = self.model.get_mut(&peer_key) {
-            return match work {
-                ModelWork::Awaiting {
-                    session_id: current_session,
-                    target: current_target,
-                    scope: current_scope,
-                    priority: current_priority,
-                    status: current_status,
-                } => {
-                    *current_session = session_id;
-                    *current_target = target;
-                    *current_scope = scope;
-                    *current_priority = priority;
-                    *current_status = status;
-                    QueueWorkResult::NeedsLocator
-                }
-                ModelWork::Active { .. } => QueueWorkResult::AlreadyActive,
-            };
+    ) {
+        let started = matches!(self.work.get(&peer_key), Some(RecordedWork::Active { .. }));
+        let full = !self.work.contains_key(&peer_key) && self.work.len() >= MAX_STAGED_TARGETS_V1;
+        match result {
+            QueueWorkResult::AlreadyActive => {
+                assert!(started, "only started work is already active");
+                return;
+            }
+            QueueWorkResult::AtCapacity => {
+                assert!(full, "only a full queue refuses new work");
+                return;
+            }
+            QueueWorkResult::TargetAlreadyAssigned => {
+                panic!("plain staging ignores other owners of the target")
+            }
+            QueueWorkResult::NeedsLocator => {
+                assert!(!started, "started work never takes a new target");
+            }
         }
-        if self.model.len() >= MAX_STAGED_TARGETS_V1 {
-            let replace = self
-                .model
-                .iter()
-                .filter_map(|(candidate, work)| match work {
-                    ModelWork::Awaiting {
-                        priority: current, ..
-                    } if *current < priority => Some((*candidate, *current)),
-                    ModelWork::Awaiting { .. } | ModelWork::Active { .. } => None,
-                })
-                .min_by(|(left_peer, left_priority), (right_peer, right_priority)| {
-                    left_priority
-                        .cmp(right_priority)
-                        .then_with(|| left_peer.cmp(right_peer))
-                })
-                .map(|(candidate, _)| candidate);
-            let Some(replace) = replace else {
-                return QueueWorkResult::AtCapacity;
-            };
-            self.model.remove(&replace);
-        }
-        self.model.insert(
-            peer_key,
-            ModelWork::Awaiting {
-                session_id,
-                target,
-                scope,
-                priority,
-                status,
-            },
+        let evicted: Vec<u8> = self
+            .work
+            .keys()
+            .copied()
+            .filter(|key| *key != peer_key && !self.queue.has_work(&peer(*key)))
+            .collect();
+        assert_eq!(
+            evicted.len(),
+            usize::from(full),
+            "a full queue makes room by evicting exactly one peer's work"
         );
-        QueueWorkResult::NeedsLocator
+        for key in evicted {
+            assert!(
+                matches!(
+                    self.work.remove(&key),
+                    Some(RecordedWork::Awaiting { priority: evicted, .. }) if evicted < priority
+                ),
+                "only unstarted work below the new priority makes room"
+            );
+        }
+        self.work.insert(peer_key, awaiting);
     }
 
     fn start(&mut self, peer_key: u8, marker: u8, flags: u8) {
@@ -263,9 +266,9 @@ impl PursuitHarness {
         let supplied_target = target(marker);
         let supplied_scope = HeaderWorkAuthority::for_target(&self.snapshot, supplied_target);
         let request = request(&self.snapshot, peer_key, supplied_session, marker);
-        let model_match = matches!(
-            self.model.get(&peer_key),
-            Some(ModelWork::Awaiting {
+        let recorded_match = matches!(
+            self.work.get(&peer_key),
+            Some(RecordedWork::Awaiting {
                 session_id,
                 target,
                 scope,
@@ -277,23 +280,26 @@ impl PursuitHarness {
                 && *status == request.target.status
         );
         let owner = request.owner;
-        if model_match {
+        if recorded_match {
             assert!(
                 self.queue.reserve_request(&peer(peer_key), 1),
                 "matching initial work owns one response reservation"
             );
         }
         let started = self.queue.start(request);
-        assert_eq!(started, model_match, "request admission changed its target");
+        assert_eq!(
+            started, recorded_match,
+            "request admission changed its target"
+        );
         if started {
             assert_eq!(
                 self.pending.insert(source(peer_key), owner),
                 None,
                 "one peer has at most one active request owner"
             );
-            self.model.insert(
+            self.work.insert(
                 peer_key,
-                ModelWork::Active {
+                RecordedWork::Active {
                     session_id: supplied_session,
                     target: supplied_target,
                     owner,
@@ -313,8 +319,8 @@ impl PursuitHarness {
         let supplied_target = target(marker);
         // A branch reset moves the best header away from the finalized frontier, so answer
         // from the locator the request actually sent.
-        let sent_ancestor = match self.model.get(&peer_key) {
-            Some(ModelWork::Active { locator_head, .. }) => *locator_head,
+        let sent_ancestor = match self.work.get(&peer_key) {
+            Some(RecordedWork::Active { locator_head, .. }) => *locator_head,
             _ => self.snapshot.frontiers.header_best,
         };
         let returned_ancestor = if flags & 0x20 == 0 {
@@ -331,8 +337,8 @@ impl PursuitHarness {
         });
         // A bound page stages no headers here, so no later page can continue from it.
         let matches = matches!(
-            self.model.get(&peer_key),
-            Some(ModelWork::Active {
+            self.work.get(&peer_key),
+            Some(RecordedWork::Active {
                 session_id,
                 target,
                 phase: HeaderTargetPhase::Receiving,
@@ -344,7 +350,7 @@ impl PursuitHarness {
         );
         assert_eq!(
             production_accepts, matches,
-            "production page-shape admission diverged from the model"
+            "production page-shape admission diverged from the record"
         );
         if !matches {
             self.summary.refused_operations += 1;
@@ -352,23 +358,23 @@ impl PursuitHarness {
         }
         assert!(
             self.queue.consume_response_capacity(&peer(peer_key), 1),
-            "a modeled response consumes its exact reservation"
+            "a recorded response consumes its exact reservation"
         );
         assert!(
             self.queue.reserve_request(&peer(peer_key), 1),
-            "a modeled continuation owns its response reservation"
+            "a recorded continuation owns its response reservation"
         );
         let request = self
             .queue
             .active_mut(&peer(peer_key))
-            .expect("the production queue is active when the model is active");
+            .expect("the production queue is active when the record is active");
         assert_eq!(
             request.target.status.selected_tip_hash, supplied_target,
             "a response page cannot substitute another target"
         );
         request.common_ancestor = Some(returned_ancestor);
-        let Some(ModelWork::Active { ancestor_bound, .. }) = self.model.get_mut(&peer_key) else {
-            unreachable!("the operation matched an active model request");
+        let Some(RecordedWork::Active { ancestor_bound, .. }) = self.work.get_mut(&peer_key) else {
+            unreachable!("the operation matched an active recorded request");
         };
         *ancestor_bound = true;
     }
@@ -377,8 +383,8 @@ impl PursuitHarness {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         let matches = matches!(
-            self.model.get(&peer_key),
-            Some(ModelWork::Active {
+            self.work.get(&peer_key),
+            Some(RecordedWork::Active {
                 session_id,
                 target,
                 phase: HeaderTargetPhase::Receiving,
@@ -393,10 +399,10 @@ impl PursuitHarness {
         self.queue.cancel_request_reservation(&peer(peer_key));
         self.queue
             .active_mut(&peer(peer_key))
-            .expect("the production queue is active when the model is active")
+            .expect("the production queue is active when the record is active")
             .phase = HeaderTargetPhase::Preparing;
-        let Some(ModelWork::Active { phase, .. }) = self.model.get_mut(&peer_key) else {
-            unreachable!("the operation matched an active model request");
+        let Some(RecordedWork::Active { phase, .. }) = self.work.get_mut(&peer_key) else {
+            unreachable!("the operation matched an active recorded request");
         };
         *phase = HeaderTargetPhase::Preparing;
     }
@@ -404,14 +410,14 @@ impl PursuitHarness {
     fn complete(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
-        let Some(ModelWork::Active {
+        let Some(RecordedWork::Active {
             session_id,
             target,
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
             ..
-        }) = self.model.get(&peer_key).cloned()
+        }) = self.work.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
             return;
@@ -434,13 +440,13 @@ impl PursuitHarness {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         // Only a request still receiving pages accepts an explicit outcome.
-        let Some(ModelWork::Active {
+        let Some(RecordedWork::Active {
             session_id,
             target,
             owner,
             phase: HeaderTargetPhase::Receiving,
             ..
-        }) = self.model.get(&peer_key).cloned()
+        }) = self.work.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
             return;
@@ -454,37 +460,37 @@ impl PursuitHarness {
         let request = self
             .queue
             .active(&peer(peer_key))
-            .expect("the model and production queue have the same active request");
+            .expect("the record and production queue have the same active request");
         assert!(
             request.target.session_id == supplied_session
                 && request.accepts_outcome(request_id, supplied_target),
-            "production outcome admission diverged from the model"
+            "production outcome admission diverged from the record"
         );
         self.summary.explicit_outcomes += 1;
         self.retire(peer_key, owner);
     }
 
     fn disconnect(&mut self, peer_key: u8) {
-        if let Some(ModelWork::Active { owner, .. }) = self.model.get(&peer_key).cloned() {
+        if let Some(RecordedWork::Active { owner, .. }) = self.work.get(&peer_key).cloned() {
             self.pending.remove(source(peer_key), owner.request_id());
         }
         self.queue.remove(&peer(peer_key));
         self.queue.remove_unstarted(&peer(peer_key));
-        self.model.remove(&peer_key);
+        self.work.remove(&peer_key);
     }
 
     fn hold_completion(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         let slot = (flags >> 2).saturating_add(32);
-        let Some(ModelWork::Active {
+        let Some(RecordedWork::Active {
             session_id,
             target,
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
             ..
-        }) = self.model.get(&peer_key).cloned()
+        }) = self.work.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
             return;
@@ -547,16 +553,22 @@ impl PursuitHarness {
             let priority =
                 PeerWorkPriority::from_work_order(advertised.claimed_work_order(&self.snapshot));
             let status = advertised.status.clone();
-            let actual = self.queue.stage(peer(peer_key), advertised, priority);
-            let expected = self.model_stage(peer_key, session_id, target, scope, priority, status);
-            assert_eq!(
-                actual, expected,
-                "advisory mutation changed queue semantics"
-            );
+            let result = self.queue.stage(peer(peer_key), advertised, priority);
+            let awaiting = RecordedWork::Awaiting {
+                session_id,
+                target,
+                scope,
+                priority,
+                status,
+            };
+            self.record_stage(peer_key, result, awaiting, priority);
         } else {
             self.queue.remove_unstarted(&peer(peer_key));
-            if matches!(self.model.get(&peer_key), Some(ModelWork::Awaiting { .. })) {
-                self.model.remove(&peer_key);
+            if matches!(
+                self.work.get(&peer_key),
+                Some(RecordedWork::Awaiting { .. })
+            ) {
+                self.work.remove(&peer_key);
             }
         }
         assert_eq!(
@@ -590,8 +602,8 @@ impl PursuitHarness {
                 self.queue.remove_owner(owner).is_some(),
                 "retired pending owners have exact queue work"
             );
-            self.model.retain(
-                |_, work| !matches!(work, ModelWork::Active { owner: active, .. } if *active == owner),
+            self.work.retain(
+                |_, work| !matches!(work, RecordedWork::Active { owner: active, .. } if *active == owner),
             );
         }
     }
@@ -624,8 +636,8 @@ impl PursuitHarness {
                 self.queue.remove_owner(owner).is_some(),
                 "branch-reset retirement removes exact queue work"
             );
-            self.model.retain(
-                |_, work| !matches!(work, ModelWork::Active { owner: active, .. } if *active == owner),
+            self.work.retain(
+                |_, work| !matches!(work, RecordedWork::Active { owner: active, .. } if *active == owner),
             );
         }
     }
@@ -633,14 +645,14 @@ impl PursuitHarness {
     fn dispatch_state(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
-        let Some(ModelWork::Active {
+        let Some(RecordedWork::Active {
             session_id,
             target,
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
             ..
-        }) = self.model.get(&peer_key).cloned()
+        }) = self.work.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
             return;
@@ -659,10 +671,10 @@ impl PursuitHarness {
         }
         self.queue
             .active_mut(&peer(peer_key))
-            .expect("the current model request has exact production queue work")
+            .expect("the current recorded request has exact production queue work")
             .phase = HeaderTargetPhase::Applying;
-        let Some(ModelWork::Active { phase, .. }) = self.model.get_mut(&peer_key) else {
-            unreachable!("the state dispatch matched an active model request");
+        let Some(RecordedWork::Active { phase, .. }) = self.work.get_mut(&peer_key) else {
+            unreachable!("the state dispatch matched an active recorded request");
         };
         *phase = HeaderTargetPhase::Applying;
         self.summary.state_submissions += 1;
@@ -680,13 +692,13 @@ impl PursuitHarness {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         let slot = (flags >> 2).saturating_add(32);
-        let Some(ModelWork::Active {
+        let Some(RecordedWork::Active {
             session_id,
             target,
             owner,
             phase: HeaderTargetPhase::Applying,
             ..
-        }) = self.model.get(&peer_key).cloned()
+        }) = self.work.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
             return;
@@ -778,7 +790,7 @@ impl PursuitHarness {
         let owner = template
             .owner
             .header_owner()
-            .expect("the modeled request is ordinary header work");
+            .expect("the recorded request is ordinary header work");
         template.owner = HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 branch: BranchId::new(owner.authority.branch.anchor_hash, target),
@@ -844,7 +856,7 @@ impl PursuitHarness {
             .remove_owner(owner)
             .expect("the queue contains the exact active owner");
         assert_eq!(retired.owner, owner);
-        self.model.remove(&peer_key);
+        self.work.remove(&peer_key);
     }
 
     fn retire_if_exact(&mut self, completion: HeldCompletion) {
@@ -859,27 +871,28 @@ impl PursuitHarness {
             "an exact held owner retires only its own pending entry"
         );
         if matches!(
-            self.model.get(&completion.peer_key),
-            Some(ModelWork::Active { owner, .. }) if *owner == completion.owner
+            self.work.get(&completion.peer_key),
+            Some(RecordedWork::Active { owner, .. }) if *owner == completion.owner
         ) {
-            self.model.remove(&completion.peer_key);
+            self.work.remove(&completion.peer_key);
         }
     }
 
-    fn assert_matches_model(&self) {
+    fn assert_matches_record(&self) {
+        self.queue.assert_invariants();
         assert_eq!(
             self.queue.len(),
-            self.model.len(),
-            "the production queue and model own the same number of peers"
+            self.work.len(),
+            "the production queue and the record own the same number of peers"
         );
         assert!(
-            self.model.len() <= MAX_STAGED_TARGETS_V1,
+            self.work.len() <= MAX_STAGED_TARGETS_V1,
             "the bounded queue never exceeds its ownership cap"
         );
         let active_count = self
-            .model
+            .work
             .values()
-            .filter(|work| matches!(work, ModelWork::Active { .. }))
+            .filter(|work| matches!(work, RecordedWork::Active { .. }))
             .count();
         assert_eq!(
             self.pending.len(),
@@ -893,8 +906,8 @@ impl PursuitHarness {
             "wire reservations and staged chunks never exceed the aggregate budget"
         );
         for peer_key in 0..LOGICAL_PEERS {
-            match self.model.get(&peer_key) {
-                Some(ModelWork::Awaiting {
+            match self.work.get(&peer_key) {
+                Some(RecordedWork::Awaiting {
                     session_id,
                     target,
                     scope,
@@ -904,14 +917,14 @@ impl PursuitHarness {
                     let awaiting = self
                         .queue
                         .awaiting(&peer(peer_key), *session_id, *target, *scope)
-                        .expect("the queue's exact awaiting target matches the model");
+                        .expect("the queue's exact awaiting target matches the record");
                     assert_eq!(
                         &awaiting.status, status,
-                        "the queue keeps the exact advisory status the model staged"
+                        "the queue keeps the exact advisory status the record staged"
                     );
                     assert!(self.queue.active(&peer(peer_key)).is_none());
                 }
-                Some(ModelWork::Active {
+                Some(RecordedWork::Active {
                     session_id,
                     target,
                     owner,
@@ -922,7 +935,7 @@ impl PursuitHarness {
                     let request = self
                         .queue
                         .active(&peer(peer_key))
-                        .expect("the production queue is active when the model is active");
+                        .expect("the production queue is active when the record is active");
                     assert_eq!(request.target.session_id, *session_id);
                     assert_eq!(request.target.status.selected_tip_hash, *target);
                     assert_eq!(request.owner, *owner);
@@ -1113,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn modeled_queue_cap_and_priority_replacement_match_production() {
+    fn a_full_queue_refuses_then_replaces_lower_priority_work() {
         let mut input = Vec::new();
         for peer_key in 0..=16_u8 {
             input.extend([

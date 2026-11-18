@@ -4,8 +4,10 @@
 //! and pool. Eight slots retain real block, header, and transaction handles.
 //! Three pools have distinct identities; two enforce equal pipeline byte limits
 //! and one enforces a count limit. The model derives charges from its own handle
-//! graph. Action 5 retired with charge transfer, so it does nothing and decoder-v1
-//! inputs keep their byte positions.
+//! graph. The pools decide admission. The model records each admission and checks
+//! it against the pool's closure and the blocks it holds. Action 5 retired with
+//! charge transfer, so it does nothing and decoder-v1 inputs keep their byte
+//! positions.
 //! Weak allocation probes independently read the real payloads and charge owner.
 //! Checks cover completed operations and an explicit drain before pool destruction.
 
@@ -41,6 +43,10 @@ impl<T: ZcashSerialize> PayloadProbe<T> {
 }
 
 const SLOTS: usize = 8;
+
+/// Blocks each pool may retain: two pipeline pools hold three blocks' bytes,
+/// and the count pool holds two blocks.
+const LIMITS: [usize; 3] = [3, 3, 2];
 
 /// One pool's current counters, read after a completed operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +103,7 @@ pub struct RetentionStep {
     pub drain: bool,
     /// Actual counters and allocation reads, absent when capture failed.
     pub actual: Option<RetentionView>,
-    /// State derived from the independent handle graph.
+    /// State derived from the model's handle graph.
     pub expected: RetentionView,
     /// A driver panic or unavailable observation is not a property detection.
     pub capture_error: Option<String>,
@@ -194,24 +200,25 @@ impl Model {
             .count()
     }
 
-    fn admission(&self, pool: usize) -> Result<(), &'static str> {
-        if self.closed[pool] {
-            Err("decoded block pool closed")
-        } else if self.used(pool) >= if pool == 2 { 2 } else { 3 } {
-            Err("decoded block capacity exhausted")
-        } else {
-            Ok(())
-        }
-    }
-
-    fn apply(&mut self, id: usize, op: [u8; 4]) -> String {
+    /// Apply `op`. An admission takes the pool's decision from `observed`, the
+    /// driver's outcome. The expected outcome names a contradiction when the
+    /// pool admitted past its closure or limit, or refused while open with room.
+    fn apply(&mut self, id: usize, op: [u8; 4], observed: &str) -> String {
         let source = usize::from(op[1]) % SLOTS;
         let destination = usize::from(op[2]) % SLOTS;
         let pool = usize::from(op[3]) % 3;
         match op[0] % 7 {
             0 => {
-                if let Err(reason) = self.admission(pool) {
-                    return reason.into();
+                let room = !self.closed[pool] && self.used(pool) < LIMITS[pool];
+                if observed != "applied" {
+                    return if room {
+                        "refused while open with room".into()
+                    } else {
+                        observed.into()
+                    };
+                }
+                if !room {
+                    return "admitted past closure or the limit".into();
                 }
                 self.allocations.insert(id, pool);
                 self.slots[destination] = Some(ModelHandle {
@@ -334,7 +341,7 @@ impl Driver {
     }
 }
 
-/// Run at most 512 causal bytes through production owners and an independent model.
+/// Run at most 512 causal bytes through production owners and a bookkeeping model.
 ///
 /// Operations are admit, clone, retain header, retain transaction, drop, nothing,
 /// and close (opcode modulo seven). Short operations are zero-padded for execution
@@ -354,9 +361,9 @@ pub fn trace_retention_bytes(input: &[u8]) -> Vec<RetentionStep> {
     };
     let mut driver = Driver {
         pools: [
-            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, 3 * bytes),
-            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, 3 * bytes),
-            DecodedBlockPool::for_block_count(NonZeroU64::new(2).unwrap()),
+            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, LIMITS[0] as u64 * bytes),
+            DecodedBlockPool::for_pipeline(NonZeroU64::MAX, LIMITS[1] as u64 * bytes),
+            DecodedBlockPool::for_block_count(NonZeroU64::new(LIMITS[2] as u64).unwrap()),
         ],
         slots: std::array::from_fn(|_| None),
         probes: BTreeMap::new(),
@@ -374,12 +381,6 @@ pub fn trace_retention_bytes(input: &[u8]) -> Vec<RetentionStep> {
             op[..input.len()].copy_from_slice(input);
         }
         let drain = input.is_none();
-        let expected_outcome = if drain {
-            model.slots.fill(None);
-            "drained".into()
-        } else {
-            model.apply(step, op)
-        };
         let observed = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let outcome = if drain {
                 driver.slots.fill(None);
@@ -389,6 +390,16 @@ pub fn trace_retention_bytes(input: &[u8]) -> Vec<RetentionStep> {
             };
             driver.view(outcome)
         }));
+        let expected_outcome = if drain {
+            model.slots.fill(None);
+            "drained".into()
+        } else {
+            let outcome = match &observed {
+                Ok(Ok(view)) => view.outcome.as_str(),
+                _ => "unobserved",
+            };
+            model.apply(step, op, outcome)
+        };
         let (actual, capture_error) = match observed {
             Ok(Ok(view)) => (Some(view), None),
             Ok(Err(error)) => (None, Some(error)),

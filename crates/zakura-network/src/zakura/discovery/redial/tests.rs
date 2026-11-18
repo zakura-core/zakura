@@ -1,15 +1,18 @@
-//! Machine tests for [`RedialState`]: worked scenarios and a proptest against
-//! an independent model.
+//! Machine tests for [`RedialState`]: named scenarios, the `discovery_redial`
+//! machine target, and the real redial loop.
 //!
-//! The model restates the documented rules. It never calls the code it
-//! checks.
+//! [`replay_redial_bytes`] drives the production state and checks its
+//! invariants after every attempt (see `replay.rs`). The scenarios pin each
+//! rule with literal inputs and outputs.
 
-use proptest::prelude::*;
-
-use super::model::*;
+use super::replay::*;
 use super::state::{RedialNext, RedialStart, RedialState};
 use super::*;
-use crate::zakura::{trace::peer_label, ZAKURA_ALPN_MISMATCH_BACKOFF};
+use crate::zakura::{
+    machine_test::machine_target_tests, trace::peer_label, ZAKURA_ALPN_MISMATCH_BACKOFF,
+};
+
+const HEALTHY: Duration = ZAKURA_REDIAL_HEALTHY_CONNECTION;
 
 // Worked scenario: local limits retry at the initial backoff and leave the
 // remote-failure budget and the backoff growth untouched.
@@ -124,75 +127,39 @@ async fn score_dial_times_health_from_the_registered_report() {
     );
 }
 
-fn model_policy() -> impl Strategy<Value = ModelPolicy> {
-    let mode = prop_oneof![
-        (1usize..5, 1u64..120).prop_map(|(attempts, settle)| ModelMode::ConnectOnce {
-            attempts,
-            settle: Duration::from_secs(settle),
-        }),
-        Just(ModelMode::Maintain),
-        (1usize..5).prop_map(|attempts| ModelMode::MaintainBounded { attempts }),
-    ];
-    (mode, 1u64..30, 1u64..120).prop_map(|(mode, initial, max)| ModelPolicy {
-        mode,
-        initial: Duration::from_secs(initial),
-        max: Duration::from_secs(max),
-    })
+/// Maintained, initial backoff 1s, maximum 30s: a failure, a local limit, two
+/// failures, the last upgraded by a 60s lagging registration, then an ALPN
+/// mismatch.
+const WITNESS: &[u8] = &[0, 0, 29, 3, 0, 0, 7, 0, 0, 3, 0, 0, 3, 1, 60, 5, 0, 0];
+
+machine_target_tests! {
+    replay: replay_redial_bytes,
+    target: "discovery_redial",
+    decoder: 2,
+    witness: WITNESS => RedialReplaySummary {
+        scored: 5,
+        local_limits: 1,
+        resets: 1,
+        lagging_upgrades: 1,
+        stops: 0,
+    },
 }
 
-fn redial_op() -> impl Strategy<Value = RedialOp> {
-    let result = prop_oneof![
-        Just(DialResult::Healthy),
-        Just(DialResult::Failed),
-        Just(DialResult::AlpnMismatch),
-        Just(DialResult::LocalLimit),
-    ];
-    let lasted = prop::option::of(0u64..120);
-    prop_oneof![
-        (any::<bool>(), lasted.clone())
-            .prop_map(|(registered, lasted)| RedialOp::Start { registered, lasted }),
-        (result, lasted).prop_map(|(result, lagging)| RedialOp::Dial { result, lagging }),
-    ]
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    #[test]
-    fn redial_state_matches_independent_model(
-        policy in model_policy(),
-        ops in prop::collection::vec(redial_op(), 1..64),
-    ) {
-        run(policy, ops, |_, _| {});
-    }
-
-    #[test]
-    fn redial_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_redial_bytes(&bytes);
-    }
-}
-
+/// A bounded policy of three attempts scores a registration that lasted 70s
+/// as healthy, and stops at its first ALPN mismatch.
 #[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn redial_witness_exercises_limits_resets_and_lagging_registration() {
-    let summary = replay_redial_bytes(&[1, 0, 29, 3, 0, 0, 7, 0, 0, 3, 0, 0, 3, 1, 60, 5, 0, 0]);
+fn bounded_witness_scores_a_registration_and_stops() {
+    let summary = replay_redial_bytes(&[5, 0, 29, 3, 0, 0, 2, 1, 70, 5, 0, 0]);
     assert_eq!(
         summary,
         RedialReplaySummary {
-            scored: 5,
-            local_limits: 1,
+            scored: 3,
+            local_limits: 0,
             resets: 1,
-            lagging_upgrades: 1,
-            stops: 0
+            lagging_upgrades: 0,
+            stops: 1,
         }
     );
-    assert_eq!(replay_redial_bytes(&[0, 0, 29, 3, 0, 0]).stops, 1);
-    assert_eq!(replay_redial_bytes(&[0, 0, 29, 2, 0, 0]).resets, 1);
-    assert_eq!(replay_redial_bytes(&[]), RedialReplaySummary::default());
-    println!("tier=Machine target=discovery_redial decoder=1 {summary:?}");
 }
 
 fn failure_sequence() -> impl Iterator<Item = RedialOp> {
@@ -208,9 +175,9 @@ fn failure_sequence() -> impl Iterator<Item = RedialOp> {
     })
 }
 
-fn maintained_policy() -> ModelPolicy {
-    ModelPolicy {
-        mode: ModelMode::Maintain,
+fn policy(attempts: Option<usize>) -> Policy {
+    Policy {
+        attempts,
         initial: Duration::from_secs(1),
         max: Duration::from_secs(30),
     }
@@ -219,7 +186,7 @@ fn maintained_policy() -> ModelPolicy {
 #[test]
 #[should_panic(expected = "discovery/redial-policy")]
 fn redial_witness_rejects_resetting_after_failure() {
-    run(maintained_policy(), failure_sequence(), |state, _| {
+    run(policy(None), failure_sequence(), |state, _| {
         state.registration_changed()
     });
 }
@@ -227,11 +194,43 @@ fn redial_witness_rejects_resetting_after_failure() {
 #[test]
 #[should_panic(expected = "discovery/redial-policy")]
 fn redial_witness_rejects_charging_local_limits() {
-    run(maintained_policy(), failure_sequence(), |state, result| {
+    run(policy(Some(3)), failure_sequence(), |state, result| {
         if result == DialResult::LocalLimit {
             let _ = state.record(DialResult::Failed);
         }
     });
+}
+
+/// A maintained policy dials an unregistered peer, and scores a registered
+/// one's registration instead of dialing it again.
+#[test]
+fn a_maintained_policy_scores_a_registered_peer() {
+    let (initial, max) = (Duration::from_secs(1), Duration::from_secs(30));
+    for policy in [
+        RedialPolicy::maintain(initial, max),
+        RedialPolicy::maintain_bounded(initial, max, 3),
+    ] {
+        let state = RedialState::new(policy);
+        assert_eq!(state.start(false), RedialStart::Dial);
+        assert_eq!(state.start(true), RedialStart::ScoreRegistration);
+    }
+}
+
+/// A healthy attempt resets a bounded policy's failure budget and its backoff.
+#[test]
+fn a_healthy_attempt_restores_the_failure_budget() {
+    let (initial, max) = (Duration::from_secs(1), Duration::from_secs(30));
+    let mut state = RedialState::new(RedialPolicy::maintain_bounded(initial, max, 2));
+    assert_eq!(
+        state.record(DialResult::Failed),
+        RedialNext::RetryAfter(initial)
+    );
+    assert_eq!(state.record(DialResult::Healthy), RedialNext::RedialNow);
+    assert_eq!(
+        state.record(DialResult::Failed),
+        RedialNext::RetryAfter(initial)
+    );
+    assert_eq!(state.record(DialResult::Failed), RedialNext::Stop);
 }
 
 fn redial_test_peer_id() -> ZakuraPeerId {

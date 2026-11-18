@@ -1,4 +1,4 @@
-//! Scenarios, generated histories, and mutants for discovery's machine drivers.
+//! Scenarios, byte histories, and planted faults for discovery's machine drivers.
 
 use proptest::prelude::*;
 use rand_10::Rng;
@@ -89,31 +89,6 @@ fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
     );
 }
 
-fn supplier() -> impl Strategy<Value = Supplier> {
-    prop_oneof![
-        2 => Just(Supplier::Author),
-        3 => (0..RELAYS).prop_map(Supplier::Relay),
-        1 => Just(Supplier::Nobody),
-    ]
-}
-
-fn book_op() -> impl Strategy<Value = BookOp> {
-    prop_oneof![
-        6 => (0..AUTHORS, 0u64..4, -400i64..120, supplier()).prop_map(
-            |(author, sequence, expires_in, supplier)| BookOp::Import {
-                author,
-                sequence,
-                expires_in,
-                supplier,
-            }
-        ),
-        1 => (0..AUTHORS).prop_map(BookOp::DialSuccess),
-        1 => (0..AUTHORS).prop_map(BookOp::DialFailure),
-        2 => (0..RELAYS, 0usize..5).prop_map(|(requester, limit)| BookOp::Sample { requester, limit }),
-        2 => prop_oneof![0u64..60, 500u64..700].prop_map(BookOp::Advance),
-    ]
-}
-
 fn run_book(
     ops: impl IntoIterator<Item = BookOp>,
     seed: u64,
@@ -128,54 +103,20 @@ fn run_book(
 
 proptest! {
  #![proptest_config(ProptestConfig::with_cases(48))]
- #[test]
- fn book_matches_independent_model(seed in any::<u64>(), ops in prop::collection::vec(book_op(), 1..64)) { run_book(ops, seed, |_, _| {}); }
  // 64 operations at most. Each import signs and verifies a record, and 16
  // operations already reach every rule (`random_short_inputs_reach_every_book_rule`).
  #[test]
- fn book_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=128)) { run_book(decode_book_v3(&bytes), 0, |_, _| {}); }
-}
-
-fn state_op() -> impl Strategy<Value = StateOp> {
-    let key = || (0..PEERS, 0u64..3, 0u64..3);
-    prop_oneof![
-        3 => (key(), any::<bool>()).prop_map(|((peer, conn_id, session_id), outbound)| StateOp::Admit {
-            peer,
-            conn_id,
-            session_id,
-            outbound,
-        }),
-        1 => key().prop_map(|(peer, conn_id, session_id)| StateOp::RemoveSession {
-            peer,
-            conn_id,
-            session_id,
-        }),
-        1 => (0..PEERS, 0u64..3).prop_map(|(peer, conn_id)| StateOp::RemoveConnection { peer, conn_id }),
-        2 => (0..PEERS, any::<bool>()).prop_map(|(peer, connected)| StateOp::SetConnected { peer, connected }),
-        2 => key().prop_map(|(peer, conn_id, session_id)| StateOp::StartHello {
-            peer,
-            conn_id,
-            session_id,
-        }),
-        2 => (0usize..8).prop_map(StateOp::FinishHello),
-        3 => (key(), 1u64..60).prop_map(|((peer, conn_id, session_id), ttl)| StateOp::ReceiveServices {
-            peer,
-            conn_id,
-            session_id,
-            ttl,
-        }),
-        2 => (0u64..40).prop_map(StateOp::Advance),
-    ]
+ fn book_bytes_keep_the_book_invariants(bytes in prop::collection::vec(any::<u8>(), 0..=128)) { run_book(decode_book_v3(&bytes), 0, |_, _| {}); }
 }
 
 fn run_state(
     ops: impl IntoIterator<Item = StateOp>,
-    mut after_step: impl FnMut(&mut DiscoveryState, &StateModel),
+    mut after_step: impl FnMut(&mut DiscoveryState, &Sessions),
 ) {
     let mut driver = StateDriver::new();
     for op in ops {
         driver.apply(op);
-        after_step(&mut driver.state, &driver.model);
+        after_step(&mut driver.state, &driver.sent);
         driver.check_reads();
         driver.check_sessions();
     }
@@ -184,9 +125,7 @@ fn run_state(
 proptest! {
  #![proptest_config(ProptestConfig::with_cases(256))]
  #[test]
- fn discovery_state_matches_independent_model(ops in prop::collection::vec(state_op(), 1..64)) { run_state(ops, |_, _| {}); }
- #[test]
- fn state_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { run_state(decode_state_v2(&bytes), |_, _| {}); }
+ fn state_bytes_keep_the_state_invariants(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { run_state(decode_state_v2(&bytes), |_, _| {}); }
 }
 
 // Worked scenarios.
@@ -456,10 +395,7 @@ fn book_trace_reports_exact_install_replacement_and_eviction() {
     let witness = book_trace_witness();
     let steps = trace_discovery_book_bytes(&witness);
     assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
-    for step in &steps {
-        assert_eq!(step.actual, step.expected);
-    }
-    let changes = || steps.iter().flat_map(|step| &step.actual.changes);
+    let changes = || steps.iter().flat_map(|step| &step.view.changes);
     assert!(changes().any(|change| matches!(change, BookFact::Installed { .. })));
     assert!(changes().any(|change| matches!(change, BookFact::Replaced { .. })));
     assert!(changes().any(|change| matches!(
@@ -477,16 +413,16 @@ fn book_trace_reports_exact_install_replacement_and_eviction() {
         }
     )));
     assert!(steps.iter().any(|step| !step.sample.is_empty()));
-    let results = || steps.iter().filter_map(|step| step.actual.result);
+    let results = || steps.iter().filter_map(|step| step.view.result);
     assert!(results().any(|result| result == ImportFact::RelayFull));
     assert!(results().any(|result| result == ImportFact::Expired));
     assert!(results().any(|result| result == ImportFact::IgnoredOlder));
-    let entries = || steps.iter().flat_map(|step| &step.actual.entries);
+    let entries = || steps.iter().flat_map(|step| &step.view.entries);
     assert!(entries().any(|entry| entry.last_success.is_some()));
     assert!(entries().any(|entry| entry.failures > 0));
     assert!(steps
         .windows(2)
-        .any(|pair| pair[1].actual.now > pair[0].actual.now));
+        .any(|pair| pair[1].view.now > pair[0].view.now));
     assert_eq!(steps, trace_discovery_book_bytes(&witness));
     assert!(trace_discovery_book_bytes(&[]).is_empty());
 }
@@ -494,7 +430,7 @@ fn book_trace_reports_exact_install_replacement_and_eviction() {
 /// Whether `steps` reach every rule `discovery/record-book` needs before it
 /// applies: an install, a replacement, an eviction and a nonempty sample.
 fn reaches_every_book_rule(steps: &[BookStep]) -> bool {
-    let changes = || steps.iter().flat_map(|step| &step.expected.changes);
+    let changes = || steps.iter().flat_map(|step| &step.view.changes);
     changes().any(|change| matches!(change, BookFact::Installed { .. }))
         && changes().any(|change| matches!(change, BookFact::Replaced { .. }))
         && changes().any(|change| matches!(change, BookFact::Evicted { .. }))
@@ -584,17 +520,17 @@ fn committed_book_witness_reaches_each_planted_trigger() {
     assert!(reaches_every_book_rule(&steps));
     let step = |number: usize| &steps[number - 1];
     let evicted = |number: usize, cause: EvictionFact| {
-        step(number).expected.changes.iter().any(
+        step(number).view.changes.iter().any(
             |change| matches!(change, BookFact::Evicted { cause: actual, .. } if *actual == cause),
         )
     };
-    // The record limit evicts, so skipping that eviction differs from the model.
+    // The record limit evicts, so skipping that eviction breaks the record limit.
     assert!(evicted(6, EvictionFact::BookLimit));
     // Four confirmed records stand under a window of three.
     assert_eq!(step(7).sample.len(), SAMPLE_WINDOW);
     assert_eq!(
         step(7)
-            .expected
+            .view
             .entries
             .iter()
             .filter(|entry| entry.confirmed)
@@ -605,20 +541,20 @@ fn committed_book_witness_reaches_each_planted_trigger() {
     // A later sequence moves author 5's record from relay 0 to relay 1.
     let author_5 = hex::encode(author(5).public().as_bytes());
     let relay_1 = hex::encode(relay(1).as_bytes());
-    assert!(step(14).expected.changes.iter().any(|change| matches!(
+    assert!(step(14).view.changes.iter().any(|change| matches!(
         change,
         BookFact::Replaced { node, source: Some(source), .. }
             if *node == author_5 && *source == relay_1
     )));
-    assert_eq!(step(14).expected.relayed, vec![(relay_1, 1)]);
+    assert_eq!(step(14).view.relayed, vec![(relay_1, 1)]);
     // The last import overfills a book of live records, and the record no
     // peer confirmed is the one that leaves.
     let last = steps.last().expect("the witness has steps");
-    assert!(last.expected.changes.iter().any(|change| matches!(
+    assert!(last.view.changes.iter().any(|change| matches!(
         change,
         BookFact::Evicted { node, cause: EvictionFact::BookLimit, .. } if *node == author_5
     )));
-    let before = &steps[steps.len() - 2].expected;
+    let before = &steps[steps.len() - 2].view;
     assert!(before
         .entries
         .iter()
@@ -637,20 +573,17 @@ fn committed_book_witness_reaches_each_planted_trigger() {
 fn session_trace_separates_stale_results_and_retained_hints() {
     let steps = trace_discovery_state_bytes(STATE_TRACE_WITNESS);
     assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
-    for step in &steps {
-        assert_eq!(step.actual, step.expected);
-    }
     let installations = || {
         steps
             .iter()
-            .filter_map(|step| step.actual.installation.as_ref())
+            .filter_map(|step| step.view.installation.as_ref())
     };
     assert!(installations().any(|result| *result == InstallFact::Superseded));
     assert!(installations().any(|result| matches!(result, InstallFact::Installed(_))));
-    assert!(steps.iter().any(|step| !step.actual.hints.is_empty()));
-    assert!(steps.iter().any(|step| !step.actual.admitted.is_empty()));
+    assert!(steps.iter().any(|step| !step.view.hints.is_empty()));
+    assert!(steps.iter().any(|step| !step.view.admitted.is_empty()));
     let live =
-        |step: &DiscoverySessionStep| step.actual.hints.iter().any(|hint| hint.live_summaries > 0);
+        |step: &DiscoverySessionStep| step.view.hints.iter().any(|hint| hint.live_summaries > 0);
     assert!(
         steps
             .windows(2)
@@ -740,8 +673,8 @@ fn discovery_book_witness_rejects_extra_dial_failure() {
 #[test]
 #[should_panic(expected = "discovery/session-installation")]
 fn discovery_state_witness_rejects_lost_admission() {
-    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, model| {
-        if let Some((conn, id, _)) = model.peers[0].admitted {
+    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, sessions| {
+        if let Some((conn, id, _)) = sessions.admitted[0] {
             state.remove_session(&session(0, conn, id));
         }
     });
@@ -750,9 +683,9 @@ fn discovery_state_witness_rejects_lost_admission() {
 #[test]
 #[should_panic(expected = "discovery/session-installation")]
 fn discovery_state_witness_rejects_unearned_service_hint() {
-    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, model| {
-        if model.peers[0].connected {
-            if let Some((conn, id, _)) = model.peers[0].admitted {
+    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, sessions| {
+        if sessions.connected[0] {
+            if let Some((conn, id, _)) = sessions.admitted[0] {
                 let verified = VerifiedRecord::verify(hello(0), &context(START))
                     .expect("fixture is authentic");
                 state

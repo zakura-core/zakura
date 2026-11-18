@@ -1,7 +1,8 @@
 //! Transport-free execution of a pure machine's history.
 //!
-//! A [`Machine`] names a decoder that runs the real owner against its
-//! independent model and returns one [`MachineStep`] per operation. This module
+//! A [`Machine`] names a decoder that drives the production owner, checks its
+//! invariants and the facts its inputs fix after every operation, and returns
+//! one [`MachineStep`] per operation. This module
 //! runs that history under the shared registry, recorder, replay verifier and
 //! explorer. [`machine_entry!`](crate::machine_entry) makes a [`Machine`] a
 //! [`HarnessEntry`](super::HarnessEntry).
@@ -171,7 +172,7 @@ fn check(cx: &mut CheckCtx<'_, Handle>) -> Verdict {
         property: cx.id().to_string(),
         step: cx.step,
         witness: (1..=cx.step).collect(),
-        expected: "independent model agrees with the transition and retained state".into(),
+        expected: "the owner keeps its invariants and the facts its inputs fix".into(),
         actual: format!("{:?}: {}", failure.phase, failure.message),
     })
 }

@@ -768,6 +768,11 @@ def cmd_blast(args) -> int:
     # Passed only when asked for, so an older Kresko still runs the Orchard load.
     if args.load == "transparent":
         cmd += ["--load", "transparent", "--transparent-lanes", str(args.transparent_lanes)]
+        # Each premine key holds one 10 ZEC coinbase output, so lanes draw on every
+        # key's premine, not just node 0's. Passed by path; keys never leave the box.
+        keys = lab / "payload" / "local_genesis" / "funded_keys.json"
+        if keys.is_file():
+            cmd += ["--transparent-source-keys", str(keys)]
     print(f"+ {' '.join(cmd)}", flush=True)
     # Same upgrade the chain was generated with -- see cmd_genesis.
     upgrade_file = lab / "latest-upgrade"

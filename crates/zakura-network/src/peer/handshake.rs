@@ -42,6 +42,7 @@ use crate::{
     inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
+        error::serialization_error_metric_label,
         gossip_trace::{LegacyGossipTrace, PeerGossipTrace},
         AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
         ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
@@ -999,11 +1000,11 @@ where
             "disconnecting from peer with obsolete network protocol version",
         );
 
-        // Handshake rejects by protocol version. Not labeled by peer address or
-        // user-agent: the Prometheus exporter never prunes series.
+        // Handshake rejects by the minimum version this node required. Not labeled
+        // by peer address, user-agent or the peer's own version: the peer chooses
+        // those, and the Prometheus exporter never prunes series.
         metrics::counter!(
             "zcash.net.peers.obsolete",
-            "remote_version" => remote.version.to_string(),
             "min_version" => min_version.to_string(),
         )
         .increment(1);
@@ -1034,19 +1035,6 @@ where
         "negotiated network protocol version with peer",
     );
 
-    // Handshake count by protocol version. Not labeled by peer address or
-    // user-agent: the Prometheus exporter never prunes series.
-    metrics::counter!(
-        "zcash.net.peers.connected",
-        "remote_version" => connection_info.remote.version.to_string(),
-        "negotiated_version" => negotiated_version.to_string(),
-        "min_version" => min_version.to_string(),
-    )
-    .increment(1);
-
-    metrics::gauge!("zcash.net.peers.version.connected")
-        .set(connection_info.remote.version.0 as f64);
-
     peer_conn.send(Message::Verack).await?;
 
     let mut remote_msg = peer_conn
@@ -1070,6 +1058,20 @@ where
             }
         }
     }
+
+    // Completed handshakes by negotiated version, which is clamped to the range
+    // from `min_version` to this node's version. Not labeled by peer address,
+    // user-agent or the peer's own version: the peer chooses those, and the
+    // Prometheus exporter never prunes series.
+    metrics::counter!(
+        "zcash.net.peers.connected",
+        "negotiated_version" => negotiated_version.to_string(),
+        "min_version" => min_version.to_string(),
+    )
+    .increment(1);
+
+    metrics::gauge!("zcash.net.peers.version.connected")
+        .set(connection_info.remote.version.0 as f64);
 
     Ok(connection_info)
 }
@@ -2039,24 +2041,6 @@ where
                 },
             )
             .boxed()
-    }
-}
-
-/// Returns a bounded serialization error label without error details.
-fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
-    match error {
-        SerializationError::Io(_) => "io",
-        SerializationError::Parse(_) => "parse",
-        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
-        SerializationError::Utf8Error(_) => "utf8_error",
-        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
-        SerializationError::TryFromIntError(_) => "try_from_int_error",
-        SerializationError::FromHexError(_) => "from_hex_error",
-        SerializationError::Amount { .. } => "amount",
-        SerializationError::BadTransactionBalance => "bad_transaction_balance",
-        SerializationError::Script(_) => "script",
-        SerializationError::Opcode(_) => "opcode",
-        SerializationError::Num(_) => "num",
     }
 }
 

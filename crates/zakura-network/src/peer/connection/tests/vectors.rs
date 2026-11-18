@@ -5,7 +5,7 @@
 //!   - inbound message, but not a request (or a response)
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::Arc,
     task::Poll,
     time::{Duration, Instant},
@@ -20,7 +20,11 @@ use indexmap::IndexSet;
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::{block, serialization::SerializationError};
+use zakura_chain::{
+    amount::{Amount, NonNegative},
+    block,
+    serialization::SerializationError,
+};
 use zakura_node_services::block_memory::BlockHandle;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -31,6 +35,7 @@ use crate::{
     },
     peer::{
         connection::{overload_drop_connection_probability, Connection, Handler, State},
+        test_metrics::SeriesRecorder,
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
@@ -666,6 +671,41 @@ async fn connection_run_loop_inbound_drop() {
     std::mem::drop(connection_guard);
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+/// A peer chooses the amounts in the transactions it sends, and an invalid amount
+/// fails the connection with an error that quotes it. The final connection state
+/// label names the kind of error only, so peers that send different invalid
+/// amounts share one `zakura.net.connection.state` series.
+#[tokio::test]
+async fn failed_connection_state_series_ignore_error_details() {
+    let _init_guard = zakura_test::init();
+
+    let final_state_series = |invalid_amount: i64| {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (mut connection, _client_tx, _inbound_service, _peer_outbound_messages, error_slot) =
+            new_test_connection();
+
+        let amount_error = Amount::<NonNegative>::try_from(invalid_amount)
+            .expect_err("negative amounts are outside the non-negative range");
+        connection.state = State::Failed;
+        error_slot
+            .try_update_error(PeerError::from(SerializationError::from(amount_error)).into())
+            .expect("unexpected previous error in tests");
+
+        let recorder = SeriesRecorder::default();
+        let result = recorder.record(|| connection.run(peer_rx).now_or_never());
+        assert_eq!(result, Some(()));
+
+        recorder.series("zakura.net.connection.state")
+    };
+
+    let expected = BTreeSet::from([
+        "zakura.net.connection.state{command=Failed}".to_string(),
+        "zakura.net.connection.state{command=Failed::Serialization(amount)}".to_string(),
+    ]);
+    assert_eq!(final_state_series(-1), expected);
+    assert_eq!(final_state_series(-2), expected);
 }
 
 /// Test that the connection run loop fails correctly on internal connection errors.

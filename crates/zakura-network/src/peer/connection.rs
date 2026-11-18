@@ -1196,7 +1196,9 @@ where
             "closing connections must call fail_with() or shutdown() to set the error slot"
         );
 
-        self.update_state_metrics(error.expect("checked is_some").to_string());
+        // Label the final state with the error's kind, not its message: the message
+        // can carry values the peer chose, and the exporter keeps every series.
+        self.update_state_metrics(error.expect("checked is_some").kind().into_owned());
     }
 
     /// Fail this connection, log the failure, and shut it down.

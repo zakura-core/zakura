@@ -281,9 +281,9 @@
       "targets": [
         {
           "exemplar": true,
-          "expr": "sum by (remote_version) (zcash_net_peers_connected{job=\"$job\"})",
+          "expr": "sum by (negotiated_version) (zcash_net_peers_connected{job=\"$job\"})",
           "interval": "",
-          "legendFormat": "{{remote_version}}",
+          "legendFormat": "{{negotiated_version}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -381,9 +381,9 @@
       "targets": [
         {
           "exemplar": true,
-          "expr": "sum by (remote_version) (zcash_net_peers_obsolete{job=\"$job\"})",
+          "expr": "sum by (min_version) (zcash_net_peers_obsolete{job=\"$job\"})",
           "interval": "",
-          "legendFormat": "{{remote_version}}",
+          "legendFormat": "{{min_version}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",

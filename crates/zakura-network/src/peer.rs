@@ -13,6 +13,8 @@ mod load_tracked_client;
 mod minimum_peer_version;
 mod priority;
 pub(crate) mod tcp_warmup;
+#[cfg(test)]
+mod test_metrics;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]

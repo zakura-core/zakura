@@ -67,6 +67,11 @@ impl SharedPeerError {
         format!("{:?}", self.0.as_ref())
     }
 
+    /// Returns the inner [`PeerError`]'s variant as a metric label, see [`PeerError::kind`].
+    pub fn kind(&self) -> Cow<'static, str> {
+        self.0.kind()
+    }
+
     /// The `notfound`-style classification of this error, computed at construction.
     ///
     /// Returns `None` for errors that aren't a `notfound`-style failure.
@@ -184,7 +189,10 @@ pub enum PeerError {
 }
 
 impl PeerError {
-    /// Returns the Zebra internal handler type as a string.
+    /// Returns the error variant as a metric label.
+    ///
+    /// The label leaves out the error's details, which a peer can choose, so the
+    /// set of labels is fixed.
     pub fn kind(&self) -> Cow<'static, str> {
         match self {
             PeerError::ConnectionClosed => "ConnectionClosed".into(),
@@ -195,8 +203,9 @@ impl PeerError {
             PeerError::ConnectionTaskExited => "ConnectionTaskExited".into(),
             PeerError::ConnectionSendTimeout => "ConnectionSendTimeout".into(),
             PeerError::ConnectionReceiveTimeout => "ConnectionReceiveTimeout".into(),
-            // TODO: add error kinds or summaries to `SerializationError`
-            PeerError::Serialization(inner) => format!("Serialization({inner})").into(),
+            PeerError::Serialization(inner) => {
+                format!("Serialization({})", serialization_error_metric_label(inner)).into()
+            }
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
@@ -206,6 +215,24 @@ impl PeerError {
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),
             PeerError::NotFoundRegistry(_) => "NotFoundRegistry".into(),
         }
+    }
+}
+
+/// Returns a bounded serialization error label without error details.
+pub(super) fn serialization_error_metric_label(error: &SerializationError) -> &'static str {
+    match error {
+        SerializationError::Io(_) => "io",
+        SerializationError::Parse(_) => "parse",
+        SerializationError::NonCanonicalShieldedProofSize => "non_canonical_shielded_proof_size",
+        SerializationError::Utf8Error(_) => "utf8_error",
+        SerializationError::TryFromSliceError(_) => "try_from_slice_error",
+        SerializationError::TryFromIntError(_) => "try_from_int_error",
+        SerializationError::FromHexError(_) => "from_hex_error",
+        SerializationError::Amount { .. } => "amount",
+        SerializationError::BadTransactionBalance => "bad_transaction_balance",
+        SerializationError::Script(_) => "script",
+        SerializationError::Opcode(_) => "opcode",
+        SerializationError::Num(_) => "num",
     }
 }
 

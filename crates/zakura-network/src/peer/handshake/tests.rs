@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -13,6 +13,7 @@ use std::{
 
 use super::*;
 use crate::{
+    peer::test_metrics::SeriesRecorder,
     peer_set::ActiveConnectionCounter,
     zakura::{
         Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
@@ -54,6 +55,121 @@ fn serialization_error_metric_labels_ignore_details() {
         assert_eq!(
             serialization_error_metric_label(&SerializationError::Parse(detail)),
             "parse",
+        );
+    }
+}
+
+/// Runs a handshake with a peer that offers `remote_version`, and returns the
+/// metric series the handshake created.
+///
+/// The peer answers with `verack` only if `completes_handshake` is true.
+/// Otherwise it closes the connection after its `version` message.
+fn handshake_series(remote_version: Version, completes_handshake: bool) -> SeriesRecorder {
+    let config = Config::default();
+    let codec = || Codec::builder().for_network(&config.network).finish();
+    let (local_stream, remote_stream) = duplex(16 * 1024);
+    let mut local_conn = Framed::new(local_stream, codec());
+    let mut remote_conn = Framed::new(remote_stream, codec());
+
+    let services = config.handshake_services(PeerServices::NODE_NETWORK);
+    let min_version = MinimumPeerVersion::new(NoChainTip, &config.network);
+    let addr = ConnectedAddr::new_outbound_direct(peer_addr(18233));
+
+    let local = negotiate_version(
+        &mut local_conn,
+        &addr,
+        config.clone(),
+        Arc::new(futures::lock::Mutex::new(IndexSet::new())),
+        TEST_LOCAL_USER_AGENT.to_string(),
+        services,
+        true,
+        min_version,
+        false,
+    );
+
+    let remote = async move {
+        let Some(Ok(Message::Version(mut version))) = remote_conn.next().await else {
+            panic!("the handshake starts with a version message");
+        };
+        version.version = remote_version;
+        // A repeated nonce would be rejected as a self-connection.
+        version.nonce = Nonce::default();
+        remote_conn.send(Message::Version(version)).await.unwrap();
+
+        if !completes_handshake {
+            return None;
+        }
+        remote_conn.send(Message::Verack).await.unwrap();
+
+        // Keep the connection open while the local node sends its own `verack`.
+        Some(remote_conn)
+    };
+
+    let recorder = SeriesRecorder::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (negotiated, _open_conn) =
+        recorder.record(|| runtime.block_on(future::join(local, remote)));
+    assert_eq!(
+        negotiated.is_ok(),
+        completes_handshake && remote_version >= min_peer_version(),
+    );
+
+    recorder
+}
+
+/// The minimum peer version of the default test network without a chain tip.
+fn min_peer_version() -> Version {
+    MinimumPeerVersion::new(NoChainTip, &Config::default().network).current()
+}
+
+/// A peer chooses the version it offers, so the offered version is not a metric
+/// label. Peers that offer different versions above ours negotiate our version,
+/// and share one `zcash.net.peers.connected` series.
+#[test]
+fn connected_peer_series_ignore_offered_version() {
+    let newer = Version(constants::CURRENT_NETWORK_PROTOCOL_VERSION.0 + 1);
+    let expected = BTreeSet::from([format!(
+        "zcash.net.peers.connected{{negotiated_version={},min_version={}}}",
+        constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        min_peer_version(),
+    )]);
+
+    for offered in [newer, Version(u32::MAX)] {
+        assert_eq!(
+            handshake_series(offered, true).series("zcash.net.peers.connected"),
+            expected,
+        );
+    }
+}
+
+/// A peer that never answers with `verack` has not connected, so it creates no
+/// `zcash.net.peers.connected` series.
+#[test]
+fn unfinished_handshake_creates_no_connected_peer_series() {
+    let recorder = handshake_series(constants::CURRENT_NETWORK_PROTOCOL_VERSION, false);
+
+    assert_eq!(
+        recorder.series("zcash.net.peers.connected"),
+        BTreeSet::new()
+    );
+}
+
+/// Peers that offer different obsolete versions share one
+/// `zcash.net.peers.obsolete` series.
+#[test]
+fn obsolete_peer_series_ignore_offered_version() {
+    let expected = BTreeSet::from([format!(
+        "zcash.net.peers.obsolete{{min_version={}}}",
+        min_peer_version(),
+    )]);
+
+    for offered in [Version(0), Version(min_peer_version().0 - 1)] {
+        assert_eq!(
+            handshake_series(offered, true).series("zcash.net.peers.obsolete"),
+            expected,
         );
     }
 }

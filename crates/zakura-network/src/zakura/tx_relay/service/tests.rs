@@ -327,96 +327,117 @@ async fn apply_calls(session: &mut Session, last: fn(&PoolResult) -> bool) {
 /// its session runs, as a pinned name's joins once a connection proves the
 /// name's node ID. A body keeps the exemption its supplier had when it
 /// arrived. One that arrived while the address was listed is never charged,
-/// even if the address leaves before the verdict, so the rejection that bans
-/// an ordinary supplier leaves the peer connected. One that arrived while
-/// the address was not listed is charged, even if the address joins.
-#[tokio::test]
-async fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
-    for listed in [false, true] {
-        let mut pool = transactions(2);
-        let supplied = pool.pop().expect("two transactions").transaction;
-        let (id, size) = (
-            supplied.id(),
-            u32::try_from(supplied.size()).expect("a test body is small"),
-        );
-        let (handle, mut inbox) = pool_port();
-        publish(&inbox, vec![Change::Added(pool[0].transaction.id())], pool);
-        let (mut wiring, _handed) = wiring(handle);
-        let unconditional =
-            toml::from_str::<crate::config::Config>("unconditional_peers = ['a.example.com:8233']")
-                .expect("a valid config")
-                .unconditional_peers;
-        wiring.unconditional = unconditional.clone();
-        let mut session = Session::open(&wiring);
-        session
-            .deliver(TxRelayMessage::Hello {
-                serves: 16,
-                max_tx_bytes: MAX_TX_BYTES,
-            })
-            .await;
-        session.deliver(TxRelayMessage::Inv(vec![(id, size)])).await;
+/// even if the address leaves while the body decodes, so the rejection that
+/// bans an ordinary supplier leaves the peer connected. One that arrived
+/// while the address was not listed is charged, even if the address joins.
+#[test]
+fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
+    // The runtime has one blocking thread, so holding it holds a decode.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("a test runtime builds");
+    runtime.block_on(async {
+        for listed in [false, true] {
+            let mut pool = transactions(2);
+            let supplied = pool.pop().expect("two transactions").transaction;
+            let (id, size) = (
+                supplied.id(),
+                u32::try_from(supplied.size()).expect("a test body is small"),
+            );
+            let (handle, mut inbox) = pool_port();
+            publish(&inbox, vec![Change::Added(pool[0].transaction.id())], pool);
+            let (mut wiring, _handed) = wiring(handle);
+            let unconditional = toml::from_str::<crate::config::Config>(
+                "unconditional_peers = ['a.example.com:8233']",
+            )
+            .expect("a valid config")
+            .unconditional_peers;
+            wiring.unconditional = unconditional.clone();
+            let mut session = Session::open(&wiring);
+            session
+                .deliver(TxRelayMessage::Hello {
+                    serves: 16,
+                    max_tx_bytes: MAX_TX_BYTES,
+                })
+                .await;
+            session.deliver(TxRelayMessage::Inv(vec![(id, size)])).await;
 
-        // The core grants the fetch.
-        let grant = async {
-            let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
-                panic!("the session reserves the id it was offered");
+            // The core grants the fetch.
+            let grant = async {
+                let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
+                    panic!("the session reserves the id it was offered");
+                };
+                let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());
+                let _ = reply.send(Ok(reservation));
             };
-            let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());
-            let _ = reply.send(Ok(reservation));
-        };
-        let reserved = apply_calls(&mut session, |result| {
-            matches!(result, PoolResult::Reserved { .. })
-        });
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            futures::future::join(reserved, grant),
-        )
-        .await
-        .expect("the reservation is granted");
+            let reserved = apply_calls(&mut session, |result| {
+                matches!(result, PoolResult::Reserved { .. })
+            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::future::join(reserved, grant),
+            )
+            .await
+            .expect("the reservation is granted");
 
-        // The address joins the list after the session opened.
-        if listed {
-            unconditional.set_resolved_ip(0, Some(peer_ip()));
-        }
-        let body = supplied
-            .transaction()
-            .zcash_serialize_to_vec()
-            .expect("a valid transaction serializes");
-        session.deliver(TxRelayMessage::Tx { id, body }).await;
+            // The address joins the list after the session opened.
+            if listed {
+                unconditional.set_resolved_ip(0, Some(peer_ip()));
+            }
 
-        // Before the verdict, the address leaves the list if it was on it
-        // and joins if it was not.
-        unconditional.set_resolved_ip(0, (!listed).then(peer_ip));
+            // The body arrives while the blocking thread is held, so the routine
+            // takes it and waits on its decode.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let hold = tokio::task::spawn_blocking(move || held.recv());
+            let body = supplied
+                .transaction()
+                .zcash_serialize_to_vec()
+                .expect("a valid transaction serializes");
+            let mut delivery = Box::pin(session.deliver(TxRelayMessage::Tx { id, body }));
+            assert!(
+                futures::poll!(&mut delivery).is_pending(),
+                "the body waits on its decode"
+            );
 
-        // The core rejects the body with the charge that bans its supplier.
-        let reject = async {
-            let Some(PoolCommand::Submit { reply, .. }) = inbox.next().await else {
-                panic!("the session submits the body");
+            // While the body decodes, the address leaves the list if it was on
+            // it and joins if it was not. It stays that way through the verdict.
+            unconditional.set_resolved_ip(0, (!listed).then(peer_ip));
+            drop(release);
+            delivery.await;
+            let _ = hold.await;
+
+            // The core rejects the body with the charge that bans its supplier.
+            let reject = async {
+                let Some(PoolCommand::Submit { reply, .. }) = inbox.next().await else {
+                    panic!("the session submits the body");
+                };
+                let _ = reply.send(PortVerdict::Rejected(Rejection {
+                    scope: RejectionScope::Uncached,
+                    charge: Charge::Ban,
+                    tip: block::Height(0),
+                    detail: Arc::new(std::io::Error::other("an invalid transaction")),
+                }));
             };
-            let _ = reply.send(PortVerdict::Rejected(Rejection {
-                scope: RejectionScope::Uncached,
-                charge: Charge::Ban,
-                tip: block::Height(0),
-                detail: Arc::new(std::io::Error::other("an invalid transaction")),
-            }));
-        };
-        let decided = apply_calls(&mut session, |result| {
-            matches!(result, PoolResult::Verdict { .. })
-        });
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            futures::future::join(decided, reject),
-        )
-        .await
-        .expect("the verdict arrives");
+            let decided = apply_calls(&mut session, |result| {
+                matches!(result, PoolResult::Verdict { .. })
+            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::future::join(decided, reject),
+            )
+            .await
+            .expect("the verdict arrives");
 
-        let cause = session.cause.get();
-        if listed {
-            assert_eq!(cause, None, "an unconditional supplier is never charged");
-        } else {
-            assert_eq!(cause, Some("tx-relay: banned transaction"));
+            let cause = session.cause.get();
+            if listed {
+                assert_eq!(cause, None, "an unconditional supplier is never charged");
+            } else {
+                assert_eq!(cause, Some("tx-relay: banned transaction"));
+            }
         }
-    }
+    });
 }
 
 /// A connection whose last session ended stays owned through the

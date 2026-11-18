@@ -898,7 +898,11 @@ where
         biased;
         result = &mut checks => result,
         _ = tokio::time::sleep_until(window.started() + zn::BlockHedge::WINDOW) => {
-            if window.close() { checks.await } else { Err(zn::NoFasterBlockSource::default().into()) }
+            if window.close() {
+                checks.await
+            } else {
+                Err(zn::NoFasterBlockSource::default().into())
+            }
         }
     }
 }

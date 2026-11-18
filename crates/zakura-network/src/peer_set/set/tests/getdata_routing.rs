@@ -1817,7 +1817,7 @@ async fn hedge_wakes_for_a_busy_announcers_transaction_reply_without_other_traff
     near.peer_inbound.send(Ok(Message::Tx(tx))).await.unwrap();
     reply.await.unwrap();
     assert!(idle.await);
-    let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+    let _second = tokio::spawn(network.clone().oneshot(Request::BlockByHashHedge {
         hash: BLOCK_HASH,
         attempt: attempt.clone(),
     }));
@@ -1870,7 +1870,7 @@ async fn hedge_rechecks_at_the_overdue_and_stall_deadlines_without_polling() {
             tokio::time::advance(Duration::from_millis(1)).await;
             assert!(change.await);
         }
-        let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+        let _second = tokio::spawn(network.clone().oneshot(Request::BlockByHashHedge {
             hash: BLOCK_HASH,
             attempt: attempt.clone(),
         }));
@@ -1902,7 +1902,7 @@ async fn hedge_wakes_when_an_idle_announcer_acquires_a_fast_score() {
     let changed = wait_for_candidate(&mut network, &attempt).await;
     samples.record_response(Duration::from_millis(5));
     assert!(changed.await);
-    let _second = tokio::spawn(network.oneshot(Request::BlockByHashHedge {
+    let _second = tokio::spawn(network.clone().oneshot(Request::BlockByHashHedge {
         hash: BLOCK_HASH,
         attempt: attempt.clone(),
     }));
@@ -1911,4 +1911,52 @@ async fn hedge_wakes_when_an_idle_announcer_acquires_a_fast_score() {
         Some(Message::GetData(vec![BLOCK_HASH.into()]))
     );
     assert_eq!(tokio::time::Instant::now(), attempt.started());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_first_request_wakes_a_wait_for_the_same_block() {
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _far = measured_peer(&mut far, &registry, Some(242));
+    let _near = measured_peer(&mut near, &registry, Some(5));
+    let (mut peers, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+    announce_block(&mut peers, &mut guard, &far).await;
+    // The preceding download already sent both requests. Its record outlives its caller.
+    peers
+        .first_block_requests
+        .insert(BLOCK_HASH, far.addr, None, std::time::Instant::now());
+    peers
+        .first_block_requests
+        .get_mut(&BLOCK_HASH)
+        .unwrap()
+        .second_sent = true;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let declined = peers
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt: attempt.clone(),
+        })
+        .await
+        .unwrap_err()
+        .downcast::<crate::NoFasterBlockSource>()
+        .unwrap();
+    let _new_first = request_block(&mut peers).await;
+    assert_eq!(declined.wait_for_change().now_or_never(), Some(true));
+    announce_block(&mut peers, &mut guard, &near).await;
+    let _second = peers
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashHedge {
+            hash: BLOCK_HASH,
+            attempt,
+        });
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
 }

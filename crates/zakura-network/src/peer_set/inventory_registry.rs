@@ -237,6 +237,7 @@ impl InventoryRegistry {
         }
     }
 
+    /// Register one download for changes to the set of other available announcers.
     pub(super) fn watch_block(
         &mut self,
         hash: block::Hash,
@@ -266,6 +267,7 @@ impl InventoryRegistry {
         self.watches.retain(|watch| watch.hash != hash);
     }
 
+    /// Wake the downloads for which this connection has advertised the block.
     pub(super) fn peer_became_ready(&mut self, addr: PeerSocketAddr) {
         self.watches.retain(|watch| {
             let inv = InventoryHash::Block(watch.hash);

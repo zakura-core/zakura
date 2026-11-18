@@ -1610,7 +1610,7 @@ where
     }
 
     /// Sends a second request for a gossiped block, if another announcer should deliver it
-    /// sooner than the first request, which has been outstanding for `first_request_waited`.
+    /// sooner than the first request and the download still accepts a second request.
     ///
     /// The candidates are the idle peers that announced the block, other than the one the first
     /// request went to, and the best is the one expected to answer soonest. It is asked when it
@@ -1618,20 +1618,30 @@ where
     /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
     /// this node, so a peer cannot claim a faster one.
     ///
-    /// Otherwise, and for a block that already had a second request, fails at once with
-    /// [`NoFasterBlockSource`] without contacting any peer, so the caller can ask again later.
+    /// When nobody qualifies, returns the subscriptions and next deadline to the downloader.
     fn route_block_hedge(
         &mut self,
         hash: block::Hash,
         attempt: crate::BlockHedge,
     ) -> <Self as tower::Service<Request>>::Future {
         let not_yet = || async { Err(NoFasterBlockSource::default().into()) }.boxed();
-        if !self.block_second_request {
+        if !self.block_second_request || attempt.elapsed_if_open().is_none() {
             return not_yet();
         }
 
         let (first_peer, first_score) = match self.first_block_requests.get_mut(&hash) {
-            Some(first) if first.second_sent => return not_yet(),
+            // A retry for this hash can reach the peer set before its new first request.
+            // The previous download already used its second request. Wait for the new
+            // routing record instead of dispatching against the old one.
+            Some(first) if first.second_sent => {
+                let inventory = self.inventory_registry.watch_block(hash, Some(first.peer));
+                let wait = NoFasterBlockSource::waiting(
+                    inventory,
+                    Vec::new(),
+                    attempt.started() + crate::BlockHedge::WINDOW,
+                );
+                return async move { Err(wait.into()) }.boxed();
+            }
             Some(first) => (Some(first.peer), first.score),
             None => (None, None),
         };

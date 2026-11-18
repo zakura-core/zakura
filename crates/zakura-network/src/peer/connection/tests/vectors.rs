@@ -2303,7 +2303,9 @@ async fn only_a_delivered_block_clears_a_missed_announced_block() {
     let slot = connection.request_slot.clone();
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let (_tx, block) = response_vectors();
-    slot.set_announced_block_missed(true);
+    slot.missed_block
+        .request(std::time::Instant::now())
+        .missed();
 
     let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
     client_tx.send(request).await.expect("connection is open");

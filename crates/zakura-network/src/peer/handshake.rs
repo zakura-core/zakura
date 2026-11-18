@@ -1944,7 +1944,7 @@ where
                     )
                 });
 
-            let server = Connection::new(
+            let mut server = Connection::new(
                 inbound_service,
                 ConnectionRequests {
                     client_rx: server_rx,
@@ -1964,6 +1964,9 @@ where
             .with_gossip_trace(gossip_trace)
             .with_delivery_samples(peer_registry_updater.clone());
 
+            if let Some(guard) = &peer_registry_guard {
+                server.request_slot.missed_block = guard.missed_block.clone();
+            }
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
             let client_peer_registry_updater = peer_registry_updater.clone();

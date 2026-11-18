@@ -12,7 +12,7 @@ use zakura_chain::block;
 mod delivery;
 mod delivery_trace;
 
-use delivery::{ClosedScores, DeliveryEstimate};
+use delivery::{BlockSourceHistory, ClosedScores, DeliveryEstimate};
 pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
 
 use crate::{
@@ -173,10 +173,12 @@ impl PeerRegistry {
             .checked_add(1)
             .expect("legacy connection generation cannot overflow in one process");
         let key = ConnectionKey::Legacy(generation);
-        let restored = state
+        let history = state
             .closed_scores
             .as_mut()
-            .and_then(|scores| scores.take(connected_peer.addr.ip(), now));
+            .and_then(|scores| scores.take(connected_peer.addr.ip(), now))
+            .unwrap_or_default();
+        let restored = history.estimate;
         if let Some(estimate) = restored {
             state.delivery_estimates.insert(key.clone(), estimate);
         }
@@ -198,6 +200,7 @@ impl PeerRegistry {
 
         (
             PeerRegistryGuard {
+                missed_block: history.missed_block,
                 registry: self.clone(),
                 key: key.clone(),
             },
@@ -315,17 +318,22 @@ impl PeerRegistry {
         }
     }
 
-    fn remove_connection(&self, key: &ConnectionKey) {
+    fn remove_connection(&self, key: &ConnectionKey, missed_block: &crate::peer::MissedBlock) {
         let mut state = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
         let peer = state.active_connections.remove(key);
         let estimate = state.delivery_estimates.remove(key);
-        if let (Some(scores), Some(peer), Some(estimate)) =
-            (&mut state.closed_scores, peer, estimate)
-        {
-            scores.remember(peer.addr.ip(), estimate, Instant::now());
+        if let (Some(scores), Some(peer)) = (&mut state.closed_scores, peer) {
+            scores.remember(
+                peer.addr.ip(),
+                BlockSourceHistory {
+                    estimate,
+                    missed_block: missed_block.clone(),
+                },
+                Instant::now(),
+            );
         }
     }
 }
@@ -428,13 +436,16 @@ impl PeerRegistryUpdater {
 /// Removes one exact legacy connection generation on drop.
 #[derive(Debug)]
 pub(crate) struct PeerRegistryGuard {
+    /// The missed-block flag shared with the request slot for this connection.
+    pub(crate) missed_block: crate::peer::MissedBlock,
     registry: PeerRegistry,
     key: ConnectionKey,
 }
 
 impl Drop for PeerRegistryGuard {
     fn drop(&mut self) {
-        self.registry.remove_connection(&self.key);
+        self.registry
+            .remove_connection(&self.key, &self.missed_block);
     }
 }
 
@@ -635,6 +646,90 @@ mod tests {
         drop(older);
         let (_next, next) = registry.register_legacy(peer(3));
         assert_eq!(next.delivery_score(), Some(Duration::from_millis(800)));
+    }
+
+    #[test]
+    fn a_reconnected_source_remembers_a_miss_even_without_a_score() {
+        let now = Instant::now();
+        for enabled in [false, true] {
+            let registry = PeerRegistry::new(enabled);
+            let (old, _) = registry.register_legacy(peer(1));
+            old.missed_block.request(now).missed();
+            drop(old);
+            let (next, updater) = registry.register_legacy_at(
+                peer(2),
+                DeliveryTrace::default(),
+                now + delivery::REMEMBER_FOR,
+            );
+            assert_eq!(updater.delivery_score(), None);
+            assert_eq!(next.missed_block.is_set(), enabled);
+            drop(next);
+            let (expired, _) = registry.register_legacy_at(
+                peer(3),
+                DeliveryTrace::default(),
+                now + delivery::REMEMBER_FOR + Duration::from_nanos(1),
+            );
+            assert!(
+                !expired.missed_block.is_set(),
+                "reconnecting does not renew a miss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disconnect_before_the_result_keeps_the_miss_and_a_later_delivery_clears_it() {
+        let registry = PeerRegistry::new(true);
+        let now = Instant::now();
+        let (old, _) = registry.register_legacy(peer(1));
+        let stale_slot = old.missed_block.clone();
+        let pending = old.missed_block.request(now);
+        let delayed = old.missed_block.request(now);
+        drop(old);
+        let (next, _) = registry.register_legacy(peer(2));
+        assert!(!next.missed_block.is_set());
+        pending.missed();
+        assert!(
+            next.missed_block.is_set(),
+            "the result can arrive after reconnect"
+        );
+        drop(pending);
+        next.missed_block.delivered();
+        delayed.missed();
+        stale_slot.request(Instant::now()).missed();
+        assert!(
+            !next.missed_block.is_set(),
+            "a stale failure cannot undo the new connection's delivery"
+        );
+        drop(delayed);
+        drop(next);
+        let (again, _) = registry.register_legacy(peer(3));
+        assert!(!again.missed_block.is_set());
+    }
+
+    #[test]
+    fn score_samples_and_missed_requests_have_separate_expiry_times() {
+        let now = Instant::now();
+        let fresh = now + delivery::REMEMBER_FOR + Duration::from_secs(1);
+        for recent_miss in [true, false] {
+            let registry = PeerRegistry::new(true);
+            let (old, score) = registry.register_legacy(peer(1));
+            let (sampled_at, missed_at) = if recent_miss {
+                (now, fresh)
+            } else {
+                (fresh, now)
+            };
+            score.record_delivery_sample(
+                DeliverySampleKind::Ping,
+                Duration::from_millis(5),
+                sampled_at,
+            );
+            old.missed_block.request(missed_at).missed();
+            drop(old);
+            let (next, next_score) =
+                registry.register_legacy_at(peer(2), DeliveryTrace::default(), fresh);
+            assert_eq!(next_score.delivery_score().is_some(), !recent_miss);
+            assert_eq!(next.missed_block.is_set(), recent_miss);
+        }
     }
 
     #[tokio::test]

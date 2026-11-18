@@ -11,6 +11,8 @@ mod gossip_trace;
 mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;
+mod missed_block;
+pub(crate) use missed_block::{AnnouncedBlockRequest, MissedBlock};
 mod priority;
 pub(crate) mod tcp_warmup;
 
@@ -29,7 +31,7 @@ pub(crate) use announced_blocks::AnnouncedBlocks;
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 
-pub(crate) use client::{CancelHeartbeatTask, ClientRequest, RequestSlot};
+pub(crate) use client::{CancelHeartbeatTask, ClientRequest};
 
 pub use client::Client;
 pub use connection::Connection;

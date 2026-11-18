@@ -333,7 +333,7 @@ fn delivered_block(result: &Result<Response, SharedPeerError>) -> bool {
 struct MissedBlockRecord {
     /// The connection's request slot, which makes block routing stop preferring the peer until
     /// it next delivers a block.
-    request_slot: crate::peer::RequestSlot,
+    request: crate::peer::AnnouncedBlockRequest,
     /// The connection's delivery trace, when the node keeps a peer registry.
     registry: Option<PeerRegistryUpdater>,
     /// Whether the request was a second request for the block.
@@ -346,7 +346,7 @@ impl MissedBlockRecord {
         if delivered_block(result) {
             return;
         }
-        self.request_slot.set_announced_block_missed(true);
+        self.request.missed();
         if let Some(registry) = &self.registry {
             registry.trace_block_missed(self.second_request);
         }
@@ -1495,7 +1495,7 @@ where
                     hash,
                     Instant::now(),
                     MissedBlockRecord {
-                        request_slot: svc.request_slot(),
+                        request: svc.announced_block_request(),
                         registry: svc.block_gossip.registry.clone(),
                         second_request: false,
                     },
@@ -1712,7 +1712,7 @@ where
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
         let missed = MissedBlockRecord {
-            request_slot: svc.request_slot(),
+            request: svc.announced_block_request(),
             registry: svc.block_gossip.registry.clone(),
             second_request: true,
         };

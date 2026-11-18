@@ -104,7 +104,7 @@ pub(crate) struct RequestSlot {
 
     /// True if the peer announced a block and then did not deliver it to a gossip block request,
     /// until the peer delivers a requested block on this connection.
-    announced_block_missed: Arc<AtomicBool>,
+    pub(crate) missed_block: super::MissedBlock,
 }
 
 impl RequestSlot {
@@ -129,15 +129,9 @@ impl RequestSlot {
         self.block_request_unanswered.load(Ordering::Acquire)
     }
 
-    /// Records whether the peer announced a block and then did not deliver it.
-    pub(crate) fn set_announced_block_missed(&self, missed: bool) {
-        self.announced_block_missed.store(missed, Ordering::Release);
-    }
-
-    /// Returns true if the peer announced a block and then did not deliver it, and has not
-    /// delivered a requested block since.
+    /// Whether routing should pass over this peer after an announced block went undelivered.
     pub(crate) fn announced_block_missed(&self) -> bool {
-        self.announced_block_missed.load(Ordering::Acquire)
+        self.missed_block.is_set()
     }
 }
 

@@ -2014,7 +2014,7 @@ where
             if matches!(&response, Ok(Response::Blocks(blocks))
                 if blocks.iter().any(|block| block.available().is_some()))
             {
-                self.request_slot.set_announced_block_missed(false);
+                self.request_slot.missed_block.delivered();
             }
 
             if let (Some(delivery_samples), Some(started_at), Ok(response)) = (

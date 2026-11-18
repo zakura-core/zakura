@@ -61,12 +61,19 @@ impl DeliveryEstimate {
 pub(super) const REMEMBER_FOR: Duration = Duration::from_secs(30 * 60);
 const MAX_CLOSED_SCORES: usize = 4096;
 
-/// The most recently closed scored connection per IPv4 address or IPv6 /64.
+/// A score and missed-request history age independently within one cache entry.
+#[derive(Debug, Default)]
+pub(super) struct BlockSourceHistory {
+    pub(super) estimate: Option<DeliveryEstimate>,
+    pub(super) missed_block: crate::peer::MissedBlock,
+}
+
+/// The most recently closed block source per IPv4 address or IPv6 /64.
 /// The age index lets disconnects prune expired scores without scanning the cache.
 #[derive(Debug, Default)]
 pub(super) struct ClosedScores {
-    last_sample: HashMap<IpAddr, Instant>,
-    by_age: BTreeMap<(Instant, IpAddr), DeliveryEstimate>,
+    last_activity: HashMap<IpAddr, Instant>,
+    by_age: BTreeMap<(Instant, IpAddr), BlockSourceHistory>,
 }
 
 impl ClosedScores {
@@ -78,24 +85,36 @@ impl ClosedScores {
     }
 
     /// Consumes the last closed estimate, including when it has expired.
-    pub(super) fn take(&mut self, ip: IpAddr, now: Instant) -> Option<DeliveryEstimate> {
+    pub(super) fn take(&mut self, ip: IpAddr, now: Instant) -> Option<BlockSourceHistory> {
         let key = Self::key(ip);
-        let updated = self.last_sample.remove(&key)?;
-        self.by_age
+        let updated = self.last_activity.remove(&key)?;
+        let mut history = self
+            .by_age
             .remove(&(updated, key))
-            .filter(|_| now.saturating_duration_since(updated) <= REMEMBER_FOR)
+            .filter(|_| now.saturating_duration_since(updated) <= REMEMBER_FOR)?;
+        history.estimate = history.estimate.filter(|estimate| {
+            estimate
+                .updated_at
+                .is_some_and(|time| now.saturating_duration_since(time) <= REMEMBER_FOR)
+        });
+        history.missed_block.reconnect(now, REMEMBER_FOR);
+        Some(history)
     }
 
-    pub(super) fn remember(&mut self, ip: IpAddr, estimate: DeliveryEstimate, now: Instant) {
-        let Some(updated) = estimate.updated_at else {
+    pub(super) fn remember(&mut self, ip: IpAddr, history: BlockSourceHistory, now: Instant) {
+        let Some(updated) = history
+            .estimate
+            .and_then(|score| score.updated_at)
+            .max(history.missed_block.last_activity())
+        else {
             return;
         };
         let key = Self::key(ip);
         // Replace even if the last connection to close has an older sample.
-        if let Some(previous) = self.last_sample.insert(key, updated) {
+        if let Some(previous) = self.last_activity.insert(key, updated) {
             self.by_age.remove(&(previous, key));
         }
-        self.by_age.insert((updated, key), estimate);
+        self.by_age.insert((updated, key), history);
 
         while let Some((&(oldest, address), _)) = self.by_age.first_key_value() {
             if self.by_age.len() <= MAX_CLOSED_SCORES
@@ -104,7 +123,7 @@ impl ClosedScores {
                 break;
             }
             self.by_age.pop_first();
-            self.last_sample.remove(&address);
+            self.last_activity.remove(&address);
         }
     }
 }
@@ -126,19 +145,23 @@ mod tests {
         let mut older = DeliveryEstimate::default();
         older.record(ms(20), now - Duration::from_secs(1));
         let ip = |n: u32| IpAddr::V4(n.into());
+        let measured = |estimate| BlockSourceHistory {
+            estimate: Some(estimate),
+            ..Default::default()
+        };
         for n in 1..=u32::try_from(MAX_CLOSED_SCORES).unwrap() {
-            scores.remember(ip(n), recent, now);
+            scores.remember(ip(n), measured(recent), now);
         }
-        scores.remember(ip(0), older, now);
+        scores.remember(ip(0), measured(older), now);
         assert_eq!(scores.by_age.len(), MAX_CLOSED_SCORES);
         assert!(scores.take(ip(0), now).is_none());
 
         let later = now + REMEMBER_FOR + Duration::from_nanos(1);
         recent.record(ms(30), later);
-        scores.remember(ip(0), recent, later);
+        scores.remember(ip(0), measured(recent), later);
         assert_eq!(scores.by_age.len(), 1);
         assert!(scores.take(ip(0), later).is_some());
-        assert!(scores.last_sample.is_empty());
+        assert!(scores.last_activity.is_empty());
     }
 
     #[test]

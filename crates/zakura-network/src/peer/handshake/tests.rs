@@ -1038,19 +1038,19 @@ async fn remote_p2p_v2_with_local_disabled_continues_legacy() {
     drop(remote_client);
 }
 
-/// Each connection a handshaker makes gets its own trace number, the one its gossip trace
-/// rows carry, and the client keeps it for the peer set's request rows.
+/// A reconnect gets its own trace ID while its request slot remembers the missed block.
 #[tokio::test]
-async fn each_connection_keeps_its_gossip_trace_number() {
+async fn legacy_reconnect_keeps_the_missed_block_but_gets_a_new_trace_id() {
     let _init_guard = zakura_test::init();
 
     let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
     let calls = Arc::new(AtomicUsize::new(0));
-    let local_handshake = test_handshake(
+    let registry = PeerRegistry::new(true);
+    let local_handshake = test_handshake_with_connector(
         test_config(P2pStack::Legacy),
         address_book_tx.clone(),
-        calls.clone(),
-        upgraded_outcome(),
+        crate::zakura::ZakuraHandshakeConnector::for_test(calls.clone(), upgraded_outcome()),
+        registry.clone(),
     );
     let remote_handshake = test_handshake(
         test_config(P2pStack::Legacy),
@@ -1076,8 +1076,28 @@ async fn each_connection_keeps_its_gossip_trace_number() {
         }));
 
         let local_client = local_task.await.unwrap().unwrap();
-        let _remote_client = remote_task.await.unwrap().unwrap();
+        let remote_client = remote_task.await.unwrap().unwrap();
+        let reconnect = !connection_ids.is_empty();
         connection_ids.push(local_client.connection_id);
+        assert_eq!(
+            local_client.request_slot.announced_block_missed(),
+            reconnect
+        );
+        let source = crate::peer::LoadTrackedClient::from(local_client);
+        if reconnect {
+            assert!(!source.is_preferred_block_source());
+        } else {
+            source.announced_block_request().missed();
+        }
+        drop(source);
+        drop(remote_client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !registry.connected_peers().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection unregisters after both clients close");
     }
 
     assert_eq!(connection_ids, [1, 2]);

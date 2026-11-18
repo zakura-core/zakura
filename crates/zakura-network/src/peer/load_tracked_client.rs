@@ -139,10 +139,11 @@ impl LoadTrackedClient {
             && !self.request_slot.announced_block_missed()
     }
 
-    /// The connection's request slot, for marking that the peer announced a block it then did
-    /// not deliver.
-    pub(crate) fn request_slot(&self) -> super::client::RequestSlot {
-        self.request_slot.clone()
+    /// Track an advertised-block request until it succeeds, fails or is cancelled.
+    pub(crate) fn announced_block_request(&self) -> super::AnnouncedBlockRequest {
+        self.request_slot
+            .missed_block
+            .request(std::time::Instant::now())
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.

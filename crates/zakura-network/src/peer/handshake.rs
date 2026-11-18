@@ -1000,11 +1000,13 @@ where
             "disconnecting from peer with obsolete network protocol version",
         );
 
-        // Handshake rejects by the minimum version this node required. Not labeled
-        // by peer address, user-agent or the peer's own version: the peer chooses
-        // those, and the Prometheus exporter never prunes series.
+        // Handshake rejects by client family and the minimum version this node
+        // required. Not labeled by peer address, full user-agent or the peer's own
+        // version: the peer chooses those, and the Prometheus exporter never
+        // prunes series.
         metrics::counter!(
             "zcash.net.peers.obsolete",
+            "user_agent" => user_agent_metric_label(&remote.user_agent),
             "min_version" => min_version.to_string(),
         )
         .increment(1);
@@ -1059,12 +1061,13 @@ where
         }
     }
 
-    // Completed handshakes by negotiated version, which is clamped to the range
-    // from `min_version` to this node's version. Not labeled by peer address,
-    // user-agent or the peer's own version: the peer chooses those, and the
-    // Prometheus exporter never prunes series.
+    // Completed handshakes by client family and negotiated version, which is
+    // clamped to the range from `min_version` to this node's version. Not labeled
+    // by peer address, full user-agent or the peer's own version: the peer chooses
+    // those, and the Prometheus exporter never prunes series.
     metrics::counter!(
         "zcash.net.peers.connected",
+        "user_agent" => user_agent_metric_label(&connection_info.remote.user_agent),
         "negotiated_version" => negotiated_version.to_string(),
         "min_version" => min_version.to_string(),
     )
@@ -2042,6 +2045,26 @@ where
             )
             .boxed()
     }
+}
+
+/// The client names that get their own `user_agent` metric label.
+const KNOWN_USER_AGENT_CLIENTS: [&str; 3] = ["Zakura", "Zebra", "MagicBean"];
+
+/// Returns the client family that `user_agent` names first, as a metric label.
+///
+/// A peer chooses its user agent, so only the clients in
+/// [`KNOWN_USER_AGENT_CLIENTS`] get a label of their own, without their version.
+/// Every other user agent is `other`.
+fn user_agent_metric_label(user_agent: &str) -> &'static str {
+    // BIP 14 user agents look like `/Name:version/`.
+    let client = user_agent
+        .strip_prefix('/')
+        .and_then(|rest| rest.split([':', '/']).next());
+
+    KNOWN_USER_AGENT_CLIENTS
+        .into_iter()
+        .find(|known| client == Some(known))
+        .unwrap_or("other")
 }
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.

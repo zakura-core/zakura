@@ -59,6 +59,25 @@ fn serialization_error_metric_labels_ignore_details() {
     }
 }
 
+/// A peer chooses its user agent, so the `user_agent` metric label names a known
+/// client or `other`, and never the client's version or any other detail.
+#[test]
+fn user_agent_metric_labels_are_known_clients_or_other() {
+    for (user_agent, label) in [
+        ("/Zakura:1.1.0/", "Zakura"),
+        ("/Zakura:7.0.0/Zebra:compat/", "Zakura"),
+        ("/Zebra:2.0.0/", "Zebra"),
+        ("/MagicBean:6.2.0/", "MagicBean"),
+        ("/MagicBean/", "MagicBean"),
+        ("/MagicBeans:6.2.0/", "other"),
+        ("/Gone:1.0/", "other"),
+        ("Zakura:1.1.0", "other"),
+        ("", "other"),
+    ] {
+        assert_eq!(user_agent_metric_label(user_agent), label, "{user_agent}");
+    }
+}
+
 /// Runs a handshake with a peer that offers `remote_version`, and returns the
 /// metric series the handshake created.
 ///
@@ -132,7 +151,7 @@ fn min_peer_version() -> Version {
 fn connected_peer_series_ignore_offered_version() {
     let newer = Version(constants::CURRENT_NETWORK_PROTOCOL_VERSION.0 + 1);
     let expected = BTreeSet::from([format!(
-        "zcash.net.peers.connected{{negotiated_version={},min_version={}}}",
+        "zcash.net.peers.connected{{user_agent=Zebra,negotiated_version={},min_version={}}}",
         constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         min_peer_version(),
     )]);
@@ -162,7 +181,7 @@ fn unfinished_handshake_creates_no_connected_peer_series() {
 #[test]
 fn obsolete_peer_series_ignore_offered_version() {
     let expected = BTreeSet::from([format!(
-        "zcash.net.peers.obsolete{{min_version={}}}",
+        "zcash.net.peers.obsolete{{user_agent=Zebra,min_version={}}}",
         min_peer_version(),
     )]);
 

@@ -447,7 +447,7 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
         let error = try_deliver(&mut routine, BlockSyncMessage::Block(Arc::new(junk)))
             .await
             .unwrap_err();
-        assert!(matches!(error, SinkReject::Protocol(_)), "{error}");
+        assert!(matches!(error, SinkReject::Protocol(..)), "{error}");
         assert!(
             bodies.try_recv().is_err(),
             "junk never reaches the sequencer"
@@ -941,7 +941,7 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
     routine.io.sequencer_input = bodies;
     assert!(matches!(
         try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
-        Err(SinkReject::Protocol(_))
+        Err(SinkReject::Protocol(..))
     ));
     assert!(received.try_recv().is_err());
     assert_eq!(pool.held(), 0);
@@ -960,7 +960,7 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
         assert_eq!(result.is_ok(), accepted, "{limit}-byte limit: {result:?}");
         assert_eq!(received.try_recv().is_ok(), accepted);
         if !accepted {
-            assert!(matches!(result, Err(SinkReject::Protocol(_))));
+            assert!(matches!(result, Err(SinkReject::Protocol(..))));
             assert_eq!(
                 routine.io.requester.unreceived_expected(16),
                 [(block::Height(1), block.hash())],
@@ -1021,7 +1021,7 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     let error = try_deliver(&mut routine, BlockSyncMessage::Block(block))
         .await
         .unwrap_err();
-    assert!(matches!(error, SinkReject::Protocol(_)), "{error:?}");
+    assert!(matches!(error, SinkReject::Protocol(..)), "{error:?}");
     assert!(error.to_string().contains("coinbase height"));
     assert!(received.try_recv().is_err());
 }

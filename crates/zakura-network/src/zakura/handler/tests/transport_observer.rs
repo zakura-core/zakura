@@ -17,6 +17,8 @@ use crate::zakura::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a test waits for a worker that should have ended.
 const END_WAIT: Duration = Duration::from_secs(3);
+/// The idle timeout of the cases that stall.
+const STALL: Duration = Duration::from_millis(300);
 /// The connection ID the tests register.
 const CONN: ZakuraConnId = 7;
 /// The remote address of the tests' connection.
@@ -120,9 +122,47 @@ async fn run_worker(
     subscription: bool,
     outbound: Option<Frame>,
 ) -> Result<Run, BoxError> {
+    run_worker_with(
+        bytes,
+        Setup {
+            subscription,
+            outbound,
+            ..Setup::default()
+        },
+    )
+    .await
+}
+
+/// How [`run_worker_with`] sets up the worker.
+#[derive(Default)]
+struct Setup {
+    /// The reader's precheck holds one subscription with the row's whole
+    /// credit.
+    subscription: bool,
+    /// The node sends `Close` for that subscription before the peer's bytes
+    /// arrive.
+    closed: bool,
+    /// The frame the service sends after the peer's bytes.
+    outbound: Option<Frame>,
+    /// The connection's idle timeout, which bounds a frame read once its
+    /// first byte arrives.
+    idle_timeout: Option<Duration>,
+}
+
+/// [`run_worker`] with the whole [`Setup`].
+async fn run_worker_with(bytes: &[u8], setup: Setup) -> Result<Run, BoxError> {
+    let Setup {
+        subscription,
+        closed,
+        outbound,
+        idle_timeout,
+    } = setup;
     let mut link = Link::connect().await?;
     let mut context = tabled_context(Some(rows()), 128);
     context.inbound_frame_cap = RegtestMessage::LAYOUT[0].frame_cap;
+    if let Some(idle_timeout) = idle_timeout {
+        context.limits.idle_timeout = idle_timeout;
+    }
     let recorder = Arc::new(Recorder::default());
     let conn = registered_tap(recorder.clone());
     context.close_cause.observe_with(conn.clone());
@@ -134,6 +174,9 @@ async fn run_worker(
     context.precheck.observe_with(tap.clone());
     if subscription {
         let tools = subscribed(Some(RegulationTap::new(tap.clone(), |id| *id)));
+        if closed {
+            tools.lock().close(&1).expect("the subscription is open");
+        }
         context.precheck.attach(Arc::new(tools.admitting()));
     }
     let prelude = StreamPrelude {
@@ -177,6 +220,92 @@ async fn run_worker(
         ended,
         quic_stream,
     })
+}
+
+/// The close outcomes the observer saw, in order.
+fn decided(events: &[TransportEvent]) -> Vec<Option<CloseOutcome>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::CloseDecided { cause, .. } => Some(*cause),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A legal crossing and a slow link reach the final connection observer as
+/// neutral closes. The crossing is a full page within credit after the node
+/// sent `Close`, which the reader admits. Each peer then stalls partway
+/// through a header, so the reader's timeout closes the connection.
+#[tokio::test]
+async fn a_crossing_and_a_slow_link_close_neutral() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let len = largest_page();
+    let page = [header(v9::message_type::HEADERS, len), vec![0; len]].concat();
+    let stall = header(v9::message_type::STATUS, 4)[..3].to_vec();
+    for (crossing, bytes) in [(true, [page, stall.clone()].concat()), (false, stall)] {
+        let run = run_worker_with(
+            &bytes,
+            Setup {
+                subscription: true,
+                closed: true,
+                idle_timeout: Some(STALL),
+                ..Setup::default()
+            },
+        )
+        .await?;
+        assert!(run.ended, "crossing {crossing}: {:?}", run.events);
+        let reserved = run.events.iter().any(|event| {
+            matches!(
+                event,
+                TransportEvent::Regulated {
+                    transition: Transition::HeaderChecked {
+                        seq: 0,
+                        outcome: HeaderCheck::Reserved { .. },
+                    },
+                    ..
+                }
+            )
+        });
+        assert_eq!(reserved, crossing, "{:?}", run.events);
+        let decided = decided(&run.events);
+        assert_eq!(
+            decided,
+            [Some(CloseOutcome::neutral(
+                NeutralCause::Timeout,
+                "ordered_read_timeout"
+            ))],
+            "crossing {crossing}"
+        );
+        assert!(decided.iter().flatten().all(|cause| !cause.is_fault()));
+    }
+    Ok(())
+}
+
+/// A local failure reaches the final connection observer as a neutral close:
+/// a supervised service pipe that panics records the service-panic outcome,
+/// as every service's panic hook does.
+#[tokio::test]
+async fn a_local_failure_closes_neutral() {
+    let recorder = Arc::new(Recorder::default());
+    let cause = CloseCause::new();
+    cause.observe_with(registered_tap(recorder.clone()));
+    let hook_cause = cause.clone();
+    let pipe = crate::zakura::spawn_supervised_pipe(
+        "failing_pipe",
+        test_peer(53),
+        CancellationToken::new(),
+        || {},
+        move || hook_cause.record(CloseOutcome::SERVICE_PANIC),
+        async { panic!("local port failure") },
+    );
+    let error = pipe.await.expect_err("the panic ends the pipe");
+    assert!(error.is_panic());
+    assert_eq!(
+        decided(&recorder.events()),
+        [Some(CloseOutcome::SERVICE_PANIC)]
+    );
+    assert!(!CloseOutcome::SERVICE_PANIC.is_fault());
 }
 
 /// A page one byte over the row's maximum is refused by the row's length
@@ -231,7 +360,8 @@ async fn the_length_guard_alone_closes_an_oversize_page() -> Result<(), BoxError
             TransportEvent::CloseDecided {
                 remote: REMOTE,
                 conn_id: Some(CONN),
-                cause: Some("ordered_read_rejected"),
+                // The length guard caps the frame at the row's maximum.
+                cause: Some(CloseOutcome::fault(900, 1, CloseRow::REG_CLOSE_1)),
             },
         ]
     );
@@ -261,7 +391,7 @@ async fn oversize_header_is_read_then_closed() -> Result<(), BoxError> {
             TransportEvent::CloseDecided {
                 remote: REMOTE,
                 conn_id: Some(CONN),
-                cause: Some("ordered_read_rejected"),
+                cause: Some(CloseOutcome::fault(900, 1, CloseRow::REG_CLOSE_1)),
             },
         ]
     );
@@ -340,8 +470,9 @@ fn close_is_decided_once() {
     let recorder = Arc::new(Recorder::default());
     let cause = CloseCause::new();
     cause.observe_with(registered_tap(recorder.clone()));
-    cause.record("first");
-    cause.record("second");
+    let first = CloseOutcome::neutral(NeutralCause::Timeout, "first");
+    cause.record(first);
+    cause.record(CloseOutcome::SERVICE_PANIC);
     cause.cancelled_without_cause();
     cause.torn_down();
     assert_eq!(
@@ -350,7 +481,7 @@ fn close_is_decided_once() {
             TransportEvent::CloseDecided {
                 remote: REMOTE,
                 conn_id: Some(CONN),
-                cause: Some("first"),
+                cause: Some(first),
             },
             TransportEvent::TornDown { conn_id: CONN },
         ]
@@ -428,7 +559,7 @@ fn observer_panic_unwinds_with_its_own_payload() {
     let cause = CloseCause::new();
     cause.observe_with(registered_tap(Arc::new(Panics)));
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cause.record("fault");
+        cause.record(CloseOutcome::fault(900, 1, CloseRow::REG_CLOSE_2));
     }))
     .expect_err("the observer panics");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"observer boom"));
@@ -737,7 +868,7 @@ async fn an_observer_panic_in_a_pipe_unwinds_once() {
         test_peer(52),
         CancellationToken::new(),
         || {},
-        move || hook_cause.record("service_panic"),
+        move || hook_cause.record(CloseOutcome::SERVICE_PANIC),
         async move {
             conn.emit(TransportEvent::TornDown { conn_id: CONN });
         },
@@ -746,7 +877,7 @@ async fn an_observer_panic_in_a_pipe_unwinds_once() {
     assert!(error.is_panic());
     let payload = error.into_panic();
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"observer boom"));
-    assert_eq!(cause.get_or("unset"), "service_panic");
+    assert_eq!(cause.get(), Some(CloseOutcome::SERVICE_PANIC));
 }
 
 /// An inbound connection whose claim finds a budget full is refused before

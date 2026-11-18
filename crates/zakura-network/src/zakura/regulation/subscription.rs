@@ -99,6 +99,8 @@ mod tests;
 
 use thiserror::Error;
 
+use crate::zakura::CloseRow;
+
 pub(crate) use credit::{within_window, CreditExceeded, ResponseCredit, Totals};
 #[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 pub(crate) use publisher::Publications;
@@ -203,6 +205,22 @@ pub(crate) enum SubscriptionFault {
 }
 
 impl SubscriptionFault {
+    /// The regulation close-spec row this fault breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Unknown => CloseRow::REG_CLOSE_10,
+            Self::OverCredit => CloseRow::REG_CLOSE_11,
+            Self::Sequence { .. } => CloseRow::REG_CLOSE_12,
+            Self::UnknownAcknowledgement => CloseRow::REG_CLOSE_13,
+            Self::EmptyCredit => CloseRow::REG_CLOSE_14,
+            Self::AboveWindow => CloseRow::REG_CLOSE_15,
+            Self::CrossedAboveWindow => CloseRow::REG_CLOSE_16,
+            Self::AfterClose => CloseRow::REG_CLOSE_17,
+            Self::ReusedKey => CloseRow::REG_CLOSE_18,
+            Self::NoSlot { .. } => CloseRow::REG_CLOSE_19,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {

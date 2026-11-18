@@ -174,14 +174,14 @@ fn peer_frames(report: &RunReport) -> Vec<(u64, String, &'static str)> {
         .collect()
 }
 
-/// The causes the node closed connections with.
+/// The labels of the causes the node closed connections with.
 fn closes(report: &RunReport) -> Vec<String> {
     report
         .log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
-            Observation::ConnectionClosed { cause, .. } => Some(cause.clone()),
+            Observation::ConnectionClosed { cause, .. } => Some(cause.label().to_owned()),
             _ => None,
         })
         .collect()

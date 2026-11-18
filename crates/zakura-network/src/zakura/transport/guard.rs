@@ -14,7 +14,7 @@ use zakura_rt::sync::{
     Notify,
 };
 
-use super::Frame;
+use super::{CloseRow, Frame};
 
 /// Shared budget for owned byte charges.
 ///
@@ -473,8 +473,8 @@ pub(crate) enum Admit {
     Pass,
     /// The frame is dropped but the peer is kept (rate/budget back-pressure).
     Throttle,
-    /// The peer violated a protocol-level protection and should be disconnected.
-    Reject(&'static str),
+    /// The peer broke the close-spec row and should be disconnected.
+    Reject(CloseRow),
 }
 
 /// Per-peer semantic meters (status spam, new-block spam,...).
@@ -544,15 +544,15 @@ impl SessionGuard {
         // bytes, so a value that does not fit in a `u8` is by definition not an
         // allowed type and is treated as a protocol violation.
         let Ok(ty) = u8::try_from(frame.message_type) else {
-            return Admit::Reject("bad type");
+            return Admit::Reject(CloseRow::REG_CLOSE_2);
         };
         if !self.allowed.contains(&ty) {
-            return Admit::Reject("disallowed type");
+            return Admit::Reject(CloseRow::REG_CLOSE_2);
         }
         // `max_bytes` is a `u32`; widen to `usize` for the payload-length
         // comparison (`usize` is at least 32 bits on supported targets).
         if frame.payload.len() > self.max_bytes as usize {
-            return Admit::Reject("oversize");
+            return Admit::Reject(CloseRow::REG_CLOSE_1);
         }
         if !self.meters.try_take(ty) {
             return Admit::Throttle;
@@ -792,19 +792,28 @@ pub(crate) mod tests {
     #[test]
     fn admit_rejects_disallowed_type() {
         let mut guard = SessionGuard::new(ALLOWED, 1_024);
-        assert_eq!(guard.admit(&frame(99, 0)), Admit::Reject("disallowed type"));
+        assert_eq!(
+            guard.admit(&frame(99, 0)),
+            Admit::Reject(CloseRow::REG_CLOSE_2)
+        );
     }
 
     #[test]
     fn admit_rejects_non_u8_type() {
         let mut guard = SessionGuard::new(ALLOWED, 1_024);
-        assert_eq!(guard.admit(&frame(0x0100, 0)), Admit::Reject("bad type"));
+        assert_eq!(
+            guard.admit(&frame(0x0100, 0)),
+            Admit::Reject(CloseRow::REG_CLOSE_2)
+        );
     }
 
     #[test]
     fn admit_rejects_oversize() {
         let mut guard = SessionGuard::new(ALLOWED, 4);
-        assert_eq!(guard.admit(&frame(1, 5)), Admit::Reject("oversize"));
+        assert_eq!(
+            guard.admit(&frame(1, 5)),
+            Admit::Reject(CloseRow::REG_CLOSE_1)
+        );
     }
 
     #[test]
@@ -827,12 +836,18 @@ pub(crate) mod tests {
     #[test]
     fn oversize_only_rejects_non_u8_type() {
         let mut guard = SessionGuard::oversize_only(1_024);
-        assert_eq!(guard.admit(&frame(0x0100, 0)), Admit::Reject("bad type"));
+        assert_eq!(
+            guard.admit(&frame(0x0100, 0)),
+            Admit::Reject(CloseRow::REG_CLOSE_2)
+        );
     }
 
     #[test]
     fn oversize_only_rejects_oversize() {
         let mut guard = SessionGuard::oversize_only(4);
-        assert_eq!(guard.admit(&frame(1, 5)), Admit::Reject("oversize"));
+        assert_eq!(
+            guard.admit(&frame(1, 5)),
+            Admit::Reject(CloseRow::REG_CLOSE_1)
+        );
     }
 }

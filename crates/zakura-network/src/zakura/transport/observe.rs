@@ -313,8 +313,8 @@ pub enum TransportEvent {
         remote: SocketAddr,
         /// The connection, once registered.
         conn_id: Option<ZakuraConnId>,
-        /// The first recorded cause.
-        cause: Option<&'static str>,
+        /// The first recorded outcome.
+        cause: Option<super::CloseOutcome>,
     },
     /// The connection's workers drained and its peer was unregistered. A
     /// drain that times out with a worker still running reports no
@@ -513,7 +513,7 @@ impl ConnTap {
 
     /// Reports `CloseDecided` with `cause`, unless a decision was already
     /// reported.
-    pub(crate) fn decide(&self, cause: Option<&'static str>) {
+    pub(crate) fn decide(&self, cause: Option<super::CloseOutcome>) {
         if self.decided.swap(1, Ordering::AcqRel) == 0 {
             self.emit(TransportEvent::CloseDecided {
                 remote: self.remote,

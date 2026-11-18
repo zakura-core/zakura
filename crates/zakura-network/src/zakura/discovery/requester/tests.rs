@@ -437,7 +437,7 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     written.recv().await.expect("the query is written");
     queries.retire();
     assert!(connection.is_cancelled());
-    assert_eq!(close_cause.get_or("none"), UNFINISHED_EXCHANGE);
+    assert_eq!(close_cause.get(), Some(UNFINISHED_EXCHANGE));
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
 }
 

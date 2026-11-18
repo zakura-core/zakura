@@ -9,7 +9,6 @@ use std::{
 use zakura_network::zakura::{ZakuraBlockSyncConfig, ZAKURA_STREAM_BLOCK_SYNC};
 
 use crate::{
-    model::is_fault_cause,
     observe::{BlockSyncFact, Entry, SessionStepFact, TransportFact},
     peer::peer_of,
     property::{
@@ -91,7 +90,7 @@ where
             {
                 verdict = Verdict::Holds;
             }
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause } if cause.is_fault() => {
                 punished.push((at, *connection, format!("a close with cause {cause}")));
             }
             Observation::Misbehavior { connection } => {

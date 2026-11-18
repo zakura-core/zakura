@@ -34,7 +34,7 @@ use zakura_sim::{
         wire_plans::SavedPlan,
         HarnessError, RecordInput, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{
         DatagramOutcome, Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest,
         StorageResult, TransportFact,
@@ -647,12 +647,12 @@ fn disconnect_while_pages_are_in_flight() {
                 Observation::Transport {
                     event: TransportFact::CloseDecided { cause },
                     ..
-                } => Some(cause.clone()),
+                } => Some(*cause),
                 _ => None,
             });
         let cause = cause.expect("the node decided the close");
         assert!(
-            cause.as_deref().is_none_or(|cause| !is_fault_cause(cause)),
+            cause.is_none_or(|cause| !cause.is_fault()),
             "a neutral cause: {cause:?}"
         );
         assert!(

@@ -34,9 +34,9 @@ use crate::zakura::{
     spawn_supervised_pipe,
     transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
-    BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
-    ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
-    ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
+    BoxRunFuture, CloseCause, CloseOutcome, CloseRow, Frame, FramedRecv, FramedSend, NeutralCause,
+    OrderedSendError, Peer, Service, ServicePeerDirection, SessionDemand, SessionOpening,
+    SessionPolicy, Sink, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::{RegulationTap, SessionOrigin};
@@ -321,7 +321,10 @@ impl PeerSession {
     }
 
     pub(super) fn disconnect_for_port_panic(&self) {
-        self.inner.close_cause.record("header_port_panic");
+        self.inner.close_cause.record(CloseOutcome::neutral(
+            NeutralCause::LocalCancellation,
+            "header_port_panic",
+        ));
         self.inner.connection_cancel_token.cancel();
     }
 
@@ -329,7 +332,11 @@ impl PeerSession {
     /// validation. The subscription acknowledges no further cursor.
     pub(super) fn disconnect_for_header_fault(&self, id: u64) {
         self.subscriber().validation_failed(id);
-        self.inner.close_cause.record("header_peer_fault");
+        self.inner.close_cause.record(CloseOutcome::fault(
+            ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            CloseRow::HSYNC_CLOSE_33,
+        ));
         self.inner.connection_cancel_token.cancel();
     }
 
@@ -719,7 +726,10 @@ impl Service for HeaderSyncService {
             || peer.negotiated & ZAKURA_CAP_HEADER_SYNC == 0
             || send.max_capacity() < 2
         {
-            peer.close_cause().record("header_sync_regulation_contract");
+            peer.close_cause().record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "header_sync_regulation_contract",
+            ));
             peer.cancel_token().cancel();
             return;
         }
@@ -854,6 +864,7 @@ impl Service for HeaderSyncService {
             };
             handle_pipe_exit(
                 "header-sync",
+                (ZAKURA_STREAM_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION),
                 &protocol_connection_cancel,
                 &protocol_close_cause,
                 result,
@@ -876,7 +887,7 @@ impl Service for HeaderSyncService {
         let panic_connection_cancel = connection_cancel_token.clone();
         let panic_close_cause = close_cause.clone();
         let on_panic = move || {
-            panic_close_cause.record("service_panic");
+            panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
             panic_connection_cancel.cancel();
         };
         spawn_supervised_pipe(

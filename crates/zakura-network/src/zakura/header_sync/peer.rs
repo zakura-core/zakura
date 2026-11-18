@@ -10,10 +10,10 @@ use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 use super::{
     events::HeaderSyncHandle,
     service::PeerSession,
-    v9::{Headers, Message, Publisher},
+    v9::{message_type, Headers, Message, Publisher},
     wire::{HeaderSyncWireError, TreeAuxWire},
 };
-use crate::zakura::{wire_codec::decode_frame, Frame, FramedRecv, SinkReject};
+use crate::zakura::{wire_codec::decode_frame, CloseRow, Frame, FramedRecv, SinkReject};
 
 mod state;
 
@@ -55,10 +55,15 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
         let input = admit::<HEADER_BYTES>(&handle, &session, frame)?;
         match state.on_input(input) {
             PeerOutput::Apply(update) => {
-                publisher
-                    .apply(&update)
-                    .await
-                    .map_err(|fault| violation(&handle, &session, "subscription_update", fault))?;
+                publisher.apply(&update).await.map_err(|fault| {
+                    violation(
+                        &handle,
+                        &session,
+                        "subscription_update",
+                        fault.close_row(),
+                        fault,
+                    )
+                })?;
             }
             PeerOutput::Forward(event) => {
                 zakura_rt::select! {
@@ -90,10 +95,17 @@ fn admit<const HEADER_BYTES: usize>(
         session
             .subscriber()
             .admit(&frame)
-            .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+            .map_err(|fault| violation(handle, session, fault.label(), fault.close_row(), fault))?;
     }
-    let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
-        .map_err(|error| violation(handle, session, "malformed_message", error))?;
+    let message = decode_frame::<Message<HEADER_BYTES>>(&frame).map_err(|error| {
+        violation(
+            handle,
+            session,
+            "malformed_message",
+            decode_row(frame.message_type),
+            error,
+        )
+    })?;
     Ok(match message {
         Message::Status(status) => {
             session.subscriber().observe(&status);
@@ -101,22 +113,44 @@ fn admit<const HEADER_BYTES: usize>(
         }
         Message::SubscribeHeaders(update) => PeerInput::Update(update),
         Message::Headers(page) => {
-            check_records(&page, &handle.network)
-                .map_err(|error| violation(handle, session, "malformed_message", error))?;
+            check_records(&page, &handle.network).map_err(|error| {
+                violation(
+                    handle,
+                    session,
+                    "malformed_message",
+                    CloseRow::HSYNC_CLOSE_6,
+                    error,
+                )
+            })?;
             let admitted = session
                 .subscriber()
                 .receive_page(&page, payload_len)
-                .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+                .map_err(|fault| {
+                    violation(handle, session, fault.label(), fault.close_row(), fault)
+                })?;
             PeerInput::Page { page, admitted }
         }
         Message::HeadersOutcome(outcome) => {
             let ended = session
                 .subscriber()
                 .receive_outcome(&outcome)
-                .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+                .map_err(|fault| {
+                    violation(handle, session, fault.label(), fault.close_row(), fault)
+                })?;
             PeerInput::Outcome(ended)
         }
     })
+}
+
+/// The row a frame of `message_type` breaks when its payload fails decode.
+fn decode_row(message_type: u16) -> CloseRow {
+    match message_type {
+        message_type::STATUS => CloseRow::HSYNC_CLOSE_3,
+        message_type::SUBSCRIBE_HEADERS => CloseRow::HSYNC_CLOSE_4,
+        message_type::HEADERS => CloseRow::HSYNC_CLOSE_5,
+        // The transport reader admits only the four tabled types.
+        _ => CloseRow::HSYNC_CLOSE_7,
+    }
 }
 
 /// Check each schema-1 record against its header's height and the network's
@@ -132,12 +166,13 @@ fn check_records(page: &Headers, network: &Network) -> Result<(), HeaderSyncWire
     Ok(())
 }
 
-/// Trace a protocol violation by `session`'s peer, and return the rejection
-/// that ends the session.
+/// Trace a protocol violation of `row` by `session`'s peer, and return the
+/// rejection that ends the session.
 fn violation(
     handle: &HeaderSyncHandle,
     session: &PeerSession,
     reason: &'static str,
+    row: CloseRow,
     error: impl std::fmt::Display,
 ) -> SinkReject {
     use crate::zakura::trace::{header_sync_trace as hs_trace, peer_label, HEADER_SYNC_TABLE};
@@ -165,8 +200,5 @@ fn violation(
             reason,
         });
     }
-    SinkReject::protocol(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        error.to_string(),
-    ))
+    SinkReject::protocol(row, error.to_string())
 }

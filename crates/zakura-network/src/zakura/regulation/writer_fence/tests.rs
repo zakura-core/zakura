@@ -51,7 +51,7 @@ fn owner_drop_fences_unstarted_writes_and_closes_started_exchanges() {
         assert_eq!(connection.is_cancelled(), started);
         assert_eq!(fence.retire(), !started);
         if started {
-            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
         }
     }
 }
@@ -206,7 +206,7 @@ async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
         assert_eq!(fence.retire(), !encodes);
         assert_eq!(connection.is_cancelled(), encodes);
         if encodes {
-            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
         }
     }
 }
@@ -270,7 +270,7 @@ fn retirement_during_a_following_write_closes_the_connection() {
         assert_eq!(fence.retire(), written);
         assert_eq!(connection.is_cancelled(), !written);
         if !written {
-            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
         }
     }
 }

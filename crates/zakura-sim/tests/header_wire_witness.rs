@@ -15,7 +15,7 @@ use support::{
     inputs,
     script::{run_scripted, run_under, Node, OBSERVED},
 };
-use zakura_network::zakura::v9::RegtestMessage;
+use zakura_network::zakura::{v9::RegtestMessage, CloseOutcome, CloseRow, NeutralCause};
 use zakura_sim::NaReason;
 use zakura_sim::{
     domain::{
@@ -32,7 +32,7 @@ use zakura_sim::{
         wire_plans::{act_scenario, SavedPlan},
         HarnessError, LinkSpec, NetScenario, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{StreamId, TransportFact},
     peer::{
         adversary::{Act, ContentRule, CursorField, Row},
@@ -50,6 +50,13 @@ const STREAM: StreamId = StreamId {
     kind: 5,
     version: 9,
 };
+
+/// A header-sync reader's fault close of an undeclared message type.
+const FAULT: CloseOutcome = CloseOutcome::fault(STREAM.kind, STREAM.version, CloseRow::REG_CLOSE_2);
+
+/// A neutral read-timeout close.
+const READ_TIMEOUT: CloseOutcome =
+    CloseOutcome::neutral(NeutralCause::Timeout, "ordered_read_timeout");
 
 /// The node's chain at the start of most witnesses.
 const PRELOAD: u32 = 50;
@@ -451,7 +458,7 @@ fn each_invalid_label_witness_has_a_conformant_control() {
                 Observation::ConnectionClosed {
                     connection: c,
                     cause,
-                } if *c == connection && is_fault_cause(cause) => Some(cause.clone()),
+                } if *c == connection && cause.is_fault() => Some(*cause),
                 _ => None,
             });
         assert_eq!(faulted, None, "{control:?}: the node punished the frame");
@@ -542,7 +549,7 @@ fn honest_peer_never_punished() {
                     Observation::ConnectionClosed { connection, cause }
                         if honest.contains(connection) =>
                     {
-                        assert!(!is_fault_cause(cause), "{name}: closed with {cause}");
+                        assert!(!cause.is_fault(), "{name}: closed with {cause}");
                     }
                     Observation::Misbehavior { connection } => {
                         assert!(!honest.contains(connection), "{name}: Misbehavior");
@@ -556,7 +563,7 @@ fn honest_peer_never_punished() {
             if name == "bystander" {
                 let faulted = report.log.entries().iter().any(|entry| {
                     matches!(&entry.obs, Observation::ConnectionClosed { connection, cause }
-                        if !honest.contains(connection) && is_fault_cause(cause))
+                        if !honest.contains(connection) && cause.is_fault())
                 });
                 assert!(faulted, "the node closed the adversary's connection");
             }
@@ -650,7 +657,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
     };
     let fault_close = Observation::ConnectionClosed {
         connection: 1,
-        cause: "service_protocol_reject".to_owned(),
+        cause: FAULT,
     };
     match id.template {
         Template::Closes(label) => vec![vec![peer(label, false)], vec![judged]],
@@ -776,10 +783,10 @@ fn labelled(label: Label) -> [Observation; 2] {
 }
 
 /// A close of connection 1 with `cause`.
-fn closed(cause: &str) -> Observation {
+fn closed(cause: CloseOutcome) -> Observation {
     Observation::ConnectionClosed {
         connection: 1,
-        cause: cause.to_owned(),
+        cause,
     }
 }
 
@@ -801,10 +808,7 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         false,
         vec![
             vec![registered(), second],
-            vec![
-                closed("ordered_read_rejected"),
-                Observation::Misbehavior { connection: 2 },
-            ],
+            vec![closed(FAULT), Observation::Misbehavior { connection: 2 }],
         ],
     );
     assert_eq!(report.end.harness, None, "{:?}", report.end);
@@ -825,7 +829,7 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         [
             found(
                 "honest peer-0's connection 1 is never punished",
-                "a close with cause ordered_read_rejected"
+                &format!("a close with cause {FAULT}")
             ),
             found(
                 "honest peer-0's connection 2 is never punished",
@@ -846,11 +850,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
     let [frame, judged] = labelled(Label::ShortPayload);
     // `status/short-payload-closes` holds: the fault close discharges it.
     // `conformant-never-closes` holds: the label excuses the close.
-    let excused = vec![
-        vec![registered()],
-        vec![frame],
-        vec![judged, closed("ordered_read_rejected")],
-    ];
+    let excused = vec![vec![registered()], vec![frame], vec![judged, closed(FAULT)]];
     let misbehavior = vec![
         vec![registered()],
         vec![Observation::Misbehavior { connection: 1 }],
@@ -873,7 +873,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
             "{name}"
         );
     }
-    let neutral = vec![vec![registered()], vec![closed("ordered_read_timeout")]];
+    let neutral = vec![vec![registered()], vec![closed(READ_TIMEOUT)]];
     let report = run_marked(true, true, neutral);
     assert!(
         matches!(
@@ -887,7 +887,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
         *outcome(&report, &id("conformant-never-closes")),
         PropertyOutcome::not_applicable(NaReason::NeverApplied)
     );
-    let report = run_marked(true, false, vec![vec![closed("ordered_read_rejected")]]);
+    let report = run_marked(true, false, vec![vec![closed(FAULT)]]);
     assert!(
         report.end.harness.is_some(),
         "a punishment with no transport row is missing evidence: {:?}",

@@ -174,7 +174,12 @@ async fn port_future_panic_disconnects_exact_session_and_reactor_survives() {
     reactor.handle_port_completion(completion);
 
     assert!(connection_cancel.is_cancelled());
-    assert_eq!(close_cause.get_or("missing"), "header_port_panic");
+    let cause = close_cause.get().expect("the port panic records a cause");
+    assert_eq!(cause.label(), "header_port_panic");
+    assert!(
+        !cause.is_fault(),
+        "a local port failure is neutral: {cause}"
+    );
     assert!(!reactor.state.request_deadlines.contains_key(&peer));
 
     let second_peer =

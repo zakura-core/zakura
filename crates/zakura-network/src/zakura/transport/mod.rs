@@ -4,6 +4,7 @@
 //! protocol services.
 
 mod clock;
+mod close;
 mod frame;
 mod guard;
 mod handshake_counts;
@@ -22,6 +23,7 @@ mod session;
 mod sim_reader;
 
 pub use clock::{Clock, RealClock};
+pub use close::{CloseOutcome, CloseRow, NeutralCause};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 pub use handshake_counts::{
     handshake_cadence, inbound_share, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission,

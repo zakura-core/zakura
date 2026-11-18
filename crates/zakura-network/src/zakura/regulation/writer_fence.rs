@@ -49,14 +49,16 @@ use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, PoisonError};
 
 use crate::zakura::{
     transport::{FrameWriteClaim, GuardedFrameSlot},
-    CloseCause, Frame, FramedSend,
+    CloseCause, CloseOutcome, Frame, FramedSend, NeutralCause,
 };
 
 #[cfg(test)]
 mod tests;
 
-/// The close cause a fence records.
-pub(crate) const UNFINISHED_EXCHANGE: &str = "unfinished_exchange";
+/// The close outcome a fence records: this node retired the session, so the
+/// close is neutral.
+pub(crate) const UNFINISHED_EXCHANGE: CloseOutcome =
+    CloseOutcome::neutral(NeutralCause::LocalCancellation, "unfinished_exchange");
 
 /// One session's fence over its request writers.
 #[derive(Clone, Debug)]

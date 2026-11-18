@@ -17,7 +17,9 @@ use support::{
     byte_inputs, inputs,
     script::{run_under, Node, OBSERVED},
 };
-use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
+use zakura_network::zakura::{
+    block_sync_streams, BlockSyncMessage, CloseOutcome, CloseRow, MSG_BS_BLOCK,
+};
 use zakura_sim::NaReason;
 use zakura_sim::{
     harness::{
@@ -88,13 +90,13 @@ fn runs(scenario: &BlockScenario, count: usize) -> Vec<RunReport> {
 }
 
 /// The close causes in `report`, in order.
-fn causes(report: &RunReport) -> Vec<&str> {
+fn causes(report: &RunReport) -> Vec<CloseOutcome> {
     report
         .log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
-            Observation::ConnectionClosed { cause, .. } => Some(cause.as_str()),
+            Observation::ConnectionClosed { cause, .. } => Some(*cause),
             _ => None,
         })
         .collect()
@@ -506,7 +508,7 @@ fn faults_inside_the_nodes_exchange_reach_their_exact_ids() {
             );
             let causes = causes(&report);
             assert!(
-                matches!(causes[..], [cause] if cause != "unfinished_exchange"),
+                matches!(causes[..], [cause] if cause.label() != "unfinished_exchange"),
                 "{suffix}: {causes:?}"
             );
             if tampered {
@@ -608,7 +610,8 @@ fn a_well_formed_unsolicited_body_reaches_unsolicited_closes() {
             })
             .collect();
         assert_eq!(labels, [Label::Unsolicited]);
-        assert_eq!(causes(&report), ["ordered_read_rejected"]);
+        let rows: Vec<_> = causes(&report).into_iter().map(CloseOutcome::row).collect();
+        assert_eq!(rows, [Some(CloseRow::REG_CLOSE_6)]);
     }
 }
 
@@ -724,7 +727,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
     };
     let fault_close = Observation::ConnectionClosed {
         connection: 1,
-        cause: "service_protocol_reject".to_owned(),
+        cause: CloseOutcome::fault(STREAM.kind, STREAM.version, CloseRow::REG_CLOSE_2),
     };
     let frame = || row(id.row.expect("a per-row template"));
     match id.template {

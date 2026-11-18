@@ -1328,7 +1328,11 @@ fn measured_peer(
         ping_sent_at: None,
     });
     if let Some(answer_ms) = answer_ms {
-        updater.record_delivery_sample(Duration::from_millis(answer_ms), std::time::Instant::now());
+        updater.record_delivery_sample(
+            crate::peer_registry::DeliverySampleKind::Block,
+            Duration::from_millis(answer_ms),
+            std::time::Instant::now(),
+        );
     }
     peer.client
         .as_mut()
@@ -1499,6 +1503,40 @@ async fn an_announcer_that_does_not_deliver_its_block_scores_worse() {
     assert!(
         score > Duration::from_millis(500),
         "a missed block raises the score: {score:?}"
+    );
+}
+
+/// A peer that announced a block and does not deliver it to a second request is penalised as
+/// for a first request.
+#[tokio::test(start_paused = true)]
+async fn an_announcer_that_does_not_deliver_a_second_request_scores_worse() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let (_far_guard, _far) = measured_peer(&mut far, &registry, Some(230));
+    let (_near_guard, near_score) = measured_peer(&mut near, &registry, Some(10));
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut far, &mut near]);
+
+    announce_block(&mut peer_set, &mut guard, &far).await;
+    let _first = request_block(&mut peer_set).await;
+    assert!(far.written_now().await.is_some(), "the first peer is asked");
+    announce_block(&mut peer_set, &mut guard, &near).await;
+    let second = request_block_again(&mut peer_set, 30).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![BLOCK_HASH.into()])))
+        .await
+        .expect("connection is open");
+    assert!(second.await.is_err(), "the peer did not have the block");
+
+    let score = near_score.delivery_score().expect("measured");
+    assert!(
+        score > Duration::from_millis(500),
+        "a missed second request raises the score: {score:?}"
     );
 }
 

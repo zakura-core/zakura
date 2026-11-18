@@ -10,9 +10,11 @@ use std::{
 use zakura_chain::block;
 
 mod delivery;
+mod delivery_trace;
 
 use delivery::DeliveryEstimate;
 pub(crate) use delivery::MISSED_BLOCK_PENALTY;
+pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
 
 use crate::{
     peer::ConnectionInfo,
@@ -162,6 +164,7 @@ impl PeerRegistry {
             PeerRegistryUpdater {
                 registry: self.clone(),
                 key,
+                delivery_trace: DeliveryTrace::default(),
             },
         )
     }
@@ -287,9 +290,17 @@ impl PeerRegistry {
 pub(crate) struct PeerRegistryUpdater {
     registry: PeerRegistry,
     key: ConnectionKey,
+    /// Where this connection's delivery samples are traced.
+    delivery_trace: DeliveryTrace,
 }
 
 impl PeerRegistryUpdater {
+    /// Makes this connection trace its delivery samples with `delivery_trace`.
+    pub(crate) fn with_delivery_trace(mut self, delivery_trace: DeliveryTrace) -> Self {
+        self.delivery_trace = delivery_trace;
+        self
+    }
+
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry
             .inner
@@ -313,7 +324,7 @@ impl PeerRegistryUpdater {
                 connected_peer.rtt = Some(rtt);
                 connected_peer.ping_sent_at = None;
             });
-        self.record_delivery_sample(rtt, Instant::now());
+        self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
     }
 
     /// Records how long the peer took, measured at `now`, to answer a ping, a transaction
@@ -322,7 +333,14 @@ impl PeerRegistryUpdater {
     ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.
-    pub(crate) fn record_delivery_sample(&self, sample: Duration, now: Instant) {
+    ///
+    /// Each recorded sample is written to the connection's delivery trace.
+    pub(crate) fn record_delivery_sample(
+        &self,
+        kind: DeliverySampleKind,
+        sample: Duration,
+        now: Instant,
+    ) {
         if !matches!(self.key, ConnectionKey::Legacy(_)) {
             return;
         }
@@ -331,13 +349,23 @@ impl PeerRegistryUpdater {
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if state.active_connections.contains_key(&self.key) {
-            state
-                .delivery_estimates
-                .entry(self.key.clone())
-                .or_default()
-                .record(sample, now);
+        if !state.active_connections.contains_key(&self.key) {
+            return;
         }
+        let estimate = state
+            .delivery_estimates
+            .entry(self.key.clone())
+            .or_default();
+        let score_before = estimate.score();
+        estimate.record(sample, now);
+        let estimate = *estimate;
+        drop(state);
+
+        let score = estimate
+            .score()
+            .expect("an estimate that just recorded a sample has a score");
+        self.delivery_trace
+            .sample(kind, sample, score_before, score, estimate.weight());
     }
 
     /// The expected time for this peer to answer a block request, from its recent answers, or
@@ -451,12 +479,60 @@ mod tests {
 
         drop(guard);
         assert_eq!(updater.delivery_score(), None);
-        updater.record_delivery_sample(Duration::from_millis(5), Instant::now());
+        updater.record_delivery_sample(
+            DeliverySampleKind::Block,
+            Duration::from_millis(5),
+            Instant::now(),
+        );
         assert_eq!(
             updater.delivery_score(),
             None,
             "a closed connection keeps no estimate"
         );
+    }
+
+    #[tokio::test]
+    async fn every_delivery_sample_is_traced_with_the_score_it_leaves() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let registry = PeerRegistry::default();
+        let (_connection, updater) = registry.register_legacy(peer(1));
+        let updater = updater.with_delivery_trace(DeliveryTrace::new(
+            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            7,
+        ));
+
+        let now = Instant::now();
+        updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
+        updater.record_delivery_sample(DeliverySampleKind::MissedBlock, MISSED_BLOCK_PENALTY, now);
+        drop(updater);
+        guard.shutdown().await;
+
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("delivery_score.jsonl"))
+                .expect("delivery trace is written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+                .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["event"], "delivery_sample");
+        assert_eq!(rows[0]["connection_id"], 7);
+        assert_eq!(rows[0]["kind"], "ping");
+        assert_eq!(rows[0]["sample_ms"], 10);
+        assert!(
+            rows[0].get("score_before_ms").is_none(),
+            "the first sample has no earlier score"
+        );
+        assert_eq!(rows[0]["score_ms"], 10);
+        assert_eq!(rows[0]["weight"], 1.0);
+        assert_eq!(rows[1]["kind"], "missed_block");
+        assert_eq!(rows[1]["sample_ms"], 2000);
+        assert_eq!(rows[1]["score_before_ms"], 10);
+        assert_eq!(
+            rows[1]["score_ms"], 1005,
+            "two equal-weight samples are averaged"
+        );
+        assert_eq!(rows[1]["weight"], 2.0);
     }
 
     #[test]

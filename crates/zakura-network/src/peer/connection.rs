@@ -46,7 +46,7 @@ use crate::{
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
-    peer_registry::PeerRegistryUpdater,
+    peer_registry::{DeliverySampleKind, PeerRegistryUpdater},
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, HashedBlock, InventoryHash, Message},
@@ -755,25 +755,27 @@ where
 /// quickly the peer answers the next request.
 const MAX_SAMPLED_BLOCK_BYTES: u64 = 256 * 1024;
 
-/// Returns true if `response`'s answer time says how quickly the peer answers a block request:
-/// a reply with at least one transaction, or with blocks that are all small.
+/// Returns what `response`'s answer time measures, if it says how quickly the peer answers a
+/// block request: a reply with at least one transaction, or with blocks that are all small.
 ///
 /// Pings are measured by the heartbeat, and other replies (block hashes, headers, addresses,
 /// "not found" alone) take the peer a different amount of work, so they don't count.
-fn is_delivery_sample(response: &Response) -> bool {
+fn delivery_sample_kind(response: &Response) -> Option<DeliverySampleKind> {
     match response {
         Response::Transactions(transactions) => transactions
             .iter()
-            .any(|transaction| transaction.available().is_some()),
+            .any(|transaction| transaction.available().is_some())
+            .then_some(DeliverySampleKind::Transaction),
         Response::Blocks(blocks) => {
             let mut available = blocks
                 .iter()
                 .filter_map(InventoryResponse::available)
                 .peekable();
-            available.peek().is_some()
-                && available.all(|(block, _)| block.decoded_bytes() <= MAX_SAMPLED_BLOCK_BYTES)
+            (available.peek().is_some()
+                && available.all(|(block, _)| block.decoded_bytes() <= MAX_SAMPLED_BLOCK_BYTES))
+            .then_some(DeliverySampleKind::Block)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -2015,8 +2017,12 @@ where
                 self.request_started_at.take(),
                 response.as_ref(),
             ) {
-                if is_delivery_sample(response) {
-                    delivery_samples.record_delivery_sample(started_at.elapsed(), Instant::now());
+                if let Some(kind) = delivery_sample_kind(response) {
+                    delivery_samples.record_delivery_sample(
+                        kind,
+                        started_at.elapsed(),
+                        Instant::now(),
+                    );
                 }
             }
 

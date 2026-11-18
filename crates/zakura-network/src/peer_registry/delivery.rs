@@ -43,6 +43,11 @@ impl DeliveryEstimate {
         self.updated_at = Some(now);
     }
 
+    /// The decayed number of samples the estimate rests on, as of the last sample.
+    pub(crate) fn weight(&self) -> f64 {
+        self.weight
+    }
+
     /// The expected answer time, or `None` when nothing has been measured yet.
     pub(crate) fn score(&self) -> Option<Duration> {
         self.updated_at?;

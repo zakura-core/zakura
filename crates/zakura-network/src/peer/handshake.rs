@@ -1840,6 +1840,8 @@ where
             let inbound_announced_blocks = announced_blocks.clone();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
+            let peer_registry_updater = peer_registry_updater
+                .map(|updater| updater.with_delivery_trace(gossip_trace.delivery_trace()));
             let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();

@@ -132,7 +132,7 @@ use crate::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
         LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
-    peer_registry::MISSED_BLOCK_PENALTY,
+    peer_registry::{DeliverySampleKind, MISSED_BLOCK_PENALTY},
     peer_set::{
         legacy_peer_trace::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
@@ -1475,8 +1475,11 @@ where
                     if let Some(delivery_samples) =
                         delivery_samples.filter(|_| !delivered_block(&result))
                     {
-                        delivery_samples
-                            .record_delivery_sample(MISSED_BLOCK_PENALTY, Instant::now());
+                        delivery_samples.record_delivery_sample(
+                            DeliverySampleKind::MissedBlock,
+                            MISSED_BLOCK_PENALTY,
+                            Instant::now(),
+                        );
                     }
                     trace.block_request_finish(
                         request_id,
@@ -1670,6 +1673,7 @@ where
         };
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+        let delivery_samples = svc.block_gossip.registry.clone();
         let started = Instant::now();
         let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
@@ -1677,6 +1681,15 @@ where
         let trace = self.legacy_peer_trace.clone();
         async move {
             let result = fut.await;
+            // Like a first request, a second request to a peer that announced the block and then
+            // did not deliver it makes the peer expected to answer slowly.
+            if let Some(delivery_samples) = delivery_samples.filter(|_| !delivered_block(&result)) {
+                delivery_samples.record_delivery_sample(
+                    DeliverySampleKind::MissedSecondBlock,
+                    MISSED_BLOCK_PENALTY,
+                    Instant::now(),
+                );
+            }
             trace.block_request_finish(
                 request_id,
                 trace_peer,

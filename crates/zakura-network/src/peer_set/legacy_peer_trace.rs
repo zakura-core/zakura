@@ -13,6 +13,8 @@
 //! first request ran well past its expected time. `first_request_waited_ms` is how long the first
 //! request had been outstanding, so the download is timed from the first request, and
 //! `first_score_ms` is the first peer's expected answer time.
+//! A delivered block's row has `block_bytes`, its decoded size, so answer times can be compared
+//! with expected ones by block size.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
 //! inventory guarantee. A connection's process-local
 //! `connection_id` is the same number its `legacy_gossip` rows carry, so the two tables join.
@@ -179,6 +181,7 @@ enum BlockRequestResult<'a> {
         returned_hash: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         returned_height: Option<u32>,
+        block_bytes: u64,
     },
     Missing {
         result: &'static str,
@@ -306,6 +309,7 @@ impl LegacyPeerTrace {
                             },
                             returned_hash: returned_hash.to_string(),
                             returned_height: block.coinbase_height().map(|height| height.0),
+                            block_bytes: block.decoded_bytes(),
                         }
                     } else if let Some(missing_hash) = missing {
                         BlockRequestResult::Missing {

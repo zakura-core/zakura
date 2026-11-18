@@ -533,12 +533,13 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored measures `[network.block_source_score]` (#2558).
+          # asia-scored measures `[network.block_source_score]` (#2558) with its
+          # `second_request` setting (#2572).
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "7506d44aefc479e3994a43368b40e4dc8b2497bf"
+          commit     = "13ade9fe529e5d53b8ced7f851c872e4205798fd"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

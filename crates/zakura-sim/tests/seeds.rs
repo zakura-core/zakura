@@ -368,8 +368,93 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),
         "header-repair-apply-departs" => value(RepairScenario::ApplyDeparts),
         "header-repair-supplier-pruned" => value(RepairScenario::SupplierPruned),
-        _ => None,
+        _ => composed(stem),
     }
+}
+
+/// The intended scenario of a `discovery/composed`, `discovery/spam` or
+/// `sync/composed` seed: the one its steps' encoding draws, or for a found
+/// input, the one its bytes draw.
+fn composed(stem: &str) -> Option<serde_json::Value> {
+    use discovery_service::{composed_prefix, spam_prefix, DiscoveryComposed, DiscoverySpam};
+    use sync_wire::{SyncComposed, SYNC_COMPOSED_BYTES, SYNC_COMPOSED_VERSION};
+    use zakura_sim::{
+        harness::Subsystem,
+        peer::{
+            discovery::{DiscoveryAct, Request},
+            PeerAction,
+        },
+    };
+    let ask = |request| PeerAction::Ask { request };
+    let undeclared = PeerAction::Discover {
+        act: DiscoveryAct::UndeclaredType { message_type: 0 },
+    };
+    let hello_burst = PeerAction::Discover {
+        act: DiscoveryAct::HelloBurst,
+    };
+    // Two mirrors, one each way, on the default chain, then the events.
+    let sync = |events: &[[u8; 3]]| {
+        let mut prefix = vec![SYNC_COMPOSED_VERSION, 0b0000_1001, 0];
+        prefix.extend(events.iter().flatten());
+        prefix.resize(SYNC_COMPOSED_BYTES, 0);
+        SyncComposed::draw(&prefix)
+    };
+    let scenario = match stem {
+        "discovery-composed-crossed" => serde_json::to_value(DiscoveryComposed::draw(
+            include_bytes!("fixtures/discovery-composed-crossed.bin"),
+        )),
+        "discovery-composed-two-requests" => {
+            let steps = [ask(Request::GetOnePeer), ask(Request::GetHeaderSyncService)];
+            let prefix = composed_prefix(0, 1, 0b0000_1100, &steps).unwrap();
+            serde_json::to_value(DiscoveryComposed::draw(&prefix))
+        }
+        "discovery-composed-undeclared" => {
+            let prefix =
+                composed_prefix(0, 0x81, 0, &[ask(Request::GetPeers), undeclared]).unwrap();
+            serde_json::to_value(DiscoveryComposed::draw(&prefix))
+        }
+        "discovery-spam-reconnect" => {
+            let steps = [
+                undeclared,
+                undeclared,
+                PeerAction::Disconnect,
+                undeclared,
+                undeclared,
+            ];
+            let prefix = spam_prefix(0, 1, &[Request::GetPeers], &steps).unwrap();
+            serde_json::to_value(DiscoverySpam::draw(&prefix))
+        }
+        "discovery-spam-bursts" => {
+            let steps = [
+                hello_burst,
+                hello_burst,
+                ask(Request::GetPeers),
+                ask(Request::GetPeers),
+                ask(Request::GetServices),
+                ask(Request::GetServices),
+                ask(Request::GetPeers),
+            ];
+            let asks = [Request::GetServices, Request::GetPeers];
+            let prefix = spam_prefix(0, 3, &asks, &steps).unwrap();
+            serde_json::to_value(DiscoverySpam::draw(&prefix))
+        }
+        "sync-composed-honest" => serde_json::to_value(sync(&[])),
+        "sync-composed-close-growth-stall" => {
+            serde_json::to_value(sync(&[[1, 0, 0b0000_0101], [3, 0, 0], [5, 0b0000_0100, 1]]))
+        }
+        "sync-composed-reset" => serde_json::to_value(sync(&[[4, 9, 0]])),
+        "sync-composed-every-step" => serde_json::to_value(sync(&[
+            [1, 1, 0b0000_0100],
+            [2, 1, 0],
+            [3, 1, 0],
+            [4, 9, 0],
+            [5, 0b0000_0100, 2],
+            [7, 0, 0],
+            [3, 3, 0],
+        ])),
+        _ => return None,
+    };
+    Some(scenario.expect("scenarios serialize"))
 }
 
 /// Each committed seed's sidecar records its intended scenario, so a seed

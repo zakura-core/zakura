@@ -1,0 +1,8 @@
+# The committed fuzz input `discovery-composed-two-requests.bin` for `discovery/composed`.
+# A peer that holds its `Services` and asks for one record and for the
+# header-sync service.
+harness = "discovery/composed"
+generator = 1
+sha256 = "4bca470f23e82be81f4ab9d6909541b42d638112761d83b3b88f518542e018bd"
+scenario_sha256 = "b97408b3684a48acfc69ce6d95952ca4106506b00cb8c8d8f1393090a985c323"
+source = "crates/zakura-sim/tests/targets.rs"

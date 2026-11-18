@@ -175,15 +175,32 @@ pub struct ScenarioFamily {
     pub name: &'static str,
     /// The bytes at the prefix's start that pick it.
     pub tag: Vec<u8>,
+    /// How many values of the byte after the tag pick distinct scenarios,
+    /// such as one fault each. 1 when that byte picks nothing. Only the
+    /// generator's cycle draws read it ([`DrawPolicy::Cycle`]).
+    ///
+    /// [`DrawPolicy::Cycle`]: crate::explore::generate::DrawPolicy::Cycle
+    pub variants: u16,
 }
 
 impl ScenarioFamily {
-    /// The family `tag` picks, named `name`.
+    /// The family `tag` picks, named `name`, with one variant.
     pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
         ScenarioFamily {
             name,
             tag: tag.into(),
+            variants: 1,
         }
+    }
+
+    /// This family, whose byte after the tag picks one of `variants`
+    /// scenarios, from 0.
+    pub fn with_variants(self, variants: usize) -> Self {
+        let variants = u16::try_from(variants)
+            .ok()
+            .filter(|variants| (1..=256).contains(variants))
+            .expect("one byte picks 1 to 256 variants");
+        ScenarioFamily { variants, ..self }
     }
 }
 

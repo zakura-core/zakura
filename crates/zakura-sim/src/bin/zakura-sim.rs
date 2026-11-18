@@ -23,7 +23,7 @@
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
 //! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
-//!     [--max-bytes <n>] [--exclude <file>]
+//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle]
 //! zakura-sim generators
 //! ```
 //!
@@ -82,7 +82,9 @@ mod cli {
         },
         explore::{
             abandon_limit,
-            generate::{self, GenerateOptions, DEFAULT_MAX_BYTES, REPORT_FILE as GENERATE_FILE},
+            generate::{
+                self, DrawPolicy, GenerateOptions, DEFAULT_MAX_BYTES, REPORT_FILE as GENERATE_FILE,
+            },
             ABANDON_LIMIT_VAR,
         },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
@@ -129,7 +131,7 @@ mod cli {
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n  \
              zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
-             [--max-bytes <n>] [--exclude <file>]\n  \
+             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle]\n  \
              zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
@@ -202,6 +204,9 @@ mod cli {
              the run index that stopped it, and each property's outcome counts. With\n\
              ZAKURA_SIM_END_RECORDS set, it writes only the stopping run's end record\n\
              there. It exits 0 once the report is written, whatever the search found.\n\
+             --draws picks each run's scenario family: uniform (the default) from the\n\
+             seed and the run alone, or cycle, which visits every family, each of its\n\
+             variants and one untagged run once per block of runs.\n\
              `generators` prints, as JSON, each registered property with the harnesses\n\
              that `generate` can search it on: every harness that reports it and doesn't\n\
              plant its bugs.\n",
@@ -1178,8 +1183,9 @@ mod cli {
             "--out",
             "--max-bytes",
             "--exclude",
+            "--draws",
         ];
-        let mut flags: [Option<String>; 6] = Default::default();
+        let mut flags: [Option<String>; 7] = Default::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = names
@@ -1193,7 +1199,7 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        let [sim, seed, runs, out, max_bytes, exclude] = flags;
+        let [sim, seed, runs, out, max_bytes, exclude, draws] = flags;
         let need = |value: Option<String>, flag: &str| {
             value.ok_or_else(|| Error::Usage(format!("`generate` needs {flag}")))
         };
@@ -1227,6 +1233,15 @@ mod cli {
             records: trace::end_records::dir(),
             abandon_limit: abandon_limit(std::env::var(ABANDON_LIMIT_VAR).ok().as_deref())
                 .map_err(Error::Usage)?,
+            draw_policy: match draws.as_deref() {
+                None | Some("uniform") => DrawPolicy::Uniform,
+                Some("cycle") => DrawPolicy::Cycle,
+                Some(other) => {
+                    return Err(Error::Usage(format!(
+                        "--draws: `{other}` isn't uniform or cycle"
+                    )))
+                }
+            },
         };
         let report = generate::generate(entry, &options).map_err(|error| {
             Error::Failed(format!(

@@ -33,6 +33,11 @@
 //! of the families or no tag, uniformly, from the seed and the run's index,
 //! and writes the family's tag over the input's first bytes. The input
 //! stays the whole run, so replay, shrink and confirm read it unchanged.
+//!
+//! A uniform pick repeats families long before it has drawn them all, so a
+//! slow harness's short search misses most of them. [`DrawPolicy::Cycle`]
+//! instead visits every family, each of its variants and one untagged run
+//! once per block of runs ([`draws_with`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -80,6 +85,29 @@ pub struct GenerateOptions {
     pub records: Option<PathBuf>,
     /// How many abandoned runs the search takes before it stops.
     pub abandon_limit: usize,
+    /// How each run's scenario family is drawn.
+    pub draw_policy: DrawPolicy,
+}
+
+/// How [`draws_with`] picks each run's scenario family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrawPolicy {
+    /// Each run's family, or no tag, is uniform from the seed and the run's
+    /// index alone, as before policies existed, so a seed keeps its runs.
+    #[default]
+    Uniform,
+    /// Each block of runs visits every family's variants and one untagged
+    /// run once, in an order the seed and the block shuffle. A search no
+    /// longer than one block draws no slot twice.
+    Cycle,
+}
+
+impl DrawPolicy {
+    /// True for [`DrawPolicy::Uniform`], which a report leaves out.
+    fn is_uniform(&self) -> bool {
+        *self == DrawPolicy::Uniform
+    }
 }
 
 /// Why a search stopped.
@@ -161,6 +189,10 @@ pub struct GenerateReport {
     pub runs: u64,
     /// The longest input it could draw.
     pub max_bytes: usize,
+    /// How each run's scenario family was drawn. Left out for
+    /// [`DrawPolicy::Uniform`], so earlier reports read the same.
+    #[serde(default, skip_serializing_if = "DrawPolicy::is_uniform")]
+    pub draw_policy: DrawPolicy,
     /// Inputs it ran.
     pub executed: u64,
     /// Inputs it skipped as excluded.
@@ -235,26 +267,91 @@ pub fn draws(
     max_bytes: usize,
     families: Vec<ScenarioFamily>,
 ) -> impl Iterator<Item = (Option<&'static str>, Vec<u8>)> {
+    draws_with(seed, max_bytes, families, DrawPolicy::Uniform)
+}
+
+/// [`draws`] under `policy`. [`DrawPolicy::Uniform`] gives [`draws`]'
+/// inputs. [`DrawPolicy::Cycle`] gives each input one slot: a family with
+/// a value of the byte after its tag below its variant count, which it
+/// writes there when the family has more than one variant, or no tag. Run
+/// `index` takes a slot of block `index / slots`, whose runs visit every
+/// slot once ([`cycled`]). Either way the bytes past what the slot writes
+/// are [`inputs`]' own.
+pub fn draws_with(
+    seed: u64,
+    max_bytes: usize,
+    families: Vec<ScenarioFamily>,
+    policy: DrawPolicy,
+) -> impl Iterator<Item = (Option<&'static str>, Vec<u8>)> {
     // A usize always fits in a u64 on supported targets.
     let choices = families.len() as u64 + 1;
+    let slots: Vec<Option<(usize, u8)>> = families
+        .iter()
+        .enumerate()
+        .flat_map(|(family, listed)| {
+            (0..listed.variants).map(move |variant| {
+                Some((
+                    family,
+                    u8::try_from(variant).expect("a family has at most 256 variants"),
+                ))
+            })
+        })
+        .chain([None])
+        .collect();
     inputs(seed, max_bytes)
         .zip(0u64..)
         .map(move |(mut input, index)| {
             if families.is_empty() {
                 return (None, input);
             }
-            // The remainder is below `choices`, the families' count plus 1.
-            match families.get((mix(seed.rotate_left(32) ^ index) % choices) as usize) {
-                Some(family) => {
-                    if input.len() < family.tag.len() {
-                        input.resize(family.tag.len(), 0);
+            let (family, variant) = match policy {
+                // The remainder is below `choices`, the families' count plus 1.
+                DrawPolicy::Uniform => (
+                    families.get((mix(seed.rotate_left(32) ^ index) % choices) as usize),
+                    None,
+                ),
+                DrawPolicy::Cycle => match slots[cycled(seed, index, slots.len())] {
+                    Some((family, variant)) => {
+                        let listed = &families[family];
+                        (Some(listed), (listed.variants > 1).then_some(variant))
                     }
-                    input[..family.tag.len()].copy_from_slice(&family.tag);
+                    None => (None, None),
+                },
+            };
+            match family {
+                Some(family) => {
+                    let tag = family.tag.len();
+                    let written = tag + usize::from(variant.is_some());
+                    if input.len() < written {
+                        input.resize(written, 0);
+                    }
+                    input[..tag].copy_from_slice(&family.tag);
+                    if let Some(variant) = variant {
+                        input[tag] = variant;
+                    }
                     (Some(family.name), input)
                 }
                 None => (Some(UNTAGGED), input),
             }
         })
+}
+
+/// The slot run `index` of a cycle draw takes, out of `count`. Run `index`
+/// falls in block `index / count`, whose runs visit the slots in an order a
+/// Fisher-Yates shuffle draws from `seed` and the block alone, so a run's
+/// slot doesn't depend on which earlier inputs a search skipped.
+fn cycled(seed: u64, index: u64, count: usize) -> usize {
+    // A usize always fits in a u64 on supported targets.
+    let span = count as u64;
+    let mut order: Vec<usize> = (0..count).collect();
+    let mut state = mix(seed.rotate_left(16) ^ (index / span));
+    for last in (1..count).rev() {
+        state = mix(state);
+        // The remainder is at most `last`, a usize.
+        order.swap(last, (state % (last as u64 + 1)) as usize);
+    }
+    // The remainder is below `span`, a usize.
+    order[(index % span) as usize]
 }
 
 /// SplitMix64's finalizer: a well-mixed function of `x`.
@@ -326,6 +423,7 @@ pub fn generate(
         seed: options.seed,
         runs: options.runs,
         max_bytes: options.max_bytes,
+        draw_policy: options.draw_policy,
         executed: 0,
         skipped: 0,
         millis: 0,
@@ -343,7 +441,12 @@ pub fn generate(
     };
     let mut worker = Worker::new();
     let mut stopped = None;
-    let drawn = draws(options.seed, options.max_bytes, (entry.families)());
+    let drawn = draws_with(
+        options.seed,
+        options.max_bytes,
+        (entry.families)(),
+        options.draw_policy,
+    );
     for (index, (family, input)) in (0..options.runs).zip(drawn) {
         let digest = hex(&Sha256::digest(&input));
         if options.exclude.contains(&digest) {

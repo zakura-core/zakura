@@ -67,7 +67,8 @@ come from" panel):
   before the first request's block, and the time they saved;
 - how often a peer that announced a block did not deliver it, and how long
   block routing passed it over before it delivered a block again;
-- what the scores were made of: pings, transaction replies and small blocks.
+- what the scores were made of: pings and blocks (older builds also counted
+  transaction replies, and only blocks up to 256 KiB).
 
 The last two need a node build that writes the `delivery_score` trace table.
 The summary is kept in memory, so a restarted profiler rebuilds it from what

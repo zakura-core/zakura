@@ -26,8 +26,8 @@ from blocks import process_started
 MAX_HOURS = 24
 MAX_REQUESTS = 50_000
 MAX_SAMPLES = 300_000
-# Block sizes compared separately: the score comes from pings, transaction replies and blocks
-# up to 256 KiB, so larger blocks show how much transfer time it leaves out.
+# Block sizes compared separately: the score comes mostly from pings, so larger blocks show how
+# much transfer time it leaves out.
 SIZE_BUCKETS = ((50_000, "under 50 KB"), (256 * 1024, "50-256 KB"), (None, "over 256 KB"))
 UNKNOWN_SIZE = "size not traced"
 SAMPLE_KINDS = ("ping", "transaction", "block", "carried_over")

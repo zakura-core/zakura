@@ -27,8 +27,10 @@ const MARGIN_SHARE: u32 = 4;
 /// How long past its expected answer time a first request may run before it counts as stalled.
 const STALL_SLACK: Duration = Duration::from_millis(500);
 
-/// When a first request to a peer whose answers have not been measured counts as stalled.
-const UNSCORED_STALL_AFTER: Duration = Duration::from_secs(1);
+/// The expected answer time assumed for a first peer whose answers have not been measured: a
+/// typical download from a far peer. Assuming nothing would let any measured announcer, however
+/// far, replace it.
+const UNSCORED_FIRST_SCORE: Duration = Duration::from_millis(250);
 
 /// How long a first request is remembered. Block downloads time out well before this.
 const FIRST_REQUEST_LIFETIME: Duration = Duration::from_secs(60);
@@ -58,7 +60,8 @@ impl SecondRequestReason {
 
 /// Decides whether to send a second request for a block.
 ///
-/// - `first_score` is the first peer's expected answer time when it was asked, if measured;
+/// - `first_score` is the first peer's expected answer time when it was asked, if measured, or
+///   else [`UNSCORED_FIRST_SCORE`];
 /// - `waited` is how long the first request has been outstanding;
 /// - `best_candidate_score` is the expected answer time of the best other idle announcer, if
 ///   there is one and it has been measured.
@@ -70,18 +73,13 @@ pub(super) fn second_request_reason(
     waited: Duration,
     best_candidate_score: Option<Duration>,
 ) -> Option<SecondRequestReason> {
-    let stall_after = first_score.map_or(UNSCORED_STALL_AFTER, |score| {
-        (score * 2).max(score + STALL_SLACK)
-    });
+    let first_score = first_score.unwrap_or(UNSCORED_FIRST_SCORE);
+    let stall_after = (first_score * 2).max(first_score + STALL_SLACK);
     if waited >= stall_after {
         return Some(SecondRequestReason::Stalled);
     }
 
     let candidate = best_candidate_score?;
-    let Some(first_score) = first_score else {
-        // Nothing is known about the first peer, so a measured one is the better bet.
-        return Some(SecondRequestReason::Predicted);
-    };
     let remaining = first_score.saturating_sub(waited);
     let margin = MIN_MARGIN.max(first_score / MARGIN_SHARE);
     (candidate + margin < remaining).then_some(SecondRequestReason::Predicted)
@@ -222,14 +220,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unmeasured_first_peer_loses_to_a_measured_announcer() {
+    fn an_unmeasured_first_peer_is_treated_as_a_typical_far_peer() {
+        // It loses to a clearly faster measured announcer...
         assert_eq!(
-            second_request_reason(None, ms(10), Some(ms(300))),
+            second_request_reason(None, ms(10), Some(ms(50))),
             Some(SecondRequestReason::Predicted)
         );
+        // ...but not to one about as far away.
+        assert_eq!(second_request_reason(None, ms(10), Some(ms(190))), None);
         assert_eq!(second_request_reason(None, ms(10), None), None);
+        // Its stall point is that of a 250 ms peer: 250 ms plus 500 ms.
+        assert_eq!(second_request_reason(None, ms(749), None), None);
         assert_eq!(
-            second_request_reason(None, ms(1000), None),
+            second_request_reason(None, ms(750), None),
             Some(SecondRequestReason::Stalled)
         );
     }

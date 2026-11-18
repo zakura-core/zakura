@@ -200,7 +200,9 @@ def propagation_stats(first_seen: dict[str, dict[str, float]], node_count: int) 
 # mined block supersedes; Kresko detects this and rebuilds. Counting these as
 # node rejects makes a healthy run look like a mempool regression -- at low
 # submission counts a single one is several percent.
-WORKLOAD_ERROR_CLASSES = frozenset({"unknown_orchard_anchor", "anchor_rejection"})
+WORKLOAD_ERROR_CLASSES = frozenset(
+    {"unknown_orchard_anchor", "unknown_ironwood_anchor", "anchor_rejection"}
+)
 
 # Event names from Kresko's src/txblast/shielded.rs.
 EVENT_COUNTERS = {

@@ -633,22 +633,25 @@ class TxblastTraces(unittest.TestCase):
         # A live run produced exactly this: one unknown_orchard_anchor among 22
         # submissions is 4.35%, close enough to the 5% threshold to fail a
         # healthy PR. It is the blaster racing a new block, not a node reject.
+        # From NU6.3 the blast spends Ironwood, and the same race names that pool.
         import tempfile
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trace_dir = self.write_trace(
-                Path(tmpdir),
-                [{"event": "tx_submitted"} for _ in range(21)]
-                + [
-                    {"event": "tx_submit_failed", "error_class": "unknown_orchard_anchor"},
-                    {"event": "chain_rebuild_started"},
-                ],
-            )
-            out = monitor.read_txblast_traces(trace_dir)
-        self.assertEqual(out["workload_failures"], 1)
-        self.assertEqual(out["node_rejects"], 0)
-        self.assertEqual(out["reject_rate"], 0.0)
-        self.assertEqual(out["chain_rebuilds"], 1)
+        for anchor_class in ("unknown_orchard_anchor", "unknown_ironwood_anchor"):
+            with self.subTest(anchor_class):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    trace_dir = self.write_trace(
+                        Path(tmpdir),
+                        [{"event": "tx_submitted"} for _ in range(21)]
+                        + [
+                            {"event": "tx_submit_failed", "error_class": anchor_class},
+                            {"event": "chain_rebuild_started"},
+                        ],
+                    )
+                    out = monitor.read_txblast_traces(trace_dir)
+                self.assertEqual(out["workload_failures"], 1)
+                self.assertEqual(out["node_rejects"], 0)
+                self.assertEqual(out["reject_rate"], 0.0)
+                self.assertEqual(out["chain_rebuilds"], 1)
 
     def test_genuine_node_rejects_still_count(self):
         import tempfile

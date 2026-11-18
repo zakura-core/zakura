@@ -6,7 +6,7 @@ name: Mempool load
 # Boots a droplet from the pre-baked PR-node image (deps + warm cargo cache, see
 # zakura-pr-node-bake.yml), builds zakurad from the chosen ref, generates an
 # isolated local-genesis chain with synthetic premine funds, runs `node_count`
-# zakurad nodes peered on loopback, and blasts funded Orchard transactions at
+# zakurad nodes peered on loopback, and blasts funded shielded transactions at
 # them for `duration_minutes`. Grades throughput, propagation latency,
 # backpressure, and tip convergence, then posts a summary as a PR comment.
 #

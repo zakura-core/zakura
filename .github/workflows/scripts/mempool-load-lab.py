@@ -2,7 +2,7 @@
 """Drive an isolated local-genesis mempool-load testnet.
 
 Generates a throwaway chain with the Kresko Rust binary, runs N zakurad nodes
-peered to each other, mines, and blasts funded Orchard transactions at one
+peered to each other, mines, and blasts funded shielded transactions at one
 node's RPC. Used identically by the local rehearsal and by the CI droplet, so a
 green local run means the CI path is exercising the same code.
 
@@ -202,10 +202,6 @@ def cmd_genesis(args) -> int:
     config = build_kresko_config(args)
     (lab / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
-    # NU6.3 gates the Ironwood shielded pool, so a chain that stops below it
-    # cannot exercise Ironwood at all. Nu7 is deliberately not requested: a
-    # release zakurad compiles its consensus branch id out, and no block at an
-    # Nu7 activation height can be mined.
     env = {**os.environ, "KRESKO_LATEST_NETWORK_UPGRADE": args.latest_upgrade}
     # Recorded so the blast uses the same upgrade as the chain. Kresko's
     # transaction builder derives its consensus branch id from this, and a
@@ -667,7 +663,7 @@ def stop_pid(pid: int, name: str) -> bool:
 
 
 def cmd_blast(args) -> int:
-    """Run the funded Orchard transaction blast against node 0's RPC."""
+    """Run the funded shielded transaction blast against node 0's RPC."""
     lab = Path(args.lab_dir).resolve()
     trace_dir = lab / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -800,21 +796,19 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--chain-id", default="mempool-load")
     gen.add_argument(
         "--latest-upgrade",
-        # nu6_1, not nu6_3, until Kresko's transaction builder can follow. Its
-        # zcash_protocol 0.7 has no Nu6_2/Nu6_3 variants, so on an NU6.3 chain
-        # it signs at NU6.1's consensus branch id and every transaction is
-        # rejected -- the blast dies during bootstrap and the run measures
-        # nothing. Kresko can now *express* NU6.2/NU6.3 (valargroup/kresko),
-        # so this becomes nu6_3 once its zcash stack is bumped to the 0.10 /
-        # 0.29 / orchard 0.15 line that Zakura already uses.
-        #
-        # Ironwood is gated on NU6.3, so Ironwood coverage waits on that too.
-        default="nu6_1",
+        # NU7, like Mainnet. Main takes block spacing from the active upgrade
+        # (75 s from Blossom, 25 s from NU7) and has no key to override it, so
+        # an earlier upgrade runs a 75 s chain. From NU6.3 the blast spends
+        # Ironwood, because NU6.3 closes Orchard to new value.
+        default="nu7",
         help="newest network upgrade the generated chain activates "
-        "(nu6_3 needs a Kresko built against zcash_protocol 0.10+)",
+        "(nu7 gives Mainnet's 25 s blocks)",
     )
     gen.add_argument("--experiment", default="mempool-load")
-    gen.add_argument("--block-time-secs", type=int, default=5)
+    # Kresko spaces the seeded blocks by this. The default matches NU7's 25 s
+    # target. A value off the chain's target skews its first difficulty
+    # adjustments.
+    gen.add_argument("--block-time-secs", type=int, default=25)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)
     # 32, not Kresko's 384: every lane is proved during bootstrap, so a large
     # inventory means a bounded run never reaches steady state.

@@ -2,7 +2,7 @@
 # Runs ON the ephemeral mempool-load droplet (zakura-mempool-load.yml): checks
 # out the target commit in the baked repo clone, builds zakurad and the Kresko
 # load generator, brings up an isolated local-genesis testnet, blasts funded
-# Orchard transactions at it, and grades the result.
+# shielded transactions at it, and grades the result.
 #
 # Config via /root/run.env (sourced by the caller before exec):
 #   GH_REPO / GH_CLONE_TOKEN  repo slug + per-run token for the ref fetch

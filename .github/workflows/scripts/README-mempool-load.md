@@ -1,6 +1,6 @@
 # Mempool load harness
 
-An isolated local-genesis testnet that blasts funded Orchard transactions at a
+An isolated local-genesis testnet that blasts funded shielded transactions at a
 small fleet of zakurad nodes and grades the result: throughput, propagation
 latency, backpressure, and tip convergence.
 
@@ -107,6 +107,13 @@ the zakura experiment branch it pins, with custom parameters under
 parameters only as the explicit `[network.network]` table, so `localize-fleet` is
 followed by that rewrite, which also drops `post_blossom_pow_target_spacing`.
 
+**The chain runs NU7, like Mainnet.** Main takes each block's target spacing
+from the upgrade active at its height, 75 s from Blossom and 25 s from NU7, and
+has no key to override it. So `--latest-upgrade` defaults to `nu7`, and
+`--block-time-secs` defaults to 25 to match, since Kresko spaces the seeded
+blocks by it. NU6.3 closes Orchard to new value, so Kresko blasts Ironwood on
+this chain.
+
 **`up` is idempotent.** It skips seeding a node that already holds the chain.
 Resubmitting genesis to a node whose tip has moved past it returns a bare
 `rejected`, which reads like a chain failure rather than "this already ran".
@@ -149,6 +156,10 @@ rather than leaving you with the raw field name.
 Fix by testing a newer ref, or by repinning Kresko's zakura dependency and
 updating `kresko_ref`.
 
+The NU7 chain also needs a Kresko that knows the node's `unknown Ironwood anchor`
+rejection. An older one neither rescans after it nor classifies it, so the run
+counts those races as node rejects.
+
 ## Artifact safety
 
 Premine spending keys never leave the box, even though they are worthless off
@@ -178,11 +189,12 @@ and the input to `mempool-load-compare.py`.
   than the sampling cadence — but it varies run to run (4-8s observed), which is
   why `baseline_ref` compares two legs on one droplet rather than against a
   stored number.
-- **Node rejects vs workload failures.** `unknown_orchard_anchor` means the
-  blaster built against an anchor a new block superseded; Kresko rebuilds and
-  retries. Those are counted as `workload_failures` and excluded from the graded
-  reject rate — one of them in a 22-submission run is 4.35%, near enough the 5%
-  threshold to fail a healthy PR.
+- **Node rejects vs workload failures.** `unknown_orchard_anchor`, or
+  `unknown_ironwood_anchor` from NU6.3, means the blaster built against an anchor
+  a new block superseded; Kresko rebuilds and retries. Those are counted as
+  `workload_failures` and excluded from the graded reject rate — one of them in
+  a 22-submission run is 4.35%, near enough the 5% threshold to fail a healthy
+  PR.
 - **Reject rate is only graded above `--min-graded-submissions`** (default 50),
   for the same reason.
 - A run is `failed` on panics, zero submissions, missing traces, graded rejects

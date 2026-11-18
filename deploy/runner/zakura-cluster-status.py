@@ -5135,7 +5135,7 @@ function renderTop() {
 }
 // ---- block sources: how well the legacy block source scores predict downloads ----
 const SOURCE_REASON = { predicted: "Another announcer expected sooner", stalled: "First request stalled", "fixed delay": "Fixed delay" };
-const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", missed_block: "missed blocks", missed_second_block: "missed second requests" };
+const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", missed_block: "missed blocks", missed_second_block: "missed second requests", carried_over: "scores restored on reconnect" };
 function signedMs(value) { return value == null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "") + ms(Math.abs(value)); }
 function seconds(value) { return value == null ? "–" : value >= 120 ? Math.round(value / 60) + " min" : Math.round(value) + " s"; }
 function share(part, whole) { return whole ? Math.round(100 * part / whole) + "%" : "–"; }
@@ -5173,11 +5173,13 @@ function renderSources() {
         + `<td class="pf-num">${p.weight.p50 == null ? "–" : p.weight.p50.toFixed(1)}</td><td class="pf-num">${p.recovered}</td><td class="pf-num">${seconds(p.recovery_s.p50)}</td>`
         + `<td class="pf-num">${p.still_raised}</td><td class="pf-num">${p.closed}</td></tr>`;
     }).join("");
-  const counts = sources.samples.counts, total = Object.values(counts).reduce((a, b) => a + b, 0);
+  const { carried_over = 0, ...counts } = sources.samples.counts;
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
   el("src-mix").textContent = total
     ? "What the scores were made of: " + Object.entries(counts).filter(([, n]) => n).map(([kind, n]) => `${share(n, total)} ${SAMPLE_LABEL[kind] || kind}`).join(", ")
       + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples, so one missed block (2 s) moves it by about 2 s divided by that.`
-    : "This node build does not trace score samples yet.";
+    : "No new score measurements in this window.";
+  if (carried_over) el("src-mix").textContent += ` ${carried_over} ${SAMPLE_LABEL.carried_over}.`;
 }
 
 function renderNotes() {

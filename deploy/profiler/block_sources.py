@@ -28,7 +28,7 @@ MAX_SAMPLES = 300_000
 # up to 256 KiB, so larger blocks show how much transfer time it leaves out.
 SIZE_BUCKETS = ((50_000, "under 50 KB"), (256 * 1024, "50-256 KB"), (None, "over 256 KB"))
 UNKNOWN_SIZE = "size not traced"
-SAMPLE_KINDS = ("ping", "transaction", "block", "missed_block", "missed_second_block")
+SAMPLE_KINDS = ("ping", "transaction", "block", "missed_block", "missed_second_block", "carried_over")
 PENALTY_KINDS = ("missed_block", "missed_second_block")
 # A penalised score counts as recovered once it is back within this of where it was.
 RECOVERED_FACTOR = 1.25
@@ -201,7 +201,7 @@ def second_request_outcomes(requests):
 def sample_mix(samples):
     """How many samples of each kind changed scores, and how many samples a score rests on."""
     counts = collections.Counter(s[2] for s in samples)
-    weights = [s[5] for s in samples if isinstance(s[5], (int, float))]
+    weights = [s[5] for s in samples if s[2] != "carried_over" and isinstance(s[5], (int, float))]
     return {
         "counts": {kind: counts.get(kind, 0) for kind in SAMPLE_KINDS},
         "weight": spread(weights),

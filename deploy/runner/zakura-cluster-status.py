@@ -85,6 +85,7 @@ PROFILER_API = {
     "flame": ("range", "from", "to", "view", "lens", "focus"),
     "timeline": ("range", "from", "to"),
     "blocks": ("limit",),
+    "sources": ("hours",),
 }
 PUBLIC_ORIGINS = {
     "mainnet": frozenset({"https://zakura.com"}),
@@ -3660,6 +3661,22 @@ footer {
         <div class="pf-chart"><table id="pf-block-table"></table></div>
       </div>
 
+      <div class="panel pad pf-panel" role="region" aria-labelledby="pf-src-h" id="pf-sources-panel" hidden>
+        <div class="pf-controls">
+          <h3 id="pf-src-h">Where legacy blocks come from</h3>
+          <div class="pf-group" role="group" aria-label="Hours to summarise">
+            <button data-pf-src-hours="1">1 h</button>
+            <button data-pf-src-hours="6">6 h</button>
+            <button data-pf-src-hours="24">24 h</button>
+          </div>
+        </div>
+        <p class="pf-note" id="pf-src-note"></p>
+        <div class="pf-chart"><table id="pf-src-pred"></table></div>
+        <div class="pf-chart"><table id="pf-src-second"></table></div>
+        <div class="pf-chart"><table id="pf-src-pen"></table></div>
+        <p class="pf-note" id="pf-src-mix"></p>
+      </div>
+
       <div class="panel pad pf-panel" role="region" aria-labelledby="pf-top-h">
         <h3 id="pf-top-h">Functions with the most time of their own</h3>
         <p class="pf-note">Time sampled in the function itself, not in what it calls, added up over every place it appears in this view. Click one to see everything under it.</p>
@@ -4680,8 +4697,8 @@ const el = id => document.getElementById("pf-" + id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const color = cat => `var(--c-${cat})`;
 
-const state = { range: "1h", from: null, to: null, view: "all", lens: "all", focus: "", zoom: [], search: "", scale: "all", block: null, path: null };
-let meta = null, status = null, flame = null, timeline = null, selected = null, labels = {}, blockStages = null;
+const state = { range: "1h", from: null, to: null, view: "all", lens: "all", focus: "", zoom: [], search: "", scale: "all", block: null, path: null, srcHours: 6 };
+let meta = null, status = null, flame = null, timeline = null, selected = null, labels = {}, blockStages = null, sources = null;
 // The colour of each stage is the colour of the subsystem that does the work.
 const STAGE_CATEGORY = {
   header_fetch: "arrival", header_check: "arrival", body_request: "arrival", body_download: "arrival", submit: "arrival",
@@ -4816,6 +4833,7 @@ document.getElementById("profile").addEventListener("click", event => {
   else if (button.id === "pf-focus-fn" && selected) { state.focus = selected.name.slice(0, 300); state.zoom = []; reload(); }
   else if (button.id === "pf-zoom-out") { state.zoom.pop(); selected = null; drawFlame(); }
   else if (button.dataset.pfScale) { state.scale = button.dataset.pfScale; drawStages(); }
+  else if (button.dataset.pfSrcHours) { state.srcHours = +button.dataset.pfSrcHours; loadSources(); }
   else if (button.id === "pf-stage-median") { state.block = null; drawStages(); }
   else if (button.dataset.pfPath) { state.path = button.dataset.pfPath; state.block = null; drawStages(); }
   else if (button.dataset.pfBlock) { state.block = state.block === button.dataset.pfBlock ? null : button.dataset.pfBlock; drawStages(); }
@@ -5115,6 +5133,53 @@ function renderTop() {
       + `<td style="width:28%"><div class="pf-bar" style="width:${(100 * us / peak).toFixed(1)}%;background:${color(cat)}"></div></td></tr>`;
   }).join("");
 }
+// ---- block sources: how well the legacy block source scores predict downloads ----
+const SOURCE_REASON = { predicted: "Another announcer expected sooner", stalled: "First request stalled", "fixed delay": "Fixed delay" };
+const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "small blocks", missed_block: "missed blocks", missed_second_block: "missed second requests" };
+function signedMs(value) { return value == null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "") + ms(Math.abs(value)); }
+function seconds(value) { return value == null ? "–" : value >= 120 ? Math.round(value / 60) + " min" : Math.round(value) + " s"; }
+function share(part, whole) { return whole ? Math.round(100 * part / whole) + "%" : "–"; }
+async function loadSources() {
+  if (!status || !status.block_sources) { sources = null; renderSources(); return; }
+  try { sources = await api("sources", { hours: state.srcHours }); } catch (error) { sources = null; }
+  renderSources();
+}
+function renderSources() {
+  const panel = el("sources-panel");
+  panel.hidden = !sources;
+  if (!sources) return;
+  document.querySelectorAll("[data-pf-src-hours]").forEach(b => b.setAttribute("aria-pressed", +b.dataset.pfSrcHours === sources.hours));
+  const req = sources.requests;
+  if (!req.first) {
+    el("src-note").textContent = `No legacy block requests to a peer that announced the block in the last ${sources.hours} h. The node has block source scores off, or gets its blocks another way.`;
+    ["src-pred", "src-second", "src-pen"].forEach(id => { el(id).innerHTML = ""; });
+    el("src-mix").textContent = "";
+    return;
+  }
+  el("src-note").textContent = `Last ${sources.hours} h: ${req.first} first requests for announced blocks, ${share(req.first_unscored, req.first)} to a peer with no score yet, ${share(req.first_undelivered, req.first)} not delivered; ${req.second} second requests. A score is the peer's expected answer time; below, "off by" is the actual download time minus it, so a positive number means the peer was slower than expected.`;
+  el("src-pred").innerHTML = "<tr><th>Request</th><th>Block size</th><th>Downloads</th><th>Off by, p10</th><th>median</th><th>p90</th></tr>"
+    + sources.prediction.map(g => `<tr><td>${g.request === "second" ? "Second" : "First"}</td><td>${esc(g.size)}</td><td class="pf-num">${g.n}</td>`
+      + `<td class="pf-num">${signedMs(g.p10)}</td><td class="pf-num">${signedMs(g.p50)}</td><td class="pf-num">${signedMs(g.p90)}</td></tr>`).join("");
+  el("src-second").innerHTML = sources.second_requests.length
+    ? "<tr><th>Why a second request was sent</th><th>Sent</th><th>Delivered</th><th>Arrived first</th><th>Time saved, median</th><th>p90</th></tr>"
+      + sources.second_requests.map(o => `<tr><td>${esc(SOURCE_REASON[o.reason] || o.reason)}</td><td class="pf-num">${o.sent}</td><td class="pf-num">${o.delivered}</td>`
+        + `<td class="pf-num">${o.won} (${share(o.won, o.sent)})</td><td class="pf-num">${ms(o.saved_p50_ms)}</td><td class="pf-num">${ms(o.saved_p90_ms)}</td></tr>`).join("")
+    : "";
+  const pens = sources.penalties;
+  el("src-pen").innerHTML = "<tr><th>Announced block not delivered</th><th>Times</th><th>Score before, median</th><th>Raised by, median</th><th>Samples behind the score, median</th><th>Back to normal</th><th>Time to recover, median</th><th>Still raised</th><th>Disconnected</th></tr>"
+    + [["missed_block", "First request"], ["missed_second_block", "Second request"]].map(([kind, label]) => {
+      const p = pens[kind];
+      return `<tr><td>${label}</td><td class="pf-num">${p.count}</td><td class="pf-num">${ms(p.score_before_ms.p50)}</td><td class="pf-num">${signedMs(p.jump_ms.p50)}</td>`
+        + `<td class="pf-num">${p.weight.p50 == null ? "–" : p.weight.p50.toFixed(1)}</td><td class="pf-num">${p.recovered}</td><td class="pf-num">${seconds(p.recovery_s.p50)}</td>`
+        + `<td class="pf-num">${p.still_raised}</td><td class="pf-num">${p.closed}</td></tr>`;
+    }).join("");
+  const counts = sources.samples.counts, total = Object.values(counts).reduce((a, b) => a + b, 0);
+  el("src-mix").textContent = total
+    ? "What the scores were made of: " + Object.entries(counts).filter(([, n]) => n).map(([kind, n]) => `${share(n, total)} ${SAMPLE_LABEL[kind] || kind}`).join(", ")
+      + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples, so one missed block (2 s) moves it by about 2 s divided by that.`
+    : "This node build does not trace score samples yet.";
+}
+
 function renderNotes() {
   const lead = Math.abs(status.block_window_ms[0]), tail = status.block_window_ms[1];
   el("notes").innerHTML = [
@@ -5143,6 +5208,7 @@ async function reload() {
     return;
   }
   renderStatus(); renderTiles(); drawTimeline(); buildTree(); drawFlame(); drawStages(); renderTop(); renderNotes();
+  loadSources();
 }
 async function start() {
   readHash();

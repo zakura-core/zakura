@@ -212,8 +212,8 @@ impl PeerMachine {
 
     /// A `Tx` arrived answering the request for `id`, carrying `body`. Its
     /// size on the wire is the body's own size. `exempt` is whether the
-    /// peer's address is one of `network.unconditional_peers` now. See
-    /// [`Submitted::exempt`].
+    /// peer's address was one of `network.unconditional_peers` when the body
+    /// arrived. See [`Submitted::exempt`].
     pub(crate) fn tx(
         &mut self,
         shared: &mut Shared,

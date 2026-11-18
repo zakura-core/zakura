@@ -323,12 +323,15 @@ async fn apply_calls(session: &mut Session, last: fn(&PoolResult) -> bool) {
     panic!("the routine ran out of calls");
 }
 
-/// A peer's address can join `network.unconditional_peers` after its
-/// session opened, as a pinned name's does once a connection proves the
-/// name's node ID. A body the peer supplies after that is never charged, so
-/// the rejection that bans an ordinary supplier leaves it connected.
+/// A peer's address can join or leave `network.unconditional_peers` while
+/// its session runs, as a pinned name's joins once a connection proves the
+/// name's node ID. A body keeps the exemption its supplier had when it
+/// arrived. One that arrived while the address was listed is never charged,
+/// even if the address leaves before the verdict, so the rejection that bans
+/// an ordinary supplier leaves the peer connected. One that arrived while
+/// the address was not listed is charged, even if the address joins.
 #[tokio::test]
-async fn a_body_supplied_after_its_address_became_unconditional_is_not_charged() {
+async fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
     for listed in [false, true] {
         let mut pool = transactions(2);
         let supplied = pool.pop().expect("two transactions").transaction;
@@ -380,6 +383,10 @@ async fn a_body_supplied_after_its_address_became_unconditional_is_not_charged()
             .zcash_serialize_to_vec()
             .expect("a valid transaction serializes");
         session.deliver(TxRelayMessage::Tx { id, body }).await;
+
+        // Before the verdict, the address leaves the list if it was on it
+        // and joins if it was not.
+        unconditional.set_resolved_ip(0, (!listed).then(peer_ip));
 
         // The core rejects the body with the charge that bans its supplier.
         let reject = async {

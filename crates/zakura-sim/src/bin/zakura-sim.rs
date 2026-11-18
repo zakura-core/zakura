@@ -207,6 +207,9 @@ mod cli {
              --draws picks each run's scenario family: uniform (the default) from the\n\
              seed and the run alone, or cycle, which visits every family, each of its\n\
              variants and one untagged run once per block of runs.\n\
+             ZAKURA_SIM_KNOWN=<id>[=<issue>],... makes every command treat each named\n\
+             Active property as Known, so a search records its violations and goes on\n\
+             past an open bug. Replaying such a trace needs the same value.\n\
              `generators` prints, as JSON, each registered property with the harnesses\n\
              that `generate` can search it on: every harness that reports it and doesn't\n\
              plant its bugs.\n",

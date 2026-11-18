@@ -34,7 +34,7 @@ pub mod sync_wire;
 pub mod wire_node;
 pub mod wire_plans;
 
-use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -444,7 +444,48 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
         },
     ];
     properties.extend(S::properties());
+    let known = treated_as_known();
+    for property in &mut properties {
+        if let Some(&issue) = known.get(property.id.as_str()) {
+            if property.status == Status::Active {
+                property.status = Status::Known { issue };
+            }
+        }
+    }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
+}
+
+/// The variable that names properties a run treats as `Known`, comma
+/// separated, each as `<id>` or `<id>=<issue>`, issue 0 when left out. An
+/// `Active` property it names records its violations and lets the run go
+/// on, as a `Known` one does, so a search can look past an open bug it
+/// keeps finding. A trace records each status, so replaying one needs the
+/// same value. Unset, every property keeps its own status.
+pub const KNOWN_VAR: &str = "ZAKURA_SIM_KNOWN";
+
+/// The properties [`KNOWN_VAR`] names, each with its issue.
+///
+/// # Panics
+///
+/// If an issue isn't a number, so a mistyped value can't pass silently.
+fn treated_as_known() -> BTreeMap<String, u32> {
+    let Ok(value) = std::env::var(KNOWN_VAR) else {
+        return BTreeMap::new();
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((id, issue)) => (
+                id.to_owned(),
+                issue
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{KNOWN_VAR}: `{issue}` isn't an issue number")),
+            ),
+            None => (entry.to_owned(), 0),
+        })
+        .collect()
 }
 
 /// Checks [`NO_TASK_PANIC`]: violated at a step where a task panicked.

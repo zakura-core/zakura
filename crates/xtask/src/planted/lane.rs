@@ -6,7 +6,7 @@
 //! It also reads why a build failed ([`BuildFailure`]).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -441,6 +441,53 @@ pub(in crate::planted) struct CampaignFacts {
     /// Why the run's fuzzer build doesn't pair with the expected identity,
     /// or its fuzzer with its arm, if it doesn't.
     pub(in crate::planted) unpaired: Option<String>,
+    /// For each other violated property, its first saved input, relative
+    /// to the store, and the seconds to that input's detection, as
+    /// [`CampaignFacts::first_intended_secs`] counts them.
+    #[serde(skip)]
+    pub(in crate::planted) co_violation_inputs: BTreeMap<String, (String, Option<f64>)>,
+}
+
+impl CampaignFacts {
+    /// The first saved input of a property in `also_violates`, if no saved
+    /// input violates the intended property. A target saves an input under
+    /// its run's first violation, so an input saved under a co-violation
+    /// may violate the intended property too, which only a confirmation
+    /// against that property shows.
+    pub(in crate::planted) fn co_violation_input(&self, also_violates: &[String]) -> Option<&str> {
+        if self.intended_input.is_some() {
+            return None;
+        }
+        also_violates
+            .iter()
+            .filter_map(|id| self.co_violation_inputs.get(id))
+            .map(|(input, _)| input.as_str())
+            .next()
+    }
+
+    /// Counts `input`, a saved co-violation input that a fresh process
+    /// confirmed against `property`, the intended property, as the run's
+    /// intended finding.
+    pub(in crate::planted) fn adopt_co_violation(&mut self, property: &str, input: &str) {
+        let Some((id, secs)) = self
+            .co_violation_inputs
+            .iter()
+            .find(|(_, (saved, _))| saved == input)
+            .map(|(id, (_, secs))| (id.clone(), *secs))
+        else {
+            return;
+        };
+        self.intended_input = Some(input.to_owned());
+        self.first_intended_secs = secs;
+        if !self.violated.iter().any(|id| id == property) {
+            self.violated.push(property.to_owned());
+            self.violated.sort();
+        }
+        if self.active.contains(&id) && !self.active.iter().any(|id| id == property) {
+            self.active.push(property.to_owned());
+            self.active.sort();
+        }
+    }
 }
 
 /// What a saved failure file is, from its path in the store.
@@ -556,6 +603,7 @@ pub(in crate::planted) fn campaign_facts(
     let (mut failures, mut killed, mut crashes, mut intended_input) =
         (Vec::new(), Vec::new(), Vec::new(), None);
     let mut intended_digests = BTreeSet::new();
+    let mut co_violations: BTreeMap<String, (String, BTreeSet<&str>)> = BTreeMap::new();
     let records = end
         .and_then(|end| end.get("failures"))
         .and_then(Value::as_array);
@@ -565,9 +613,15 @@ pub(in crate::planted) fn campaign_facts(
         };
         match failure_kind(path) {
             Failure::Violation(violation) => {
+                let digest = record.get("sha256").and_then(Value::as_str);
                 if violation == property {
                     intended_input.get_or_insert_with(|| path.to_owned());
-                    intended_digests.extend(record.get("sha256").and_then(Value::as_str));
+                    intended_digests.extend(digest);
+                } else {
+                    let (_, digests) = co_violations
+                        .entry(violation.clone())
+                        .or_insert_with(|| (path.to_owned(), BTreeSet::new()));
+                    digests.extend(digest);
                 }
                 if bucket(path) == Some("active") {
                     active.insert(violation.clone());
@@ -645,6 +699,10 @@ pub(in crate::planted) fn campaign_facts(
         first_intended_secs: first_detection(attempts, &intended_digests),
         intended_input,
         unpaired: None,
+        co_violation_inputs: co_violations
+            .into_iter()
+            .map(|(id, (input, digests))| (id, (input, first_detection(attempts, &digests))))
+            .collect(),
     }
 }
 

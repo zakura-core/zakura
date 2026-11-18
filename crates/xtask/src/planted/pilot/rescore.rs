@@ -72,10 +72,13 @@ struct SavedSeed {
 }
 
 /// What `rescore` keeps of a campaign's facts: its pairing verdict, which
-/// needs the run's checkout to decide again.
+/// needs the run's checkout to decide again, and its intended input, which
+/// may be a co-violation input that the run's confirmation adopted.
 #[derive(Debug, Deserialize)]
 struct SavedFacts {
     unpaired: Option<String>,
+    #[serde(default)]
+    intended_input: Option<String>,
 }
 
 /// Re-derives the report of the run whose `--out` is `from` into `out`.
@@ -176,11 +179,15 @@ fn reread(
     if saved.unpaired.is_none() {
         toolchains.insert(Value::Object(toolchain_of(records.identity())).to_string());
     }
-    Ok(Campaign {
+    let mut facts = Campaign {
         records,
         unpaired: saved.unpaired,
     }
-    .facts(property))
+    .facts(property);
+    if let (None, Some(input)) = (&facts.intended_input, &saved.intended_input) {
+        facts.adopt_co_violation(property, input);
+    }
+    Ok(facts)
 }
 
 /// The one toolchain every paired build shares, as `toolchains` holds

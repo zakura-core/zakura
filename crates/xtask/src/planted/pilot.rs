@@ -1262,22 +1262,31 @@ fn discovery_case(
                         run.mutant = Some(Err(NoCampaign::Killed(why)));
                     }
                     Ok(campaign) => {
-                        let facts = campaign.facts(&case.property);
+                        let mut facts = campaign.facts(&case.property);
                         run.patch = Some(Ok(()));
-                        if let Some(input) = &facts.intended_input {
-                            run.confirmation = Some(
-                                confirm_and_replay(
-                                    &|| Command::new(&sim),
-                                    &case.harness,
-                                    &lane_dir.join("store").join(input),
-                                    &case.property,
-                                    &case.also_violates,
-                                    Confirm::Witness,
-                                    &lane_dir.join("confirmation"),
-                                    plan.child,
-                                )?
-                                .map(drop),
-                            );
+                        // A target saves an input under its first
+                        // violation, so the case's property may sit behind
+                        // an allowed co-violation: confirm that input
+                        // against the case's property.
+                        let co_violation = facts
+                            .co_violation_input(&case.also_violates)
+                            .map(str::to_owned);
+                        if let Some(input) = facts.intended_input.clone().or(co_violation.clone()) {
+                            let confirmed = confirm_and_replay(
+                                &|| Command::new(&sim),
+                                &case.harness,
+                                &lane_dir.join("store").join(&input),
+                                &case.property,
+                                &case.also_violates,
+                                Confirm::Witness,
+                                &lane_dir.join("confirmation"),
+                                plan.child,
+                            )?
+                            .map(drop);
+                            if let (Ok(()), Some(input)) = (&confirmed, &co_violation) {
+                                facts.adopt_co_violation(&case.property, input);
+                            }
+                            run.confirmation = Some(confirmed);
                         }
                         run.mutant = Some(Ok(facts));
                         *store = lane_dir

@@ -2590,6 +2590,53 @@ fn discovery_allows_listed_violations_beside_the_intended_one() {
     assert_eq!(judged(&unlisted, &also).class, Class::OtherViolation);
 }
 
+/// A target saves an input under its run's first violation, so a campaign
+/// that reaches the case's property behind an allowed co-violation saves
+/// the input only under the co-violation. That input is the one to confirm
+/// against the case's property, and once confirmed it is the campaign's
+/// intended finding, timed by its crash.
+#[test]
+fn a_confirmed_co_violation_input_is_the_intended_finding() {
+    const ALSO: &str = "block/also";
+    let also = [ALSO.to_owned()];
+    let worker = "runs/m/workers/0";
+    let input = format!("{worker}/sim/inputs/active/block/also/aa.bin");
+    let end = serde_json::json!({
+        "failures": [{"path": input, "sha256": "00"}],
+        "workers": [{"index": 0, "millis": 1500}],
+    });
+    let evidence =
+        serde_json::json!({"status": "worker-stopped", "unapplied": [], "incomplete": []});
+    let attempts = [vec![serde_json::json!({
+        "millis": 1200,
+        "artifacts": [{"path": format!("{worker}/artifacts/crash-bb"), "sha256": "00"}],
+    })]];
+    let mut facts = campaign_facts(ID, Some(&end), &evidence, 0, &attempts);
+    assert_eq!(facts.intended_input, None);
+    assert_eq!(
+        facts.co_violation_input(&[]),
+        None,
+        "unlisted: never confirmed"
+    );
+    assert_eq!(facts.co_violation_input(&also), Some(input.as_str()));
+    let judged = |facts: &CampaignFacts| {
+        classify::discovery(ID, &also, &discovery_run(facts.clone(), Some(Ok(())))).class
+    };
+    assert_eq!(judged(&facts), Class::OtherViolation, "not yet confirmed");
+
+    facts.adopt_co_violation(ID, &input);
+    assert_eq!(facts.intended_input.as_deref(), Some(input.as_str()));
+    assert_eq!(facts.first_intended_secs, Some(1.2));
+    assert_eq!(facts.violated, [ALSO, ID]);
+    assert_eq!(facts.active, [ALSO, ID]);
+    assert_eq!(judged(&facts), Class::IntendedViolation);
+    assert_eq!(
+        facts.co_violation_input(&also),
+        None,
+        "an intended input needs no co-violation"
+    );
+}
+
 /// A fresh confirmation lets the input violate the case's `also_violates`
 /// beside its property, as `cargo xtask planted` confirms a case, and a
 /// case without them passes no such flag.
@@ -2803,6 +2850,64 @@ fn rescore_rederives_a_run_from_its_records() {
     assert!(why.contains("don't share one toolchain"), "{why}");
     // A directory without a report has nothing to rescore.
     assert!(rescore::rescore(&root, &out.join("none"), &dir.path().join("x")).is_err());
+}
+
+/// A run that confirmed a co-violation input against the case's property
+/// saved that input as the mutant's intended input. `rescore` reads it back
+/// and adopts it again, so the seed keeps its detection.
+#[test]
+fn rescore_keeps_an_adopted_co_violation_input() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let from = dir.path().join("run");
+    let (property, also) = ("p/named", "p/also");
+    let lane = Lane {
+        seed: 11,
+        arm: Arm::On,
+    };
+    write_lane(&baseline_dir(&from, "t", lane), &[], &[], "rustc 1");
+    write_lane(
+        &mutant_dir(&from, "p/named/a", lane),
+        &[also],
+        &[],
+        "rustc 1",
+    );
+    let input = format!("runs/r/workers/0/sim/inputs/active/{also}/aa.bin");
+    let saved = serde_json::json!({
+        "experiment": "feedback",
+        "catalogue_sha256": "00",
+        "built_revision": "b",
+        "runner_revision": "b",
+        "reviewed_cases": 1,
+        "cases": [{
+            "id": "p/named/a",
+            "fault_class": "co-violation",
+            "property": property,
+            "target": "t",
+            "seeds": [{
+                "seed": 11,
+                "arm": "on",
+                "result": {"class": "intended-violation", "reason": "found"},
+                "baseline": {"unpaired": null},
+                "mutant": {"unpaired": null, "intended_input": input},
+                "store": "cases/p/named/a/on/seed-11/store",
+            }],
+            "arms": [],
+            "cleanup": null,
+        }],
+        "summary": {},
+    });
+    fs::write(from.join("feedback.json"), saved.to_string()).expect("the report is written");
+
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    let written =
+        rescore::rescore(&root, &from, &dir.path().join("rescored")).expect("the run rescores");
+    let report: Value =
+        serde_json::from_slice(&fs::read(&written.path).expect("the report is written"))
+            .expect("the report parses");
+    let mutant = &report["cases"][0]["seeds"][0]["mutant"];
+    assert_eq!(mutant["intended_input"], input.as_str());
+    assert_eq!(mutant["violated"], serde_json::json!([also, property]));
+    assert_eq!(report["cases"][0]["arms"][0]["detected"], 1);
 }
 
 /// `lane::campaign_lane` runs `campaign build` with its `build` command and

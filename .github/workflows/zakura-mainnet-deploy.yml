@@ -541,7 +541,7 @@ jobs:
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "3349f9364f3a642945e56693bbdeb8b6c089d09a"
+          commit     = "4e5d4c3d66d70c9a126bf16c0a2b7084e58d3749"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 

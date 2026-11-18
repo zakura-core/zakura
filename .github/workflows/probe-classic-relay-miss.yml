@@ -61,7 +61,7 @@ jobs:
           for i in $(seq 1 20); do
             dir="$RUNNER_TEMP/logs/iter-$i"
             mkdir -p "$dir"
-            if PROBE_TEE_DIR="$dir" cargo nextest run --profile zcashd-compat-integration --run-ignored=only \
+            if PROBE_TEE_DIR="$dir" cargo nextest run --profile zcashd-compat-integration --run-ignored=only --no-fail-fast \
                 -E 'test(~zcashd_compat_nu7) | test(~zcashd_compat_transparent_tx)' > "$dir/nextest.out" 2>&1; then
               echo "iter $i pass"
               [ "$i" -le 2 ] || rm -rf "$dir"

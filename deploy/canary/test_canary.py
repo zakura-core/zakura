@@ -138,9 +138,9 @@ class TemplateTests(unittest.TestCase):
         rows = []
         for r in range(3):
             rows += [
-                row(r, "n1", "h", set(), template={"prev": "p", "txids": ["a"], "fees": 100}),
+                row(r, "n1", "h", set(), template={"t": float(r), "prev": "p", "txids": ["a"], "fees": 100}),
                 row(r, "can", "h", set(),
-                    template={"prev": canary_prev, "txids": ["a"], "fees": canary_fees}),
+                    template={"t": float(r), "prev": canary_prev, "txids": ["a"], "fees": canary_fees}),
             ]
         return rows
 
@@ -156,8 +156,8 @@ class TemplateTests(unittest.TestCase):
         for r, (fees, neighbour_fees) in enumerate(pairs):
             rows += [
                 row(r, "n1", "h", set(),
-                    template={"prev": "p", "txids": ["a"], "fees": neighbour_fees}),
-                row(r, "can", "h", set(), template={"prev": "p", "txids": ["a"], "fees": fees}),
+                    template={"t": float(r), "prev": "p", "txids": ["a"], "fees": neighbour_fees}),
+                row(r, "can", "h", set(), template={"t": float(r), "prev": "p", "txids": ["a"], "fees": fees}),
             ]
 
         report = canary.grade_templates(rows, "can", 3, 0.01)
@@ -169,7 +169,7 @@ class TemplateTests(unittest.TestCase):
     def test_a_canary_missing_template_reads_fails(self):
         rows = self.rows(100)
         for r in range(3, 6):
-            rows += [row(r, "n1", "h", set(), template={"prev": "p", "txids": ["a"], "fees": 100}),
+            rows += [row(r, "n1", "h", set(), template={"t": float(r), "prev": "p", "txids": ["a"], "fees": 100}),
                      {**row(r, "can", "h", set()), "template_error": "timed out"}]
 
         report = canary.grade_templates(rows, "can", 3, 0.01)
@@ -186,6 +186,17 @@ class TemplateTests(unittest.TestCase):
                 row(r, "can", "h", set(),
                     template={"prev": "p", "txids": ["a"], "fees": 100, "t": 4.0}),
             ]
+
+        report = canary.grade_templates(rows, "can", 1, 0.01)
+
+        self.assertEqual(report["neighbours"]["n1"]["skipped"], 3)
+        self.assertEqual(report["verdict"], "inconclusive")
+
+    def test_templates_without_read_times_do_not_pair(self):
+        rows = []
+        for r in range(3):
+            rows += [row(r, node, "h", set(), template={"prev": "p", "txids": ["a"], "fees": 100})
+                     for node in ("n1", "can")]
 
         report = canary.grade_templates(rows, "can", 1, 0.01)
 
@@ -211,7 +222,7 @@ class TemplateTests(unittest.TestCase):
         for r in range(3):
             for node in ("n1", "can"):
                 rows.append(row(r, node, "h", set(),
-                                template={"prev": "p", "txids": [], "fees": 0}))
+                                template={"t": float(r), "prev": "p", "txids": [], "fees": 0}))
 
         report = canary.grade_templates(rows, "can", 1, 0.01)
 

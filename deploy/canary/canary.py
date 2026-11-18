@@ -296,11 +296,15 @@ def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01, max_ske
             if not x or not y or x["prev"] != y["prev"]:
                 skipped += 1
                 continue
-            if "t" in x and "t" in y:
-                apart = abs(x["t"] - y["t"]) + x.get("t_err", 0.0) + y.get("t_err", 0.0)
-                if apart > max_skew:
-                    skipped += 1
-                    continue
+            # A template with no read time, from an older `sample`, can't
+            # show the two reads lined up, so it pairs with nothing.
+            if "t" not in x or "t" not in y:
+                skipped += 1
+                continue
+            apart = abs(x["t"] - y["t"]) + x.get("t_err", 0.0) + y.get("t_err", 0.0)
+            if apart > max_skew:
+                skipped += 1
+                continue
             set_x, set_y = set(x["txids"]), set(y["txids"])
             union = set_x | set_y
             if not union:

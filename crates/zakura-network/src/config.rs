@@ -1692,6 +1692,7 @@ impl<'de> Deserialize<'de> for Config {
         .map_err(de::Error::custom)?;
         zakura.tx_relay.validate().map_err(de::Error::custom)?;
         tcp_warmup.validate().map_err(de::Error::custom)?;
+        block_source_score.validate().map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {

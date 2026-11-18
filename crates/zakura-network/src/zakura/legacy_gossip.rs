@@ -2223,6 +2223,10 @@ enum DualStackRoute {
     /// legacy peer set and stalls (its syncer can never obtain tips or fetch
     /// blocks). The set mirrors `LegacyRequestFrame::from_request`.
     LegacyFirstThenZakura,
+    /// A second request for a slow legacy block download: legacy peer set only, because the
+    /// peer set picks a legacy peer that announced the block. A block it returns counts as
+    /// received over legacy.
+    LegacyBlockHedge,
     /// Anything the Zakura adapter cannot serve (e.g. peer-address discovery):
     /// legacy peer set only.
     Passthrough,
@@ -2331,6 +2335,7 @@ where
             | Request::FindHeaders { .. }
             | Request::MempoolTransactionIds
             | Request::PushTransaction(..) => DualStackRoute::LegacyFirstThenZakura,
+            Request::BlockByHashHedge { .. } => DualStackRoute::LegacyBlockHedge,
             _ => DualStackRoute::Passthrough,
         };
 
@@ -2339,6 +2344,7 @@ where
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 Some(hashes.clone())
             }
+            Request::BlockByHashHedge { hash, .. } => Some(IndexSet::from([*hash])),
             _ => None,
         };
         let mut gossip = self.gossip.clone();
@@ -2423,6 +2429,12 @@ where
                             .map(|response| record_source(response, BlockBodySource::Zakura)),
                     }
                 }
+                DualStackRoute::LegacyBlockHedge => legacy
+                    .ready()
+                    .await?
+                    .call(request)
+                    .await
+                    .map(|response| record_source(response, BlockBodySource::Legacy)),
                 DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
             }
         })
@@ -4046,6 +4058,13 @@ mod tests {
                             })
                             .collect(),
                     )
+                }
+                // The legacy peer set answers a hedge with the block, like `BlocksByHash`.
+                Request::BlockByHashHedge { hash, .. } if hash == self.block.hash() => {
+                    Response::Blocks(vec![InventoryResponse::Available((
+                        self.block.clone().into(),
+                        None,
+                    ))])
                 }
                 request => {
                     return std::future::ready(Err(format!(
@@ -8577,6 +8596,48 @@ mod tests {
         assert_eq!(
             trace.first_block_body_source(hash),
             Some(BlockBodySource::Legacy)
+        );
+
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_stack_block_hedge_counts_its_block_as_received_over_legacy(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let requester = ZakuraTestNode::builder(9221).spawn().await?;
+
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
+            BlockInventoryResponder { block },
+            requester.supervisor(),
+            true,
+            trace.clone(),
+            1,
+        );
+
+        let response = composite
+            .ready()
+            .await?
+            .call(Request::BlockByHashHedge {
+                hash,
+                first_request_waited: Duration::from_millis(50),
+            })
+            .await?;
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Legacy),
+            "a later answer to the first request must not count as the first arrival"
         );
 
         requester.shutdown().await;

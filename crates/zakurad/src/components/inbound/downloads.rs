@@ -4,8 +4,12 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{
@@ -445,6 +449,10 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
     /// results.
     spawned_sender: mpsc::UnboundedSender<DownloadHandle>,
+
+    /// Whether an advertised block can also be requested from a second announcer expected to
+    /// deliver it sooner.
+    second_block_request: bool,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -458,6 +466,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             chain_network: self.chain_network.clone(),
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
+            second_block_request: self.second_block_request,
         }
     }
 }
@@ -612,11 +621,21 @@ where
                 chain_network,
                 admission: Arc::default(),
                 spawned_sender,
+                second_block_request: false,
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
             poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Lets an advertised block that has not arrived yet also be requested from another peer that
+    /// announced it, when the peer set expects that peer to deliver it sooner (see
+    /// [`zn::Request::BlockByHashHedge`]). The first copy to arrive is used. Parent recoveries
+    /// only ever send one request.
+    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
+        self.spawner.second_block_request = enabled;
+        self
     }
 
     /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
@@ -838,6 +857,102 @@ where
     }
 }
 
+/// How often a block download asks the peer set whether another announcer should deliver the
+/// block sooner than the first request.
+const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long after the first request a block download keeps asking. Later, a block that has not
+/// arrived waits for the first request alone, as without second requests.
+const SECOND_REQUEST_CHECK_WINDOW: Duration = Duration::from_secs(5);
+
+/// Sends `request` for the block `hash` and returns the first successful response.
+///
+/// With `second_request`, it also asks the peer set every [`SECOND_REQUEST_CHECK_INTERVAL`]
+/// whether another peer that announced the block should deliver it sooner, and if so the peer
+/// set sends that peer a second request. At most one second request is sent. Whichever request
+/// loses keeps running in its own task until the peer answers or the network service times it
+/// out, so the peer set's trace records both download times; its response is discarded.
+async fn request_block<ZN>(
+    network: ZN,
+    request: zn::Request,
+    hash: block::Hash,
+    second_request: bool,
+) -> Result<zn::Response, BoxError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    if !second_request {
+        return network.oneshot(request).await;
+    }
+
+    let first_sent = tokio::time::Instant::now();
+    let stop_checking = Arc::new(AtomicBool::new(false));
+    let mut first = network.clone().oneshot(request).boxed();
+    let mut second = request_block_again(network, hash, first_sent, stop_checking.clone()).boxed();
+
+    tokio::select! {
+        biased;
+        result = &mut first => {
+            // A second request that was sent is still awaited or kept running, but no new one
+            // is sent: the block is here, or a block the first peer failed to deliver is left to
+            // later announcements, as without second requests.
+            stop_checking.store(true, Ordering::Relaxed);
+            match result {
+                Ok(response) => {
+                    tokio::spawn(second);
+                    Ok(response)
+                }
+                Err(first_error) => second.await.map_err(|_| first_error),
+            }
+        }
+        result = &mut second => match result {
+            Ok(response) => {
+                metrics::counter!("gossip.hedge.won.count").increment(1);
+                tokio::spawn(first);
+                Ok(response)
+            }
+            Err(_) => first.await,
+        },
+    }
+}
+
+/// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
+/// until it sends one, and returns that request's result.
+///
+/// Fails with [`zn::NoFasterBlockSource`] without a request sent once `stop_checking` is set or
+/// [`SECOND_REQUEST_CHECK_WINDOW`] has passed since `first_sent`.
+async fn request_block_again<ZN>(
+    network: ZN,
+    hash: block::Hash,
+    first_sent: tokio::time::Instant,
+    stop_checking: Arc<AtomicBool>,
+) -> Result<zn::Response, BoxError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    loop {
+        tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
+        if stop_checking.load(Ordering::Relaxed)
+            || first_sent.elapsed() >= SECOND_REQUEST_CHECK_WINDOW
+        {
+            return Err(zn::NoFasterBlockSource.into());
+        }
+        let result = network
+            .clone()
+            .oneshot(zn::Request::BlockByHashHedge {
+                hash,
+                first_request_waited: first_sent.elapsed(),
+            })
+            .await;
+        match result {
+            Err(error) if error.is::<zn::NoFasterBlockSource>() => continue,
+            result => return result,
+        }
+    }
+}
+
 impl<ZN, ZV, ZS> TaskSpawner<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -967,6 +1082,7 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let second_request = self.second_block_request && kind == DownloadKind::Advertised;
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -995,7 +1111,9 @@ where
                     };
                     (block, pusher_addr)
                 }
-                None => download_block(network, hash, download_source.clone()).await?,
+                None => {
+                    download_block(network, hash, download_source.clone(), second_request).await?
+                }
             };
 
             // # Security & Performance
@@ -1256,15 +1374,20 @@ where
 
 /// Downloads the block `hash` from `download_source`, or from any peer without a source.
 ///
+/// With `second_request`, another peer that announced the block may also be asked while the first
+/// request is outstanding (see [`request_block`]).
+///
 /// Returns the block and the address of the peer that sent it. Fails unless the peer sends
 /// exactly the block `hash`.
 async fn download_block<ZN>(
     network: ZN,
     hash: block::Hash,
     download_source: Option<zn::PeerSource>,
+    second_request: bool,
 ) -> Result<(BlockHandle, Option<PeerSocketAddr>), (BoxError, Option<PeerSocketAddr>)>
 where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
 {
     let request_hashes = std::iter::once(hash).collect();
     let request = match download_source {
@@ -1276,7 +1399,9 @@ where
     };
 
     let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-        network.oneshot(request).await.map_err(|e| (e, None))?
+        request_block(network, request, hash, second_request)
+            .await
+            .map_err(|e| (e, None))?
     {
         // A peer must answer a single-hash block request with exactly one
         // block entry. A malformed or empty response is a peer fault (e.g.
@@ -1326,6 +1451,9 @@ where
 
 #[cfg(test)]
 mod missing_parent_tests;
+
+#[cfg(test)]
+mod hedge_tests;
 
 #[cfg(test)]
 mod tests {

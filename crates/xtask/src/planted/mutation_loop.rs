@@ -1088,7 +1088,7 @@ impl Runner {
         for finding in cases
             .iter()
             .flat_map(|case| &case.generator)
-            .filter_map(generate::GeneratorReport::finding)
+            .flat_map(generate::GeneratorReport::findings)
         {
             let same = |known: &generate::PropertyFinding| {
                 (&known.property, &known.harness, known.seed, known.mode)

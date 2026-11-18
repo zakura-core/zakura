@@ -1507,7 +1507,7 @@ where
                 Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
             }
             // The peer set picks the peer for a hedge and sends it an ordinary `BlocksByHash`.
-            (_, BlockByHashHedge { .. }) => {
+            (_, BlockByHashFirstAnnouncer { .. } | BlockByHashHedge { .. }) => {
                 Ok(Handler::Finished(Err(PeerError::HedgeRequiresPeerSet)))
             }
             (Failed, request) => panic!(

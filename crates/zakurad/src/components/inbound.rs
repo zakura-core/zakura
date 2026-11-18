@@ -401,6 +401,7 @@ pub struct Inbound {
     /// Whether a gossiped block can also be requested from a second announcer expected to
     /// deliver it sooner.
     second_block_request: bool,
+    first_two_announcers: bool,
 }
 
 impl Inbound {
@@ -431,6 +432,7 @@ impl Inbound {
             )),
             pending_blocks: PendingBlockRegistry::default(),
             second_block_request: false,
+            first_two_announcers: false,
         }
     }
 
@@ -442,8 +444,9 @@ impl Inbound {
 
     /// Lets a gossiped block also be requested from a second announcer the peer set expects to
     /// deliver it sooner. See `[network.block_source_score] second_request`.
-    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
+    pub fn with_second_block_request(mut self, enabled: bool, first_two_announcers: bool) -> Self {
         self.second_block_request = enabled;
+        self.first_two_announcers = first_two_announcers;
         self
     }
 
@@ -500,7 +503,10 @@ impl Service<zn::Request> for Inbound {
                             latest_chain_tip,
                             network,
                         )
-                        .with_second_block_request(self.second_block_request),
+                        .with_second_block_request(
+                            self.second_block_request,
+                            self.first_two_announcers,
+                        ),
                     );
 
                     result = Ok(());
@@ -905,7 +911,7 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
-            zn::Request::BlockByHashHedge { .. } => unreachable!("second block requests are local to the peer set"),
+            zn::Request::BlockByHashFirstAnnouncer { .. } | zn::Request::BlockByHashHedge { .. } => unreachable!("hedged block requests are local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

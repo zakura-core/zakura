@@ -211,6 +211,16 @@ pub enum Request {
         source: PeerSource,
     },
 
+    /// Request a gossiped block from its earliest ready legacy announcer.
+    /// This request is handled by the legacy peer set.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    BlockByHashFirstAnnouncer {
+        /// The block to request.
+        hash: block::Hash,
+        /// The announcing peer, kept as a fallback when the inventory has no ready announcer.
+        source: Option<PeerSource>,
+    },
+
     /// Request one block a legacy peer announced, as a second request while a first request for
     /// it is still outstanding.
     ///
@@ -441,6 +451,7 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::BlockByHashFirstAnnouncer { .. } => "BlockByHashFirstAnnouncer".to_string(),
             Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
@@ -482,6 +493,7 @@ impl Request {
 
             Request::BlocksByHash(_)
             | Request::BlocksByHashFrom { .. }
+            | Request::BlockByHashFirstAnnouncer { .. }
             | Request::BlockByHashHedge { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
@@ -507,6 +519,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::BlockByHashFirstAnnouncer { .. }
                 | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
@@ -521,7 +534,8 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
-            Request::BlockByHashHedge { hash, .. } => HashSet::from([*hash]),
+            Request::BlockByHashFirstAnnouncer { hash, .. }
+            | Request::BlockByHashHedge { hash, .. } => HashSet::from([*hash]),
             _ => HashSet::new(),
         }
     }

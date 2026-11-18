@@ -119,6 +119,7 @@ tip_quiet = "2s"
 [network.block_source_score]
 enabled = false
 second_request = false
+first_two_announcers = false
 
 [network.zakura]
 bootstrap_peers = [

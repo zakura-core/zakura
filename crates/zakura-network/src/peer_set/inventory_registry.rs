@@ -232,6 +232,34 @@ impl InventoryRegistry {
             .filter_map(|addr_status| addr_status.available())
     }
 
+    /// Returns available peers in the order their announcements entered the registry.
+    pub fn announcers_in_order(
+        &self,
+        hash: InventoryHash,
+    ) -> impl Iterator<Item = PeerSocketAddr> + '_ {
+        let previous = self.prev.get(&hash);
+        let current = self.current.get(&hash);
+        let older = previous
+            .into_iter()
+            .flatten()
+            .filter_map(move |(peer, status)| {
+                let latest = current
+                    .and_then(|entries| entries.get(peer))
+                    .unwrap_or(status);
+                (status.is_available() && latest.is_available()).then_some(*peer)
+            });
+        let newer = current
+            .into_iter()
+            .flatten()
+            .filter_map(move |(peer, status)| {
+                let already_announced = previous
+                    .and_then(|entries| entries.get(peer))
+                    .is_some_and(InventoryStatus::is_available);
+                (status.is_available() && !already_announced).then_some(*peer)
+            });
+        older.chain(newer)
+    }
+
     /// Returns an iterator over addrs of peers that have recently missed `hash` in their inventory.
     pub fn missing_peers(&self, hash: InventoryHash) -> impl Iterator<Item = &PeerSocketAddr> {
         self.status_peers(hash)

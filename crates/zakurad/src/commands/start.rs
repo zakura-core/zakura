@@ -673,7 +673,12 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
-                .with_second_block_request(config.network.block_source_score.second_request),
+                .with_second_block_request(
+                    config.network.block_source_score.second_request,
+                    config.network.legacy_p2p()
+                        && !config.network.v2_p2p()
+                        && config.network.block_source_score.first_two_announcers,
+                ),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,

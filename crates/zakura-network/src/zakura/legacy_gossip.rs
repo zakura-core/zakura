@@ -2335,7 +2335,9 @@ where
             | Request::FindHeaders { .. }
             | Request::MempoolTransactionIds
             | Request::PushTransaction(..) => DualStackRoute::LegacyFirstThenZakura,
-            Request::BlockByHashHedge { .. } => DualStackRoute::LegacyBlockHedge,
+            Request::BlockByHashFirstAnnouncer { .. } | Request::BlockByHashHedge { .. } => {
+                DualStackRoute::LegacyBlockHedge
+            }
             _ => DualStackRoute::Passthrough,
         };
 
@@ -2344,7 +2346,8 @@ where
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 Some(hashes.clone())
             }
-            Request::BlockByHashHedge { hash, .. } => Some(IndexSet::from([*hash])),
+            Request::BlockByHashFirstAnnouncer { hash, .. }
+            | Request::BlockByHashHedge { hash, .. } => Some(IndexSet::from([*hash])),
             _ => None,
         };
         let mut gossip = self.gossip.clone();

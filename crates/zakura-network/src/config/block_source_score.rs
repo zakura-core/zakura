@@ -24,15 +24,25 @@ pub struct BlockSourceScoreConfig {
     /// Whether a block can also be requested from a second announcer expected to deliver it
     /// clearly sooner than the first. Requires `enabled`.
     pub second_request: bool,
+
+    /// Ask up to two distinct legacy announcers in announcement order.
+    /// This experiment requires both score-based settings to be off.
+    pub first_two_announcers: bool,
 }
 
 impl BlockSourceScoreConfig {
-    /// Checks that a second request is only enabled with the expected answer times it needs.
+    /// Checks that the experiment settings are compatible.
     pub fn validate(&self) -> Result<(), String> {
         if self.second_request && !self.enabled {
             return Err("network.block_source_score.second_request requires \
                  network.block_source_score.enabled"
                 .to_string());
+        }
+        if self.first_two_announcers && (self.enabled || self.second_request) {
+            return Err(
+                "network.block_source_score.first_two_announcers requires scoring to be disabled"
+                    .to_string(),
+            );
         }
         Ok(())
     }

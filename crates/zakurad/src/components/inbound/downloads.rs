@@ -450,6 +450,7 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// Whether an advertised block can also be requested from a second announcer expected to
     /// deliver it sooner.
     second_block_request: bool,
+    first_two_announcers: bool,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -464,6 +465,7 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
             second_block_request: self.second_block_request,
+            first_two_announcers: self.first_two_announcers,
         }
     }
 }
@@ -619,6 +621,7 @@ where
                 admission: Arc::default(),
                 spawned_sender,
                 second_block_request: false,
+                first_two_announcers: false,
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
@@ -630,8 +633,9 @@ where
     /// announced it, when the peer set expects that peer to deliver it sooner (see
     /// [`zn::Request::BlockByHashHedge`]). The first copy to arrive is used. Parent recoveries
     /// only ever send one request.
-    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
+    pub fn with_second_block_request(mut self, enabled: bool, first_two_announcers: bool) -> Self {
         self.spawner.second_block_request = enabled;
+        self.spawner.first_two_announcers = first_two_announcers;
         self
     }
 
@@ -1072,7 +1076,9 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
-        let second_request = self.second_block_request && kind == DownloadKind::Advertised;
+        let first_two_announcers = self.first_two_announcers && kind == DownloadKind::Advertised;
+        let second_request =
+            (self.second_block_request || first_two_announcers) && kind == DownloadKind::Advertised;
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -1102,7 +1108,14 @@ where
                     (block, pusher_addr)
                 }
                 None => {
-                    download_block(network, hash, download_source.clone(), second_request).await?
+                    download_block(
+                        network,
+                        hash,
+                        download_source.clone(),
+                        second_request,
+                        first_two_announcers,
+                    )
+                    .await?
                 }
             };
 
@@ -1374,18 +1387,20 @@ async fn download_block<ZN>(
     hash: block::Hash,
     download_source: Option<zn::PeerSource>,
     second_request: bool,
+    first_two_announcers: bool,
 ) -> Result<(BlockHandle, Option<PeerSocketAddr>), (BoxError, Option<PeerSocketAddr>)>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
     let request_hashes = std::iter::once(hash).collect();
-    let request = match download_source {
-        Some(source) => zn::Request::BlocksByHashFrom {
+    let request = match (first_two_announcers, download_source) {
+        (true, source) => zn::Request::BlockByHashFirstAnnouncer { hash, source },
+        (false, Some(source)) => zn::Request::BlocksByHashFrom {
             hashes: request_hashes,
             source,
         },
-        None => zn::Request::BlocksByHash(request_hashes),
+        (false, None) => zn::Request::BlocksByHash(request_hashes),
     };
 
     let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =

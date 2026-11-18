@@ -138,7 +138,7 @@ use crate::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
             SecondRequestChoice,
         },
-        second_request::{second_request_reason, FirstBlockRequests},
+        second_request::{second_request_reason, FirstBlockRequests, SecondRequestReason},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -318,6 +318,9 @@ where
     /// sooner. See [`crate::config::BlockSourceScoreConfig`].
     block_second_request: bool,
 
+    /// Use announcement order for the legacy gossip experiment.
+    first_two_announcers: bool,
+
     /// The recent first requests for gossiped blocks, which a second request is measured against.
     first_block_requests: FirstBlockRequests<D::Key>,
 
@@ -440,6 +443,7 @@ where
             expose_peer_addresses: config.expose_peer_addresses,
             block_source_score: config.block_source_score.enabled,
             block_second_request: config.block_source_score.second_request,
+            first_two_announcers: config.block_source_score.first_two_announcers,
             first_block_requests: FirstBlockRequests::default(),
 
             network: config.network.clone(),
@@ -1424,8 +1428,9 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
+        first_announcer: bool,
     ) -> <Self as tower::Service<Request>>::Future {
-        let advertising_peer_list = self
+        let advertising_peer_list: HashSet<_> = self
             .inventory_registry
             .advertising_peers(hash)
             .filter(|&addr| self.ready_services.contains_key(addr))
@@ -1441,6 +1446,16 @@ where
         // But we need the choice to be random,
         // so that a peer can't provide all our inventory responses.
         let (peer, choice) = match hash {
+            InventoryHash::Block(_) if first_announcer => (
+                self.inventory_registry
+                    .announcers_in_order(hash)
+                    .take(2)
+                    .find(|addr| self.ready_services.contains_key(addr)),
+                Some(BlockSourceChoice {
+                    candidates: advertising_peer_list.len(),
+                    ..BlockSourceChoice::default()
+                }),
+            ),
             InventoryHash::Block(_) => self
                 .select_block_advertiser(&advertising_peer_list)
                 .map_or((None, None), |(peer, choice)| (Some(peer), Some(choice))),
@@ -1467,7 +1482,9 @@ where
             };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
-            if let (true, InventoryHash::Block(block_hash)) = (self.block_second_request, hash) {
+            if let (true, InventoryHash::Block(block_hash)) =
+                (self.block_second_request || first_announcer, hash)
+            {
                 self.first_block_requests.insert(
                     block_hash,
                     peer,
@@ -1480,7 +1497,9 @@ where
                 let choice = choice.unwrap_or_default();
                 return async move {
                     let result = fut.await;
-                    record_missed_delivery(delivery_samples, &result);
+                    if !first_announcer {
+                        record_missed_delivery(delivery_samples, &result);
+                    }
                     trace.block_request_finish(
                         request_id,
                         peer,
@@ -1622,43 +1641,58 @@ where
         attempt: crate::BlockHedge,
     ) -> <Self as tower::Service<Request>>::Future {
         let not_yet = || async { Err(NoFasterBlockSource.into()) }.boxed();
-        if !self.block_second_request {
+        if !(self.block_second_request || self.first_two_announcers) {
             return not_yet();
         }
+        let Some(first_request_waited) = attempt.elapsed_if_open() else {
+            return not_yet();
+        };
 
         let (first_peer, first_score) = match self.first_block_requests.get_mut(&hash) {
             Some(first) if first.second_sent => return not_yet(),
             Some(first) => (Some(first.peer), first.score),
+            None if self.first_two_announcers => return not_yet(),
             None => (None, None),
         };
-        let candidates: Vec<(D::Key, Option<Duration>)> = self
-            .inventory_registry
-            .advertising_peers(InventoryHash::from(hash))
-            .filter(|addr| Some(**addr) != first_peer)
-            .filter_map(|addr| {
-                let svc = self.ready_services.get(addr)?;
-                svc.is_preferred_block_source()
-                    .then(|| (*addr, svc.block_gossip.delivery_score()))
-            })
-            .collect();
-        // A measured peer comes before an unmeasured one.
-        let best = candidates
-            .iter()
-            .min_by_key(|(_, score)| (score.is_none(), *score))
-            .copied();
+        let (peer, score, reason, candidates) = if self.first_two_announcers {
+            let Some(peer) = self
+                .inventory_registry
+                .announcers_in_order(hash.into())
+                .take(2)
+                .find(|addr| Some(*addr) != first_peer)
+                .filter(|addr| self.ready_services.contains_key(addr))
+            else {
+                return not_yet();
+            };
+            (peer, None, SecondRequestReason::AnnouncementOrder, 1)
+        } else {
+            let candidates: Vec<(D::Key, Option<Duration>)> = self
+                .inventory_registry
+                .advertising_peers(InventoryHash::from(hash))
+                .filter(|addr| Some(**addr) != first_peer)
+                .filter_map(|addr| {
+                    let svc = self.ready_services.get(addr)?;
+                    svc.is_preferred_block_source()
+                        .then(|| (*addr, svc.block_gossip.delivery_score()))
+                })
+                .collect();
+            // A measured peer comes before an unmeasured one.
+            let best = candidates
+                .iter()
+                .min_by_key(|(_, score)| (score.is_none(), *score))
+                .copied();
 
-        let Some(first_request_waited) = attempt.elapsed_if_open() else {
-            return not_yet();
-        };
-        let Some(reason) =
-            second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
-        else {
-            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
-            return not_yet();
-        };
-        let Some((peer, score)) = best else {
-            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
-            return not_yet();
+            let Some(reason) =
+                second_request_reason(first_score, first_request_waited, best.and_then(|(_, s)| s))
+            else {
+                metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+                return not_yet();
+            };
+            let Some((peer, score)) = best else {
+                metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+                return not_yet();
+            };
+            (peer, score, reason, candidates.len())
         };
         if !attempt.claim_dispatch() {
             return not_yet();
@@ -1674,14 +1708,16 @@ where
         let choice = SecondRequestChoice {
             first_request_waited,
             reason,
-            candidates: candidates.len(),
+            candidates,
             score,
             first_score,
         };
         let request_id = self.legacy_peer_trace.next_request_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
         let started = Instant::now();
-        let delivery_samples = svc.block_gossip.registry.clone();
+        let delivery_samples = (!self.first_two_announcers)
+            .then(|| svc.block_gossip.registry.clone())
+            .flatten();
         let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
 
@@ -2096,7 +2132,15 @@ where
                 if hashes.len() == 1 =>
             {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, false)
+            }
+            Request::BlockByHashFirstAnnouncer { hash, source } => {
+                let hashes = std::iter::once(hash).collect();
+                let req = match source {
+                    Some(source) => Request::BlocksByHashFrom { hashes, source },
+                    None => Request::BlocksByHash(hashes),
+                };
+                self.route_inv(req, hash.into(), self.first_two_announcers)
             }
             Request::BlockByHashHedge { hash, attempt } => self.route_block_hedge(hash, attempt),
             Request::TransactionsById(ref hashes)
@@ -2104,7 +2148,7 @@ where
                 ids: ref hashes, ..
             } if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, false)
             }
 
             // Broadcast advertisements to lots of peers

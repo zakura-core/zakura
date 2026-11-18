@@ -42,6 +42,8 @@ const MAX_FIRST_REQUESTS: usize = 64;
 /// Why a second request was sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SecondRequestReason {
+    /// This peer announced the block next in the first-two-announcers experiment.
+    AnnouncementOrder,
     /// Another announcer was expected to deliver the block clearly before the first request.
     Predicted,
     /// The first request ran well past its expected answer time.
@@ -52,6 +54,7 @@ impl SecondRequestReason {
     /// The name written to the legacy peer trace.
     pub(super) fn label(self) -> &'static str {
         match self {
+            SecondRequestReason::AnnouncementOrder => "announcement_order",
             SecondRequestReason::Predicted => "predicted",
             SecondRequestReason::Stalled => "stalled",
         }

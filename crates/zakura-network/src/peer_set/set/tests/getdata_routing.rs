@@ -1743,3 +1743,46 @@ async fn an_announcer_that_fails_a_second_request_scores_worse() {
         "a missed second request raises the peer's expected delivery time"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_first_two_announcers_are_asked_in_arrival_order_without_scores() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut second = TestPeer::spawn(2);
+    let mut third = TestPeer::spawn(3);
+    let _measured = [
+        measured_peer(&mut first, &registry, Some(300)),
+        measured_peer(&mut second, &registry, None),
+        measured_peer(&mut third, &registry, Some(1)),
+    ];
+    let mut config = crate::Config::default();
+    config.block_source_score.first_two_announcers = true;
+    let (mut peer_set, mut guard) =
+        peer_set_with_peers(&mut [&mut first, &mut second, &mut third], config);
+
+    announce_block(&mut peer_set, &mut guard, &first).await;
+    announce_block(&mut peer_set, &mut guard, &first).await;
+    announce_block(&mut peer_set, &mut guard, &second).await;
+    let _first_request = peer_set
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::BlockByHashFirstAnnouncer {
+            hash: BLOCK_HASH,
+            source: None,
+        });
+    assert_eq!(
+        first.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+
+    announce_block(&mut peer_set, &mut guard, &third).await;
+    let _second_request = request_block_again(&mut peer_set, 10).await;
+    assert_eq!(
+        second.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    assert_not_yet(request_block_again(&mut peer_set, 20).await).await;
+    assert_eq!(third.written_now().await, None);
+}

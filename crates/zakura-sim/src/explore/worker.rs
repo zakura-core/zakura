@@ -23,7 +23,7 @@ use std::{
 };
 
 use super::{classify, feedback::Feedback, Classified, ExploreRun};
-use crate::{harness::HarnessEntry, Checker, NullSink};
+use crate::{harness::HarnessEntry, Checker, NullSink, Steer};
 
 /// The variable that sets how many abandoned runs a process takes before it
 /// exits for its supervisor to restart it.
@@ -125,6 +125,53 @@ impl Worker {
             });
             retire
         });
+        self.finish(job, result)
+    }
+
+    /// [`Worker::explore`] with the steer `make` builds from the input
+    /// making the live picks ([`HarnessEntry::run_steered_bytes`]). `then`
+    /// gets the input that replays the run with no steer in place of
+    /// `input`.
+    ///
+    /// # Panics
+    ///
+    /// If the harness has no steered run, as a machine has none.
+    pub fn explore_steered<R: Send + 'static>(
+        &mut self,
+        entry: &'static HarnessEntry,
+        input: &[u8],
+        make: fn(&[u8]) -> Box<dyn Steer>,
+        then: impl FnOnce(&[u8], &ExploreRun, &Classified) -> R + Send + 'static,
+    ) -> R {
+        let run_steered = entry
+            .run_steered_bytes
+            .unwrap_or_else(|| panic!("{} makes no picks to steer", entry.name));
+        let input = input.to_vec();
+        let (done, result) = mpsc::sync_channel::<Ran<R>>(1);
+        let job: Job = Box::new(move || {
+            let mut abandoned = false;
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let (run, replay) = run_steered(&input, &mut NullSink, make(&input));
+                abandoned = run.leaked() > 0;
+                let classified = classify(entry, &run);
+                then(&replay, &run, &classified)
+            }));
+            let retire = abandoned || outcome.is_err();
+            // The caller waits on this, so the send can't fail.
+            let _ = done.send(Ran {
+                outcome,
+                retire,
+                abandoned,
+            });
+            retire
+        });
+        self.finish(job, result)
+    }
+
+    /// Runs `job` on the worker's thread, starting one if none is live, and
+    /// returns what it sends on `result`. Retires the thread if the job
+    /// says to, and resumes the job's panic here.
+    fn finish<R>(&mut self, job: Job, result: mpsc::Receiver<Ran<R>>) -> R {
         self.jobs
             .get_or_insert_with(spawn)
             .send(job)

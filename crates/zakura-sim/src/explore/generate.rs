@@ -50,7 +50,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Bucket, ExploreOutcome, Worker};
+use super::{pct::Pct, Bucket, Classified, ExploreOutcome, ExploreRun, Worker};
 use crate::{
     check::PropertyOutcome,
     harness::{HarnessEntry, ScenarioFamily, HARNESSES},
@@ -87,6 +87,28 @@ pub struct GenerateOptions {
     pub abandon_limit: usize,
     /// How each run's scenario family is drawn.
     pub draw_policy: DrawPolicy,
+    /// What makes each run's live picks.
+    pub schedule: Schedule,
+}
+
+/// What makes a search's live picks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Schedule {
+    /// The input's Plan bytes, then round-robin once they run out.
+    #[default]
+    Plan,
+    /// A PCT steer the input seeds ([`super::pct`]). The search saves the
+    /// input that replays a stopping run with no steer, so every later
+    /// command reads it as a plain input.
+    Pct,
+}
+
+impl Schedule {
+    /// True for [`Schedule::Plan`], which a report leaves out.
+    fn is_plan(&self) -> bool {
+        *self == Schedule::Plan
+    }
 }
 
 /// How [`draws_with`] picks each run's scenario family.
@@ -193,6 +215,9 @@ pub struct GenerateReport {
     /// [`DrawPolicy::Uniform`], so earlier reports read the same.
     #[serde(default, skip_serializing_if = "DrawPolicy::is_uniform")]
     pub draw_policy: DrawPolicy,
+    /// What made each run's live picks. Left out for [`Schedule::Plan`].
+    #[serde(default, skip_serializing_if = "Schedule::is_plan")]
+    pub schedule: Schedule,
     /// Inputs it ran.
     pub executed: u64,
     /// Inputs it skipped as excluded.
@@ -404,6 +429,35 @@ struct Ran {
     properties: Vec<(String, PropertyOutcome)>,
     /// The run's end record, if the run stops the search.
     end: Option<EndRecord>,
+    /// The input that replays the run with no steer, which the search
+    /// saves if the run stops it: the drawn input itself, unless a steer
+    /// made the picks.
+    replay: Vec<u8>,
+}
+
+/// What `run` left for the search to count, with `replay` the input that
+/// replays it.
+fn summarize(replay: &[u8], run: &ExploreRun, classified: &Classified) -> Ran {
+    let stops = !matches!(
+        classified.outcome,
+        ExploreOutcome::Clean | ExploreOutcome::Abandoned { .. }
+    ) || classified.leaked > 0;
+    Ran {
+        outcome: classified.outcome.clone(),
+        notes: classified.notes.clone(),
+        leaked: classified.leaked,
+        properties: run.report().map_or_else(Vec::new, |report| {
+            report
+                .properties
+                .iter()
+                .map(|report| (report.property.clone(), report.outcome.clone()))
+                .collect()
+        }),
+        end: stops
+            .then(|| run.report().map(|report| report.end_record()))
+            .flatten(),
+        replay: replay.to_vec(),
+    }
 }
 
 /// Searches `entry`'s harness as `options` say, and writes the report to
@@ -424,6 +478,7 @@ pub fn generate(
         runs: options.runs,
         max_bytes: options.max_bytes,
         draw_policy: options.draw_policy,
+        schedule: options.schedule,
         executed: 0,
         skipped: 0,
         millis: 0,
@@ -457,28 +512,9 @@ pub fn generate(
         if let Some(family) = family {
             *report.families.entry(family.to_owned()).or_default() += 1;
         }
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
-            worker.explore(entry, &input, |_, run, classified| {
-                let stops = !matches!(
-                    classified.outcome,
-                    ExploreOutcome::Clean | ExploreOutcome::Abandoned { .. }
-                ) || classified.leaked > 0;
-                Ran {
-                    outcome: classified.outcome.clone(),
-                    notes: classified.notes.clone(),
-                    leaked: classified.leaked,
-                    properties: run.report().map_or_else(Vec::new, |report| {
-                        report
-                            .properties
-                            .iter()
-                            .map(|report| (report.property.clone(), report.outcome.clone()))
-                            .collect()
-                    }),
-                    end: stops
-                        .then(|| run.report().map(|report| report.end_record()))
-                        .flatten(),
-                }
-            })
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| match options.schedule {
+            Schedule::Plan => worker.explore(entry, &input, summarize),
+            Schedule::Pct => worker.explore_steered(entry, &input, Pct::for_input, summarize),
         }));
         let ran = match ran {
             Ok(ran) => ran,
@@ -521,7 +557,8 @@ pub fn generate(
             ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => None,
         };
         if let Some(stop) = stop {
-            stopped = Some((index, family, input, digest, stop, ran.end));
+            let digest = hex(&Sha256::digest(&ran.replay));
+            stopped = Some((index, family, ran.replay, digest, stop, ran.end));
             break;
         }
     }

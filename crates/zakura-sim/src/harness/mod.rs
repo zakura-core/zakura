@@ -561,6 +561,9 @@ pub struct HarnessEntry {
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
+    /// [`explore::run_steered_bytes`], for a harness the scheduler runs. A
+    /// machine has none: it makes no picks to steer.
+    pub run_steered_bytes: Option<SteeredRunFn>,
     /// [`Subsystem::accepts`].
     pub accepts: fn(&[u8]) -> bool,
     /// [`Subsystem::families`]. A machine has none.
@@ -573,6 +576,10 @@ pub struct HarnessEntry {
 /// property, the expectation, the expected co-violations and the sink.
 pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &[String], &mut dyn RecordSink) -> Result<(), WitnessError>;
+
+/// [`HarnessEntry::run_steered_bytes`]: a full fuzz input, the sink and the
+/// steer, returning the run and the input that replays it unsteered.
+pub type SteeredRunFn = fn(&[u8], &mut dyn RecordSink, Box<dyn Steer>) -> (ExploreRun, Vec<u8>);
 
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
@@ -634,6 +641,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         properties: registered::<S>,
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
+        run_steered_bytes: Some(explore::run_steered_bytes::<S>),
         accepts: S::accepts,
         families: S::families,
         migrate: S::migrate,

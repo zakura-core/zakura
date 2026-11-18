@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use zakura_sim::{
     explore::generate::{
         draws, draws_with, generate, generator_harnesses, inputs, read_exclusions, DrawPolicy,
-        GenerateOptions, GenerateReport, Stop, REPORT_FILE, UNTAGGED,
+        GenerateOptions, GenerateReport, Schedule, Stop, REPORT_FILE, UNTAGGED,
     },
     harness::{self, HarnessEntry, HARNESSES},
     trace::end_records::END_RECORDS_VAR,
@@ -48,6 +48,7 @@ fn options(out: &Path, records: Option<&Path>) -> GenerateOptions {
         records: records.map(Path::to_owned),
         abandon_limit: 1,
         draw_policy: DrawPolicy::Uniform,
+        schedule: Schedule::Plan,
     }
 }
 
@@ -357,6 +358,39 @@ fn the_cycle_draws_visit_every_variant_once_per_block() {
             assert_eq!(input[written..], plain[written..]);
         }
     }
+}
+
+/// A PCT search stops on the planted race, and the input it saves replays
+/// the same violation with no steer: the zero-padded prefix, then the Plan
+/// bytes the steered run recorded.
+#[test]
+fn a_pct_search_saves_an_input_that_replays_unsteered() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = entry(PLANTED);
+    let report = generate(
+        entry,
+        &GenerateOptions {
+            schedule: Schedule::Pct,
+            ..options(root.path(), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report.schedule, Schedule::Pct);
+    let Stop::Violation { property } = &report.stop else {
+        panic!("the PCT search missed the planted race: {report:?}");
+    };
+    let saved = fs::read(report.input.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        hex(&Sha256::digest(&saved)),
+        report.input_sha256.clone().unwrap()
+    );
+    let run = (entry.run_bytes)(&saved, &mut zakura_sim::NullSink, None);
+    assert_eq!(
+        zakura_sim::explore::classify(entry, &run).outcome,
+        zakura_sim::explore::ExploreOutcome::Fail {
+            property: property.clone()
+        }
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -98,6 +98,7 @@ macro_rules! machine_entry {
             run_bytes: |bytes, sink, extra| {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },
+            run_steered_bytes: None,
             accepts: |_| true,
             families: Vec::new,
             migrate: |_, generator| {

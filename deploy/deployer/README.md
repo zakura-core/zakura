@@ -207,6 +207,8 @@ and deploys it to:
 - `archive-vct-off` — `root@104.131.174.28`
 - `asia-hedged` — `root@68.183.178.89`
 - `asia-scored` — `root@206.189.45.15`
+- `us-scored` (New York) — `root@165.227.220.111`
+- `europe-central-scored` (Amsterdam) — `root@188.166.118.152`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
@@ -223,13 +225,12 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-`asia-hedged` and `asia-scored` are legacy-only nodes in Singapore that each
-measure one experimental setting from an open PR: `[network.block_hedge]` from
-PR 2548 and `[network.block_source_score]` with `second_request` from PRs 2558
-and 2572. Their configs enable those
-settings, so each entry is pinned to the build the node runs instead of the
-deployed ref: a build from `main` would refuse the config. Unpin an entry when
-its PR merges, or remove it when the experiment ends.
+These four experiment nodes use the legacy P2P stack. `asia-hedged` measures
+`[network.block_hedge]` from PR 2548. `asia-scored`, `us-scored`, and
+`europe-central-scored` measure `[network.block_source_score]` with
+`second_request` from PR 2572. Each entry pins a build that understands the
+settings in its node's config. Unpin an entry when its PR merges, or remove
+it when the experiment ends.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
@@ -244,8 +245,9 @@ A node only becomes deployable once the deployer runner can reach it. The fleet'
 deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
 `~/.ssh/authorized_keys`, and the node's address must be in the workflow's
 host-key pin list. A host that is missing the key fails the deploy with
-`Permission denied (publickey)` at the scp step, after a successful build. One-time runner bootstrap from an operator machine with SSH access
-and CI credentials in `~/agents-env`:
+`Permission denied (publickey)` at the scp step, after a successful build.
+One-time runner bootstrap from an operator machine with SSH access and CI
+credentials in `~/agents-env`:
 
 ```bash
 cd deploy/deployer
@@ -274,8 +276,8 @@ is separate future work.
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 
 - service: `zakura-mainnet-dashboard.service`
-- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server listens on
-  `127.0.0.1:8090` only)
+- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server
+  listens on `127.0.0.1:8090` only)
 - install dir: `/opt/zakura-mainnet-dashboard`
 
 The fleet pages (`/`, `/node/*`, `/profile/*`) and their data (`/data*`) need a

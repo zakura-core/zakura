@@ -563,6 +563,8 @@ pub struct Ports {
 pub struct Storage {
     /// The node's owner state, as its tap folds it.
     view: Rc<RefCell<BlockSyncView>>,
+    /// The node's block storage's replies, cleared once the run ends.
+    replies: Arc<LateHandle>,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close unless a `Teardown` step drops the node's.
     _topology: Rc<Topology>,
@@ -578,6 +580,13 @@ impl HasView for Storage {
         self.view.clone()
     }
 
+    /// Drops the node's block-sync handle from its block storage's
+    /// replies. The handle reaches the storage again through the reactor's
+    /// range source, so the cycle would outlive the run.
+    fn ended(&self, _: &crate::RunEnd) {
+        let _ = self.replies.clear();
+    }
+
     /// The step of the tap's last observation, or `Missing` before its
     /// first.
     fn captured(&self) -> Capture {
@@ -590,7 +599,7 @@ impl HasView for Storage {
 
 impl Subsystem for Storage {
     const NAME: &'static str = "block-sync/storage";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = BlockScenario;
     type Prepared = Ports;
@@ -741,6 +750,7 @@ impl Subsystem for Storage {
                 over: Cell::new(false),
             }));
         }
+        let replies = ports.replies.clone();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -800,6 +810,7 @@ impl Subsystem for Storage {
         sim.add_source(Box::new(control));
         Storage {
             view,
+            replies,
             _topology: topology,
         }
     }
@@ -819,28 +830,33 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The tagged scenarios [`Storage::draw`] picks, the semantic ones
-    /// last.
+    /// The tagged scenarios [`Storage::draw`] picks, then the semantic
+    /// ones, then the hostile ones.
     fn families() -> Vec<ScenarioFamily> {
         let mut families = vec![
             ScenarioFamily::new("stuck-floor", STUCK_FLOOR_TAG),
             ScenarioFamily::new("paused-handoffs", PAUSED_HANDOFFS_TAG),
             ScenarioFamily::new("above-window", ABOVE_WINDOW_TAG),
             ScenarioFamily::new("peers-leave", PEERS_LEAVE_TAG),
+            ScenarioFamily::new("peers-leave-served", PEERS_LEAVE_SERVED_TAG),
         ];
         families.extend(BlockScenario::semantic_families());
+        families.extend(BlockScenario::hostile_families());
         families
     }
 
     /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],
-    /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`] and [`PEERS_LEAVE_TAG`]
-    /// pick theirs, as do the semantic scenarios' tags
-    /// ([`BlockScenario::semantic_drawn`]). All of them start with `ff`, so
+    /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`], [`PEERS_LEAVE_TAG`]
+    /// and [`PEERS_LEAVE_SERVED_TAG`] pick theirs, as do the semantic scenarios' tags
+    /// ([`BlockScenario::semantic_drawn`]) and the hostile scenarios' tags
+    /// ([`BlockScenario::hostile_drawn`]). All of them start with `ff`, so
     /// they come before the odd-first-byte arm. Otherwise an odd first byte
     /// picks the short budget, and an even one the default. Each tagged run is long or narrow, so
     /// fuzzing draws each on one prefix in 65,536.
     fn draw(prefix: &[u8]) -> BlockScenario {
-        if let Some(scenario) = BlockScenario::semantic_drawn(prefix) {
+        if let Some(scenario) =
+            BlockScenario::semantic_drawn(prefix).or_else(|| BlockScenario::hostile_drawn(prefix))
+        {
             return scenario;
         }
         match prefix {
@@ -855,6 +871,9 @@ impl Subsystem for Storage {
             }
             [first, second, ..] if [*first, *second] == PEERS_LEAVE_TAG => {
                 BlockScenario::peers_leave()
+            }
+            [first, second, ..] if [*first, *second] == PEERS_LEAVE_SERVED_TAG => {
+                BlockScenario::peers_leave_served()
             }
             [first, ..] if first % 2 == 1 => BlockScenario::short_budget(),
             _ => BlockScenario::default(),
@@ -873,6 +892,11 @@ pub const ABOVE_WINDOW_TAG: [u8; 2] = [0xFF, 0x04];
 
 /// The scenario prefix that picks [`BlockScenario::peers_leave`].
 pub const PEERS_LEAVE_TAG: [u8; 2] = [0xFF, 0x05];
+
+/// The scenario prefix that picks [`BlockScenario::peers_leave_served`], the
+/// only drawn scenario whose links reserve session slots. It drew the short
+/// budget before, and no committed input starts with it.
+pub const PEERS_LEAVE_SERVED_TAG: [u8; 2] = [0xFF, 0x07];
 
 /// [`HandoffPause`]'s hold: a routine task that recorded a handoff's start
 /// and not its end, stopped in the budget's code, which only its release

@@ -406,6 +406,8 @@ pub struct ZakuraConfig {
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
     pub block_sync: ZakuraBlockSyncConfig,
+    /// `tx-relay` settings (`[network.zakura.tx_relay]`).
+    pub tx_relay: super::ZakuraTxRelayConfig,
     /// Optional private dev-network cohort tag.
     ///
     /// When set, this node only forms Zakura (v2) connections with peers
@@ -441,6 +443,7 @@ impl Default for ZakuraConfig {
             trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
+            tx_relay: super::ZakuraTxRelayConfig::default(),
             dev_network: None,
         }
     }
@@ -481,7 +484,8 @@ impl ZakuraConfig {
     ///
     /// The handshake share is the `[network.zakura.quic]` receive window. The
     /// kinds are legacy gossip (2), legacy requests (3), discovery (4), header
-    /// sync (5) and block sync (6). The compatibility exchanges and TCP ingress
+    /// sync (5) and block sync (6), and `tx-relay`'s data (9) and state (10)
+    /// when it is enabled. The compatibility exchanges and TCP ingress
     /// have their own envelope terms, so they are not kinds. Other kinds keep
     /// [`ReactorShares::from_quic`]'s share.
     pub fn reactor_shares(&self, network: &Network) -> ReactorShares {
@@ -495,17 +499,28 @@ impl ZakuraConfig {
             receive: u64::MAX,
             output: u64::MAX,
         });
+        let mut kinds = vec![
+            (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
+            (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
+            (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
+            (
+                HEADER_SYNC_STREAM_KIND,
+                super::header_sync::v9::budget(network),
+            ),
+            (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
+        ];
+        // `tx-relay`'s kinds are listed only when it runs, so a node with it
+        // off budgets exactly as before.
+        if self.tx_relay.enabled {
+            use super::tx_relay::wire::{
+                TX_RELAY_DATA_BUDGET, TX_RELAY_DATA_KIND, TX_RELAY_STATE_BUDGET,
+                TX_RELAY_STATE_KIND,
+            };
+            kinds.push((TX_RELAY_DATA_KIND, TX_RELAY_DATA_BUDGET));
+            kinds.push((TX_RELAY_STATE_KIND, TX_RELAY_STATE_BUDGET));
+        }
         ReactorShares {
-            kinds: vec![
-                (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
-                (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
-                (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
-                (
-                    HEADER_SYNC_STREAM_KIND,
-                    super::header_sync::v9::budget(network),
-                ),
-                (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
-            ],
+            kinds,
             ..ReactorShares::from_quic(&self.quic)
         }
     }
@@ -951,6 +966,11 @@ pub struct CustomService {
 
     /// Remote service ids to prefer when selecting outbound discovery peers.
     pub seeks: Vec<ZakuraServiceId>,
+
+    /// `tx-relay`'s live-session record, set only by
+    /// [`tx_relay_service`](super::tx_relay_service). With it, the legacy
+    /// adapter leaves each peer with a live session to `tx-relay`.
+    pub tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 impl From<CustomService> for Arc<dyn Service> {
@@ -1462,6 +1482,9 @@ pub struct ZakuraSupervisorHandle {
     /// The same counts the supervisor state charges, read by the QUIC acceptor.
     ip_slots: IpSlots,
     max_connections_per_ip: usize,
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 /// Connections charged to each source IP: registered connections, and inbound
@@ -1852,7 +1875,24 @@ impl ZakuraSupervisorHandle {
             peer_registry,
             ip_slots,
             max_connections_per_ip,
+            tx_relay_sessions: None,
         }
+    }
+
+    /// This supervisor with `tx-relay`'s live-session record, which the
+    /// legacy adapters built from it read. Set it before cloning the handle.
+    pub(crate) fn with_tx_relay_sessions(
+        mut self,
+        sessions: Option<super::TxRelaySessions>,
+    ) -> Self {
+        self.tx_relay_sessions = sessions;
+        self
+    }
+
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    pub(crate) fn tx_relay_sessions(&self) -> Option<&super::TxRelaySessions> {
+        self.tx_relay_sessions.as_ref()
     }
 
     /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
@@ -2735,10 +2775,12 @@ struct SessionOpenContext<'a> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum InboundMessageAdmission {
+pub(crate) enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
+    /// A metered row overran its connection's byte bucket.
+    ByteRateOverrun,
 }
 
 fn admit_inbound_message(
@@ -2770,26 +2812,37 @@ fn admit_inbound_message(
     // A stream with a table charges only the rows that declare a cadence.
     // Commitments bound requests and reservations bound responses.
     if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
-        let rule = MessageRule::find(rules, frame.message_type)
-            .expect("the frame filter admits only rows of the stream's table");
-        let charge = cadence
-            .buckets
-            .lock()
-            .expect("Zakura cadence bucket mutex is never poisoned")
-            .charge(cadence.layout, rule);
-        // A sibling stream can keep the connection alive during an unbounded
-        // transport stall. Exhaustion cannot prove a sender violation.
-        if charge == CadenceCharge::Exhausted {
-            context.conn.trace_rate_limit(
-                "cadence.exhausted",
-                context.stream_id,
-                stream_kind,
-                None,
-                None,
-                None,
-            );
-        }
-        return InboundMessageAdmission::Admit;
+        return admit_tabled_message(
+            frame,
+            rules,
+            |rule, payload_len| {
+                cadence
+                    .buckets
+                    .lock()
+                    .expect("Zakura cadence bucket mutex is never poisoned")
+                    .charge_frame(cadence.layout, rule, payload_len)
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "byte_rate.overrun",
+                    context.stream_id,
+                    stream_kind,
+                    Some(u64::try_from(payload_len).unwrap_or(u64::MAX)),
+                    None,
+                    None,
+                );
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "cadence.exhausted",
+                    context.stream_id,
+                    stream_kind,
+                    None,
+                    None,
+                    None,
+                );
+            },
+        );
     }
 
     let admitted = {
@@ -2817,6 +2870,61 @@ fn admit_inbound_message(
     }
 
     InboundMessageAdmission::Admit
+}
+
+/// Admits `frame` on a stream with the message table `rules`. It finds the
+/// frame's row and charges the row's bucket through `charge`, with the
+/// frame's payload length. If a metered row's frame overran its byte bucket,
+/// it calls `overrun` and refuses the frame. If the bucket was empty, it
+/// calls `exhausted`, and an empty bucket doesn't refuse the frame.
+///
+/// # Panics
+///
+/// If no row of `rules` has the frame's type. The frame filter admits only
+/// rows of the stream's table.
+pub(crate) fn admit_tabled_message(
+    frame: &Frame,
+    rules: &[MessageRule],
+    charge: impl FnOnce(&MessageRule, usize) -> CadenceCharge,
+    overrun: impl FnOnce(),
+    exhausted: impl FnOnce(),
+) -> InboundMessageAdmission {
+    let rule = MessageRule::find(rules, frame.message_type)
+        .expect("the frame filter admits only rows of the stream's table");
+    let charge = charge(rule, frame.payload.len());
+    // A metered row's bucket already holds every byte a conformant sender
+    // can have buffered, so an overrun is a violation.
+    if charge == CadenceCharge::Overrun {
+        overrun();
+        return InboundMessageAdmission::ByteRateOverrun;
+    }
+    // A sibling stream can keep the connection alive during an unbounded
+    // transport stall. Exhaustion cannot prove a sender violation.
+    if charge == CadenceCharge::Exhausted {
+        exhausted();
+    }
+    InboundMessageAdmission::Admit
+}
+
+impl InboundMessageAdmission {
+    /// The error an ordered stream's worker closes with for this result, or
+    /// `None` if it admits the frame.
+    pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
+        match self {
+            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
+            InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
+            InboundMessageAdmission::ByteRateOverrun => Some(ZakuraHandlerError::ByteRateOverrun),
+        }
+    }
+
+    /// The close cause the ordered stream reader records for this result,
+    /// or `None` if it admits the frame.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
+        self.ordered_error()
+            .map(|error| read_close_cause(ReadPath::Ordered, &error))
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -3415,7 +3523,9 @@ impl ZakuraProtocolHandler {
         let mut pending_sessions = PendingSessions::default();
         let mut incoming_setup: Option<BoxFuture<'static, Option<IncomingStreamSetup>>> = None;
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
-        let mut message_buckets = MessageRateBuckets::new();
+        let mut message_buckets = MessageRateBuckets::with_receive_window(u64::from(
+            self.limits.quic.stream_receive_window_bytes,
+        ));
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
@@ -4913,9 +5023,13 @@ async fn spawn_zakura_endpoint_inner(
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
+    // A custom kind with its own share, such as `tx-relay`'s, is counted
+    // once, with the native kinds.
+    let named_kinds = config.zakura.reactor_shares(&config.network).kinds;
     let custom_kinds: Vec<u16> = custom_services
         .iter()
         .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
+        .filter(|kind| !named_kinds.iter().any(|(named, _)| named == kind))
         .collect();
     let budgeted_max_connections = config.zakura.budgeted_max_connections_for_node(
         &config.network,
@@ -4959,7 +5073,12 @@ async fn spawn_zakura_endpoint_inner(
             peer_registry,
         ),
         None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
-    };
+    }
+    .with_tx_relay_sessions(
+        custom_services
+            .iter()
+            .find_map(|custom| custom.tx_relay_sessions.clone()),
+    );
     let tracer = config
         .zakura
         .trace_dir
@@ -5766,8 +5885,10 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => {
+                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
+                        .ordered_error()
+                    {
+                        None => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
@@ -5802,8 +5923,7 @@ async fn persistent_stream_worker_with_policy(
                             .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
                             continue;
                         }
-                        InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
-                        InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
+                        Some(error) => error,
                     }
                 }
                 Err(error) => {
@@ -5983,7 +6103,9 @@ fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)>
     let code = match error {
         ZakuraHandlerError::Closed => return None,
         ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
-        ZakuraHandlerError::RateLimited => ZAKURA_CLOSE_RATE_LIMIT,
+        ZakuraHandlerError::RateLimited | ZakuraHandlerError::ByteRateOverrun => {
+            ZAKURA_CLOSE_RATE_LIMIT
+        }
         _ => ZAKURA_CLOSE_BAD_PRELUDE,
     };
     Some((code, read_close_cause(ReadPath::Ordered, error)))
@@ -6020,6 +6142,7 @@ fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str 
     match (path, error) {
         (ReadPath::Ordered, Oversize) => "ordered_oversize",
         (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
+        (ReadPath::Ordered, ByteRateOverrun) => "ordered_byte_rate_overrun",
         (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
         (ReadPath::Request, _) if rejected => "request_read_rejected",
         (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
@@ -6109,6 +6232,14 @@ async fn request_stream_worker(
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
             context.close_cause.record("request_oversize");
+            context.connection_token.cancel();
+            return;
+        }
+        InboundMessageAdmission::ByteRateOverrun => {
+            // The layout keeps metered rows off request streams, so this is
+            // unreachable today. Close as a persistent reader would.
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
+            context.close_cause.record("request_byte_rate_overrun");
             context.connection_token.cancel();
             return;
         }
@@ -7615,6 +7746,8 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        super::tx_relay::wire::TX_RELAY_DATA_KIND => "tx_relay_data",
+        super::tx_relay::wire::TX_RELAY_STATE_KIND => "tx_relay_state",
         _ => "unknown",
     }
 }
@@ -7715,10 +7848,20 @@ struct MessageRateBuckets<C: Clock = RealClock> {
 }
 
 impl<C: Clock + Default> MessageRateBuckets<C> {
+    /// Buckets for a connection with no stream receive window, as tests use.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_receive_window(0)
+    }
+
+    /// Buckets for a connection whose stream receive window is
+    /// `receive_window`, which deepens its byte buckets.
+    fn with_receive_window(receive_window: u64) -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
+            cadence: Arc::new(StdMutex::new(
+                CadenceBuckets::new(C::default()).with_receive_window(receive_window),
+            )),
         }
     }
 }
@@ -7882,6 +8025,9 @@ pub enum ZakuraHandlerError {
     /// The peer exceeded its per-kind inbound message rate.
     #[error("Zakura message rate exceeded")]
     RateLimited,
+    /// The peer sent a metered row past its connection's byte bucket.
+    #[error("Zakura byte rate exceeded")]
+    ByteRateOverrun,
     /// QUIC connection error.
     #[error(transparent)]
     QuicConnection(#[from] zakura_quic::ConnectionError),
@@ -9489,6 +9635,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await
@@ -9926,6 +10073,7 @@ mod tests {
                 }),
                 provides: vec![service_id.clone()],
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await?
@@ -9953,6 +10101,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: vec![service_id],
+                tx_relay_sessions: None,
             }],
         )
         .await?
@@ -11471,6 +11620,38 @@ mod tests {
             flags: 0,
             payload: vec![1; payload_len],
         }
+    }
+
+    #[test]
+    fn a_metered_row_past_its_byte_bucket_closes_the_connection() {
+        const METERED: MessageRule = MessageRule {
+            name: "metered",
+            message_type: 40,
+            payload: crate::zakura::PayloadLen::between(1, 512),
+            role: crate::zakura::MessageRole::Metered {
+                rate: crate::zakura::ByteRate {
+                    bytes_per_second: 1,
+                    opening_allowance: 512,
+                    sender_allowance: 512,
+                },
+            },
+        };
+        // With no receive window, the receiver's depth is the two allowances.
+        let context = tabled_context(Some(&[METERED]), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                admit_inbound_message(&probe_frame(40, 512), &context, 900),
+                InboundMessageAdmission::Admit
+            );
+        }
+        assert_eq!(
+            admit_inbound_message(&probe_frame(40, 1), &context, 900),
+            InboundMessageAdmission::ByteRateOverrun
+        );
+        assert_eq!(
+            ordered_read_close(&ZakuraHandlerError::ByteRateOverrun),
+            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_byte_rate_overrun"))
+        );
     }
 
     #[test]

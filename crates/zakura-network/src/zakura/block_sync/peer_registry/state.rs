@@ -21,6 +21,8 @@ use zakura_rt::{collections::HashMap, time::Instant};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::block_sync_observe::{BlockEvent, ObserverSlot, RegistryWriter};
+#[cfg(any(test, zakura_sim))]
+use super::EntryFingerprint;
 use super::{
     super::{
         config::{
@@ -35,6 +37,18 @@ use crate::zakura::ZakuraConnId;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+
+/// A peer's entry before a generation-gated write, as
+/// [`PeerTable::before_write`] reads it.
+#[cfg(any(test, zakura_sim))]
+pub(super) enum BeforeWrite {
+    /// The peer had no entry.
+    Absent,
+    /// The writing generation owned the entry.
+    Owned,
+    /// Another generation owned the entry, with this fingerprint.
+    Other(EntryFingerprint),
+}
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use tests::{
     replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
@@ -105,6 +119,62 @@ impl PeerTable {
                 );
             }
         }
+    }
+
+    /// The fingerprint of the peer's entry, if it has one.
+    #[cfg(any(test, zakura_sim))]
+    fn fingerprint(&self, peer: &ZakuraPeerId) -> Option<EntryFingerprint> {
+        self.peers.get(peer).map(Entry::fingerprint)
+    }
+
+    /// What [`PeerTable::report_stale_change`] needs to know of the peer's
+    /// entry before a write from `generation`. Only an entry another
+    /// generation owns can report a change it had, so only that entry is
+    /// fingerprinted.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn before_write(&self, peer: &ZakuraPeerId, generation: u64) -> BeforeWrite {
+        match self.peers.get(peer) {
+            None => BeforeWrite::Absent,
+            Some(entry) if entry.generation == generation => BeforeWrite::Owned,
+            Some(entry) => BeforeWrite::Other(entry.fingerprint()),
+        }
+    }
+
+    /// Reports a change that `writer`'s call from `generation` made to the
+    /// peer's entry, if another generation owns the entry. `before` is what
+    /// [`PeerTable::before_write`] read before the call, under the same
+    /// lock. An entry the call created belongs to the generation that owns
+    /// it after the call.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn report_stale_change(
+        &self,
+        peer: &ZakuraPeerId,
+        writer: RegistryWriter,
+        generation: u64,
+        before: BeforeWrite,
+    ) {
+        let entry_generation = match before {
+            BeforeWrite::Owned => return,
+            BeforeWrite::Absent => match self.peers.get(peer) {
+                Some(entry) if entry.generation != generation => entry.generation,
+                _ => return,
+            },
+            BeforeWrite::Other(before) => {
+                if self.fingerprint(peer).as_ref() == Some(&before) {
+                    return;
+                }
+                before.generation
+            }
+        };
+        observe!(
+            self.observer,
+            BlockEvent::StaleRegistryChange {
+                peer: peer.clone(),
+                writer,
+                generation,
+                entry_generation,
+            }
+        );
     }
 
     pub(super) fn get(&self, peer: &ZakuraPeerId) -> Option<&Entry> {
@@ -758,6 +828,32 @@ impl SupplierRetryState {
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Check the deferral table after a transition: it stays within its
+    /// capacity, and every incompatibility from the current authority's epoch
+    /// sits under the current authority.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.entries.len() <= MAX_SUPPLIER_RETRIES,
+            "{} deferrals exceed the capacity",
+            self.entries.len()
+        );
+        let Some(current) = self.current else {
+            return;
+        };
+        for (_, key, reason) in self.entries.keys() {
+            if *reason == BodyRetryReason::Incompatible
+                && key.body_work_epoch == current.body_work_epoch
+            {
+                assert_eq!(
+                    *key,
+                    BodyRetryKey::new(current, key.hash),
+                    "an incompatibility from the current epoch is keyed under a stale authority"
+                );
+            }
+        }
+    }
 }
 
 /// The persisted all-supplier retry alarm. It holds at most one body.
@@ -784,6 +880,16 @@ impl BodyRetryAlarms {
     pub(super) fn next_deadline(&mut self, now: Instant) -> Option<Instant> {
         self.alarms.retain(|_, until| *until > now);
         self.alarms.values().copied().min()
+    }
+
+    /// Check that the alarm holds at most one body.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.alarms.len() <= 1,
+            "{} alarms are set",
+            self.alarms.len()
+        );
     }
 }
 

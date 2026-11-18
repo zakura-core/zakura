@@ -35,7 +35,7 @@ use crate::zakura::{
 };
 
 mod load;
-use super::model::snapshot;
+use super::machine::snapshot;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -1469,7 +1469,7 @@ async fn a_queued_outcome_wins_over_a_later_close() {
             .queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
         assert_eq!(shared.apply(&close), Ok(Applied::Live));
         let ended = shared.end_due();
-        assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
+        assert_eq!(ended, [(id, HeadersOutcomeCode::SubscriptionSuperseded)]);
         let terminal = shared.next_terminal::<HB>().expect("one subscription ends");
         assert!(
             shared.next_terminal::<HB>().is_none(),
@@ -2199,7 +2199,10 @@ fn close_wins_over_an_outcome_found_after_it() {
     assert_eq!(owner.apply(&close), Ok(Applied::Live));
     let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
     owner.state.finish(job.key, found, None);
-    assert_eq!(owner.end_due(), [HeadersOutcomeCode::SubscriptionClosed]);
+    assert_eq!(
+        owner.end_due(),
+        [(1, HeadersOutcomeCode::SubscriptionClosed)]
+    );
     let OwnedTerminal { frame, .. } = owner.next_terminal::<HB>().expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),

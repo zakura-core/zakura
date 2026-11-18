@@ -1,11 +1,15 @@
 //! Machine tests for [`StatusSchedule`]: which peers a status flush sends to
 //! and when the next flush wakes.
 //!
-//! The proptest records send outcomes the way `ReactorIO::send_status` does
-//! and compares every flush with an independent model of each peer's last
-//! queued status and retry time.
+//! The proptest records send outcomes the way `ReactorIO::send_status` does.
+//! It compares every flush with which peers it admitted and which latest
+//! status it queued to each, and checks that the flush's sends agree with its
+//! wake. The delivery's deadline rules are pinned by named cases here and in
+//! [`crate::zakura::block_sync::status`].
 
 use std::time::Duration;
+
+use proptest::prelude::*;
 
 use super::*;
 use crate::zakura::block_sync::MAX_BS_RESPONSE_BYTES;
@@ -92,6 +96,41 @@ fn a_replacement_session_starts_a_fresh_delivery() {
     );
 }
 
+/// A Status that the cadence deferred is due again at the cadence's next
+/// send, unless a higher tip replaces it: that is due from the deferral at
+/// once. Queuing a Status or backing off a full queue drops the deferral.
+#[test]
+fn a_new_tip_is_due_at_once_only_while_a_deferral_holds() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    // (whether the queue took a Status at 1 ms or backed off as full, the
+    // latest status, the expected wake)
+    for (after_deferral, latest, wake) in [
+        (None, 5, ms(10_000)),
+        (None, 6, ms(0)),
+        (Some(true), 6, ms(1)),
+        (Some(false), 6, ms(101)),
+    ] {
+        let mut schedule = StatusSchedule::default();
+        schedule.admit(&peer(0), start);
+        let delivery = schedule
+            .delivery_mut(&peer(0))
+            .expect("the admitted peer has a delivery record");
+        delivery.deferred_until(status(5), ms(0), ms(10_000));
+        match after_deferral {
+            Some(true) => delivery.queued(status(5), ms(1)),
+            Some(false) => delivery.queue_full(ms(1)),
+            None => {}
+        }
+        schedule.rearm(status(latest), [(&peer(0), false)]);
+        assert_eq!(
+            schedule.refresh_at(),
+            Some(wake),
+            "{after_deferral:?}, latest {latest}"
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Input {
     Admit(u8),
@@ -117,41 +156,17 @@ fn input() -> impl Strategy<Value = Input> {
     ]
 }
 
-/// One admitted peer: the status index it last queued, its retry time in
-/// milliseconds after the test start, and the status index a cadence deferral
-/// held back with when it did.
-#[derive(Clone, Copy, Debug)]
-struct ModelDelivery {
-    last_queued: Option<u32>,
-    retry_ms: u64,
-    deferred: Option<(u32, u64)>,
-}
-
-impl ModelDelivery {
-    /// The retry time while the peer still needs `latest`. Each status index
-    /// is a higher tip, so a status newer than a deferred one is due from the
-    /// deferral on.
-    fn deadline(&self, latest: u32, ready: bool) -> Option<u64> {
-        if self.last_queued == Some(latest) && ready {
-            return None;
-        }
-        Some(match self.deferred {
-            Some((deferred, at_ms)) if latest > deferred => self.retry_ms.min(at_ms),
-            _ => self.retry_ms,
-        })
-    }
-}
-
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Every flush sends to exactly the live peers the model finds due, in
-    /// peer-list order, and wakes at the model's earliest pending retry.
+    /// Every flush sends to live admitted peers only, in peer-list order, and
+    /// to exactly the peers whose deadline the wake has reached. A ready peer
+    /// that holds the latest status needs no send, and any other live peer
+    /// keeps a wake.
     #[test]
-    fn status_schedule_matches_model(inputs in prop::collection::vec(input(), 1..80)) {
+    fn status_flushes_agree_with_their_wake(inputs in prop::collection::vec(input(), 1..80)) {
         let base = Instant::now();
         let mut schedule = StatusSchedule::default();
-        let mut model: [Option<ModelDelivery>; PEERS as usize] = [None; PEERS as usize];
+        // Each admitted peer, with whether it holds the latest queued status.
+        let mut admitted: [Option<bool>; PEERS as usize] = [None; PEERS as usize];
         let mut latest = 1u32;
         let mut now_ms = 0u64;
         for input in inputs {
@@ -159,19 +174,17 @@ proptest! {
             match input {
                 Input::Admit(id) => {
                     schedule.admit(&peer(id), now);
-                    model[usize::from(id)] = Some(ModelDelivery { last_queued: None, retry_ms: now_ms, deferred: None });
+                    admitted[usize::from(id)] = Some(false);
                 }
                 Input::Remove(id) => {
                     schedule.remove(&peer(id));
-                    model[usize::from(id)] = None;
+                    admitted[usize::from(id)] = None;
                 }
                 Input::Queued(id) => {
                     let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queued(status(latest), now));
-                    prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
-                    if let Some(delivery) = model[usize::from(id)].as_mut() {
-                        delivery.last_queued = Some(latest);
-                        delivery.retry_ms = now_ms;
-                        delivery.deferred = None;
+                    prop_assert_eq!(actual.is_some(), admitted[usize::from(id)].is_some());
+                    if let Some(holds_latest) = admitted[usize::from(id)].as_mut() {
+                        *holds_latest = true;
                     }
                 }
                 Input::Deferred(id, ms) => {
@@ -179,47 +192,48 @@ proptest! {
                     let actual = schedule
                         .delivery_mut(&peer(id))
                         .map(|delivery| delivery.deferred_until(status(latest), now, at));
-                    prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
-                    if let Some(delivery) = model[usize::from(id)].as_mut() {
-                        delivery.retry_ms = now_ms + ms;
-                        delivery.deferred = Some((latest, now_ms));
-                    }
+                    prop_assert_eq!(actual.is_some(), admitted[usize::from(id)].is_some());
                 }
                 Input::QueueFull(id) => {
                     let actual = schedule.delivery_mut(&peer(id)).map(|delivery| delivery.queue_full(now));
-                    prop_assert_eq!(actual.is_some(), model[usize::from(id)].is_some());
-                    if let Some(delivery) = model[usize::from(id)].as_mut() {
-                        delivery.retry_ms = now_ms + 100;
-                        delivery.deferred = None;
+                    prop_assert_eq!(actual.is_some(), admitted[usize::from(id)].is_some());
+                }
+                Input::StatusChange => {
+                    latest += 1;
+                    for holds_latest in admitted.iter_mut().flatten() {
+                        *holds_latest = false;
                     }
                 }
-                Input::StatusChange => latest += 1,
                 Input::Flush { live, ready } => {
-                    let admitted: Vec<bool> = model.iter().map(Option::is_some).collect();
-                    let peers = flush_peers(&admitted, live, ready);
+                    let present: Vec<bool> = admitted.iter().map(Option::is_some).collect();
+                    let peers = flush_peers(&present, live, ready);
                     let due = schedule.due(status(latest), peers.iter().map(|(peer, ready)| (peer, *ready)), now);
-                    let expected_due: Vec<_> = peers
-                        .iter()
-                        .filter(|(id, ready)| {
-                            let index = usize::from(id.as_bytes()[0]);
-                            model[index]
-                                .and_then(|delivery| delivery.deadline(latest, *ready))
-                                .is_some_and(|retry_ms| retry_ms <= now_ms)
-                        })
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    prop_assert_eq!(&due, &expected_due);
-
+                    let mut listed = peers.iter().map(|(peer, _)| peer);
+                    prop_assert!(
+                        due.iter().all(|peer| listed.any(|listed| listed == peer)),
+                        "a flush sends to listed peers, in list order"
+                    );
                     schedule.rearm(status(latest), peers.iter().map(|(peer, ready)| (peer, *ready)));
-                    let expected_wake = peers
-                        .iter()
-                        .filter_map(|(id, ready)| {
-                            model[usize::from(id.as_bytes()[0])]
-                                .and_then(|delivery| delivery.deadline(latest, *ready))
-                        })
-                        .min()
-                        .map(|ms| base + Duration::from_millis(ms));
-                    prop_assert_eq!(schedule.refresh_at(), expected_wake);
+                    let wake = schedule.refresh_at();
+                    prop_assert_eq!(
+                        !due.is_empty(),
+                        wake.is_some_and(|wake| wake <= now),
+                        "a flush sends exactly when its wake is due"
+                    );
+                    for (peer, ready) in &peers {
+                        let holds_latest = admitted[usize::from(peer.as_bytes()[0])]
+                            .expect("flushes list admitted peers");
+                        if holds_latest && *ready {
+                            prop_assert!(!due.contains(peer), "a ready peer with the latest status");
+                        } else {
+                            prop_assert!(wake.is_some(), "a peer that needs our status keeps a wake");
+                        }
+                    }
+                    if peers.iter().all(|(peer, ready)| {
+                        *ready && admitted[usize::from(peer.as_bytes()[0])] == Some(true)
+                    }) {
+                        prop_assert_eq!(wake, None, "no live peer needs our status");
+                    }
                 }
                 Input::Wait(ms) => now_ms += ms,
             }

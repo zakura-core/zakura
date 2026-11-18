@@ -348,6 +348,25 @@ impl SequencerState {
         self.pending_evidence.len()
     }
 
+    /// Check the sequencer's maintained totals and the retry episode: a
+    /// scheduled retry belongs to an episode, and an episode exactly when it
+    /// has counted a refusal.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        self.sequencer.assert_invariants();
+        if self.submission_retry.at.is_some() {
+            assert!(
+                self.submission_retry.started_at.is_some(),
+                "a submission retry is scheduled outside a retry episode"
+            );
+        }
+        assert_eq!(
+            self.submission_retry.attempt > 0,
+            self.submission_retry.started_at.is_some(),
+            "a retry episode counts its refusals"
+        );
+    }
+
     /// Build the progress view from this state and IO's observations.
     pub(super) fn view(
         &self,

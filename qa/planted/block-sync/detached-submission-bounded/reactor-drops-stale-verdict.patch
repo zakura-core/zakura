@@ -1,0 +1,37 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reactor.rs b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+index d627fd5af7..3d9d7e18ab 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reactor.rs
+@@ -674,17 +674,21 @@ impl ReactorIO {
+             } => {
+                 let (semantic_completion, committed_epoch) =
+                     self.body_completion_authority(source, &owner);
+-                self.handle_block_apply_finished(
+-                    owner,
+-                    source,
+-                    token,
+-                    height,
+-                    hash,
+-                    outcome,
+-                    semantic_completion,
+-                    committed_epoch,
+-                )
+-                .await
++                // The gate found no remaining authority: a stale completion
++                // must have no effects, so it never reaches the sequencer.
++                if semantic_completion.is_some() || committed_epoch.is_none() {
++                    self.handle_block_apply_finished(
++                        owner,
++                        source,
++                        token,
++                        height,
++                        hash,
++                        outcome,
++                        semantic_completion,
++                        committed_epoch,
++                    )
++                    .await
++                }
+             }
+         }
+         self.publish_metrics();

@@ -1,6 +1,7 @@
 //! Peer connection handling.
 
 mod announced_blocks;
+pub(crate) mod block_checksum_warmup;
 pub(crate) mod block_gossip;
 mod client;
 mod connection;

@@ -121,6 +121,22 @@ use crate::{
     config::ZakuradConfig,
 };
 
+/// The background work of whichever pool runs.
+enum MempoolTasks {
+    /// Today's pool, which needs its queue checker and its gossip task.
+    Classic {
+        /// The signal its queue checker waits on.
+        verification_finished: std::sync::Arc<tokio::sync::Notify>,
+    },
+    /// The pool core, already running.
+    Core {
+        /// The core's task.
+        core: tokio::task::JoinHandle<Result<(), crate::BoxError>>,
+        /// The tasks that turn it on and follow what it publishes.
+        follower: tokio::task::JoinHandle<Result<(), crate::BoxError>>,
+    },
+}
+
 struct BlockSyncDriverExitGuard {
     fatal_events: mpsc::UnboundedSender<()>,
     shutdown: CancellationToken,
@@ -406,7 +422,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        custom_services: Vec<zakura_network::zakura::CustomService>,
+        mut custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -664,9 +680,36 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
+        // The pool is chosen once, at startup. `tx-relay` needs the pool
+        // core's port before the network starts, so it is built here and
+        // handed to the core below.
+        let pool_implementation = config.mempool.implementation.resolve();
+        let tx_relay_port = if config.network.zakura.tx_relay.enabled {
+            if pool_implementation == mempool::config::Implementation::Core {
+                let port = mempool::core::TxRelayPort::new();
+                custom_services.push(zakura_network::zakura::tx_relay_service(
+                    port.handle(),
+                    port.may_cool(),
+                    &config.network.zakura.tx_relay,
+                    config.network.unconditional_peers.clone(),
+                ));
+                Some(port)
+            } else {
+                warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
+                None
+            }
+        } else {
+            None
+        };
+
+        // The network counts `tx-relay`'s memory shares only when it is
+        // registered, not merely enabled.
+        let mut network_config = config.network.clone();
+        network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+
         let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
-                config.network.clone(),
+                network_config,
                 inbound,
                 latest_chain_tip.clone(),
                 user_agent(),
@@ -779,29 +822,70 @@ impl StartCmd {
             zakura_jsonl_trace::node_id(),
         );
 
-        info!("initializing mempool");
-        let (mempool, mempool_transaction_subscriber) = Mempool::new(
-            &config.mempool,
-            config.network.expose_peer_addresses,
-            peer_set.clone(),
-            state.clone(),
-            tower::util::BoxCloneService::new(read_only_state_service.clone()),
-            tx_verifier,
-            sync_status.clone(),
-            latest_chain_tip.clone(),
-            chain_tip_change.clone(),
-            misbehavior.clone(),
-            zcashd_compat_block_gossip_peer_ips.clone(),
-            config.network.unconditional_peers.clone(),
-        );
-        let mempool = mempool.with_trace(template_path_trace.clone());
-        let mempool_verification_finished = mempool.verification_finished();
-        let mempool = spawn_buffer(
-            BoxService::new(mempool),
-            mempool::downloads::MAX_INBOUND_CONCURRENCY,
-        );
+        info!(?pool_implementation, "initializing mempool");
+        let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
+            if pool_implementation == mempool::config::Implementation::Core {
+                let parts = mempool::core::start(
+                    &config.mempool,
+                    config.network.expose_peer_addresses,
+                    peer_set.clone(),
+                    tower::util::BoxCloneService::new(read_only_state_service.clone()),
+                    tx_verifier,
+                    sync_status.clone(),
+                    latest_chain_tip.clone(),
+                    chain_tip_change.clone(),
+                    misbehavior.clone(),
+                    mempool::core::Exempt {
+                        zcashd_compat: zcashd_compat_block_gossip_peer_ips
+                            .iter()
+                            .map(|ip| ip.to_canonical())
+                            .collect(),
+                        unconditional: config.network.unconditional_peers.clone(),
+                    },
+                    template_path_trace.clone(),
+                    tx_relay_port,
+                );
+                (
+                    parts.mempool,
+                    parts.subscriber,
+                    parts.verifier_pool,
+                    MempoolTasks::Core {
+                        core: parts.core_task,
+                        follower: parts.follower_task,
+                    },
+                )
+            } else {
+                let (mempool, mempool_transaction_subscriber) = Mempool::new(
+                    &config.mempool,
+                    config.network.expose_peer_addresses,
+                    peer_set.clone(),
+                    state.clone(),
+                    tower::util::BoxCloneService::new(read_only_state_service.clone()),
+                    tx_verifier,
+                    sync_status.clone(),
+                    latest_chain_tip.clone(),
+                    chain_tip_change.clone(),
+                    misbehavior.clone(),
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    config.network.unconditional_peers.clone(),
+                );
+                let mempool = mempool.with_trace(template_path_trace.clone());
+                let verification_finished = mempool.verification_finished();
+                let mempool = spawn_buffer(
+                    BoxService::new(mempool),
+                    mempool::downloads::MAX_INBOUND_CONCURRENCY,
+                );
+                (
+                    mempool.clone(),
+                    mempool_transaction_subscriber,
+                    mempool,
+                    MempoolTasks::Classic {
+                        verification_finished,
+                    },
+                )
+            };
 
-        if tx_verifier_setup_tx.send(mempool.clone()).is_err() {
+        if tx_verifier_setup_tx.send(verifier_pool).is_err() {
             warn!("error setting up the transaction verifier with a handle to the mempool service");
         };
 
@@ -957,29 +1041,41 @@ impl StartCmd {
             error_exit_status,
         );
 
-        info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle =
-            mempool::QueueChecker::spawn(mempool.clone(), mempool_verification_finished);
-        node_tasks.supervise(
-            "mempool queue checker",
-            mempool_queue_checker_task_handle,
-            error_exit_status,
-        );
+        // The pool core decides and announces in its own tasks, so it runs
+        // them in the queue checker's and the gossip task's places.
+        match mempool_tasks {
+            MempoolTasks::Classic {
+                verification_finished,
+            } => {
+                info!("spawning mempool queue checker task");
+                let mempool_queue_checker_task_handle =
+                    mempool::QueueChecker::spawn(mempool.clone(), verification_finished);
+                node_tasks.supervise(
+                    "mempool queue checker",
+                    mempool_queue_checker_task_handle,
+                    error_exit_status,
+                );
 
-        info!("spawning mempool transaction gossip task");
-        let tx_gossip_task_handle = spawn_erased(
-            mempool::run_mempool_transaction_id_gossip(
-                mempool_transaction_subscriber.subscribe(),
-                peer_set.clone(),
-                mempool.clone(),
-            )
-            .in_current_span(),
-        );
-        node_tasks.supervise(
-            "transaction gossip",
-            tx_gossip_task_handle,
-            error_exit_status,
-        );
+                info!("spawning mempool transaction gossip task");
+                let tx_gossip_task_handle = spawn_erased(
+                    mempool::run_mempool_transaction_id_gossip(
+                        mempool_transaction_subscriber.subscribe(),
+                        peer_set.clone(),
+                        mempool.clone(),
+                    )
+                    .in_current_span(),
+                );
+                node_tasks.supervise(
+                    "transaction gossip",
+                    tx_gossip_task_handle,
+                    error_exit_status,
+                );
+            }
+            MempoolTasks::Core { core, follower } => {
+                node_tasks.supervise("mempool core", core, error_exit_status);
+                node_tasks.supervise("mempool core follower", follower, error_exit_status);
+            }
+        }
 
         info!("spawning delete old databases task");
         let mut old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(

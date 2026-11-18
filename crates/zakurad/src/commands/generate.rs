@@ -93,8 +93,8 @@ mod tests {
 
     use super::*;
 
-    /// Native sync tuning stays out of the generated skeleton; absent sections
-    /// use their defaults from code.
+    /// Native sync tuning and the experimental `tx-relay` switch stay out of
+    /// the generated skeleton; absent sections use their defaults from code.
     fn expected_default_config(config: &ZakuradConfig) -> toml::Value {
         let mut expected = toml::Value::try_from(config).expect("the default config serializes");
         let zakura = expected
@@ -104,6 +104,7 @@ mod tests {
             .expect("the default config has a native Zakura section");
         zakura.remove("block_sync");
         zakura.remove("header_sync");
+        zakura.remove("tx_relay");
         expected
     }
 
@@ -131,6 +132,10 @@ mod tests {
         assert_eq!(
             parsed.network.zakura.header_sync,
             default_config.network.zakura.header_sync
+        );
+        assert_eq!(
+            parsed.network.zakura.tx_relay,
+            default_config.network.zakura.tx_relay
         );
     }
 

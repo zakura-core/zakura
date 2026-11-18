@@ -1,7 +1,7 @@
 //! The reference shared by the fill proptests and the `block_fill` driver.
 //!
-//! [`expected_retry_run`] is an independent model of the retry filter: it calls
-//! no planner and no admission helper. [`fund_through_queue`] is the environment
+//! [`expected_retry_run`] recomputes the retry filter's run the slow, obvious
+//! way: it calls no planner and no admission helper. [`fund_through_queue`] is the environment
 //! that charges a retained run through the production queue.
 
 use std::{num::NonZeroU64, ops::Range, sync::Arc};

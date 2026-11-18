@@ -1,9 +1,8 @@
-//! Service-session policy: unit tests of each decision, the reopen-wait
-//! contract with [`ServiceSessionIO`], and the machine test of pending
-//! assembly and the active generations from [`super::fuzz`].
+//! Service-session policy: named tests that pin each decision, and the
+//! reopen-wait contract with [`ServiceSessionIO`]. The machine target in
+//! [`super::fuzz`] checks the invariants over random histories.
 
 use futures::StreamExt as _;
-use proptest::prelude::*;
 use zakura_rt::{sync::watch, time::timeout};
 
 use super::{
@@ -186,6 +185,26 @@ fn losing_or_duplicate_remote_offers_are_rejected_before_reservation() {
     losing.local_session_id = None;
     losing.remote_session_id = Some(2);
     assert!(losing.rejects_remote_offer());
+}
+
+/// The collision winner parks a peer session that completes beside its own
+/// installed generation, and the loser adopts it.
+#[test]
+fn the_collision_winner_keeps_its_installed_generation() {
+    for (winner, completion, remote) in [
+        (true, RemoteCompletion::ParkCollision, None),
+        (false, RemoteCompletion::AdoptCollision, Some(2)),
+    ] {
+        let roles = ConnectionRoles {
+            is_initiator: true,
+            i_open_collision_winner: winner,
+        };
+        let mut session = ServiceSessionState::new(test_ordered_stream(), REOPEN, roles);
+        session.opened(1);
+        assert_eq!(session.remote_completed(2), completion, "winner: {winner}");
+        assert_eq!(session.installed(true), Some(1), "winner: {winner}");
+        assert_eq!(session.installed(false), remote, "winner: {winner}");
+    }
 }
 
 /// A local open in flight holds the service: no second reopen starts, and the
@@ -594,80 +613,6 @@ fn ordered_session_connection_teardown_drops_pending_waits() {
         0,
         "dropping the connection-owned wait map must drop every pending wait"
     );
-}
-
-// Machine test.
-
-proptest! {
-    /// After every input the session state agrees with the independent model
-    /// in [`super::fuzz`].
-    #[test]
-    fn session_sequences_follow_the_model(
-        bytes in prop::collection::vec(any::<u8>(), 0..512),
-    ) {
-        replay_service_session_bytes(&bytes);
-    }
-}
-
-/// Fixed seeds run the fuzz entry in every test run, and together exercise
-/// every rule the replay counts.
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn fixed_seeds_exercise_every_session_rule() {
-    let mut total = std::collections::BTreeMap::new();
-    for seed in 1..=32u64 {
-        // A xorshift stream: reproducible bytes without a fuzzing engine.
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let bytes: Vec<u8> = (0..512)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state.to_le_bytes()[0]
-            })
-            .collect();
-        for (rule, count) in replay_rules(&replay_service_session_bytes(&bytes)) {
-            *total.entry(rule).or_insert(0) += count;
-        }
-    }
-    println!("tier=Machine target=service_session decoder=1 {total:?}");
-    for (rule, count) in &total {
-        assert!(*count > 0, "no fixed seed exercised {rule}: {total:?}");
-    }
-}
-
-/// Every rule a replay counts, by name. The destructure makes a new counter a
-/// compile error here.
-fn replay_rules(summary: &ServiceSessionReplaySummary) -> [(&'static str, usize); 11] {
-    let ServiceSessionReplaySummary {
-        completed_offers,
-        invalid_members,
-        conflicting_members,
-        expired_offers,
-        deferred_members,
-        parked_collisions,
-        adopted_collisions,
-        local_opens,
-        stale_exits,
-        reopen_backoffs,
-        retirements,
-    } = *summary;
-    [
-        ("completed offers", completed_offers),
-        ("invalid members", invalid_members),
-        ("conflicting members", conflicting_members),
-        ("expired offers", expired_offers),
-        ("deferred members", deferred_members),
-        ("parked collisions", parked_collisions),
-        ("adopted collisions", adopted_collisions),
-        ("local opens", local_opens),
-        ("stale exits", stale_exits),
-        ("reopen backoffs", reopen_backoffs),
-        ("retirements", retirements),
-    ]
 }
 
 /// Attempts count every local open, and only the exit of the exact generation

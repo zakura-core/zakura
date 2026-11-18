@@ -68,7 +68,9 @@
     "rss_limit_mb": 2048,
     "max_restarts": 0,
     "abandon_limit": 1,
-    "feedback": "on",
+    "feedback_arms": [
+      "on"
+    ],
     "sanitizer": "none",
     "calibration": "Six baseline-only cold-start runs at the re-pin, kept in the evidence bundle under calibration/; discovery record-book did not satisfy its whole-history applicability gate in either 5s or 30s, as at the first pin. No generator, witness or corpus repair followed.",
     "paired_runs": "Use identical seed, bounds and initial empty corpus for original and mutant. Start each seed in a fresh store; never carry a previous corpus."

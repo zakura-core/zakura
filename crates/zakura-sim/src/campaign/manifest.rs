@@ -22,7 +22,7 @@ use super::{
 use crate::{
     explore::{
         feedback::{FEEDBACK_LINE, FEEDBACK_VAR},
-        ProcessFailure,
+        has_saved_input, violated_property, Bucket, ProcessFailure,
     },
     harness::HarnessEntry,
     seed,
@@ -60,6 +60,7 @@ const RESERVED_FLAGS: &[&str] = &[
     "-workers",
     "-max_len",
     "-timeout",
+    "-report_slow_units",
     "-rss_limit_mb",
     "-minimize_crash",
     "-cleanse_crash",
@@ -747,7 +748,9 @@ fn check_harness(build: &FuzzBuild, harness: &str) -> Result<(), CampaignError> 
 
 /// Runs `build`'s fuzzer once with `-runs=0` and no corpus, and returns the
 /// feedback it logs. Fails if the fuzzer fails, so a manifest never names
-/// a fuzzer that can't start.
+/// a fuzzer that can't start. A fuzzer whose empty input violates an
+/// `Active` property did start: the probe accepts it, and the run's first
+/// input records the violation as a finding.
 fn probe_feedback(
     store: &Store,
     build: &FuzzBuild,
@@ -776,7 +779,12 @@ fn probe_in(
         budget,
         &dir.join("sim"),
     );
-    command.arg("-runs=0").arg(&corpus);
+    // Without a prefix, libFuzzer writes a failed input to its working
+    // directory, which may be a checkout.
+    command
+        .arg("-runs=0")
+        .arg(format!("-artifact_prefix={}/", dir.display()))
+        .arg(&corpus);
     let (exit, log) = run_logged(
         command,
         &dir.join("log.txt"),
@@ -785,7 +793,8 @@ fn probe_in(
         |_| {},
     )?;
     let log = String::from_utf8_lossy(&log);
-    if let Some(failure) = ProcessFailure::of(exit, log.as_bytes()) {
+    let failure = ProcessFailure::of(exit, log.as_bytes());
+    if let Some(failure) = failure.filter(|_| !violated_active(&log, &dir.join("sim"))) {
         let tail: Vec<&str> = log.lines().rev().take(20).collect();
         return Err(CampaignError::Refused(format!(
             "fuzzer {} failed its startup probe with {failure:?}:\n{}",
@@ -796,9 +805,20 @@ fn probe_in(
     FeedbackRecord::parse(&log).map_err(CampaignError::Refused)
 }
 
+/// True if `log` holds a fuzz target's panic for a run that violates an
+/// `Active` property, whose input the target saved under `artifacts`. A
+/// harness failure also saves the inputs of the `Active` violations beside
+/// it, but its panic names no property.
+fn violated_active(log: &str, artifacts: &Path) -> bool {
+    log.lines()
+        .filter_map(violated_property)
+        .any(|property| has_saved_input(artifacts, Bucket::Active, property))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::explore::violation_panic;
 
     /// The feedback line parses to its fields, and a log without one has
     /// none.
@@ -813,6 +833,28 @@ mod tests {
         assert_eq!(record.logged["features"], "65536");
         assert_eq!(FeedbackRecord::parse("INFO: Seed: 1\n"), Ok(None));
         assert!(FeedbackRecord::parse("zakura-sim feedback: backend=x mode=on\n").is_err());
+    }
+
+    /// Only a violation panic whose property has a saved `Active` input
+    /// counts: a harness failure's panic doesn't, nor does an input saved
+    /// in another bucket.
+    #[test]
+    fn violations_need_their_panic_and_saved_input() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let property = "block-sync/payload-inventory-agrees";
+        let panic = violation_panic(property, Path::new("t"), Path::new("i"));
+        let log = format!("thread 'x' panicked at src/fuzz.rs:1:1:\n{panic}\n");
+        assert!(!violated_active(&log, artifacts.path()));
+        let crash = artifacts.path().join("inputs/crash").join(property);
+        fs::create_dir_all(&crash).unwrap();
+        fs::write(crash.join("a.bin"), b"").unwrap();
+        assert!(!violated_active(&log, artifacts.path()));
+        let active = artifacts.path().join("inputs/active").join(property);
+        fs::create_dir_all(&active).unwrap();
+        fs::write(active.join("a.bin"), b"").unwrap();
+        assert!(violated_active(&log, artifacts.path()));
+        let harness = "thread 'x' panicked at src/fuzz.rs:1:1:\nharness: boom\n";
+        assert!(!violated_active(harness, artifacts.path()));
     }
 
     /// Extra flags can't set what the supervisor sets.
@@ -833,6 +875,24 @@ mod tests {
         assert!(budget(&["-use_value_profile=1"]).check().is_ok());
         assert!(budget(&["-seed=3"]).check().is_err());
         assert!(budget(&["-runs=10"]).check().is_err());
+        assert!(budget(&["-report_slow_units=5"]).check().is_err());
         assert!(budget(&["corpus"]).check().is_err());
+
+        // A slow input under the timeout leaves no `slow-unit-*` artifact,
+        // which the run would count as a failure.
+        let command = super::super::run::fuzzer_command(
+            Path::new("fuzzer"),
+            None,
+            &budget(&[]),
+            Path::new("sim"),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == "-report_slow_units=30"),
+            "{args:?}"
+        );
     }
 }

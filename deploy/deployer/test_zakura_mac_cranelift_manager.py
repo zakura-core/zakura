@@ -287,6 +287,44 @@ class PublicAuditTests(unittest.TestCase):
             self.assertIn('https://status.mainnet.zakura.valargroup.dev/node/linux-reference',
                           [call.args[0].full_url for call in request.call_args_list])
 
+    def test_audit_reads_the_cluster_view_s_peer_list(self):
+        def response(request, **kwargs):
+            leaked = request.full_url.endswith('/propagation/data')
+            body = {'outside_peers': [{'ip': '198.51.100.42'}]} if leaked else {}
+            return io.BytesIO(json.dumps(body).encode())
+        with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
+                patch('urllib.request.urlopen', side_effect=response) as request:
+            with self.assertRaises(ValueError) as raised:
+                deploy.audit_public_privacy()
+            self.assertNotIn('198.51.100.42', str(raised.exception))
+            self.assertIn('https://status.mainnet.zakura.valargroup.dev/propagation',
+                          [call.args[0].full_url for call in request.call_args_list])
+
+    def test_a_dashboard_without_a_cluster_view_passes_but_another_missing_page_does_not(self):
+        import urllib.error
+
+        def missing(*paths):
+            def response(request, **kwargs):
+                url = request.full_url
+                if url.endswith(paths):
+                    raise urllib.error.HTTPError(url, 404, 'Not Found', {}, io.BytesIO(b''))
+                return io.BytesIO(b'{}')
+            return response
+        with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}):
+            with patch('urllib.request.urlopen', side_effect=missing('/propagation', '/propagation/data')):
+                deploy.audit_public_privacy()
+            with patch('urllib.request.urlopen', side_effect=missing('/ironwood-status.json')), \
+                    self.assertRaises(urllib.error.HTTPError):
+                deploy.audit_public_privacy()
+            # A cluster view that answers with an error has not been checked.
+            def unavailable(request, **kwargs):
+                url = request.full_url
+                if url.endswith('/propagation/data'):
+                    raise urllib.error.HTTPError(url, 503, 'Service Unavailable', {}, io.BytesIO(b''))
+                return io.BytesIO(b'{}')
+            with patch('urllib.request.urlopen', side_effect=unavailable), self.assertRaises(urllib.error.HTTPError):
+                deploy.audit_public_privacy()
+
     def test_linux_addresses_are_allowed_by_private_audit(self):
         with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
                 patch('urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{"linux":"192.0.2.17"}')):

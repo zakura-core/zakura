@@ -237,6 +237,7 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 
 /// Pending work, in-flight ownership, floor, authority, and logical charges.
 #[derive(Debug)]
+#[cfg_attr(any(test, feature = "p2p-fuzz"), derive(Clone))]
 pub(in crate::zakura::block_sync) struct WorkQueueState {
     pending: BTreeMap<block::Height, WorkItem>,
     in_flight: BTreeMap<block::Height, WorkItem>,
@@ -1081,6 +1082,63 @@ impl WorkQueueState {
     /// O(1): the counter is maintained at each ledger transition.
     pub(in crate::zakura::block_sync) fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes
+    }
+
+    /// Check the height partition and the maintained ledger.
+    ///
+    /// A height is pending or in flight, never both. Pending work has no owner
+    /// and holds no charge. In-flight work has an owner, and provisional work
+    /// holds no charge. Every maintained total equals a scan of the items. A
+    /// latched [`LedgerFault`] keeps the last valid totals, so the totals are
+    /// not checked after one.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(in crate::zakura::block_sync) fn assert_invariants(&self) {
+        for (height, item) in &self.pending {
+            assert!(
+                !self.in_flight.contains_key(height),
+                "{height:?} is both pending and in flight"
+            );
+            assert!(item.owner.is_none(), "pending {height:?} has an owner");
+            assert_eq!(
+                item.budget.reserved_charge(),
+                0,
+                "pending {height:?} holds a charge"
+            );
+        }
+        for (height, item) in &self.in_flight {
+            assert!(item.owner.is_some(), "in-flight {height:?} has no owner");
+            assert!(
+                !item.provisional || !item.budget.is_reserved(),
+                "provisional {height:?} holds a charge"
+            );
+        }
+        if self.ledger_fault.is_some() {
+            return;
+        }
+        assert_eq!(
+            self.reserved_bytes,
+            self.reserved_bytes_scanned(),
+            "the reserved total matches its items"
+        );
+        let mut in_flight = ReservedTally::default();
+        let mut sessions = BTreeMap::<u64, u64>::new();
+        for item in self.in_flight.values() {
+            let charge = item.budget.reserved_charge();
+            in_flight = in_flight
+                .checked_add(charge)
+                .expect("a scan of valid charges fits");
+            if let Some(owner) = item.owner.filter(|_| charge > 0) {
+                *sessions.entry(owner.session_id).or_default() += charge;
+            }
+        }
+        assert_eq!(
+            self.in_flight_reserved, in_flight,
+            "the in-flight tally matches its items"
+        );
+        assert_eq!(
+            self.session_reserved, sessions,
+            "each session's tally matches its items"
+        );
     }
 
     /// Ground-truth O(pending + in_flight) recomputation of [`Self::reserved_bytes`].

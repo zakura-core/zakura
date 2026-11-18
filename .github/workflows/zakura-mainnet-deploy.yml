@@ -544,7 +544,7 @@ jobs:
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "befd6fe87dca09ef1bf7d22abe57dbf810a73394"
+          commit     = "ee51053323de2e7841f0678a606906a5f04d7cbb"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
@@ -553,7 +553,7 @@ jobs:
           name       = "us-scored"
           ssh_string = "root@165.227.220.111"
           monitor    = { profiler_url = "http://127.0.0.1:8109" }
-          commit     = "befd6fe87dca09ef1bf7d22abe57dbf810a73394"
+          commit     = "ee51053323de2e7841f0678a606906a5f04d7cbb"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
@@ -561,7 +561,7 @@ jobs:
           name       = "europe-central-scored"
           ssh_string = "root@188.166.118.152"
           monitor    = { profiler_url = "http://127.0.0.1:8110" }
-          commit     = "befd6fe87dca09ef1bf7d22abe57dbf810a73394"
+          commit     = "ee51053323de2e7841f0678a606906a5f04d7cbb"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 

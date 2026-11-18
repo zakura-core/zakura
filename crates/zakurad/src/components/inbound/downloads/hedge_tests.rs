@@ -120,12 +120,58 @@ fn from_second() -> zn::Response {
     )
 }
 
-/// Both copies were requested before the verifier judged the first arrival. A payload
-/// mismatch permits the other supplier's copy to commit, while a service failure does not.
+/// Drive the two dispatched exchanges independently of a controlled verifier.
 #[tokio::test(start_paused = true)]
 async fn verification_can_commit_the_already_requested_copy_after_a_payload_rejection() {
     use futures::StreamExt;
-    for (hedge_first, payload_mismatch) in [(false, true), (true, true), (false, false)] {
+    use zakura_consensus::{BlockError, RouterError, VerifyBlockError, VerifyCheckpointError};
+
+    let bad_root = || {
+        RouterError::from(VerifyBlockError::from(BlockError::BadMerkleRoot {
+            actual: block::merkle::Root([0; 32]),
+            expected: block::merkle::Root([1; 32]),
+        }))
+    };
+    let semantic_duplicate =
+        RouterError::from(VerifyBlockError::from(BlockError::DuplicateTransaction));
+    let checkpoint_duplicate = RouterError::from(VerifyCheckpointError::DuplicateTransaction);
+    let unrelated = RouterError::from(VerifyBlockError::from(BlockError::NoTransactions));
+    enum Expected {
+        CommitOther,
+        ReturnFirst,
+        RetryHeight { arrived_first: bool },
+    }
+    use Expected::*;
+    let cases: [(bool, BoxError, Expected); 9] = [
+        (false, bad_root().into(), CommitOther),
+        (true, bad_root().into(), CommitOther),
+        (false, semantic_duplicate.into(), CommitOther),
+        (true, checkpoint_duplicate.into(), CommitOther),
+        (false, unrelated.into(), ReturnFirst),
+        (true, "verifier unavailable".into(), ReturnFirst),
+        (
+            false,
+            bad_root().into(),
+            RetryHeight {
+                arrived_first: false,
+            },
+        ),
+        (
+            false,
+            bad_root().into(),
+            RetryHeight {
+                arrived_first: true,
+            },
+        ),
+        (
+            true,
+            bad_root().into(),
+            RetryHeight {
+                arrived_first: true,
+            },
+        ),
+    ];
+    for (hedge_first, error, expected) in cases {
         let (network, mut sent) = network();
         let (commits, mut verification) = mpsc::unbounded_channel();
         let verifier = service_fn(move |request| {
@@ -134,10 +180,15 @@ async fn verification_can_commit_the_already_requested_copy_after_a_payload_reje
             async { decision.await.unwrap() }
         });
         let state = service_fn(|request| async move {
-            assert!(matches!(request, zs::Request::AnyChainBlock(_)));
-            Ok(zs::Response::Block(None))
+            Ok(match request {
+                zs::Request::AnyChainBlock(_) => zs::Response::Block(None),
+                zs::Request::KnownBlock(_) => {
+                    zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain))
+                }
+                _ => panic!("unexpected state request"),
+            })
         });
-        let (_tip_sender, tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
+        let (mut tip_sender, tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
         let reporter = crate::components::test_misbehavior::reporter();
         let mut downloads = Downloads::new(
             reporter.clone(),
@@ -170,6 +221,27 @@ async fn verification_can_commit_the_already_requested_copy_after_a_payload_reje
         };
         let first_body = body(bytes);
         let other_body = body(bytes);
+        let mut other_answer = Some(late.answer);
+        if matches!(
+            expected,
+            RetryHeight {
+                arrived_first: true
+            }
+        ) {
+            super::tests::set_tip(
+                &mut tip_sender,
+                block::Height(5),
+                other_body.header.previous_block_hash,
+            );
+            other_answer
+                .take()
+                .unwrap()
+                .send(Ok(reply(&other_body, late_peer)))
+                .unwrap();
+            tokio::time::sleep(CHECK).await;
+            assert!(reporter.is_banned(late_peer.ip()));
+            super::tests::set_tip(&mut tip_sender, block::Height(6), block::Hash([6; 32]));
+        }
         early
             .answer
             .send(Ok(reply(&first_body, early_peer)))
@@ -182,39 +254,68 @@ async fn verification_can_commit_the_already_requested_copy_after_a_payload_reje
             matches!(request, zakura_consensus::Request::Commit(BlockHandle::Shared(body))
                 if Arc::ptr_eq(&body, &first_body))
         );
-        late.answer.send(Ok(reply(&other_body, late_peer))).unwrap();
+        if matches!(
+            expected,
+            RetryHeight {
+                arrived_first: false
+            }
+        ) {
+            super::tests::set_tip(
+                &mut tip_sender,
+                block::Height(5),
+                other_body.header.previous_block_hash,
+            );
+        }
+        if let Some(answer) = other_answer {
+            answer.send(Ok(reply(&other_body, late_peer))).unwrap();
+        }
         tokio::task::yield_now().await;
         assert!(verification.try_recv().is_err());
-        if payload_mismatch {
-            let error = zakura_consensus::VerifyBlockError::Block {
-                source: zakura_consensus::BlockError::BadMerkleRoot {
-                    actual: block::merkle::Root([0; 32]),
-                    expected: block::merkle::Root([1; 32]),
-                },
-            };
-            reject
-                .send(Err(zakura_consensus::RouterError::Block {
-                    source: Box::new(error),
-                }
-                .into()))
-                .unwrap();
-            let (request, accept) = tokio::time::timeout(CHECK, verification.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                matches!(request, zakura_consensus::Request::Commit(BlockHandle::Shared(body))
+        let score = error
+            .downcast_ref::<RouterError>()
+            .map_or(0, RouterError::misbehavior_score);
+        let message = error.to_string();
+        reject.send(Err(error)).unwrap();
+        match expected {
+            CommitOther => {
+                let (request, accept) = tokio::time::timeout(CHECK, verification.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(request, zakura_consensus::Request::Commit(BlockHandle::Shared(body))
                     if Arc::ptr_eq(&body, &other_body))
-            );
-            accept.send(Ok(hash())).unwrap();
-            assert_eq!(downloads.next().await.unwrap().unwrap(), hash());
-            assert!(reporter.is_banned(early_peer.ip()));
-            assert!(!reporter.is_banned(late_peer.ip()));
-        } else {
-            reject.send(Err("verifier unavailable".into())).unwrap();
-            let (error, source) = downloads.next().await.unwrap().unwrap_err();
-            assert_eq!(error.to_string(), "verifier unavailable");
-            assert_eq!(source, Some(early_peer));
+                );
+                accept.send(Ok(hash())).unwrap();
+                assert_eq!(downloads.next().await.unwrap().unwrap(), hash());
+                assert_eq!(
+                    reporter.is_banned(early_peer.ip()),
+                    score >= zn::constants::MAX_PEER_MISBEHAVIOR_SCORE
+                );
+                assert!(!reporter.is_banned(late_peer.ip()));
+            }
+            ReturnFirst => {
+                let (error, source) = downloads.next().await.unwrap().unwrap_err();
+                assert_eq!(error.to_string(), message);
+                assert_eq!(source, Some(early_peer));
+            }
+            RetryHeight { .. } => {
+                let (error, source) = downloads.next().await.unwrap().unwrap_err();
+                let mismatch = error
+                    .downcast_ref::<GossipedTipChildHeightMismatch>()
+                    .expect("inbound receives the bounded retry signal");
+                assert_eq!(source, Some(late_peer));
+                assert_eq!(mismatch.hash, hash());
+                assert!(!mismatch.parent_recovery);
+                assert!(
+                    reporter.is_banned(early_peer.ip()),
+                    "the discarded commitment error is attributed"
+                );
+                assert!(
+                    reporter.is_banned(late_peer.ip()),
+                    "the height error is attributed at receipt"
+                );
+            }
         }
         assert!(verification.try_recv().is_err());
         assert_nothing_more_sent(

@@ -1235,22 +1235,29 @@ where
 
             match first_result {
                 Ok(accepted) => {
-                    tokio::spawn(async move {
-                        if let Ok(Ok((body, _, _))) = other.await {
-                            body.record_verified_copy(&winner);
-                        }
-                    });
+                    if let CompetingReply::Pending(task) = other {
+                        tokio::spawn(async move {
+                            if let Ok(Ok((body, _, _))) = task.await {
+                                body.record_verified_copy(&winner);
+                            }
+                        });
+                    }
                     Ok(accepted)
                 }
-                Err((error, source))
-                    if matches!(
-                        crate::commands::start::zakura::block_verify_error_class(&error),
-                        zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
-                    ) =>
-                {
+                Err((error, source)) if another_copy_can_verify(&error) => {
                     // The header can still have a valid body. Use only the copy already requested.
-                    let Ok(Ok(candidate)) = other.await else {
-                        return Err((error, source));
+                    let candidate = match other.result().await {
+                        Ok(candidate) => candidate,
+                        Err(other_error) => {
+                            let (selected, discarded) =
+                                prioritize_race_errors((error, source), other_error);
+                            if let Some((addr, score)) =
+                                super::block_misbehavior(discarded.0, discarded.1)
+                            {
+                                spawner.misbehavior.report(addr, score);
+                            }
+                            return Err(selected);
+                        }
                     };
                     if let Some((addr, score)) = super::block_misbehavior(error, source) {
                         spawner.misbehavior.report(addr, score);
@@ -1388,12 +1395,36 @@ impl CandidateChecks {
 #[derive(Debug)]
 struct DownloadedCandidates {
     first: BlockCandidate,
-    other: Option<JoinHandle<Result<BlockCandidate, DownloadError>>>,
+    other: Option<CompetingReply>,
+}
+
+#[derive(Debug)]
+enum CompetingReply {
+    Pending(JoinHandle<Result<BlockCandidate, DownloadError>>),
+    Failed(DownloadError),
+}
+
+impl CompetingReply {
+    async fn result(self) -> Result<BlockCandidate, DownloadError> {
+        match self {
+            Self::Pending(task) => task.await.map_err(|error| (BoxError::from(error), None))?,
+            Self::Failed(error) => Err(error),
+        }
+    }
 }
 
 impl DownloadedCandidates {
     fn single(first: BlockCandidate) -> Self {
         Self { first, other: None }
+    }
+
+    /// A height rejection can still determine the retry if this candidate fails verification.
+    fn after_failure(first: BlockCandidate, error: DownloadError) -> Self {
+        let other = error
+            .0
+            .is::<GossipedTipChildHeightMismatch>()
+            .then_some(CompetingReply::Failed(error));
+        Self { first, other }
     }
 }
 
@@ -1453,30 +1484,53 @@ where
                 return result.map(DownloadedCandidates::single);
             }
             match result {
-                Ok(first) => Ok(DownloadedCandidates { first, other: Some(tokio::spawn(second)) }),
-                Err(first_error) => {
-                    let block = second.await.map_err(|second_error| race_error(first_error, second_error))?;
-                    metrics::counter!("gossip.hedge.won.count").increment(1);
-                    Ok(DownloadedCandidates::single(block))
-                }
+                Ok(first) => Ok(DownloadedCandidates { first, other: Some(CompetingReply::Pending(tokio::spawn(second))) }),
+                Err(first_error) => match second.await {
+                    Ok(block) => {
+                        metrics::counter!("gossip.hedge.won.count").increment(1);
+                        Ok(DownloadedCandidates::after_failure(block, first_error))
+                    }
+                    Err(second_error) => Err(prioritize_race_errors(first_error, second_error).0),
+                },
             }
         }
         result = &mut second => match result {
             Ok(response) => {
                 metrics::counter!("gossip.hedge.won.count").increment(1);
-                Ok(DownloadedCandidates { first: response, other: Some(tokio::spawn(first)) })
+                Ok(DownloadedCandidates { first: response, other: Some(CompetingReply::Pending(tokio::spawn(first))) })
             }
-            Err(second_error) => first.await.map(DownloadedCandidates::single).map_err(|first_error| race_error(first_error, second_error)),
+            Err(second_error) => match first.await {
+                Ok(block) => Ok(DownloadedCandidates::after_failure(block, second_error)),
+                Err(first_error) => Err(prioritize_race_errors(first_error, second_error).0),
+            }
         },
     }
 }
 
-/// Preserve the bounded poisoned-body retry when neither source supplies a usable candidate.
-fn race_error(first: DownloadError, second: DownloadError) -> DownloadError {
+/// A different body can satisfy the same header after a commitment mismatch or a duplicate
+/// transaction rejection. The latter has its own stable semantic and checkpoint rule IDs.
+fn another_copy_can_verify(error: &BoxError) -> bool {
+    use zakura_header_chain::BodyVerificationClass;
+    match crate::commands::start::zakura::block_verify_error_class(error) {
+        BodyVerificationClass::PayloadMismatch(_) => true,
+        BodyVerificationClass::ConsensusInvalid(rule) => matches!(
+            rule.as_str(),
+            "block.duplicate_transaction" | "checkpoint.duplicate_transaction"
+        ),
+        BodyVerificationClass::Duplicate | BodyVerificationClass::Retryable(_) => false,
+    }
+}
+
+/// Return the error for inbound handling first, retaining the other for supplier attribution.
+/// A tip-child height error carries the signal for the existing bounded replacement request.
+fn prioritize_race_errors(
+    first: DownloadError,
+    second: DownloadError,
+) -> (DownloadError, DownloadError) {
     if second.0.is::<GossipedTipChildHeightMismatch>() {
-        second
+        (second, first)
     } else {
-        first
+        (first, second)
     }
 }
 

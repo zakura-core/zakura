@@ -10,7 +10,7 @@
 #   every instance. A break in one instance's `code` runs against that
 #   instance only.
 # - `single`: one property with one instance.
-# - `machine`: one owner checked against its independent model.
+# - `machine`: one owner checked against its invariants after every input.
 # - `shared-wire-path`: the production side of the wire rules every protocol
 #   table enforces. A break here runs once against each table it lists.
 # - `protocol-table`: one protocol table's own guards, covered once, not
@@ -194,7 +194,7 @@ witness = { planted = "qa/planted/discovery/verification-capacity/release-before
 [[entry]]
 id = "block-machines"
 kind = "machine"
-claim = "Each block-sync owner agrees with its independent model after every operation."
+claim = "Each block-sync owner keeps its invariants and the facts its inputs fix after every operation."
 check = ["crates/zakura-sim/src/harness/block_work.rs", "crates/zakura-sim/src/harness/machine.rs"]
 shared = []
 
@@ -221,7 +221,7 @@ witness = { planted = "qa/planted/block/decoded-retention/missing-admission.toml
 [[entry]]
 id = "discovery-machines"
 kind = "machine"
-claim = "Discovery's record book and session installation agree with their independent models after every operation."
+claim = "Discovery's record book and session installation keep their invariants and the facts their inputs fix after every operation."
 check = ["crates/zakura-sim/src/harness/discovery_machine.rs", "crates/zakura-sim/src/harness/machine.rs"]
 shared = []
 

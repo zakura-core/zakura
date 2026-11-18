@@ -26,6 +26,8 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub(crate) mod machine_test;
 mod node_envelope;
 mod peer_memory;
 mod regulation;
@@ -296,6 +298,24 @@ impl ZakuraHandshakeConnector {
             endpoint: Some(endpoint),
             #[cfg(test)]
             test_outcome: None,
+        }
+    }
+
+    /// Records in the trace where a peer connected from and which software it runs, once
+    /// its legacy connection has been upgraded to Zakura. `addr` is the address as the
+    /// node's privacy setting allows it to be written. Does nothing without a live Zakura
+    /// endpoint.
+    pub(crate) fn trace_upgraded_peer(
+        &self,
+        peer_id: &ZakuraPeerId,
+        addr: &str,
+        user_agent: &str,
+        inbound: bool,
+    ) {
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            endpoint
+                .trace()
+                .emit_peer_upgraded(peer_id, addr, user_agent, inbound);
         }
     }
 

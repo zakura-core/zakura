@@ -21,12 +21,8 @@ use zakura_chain::{
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
-use zcash_script::solver;
 
-use self::{
-    eviction_list::EvictionList,
-    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
-};
+use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
     MempoolError,
@@ -42,6 +38,7 @@ mod eviction_cost;
 mod eviction_list;
 #[cfg(any(test, feature = "mempool-bench"))]
 mod fixtures;
+#[cfg(any(test, feature = "mempool-bench"))]
 mod policy;
 mod verified_set;
 
@@ -58,97 +55,14 @@ pub(super) use verified_set::benchmarks::mempool_eviction_benchmarks;
 /// [ZIP-401]: https://zips.z.cash/zip-0401#specification
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
-/// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// lock times, or the fee per unit of cost. These rejections are only valid for the current tip.
-///
-/// Each committed block clears these rejections, because new blocks can supply missing inputs,
-/// and free mempool space.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum ExactTipRejectionError {
-    /// Skip this variant in proptest because `TransactionError` is a large enum
-    /// that causes stack overflow during arbitrary value generation.
-    #[error("transaction did not pass consensus validation: {0}")]
-    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    FailedVerification(#[from] zakura_consensus::error::TransactionError),
-    #[error("transaction did not pass standard validation: {0}")]
-    FailedStandard(#[from] NonStandardTransactionError),
+pub use zakura_mempool::{
+    NonStandardTransactionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError,
+};
 
-    /// A transaction that paid more per unit of cost evicted this transaction from the full
-    /// mempool.
-    ///
-    /// The cost depends on the transaction size, which includes the authorizing data, so the
-    /// rejection covers only the exact transaction. A smaller transaction with the same effects
-    /// pays more per unit of cost.
-    #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
-    Evicted,
-
-    /// The mempool is full, and the transaction does not pay enough to evict other
-    /// transactions.
-    ///
-    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers only the exact
-    /// transaction.
-    #[error("transaction rejected because the mempool is full and it pays too low a fee")]
-    BelowEvictionCost,
-}
-
-/// Transactions rejected based only on their effects (spends, outputs, transaction header).
-/// These rejections are only valid for the current tip.
-///
-/// Each committed block clears these rejections, because new blocks can remove other
-/// transactions from the mempool, and free mempool space.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum SameEffectsTipRejectionError {
-    #[error(
-        "transaction rejected because another transaction in the mempool has already spent some of \
-        its inputs"
-    )]
-    SpendConflict,
-
-    #[error(
-        "transaction rejected because it spends missing outputs from \
-        another transaction in the mempool"
-    )]
-    MissingOutput,
-
-    /// The transaction spends outputs of more than [`MAX_MEMPOOL_ANCESTORS`] mempool
-    /// transactions, directly or indirectly.
-    #[error(
-        "transaction rejected because it depends on more than {MAX_MEMPOOL_ANCESTORS} \
-        unconfirmed transactions in the mempool"
-    )]
-    TooManyAncestors,
-
-    /// Adding the transaction would exceed the limit for a connected group of
-    /// unconfirmed parents and children.
-    #[error(
-        "transaction rejected because its connected unconfirmed dependency group \
-        would exceed {MAX_MEMPOOL_PACKAGE_TRANSACTIONS} transactions"
-    )]
-    TooManyPackageTransactions,
-}
-
-/// Transactions rejected based only on their effects (spends, outputs, transaction header).
-/// These rejections are valid while the current chain continues to grow.
-///
-/// Rollbacks and network upgrades clear these rejections, because they can lower the tip height,
-/// or change the consensus rules.
-#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[allow(dead_code)]
-pub enum SameEffectsChainRejectionError {
-    #[error("best chain tip has reached transaction expiry height")]
-    Expired,
-
-    #[error("transaction inputs were spent, or nullifiers were revealed, in the best chain")]
-    DuplicateSpend,
-
-    #[error("transaction was committed to the best chain")]
-    Mined,
-}
+/// Rejections of these exact bytes until the tip changes, with the consensus
+/// verifier's error for a failed verification.
+pub type ExactTipRejectionError =
+    zakura_mempool::ExactTipRejectionError<zakura_consensus::error::TransactionError>;
 
 /// Storage error that combines all other specific error types.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -163,38 +77,6 @@ pub enum RejectionError {
     SameEffectsChain(#[from] SameEffectsChainRejectionError),
     #[error(transparent)]
     NonStandardTransaction(#[from] NonStandardTransactionError),
-}
-
-/// Non-standard transaction error.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub enum NonStandardTransactionError {
-    /// Sprout is retired from the mempool, including on pre-NU7 networks.
-    #[error("Sprout JoinSplits are not accepted in the mempool")]
-    SproutJoinSplit,
-
-    #[error(
-        "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
-    )]
-    TransactionTooLarge { actual_bytes: usize, max_bytes: u64 },
-    #[error("transaction is dust")]
-    IsDust,
-    #[error("transaction scriptSig is too large")]
-    ScriptSigTooLarge,
-    #[error("transaction scriptSig is not push-only")]
-    ScriptSigNotPushOnly,
-    #[error("transaction scriptPubKey is non-standard")]
-    ScriptPubKeyNonStandard,
-    #[error("transaction has a bare multisig output")]
-    BareMultiSig,
-    #[error("transaction has multiple OP_RETURN outputs")]
-    MultiOpReturn,
-    #[error("transaction has an OP_RETURN output that exceeds the size limit")]
-    DataCarrierTooLarge,
-    #[error("transaction has too many signature operations")]
-    TooManySigops,
-    #[error("transaction has non-standard inputs")]
-    NonStandardInputs,
 }
 
 /// Represents a set of transactions that have been removed from the mempool, either because
@@ -301,140 +183,24 @@ impl Storage {
         }
     }
 
-    /// Check and reject non-standard transaction.
-    ///
-    /// Zcashd defines non-consensus standard transaction checks in
-    /// <https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L58-L135>
-    ///
-    /// This checks are applied before inserting a transaction in `AcceptToMemoryPool`:
-    /// <https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819>
-    ///
-    /// Currently, we implement: per-transaction sigops limit, standard input script checks,
-    /// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
-    /// limits), and dust checks.
+    /// Checks `tx` against the standardness rules both pools share, and
+    /// caches the rejection if it breaks one. See [`zakura_mempool::standardness`].
     fn reject_if_non_standard_tx(&mut self, tx: &VerifiedUnminedTx) -> Result<(), MempoolError> {
-        use zcash_script::script::{self, Evaluable as _};
-
-        let transaction = tx.transaction.transaction().as_ref();
-        let spent_outputs = &tx.spent_outputs;
-
-        // NU7 excludes versions 1-4. Keep Sprout out of storage even on custom
-        // pre-NU7 networks, so conflict tracking needs no Sprout index.
-        if transaction.has_sprout_joinsplit_data() {
-            return self.reject_non_standard(tx, NonStandardTransactionError::SproutJoinSplit);
+        let Err(error) = zakura_mempool::standardness(tx, self.max_datacarrier_bytes) else {
+            return Ok(());
+        };
+        let inputs = tx.transaction.transaction().inputs().len();
+        if error == NonStandardTransactionError::NonStandardInputs
+            && !tx.spent_outputs.is_empty()
+            && inputs != tx.spent_outputs.len()
+        {
+            tracing::warn!(
+                inputs,
+                spent_outputs = tx.spent_outputs.len(),
+                "spent_outputs length mismatch, rejecting as non-standard"
+            );
         }
-
-        for input in transaction.inputs() {
-            let unlock_script = match input {
-                transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
-                transparent::Input::Coinbase { .. } => continue,
-            };
-
-            // Rule: scriptSig size must be within the standard limit.
-            if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigTooLarge);
-            }
-
-            let code = script::Code(unlock_script.as_raw_bytes().to_vec());
-            // Rule: scriptSig must be push-only.
-            if !code.is_push_only() {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigNotPushOnly);
-            }
-        }
-
-        if !spent_outputs.is_empty() {
-            // Validate that spent_outputs aligns with transparent inputs.
-            if transaction.inputs().len() != spent_outputs.len() {
-                tracing::warn!(
-                    inputs = transaction.inputs().len(),
-                    spent_outputs = spent_outputs.len(),
-                    "spent_outputs length mismatch, rejecting as non-standard"
-                );
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
-            }
-
-            // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
-            // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-            if !policy::are_inputs_standard(transaction, spent_outputs) {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
-            }
-
-            // Rule: per-transaction sigops (legacy + P2SH) must not exceed the limit.
-            // zcashd sums GetLegacySigOpCount + GetP2SHSigOpCount for AcceptToMemoryPool:
-            // https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819
-            let total_sigops = tx.block_sigop_count();
-            if total_sigops > policy::MAX_STANDARD_TX_SIGOPS {
-                return self.reject_non_standard(tx, NonStandardTransactionError::TooManySigops);
-            }
-        } else {
-            // No spent outputs available (e.g. shielded-only transaction).
-            // Only check legacy sigops.
-            if tx.legacy_sigop_count > policy::MAX_STANDARD_TX_SIGOPS {
-                return self.reject_non_standard(tx, NonStandardTransactionError::TooManySigops);
-            }
-        }
-
-        // Rule: outputs must be standard script kinds, with special handling for OP_RETURN.
-        let mut data_out_count = 0u32;
-
-        for output in transaction.outputs() {
-            let lock_script = &output.lock_script;
-            let script_len = lock_script.as_raw_bytes().len();
-            let script_kind = policy::standard_script_kind(lock_script);
-
-            match script_kind {
-                None => {
-                    // Rule: output script must be standard (P2PKH/P2SH/P2PK/multisig/OP_RETURN).
-                    return self.reject_non_standard(
-                        tx,
-                        NonStandardTransactionError::ScriptPubKeyNonStandard,
-                    );
-                }
-                Some(solver::ScriptKind::NullData { .. }) => {
-                    // Rule: OP_RETURN script size is limited.
-                    // Cast is safe: u32 always fits in usize on 32-bit and 64-bit platforms.
-                    if script_len > self.max_datacarrier_bytes as usize {
-                        return self.reject_non_standard(
-                            tx,
-                            NonStandardTransactionError::DataCarrierTooLarge,
-                        );
-                    }
-                    // Rule: count OP_RETURN outputs to enforce the one-output limit.
-                    data_out_count += 1;
-                }
-                Some(solver::ScriptKind::MultiSig { pubkeys, .. }) => {
-                    // Rule: multisig must be at most 3-of-3 for standardness.
-                    // Note: This check is technically subsumed by the unconditional BareMultiSig
-                    // rejection below, but we keep it to distinguish the two error reasons
-                    // (ScriptPubKeyNonStandard for >3 keys vs BareMultiSig for valid multisig).
-                    if pubkeys.len() > policy::MAX_STANDARD_MULTISIG_PUBKEYS {
-                        return self.reject_non_standard(
-                            tx,
-                            NonStandardTransactionError::ScriptPubKeyNonStandard,
-                        );
-                    }
-                    // Rule: bare multisig outputs are non-standard (fIsBareMultisigStd = false).
-                    return self.reject_non_standard(tx, NonStandardTransactionError::BareMultiSig);
-                }
-                Some(_) => {
-                    // Rule: non-OP_RETURN outputs must not be dust.
-                    if output.is_dust() {
-                        return self.reject_non_standard(tx, NonStandardTransactionError::IsDust);
-                    }
-                }
-            }
-        }
-
-        // Rule: only one OP_RETURN output is permitted.
-        if data_out_count > 1 {
-            return self.reject_non_standard(tx, NonStandardTransactionError::MultiOpReturn);
-        }
-
-        Ok(())
+        self.reject_non_standard(tx, error)
     }
 
     /// Rejects a transaction as non-standard, caches the rejection, and returns the mempool error.

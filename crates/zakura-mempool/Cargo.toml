@@ -1,0 +1,46 @@
+[package]
+name = "zakura-mempool"
+version = "0.1.0"
+authors.workspace = true
+description = "Zakura's transaction pool: its storage, its rules and the pool core. Internal crate, published to support cargo install zakura"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+readme = "../../README.md"
+keywords.workspace = true
+categories = ["asynchronous", "cryptography::cryptocurrencies"]
+
+[features]
+default = []
+
+# Arbitrary error values, for the property tests of crates that share these errors.
+proptest-impl = ["proptest", "proptest-derive"]
+
+[dependencies]
+zakura-chain = { path = "../zakura-chain", version = "16.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
+zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
+zakura-script = { path = "../zakura-script", version = "5.0.8" }
+zcash_script = { workspace = true }
+
+chrono = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+
+# test feature proptest-impl
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
+eyre = { workspace = true }
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test", version = "4.0.0" }
+
+[lints]
+workspace = true

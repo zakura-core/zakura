@@ -1,0 +1,172 @@
+//! Legacy-protocol message encoding: the cost of framing a block or transaction for
+//! one peer, as the node does each time it serves one.
+//!
+//! Blocks are built from the real Sapling-era and NU5 mainnet transactions in
+//! `zakura-test`, at the sizes in `ZAKURA_BENCH_BLOCK_BYTES` (comma-separated,
+//! default `1000000,2000000`). `repeat_send` encodes a block one codec has already sent,
+//! so its checksum and length come from the block-checksum cache, as when a node serves
+//! the same block to many peers. `first_send` uses a new codec each time, as when a peer
+//! downloads blocks nobody has asked for recently. Every send starts from an empty buffer.
+//! A block is sent the way a connection serves one, including hashing it to record the
+//! upload, so a change that moves hashing between the connection and the encoder is timed
+//! in full.
+#![allow(missing_docs)]
+
+use std::{hint::black_box, io::Cursor, sync::Arc};
+
+use bytes::BytesMut;
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use tokio_util::codec::Encoder;
+
+use zakura_chain::{
+    block::Block,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    transaction::Transaction,
+};
+use zakura_network::{Codec, HashedBlock, Message};
+
+/// Non-coinbase Sapling-era and NU5 mainnet transactions, in vector order.
+fn shielded_era_transactions() -> Vec<Arc<Transaction>> {
+    zakura_test::vectors::MAINNET_BLOCKS
+        .range(419_200..)
+        .flat_map(|(_, bytes)| {
+            Block::zcash_deserialize(Cursor::new(bytes))
+                .expect("test vectors are valid blocks")
+                .transactions
+                .into_iter()
+                .skip(1)
+        })
+        .collect()
+}
+
+/// A block of about `target_bytes` that cycles through `pool` after its coinbase.
+fn synthetic_block(target_bytes: usize, pool: &[Arc<Transaction>]) -> Block {
+    let mut block = Block::zcash_deserialize(Cursor::new(
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ))
+    .expect("test vectors are valid blocks");
+    block.transactions.truncate(1);
+
+    let mut size = block.zcash_serialized_size();
+    for tx in pool.iter().cycle() {
+        let tx_size = tx.zcash_serialized_size();
+        if size + tx_size > target_bytes {
+            break;
+        }
+        size += tx_size;
+        block.transactions.push(tx.clone());
+    }
+    block
+}
+
+fn block_targets() -> Vec<usize> {
+    std::env::var("ZAKURA_BENCH_BLOCK_BYTES")
+        .unwrap_or_else(|_| "1000000,2000000".to_string())
+        .split(',')
+        .map(|size| size.trim().parse().expect("sizes are byte counts"))
+        .collect()
+}
+
+/// A message to send: a block, sent the way a connection serves one, or any other message.
+enum Payload {
+    Block(Arc<Block>),
+    Other(Message),
+}
+
+/// Frames `message` into an empty buffer, the worst case for a connection whose buffer has
+/// no room left: the whole frame needs new memory.
+fn encode(codec: &mut Codec, message: Message) -> BytesMut {
+    let mut dst = BytesMut::new();
+    codec
+        .encode(black_box(message), &mut dst)
+        .expect("message fits in a protocol message");
+    dst
+}
+
+/// What a connection does to serve one requested block: hash the block, record the upload by
+/// that hash, then frame the block message.
+fn serve_block(codec: &mut Codec, block: &Arc<Block>) -> BytesMut {
+    let block = HashedBlock::from(block.clone());
+    black_box(block.hash());
+    encode(codec, Message::Block(block))
+}
+
+fn send(codec: &mut Codec, payload: &Payload) -> BytesMut {
+    match payload {
+        Payload::Block(block) => serve_block(codec, block),
+        Payload::Other(message) => encode(codec, message.clone()),
+    }
+}
+
+fn new_codec() -> Codec {
+    let mut codec = Codec::builder().finish();
+    codec.reconfigure_full_body_len();
+    codec
+}
+
+fn bench_encode(c: &mut Criterion) {
+    let pool = shielded_era_transactions();
+    let mut cases: Vec<(String, Payload)> = block_targets()
+        .into_iter()
+        .map(|target| {
+            let block = synthetic_block(target, &pool);
+            let label = format!(
+                "block_{}KB_{}tx",
+                block.zcash_serialized_size() / 1000,
+                block.transactions.len()
+            );
+            (label, Payload::Block(Arc::new(block)))
+        })
+        .collect();
+    cases.push((
+        "block_mainnet_1687118_small".to_string(),
+        Payload::Block(Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("test vector is a valid block"),
+        )),
+    ));
+    cases.push((
+        "tx_small".to_string(),
+        Payload::Other(Message::Tx(
+            zakura_test::vectors::DUMMY_TX1
+                .zcash_deserialize_into::<Transaction>()
+                .expect("test vector is a valid transaction")
+                .into(),
+        )),
+    ));
+
+    let mut group = c.benchmark_group("legacy_encode");
+    group.sample_size(30);
+    for (label, payload) in cases {
+        let mut warm = new_codec();
+        let frame_len = send(&mut warm, &payload).len();
+        group.throughput(Throughput::Bytes(
+            u64::try_from(frame_len).expect("a frame of at most a few MB fits in a u64"),
+        ));
+
+        // The same block sent again, as to many peers: its checksum and length are known.
+        group.bench_with_input(
+            BenchmarkId::new("repeat_send", &label),
+            &payload,
+            |b, payload| b.iter(|| black_box(send(&mut warm, payload))),
+        );
+        // A block nobody has been sent yet, as when a peer downloads old blocks. The new codec
+        // is built outside the timed part; the frame is dropped inside it, as in `repeat_send`.
+        group.bench_with_input(
+            BenchmarkId::new("first_send", &label),
+            &payload,
+            |b, payload| {
+                b.iter_batched_ref(
+                    new_codec,
+                    |codec| drop(black_box(send(codec, payload))),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_encode);
+criterion_main!(benches);

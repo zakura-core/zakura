@@ -164,3 +164,30 @@ fn an_act_that_never_becomes_ready_is_skipped() {
     );
     assert!(received(&report).contains(&u16::from(MSG_DISCOVERY_SERVICES)));
 }
+
+/// A conformant script that interleaves request runs and `GetServices`
+/// asks, found by the generator (seed 3203, run 337). Its eleventh
+/// `GetServices` leaves 76 and 77 unanswered by the peer's count, so the
+/// peer's model labels it `OverMargin`, and the evidence settles it
+/// `Conformant` by the node's count, which had already answered both. The
+/// model must still count it open: before it did, the model labelled the
+/// third request after it `Conformant` with three open on the node, which
+/// the node rightly refused, and `conformant-never-closes` failed.
+#[test]
+fn a_crossed_request_counts_toward_the_margin() {
+    const CROSSED: [u8; 83] = [
+        0x01, 0x40, 0x20, 0xb2, 0xfa, 0xad, 0xb0, 0xf9, 0x92, 0x28, 0xb0, 0xc2, 0x30, 0xcd, 0x80,
+        0x46, 0xb8, 0x54, 0x41, 0x0a, 0x38, 0xd3, 0x08, 0x09, 0x4a, 0x02, 0xef, 0x19, 0x30, 0xb0,
+        0xf2, 0x49, 0x4d, 0x72, 0xdc, 0xcf, 0x31, 0xd5, 0xd6, 0xfe, 0x00, 0x83, 0xa1, 0x78, 0x02,
+        0xa6, 0xd9, 0xf7, 0x16, 0x2e, 0xfe, 0x19, 0x17, 0x82, 0x63, 0x13, 0x00, 0x65, 0xf2, 0xa9,
+        0x07, 0x82, 0x95, 0x3e, 0xae, 0xf6, 0xff, 0x07, 0x21, 0xd8, 0xe2, 0x65, 0xef, 0xdc, 0x38,
+        0x65, 0x4b, 0x40, 0x88, 0x10, 0x1b, 0x63, 0xd7,
+    ];
+    let report = run_clean(&CROSSED);
+    let sent = sent(&report);
+    assert!(
+        sent.iter()
+            .any(|(row, label)| row == "get-services" && label == "over-margin"),
+        "the refused request is judged over the margin: {sent:?}"
+    );
+}

@@ -126,7 +126,7 @@ fn equihash_solver_honors_cancellation() {
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
     assert!(matches!(
-        Solution::solve(*block.header, || Err(SolverCancelled)),
+        Solution::solve(block.header.as_ref().clone(), || Err(SolverCancelled)),
         Err(SolverCancelled)
     ));
 }

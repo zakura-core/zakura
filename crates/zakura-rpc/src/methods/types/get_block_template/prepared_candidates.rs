@@ -637,8 +637,8 @@ mod tests {
                 assert!(cache
                     .decode_submitted(&submitted_bytes(&proposal))
                     .is_none());
-                assert!(cache.resolve("a", *first.header).is_ok());
-                assert!(cache.resolve("b", *second.header).is_ok());
+                assert!(cache.resolve("a", first.header.as_ref().clone()).is_ok());
+                assert!(cache.resolve("b", second.header.as_ref().clone()).is_ok());
                 assert_accounting(&cache.lock().proposals);
             }
         }
@@ -665,7 +665,7 @@ mod tests {
             insert(&cache, &active, "a", ClientProposal);
             cache.retain(old.clone(), ClientProposal);
             cache.retain(replacement.clone(), ClientProposal);
-            assert!(cache.resolve("a", *active.header).is_ok());
+            assert!(cache.resolve("a", active.header.as_ref().clone()).is_ok());
             assert!(cache.decode_submitted(&submitted_bytes(&old)).is_none());
             assert!(cache
                 .decode_submitted(&submitted_bytes(&replacement))
@@ -674,8 +674,10 @@ mod tests {
             // Giving a retained proposal a work ID protects it from later alias-free proposals.
             insert(&cache, &replacement, "b", ClientProposal);
             cache.retain(distinct_block(4), ClientProposal);
-            assert!(cache.resolve("a", *active.header).is_ok());
-            assert!(cache.resolve("b", *replacement.header).is_ok());
+            assert!(cache.resolve("a", active.header.as_ref().clone()).is_ok());
+            assert!(cache
+                .resolve("b", replacement.header.as_ref().clone())
+                .is_ok());
 
             // An expired alias no longer protects its candidate from eviction.
             cache
@@ -689,7 +691,9 @@ mod tests {
             cache.retain(next.clone(), ClientProposal);
             assert!(cache.decode_submitted(&submitted_bytes(&active)).is_none());
             assert!(cache.decode_submitted(&submitted_bytes(&next)).is_some());
-            assert!(cache.resolve("b", *replacement.header).is_ok());
+            assert!(cache
+                .resolve("b", replacement.header.as_ref().clone())
+                .is_ok());
             assert_accounting(&cache.lock().proposals);
         }
     }
@@ -777,7 +781,7 @@ mod tests {
         header.nonce = [9; 32].into();
         header.solution = Solution::for_proposal_for_network(&Network::Mainnet);
         let solved = cache
-            .resolve("work", header)
+            .resolve("work", header.clone())
             .expect("mutable fields can change");
         assert_eq!(*solved.header, header);
         assert_eq!(solved.transactions, block.transactions);
@@ -790,7 +794,7 @@ mod tests {
         let block = test_block();
         let cache = PreparedCandidateResolver::default();
         insert(&cache, &block, "work", ServerTemplate);
-        let mut changed = vec![*block.header; 5];
+        let mut changed = vec![block.header.as_ref().clone(); 5];
         changed[0].version ^= 1;
         changed[1].previous_block_hash = Hash([1; 32]);
         changed[2].merkle_root = Default::default();
@@ -799,7 +803,7 @@ mod tests {
         for header in changed {
             assert_eq!(cache.resolve("work", header), Err(CandidateMismatch));
         }
-        assert!(cache.resolve("work", *block.header).is_ok());
+        assert!(cache.resolve("work", block.header.as_ref().clone()).is_ok());
     }
 
     #[test]
@@ -813,8 +817,12 @@ mod tests {
         let cache = PreparedCandidateResolver::default();
         insert(&cache, &original, "first", ServerTemplate);
         insert(&cache, &changed, "second", ServerTemplate);
-        assert!(cache.resolve("first", *original.header).is_ok());
-        assert!(cache.resolve("second", *changed.header).is_ok());
+        assert!(cache
+            .resolve("first", original.header.as_ref().clone())
+            .is_ok());
+        assert!(cache
+            .resolve("second", changed.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries.len(), 1);
         assert_eq!(inner.server.work_ids.len(), 2);
@@ -835,14 +843,14 @@ mod tests {
         assert_eq!(cache.lock().server.entries.len(), 2);
         assert_eq!(
             cache
-                .resolve("first", *original.header)
+                .resolve("first", original.header.as_ref().clone())
                 .unwrap()
                 .transactions,
             original.transactions
         );
         assert_eq!(
             cache
-                .resolve("second", *changed.header)
+                .resolve("second", changed.header.as_ref().clone())
                 .unwrap()
                 .transactions,
             changed.transactions
@@ -857,9 +865,11 @@ mod tests {
             let replacement = distinct_block(2);
             insert(&cache, &original, "shared", source);
             insert(&cache, &replacement, "shared", source);
-            assert!(cache.resolve("shared", *original.header).is_ok());
+            assert!(cache
+                .resolve("shared", original.header.as_ref().clone())
+                .is_ok());
             assert_eq!(
-                cache.resolve("shared", *replacement.header),
+                cache.resolve("shared", replacement.header.as_ref().clone()),
                 Err(CandidateMismatch)
             );
             let mut inner = cache.lock();
@@ -882,10 +892,12 @@ mod tests {
                 for (source, block) in candidates {
                     insert(&cache, block, "shared", source);
                 }
-                assert!(cache.resolve("shared", *server.header).is_ok());
+                assert!(cache
+                    .resolve("shared", server.header.as_ref().clone())
+                    .is_ok());
                 if !same_candidate {
                     assert_eq!(
-                        cache.resolve("shared", *proposal.header),
+                        cache.resolve("shared", proposal.header.as_ref().clone()),
                         Err(CandidateMismatch)
                     );
                 }
@@ -904,8 +916,12 @@ mod tests {
         let block = test_block();
         insert(&cache, &block, "server", ServerTemplate);
         insert(&cache, &block, "proposal", ClientProposal);
-        assert!(cache.resolve("server", *block.header).is_ok());
-        assert!(cache.resolve("proposal", *block.header).is_ok());
+        assert!(cache
+            .resolve("server", block.header.as_ref().clone())
+            .is_ok());
+        assert!(cache
+            .resolve("proposal", block.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries.len(), 1);
         assert_eq!(inner.proposals.entries.len(), 1);
@@ -925,10 +941,19 @@ mod tests {
             for index in 0..=cap {
                 insert(&cache, &block, &format!("work-{index}"), source);
             }
-            assert_eq!(cache.resolve("work-0", *block.header), Err(StaleWork));
-            assert!(cache.resolve("work-1", *block.header).is_ok());
-            assert!(cache.resolve(&format!("work-{cap}"), *block.header).is_ok());
-            assert!(cache.resolve("other", *block.header).is_ok());
+            assert_eq!(
+                cache.resolve("work-0", block.header.as_ref().clone()),
+                Err(StaleWork)
+            );
+            assert!(cache
+                .resolve("work-1", block.header.as_ref().clone())
+                .is_ok());
+            assert!(cache
+                .resolve(&format!("work-{cap}"), block.header.as_ref().clone())
+                .is_ok());
+            assert!(cache
+                .resolve("other", block.header.as_ref().clone())
+                .is_ok());
             let mut inner = cache.lock();
             let partition = inner.partition(source);
             assert_eq!(partition.entries.len(), 1);
@@ -959,15 +984,19 @@ mod tests {
                 }
             }
             assert_eq!(
-                cache.resolve("work-0", *distinct_block(0).header),
+                cache.resolve("work-0", distinct_block(0).header.as_ref().clone()),
                 Err(StaleWork)
             );
             assert_eq!(
-                cache.resolve("old-alias", *distinct_block(0).header),
+                cache.resolve("old-alias", distinct_block(0).header.as_ref().clone()),
                 Err(StaleWork)
             );
-            assert!(cache.resolve("work-1", *distinct_block(1).header).is_ok());
-            assert!(cache.resolve("other", *other_block.header).is_ok());
+            assert!(cache
+                .resolve("work-1", distinct_block(1).header.as_ref().clone())
+                .is_ok());
+            assert!(cache
+                .resolve("other", other_block.header.as_ref().clone())
+                .is_ok());
             let mut inner = cache.lock();
             assert_eq!(inner.partition(source).entries.len(), cap);
             assert_accounting(&inner.server);
@@ -985,10 +1014,13 @@ mod tests {
         let original = distinct_block(1);
         insert(&cache, &original, "original", ServerTemplate);
         let resolved = cache
-            .resolve("original", *original.header)
+            .resolve("original", original.header.as_ref().clone())
             .expect("the original candidate resolves before eviction");
         insert(&cache, &distinct_block(2), "replacement", ServerTemplate);
-        assert_eq!(cache.resolve("original", *original.header), Err(StaleWork));
+        assert_eq!(
+            cache.resolve("original", original.header.as_ref().clone()),
+            Err(StaleWork)
+        );
         drop(cache);
         assert_eq!(resolved, original);
         assert!(Arc::ptr_eq(
@@ -1017,9 +1049,16 @@ mod tests {
         }
         insert(&cache, &first, "fresh", ServerTemplate);
         insert(&cache, &third, "third", ServerTemplate);
-        assert!(cache.resolve("first", *first.header).is_ok());
-        assert!(cache.resolve("fresh", *first.header).is_ok());
-        assert_eq!(cache.resolve("second", *second.header), Err(StaleWork));
+        assert!(cache
+            .resolve("first", first.header.as_ref().clone())
+            .is_ok());
+        assert!(cache
+            .resolve("fresh", first.header.as_ref().clone())
+            .is_ok());
+        assert_eq!(
+            cache.resolve("second", second.header.as_ref().clone()),
+            Err(StaleWork)
+        );
         let inner = cache.lock();
         assert!(inner.server.entry_for_work_id("first").unwrap().expires_at > old_expiry);
         assert_eq!(inner.server.work_ids["first"].expires_at, old_expiry);
@@ -1034,8 +1073,14 @@ mod tests {
             insert(&cache, &block, "first", source);
             insert(&cache, &block, "second", source);
             cache.lock().partition(source).entries[0].expires_at = Instant::now();
-            assert_eq!(cache.resolve("first", *block.header), Err(StaleWork));
-            assert_eq!(cache.resolve("second", *block.header), Err(StaleWork));
+            assert_eq!(
+                cache.resolve("first", block.header.as_ref().clone()),
+                Err(StaleWork)
+            );
+            assert_eq!(
+                cache.resolve("second", block.header.as_ref().clone()),
+                Err(StaleWork)
+            );
             let mut inner = cache.lock();
             let partition = inner.partition(source);
             assert!(partition.entries.is_empty());
@@ -1059,8 +1104,13 @@ mod tests {
                 inner.server.work_ids["fresh"].expires_at,
             )
         };
-        assert_eq!(cache.resolve("old", *block.header), Err(StaleWork));
-        assert!(cache.resolve("fresh", *block.header).is_ok());
+        assert_eq!(
+            cache.resolve("old", block.header.as_ref().clone()),
+            Err(StaleWork)
+        );
+        assert!(cache
+            .resolve("fresh", block.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries[0].expires_at, candidate_expiry);
         assert_eq!(inner.server.work_ids["fresh"].expires_at, fresh_expiry);
@@ -1084,8 +1134,13 @@ mod tests {
             inner.server.work_ids.get_mut("work").unwrap().expires_at = before;
         }
         insert(&cache, &second, "work", ServerTemplate);
-        assert!(cache.resolve("work", *second.header).is_ok());
-        assert_eq!(cache.resolve("work", *first.header), Err(CandidateMismatch));
+        assert!(cache
+            .resolve("work", second.header.as_ref().clone())
+            .is_ok());
+        assert_eq!(
+            cache.resolve("work", first.header.as_ref().clone()),
+            Err(CandidateMismatch)
+        );
         assert_accounting(&cache.lock().server);
     }
 
@@ -1109,8 +1164,13 @@ mod tests {
             let mut oversized = distinct_block(1);
             Arc::make_mut(&mut oversized).transactions.reserve(budget);
             insert(&cache, &oversized, "huge", source);
-            assert!(cache.resolve(work_id, *block.header).is_ok());
-            assert_eq!(cache.resolve("huge", *oversized.header), Err(StaleWork));
+            assert!(cache
+                .resolve(work_id, block.header.as_ref().clone())
+                .is_ok());
+            assert_eq!(
+                cache.resolve("huge", oversized.header.as_ref().clone()),
+                Err(StaleWork)
+            );
         }
         let inner = cache.lock();
         assert_eq!(inner.server.bytes, budget);
@@ -1136,9 +1196,16 @@ mod tests {
                 ServerTemplate,
             );
         }
-        assert_eq!(cache.resolve("work-1", *first.header), Err(StaleWork));
-        assert!(cache.resolve("work-2", *distinct_block(2).header).is_ok());
-        assert!(cache.resolve("work-3", *distinct_block(3).header).is_ok());
+        assert_eq!(
+            cache.resolve("work-1", first.header.as_ref().clone()),
+            Err(StaleWork)
+        );
+        assert!(cache
+            .resolve("work-2", distinct_block(2).header.as_ref().clone())
+            .is_ok());
+        assert!(cache
+            .resolve("work-3", distinct_block(3).header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries.len(), 2);
         assert_accounting(&inner.server);
@@ -1156,9 +1223,16 @@ mod tests {
         for index in 1..=3 {
             insert(&cache, &block, &format!("work-{index}"), ServerTemplate);
         }
-        assert_eq!(cache.resolve("work-1", *block.header), Err(StaleWork));
-        assert!(cache.resolve("work-2", *block.header).is_ok());
-        assert!(cache.resolve("work-3", *block.header).is_ok());
+        assert_eq!(
+            cache.resolve("work-1", block.header.as_ref().clone()),
+            Err(StaleWork)
+        );
+        assert!(cache
+            .resolve("work-2", block.header.as_ref().clone())
+            .is_ok());
+        assert!(cache
+            .resolve("work-3", block.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries.len(), 1);
         assert_eq!(inner.server.bytes, budget);
@@ -1209,8 +1283,10 @@ mod tests {
         let shared = "shared";
         insert(&cache, &proposal, shared, ClientProposal);
         insert(&cache, &compact, shared, ServerTemplate);
-        assert!(cache.resolve("a", *compact.header).is_ok());
-        assert!(cache.resolve(shared, *proposal.header).is_ok());
+        assert!(cache.resolve("a", compact.header.as_ref().clone()).is_ok());
+        assert!(cache
+            .resolve(shared, proposal.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert!(!inner.server.work_ids.contains_key(shared));
         assert_accounting(&inner.server);
@@ -1236,7 +1312,9 @@ mod tests {
         }
         let large_alias = "x".repeat(work_id_alias_size("a") + 1);
         insert(&cache, &second, &large_alias, ServerTemplate);
-        assert!(cache.resolve(&large_alias, *second.header).is_ok());
+        assert!(cache
+            .resolve(&large_alias, second.header.as_ref().clone())
+            .is_ok());
         let inner = cache.lock();
         assert_eq!(inner.server.entries.len(), 1);
         assert_accounting(&inner.server);
@@ -1248,7 +1326,9 @@ mod tests {
         let cloned = cache.clone();
         let block = test_block();
         insert(&cache, &block, "secret-work-id", ServerTemplate);
-        assert!(cloned.resolve("secret-work-id", *block.header).is_ok());
+        assert!(cloned
+            .resolve("secret-work-id", block.header.as_ref().clone())
+            .is_ok());
         let debug = format!("{cache:?}");
         assert!(debug.contains("server_entries: 1"));
         assert!(!debug.contains("secret-work-id"));

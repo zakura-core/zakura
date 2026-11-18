@@ -1665,7 +1665,7 @@ fn a_prepares_work_is_summed_from_its_targets() {
         Some(Frontier::new(block::Height(2), headers[0].hash()))
     );
 
-    let mut workless = *fixture.extend(chain[0], 1, 2)[0];
+    let mut workless = fixture.extend(chain[0], 1, 2)[0].as_ref().clone();
     workless.difficulty_threshold = zakura_chain::work::difficulty::INVALID_COMPACT_DIFFICULTY;
     let RequestIdentity::PrepareHeaderTarget { work, .. } = prepare(&[Arc::new(workless)], 3)
     else {

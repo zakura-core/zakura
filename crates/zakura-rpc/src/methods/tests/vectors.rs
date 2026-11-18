@@ -6141,7 +6141,7 @@ async fn prepared_server_template_registers_its_rpc_work_id() {
         .send_modify(|state| state.set_parent(parent));
     let cache = gbt.prepared_candidates();
     assert_eq!(
-        cache.resolve(template.work_id(), *candidate.header),
+        cache.resolve(template.work_id(), candidate.header.as_ref().clone()),
         Err(ResolvePreparedCandidateError::StaleWork)
     );
 
@@ -6160,7 +6160,7 @@ async fn prepared_server_template_registers_its_rpc_work_id() {
             })
             .await;
         assert_eq!(
-            cache.resolve(template.work_id(), *candidate.header),
+            cache.resolve(template.work_id(), candidate.header.as_ref().clone()),
             Err(ResolvePreparedCandidateError::StaleWork)
         );
         request.respond(candidate.hash());
@@ -6168,7 +6168,7 @@ async fn prepared_server_template_registers_its_rpc_work_id() {
     tokio::join!(preparation, respond);
     assert_eq!(
         cache
-            .resolve(template.work_id(), *candidate.header)
+            .resolve(template.work_id(), candidate.header.as_ref().clone())
             .expect("successful preparation registers the RPC alias")
             .as_ref(),
         &candidate

@@ -1561,3 +1561,98 @@ async fn a_round_dials_every_ip_of_a_slash_64() {
         ]
     );
 }
+
+/// disco-17 `teardown-releases`: after a dial attempt ends by peer
+/// disconnect, worker panic or local cancellation, the dialer holds no
+/// attempt and no per-IP reservation.
+///
+/// Each attempt reserves one count on `DIAL_IP`. The baseline is no attempt
+/// in flight and no reservation; `assert_invariants` checks that the per-IP
+/// map holds exactly the in-flight attempts' reservations, so it is empty.
+#[tokio::test]
+async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9221)
+        .spawn()
+        .await
+        .unwrap();
+    let mut io = CandidateDialerIO {
+        endpoint: node.endpoint(),
+        discovery: node.discovery(),
+        limits: node.limits().clone(),
+        sought_services: Vec::new(),
+        trace: node.endpoint().trace(),
+        workers: FuturesUnordered::new(),
+    };
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let reserved = |state: &CandidateDialerState| {
+        state.assert_invariants();
+        (
+            state.in_flight_node_ids().len(),
+            state.in_flight_dials_to(DIAL_IP),
+        )
+    };
+    assert_eq!(reserved(&state), (0, 0));
+
+    // Peer disconnect: the attempt's peer registers on its own dial, then
+    // leaves before the registration turns healthy.
+    let attempt = state.record_attempt(node_id(21), vec![DIAL_IP]).unwrap();
+    let (registered_tx, registered_rx) = watch::channel(vec![peer_id(21)]);
+    let (_admitted_tx, admitted_addr_rx) = oneshot::channel();
+    let (registration_tx, registration_rx) = oneshot::channel();
+    registration_tx.send(DialRegistration::Registered).unwrap();
+    let dial = AbortOnDropHandle::new(zakura_rt::task::spawn(std::future::pending()));
+    io.workers.push(DiscoveryDialWorker::spawn(
+        attempt,
+        DialWatch {
+            attempt,
+            peer_id: peer_id(21),
+            registered: registered_rx,
+            dial,
+            admitted_addr_rx,
+            admitted_addr: None,
+            registration_rx,
+            own_registration: None,
+            registration: PeerRegistration::Absent,
+            trace: ZakuraTrace::default(),
+        }
+        .run(),
+    ));
+    assert_eq!(reserved(&state), (1, 1));
+    // The worker must see the registration before it ends.
+    zakura_rt::time::sleep(Duration::from_millis(50)).await;
+    registered_tx.send_replace(Vec::new());
+    let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), io.workers.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+    io.settle(&mut state, completed, outcome).await;
+    assert_eq!(reserved(&state), (0, 0), "a disconnected peer's attempt");
+
+    // Worker panic: the join owner settles the attempt as a failure.
+    let attempt = state.record_attempt(node_id(22), vec![DIAL_IP]).unwrap();
+    io.workers.push(DiscoveryDialWorker::spawn(attempt, async {
+        panic!("test dial worker panic")
+    }));
+    assert_eq!(reserved(&state), (1, 1));
+    let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), io.workers.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.phase, DialPhase::WorkerPanicked);
+    io.settle(&mut state, completed, outcome).await;
+    assert_eq!(reserved(&state), (0, 0), "a panicked worker's attempt");
+
+    // Local cancellation: dialer shutdown aborts and joins the worker.
+    let attempt = state.record_attempt(node_id(23), vec![DIAL_IP]).unwrap();
+    io.workers
+        .push(DiscoveryDialWorker::spawn(attempt, std::future::pending()));
+    assert_eq!(reserved(&state), (1, 1));
+    zakura_rt::time::timeout(Duration::from_secs(5), io.shutdown(&mut state))
+        .await
+        .unwrap();
+    assert_eq!(reserved(&state), (0, 0), "a cancelled worker's attempt");
+
+    drop(io);
+    node.shutdown().await;
+}

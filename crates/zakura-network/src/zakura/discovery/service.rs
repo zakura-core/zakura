@@ -2446,6 +2446,242 @@ mod tests {
         Ok(())
     }
 
+    /// How a drained discovery session ends.
+    #[derive(Clone, Copy, Debug)]
+    enum SessionExit {
+        /// The remote closes the connection, so the transport cancels its token.
+        PeerDisconnect,
+        /// The session's writer panics in its connection-owner check.
+        WriterPanic,
+        /// The local node parks the session, and the connection ends later.
+        LocalCancel,
+    }
+
+    /// Every node-wide discovery resource the drain test reads.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DiscoveryLevels {
+        session_records: usize,
+        admitted_inbound: usize,
+        query_entries: usize,
+        /// Node output bytes, node execution slots, and running and waiting
+        /// jobs, for `GetPeers` then `GetServices`.
+        serve: [(u64, usize, (usize, usize)); 2],
+        free_verify_slots: usize,
+    }
+
+    fn discovery_levels(service: &DiscoveryService) -> DiscoveryLevels {
+        DiscoveryLevels {
+            session_records: service
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned")
+                .records
+                .len(),
+            admitted_inbound: service.handle.peer_snapshot().inbound_peers,
+            query_entries: service.query_pool.held(),
+            serve: service.serving.rows().map(|row| {
+                (
+                    row.node_output_held(),
+                    row.node_execution_held(),
+                    row.active_and_waiting(),
+                )
+            }),
+            free_verify_slots: service.handle.free_verification_slots(),
+        }
+    }
+
+    /// Waits up to five seconds for `service` to reach `expected`, and
+    /// returns the levels it reached.
+    async fn settled_levels(
+        service: &DiscoveryService,
+        expected: DiscoveryLevels,
+    ) -> DiscoveryLevels {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while discovery_levels(service) != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        discovery_levels(service)
+    }
+
+    /// An owner check that panics for one peer and owns no other connection.
+    #[derive(Debug)]
+    struct PanickingOwner {
+        peer: ZakuraPeerId,
+    }
+
+    impl Service for PanickingOwner {
+        fn name(&self) -> &'static str {
+            "test-panicking-owner"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            &[]
+        }
+
+        fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, _: ZakuraConnId) -> bool {
+            assert_ne!(peer, &self.peer, "the owner check panics for this peer");
+            false
+        }
+
+        fn add_peer(&self, _peer: Peer) {}
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
+
+    /// disco-17 `teardown-releases`: after a session ends by peer disconnect,
+    /// writer panic or local cancellation, and its connection ends, every
+    /// node-wide discovery resource returns to its pre-session baseline.
+    ///
+    /// Each session holds one session record, one admitted inbound slot, two
+    /// query-pool entries for its unanswered `GetPeers` and `GetServices`, and
+    /// the output bytes of one unwritten `Services` answer. Its peer's `Hello`
+    /// waits for a verification slot. The baseline is zero of each and every
+    /// verification slot free. A local cancellation drains everything but the
+    /// session record, which keeps the connection's failure count until the
+    /// connection ends.
+    #[tokio::test(start_paused = true)]
+    async fn every_discovery_resource_returns_to_baseline_after_each_exit(
+    ) -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[80u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let panicking_secret = NodeSecretKey::from_bytes(&[82u8; 32]);
+        service.set_connection_owners(vec![Arc::new(PanickingOwner {
+            peer: ZakuraPeerId::new(panicking_secret.public().as_bytes().to_vec())?,
+        })]);
+        let baseline = discovery_levels(&service);
+        assert_eq!(baseline.session_records, 0);
+        assert_eq!(baseline.query_entries, 0);
+        assert!(baseline.free_verify_slots > 0);
+
+        for (seed, exit) in [
+            (81u8, SessionExit::PeerDisconnect),
+            (82, SessionExit::WriterPanic),
+            (83, SessionExit::LocalCancel),
+        ] {
+            let peer_secret = NodeSecretKey::from_bytes(&[seed; 32]);
+            let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+            connected_tx.send_replace(vec![peer_id.clone()]);
+
+            // The local Hello, GetPeers and GetServices fill the stream, so
+            // the peer's queries stay unanswered and the local answer unwritten.
+            let connection_cancel = CancellationToken::new();
+            let (peer_send, service_recv) = framed_channel(16);
+            let (service_send, peer_recv) = framed_channel(3);
+            let local_output = service_send.clone();
+            let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
+            let peer = Peer::new(
+                peer_id.clone(),
+                None,
+                ZAKURA_CAP_DISCOVERY,
+                streams,
+                connection_cancel.clone(),
+            );
+            let service_cancel = peer.service_cancel_token();
+            let close_cause = peer.close_cause_reader();
+            service.add_peer(peer);
+            wait_for_discovery_inbound_peers(&handle, 1).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while local_output.capacity() > 0 || service.query_pool.held() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the local exchange fills the stream with two live queries");
+
+            let held = handle.hold_verify_slots();
+            peer_send
+                .send(discovery_frame(DiscoveryMessage::GetServices(
+                    GetServices {
+                        wanted_services: Vec::new(),
+                    },
+                ))?)
+                .await?;
+            peer_send
+                .send(discovery_frame(DiscoveryMessage::Hello {
+                    record: signed_discovery_record(&peer_secret, &handshake)?,
+                })?)
+                .await?;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while service.serving.rows()[1].node_output_held() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the unwritten Services answer holds node output");
+            let live = discovery_levels(&service);
+            assert_eq!(
+                (
+                    live.session_records,
+                    live.admitted_inbound,
+                    live.query_entries
+                ),
+                (1, 1, 2),
+                "{exit:?}: the live session holds its record, slot and queries"
+            );
+
+            match exit {
+                SessionExit::PeerDisconnect => {
+                    drop((peer_send, peer_recv));
+                    connection_cancel.cancel();
+                }
+                SessionExit::WriterPanic => {
+                    tokio::time::timeout(
+                        DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + Duration::from_secs(1),
+                        connection_cancel.cancelled(),
+                    )
+                    .await
+                    .expect("the writer panics at its owner check after the initial timeout");
+                    assert_eq!(close_cause.get(), Some("service_panic"));
+                    drop((peer_send, peer_recv));
+                }
+                SessionExit::LocalCancel => {
+                    service_cancel.cancel();
+                    let parked = DiscoveryLevels {
+                        session_records: 1,
+                        free_verify_slots: 0,
+                        ..baseline
+                    };
+                    assert_eq!(
+                        settled_levels(&service, parked).await,
+                        parked,
+                        "a parked session releases all but its record"
+                    );
+                    assert!(!connection_cancel.is_cancelled());
+                    drop((peer_send, peer_recv));
+                    connection_cancel.cancel();
+                }
+            }
+            // The registry removes the peer from each service once its
+            // connection ends.
+            service.remove_peer(&peer_id, 0);
+            drop(held);
+            connected_tx.send_replace(Vec::new());
+            assert_eq!(
+                settled_levels(&service, baseline).await,
+                baseline,
+                "{exit:?}: every discovery resource returns to its baseline"
+            );
+        }
+        Ok(())
+    }
+
     /// The `DiscoverySink` session guard must drop messages from a superseded stream generation.
     ///
     /// A replacement discovery stream re-admits the peer under a higher `session_id`.

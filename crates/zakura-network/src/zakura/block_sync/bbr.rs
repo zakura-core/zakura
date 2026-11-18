@@ -1801,7 +1801,7 @@ mod cwnd_cap_tests {
             fresh.cwnd_byte_headroom_at(0, now),
             Some(DEFAULT_BS_BBR_MIN_CWND_BYTES)
         );
-        assert!(DEFAULT_BS_BBR_MIN_CWND_BYTES >= block::MAX_BLOCK_BYTES);
+        const { assert!(DEFAULT_BS_BBR_MIN_CWND_BYTES >= block::MAX_BLOCK_BYTES) };
     }
 
     /// At 1 Gbps and 250 ms the 3× gain asks for about 94 MB; the default cap

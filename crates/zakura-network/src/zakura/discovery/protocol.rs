@@ -6456,6 +6456,171 @@ mod tests {
         assert_eq!(book.discovered_len(), 2);
     }
 
+    /// One fixture entry: its record's key seed and expiry, and its dial
+    /// metadata.
+    struct EvictionFixture {
+        seed: u8,
+        expires_at: u64,
+        last_seen: u64,
+        last_success: Option<u64>,
+        failure_count: u32,
+        confirmed: bool,
+        is_static: bool,
+    }
+
+    impl EvictionFixture {
+        fn new(seed: u8, last_seen: u64) -> Self {
+            Self {
+                seed,
+                expires_at: NOW + 3_600,
+                last_seen,
+                last_success: None,
+                failure_count: 0,
+                confirmed: false,
+                is_static: false,
+            }
+        }
+
+        fn record(&self, sequence: u64, expires_at: u64) -> ZakuraNodeRecord {
+            let secret = NodeSecretKey::from_bytes(&[self.seed; 32]);
+            let mut body = body(&secret);
+            body.sequence = sequence;
+            body.direct_addrs = vec![test_addr(self.seed)];
+            body.services = vec![service(self.seed.into())];
+            body.expires_at_unix_secs = expires_at;
+            ZakuraNodeRecord::sign(body, &secret).expect("test record signs")
+        }
+
+        fn node_id(&self) -> NodeId {
+            NodeSecretKey::from_bytes(&[self.seed; 32]).public()
+        }
+
+        fn persisted(&self) -> ZakuraDiscoveryPersistedEntry {
+            ZakuraDiscoveryPersistedEntry {
+                record: self.record(1, self.expires_at),
+                source: None,
+                is_static: self.is_static,
+                last_seen: self.last_seen,
+                last_dial_attempt: None,
+                last_success: self.last_success,
+                confirmed_addrs: if self.confirmed {
+                    vec![test_addr(self.seed)]
+                } else {
+                    Vec::new()
+                },
+                dialed_addrs: Vec::new(),
+                failure_count: self.failure_count,
+            }
+        }
+    }
+
+    /// Returns `a` and `b` lowest node ID first, the tie order of every
+    /// eviction rule.
+    fn by_node_id(a: NodeId, b: NodeId) -> [NodeId; 2] {
+        if node_id_sort_key(&a) < node_id_sort_key(&b) {
+            [a, b]
+        } else {
+            [b, a]
+        }
+    }
+
+    /// Pins the eviction order on a literal book: expired records first,
+    /// earliest expiry first; then never-successful records with at least
+    /// `HIGH_DIAL_FAILURE_COUNT` failures, most failures and then least
+    /// recently seen first; then the rest, unconfirmed before confirmed,
+    /// least recently successful and then least recently seen first. Ties go
+    /// to the lowest node ID, and static entries stay. Dial outcomes and a
+    /// newer record move entries between those groups.
+    #[test]
+    fn discovery_book_eviction_order_matches_fixture() {
+        let expiring = |seed, expires_at| EvictionFixture {
+            expires_at,
+            ..EvictionFixture::new(seed, NOW - 1)
+        };
+        let failing = |seed, failure_count, last_seen| EvictionFixture {
+            failure_count,
+            ..EvictionFixture::new(seed, last_seen)
+        };
+        let fixture = [
+            expiring(1, NOW + 20),
+            expiring(2, NOW + 10),
+            expiring(3, NOW + 20),
+            failing(4, 7, NOW),
+            failing(5, 5, NOW - 50),
+            // A success below takes it out of the failing group.
+            failing(6, 5, NOW - 10),
+            EvictionFixture {
+                last_success: Some(NOW - 5),
+                ..failing(7, 5, NOW - 60)
+            },
+            // Three failures below put it in the failing group.
+            EvictionFixture::new(8, NOW - 30),
+            EvictionFixture {
+                confirmed: true,
+                ..EvictionFixture::new(9, NOW - 90)
+            },
+            EvictionFixture {
+                is_static: true,
+                ..EvictionFixture::new(10, NOW - 100)
+            },
+            // A newer record below takes it out of the expired group.
+            expiring(11, NOW + 20),
+            EvictionFixture::new(12, NOW - 40),
+            EvictionFixture::new(13, NOW - 40),
+            failing(14, 5, NOW - 50),
+        ];
+        let id = |seed: u8| fixture[usize::from(seed) - 1].node_id();
+        let mut book = ZakuraDiscoveryBook::default();
+        let outcome = book.import_persisted_entries(
+            fixture.iter().map(|entry| entry.persisted()),
+            NOW,
+            &context(),
+        );
+        assert_eq!(outcome.added, fixture.len());
+        book.mark_dial_success(&id(6), Some(test_addr(6)), NOW + 1);
+        for _ in 0..HIGH_DIAL_FAILURE_COUNT {
+            book.mark_dial_failure(&id(8), NOW + 1);
+        }
+        assert_eq!(
+            book.import_record(
+                fixture[10].record(2, NOW + 3_600),
+                None,
+                NOW + 2,
+                &context()
+            )
+            .expect("the newer record imports"),
+            ImportOutcome::Updated
+        );
+
+        book.limits.max_records = 0;
+        let mut changes = Vec::new();
+        book.evict_to_limits(NOW + 100, &mut changes);
+        let evicted: Vec<NodeId> = changes
+            .iter()
+            .map(|change| match change {
+                BookChange::Evicted {
+                    node_id,
+                    cause: EvictionCause::BookLimit,
+                    ..
+                } => *node_id,
+                other => panic!("expected only book-limit evictions, got {other:?}"),
+            })
+            .collect();
+
+        let mut expected = vec![id(2)];
+        expected.extend(by_node_id(id(1), id(3)));
+        expected.push(id(4));
+        expected.extend(by_node_id(id(5), id(14)));
+        expected.push(id(8));
+        expected.extend(by_node_id(id(12), id(13)));
+        expected.extend([id(11), id(7), id(9), id(6)]);
+        assert_eq!(evicted, expected);
+        assert_eq!(book.discovered_len(), 0);
+        assert!(book
+            .get(&id(10))
+            .is_some_and(ZakuraDiscoveryEntry::is_static));
+    }
+
     /// A full book evicts unconfirmed relayed records before confirmed ones,
     /// so relays cannot empty the sample snapshot's windows.
     #[test]

@@ -756,16 +756,15 @@ where
 const MAX_SAMPLED_BLOCK_BYTES: u64 = 256 * 1024;
 
 /// Returns what `response`'s answer time measures, if it says how quickly the peer answers a
-/// block request: a reply with at least one transaction, or with blocks that are all small.
+/// block request: a reply with blocks that are all small.
 ///
-/// Pings are measured by the heartbeat, and other replies (block hashes, headers, addresses,
-/// "not found" alone) take the peer a different amount of work, so they don't count.
+/// Pings are measured by the heartbeat. Transaction replies are not counted: a peer chooses how
+/// many transactions it announces, so it could add as many samples as it liked, and on a live
+/// node they matched the peer's pings and did not change any block prediction. Other replies
+/// (block hashes, headers, addresses, "not found" alone) take the peer a different amount of
+/// work, so they don't count either.
 fn delivery_sample_kind(response: &Response) -> Option<DeliverySampleKind> {
     match response {
-        Response::Transactions(transactions) => transactions
-            .iter()
-            .any(|transaction| transaction.available().is_some())
-            .then_some(DeliverySampleKind::Transaction),
         Response::Blocks(blocks) => {
             let mut available = blocks
                 .iter()

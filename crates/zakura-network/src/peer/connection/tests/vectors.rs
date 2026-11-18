@@ -3242,10 +3242,10 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     .expect("the revoked advert is answered before the request timeout");
 }
 
-/// Answers to transaction and small block requests are timed from when the request was written,
-/// and recorded as the peer's delivery samples. Other answers are not.
+/// Answers to small block requests are timed from when the request was written, and recorded as
+/// the peer's delivery samples. Block-hash and transaction answers are not.
 #[tokio::test(start_paused = true)]
-async fn transaction_and_small_block_answers_are_timed_as_delivery_samples() {
+async fn small_block_answers_are_timed_as_delivery_samples() {
     let _init_guard = zakura_test::init();
 
     let registry = crate::peer_registry::PeerRegistry::default();
@@ -3292,7 +3292,7 @@ async fn transaction_and_small_block_answers_are_timed_as_delivery_samples() {
     settle().await;
     assert_eq!(delivery_samples.delivery_score(), None);
 
-    // A transaction answer 30 ms after the request is.
+    // A transaction answer is not either: the peer chooses how many transactions it announces.
     let (request, response) = client_request(Request::TransactionsById([txid].into()));
     client_tx.send(request).await.expect("connection is open");
     assert!(matches!(outbound.next().await, Some(Message::GetData(_))));
@@ -3306,12 +3306,9 @@ async fn transaction_and_small_block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent the transaction");
     settle().await;
-    assert_eq!(
-        delivery_samples.delivery_score(),
-        Some(Duration::from_millis(30))
-    );
+    assert_eq!(delivery_samples.delivery_score(), None);
 
-    // So is a small block answer, 10 ms after the request.
+    // A small block answer 10 ms after the request is.
     let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
     client_tx.send(request).await.expect("connection is open");
     assert!(matches!(outbound.next().await, Some(Message::GetData(_))));
@@ -3325,10 +3322,9 @@ async fn transaction_and_small_block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent the block");
     settle().await;
-    let score = delivery_samples.delivery_score().expect("measured answers");
-    assert!(
-        score > Duration::from_millis(15) && score < Duration::from_millis(25),
-        "the average of the two answers: {score:?}"
+    assert_eq!(
+        delivery_samples.delivery_score(),
+        Some(Duration::from_millis(10))
     );
 
     connection_task.abort();

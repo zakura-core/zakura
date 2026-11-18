@@ -70,8 +70,8 @@ pub(super) fn second_request_reason(
 
     let candidate = best_candidate_score?;
     // An overdue first request is probably fetching a large block. A legacy `inv` carries no
-    // block size, and the first peer's score comes from pings, transaction replies and small
-    // blocks, so it covers the peer's distance but not the time to transfer a large block.
+    // block size, and the first peer's score comes from pings and small blocks, so it covers
+    // the peer's distance but not the time to transfer a large block.
     // Counting down to zero would then refuse every candidate until the stall point.
     //
     // This came from a load test on the asia-scored mainnet node (Singapore), with blocks of

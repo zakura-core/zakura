@@ -4,7 +4,7 @@
 //! Each `delivery_sample` row says what was measured (`kind`), the measured time (`sample_ms`),
 //! the score before and after (`score_before_ms`, `score_ms`), and `weight`, the decayed number of
 //! samples the new score rests on. Together they show why a peer's score is what it is, and how
-//! much of it comes from pings and transaction replies rather than blocks.
+//! much of it comes from pings rather than blocks.
 //!
 //! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
 //! a second gossip block request (`request`). It does not change the score: block routing stops
@@ -25,8 +25,6 @@ const TABLE: JsonlTraceTable = JsonlTraceTable::new("delivery_score", "delivery_
 pub(crate) enum DeliverySampleKind {
     /// A heartbeat ping's round trip.
     Ping,
-    /// A reply to a transaction request that held at least one transaction.
-    Transaction,
     /// A reply to a block request whose blocks were all small.
     Block,
 }
@@ -35,7 +33,6 @@ impl DeliverySampleKind {
     fn label(self) -> &'static str {
         match self {
             Self::Ping => "ping",
-            Self::Transaction => "transaction",
             Self::Block => "block",
         }
     }

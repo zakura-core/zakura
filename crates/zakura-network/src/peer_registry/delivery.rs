@@ -1,7 +1,7 @@
 //! An estimate of how long one legacy peer takes to answer a block request.
 //!
-//! The estimate is a time-weighted average of the peer's measured answer times: heartbeat pings,
-//! transaction replies and small block replies. Older samples count for less, so a peer that slows
+//! The estimate is a time-weighted average of the peer's measured answer times: heartbeat pings
+//! and small block replies. Older samples count for less, so a peer that slows
 //! down loses its good estimate within minutes. A peer that announces a block and then does not
 //! deliver it is not penalised here: block routing stops preferring it until it delivers one.
 

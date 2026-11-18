@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 /// When a block is announced by more than one idle peer, the node draws two of them at random
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled,
 /// it asks the one expected to answer sooner, from how long each peer has recently taken to
-/// answer pings, transaction requests and small block requests. A peer that fails to deliver a
-/// block it announced is expected to be slower.
+/// answer pings and small block requests. A peer that announced a block and then did not deliver
+/// it is passed over until it delivers one, for at most 10 minutes.
 ///
 /// With `second_request` also on, a block that the first request has not delivered yet is also
 /// requested from one other idle peer that announced it, but only when that peer is expected to

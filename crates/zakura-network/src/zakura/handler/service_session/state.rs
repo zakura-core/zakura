@@ -95,6 +95,29 @@ impl PendingState {
         }
     }
 
+    /// Check the offers' invariants: each incomplete offer holds at least one
+    /// member, no member twice, and defers its service for a positive delay
+    /// if it expires.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(in crate::zakura::handler) fn assert_invariants(&self) {
+        for (kind, session) in &self.sessions {
+            assert!(!session.members.is_empty(), "offer {kind} has no member");
+            for (index, member) in session.members.iter().enumerate() {
+                assert!(
+                    session.members[..index]
+                        .iter()
+                        .all(|earlier| earlier.kind != member.kind),
+                    "offer {kind} holds member {} twice",
+                    member.kind
+                );
+            }
+            assert!(
+                session.retry_delay > Duration::ZERO,
+                "offer {kind} would not defer its service"
+            );
+        }
+    }
+
     /// The earliest deadline of an incomplete offer.
     pub(in crate::zakura::handler) fn deadline(&self) -> Option<Instant> {
         self.sessions.values().map(|session| session.deadline).min()
@@ -306,6 +329,21 @@ impl ServiceSessionState {
         }
     }
 
+    /// Check the service's invariants: a transport backoff counts its
+    /// attempt, and a local open in flight never runs beside an installed
+    /// local generation.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(in crate::zakura::handler) fn assert_invariants(&self) {
+        if self.reopen_state == SessionReopenState::Waiting(SessionWaitReason::Transport) {
+            assert!(self.reopen_attempts > 0, "a backoff counted no attempt");
+        }
+        assert!(
+            !(self.open_in_flight && self.local_session_id.is_some()),
+            "a local open runs beside local generation {:?}",
+            self.local_session_id
+        );
+    }
+
     /// Name a new local open. Returns its attempt, counted from 1. The open
     /// stays in flight until [`Self::opened`] or [`Self::open_failed`].
     pub(in crate::zakura::handler) fn begin_attempt(&mut self) -> u64 {
@@ -369,7 +407,7 @@ impl ServiceSessionState {
 
     /// The generation this state installed for its local opens, or for its
     /// peer's.
-    #[cfg(any(test, zakura_sim))]
+    #[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
     pub(in crate::zakura::handler) fn installed(&self, opened_locally: bool) -> Option<u64> {
         if opened_locally {
             self.local_session_id

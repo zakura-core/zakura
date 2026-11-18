@@ -83,7 +83,7 @@ pub use service::{
 pub use service::{CloseCauseReader, SessionOrigin};
 pub use session::{OrderedSendError, PeerStreamSession};
 #[cfg(any(test, zakura_sim))]
-pub use sim_reader::{read_framed_channel, StreamReader};
+pub use sim_reader::{read_framed_channel, StreamAdmission, StreamReader};
 
 /// Reports the event that `$event` builds to `$observer`, an
 /// `Option<Arc<dyn TransportObserver>>`.

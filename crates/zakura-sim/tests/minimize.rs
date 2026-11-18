@@ -345,6 +345,16 @@ fn a_listed_co_violation_is_expected() {
     assert_eq!(violated, [A, B]);
 }
 
+/// The input confirms against [`B`] too when [`A`], which the classifier
+/// selects first, is the expected co-violation: the fuzz target's filter
+/// finds [`B`] later in the run's report.
+#[test]
+fn a_listed_co_violation_may_come_first() {
+    let (both, _dir) = run_allowing(&[4, 7, 1], B, &[A.to_owned()]);
+    assert_eq!(both.selected.as_deref(), Some(A), "{both:?}");
+    assert_eq!(both.status, ConfirmStatus::Confirmed, "{both:?}");
+}
+
 /// `sim/no-task-panic` has no trigger-history check, so no input can show
 /// its causal witness, and one that violates nothing is no failure.
 #[test]

@@ -3,7 +3,7 @@
 # first two bytes pick the saved `stalled-blocks` scenario, and
 # `sync-wire-stalled-blocks.end.json` is its pinned end record.
 harness = "sync/wire"
-generator = 4
+generator = 5
 sha256 = "c2ce72fcaccf106e961feedac534ff8e74f196b818a0a02d608b5b781c3750d5"
 scenario_sha256 = "9b428871e86541385998e2c6eb1f7dc79cbd7398c859008c7a9bec7794cae6dc"
 source = "crates/zakura-sim/tests/sync_wire.rs"

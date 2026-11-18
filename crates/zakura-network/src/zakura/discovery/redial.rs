@@ -19,12 +19,12 @@ use crate::zakura::{
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-mod model;
+mod replay;
 mod state;
 #[cfg(all(test, not(zakura_sim)))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use model::{replay_redial_bytes, RedialReplaySummary};
+pub use replay::{replay_redial_bytes, RedialReplaySummary};
 
 use state::{RedialNext, RedialStart, RedialState};
 

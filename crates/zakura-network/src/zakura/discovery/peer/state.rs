@@ -316,6 +316,24 @@ impl PeerState {
         }
     }
 
+    /// Checks the state's invariant: only a session past its initial check
+    /// records that its initial wait timed out.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        let past_initial = !matches!(
+            self.phase,
+            Phase::Start
+                | Phase::Exchanging
+                | Phase::WaitingInitial
+                | Phase::CheckingInitial { .. }
+        );
+        assert!(
+            past_initial || !self.timed_out,
+            "discovery/session-policy: {:?} records a timed-out initial wait",
+            self.phase
+        );
+    }
+
     /// Ends a session whose initial exchange broke. Charging the session
     /// stops endless reopens that break the stream first.
     fn initial_ended(&mut self) -> PeerStep {

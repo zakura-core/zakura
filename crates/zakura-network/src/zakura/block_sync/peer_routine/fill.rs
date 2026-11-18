@@ -14,7 +14,7 @@ use zakura_rt::time::Instant;
 use super::{PeerIO, PeerRoutine};
 use crate::zakura::{
     block_sync::{
-        admission::{floor_rescue_high, request_priority, AdmissionSnapshot, RequestPriority},
+        admission::{floor_rescue_high, AdmissionSnapshot},
         events::RoutineToReactor,
         regulated::live_requester::FencedRequest,
         request::{BlockRangeRequest, ExpectedBlock},
@@ -369,13 +369,8 @@ impl PeerRoutine {
         self.take_selected(limits, request_id, snapshot, floor_start)
     }
 
-    /// Take the run that `snapshot` admits: from the probed `floor_start` if
-    /// any, else from the first pending height above the floor.
-    ///
-    /// The probe and the take run at separate synchronization points, so
-    /// another routine can take `floor_start` first. The floor take then
-    /// starts above the floor, and it needs an above-floor slot like the
-    /// above-floor lane. A refusal drops the take, which returns its run.
+    /// Take the run that `snapshot` admits through [`plan::take_lanes`]. A
+    /// refusal drops the take, which returns its run.
     fn take_selected(
         &self,
         limits: &FillLimits,
@@ -383,35 +378,32 @@ impl PeerRoutine {
         snapshot: AdmissionSnapshot,
         floor_start: Option<block::Height>,
     ) -> Result<TakenWork, FillStop> {
-        let download_floor = snapshot.download_floor;
-        if let Some(take) = plan::plan_floor(&self.config, limits, snapshot, floor_start)? {
-            let request = self.io.take_work(take, request_id);
-            if let Some((first, _)) = request.items().first() {
-                if request_priority(download_floor, *first) == RequestPriority::AboveFloor {
-                    limits.above_floor_slot()?;
+        let mut taken = None;
+        plan::take_lanes(
+            &self.config,
+            limits,
+            snapshot,
+            floor_start,
+            |lane, take| {
+                if lane == plan::Lane::AboveFloor {
+                    // A refusal stops the pass before this take, and
+                    // `finish_fill_pass` latches the gauge at cap.
+                    metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
                 }
-                return Ok(TakenWork {
-                    download_floor,
-                    request,
-                });
-            }
-        }
-
-        limits.above_floor_slot()?;
-        let start = self
-            .io
-            .work
-            .first_pending_in_range(limits.servable_low, limits.servable_high);
-        // A refusal stops the pass, and `finish_fill_pass` latches the gauge at cap.
-        let take = plan::plan_above_floor(&self.config, limits, snapshot, start)?;
-        metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
-        let request = self.io.take_work(take, request_id);
-        if request.items().is_empty() {
-            return Err(FillStop::NoWork);
-        }
+                let request = self.io.take_work(take, request_id);
+                let first = request.items().first().map(|(height, _)| *height);
+                taken = Some(request);
+                first
+            },
+            || {
+                self.io
+                    .work
+                    .first_pending_in_range(limits.servable_low, limits.servable_high)
+            },
+        )?;
         Ok(TakenWork {
-            download_floor,
-            request,
+            download_floor: snapshot.download_floor,
+            request: taken.expect("`take_lanes` succeeds only after a take returned work"),
         })
     }
 

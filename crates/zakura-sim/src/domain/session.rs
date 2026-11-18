@@ -135,8 +135,7 @@ fn remote_of(entries: &[Entry], connection: u64) -> Option<&str> {
 /// A service session the node admits on a connection that replaces an
 /// earlier connection to the same peer carries a session ID no earlier
 /// connection's session carried, and a superseded block-sync routine's
-/// generation-gated peer-registry write never lands on its replacement's
-/// entry.
+/// peer-registry write never lands on or changes its replacement's entry.
 pub const REPLACEMENT_PRESERVES_AUTHORIZATION: &str = "session/replacement-preserves-authorization";
 
 /// A block-sync request that waits on its peer closes no shared connection
@@ -194,12 +193,15 @@ fn replacement_preserves_authorization<S: HasView>() -> Property<S> {
                 generation-gated writers, each of which reports its attempts and landings, \
                 lands on an entry another generation owns, so a superseded routine that \
                 writes after its replacement's admission, matching the entry by peer ID \
-                alone, changes nothing the replacement owns",
+                alone, changes nothing the replacement owns; and no registry call that \
+                names a routine generation or an owner changes an entry another generation \
+                owns, as the registry's fingerprints of the entry before and after the call \
+                show, whether or not the call's writer reports itself",
         kind: Kind::Safety,
         assumes: &[],
         // The transport tap's session rows, which only a harness on the
-        // simulated network logs, and the block tap's admission, routine
-        // and stale registry write rows.
+        // simulated network logs, and the block tap's admission, routine,
+        // stale registry write and stale registry change rows.
         needs: &[Source::Datagrams, Source::View],
         status: Status::Active,
         check: check_replacement_preserves_authorization::<S>,
@@ -258,17 +260,22 @@ fn block_fact(obs: &Observation) -> Option<&BlockSyncFact> {
     }
 }
 
-/// Whether `fact` shows a routine's generation-gated registry write meeting
-/// an entry another generation owns: the write's attempt, which each gated
-/// writer reports before its gate, or its landing.
+/// Whether `fact` shows a routine's registry write meeting an entry another
+/// generation owns: a gated write's attempt, which each gated writer reports
+/// before its gate, its landing, or a change the registry's fingerprints of
+/// the entry show.
 fn stale_registry_write(fact: &BlockSyncFact) -> bool {
-    matches!(fact, BlockSyncFact::StaleRegistryWrite { .. })
+    matches!(
+        fact,
+        BlockSyncFact::StaleRegistryWrite { .. } | BlockSyncFact::StaleRegistryChange { .. }
+    )
 }
 
 /// Checks [`REPLACEMENT_PRESERVES_AUTHORIZATION`] at each step with a
 /// session row or a stale registry write. A session row applies on a
 /// connection that replaces an earlier one to the same peer. A stale
-/// registry write's attempt applies, and its landing is a violation. It
+/// registry write's attempt applies, and its landing is a violation, as is
+/// a stale registry change, whichever writer made it. It
 /// folds the log's earlier rows each time, since a run admits only a few
 /// dozen sessions.
 fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
@@ -302,6 +309,23 @@ fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S
                         .to_owned(),
                     format!(
                         "routine generation {generation}'s {writer} landed on peer {peer}'s \
+                         entry, which generation {entry_generation} owns"
+                    ),
+                ));
+            }
+            if let BlockSyncFact::StaleRegistryChange {
+                peer,
+                writer,
+                generation,
+                entry_generation,
+            } = fact
+            {
+                findings.push((
+                    "no peer-registry call from one routine generation changes an entry \
+                     another generation owns"
+                        .to_owned(),
+                    format!(
+                        "routine generation {generation}'s {writer} call changed peer {peer}'s \
                          entry, which generation {entry_generation} owns"
                     ),
                 ));
@@ -348,8 +372,8 @@ fn check_replacement_preserves_authorization<S: HasView>(cx: &mut CheckCtx<'_, S
 /// [`REPLACEMENT_PRESERVES_AUTHORIZATION`]'s trigger history: either half
 /// of its claim met its condition. The node admitted a session on a
 /// connection that replaces an earlier one to the same peer, or a
-/// block-sync routine attempted a generation-gated registry write on an
-/// entry another generation owns. A violation of one half can end a run
+/// block-sync routine's registry write met an entry another generation
+/// owns. A violation of one half can end a run
 /// before the other half's condition arrives, so each suffices.
 fn replaced_or_superseded_wrote(log: &ObservationLog) -> bool {
     let mut sessions = Sessions::default();

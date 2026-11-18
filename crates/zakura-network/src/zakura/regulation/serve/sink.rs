@@ -242,6 +242,28 @@ impl ResponseBound {
         }
     }
 
+    /// Check the bound's invariants: the cap holds the largest ending, and
+    /// what the response queued stays within the cap.
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        assert!(
+            self.cap.bytes >= self.ending_reserve,
+            "the cap cannot hold the largest ending"
+        );
+        assert!(
+            self.progress.bytes <= self.cap.bytes,
+            "{:?} exceeds the cap's bytes {:?}",
+            self.progress,
+            self.cap
+        );
+        assert!(
+            self.progress.frames <= self.cap.frames,
+            "{:?} exceeds the cap's frames {:?}",
+            self.progress,
+            self.cap
+        );
+    }
+
     /// The progress after queuing a frame of `len` payload bytes. A frame that
     /// is not the ending must leave room for the largest ending and fit the
     /// frame count. The caller records the progress only once it queued the frame.

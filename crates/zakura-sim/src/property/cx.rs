@@ -15,7 +15,8 @@ use crate::{
 ///
 /// The view is actual state: what the owners hold after the step, read
 /// without a guard event or a rejection. It never defines what the protocol
-/// allows; a check compares it against an independent model or bound.
+/// allows; a check compares it against an invariant, a bound, or a fact the
+/// inputs fix.
 ///
 /// The registry reads the view at the boundary after each step, the
 /// coherent boundary every check shares. A write that a task makes and

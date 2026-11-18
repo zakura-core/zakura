@@ -1773,11 +1773,17 @@ where
                     .await;
             }
 
+            let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let (peer_registry_guard, peer_registry_updater) = peer_registry
                 .as_ref()
                 .and_then(|registry| {
-                    crate::ConnectedPeer::from_connection_info(&connection_info)
-                        .map(|peer| registry.register_legacy(peer))
+                    crate::ConnectedPeer::from_connection_info(&connection_info).map(|peer| {
+                        registry.register_legacy_at(
+                            peer,
+                            gossip_trace.delivery_trace(),
+                            std::time::Instant::now(),
+                        )
+                    })
                 })
                 .unzip();
 
@@ -1838,10 +1844,7 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
-            let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
-            let peer_registry_updater = peer_registry_updater
-                .map(|updater| updater.with_delivery_trace(gossip_trace.delivery_trace()));
             let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();

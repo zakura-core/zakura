@@ -12,7 +12,7 @@ use zakura_chain::block;
 mod delivery;
 mod delivery_trace;
 
-use delivery::DeliveryEstimate;
+use delivery::{ClosedScores, DeliveryEstimate};
 pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
 
 use crate::{
@@ -68,6 +68,7 @@ struct RegistryState {
     active_connections: HashMap<ConnectionKey, ConnectedPeer>,
     /// How long each active legacy connection takes to answer, for choosing block sources.
     delivery_estimates: HashMap<ConnectionKey, DeliveryEstimate>,
+    closed_scores: Option<ClosedScores>,
     native_connections: HashMap<ZakuraPeerId, NativeConnection>,
     retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
 }
@@ -90,6 +91,16 @@ enum ConnectionKey {
 }
 
 impl PeerRegistry {
+    /// Retain estimates across legacy connections only when routing by delivery score.
+    pub(crate) fn new(remember_scores: bool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RegistryState {
+                closed_scores: remember_scores.then(ClosedScores::default),
+                ..RegistryState::default()
+            })),
+        }
+    }
+
     /// Return a point-in-time snapshot of active connections.
     pub(crate) fn connected_peers(&self) -> Vec<ConnectedPeer> {
         let mut connected_peers: Vec<_> = self
@@ -137,10 +148,20 @@ impl PeerRegistry {
             .map(|connection| connection.remote_ip)
     }
 
-    /// Register one legacy connection until the returned guard drops.
+    #[cfg(test)]
     pub(crate) fn register_legacy(
         &self,
         connected_peer: ConnectedPeer,
+    ) -> (PeerRegistryGuard, PeerRegistryUpdater) {
+        self.register_legacy_at(connected_peer, DeliveryTrace::default(), Instant::now())
+    }
+
+    /// Register a legacy connection and restore its recent score before it can serve requests.
+    pub(crate) fn register_legacy_at(
+        &self,
+        connected_peer: ConnectedPeer,
+        delivery_trace: DeliveryTrace,
+        now: Instant,
     ) -> (PeerRegistryGuard, PeerRegistryUpdater) {
         let mut state = self
             .inner
@@ -152,8 +173,28 @@ impl PeerRegistry {
             .checked_add(1)
             .expect("legacy connection generation cannot overflow in one process");
         let key = ConnectionKey::Legacy(generation);
+        let restored = state
+            .closed_scores
+            .as_mut()
+            .and_then(|scores| scores.take(connected_peer.addr.ip(), now));
+        if let Some(estimate) = restored {
+            state.delivery_estimates.insert(key.clone(), estimate);
+        }
         state.active_connections.insert(key.clone(), connected_peer);
         drop(state);
+
+        if let Some(estimate) = restored {
+            let score = estimate
+                .score()
+                .expect("only measured scores are remembered");
+            delivery_trace.sample(
+                DeliverySampleKind::CarriedOver,
+                None,
+                None,
+                score,
+                estimate.weight(),
+            );
+        }
 
         (
             PeerRegistryGuard {
@@ -163,7 +204,7 @@ impl PeerRegistry {
             PeerRegistryUpdater {
                 registry: self.clone(),
                 key,
-                delivery_trace: DeliveryTrace::default(),
+                delivery_trace,
             },
         )
     }
@@ -279,8 +320,13 @@ impl PeerRegistry {
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        state.active_connections.remove(key);
-        state.delivery_estimates.remove(key);
+        let peer = state.active_connections.remove(key);
+        let estimate = state.delivery_estimates.remove(key);
+        if let (Some(scores), Some(peer), Some(estimate)) =
+            (&mut state.closed_scores, peer, estimate)
+        {
+            scores.remember(peer.addr.ip(), estimate, Instant::now());
+        }
     }
 }
 
@@ -294,12 +340,6 @@ pub(crate) struct PeerRegistryUpdater {
 }
 
 impl PeerRegistryUpdater {
-    /// Makes this connection trace its delivery samples with `delivery_trace`.
-    pub(crate) fn with_delivery_trace(mut self, delivery_trace: DeliveryTrace) -> Self {
-        self.delivery_trace = delivery_trace;
-        self
-    }
-
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry
             .inner
@@ -363,7 +403,7 @@ impl PeerRegistryUpdater {
             .score()
             .expect("an estimate that just recorded a sample has a score");
         self.delivery_trace
-            .sample(kind, sample, score_before, score, estimate.weight());
+            .sample(kind, Some(sample), score_before, score, estimate.weight());
     }
 
     /// Traces that the peer announced a block and did not deliver it to a first request, or to a
@@ -473,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
+    fn disabling_score_retention_keeps_only_live_measurements() {
         let registry = PeerRegistry::default();
         let (guard, updater) = registry.register_legacy(peer(1));
         assert_eq!(updater.delivery_score(), None);
@@ -493,24 +533,130 @@ mod tests {
             None,
             "a closed connection keeps no estimate"
         );
+        let (_next, next) = registry.register_legacy(peer(2));
+        assert_eq!(next.delivery_score(), None);
+    }
+
+    fn peer_at(addr: &str) -> ConnectedPeer {
+        ConnectedPeer {
+            addr: addr.parse().expect("test socket address"),
+            ..peer(0)
+        }
+    }
+
+    #[test]
+    fn a_reconnect_consumes_the_estimate_and_preserves_time_since_the_last_sample() {
+        let registry = PeerRegistry::new(true);
+        let now = Instant::now();
+        let (first, stale) = registry.register_legacy(peer(1));
+        stale.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(800), now);
+        drop(first);
+        let later = now + Duration::from_secs(600);
+        let (_next, next) = registry.register_legacy_at(peer(2), DeliveryTrace::default(), later);
+        let (_parallel, parallel) = registry.register_legacy(peer(3));
+        assert_eq!(parallel.delivery_score(), None);
+        stale.record_response(Duration::from_millis(1));
+        assert_eq!(stale.delivery_score(), None);
+        assert_eq!(next.delivery_score(), Some(Duration::from_millis(800)));
+
+        let ping = Duration::from_millis(10);
+        next.record_delivery_sample(DeliverySampleKind::Ping, ping, later);
+        let mut uninterrupted = DeliveryEstimate::default();
+        uninterrupted.record(Duration::from_millis(800), now);
+        uninterrupted.record(ping, later);
+        assert_eq!(next.delivery_score(), uninterrupted.score());
+    }
+
+    #[test]
+    fn recent_scores_follow_ipv4_addresses_and_ipv6_prefixes() {
+        for (original, reconnect, age, restored) in [
+            (
+                "192.0.2.1:1",
+                "[::ffff:192.0.2.1]:2",
+                delivery::REMEMBER_FOR,
+                true,
+            ),
+            ("[::ffff:192.0.2.1]:1", "192.0.2.1:2", Duration::ZERO, true),
+            ("192.0.2.1:1", "192.0.2.2:2", Duration::ZERO, false),
+            (
+                "[2001:db8:1:2::1]:1",
+                "[2001:db8:1:2:ffff::5]:2",
+                Duration::ZERO,
+                true,
+            ),
+            (
+                "[2001:db8:1:2::1]:1",
+                "[2001:db8:1:3::1]:1",
+                Duration::ZERO,
+                false,
+            ),
+            (
+                "192.0.2.1:1",
+                "192.0.2.1:2",
+                delivery::REMEMBER_FOR + Duration::from_nanos(1),
+                false,
+            ),
+        ] {
+            let registry = PeerRegistry::new(true);
+            let now = Instant::now();
+            let (guard, updater) = registry.register_legacy(peer_at(original));
+            updater.record_delivery_sample(
+                DeliverySampleKind::Block,
+                Duration::from_millis(800),
+                now,
+            );
+            drop(guard);
+            let (_guard, next) = registry.register_legacy_at(
+                peer_at(reconnect),
+                DeliveryTrace::default(),
+                now + age,
+            );
+            assert_eq!(
+                next.delivery_score(),
+                restored.then_some(Duration::from_millis(800)),
+                "{original} to {reconnect} after {age:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_scored_connection_to_close_supplies_the_remembered_score() {
+        let registry = PeerRegistry::new(true);
+        let now = Instant::now();
+        let (older, slow) = registry.register_legacy(peer(1));
+        let (newer, fast) = registry.register_legacy(peer(2));
+        slow.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(800), now);
+        fast.record_delivery_sample(
+            DeliverySampleKind::Ping,
+            Duration::from_millis(10),
+            now + Duration::from_secs(1),
+        );
+        drop(newer);
+        drop(older);
+        let (_next, next) = registry.register_legacy(peer(3));
+        assert_eq!(next.delivery_score(), Some(Duration::from_millis(800)));
     }
 
     #[tokio::test]
     async fn delivery_samples_and_missed_blocks_are_traced() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let registry = PeerRegistry::default();
-        let (_connection, updater) = registry.register_legacy(peer(1));
-        let updater = updater.with_delivery_trace(DeliveryTrace::new(
-            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
-            7,
-        ));
-
+        let registry = PeerRegistry::new(true);
+        let trace = |id| {
+            DeliveryTrace::new(
+                zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
+                id,
+            )
+        };
         let now = Instant::now();
+        let (connection, updater) = registry.register_legacy_at(peer(1), trace(7), now);
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
         updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
         updater.trace_block_missed(true);
-        drop(updater);
+        drop(connection);
+        let (_restored, next) = registry.register_legacy_at(peer(2), trace(8), now);
+        let (_other, _) = registry.register_legacy_at(peer(3), trace(9), now);
+        assert_eq!(next.delivery_score(), Some(Duration::from_millis(20)));
         guard.shutdown().await;
 
         let rows: Vec<serde_json::Value> =
@@ -519,7 +665,7 @@ mod tests {
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
                 .collect();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0]["event"], "delivery_sample");
         assert_eq!(rows[0]["connection_id"], 7);
         assert_eq!(rows[0]["kind"], "ping");
@@ -545,6 +691,13 @@ mod tests {
             rows[2].get("score_ms").is_none(),
             "a missed block leaves the score alone"
         );
+        assert_eq!(rows[3]["event"], "delivery_sample");
+        assert_eq!(rows[3]["connection_id"], 8);
+        assert_eq!(rows[3]["kind"], "carried_over");
+        assert_eq!(rows[3]["score_ms"], 20);
+        assert_eq!(rows[3]["weight"], 2.0);
+        assert!(rows[3].get("score_before_ms").is_none());
+        assert!(rows[3].get("sample_ms").is_none());
     }
 
     #[test]

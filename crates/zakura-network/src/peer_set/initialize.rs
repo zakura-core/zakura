@@ -230,7 +230,7 @@ where
     // peers' `getdata`, so it precomputes checksums of the bodies connections will send.
     let inbound_for_checksum_warmup = inbound_service.clone();
     let block_checksums = BlockChecksums::default();
-    let peer_registry = PeerRegistry::default();
+    let peer_registry = PeerRegistry::new(config.block_source_score.enabled);
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
         &config,
         move |supervisor, trace| {

@@ -4,7 +4,8 @@
 //! Each `delivery_sample` row says what was measured (`kind`), the measured time (`sample_ms`),
 //! the score before and after (`score_before_ms`, `score_ms`), and `weight`, the decayed number of
 //! samples the new score rests on. Together they show why a peer's score is what it is, and how
-//! much of it comes from pings and transaction replies rather than blocks.
+//! much of it comes from pings and transaction replies rather than blocks. A `carried_over` row
+//! records the restored score and weight without a new measurement or previous score.
 //!
 //! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
 //! a second gossip block request (`request`). It does not change the score: block routing stops
@@ -20,9 +21,11 @@ use zakura_jsonl_trace::{saturating_millis, JsonlEventEmitter, JsonlTraceEvent, 
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("delivery_score", "delivery_score.jsonl");
 
-/// What a delivery sample measured.
+/// Why the connection received its current score.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeliverySampleKind {
+    /// A recent estimate restored on a new connection.
+    CarriedOver,
     /// A heartbeat ping's round trip.
     Ping,
     /// A reply to a transaction request that held at least one transaction.
@@ -34,6 +37,7 @@ pub(crate) enum DeliverySampleKind {
 impl DeliverySampleKind {
     fn label(self) -> &'static str {
         match self {
+            Self::CarriedOver => "carried_over",
             Self::Ping => "ping",
             Self::Transaction => "transaction",
             Self::Block => "block",
@@ -46,7 +50,8 @@ impl DeliverySampleKind {
 struct DeliverySampleEvent {
     connection_id: u64,
     kind: &'static str,
-    sample_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     score_before_ms: Option<u64>,
     score_ms: u64,
@@ -89,7 +94,7 @@ impl DeliveryTrace {
     pub(super) fn sample(
         &self,
         kind: DeliverySampleKind,
-        sample: Duration,
+        sample: Option<Duration>,
         score_before: Option<Duration>,
         score: Duration,
         weight: f64,
@@ -97,7 +102,7 @@ impl DeliveryTrace {
         self.emitter.emit_event(|| DeliverySampleEvent {
             connection_id: self.connection_id,
             kind: kind.label(),
-            sample_ms: saturating_millis(sample),
+            sample_ms: sample.map(saturating_millis),
             score_before_ms: score_before.map(saturating_millis),
             score_ms: saturating_millis(score),
             // Two decimals are enough to see how many recent samples a score rests on.

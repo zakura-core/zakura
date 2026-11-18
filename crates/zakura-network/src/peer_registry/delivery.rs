@@ -5,7 +5,11 @@
 //! down loses its good estimate within minutes. A peer that announces a block and then does not
 //! deliver it is not penalised here: block routing stops preferring it until it delivers one.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 /// How quickly old samples stop counting. A sample this old has `1/e` of a new sample's weight.
 const TIME_CONSTANT: Duration = Duration::from_secs(10 * 60);
@@ -53,12 +57,93 @@ impl DeliveryEstimate {
     }
 }
 
+/// Keep a closed score for three decay time constants after its last measurement.
+pub(super) const REMEMBER_FOR: Duration = Duration::from_secs(30 * 60);
+const MAX_CLOSED_SCORES: usize = 4096;
+
+/// The most recently closed scored connection per IPv4 address or IPv6 /64.
+/// The age index lets disconnects prune expired scores without scanning the cache.
+#[derive(Debug, Default)]
+pub(super) struct ClosedScores {
+    estimates: HashMap<IpAddr, DeliveryEstimate>,
+    by_age: BTreeSet<(Instant, IpAddr)>,
+}
+
+impl ClosedScores {
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(addr) => IpAddr::V6((addr.to_bits() & (u128::MAX << 64)).into()),
+            v4 => v4,
+        }
+    }
+
+    /// Consumes the last closed estimate, including when it has expired.
+    pub(super) fn take(&mut self, ip: IpAddr, now: Instant) -> Option<DeliveryEstimate> {
+        let key = Self::key(ip);
+        let estimate = self.estimates.remove(&key)?;
+        let updated = estimate
+            .updated_at
+            .expect("only measured scores are remembered");
+        self.by_age.remove(&(updated, key));
+        (now.saturating_duration_since(updated) <= REMEMBER_FOR).then_some(estimate)
+    }
+
+    pub(super) fn remember(&mut self, ip: IpAddr, estimate: DeliveryEstimate, now: Instant) {
+        let Some(updated) = estimate.updated_at else {
+            return;
+        };
+        let key = Self::key(ip);
+        // Replace even if the last connection to close has an older sample.
+        if let Some(previous) = self.estimates.insert(key, estimate) {
+            let previous_time = previous
+                .updated_at
+                .expect("only measured scores are remembered");
+            self.by_age.remove(&(previous_time, key));
+        }
+        self.by_age.insert((updated, key));
+
+        while let Some(&(oldest, address)) = self.by_age.first() {
+            if self.estimates.len() <= MAX_CLOSED_SCORES
+                && now.saturating_duration_since(oldest) <= REMEMBER_FOR
+            {
+                break;
+            }
+            self.by_age.pop_first();
+            self.estimates.remove(&address);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn eviction_uses_sample_time_and_prunes_expired_scores_on_insert() {
+        let now = Instant::now();
+        let mut scores = ClosedScores::default();
+        let mut recent = DeliveryEstimate::default();
+        recent.record(ms(10), now);
+        let mut older = DeliveryEstimate::default();
+        older.record(ms(20), now - Duration::from_secs(1));
+        let ip = |n: u32| IpAddr::V4(n.into());
+        for n in 1..=u32::try_from(MAX_CLOSED_SCORES).unwrap() {
+            scores.remember(ip(n), recent, now);
+        }
+        scores.remember(ip(0), older, now);
+        assert_eq!(scores.estimates.len(), MAX_CLOSED_SCORES);
+        assert!(scores.take(ip(0), now).is_none());
+
+        let later = now + REMEMBER_FOR + Duration::from_nanos(1);
+        recent.record(ms(30), later);
+        scores.remember(ip(0), recent, later);
+        assert_eq!(scores.estimates.len(), 1);
+        assert!(scores.take(ip(0), later).is_some());
+        assert!(scores.by_age.is_empty());
     }
 
     #[test]

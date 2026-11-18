@@ -1897,6 +1897,11 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
+    ///
+    /// The bounds, network, chain, and protocol checks run before the
+    /// signature. Each failure disconnects a `Hello`, as a bad signature does,
+    /// so the order changes no verdict. A relayed record keeps the signature
+    /// first, since its context failures only drop it.
     async fn verify_connected_peer_record(
         &self,
         record: ZakuraNodeRecord,
@@ -1905,6 +1910,8 @@ impl ZakuraDiscoveryHandle {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
+        validate_record_body_bounds(&record.body).map_err(DiscoveryRecordError::Wire)?;
+        validate_record_context(&record.body, &self.verification_context)?;
         self.verify_unless_stored(record).await
     }
 
@@ -7519,6 +7526,63 @@ mod tests {
                 .expect("a changed hello imports once a slot is free"),
             ImportOutcome::Updated
         );
+    }
+
+    /// disco-7: a `Hello` with an oversized body or the wrong network, chain,
+    /// or protocol fails before its signature. The signature check runs only
+    /// under a verification slot, so with every slot held each `Hello` must
+    /// finish with zero signature checks. A tampered signature changes no
+    /// verdict, and each verdict disconnects as `InvalidSignature` does.
+    #[tokio::test]
+    async fn hello_context_checks_run_before_the_signature() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let hello = |edit: fn(&mut ZakuraNodeRecordBody)| {
+            let mut record = runtime_record_with_secret(&secret, 1, service(1), test_addr(1));
+            edit(&mut record.body);
+            let mut record = ZakuraNodeRecord::sign(record.body, &secret)
+                .expect("the bounds hold on every signed body");
+            // Tampering after signing leaves only the signature check to fail.
+            record.signature[0] ^= 1;
+            record
+        };
+        let wrong_network = hello(|body| body.network_id = ZakuraNetworkId::Mainnet);
+        let wrong_chain = hello(|body| body.chain_id[0] ^= 1);
+        let incompatible = hello(|body| {
+            body.zakura_protocol_min = u16::MAX;
+            body.zakura_protocol_max = u16::MAX;
+        });
+        let mut oversized = hello(|_| {});
+        oversized.body.services = vec![service(1); MAX_SERVICES_PER_RECORD + 1];
+        let cases = [
+            (wrong_network, DiscoveryRecordError::WrongNetwork),
+            (wrong_chain, DiscoveryRecordError::WrongChain),
+            (incompatible, DiscoveryRecordError::IncompatibleProtocol),
+            (
+                oversized,
+                DiscoveryRecordError::Wire(DiscoveryWireError::OversizedPayload {
+                    actual: MAX_SERVICES_PER_RECORD + 1,
+                    max: MAX_SERVICES_PER_RECORD,
+                }),
+            ),
+        ];
+
+        let held = handle.hold_verify_slots();
+        for (record, expected) in cases {
+            let node_id = record.body.node_id;
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle.import_connected_peer_record(record, node_id, None),
+            )
+            .await
+            .expect("a hello that fails a context check needs no verification slot")
+            .expect_err("a hello that fails a context check never imports");
+            // The error types have no `PartialEq`, and each variant has its own message.
+            assert_eq!(error.to_string(), expected.to_string());
+            assert_eq!(hello_verdict(&error), RecordVerdict::Disconnect);
+        }
+        drop(held);
     }
 
     #[tokio::test]

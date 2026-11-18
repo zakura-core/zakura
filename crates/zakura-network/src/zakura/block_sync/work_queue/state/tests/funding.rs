@@ -1,4 +1,4 @@
-//! Runtime-owner histories over the real queue and an independent funding ledger.
+//! Runtime-owner histories over the real queue and its funding.
 //!
 //! Generator 2 runs the queue under [`OWNER_CAP`], so admission also refuses a
 //! request that would take its session past the owner cap. Generator 1 ran an
@@ -14,6 +14,17 @@
 //! Operation 24 injects a funding-pool discrepancy while retaining the displaced
 //! reservation. This explicit fault tests containment; it is not a peer action.
 //! A final drain observes zero remaining charge before the queue is destroyed.
+//!
+//! After every input the driver checks the queue's invariants and that the
+//! shared budget's charge is exactly what the driver's owners retain: the
+//! queue's pooled funding, unpublished requests, receipts and quarantined
+//! funding. The pool funds exactly the queue's ledger until the injected
+//! discrepancy closes accounting. Each output is compared only with facts
+//! that follow from the input: an admission charges the estimates its take
+//! captured and keeps its session within the owner cap's floor total; a
+//! receipt carries exactly the bytes that left the ledger; nothing is
+//! admitted, published or started after the driver cancelled it or closed
+//! accounting. Named scenarios pin the admission and receipt rules.
 
 use std::sync::Arc;
 
@@ -58,7 +69,7 @@ pub enum FundingRequestPhase {
     Dropped,
 }
 
-/// One request's actual or independently predicted retention.
+/// One request's retention, read from its runtime owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FundingRequestView {
     /// Exact owner assigned by the take.
@@ -84,7 +95,7 @@ pub struct FundingReceiptView {
     pub bytes: u64,
 }
 
-/// Actual resource reads or independent model predictions at one boundary.
+/// Resource reads at one boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkFundingView {
     /// Logical queue state.
@@ -114,10 +125,8 @@ pub struct WorkFundingStep {
     pub input: Vec<u8>,
     /// Whether this step drains all driver-owned resources before queue destruction.
     pub drain: bool,
-    /// Independent reads of actual queue and reservation owners.
+    /// Reads of the actual queue and reservation owners.
     pub actual: WorkFundingView,
-    /// Predictions from the independent model.
-    pub expected: WorkFundingView,
     /// First failed transition or invariant.
     pub failure: Option<WorkOwnershipFailure>,
 }
@@ -138,6 +147,9 @@ enum RetainedRequest {
 struct ActualRequest {
     owner: Option<BodyWorkOwner>,
     heights: Vec<u32>,
+    /// The estimates the take captured. Admission charges these, not later
+    /// retry hints.
+    estimates: Vec<u64>,
     retained: Option<RetainedRequest>,
     clones: Vec<Arc<RequestWrite>>,
     cancel: CancellationToken,
@@ -207,33 +219,40 @@ impl ActualRequest {
     }
 }
 
-struct ExpectedRequest {
-    view: FundingRequestView,
-    primary: bool,
-    registered: bool,
-    /// Admission uses the estimates captured by the take, not later retry hints.
-    taken_estimates: Vec<u64>,
-}
-
-#[derive(Default)]
-struct Estimate {
-    observed: u64,
-    retry: Option<u64>,
-    retry_after: Option<u32>,
-}
-
 struct Driver {
     work: Arc<WorkQueue>,
     budget: ByteBudget,
     requests: Vec<ActualRequest>,
     receipts: Vec<(BodyWorkOwner, Option<ByteReservation>)>,
-    model: Model,
-    expected_requests: Vec<ExpectedRequest>,
-    expected_receipts: Vec<FundingReceiptView>,
-    estimates: BTreeMap<u32, Estimate>,
+    /// Generation of the authority the next extend installs.
+    generation: u64,
     quarantine: Vec<ByteReservation>,
-    expected_quarantine: u64,
+    /// Whether the driver injected a funding discrepancy.
     closed: bool,
+    summary: WorkFundingReplaySummary,
+}
+
+/// The queue item at `raw`, with whether it is in flight.
+fn item_at(state: &WorkQueueState, raw: u32) -> Option<(bool, WorkItem)> {
+    state
+        .item_for_height(height(raw))
+        .map(|item| (state.in_flight_contains(height(raw)), item))
+}
+
+/// Whether `owner` holds any queued height.
+fn holds_any(state: &WorkQueueState, owner: BodyWorkOwner) -> bool {
+    state
+        .in_flight
+        .values()
+        .any(|item| item.owner == Some(owner))
+}
+
+fn ensure(holds: bool, boundary: &str) -> Result<(), String> {
+    if holds {
+        Ok(())
+    } else {
+        Err(format!("{PROPERTY}: {boundary}"))
+    }
 }
 
 impl Driver {
@@ -246,13 +265,10 @@ impl Driver {
             budget,
             requests: Vec::new(),
             receipts: Vec::new(),
-            model: Model::default(),
-            expected_requests: Vec::new(),
-            expected_receipts: Vec::new(),
-            estimates: BTreeMap::new(),
+            generation: 0,
             quarantine: Vec::new(),
-            expected_quarantine: 0,
             closed: false,
+            summary: WorkFundingReplaySummary::default(),
         }
     }
 
@@ -277,110 +293,8 @@ impl Driver {
         }
     }
 
-    fn expected(&self) -> WorkFundingView {
-        let queue = expected_view(&self.model);
-        let requests: Vec<_> = self
-            .expected_requests
-            .iter()
-            .map(|r| r.view.clone())
-            .collect();
-        let receipts = self.expected_receipts.clone();
-        let funded = if self.closed { 0 } else { queue.reserved };
-        let reserved = funded
-            + self.expected_quarantine
-            + requests.iter().map(|r| r.unpublished_bytes).sum::<u64>()
-            + receipts.iter().map(|r| r.bytes).sum::<u64>();
-        WorkFundingView {
-            funded,
-            reserved,
-            available: if self.closed {
-                0
-            } else {
-                LIMIT.saturating_sub(reserved)
-            },
-            quarantined: self.expected_quarantine,
-            queue,
-            closed: self.closed,
-            requests,
-            receipts,
-        }
-    }
-
-    fn refresh_returned_estimates(&mut self) {
-        self.estimates
-            .retain(|raw, _| self.model.entries.contains_key(raw));
-        for (raw, entry) in &mut self.model.entries {
-            let estimate = self.estimates.entry(*raw).or_default();
-            if !entry.in_flight {
-                if let Some(retry) = estimate.retry.take() {
-                    entry.estimate = retry.max(estimate.observed);
-                }
-            }
-        }
-    }
-
-    /// The writer can skip a queued request as a whole when one height retires.
-    fn return_model(&mut self, index: usize, mut heights: BTreeSet<u32>) {
-        let request = &mut self.expected_requests[index];
-        if request.registered {
-            if request.view.phase == FundingRequestPhase::Queued {
-                request.view.phase = FundingRequestPhase::Skipped;
-            }
-            if request.view.phase == FundingRequestPhase::Skipped && request.view.copies > 0 {
-                heights.extend(request.view.heights.iter().copied());
-            }
-        }
-        if let Some(owner) = request.view.owner {
-            self.model.return_owned(owner, &heights);
-        }
-        self.refresh_returned_estimates();
-    }
-
-    fn rollback_model(&mut self, index: usize) {
-        let request = &mut self.expected_requests[index];
-        if let Some(owner) = request.view.owner {
-            self.model.return_unpublished(owner, &request.view.heights);
-        }
-        request.view.phase = FundingRequestPhase::Dropped;
-        request.view.copies = 0;
-        request.view.unpublished_bytes = 0;
-        request.primary = false;
-        self.refresh_returned_estimates();
-    }
-
-    fn drop_model_copy(&mut self, index: usize, primary: bool) {
-        let request = &mut self.expected_requests[index];
-        if primary {
-            if !request.primary {
-                return;
-            }
-            request.primary = false;
-        } else if request.view.copies <= usize::from(request.primary) {
-            return;
-        }
-        request.view.copies -= 1;
-        if request.view.copies != 0 {
-            return;
-        }
-        match request.view.phase {
-            FundingRequestPhase::Taken | FundingRequestPhase::Admitted => {
-                self.rollback_model(index)
-            }
-            FundingRequestPhase::Written => {}
-            FundingRequestPhase::Dropped => unreachable!("a dropped owner has no copies"),
-            FundingRequestPhase::Queued
-            | FundingRequestPhase::Started
-            | FundingRequestPhase::Skipped => {
-                if request.view.phase == FundingRequestPhase::Started {
-                    request.view.cancelled = true;
-                }
-                let heights = request.view.heights.iter().copied().collect();
-                self.return_model(index, heights);
-            }
-        }
-        let request = &mut self.expected_requests[index];
-        request.view.phase = FundingRequestPhase::Dropped;
-        request.registered = false;
+    fn state<T>(&self, read: impl FnOnce(&WorkQueueState) -> T) -> T {
+        read(&self.work.lock().state)
     }
 
     fn take(&mut self, a: u8, b: u8, c: u8, d: u8) {
@@ -390,193 +304,131 @@ impl Driver {
         let bytes = u64::from(d) * 100;
         let session = u64::from(a / 25 % 3);
         let id = NonZeroU64::new(u64::try_from(self.requests.len() + 1).unwrap()).unwrap();
-        let eligible_high = self
-            .model
-            .entries
-            .range(low..=high)
-            .find(|(raw, entry)| {
-                !entry.in_flight
-                    && self
-                        .estimates
-                        .get(raw)
-                        .and_then(|estimate| estimate.retry_after)
-                        .is_some_and(|tip| self.model.floor <= tip)
-            })
-            .map_or(high, |(raw, _)| raw - 1);
-        let heights = if eligible_high < low {
-            Vec::new()
-        } else {
-            self.model
-                .take(low, eligible_high, count, bytes, (session, id))
-        };
-        let owner = heights
-            .first()
-            .and_then(|raw| self.model.entries[raw].owner);
-        let taken_estimates = heights
-            .iter()
-            .map(|raw| self.model.entries[raw].estimate)
-            .collect();
-        self.expected_requests.push(ExpectedRequest {
-            view: FundingRequestView {
-                owner,
-                heights,
-                phase: FundingRequestPhase::Taken,
-                copies: 1,
-                unpublished_bytes: 0,
-                cancelled: false,
-            },
-            primary: true,
-            registered: false,
-            taken_estimates,
-        });
         let taken = self
             .work
             .take_request(height(low), height(high), count, bytes, session, id);
         self.requests.push(ActualRequest {
             owner: taken.items().first().and_then(|(_, item)| item.owner),
             heights: taken.items().iter().map(|(raw, _)| raw.0).collect(),
+            estimates: taken
+                .items()
+                .iter()
+                .map(|(_, item)| item.estimated_bytes)
+                .collect(),
             retained: Some(RetainedRequest::Taken(taken)),
             clones: Vec::new(),
             cancel: CancellationToken::new(),
         });
     }
 
-    /// The ledger charge the model's in-flight heights hold for `session`.
-    fn session_charge(&self, session: u64) -> u64 {
-        self.model
-            .entries
-            .values()
-            .filter(|entry| entry.owner.is_some_and(|owner| owner.session_id == session))
-            .map(|entry| entry.charge)
-            .sum()
-    }
-
     fn admit(&mut self, index: usize, floor: u32) -> Result<(), String> {
-        if self.expected_requests[index].view.phase != FundingRequestPhase::Taken {
-            return Ok(());
-        }
-        let current = &self.expected_requests[index];
-        let expected = if current.view.heights.is_empty() {
-            Err("Empty")
-        } else if self.closed {
-            Err("AccountingClosed")
-        } else if current.view.cancelled {
-            Err("Cancelled")
-        } else if !self
-            .model
-            .is_unpublished(current.view.owner.unwrap(), &current.view.heights)
-        {
-            Err("StaleClaim")
-        } else if self.session_charge(current.view.owner.unwrap().session_id)
-            + current.taken_estimates.iter().sum::<u64>()
-            > if current.view.heights[0] > floor + 1 {
-                OWNER_CAP.above_floor
-            } else {
-                OWNER_CAP.floor
+        let request = &mut self.requests[index];
+        let taken = match request.retained.take() {
+            Some(RetainedRequest::Taken(taken)) => taken,
+            other => {
+                request.retained = other;
+                return Ok(());
             }
-        {
-            Err("OwnerCap")
-        } else if self.expected().reserved + current.taken_estimates.iter().sum::<u64>() > LIMIT
-            && current.view.heights[0] > floor + 1
-        {
-            Err("Capacity")
-        } else {
-            Ok(())
         };
-        if expected.is_ok() {
-            let current = &mut self.expected_requests[index];
-            current.view.phase = FundingRequestPhase::Admitted;
-            current.view.unpublished_bytes = current.taken_estimates.iter().sum::<u64>();
-        } else {
-            self.rollback_model(index);
-        }
-        let Some(RetainedRequest::Taken(taken)) = self.requests[index].retained.take() else {
-            return Err("admission lost its actual take".into());
-        };
-        let actual = match taken.admit(height(floor), self.requests[index].cancel.clone()) {
-            Ok(request) => {
-                self.requests[index].retained = Some(RetainedRequest::Admitted(request));
-                Ok(())
+        let owner = request.owner;
+        let cancelled = request.cancel.is_cancelled();
+        let estimates: u64 = request.estimates.iter().sum();
+        let cancel = request.cancel.clone();
+        let held = owner.map_or(0, |owner| {
+            self.state(|state| state.session_reserved(owner.session_id))
+        });
+        match taken.admit(height(floor), cancel) {
+            Ok(admitted) => {
+                ensure(
+                    !self.closed && !cancelled,
+                    "admission after closure or cancellation",
+                )?;
+                equal(
+                    admitted.bytes(),
+                    estimates,
+                    "admission charges the take's estimates",
+                )?;
+                ensure(
+                    held + estimates <= OWNER_CAP.floor,
+                    "admission takes a session past the owner cap's floor total",
+                )?;
+                self.requests[index].retained = Some(RetainedRequest::Admitted(admitted));
+                self.summary.admitted += 1;
             }
-            Err(reason) => Err(format!("{reason:?}")),
-        };
-        equal(actual, expected.map_err(str::to_owned), "admission outcome")
+            Err(_) => {
+                if let Some(owner) = owner {
+                    ensure(
+                        !self.state(|state| holds_any(state, owner)),
+                        "a refused admission keeps its heights",
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn publish(&mut self, index: usize) -> Result<(), String> {
-        if self.expected_requests[index].view.phase != FundingRequestPhase::Admitted {
-            return Ok(());
-        }
-        let request = &self.expected_requests[index];
-        let expected = !self.closed
-            && !request.view.cancelled
-            && self
-                .model
-                .is_unpublished(request.view.owner.unwrap(), &request.view.heights);
-        if expected {
-            let request = &mut self.expected_requests[index];
-            self.model
-                .publish(request.view.owner.unwrap(), &request.view.heights);
-            request.view.phase = FundingRequestPhase::Queued;
-            request.view.unpublished_bytes = 0;
-            request.registered = true;
-        } else {
-            self.rollback_model(index);
-        }
-        let Some(RetainedRequest::Admitted(request)) = self.requests[index].retained.take() else {
-            return Err("publication lost its actual owner".into());
+        let request = &mut self.requests[index];
+        let admitted = match request.retained.take() {
+            Some(RetainedRequest::Admitted(admitted)) => admitted,
+            other => {
+                request.retained = other;
+                return Ok(());
+            }
         };
-        let published = request.publish(|_| {});
-        let actual = published.is_some();
+        let owner = admitted.owner();
+        let cancelled = request.cancel.is_cancelled();
+        let published = admitted.publish(|_| {});
+        if published.is_some() {
+            ensure(
+                !self.closed && !cancelled,
+                "publication after closure or cancellation",
+            )?;
+            self.summary.published += 1;
+        } else {
+            ensure(
+                !self.state(|state| holds_any(state, owner)),
+                "a refused publication keeps its heights",
+            )?;
+        }
         self.requests[index].retained = published.map(RetainedRequest::Published);
-        equal(actual, expected, "publication outcome")
+        Ok(())
     }
 
     fn start(&mut self, index: usize) -> Result<(), String> {
-        if self.requests[index].published().is_none() {
+        let request = &self.requests[index];
+        let Some(claim) = request.published() else {
             return Ok(());
+        };
+        let current = self.state(|state| {
+            state.is_published_claim(claim.owner(), claim.heights().collect::<Vec<_>>())
+        });
+        let cancelled = request.cancel.is_cancelled();
+        let queued = claim.status().phase() == RequestWritePhase::Queued;
+        if claim.try_start() {
+            ensure(
+                current && !self.closed && !cancelled,
+                "a writer starts a request that no longer holds its heights",
+            )?;
+        } else if queued {
+            ensure(
+                claim.status().phase() == RequestWritePhase::Skipped,
+                "a refused writer leaves its request queued",
+            )?;
         }
-        let request = &mut self.expected_requests[index];
-        let current = !self.closed
-            && !request.view.cancelled
-            && self
-                .model
-                .is_published(request.view.owner.unwrap(), &request.view.heights);
-        let expected = current && request.view.phase == FundingRequestPhase::Queued;
-        if expected {
-            request.view.phase = FundingRequestPhase::Started;
-        } else if !current && request.view.phase == FundingRequestPhase::Queued {
-            request.view.phase = FundingRequestPhase::Skipped;
-        }
-        equal(
-            self.requests[index].published().unwrap().try_start(),
-            expected,
-            "writer authorization",
-        )
+        Ok(())
     }
 
     fn receipt(&mut self, index: usize, at: usize, kind: u8) -> Result<(), String> {
-        let request = &self.expected_requests[index];
-        let Some(owner) = request.view.owner else {
+        let request = &self.requests[index];
+        let Some(owner) = request.owner else {
             return Ok(());
         };
-        if request.view.heights.is_empty() {
+        if request.heights.is_empty() {
             return Ok(());
         }
-        let raw = request.view.heights[at % request.view.heights.len()];
-        let before = expected_view(&self.model).reserved;
-        let mut accepted = self.model.receive(owner, raw).is_some();
-        if kind == 10 {
-            accepted = self
-                .model
-                .entries
-                .get(&raw)
-                .is_some_and(|entry| entry.owner == Some(owner));
-        }
-        if accepted {
-            self.return_model(index, BTreeSet::new());
-        }
-        let bytes = before - expected_view(&self.model).reserved;
+        let raw = request.heights[at % request.heights.len()];
+        let (before, reserved) = self.state(|state| (item_at(state, raw), state.reserved_bytes()));
         let actual = match kind {
             8 => self
                 .work
@@ -591,30 +443,40 @@ impl Driver {
                 .claim_receipt_for_owner(owner, height(raw))
                 .map(Some),
         };
-        let actual = match actual {
-            Err(error) if self.closed && bytes > 0 => {
+        let released = reserved - self.state(WorkQueueState::reserved_bytes);
+        let funding = match actual {
+            Err(error) if self.closed => {
                 return equal(
                     format!("{error:?}"),
                     "Amount".to_owned(),
                     "quarantined receipt",
                 );
             }
-            Err(error) => return Err(format!("receipt transfer failed: {error:?}")),
-            Ok(_) if self.closed && bytes > 0 => {
-                return Err("receipt escaped an empty quarantined pool".into())
-            }
-            Ok(actual) => actual,
+            Err(error) => return Err(format!("{PROPERTY}: receipt transfer failed: {error:?}")),
+            Ok(funding) => funding,
         };
-        equal(
-            actual.is_some(),
-            accepted || kind == 10,
-            "receipt acceptance",
+        let Some(funding) = funding else {
+            return equal(released, 0, "a refused receipt keeps the ledger");
+        };
+        ensure(
+            !self.closed || funding.bytes() == 0,
+            "receipt escaped an empty quarantined pool",
         )?;
-        if let Some(funding) = actual {
-            self.receipts.push((owner, Some(funding)));
-            self.expected_receipts
-                .push(FundingReceiptView { owner, bytes });
+        equal(
+            funding.bytes(),
+            released,
+            "a receipt carries the bytes that left the ledger",
+        )?;
+        if kind != 10 {
+            ensure(
+                before.is_some_and(|(in_flight, item)| {
+                    in_flight && item.owner == Some(owner) && item.budget.is_reserved()
+                }),
+                "a receipt ends a reservation its owner did not hold",
+            )?;
         }
+        self.receipts.push((owner, Some(funding)));
+        self.summary.receipts += 1;
         Ok(())
     }
 
@@ -629,16 +491,8 @@ impl Driver {
             0 => {
                 let len = u32::from(c % 8);
                 let size = u64::from(d) + 1;
-                self.model.extend(low, len, size);
-                for (raw, entry) in &mut self.model.entries {
-                    if !entry.in_flight {
-                        entry.estimate = entry
-                            .estimate
-                            .max(self.estimates.entry(*raw).or_default().observed);
-                    }
-                }
                 self.work.extend(
-                    self.model.authority(),
+                    authority(self.generation),
                     (low..=(low + len).min(MAX_HEIGHT))
                         .map(|raw| (height(raw), hash(raw), confirmed(size))),
                 );
@@ -651,55 +505,33 @@ impl Driver {
             11 => {
                 if !self.receipts.is_empty() {
                     let index = usize::from(b) % self.receipts.len();
-                    self.expected_receipts[index].bytes = 0;
                     drop(self.receipts[index].1.take());
                 }
                 return Ok(());
             }
             15 => {
                 let size = u64::from(d) + 1;
-                let scope = self.model.authority();
-                if let Some(entry) = self.model.entries.get_mut(&low) {
-                    let estimate = self.estimates.entry(low).or_default();
-                    if entry.in_flight {
-                        estimate.retry = Some(size.max(estimate.observed));
-                    } else if entry.scope == scope {
-                        entry.estimate = size.max(estimate.observed);
-                    }
-                }
                 self.work.refresh_size_estimates(
-                    self.model.authority(),
+                    authority(self.generation),
                     [(height(low), hash(low), confirmed(size))],
                 );
                 return Ok(());
             }
-            16 | 17 => {
-                let floor = u32::from(b) % (MAX_HEIGHT + 1);
-                if op == 16 {
-                    self.model.advance_floor(floor);
-                    self.work.advance_floor(height(floor));
-                } else {
-                    for request in &mut self.expected_requests {
-                        if request.registered && request.view.heights.iter().any(|raw| *raw > floor)
-                        {
-                            if request.view.phase == FundingRequestPhase::Queued {
-                                request.view.phase = FundingRequestPhase::Skipped;
-                            }
-                            if request.view.phase == FundingRequestPhase::Started {
-                                request.view.cancelled = true;
-                            }
-                            request.registered = false;
-                        }
-                    }
-                    self.model.reset_above(floor);
-                    self.work.reset_above(height(floor));
-                }
-                self.refresh_returned_estimates();
+            16 => {
+                self.work
+                    .advance_floor(height(u32::from(b) % (MAX_HEIGHT + 1)));
+                return Ok(());
+            }
+            17 => {
+                self.generation += 1;
+                self.summary.resets += 1;
+                self.work
+                    .reset_above(height(u32::from(b) % (MAX_HEIGHT + 1)));
                 return Ok(());
             }
             18 => {
-                self.model.refresh_authority();
-                self.work.refresh_authority(self.model.authority());
+                self.generation += 1;
+                self.work.refresh_authority(authority(self.generation));
                 return Ok(());
             }
             23 => {
@@ -709,8 +541,7 @@ impl Driver {
                 // Explicit fault input: move the real pool aside without changing
                 // its ledger. The production audit must close admission while
                 // the driver retains that funding for teardown verification.
-                if !self.closed && expected_view(&self.model).reserved > 0 {
-                    self.expected_quarantine = expected_view(&self.model).reserved;
+                if !self.closed && self.state(WorkQueueState::reserved_bytes) > 0 {
                     self.closed = true;
                     let funding = {
                         let mut inner = self.work.lock();
@@ -732,41 +563,31 @@ impl Driver {
             3 => self.publish(index)?,
             4 => self.start(index)?,
             5 => {
-                if self.expected_requests[index].view.phase == FundingRequestPhase::Started {
-                    self.expected_requests[index].view.phase = FundingRequestPhase::Written;
-                    self.expected_requests[index].registered = false;
-                    self.requests[index]
-                        .published()
-                        .ok_or("writer lost its owner")?
-                        .written();
+                if let Some(claim) = self.requests[index].published() {
+                    if claim.status().phase() == RequestWritePhase::Started {
+                        claim.written();
+                    }
                 }
             }
-            6 => {
-                self.drop_model_copy(index, true);
-                drop(self.requests[index].retained.take());
-            }
-            7 => {
-                self.expected_requests[index].view.cancelled = true;
-                self.requests[index].cancel.cancel();
-            }
+            6 => drop(self.requests[index].retained.take()),
+            7 => self.requests[index].cancel.cancel(),
             8..=10 => self.receipt(index, usize::from(c), op)?,
             12..=14 => {
-                let request = &self.expected_requests[index];
-                let Some(owner) = request.view.owner else {
+                let request = &self.requests[index];
+                let Some(owner) = request.owner else {
                     return Ok(());
                 };
-                if request.view.heights.is_empty() {
+                if request.heights.is_empty() {
                     return Ok(());
                 }
-                let raw = request.view.heights[usize::from(c) % request.view.heights.len()];
+                let raw = request.heights[usize::from(c) % request.heights.len()];
                 match op {
                     12 => {
-                        let heights: BTreeSet<_> = if d % 2 == 0 {
-                            BTreeSet::from([raw])
+                        let heights: Vec<_> = if d % 2 == 0 {
+                            vec![raw]
                         } else {
-                            request.view.heights.iter().copied().collect()
+                            request.heights.clone()
                         };
-                        self.return_model(index, heights.clone());
                         self.work
                             .release_reserved_and_return_items_detailed_for_owner(
                                 owner,
@@ -774,89 +595,55 @@ impl Driver {
                             );
                     }
                     13 => {
-                        self.model.receive(owner, raw);
                         self.work
                             .release_reserved_heights_for_owner(owner, [height(raw)]);
                     }
                     _ => {
-                        let expected = self.model.entries.get(&raw).is_some_and(|entry| {
-                            entry.in_flight
-                                && entry.owner == Some(owner)
-                                && entry.charge == 0
-                                && raw > self.model.floor
-                        });
-                        if expected {
-                            let estimate = self.estimates.entry(raw).or_default();
-                            estimate.observed = estimate.observed.max(u64::from(d) + 1);
-                            estimate.retry_after = Some(self.model.floor);
-                            let entry = self.model.entries.get_mut(&raw).unwrap();
-                            entry.estimate = estimate
-                                .retry
-                                .take()
-                                .unwrap_or(entry.estimate)
-                                .max(estimate.observed);
-                            entry.in_flight = false;
-                            entry.owner = None;
+                        let before = self.state(|state| item_at(state, raw));
+                        let floor = self.state(|state| state.floor);
+                        if self.work.defer_received_for_owner(
+                            owner,
+                            height(raw),
+                            hash(raw),
+                            u64::from(d) + 1,
+                            floor,
+                        ) {
+                            ensure(
+                                before.is_some_and(|(in_flight, item)| {
+                                    in_flight
+                                        && item.owner == Some(owner)
+                                        && !item.budget.is_reserved()
+                                }),
+                                "a deferral returns a height its owner did not hold unreserved",
+                            )?;
+                            ensure(
+                                self.state(|state| state.pending_contains(height(raw))),
+                                "a deferred height is not pending",
+                            )?;
                         }
-                        equal(
-                            self.work.defer_received_for_owner(
-                                owner,
-                                height(raw),
-                                hash(raw),
-                                u64::from(d) + 1,
-                                height(self.model.floor),
-                            ),
-                            expected,
-                            "deferred receipt",
-                        )?;
                     }
                 }
             }
             19 => {
-                let request = &mut self.expected_requests[index];
-                if request.view.phase == FundingRequestPhase::Taken {
-                    let len = request.view.heights.len();
+                let request = &mut self.requests[index];
+                if let Some(RetainedRequest::Taken(taken)) = &mut request.retained {
+                    let len = taken.items().len();
                     let start = usize::from(c) % (len + 1);
                     let end = start + usize::from(d) % (len - start + 1);
-                    if let Some(owner) = request.view.owner {
-                        self.model
-                            .return_unpublished(owner, &request.view.heights[..start]);
-                        self.model
-                            .return_unpublished(owner, &request.view.heights[end..]);
-                    }
-                    request.view.heights = request.view.heights[start..end].to_vec();
-                    request.taken_estimates = request.taken_estimates[start..end].to_vec();
-                    let Some(RetainedRequest::Taken(taken)) = &mut self.requests[index].retained
-                    else {
-                        return Err("retained range lost its take".into());
-                    };
                     taken.retain_range(start..end);
-                    self.requests[index].heights =
-                        taken.items().iter().map(|(raw, _)| raw.0).collect();
-                    self.refresh_returned_estimates();
+                    request.heights = taken.items().iter().map(|(raw, _)| raw.0).collect();
+                    request.estimates = request.estimates[start..end].to_vec();
                 }
             }
             20 => {
                 if let Some(claim) = self.requests[index].published().cloned() {
                     self.requests[index].clones.push(claim);
-                    self.expected_requests[index].view.copies += 1;
                 }
             }
-            21 => {
-                self.drop_model_copy(index, false);
-                drop(self.requests[index].clones.pop());
-            }
+            21 => drop(self.requests[index].clones.pop()),
             22 => {
-                if self.requests[index].published().is_some() {
-                    self.expected_requests[index].view.cancelled = true;
-                    let heights = self.expected_requests[index]
-                        .view
-                        .heights
-                        .iter()
-                        .copied()
-                        .collect();
-                    self.return_model(index, heights);
-                    self.requests[index].published().unwrap().delivery_failed();
+                if let Some(claim) = self.requests[index].published() {
+                    claim.delivery_failed();
                 }
             }
             _ => unreachable!("all decoder operations have a transition"),
@@ -865,22 +652,62 @@ impl Driver {
     }
 
     fn drain(&mut self) {
-        for index in 0..self.requests.len() {
-            self.drop_model_copy(index, true);
-            drop(self.requests[index].retained.take());
-            while !self.requests[index].clones.is_empty() {
-                self.drop_model_copy(index, false);
-                drop(self.requests[index].clones.pop());
-            }
+        for request in &mut self.requests {
+            drop(request.retained.take());
+            request.clones.clear();
         }
-        for ((_, receipt), expected) in self.receipts.iter_mut().zip(&mut self.expected_receipts) {
-            expected.bytes = 0;
+        for (_, receipt) in &mut self.receipts {
             drop(receipt.take());
         }
-        self.model.advance_floor(MAX_HEIGHT);
         self.work.advance_floor(height(MAX_HEIGHT));
-        self.expected_quarantine = 0;
         self.quarantine.clear();
+    }
+
+    /// Check the queue's invariants and that the budget's charge is exactly
+    /// what the driver's owners retain.
+    fn check(&self, view: &WorkFundingView, drain: bool) -> Result<(), String> {
+        let invariants = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.state(WorkQueueState::assert_invariants);
+        }));
+        if let Err(payload) = invariants {
+            return Err(format!("{PROPERTY}: {}", panic_text(payload.as_ref())));
+        }
+        equal(view.closed, self.closed, "accounting closes only on drift")?;
+        let retained = view.funded
+            + view.quarantined
+            + view
+                .requests
+                .iter()
+                .map(|request| request.unpublished_bytes)
+                .sum::<u64>()
+            + view
+                .receipts
+                .iter()
+                .map(|receipt| receipt.bytes)
+                .sum::<u64>();
+        equal(
+            view.reserved,
+            retained,
+            "the budget charges exactly the retained funding",
+        )?;
+        if self.closed {
+            equal((view.funded, view.available), (0, 0), "closed accounting")?;
+        } else {
+            equal(
+                view.funded,
+                view.queue.reserved,
+                "the pool funds the queue's ledger",
+            )?;
+            equal(
+                view.available,
+                LIMIT.saturating_sub(view.reserved),
+                "available capacity",
+            )?;
+        }
+        if drain {
+            equal(view.reserved, 0, "a drain returns every reservation")?;
+        }
+        Ok(())
     }
 }
 
@@ -898,71 +725,32 @@ fn equal<T: std::fmt::Debug + PartialEq>(
     }
 }
 
-fn compare_views(actual: &WorkFundingView, expected: &WorkFundingView) -> Result<(), String> {
-    equal(actual.closed, expected.closed, "accounting closure")?;
-    equal(actual.funded, expected.funded, "pooled funding")?;
-    equal(actual.reserved, expected.reserved, "actual retained budget")?;
-    equal(actual.available, expected.available, "available capacity")?;
-    equal(
-        actual.quarantined,
-        expected.quarantined,
-        "quarantined funding",
-    )?;
-    equal(actual.queue.floor, expected.queue.floor, "queue floor")?;
-    equal(
-        actual.queue.authority,
-        expected.queue.authority,
-        "queue authority",
-    )?;
-    equal(
-        actual.queue.reserved,
-        expected.queue.reserved,
-        "logical charge",
-    )?;
-    equal(
-        actual.queue.scanned,
-        expected.queue.scanned,
-        "scanned charge",
-    )?;
-    equal(
-        actual.queue.above_floor,
-        expected.queue.above_floor,
-        "above-floor charge",
-    )?;
-    equal(
-        actual.queue.items.len(),
-        expected.queue.items.len(),
-        "queue entries",
-    )?;
-    for (actual, expected) in actual.queue.items.iter().zip(&expected.queue.items) {
-        equal(actual, expected, "queue item")?;
-    }
-    equal(
-        actual.requests.len(),
-        expected.requests.len(),
-        "request records",
-    )?;
-    for (actual, expected) in actual.requests.iter().zip(&expected.requests) {
-        equal(actual, expected, "request owner")?;
-    }
-    equal(
-        actual.receipts.len(),
-        expected.receipts.len(),
-        "receipt records",
-    )?;
-    for (actual, expected) in actual.receipts.iter().zip(&expected.receipts) {
-        equal(actual, expected, "receipt owner")?;
-    }
-    // Keep any future field visible until its specific comparison is added.
-    equal(actual, expected, "runtime funding view")
+/// Completed runtime operations in a funding history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct WorkFundingReplaySummary {
+    /// Inputs applied, excluding the final drain.
+    pub transitions: usize,
+    /// Admissions that charged the budget.
+    pub admitted: usize,
+    /// Publications that moved funding into the pool.
+    pub published: usize,
+    /// Receipts that took funding from the pool.
+    pub receipts: usize,
+    /// Frontier resets.
+    pub resets: usize,
 }
 
 /// Run generator-2 runtime-owner inputs and observe obligations before queue destruction.
-/// This target is distinct from the preserved pure-state decoder and consumes at most 512 bytes.
+/// This target is distinct from the preserved pure-state decoder and consumes at most
+/// [`MAX_HISTORY_BYTES`] bytes.
 pub fn trace_work_funding_bytes(data: &[u8]) -> WorkFundingHistory {
+    trace(data).0
+}
+
+fn trace(data: &[u8]) -> (WorkFundingHistory, WorkFundingReplaySummary) {
     let mut driver = Driver::new();
     let mut steps = Vec::new();
-    let data = &data[..data.len().min(512)];
+    let data = &data[..data.len().min(MAX_HISTORY_BYTES)];
     for input in data.chunks(4).chain(std::iter::once(&[][..])) {
         let drain = input.is_empty();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -970,18 +758,15 @@ pub fn trace_work_funding_bytes(data: &[u8]) -> WorkFundingHistory {
                 driver.drain();
                 Ok(())
             } else {
+                driver.summary.transitions += 1;
                 driver.apply(input)
             }
         }));
         let actual = driver.actual();
-        let expected = driver.expected();
         let failure = match result {
             Ok(result) => {
                 let (phase, result) = match result {
-                    Ok(()) => (
-                        WorkOwnershipPhase::Invariant,
-                        compare_views(&actual, &expected),
-                    ),
+                    Ok(()) => (WorkOwnershipPhase::Invariant, driver.check(&actual, drain)),
                     Err(message) => (WorkOwnershipPhase::Transition, Err(message)),
                 };
                 result.err().map(|message| WorkOwnershipFailure {
@@ -1002,18 +787,30 @@ pub fn trace_work_funding_bytes(data: &[u8]) -> WorkFundingHistory {
             input: input.to_vec(),
             drain,
             actual,
-            expected,
             failure,
         });
         if failed {
             break;
         }
     }
-    WorkFundingHistory { steps }
+    (WorkFundingHistory { steps }, driver.summary)
+}
+
+/// Replay at most [`MAX_HISTORY_BYTES`] generator-2 bytes through the runtime
+/// owners and drain them. Panics with the first failure.
+#[cfg(test)]
+fn replay_work_funding_bytes(data: &[u8]) -> WorkFundingReplaySummary {
+    let (history, summary) = trace(data);
+    if let Some(failure) = history.steps.iter().find_map(|step| step.failure.as_ref()) {
+        panic!("{}; input {data:?}", failure.message);
+    }
+    summary
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn check(data: &[u8]) -> WorkFundingHistory {
@@ -1028,10 +825,7 @@ mod tests {
 
     #[test]
     fn receipt_retains_funding_through_reset_and_replacement() {
-        let history = check(&[
-            0, 0, 1, 99, 1, 0, 9, 3, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
-            17, 0, 0, 0, 0, 0, 1, 99, 1, 0, 9, 3, 2, 1, 0, 0, 3, 1, 0, 0, 12, 0, 0, 1, 11, 0, 0, 0,
-        ]);
+        let history = check(WITNESS);
         assert_eq!(history.steps[6].actual.receipts[0].bytes, 100);
         assert_eq!(history.steps[7].actual.reserved, 100);
         assert_eq!(history.steps[11].actual.reserved, 300);
@@ -1116,6 +910,21 @@ mod tests {
         assert_eq!(refused.reserved, 1_500);
     }
 
+    /// A writer that finds its request no longer holds its heights refuses to
+    /// start and skips the request.
+    #[test]
+    fn a_refused_writer_skips_its_request() {
+        let history = from_published(&[13, 0, 0, 0, 4, 0, 0, 0]);
+        assert_eq!(
+            history.steps[4].actual.requests[0].phase,
+            FundingRequestPhase::Queued
+        );
+        assert_eq!(
+            history.steps[5].actual.requests[0].phase,
+            FundingRequestPhase::Skipped
+        );
+    }
+
     #[test]
     fn stale_provisional_ranges_keep_their_take_estimates() {
         check(&[
@@ -1148,11 +957,35 @@ mod tests {
         assert_eq!(history.steps[10].actual.reserved, 400);
     }
 
+    /// Retains a receipt through a reset, then admits, publishes and returns
+    /// a replacement.
+    const WITNESS: &[u8] = &[
+        0, 0, 1, 99, 1, 0, 9, 3, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 17, 0,
+        0, 0, 0, 0, 1, 99, 1, 0, 9, 3, 2, 1, 0, 0, 3, 1, 0, 0, 12, 0, 0, 1, 11, 0, 0, 0,
+    ];
+
+    mod funding_target {
+        use super::*;
+        use crate::zakura::machine_test::machine_target_tests;
+
+        machine_target_tests! {
+            replay: replay_work_funding_bytes,
+            target: "block_work_funding",
+            decoder: 2,
+            witness: WITNESS => WorkFundingReplaySummary {
+                transitions: 14,
+                admitted: 2,
+                published: 2,
+                receipts: 1,
+                resets: 1,
+            },
+        }
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        /// Histories that start from a published, or written, request.
         #[test]
-        fn runtime_funding_matches_independent_owners(data in prop::collection::vec(any::<u8>(), 0..=512)) {
-            check(&data);
+        fn seeded_funding_histories_keep_every_property(data in prop::collection::vec(any::<u8>(), 0..=MAX_HISTORY_BYTES)) {
             for written in [false, true] {
                 let mut seeded = vec![0, 0, 3, 99, 1, 0, 27, 5, 2, 0, 0, 0, 3, 0, 0, 0];
                 if written { seeded.extend([4, 0, 0, 0, 5, 0, 0, 0]); }

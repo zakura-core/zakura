@@ -330,12 +330,15 @@ fn work_spends_only_its_own_frames_bytes() {
 }
 
 /// A storage callback that admits a retired owner's work after its
-/// connection closed fails, even within what was delivered.
+/// connection closed fails, even within what was delivered, once the node
+/// judged a later frame before the close.
 #[test]
 fn stale_owner_work_after_close_fails() {
     let report = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 0)],
+        vec![frame(TEST_STREAM, 1, "part", Label::Conformant, 7, 20)],
+        vec![judged(TEST_STREAM, 1)],
         vec![closed("idle_timeout")],
         vec![part_work(0, 4)],
     ]);
@@ -343,6 +346,41 @@ fn stale_owner_work_after_close_fails() {
         .end
         .violation
         .expect("the owner retired at the close");
+    assert_eq!(violation.property, WORK);
+    assert!(
+        violation.actual.contains("after the close"),
+        "{violation:?}"
+    );
+}
+
+/// The frame the node was handling when another task closed the
+/// connection may still finish, within what it delivered.
+#[test]
+fn the_frame_in_hand_at_a_close_may_finish() {
+    let report = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
+        vec![judged(TEST_STREAM, 0)],
+        vec![closed("idle_timeout")],
+        vec![part_work(0, 4)],
+    ]);
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+}
+
+/// A frame whose work the node had already admitted before the close
+/// was no longer in hand, so more work from it after the close fails.
+#[test]
+fn more_work_from_a_handed_off_frame_after_close_fails() {
+    let report = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
+        vec![judged(TEST_STREAM, 0)],
+        vec![part_work(0, 2)],
+        vec![closed("idle_timeout")],
+        vec![part_work(0, 2)],
+    ]);
+    let violation = report
+        .end
+        .violation
+        .expect("the frame was handed off before the close");
     assert_eq!(violation.property, WORK);
     assert!(
         violation.actual.contains("after the close"),

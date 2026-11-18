@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+index 2a6e606b45..c668f80d8e 100644
+--- a/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
++++ b/crates/zakura-network/src/zakura/block_sync/work_queue/state.rs
+@@ -866,7 +866,7 @@ impl WorkQueueState {
+                 }
+                 continue;
+             };
+-            if item.owner != Some(owner) {
++            if item.owner.is_none() {
+                 outcome.missing_count = outcome.missing_count.saturating_add(1);
+                 continue;
+             }

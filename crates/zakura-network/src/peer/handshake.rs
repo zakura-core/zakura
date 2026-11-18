@@ -530,6 +530,7 @@ where
     latest_chain_tip: C,
     misbehavior: Option<MisbehaviorReporter>,
     tcp_warmup: Option<TcpWarmup>,
+    block_checksums: Option<BlockChecksums>,
 }
 
 impl<S, C> Builder<S, C>
@@ -616,6 +617,7 @@ where
             protected_peer_ips: self.protected_peer_ips,
             misbehavior: self.misbehavior,
             tcp_warmup: self.tcp_warmup,
+            block_checksums: self.block_checksums,
         }
     }
 
@@ -660,6 +662,15 @@ where
     /// If this is unset or `None`, connections are not warmed.
     pub fn with_tcp_warmup(mut self, tcp_warmup: Option<TcpWarmup>) -> Self {
         self.tcp_warmup = tcp_warmup;
+        self
+    }
+
+    /// Share `block_checksums` with the connections this handshake creates, so they reuse
+    /// checksums that block advertisement precomputed. Optional.
+    ///
+    /// If this is unset, the connections share checksums only with each other.
+    pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
+        self.block_checksums = Some(block_checksums);
         self
     }
 
@@ -715,7 +726,7 @@ where
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
-            block_checksums: BlockChecksums::default(),
+            block_checksums: self.block_checksums.unwrap_or_default(),
             bans: misbehavior.bans(),
             misbehavior,
             tcp_warmup: self.tcp_warmup,
@@ -749,6 +760,7 @@ where
             latest_chain_tip: NoChainTip,
             misbehavior: None,
             tcp_warmup: None,
+            block_checksums: None,
         }
     }
 }

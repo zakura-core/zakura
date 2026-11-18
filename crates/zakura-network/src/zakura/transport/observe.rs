@@ -123,8 +123,6 @@ pub enum TransportEvent {
         validated: bool,
         /// Admitted, exhausted, capacity, registered, or cancelled.
         action: &'static str,
-        /// This charge created a new full bucket.
-        fresh: bool,
         /// Tokens in a full bucket.
         capacity: u32,
         /// Time needed to refill one token.

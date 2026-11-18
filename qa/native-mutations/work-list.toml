@@ -545,7 +545,7 @@ witness = { test = "conformant_control_and_prelude_are_accepted", test_target = 
 id = "handshake-admission"
 kind = "shared-definition"
 claim = "Production admission counts and live permits preserve pending, address, and outbound-reserve bounds."
-check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/table/cadence_window.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
 shared = []
 
 [[entry.instance]]
@@ -707,7 +707,7 @@ witness = { input = "crates/zakura-sim/tests/fixtures/handshake-capability-befor
 id = "handshake-cadence"
 kind = "shared-definition"
 claim = "TLS attempts consume available address credit, and funded attempts receive neutral admission."
-check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
+check = ["crates/zakura-sim/src/table/handshake.rs", "crates/zakura-sim/src/table/cadence_window.rs", "crates/zakura-sim/src/harness/handshake_counts.rs"]
 shared = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/regulation/cadence.rs", "crates/zakura-quic/src/endpoint.rs"]
 
 [[entry.instance]]

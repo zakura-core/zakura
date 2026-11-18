@@ -22,6 +22,7 @@
 //! label, or an unclaimed fault, fails the run as a harness failure, so it
 //! can't hide an obligation.
 
+pub(crate) mod cadence_window;
 pub mod handshake;
 
 use std::fmt;

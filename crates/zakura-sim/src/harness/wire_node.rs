@@ -1096,7 +1096,6 @@ impl TransportTap {
                 remote,
                 validated,
                 action,
-                fresh,
                 capacity,
                 refill_interval,
                 hosts,
@@ -1107,7 +1106,6 @@ impl TransportTap {
                 TransportFact::HandshakeCadence {
                     validated,
                     action: action.into(),
-                    fresh,
                     capacity,
                     refill_ns: u64::try_from(refill_interval.as_nanos()).map_err(|_| {
                         format!(

@@ -1,4 +1,5 @@
-//! Admission histories against the production machine and independent live owners.
+//! Admission histories against the production machine and the live owners
+//! the harness tracks.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -11,6 +12,7 @@ use zakura_network::zakura::{HandshakeCadenceAdmission, HandshakeCounts, IpAdmis
 use super::{machine::Machine, HarnessEntry};
 use crate::property::Status;
 use crate::record::machine::{CountsStep, CountsView, FailurePhase, MachineFailure, MachineStep};
+use crate::table::cadence_window::CadenceWindow;
 
 /// Pending handshake bounds.
 pub const PENDING: &str = "handshake/pending-bounded";
@@ -258,27 +260,21 @@ fn operations(input: &[u8]) -> Vec<u8> {
     operations
 }
 
-struct CadenceOracle {
+/// The cadence refills one token per sixteenth of a second: sixteen nodes
+/// share an address, and each retries once a second.
+const REFILL_NS: u64 = 62_500_000;
+
+/// The harness clock and each host's charges and refunds. It tracks counts
+/// only; the machine alone decides admission.
+struct CadenceLog {
     origin: Instant,
     now_ns: u64,
-    last: [Option<u64>; HOSTS],
-    tokens: [u32; HOSTS],
+    windows: [CadenceWindow; HOSTS],
 }
 
-impl CadenceOracle {
+impl CadenceLog {
     fn now(&self) -> Instant {
         self.origin + Duration::from_nanos(self.now_ns)
-    }
-
-    fn refill(&mut self, host: usize) {
-        // The harness admits sixteen nodes per address, each retrying once a second.
-        let last = self.last[host].get_or_insert(self.now_ns);
-        while self.tokens[host] < 16 && self.now_ns - *last >= 62_500_000 {
-            *last += 62_500_000;
-            self.tokens[host] += 1;
-        }
-        // A full bucket skips complete refill intervals while retaining their phase.
-        *last += ((self.now_ns - *last) / 62_500_000) * 62_500_000;
     }
 
     fn attempt(
@@ -288,7 +284,6 @@ impl CadenceOracle {
         ip: IpAddr,
         failures: &mut Vec<(String, MachineFailure)>,
     ) -> bool {
-        self.refill(host);
         let admitted = counts.admit_cadence(
             ip,
             false,
@@ -296,36 +291,32 @@ impl CadenceOracle {
             CONNECTION_CAP + PENDING_CAP,
             self.now(),
         ) == HandshakeCadenceAdmission::Admit;
-        if admitted && self.tokens[host] == 0 {
+        if admitted && !self.windows[host].charge(self.now_ns) {
             failure(
                 failures,
                 CADENCE,
-                "an exhausted address started another TLS attempt",
+                "an address started more TLS attempts than its cadence pays for",
             );
         }
-        if !admitted && self.tokens[host] != 0 {
+        if !admitted && !self.windows[host].refusal_earned(self.now_ns) {
             failure(failures, CONFORMANT, "an address with a token was refused");
-        }
-        if admitted {
-            self.tokens[host] = self.tokens[host].saturating_sub(1);
         }
         admitted
     }
 
     fn refund(&mut self, counts: &mut HandshakeCounts, host: usize, ip: IpAddr) {
-        self.refill(host);
-        self.tokens[host] = (self.tokens[host] + 1).min(16);
+        self.windows[host].refund(self.now_ns);
         counts.refund_cadence(ip, false, self.now());
     }
 }
 
 fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut counts = HandshakeCounts::default();
-    let mut cadence = CadenceOracle {
+    // The address cap is sixteen, so it fits `u32`.
+    let mut cadence = CadenceLog {
         origin: Instant::now(),
         now_ns: 0,
-        last: [None; HOSTS],
-        tokens: [16; HOSTS],
+        windows: std::array::from_fn(|_| CadenceWindow::new(ADDRESS_CAP as u32, REFILL_NS)),
     };
     let mut owners = [None; SLOTS];
     let mut history = Vec::new();

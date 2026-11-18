@@ -73,6 +73,12 @@ tests `unvalidated_charges_leave_validated_sources_their_cadence` and
 `spoofed_initials_never_lock_out_a_validated_source` cover the split between
 the validated and unvalidated ledgers.
 
+Neither cadence check rebuilds the token bucket.
+Both count each address's charges and refunds (`table/cadence_window.rs`).
+A window that starts at a charge holds at most the capacity, plus one charge per refund and per started refill interval.
+A refusal needs a window whose charges cover the capacity, its refunds and its whole refill intervals.
+The bound allows one refill of slack per window, so a mutant that grants one extra token per refill interval survives these checks.
+
 The native required-capability mask is zero under the production network policy.
 Deleting its mask check cannot change a native handshake under that policy.
 The required-channel guard remains reachable and has a missing-capability witness.

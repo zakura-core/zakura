@@ -612,11 +612,14 @@ fn scripted_host(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-/// Counts actual QUIC attempts for the rate bound. Checks admission decisions
-/// against a separate balance that includes charges cancelled before TLS.
+/// Bounds each address's cadence charges by counts, per instance and
+/// validation state. The rate property also requires every TLS start to
+/// spend an admitted charge.
 fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     use std::collections::BTreeMap;
     use zakura_network::zakura::DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF;
+
+    use super::cadence_window::CadenceWindow;
 
     let rate = cx.id().as_str() == "handshake/attempts-within-cadence";
     if !cx.observations().any(|obs| {
@@ -639,7 +642,9 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
     let mut now = 0u64;
     let mut limits = BTreeMap::new();
-    let mut balances = BTreeMap::new();
+    let mut windows = BTreeMap::new();
+    // Admitted charges that haven't yet started TLS or been cancelled.
+    let mut unspent = BTreeMap::<_, u64>::new();
     for entry in cx.log.entries() {
         if let Observation::TimeAdvanced { to_ns, .. } = entry.obs {
             now = to_ns;
@@ -677,16 +682,16 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         let cap = u32::try_from(address_cap).unwrap();
         let interval = u64::try_from(DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF.as_nanos()).unwrap()
             / u64::from(cap);
-        let (action, fresh, validated) = match event {
-            TransportFact::QuicHandshakeStarted { validated } => ("started", false, *validated),
+        let (action, validated) = match event {
+            TransportFact::QuicHandshakeStarted { validated } => ("started", *validated),
             TransportFact::HandshakeCadence {
                 validated,
                 action,
-                fresh,
                 capacity,
                 refill_ns,
                 hosts,
                 host_limit,
+                ..
             } => {
                 if rate
                     && (*capacity != cap
@@ -705,7 +710,7 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     }
                     continue;
                 }
-                (action.as_str(), *fresh, *validated)
+                (action.as_str(), *validated)
             }
             _ => unreachable!("only cadence and QUIC attempt events pass the filter"),
         };
@@ -713,35 +718,34 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             .parse()
             .expect("transport addresses use socket syntax");
         // Each validation state has its own ledger.
-        let (tokens, last) = balances
-            .entry((*instance, scripted_host(remote.ip()), validated))
-            .or_insert((cap, now));
-        let earned = now.saturating_sub(*last) / interval;
-        *tokens = tokens
-            .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX))
-            .min(cap);
-        *last += earned * interval;
-        if fresh {
-            if rate && *tokens != cap {
-                return cx.violated(
-                    "a depleted address retains its cadence debt",
-                    remote.to_string(),
-                );
-            }
-            *last = now;
-        }
+        let key = (*instance, scripted_host(remote.ip()), validated);
+        let window = windows
+            .entry(key)
+            .or_insert_with(|| CadenceWindow::new(cap, interval));
+        let unspent = unspent.entry(key).or_default();
         match action {
-            "started" if rate => {
-                if *tokens == 0 {
-                    return cx.violated("TLS requires an address token", remote.to_string());
+            "admitted" => {
+                *unspent += 1;
+                if !window.charge(now) && rate {
+                    return cx.violated(
+                        "an address started more TLS attempts than its cadence pays for",
+                        remote.to_string(),
+                    );
                 }
-                *tokens = tokens.saturating_sub(1);
             }
-            "admitted" if !rate => *tokens = tokens.saturating_sub(1),
+            "started" if rate => {
+                if *unspent == 0 {
+                    return cx.violated("TLS requires an admitted charge", remote.to_string());
+                }
+                *unspent -= 1;
+            }
+            "cancelled" => {
+                *unspent = unspent.saturating_sub(1);
+                window.refund(now);
+            }
             // Registration and a local refusal after TLS refund the attempt.
-            "registered" | "refused" => *tokens = tokens.saturating_add(1).min(cap),
-            "cancelled" if !rate => *tokens = tokens.saturating_add(1).min(cap),
-            "exhausted" if !rate && *tokens != 0 => {
+            "registered" | "refused" => window.refund(now),
+            "exhausted" if !rate && !window.refusal_earned(now) => {
                 return cx.violated(
                     "an address with a token is never exhausted",
                     remote.to_string(),

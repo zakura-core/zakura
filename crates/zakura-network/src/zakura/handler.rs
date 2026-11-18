@@ -3245,7 +3245,7 @@ impl ZakuraProtocolHandler {
         let hosts = counts.cadence_hosts(validated);
         drop(counts);
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(remote, validated, action, false, hosts);
+        self.observe_handshake_cadence(remote, validated, action, hosts);
         #[cfg(not(any(test, zakura_sim)))]
         let _ = action;
     }
@@ -3259,7 +3259,6 @@ impl ZakuraProtocolHandler {
         remote: SocketAddr,
         validated: bool,
         action: &'static str,
-        fresh: bool,
         hosts: usize,
     ) {
         let cadence = super::handshake_cadence(self.supervisor.max_connections_per_ip);
@@ -3269,7 +3268,6 @@ impl ZakuraProtocolHandler {
                 remote,
                 validated,
                 action,
-                fresh,
                 capacity: cadence.capacity,
                 refill_interval: cadence.refill_interval,
                 hosts,
@@ -5061,8 +5059,6 @@ impl Acceptor for ZakuraProtocolHandler {
         // Initial, which is never validated, can't take a validated source's
         // tokens. An unvalidated source that runs out gets a stateless Retry
         // below, which an honest peer answers with a validated Initial.
-        #[cfg(any(test, zakura_sim))]
-        let fresh = !counts.has_cadence_host(incoming.remote.ip(), incoming.validated);
         let cadence = counts.admit_cadence(
             incoming.remote.ip(),
             incoming.validated,
@@ -5087,7 +5083,6 @@ impl Acceptor for ZakuraProtocolHandler {
                 super::HandshakeCadenceAdmission::Exhausted => "exhausted",
                 super::HandshakeCadenceAdmission::Capacity => "capacity",
             },
-            fresh && cadence == super::HandshakeCadenceAdmission::Admit,
             hosts,
         );
         match cadence {

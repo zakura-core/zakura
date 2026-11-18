@@ -2102,8 +2102,6 @@ pub enum TransportFact {
         validated: bool,
         /// Admitted, exhausted, capacity, registered, or cancelled.
         action: String,
-        /// The production ledger created this address bucket for the charge.
-        fresh: bool,
         /// Full bucket capacity.
         capacity: u32,
         /// Nanoseconds per replenished token.

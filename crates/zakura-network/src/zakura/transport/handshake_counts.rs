@@ -104,12 +104,6 @@ impl HandshakeCounts {
         }
     }
 
-    /// Reports bucket creation to the simulator without exposing its token balance.
-    #[cfg(any(test, zakura_sim))]
-    pub(crate) fn has_cadence_host(&self, ip: IpAddr, validated: bool) -> bool {
-        self.cadence(validated).contains_key(&admission_host(ip))
-    }
-
     /// Counts the bounded address ledger for `validated` sources, including
     /// depleted idle buckets.
     pub fn cadence_hosts(&self, validated: bool) -> usize {

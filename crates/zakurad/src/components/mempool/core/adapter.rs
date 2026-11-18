@@ -696,7 +696,7 @@ async fn bring_in(
                 }
             };
             let Ok(fetched) = fetched else {
-                shared.handle.fetch_failed(reservation).await;
+                fetch_failed(&shared, reservation, deadline).await;
                 return Err(timed_out());
             };
             match fetched {
@@ -712,7 +712,7 @@ async fn bring_in(
                         );
                     metrics::counter!("mempool.failed.verify.tasks.total", "reason" => reason)
                         .increment(1);
-                    shared.handle.fetch_failed(reservation).await;
+                    fetch_failed(&shared, reservation, deadline).await;
                     return Err(format!("failed to validate tx: {tx_id}, error: {error}").into());
                 }
             }
@@ -734,7 +734,7 @@ async fn bring_in(
         && sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()))
     {
         metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-        shared.handle.fetch_failed(reservation).await;
+        fetch_failed(&shared, reservation, deadline).await;
         return Err(format!(
             "failed to validate tx: {tx_id}, error: {}",
             TransactionDownloadVerifyError::PeerCoolingDown
@@ -860,6 +860,14 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
             Err(format!("the pool core could not decide transaction {tx_id}: {fault:?}").into())
         }
     }
+}
+
+/// Tells the core that `reservation`'s fetch ended without a body, unless
+/// the core's command queue stays full past `deadline`. Then the reservation
+/// is dropped, which still frees its slot, and only the refusal goes
+/// unlogged.
+async fn fetch_failed(shared: &Shared, reservation: Reservation, deadline: tokio::time::Instant) {
+    let _ = tokio::time::timeout_at(deadline, shared.handle.fetch_failed(reservation)).await;
 }
 
 /// Fetches `tx_id`, unless the best chain already holds it.

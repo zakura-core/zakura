@@ -1707,6 +1707,14 @@ mod cwnd_cap_tests {
     /// lasts past that 10-second window. It ends between ProbeRTT drains, which
     /// fall at 10 s and 20 s.
     fn settled_cwnd(max_cwnd_bytes: u64, rate: u64, rtt: Duration) -> u64 {
+        settled_window(max_cwnd_bytes, rate, rtt)
+            .0
+            .bbr_effective_cwnd_bytes()
+            .unwrap()
+    }
+
+    /// The window [`settled_cwnd`] reads, and the time its run ends.
+    fn settled_window(max_cwnd_bytes: u64, rate: u64, rtt: Duration) -> (DownloadWindow, Instant) {
         let mut window = byte_window(max_cwnd_bytes);
         let body = 1_000_000u64;
         let gap = Duration::from_nanos(body * 1_000_000_000 / rate);
@@ -1725,7 +1733,75 @@ mod cwnd_cap_tests {
             }
         }
         assert_eq!(window.bbr_phase_code(), 0, "the run ends in ProbeBW");
-        window.bbr_effective_cwnd_bytes().unwrap()
+        (window, now)
+    }
+
+    /// bsync-5 in the default `Bytes` unit. A window at its 32 MiB cap seals
+    /// to zero after 172 consecutive short responses, which age reliability
+    /// without a dip. Timeouts also dip the window, so they seal it sooner.
+    /// One late body reopens a sealed window to a tenth of its base, which
+    /// still admits a full block, and so does a new session's window.
+    #[test]
+    fn the_default_byte_window_seals_and_reopens() {
+        let gigabit = 125_000_000;
+        let (capped, now) = settled_window(
+            DEFAULT_BS_BBR_MAX_CWND_BYTES,
+            gigabit,
+            Duration::from_millis(250),
+        );
+        assert_eq!(
+            capped.bbr_effective_cwnd_bytes(),
+            Some(DEFAULT_BS_BBR_MAX_CWND_BYTES)
+        );
+
+        // Each failure scales the window by `1 - alpha` until it rounds to zero.
+        // The cap is 2^25 bytes, so f64 holds it exactly.
+        let derived = (0..)
+            .find(|n| {
+                (DEFAULT_BS_BBR_MAX_CWND_BYTES as f64 * (1.0 - BBR_RELIABILITY_EWMA_ALPHA).powi(*n))
+                    .round()
+                    == 0.0
+            })
+            .expect("a positive window scaled by 0.9 rounds to zero");
+        assert_eq!(derived, 172);
+
+        let mut shorts = capped.clone();
+        let mut failures = 0;
+        while shorts.cwnd_byte_headroom_at(0, now) != Some(0) {
+            assert!(
+                shorts.cwnd_byte_headroom_at(0, now) >= Some(1),
+                "an unsealed window keeps at least one byte, which admits a first item"
+            );
+            shorts.penalize_short_response(1);
+            failures += 1;
+            assert!(failures <= derived, "the window outlasts its derived seal");
+        }
+        assert_eq!(failures, derived);
+        assert_eq!(shorts.bbr_effective_cwnd_bytes(), Some(0));
+
+        let mut timeouts = capped;
+        let mut timed_out = 0;
+        while timeouts.cwnd_byte_headroom_at(0, now) != Some(0) {
+            timeouts.record_timeout(1);
+            timed_out += 1;
+        }
+        assert!(timed_out < derived, "timeouts seal after {timed_out}");
+
+        // One late body lifts reliability to about alpha.
+        shorts.credit_late_delivery();
+        let reopened = shorts.cwnd_byte_headroom_at(0, now).expect("bytes unit");
+        assert!(
+            reopened >= block::MAX_BLOCK_BYTES,
+            "a late body reopens the window to {reopened} bytes"
+        );
+
+        // A new session starts at the byte floor.
+        let fresh = byte_window(DEFAULT_BS_BBR_MAX_CWND_BYTES);
+        assert_eq!(
+            fresh.cwnd_byte_headroom_at(0, now),
+            Some(DEFAULT_BS_BBR_MIN_CWND_BYTES)
+        );
+        assert!(DEFAULT_BS_BBR_MIN_CWND_BYTES >= block::MAX_BLOCK_BYTES);
     }
 
     /// At 1 Gbps and 250 ms the 3× gain asks for about 94 MB; the default cap

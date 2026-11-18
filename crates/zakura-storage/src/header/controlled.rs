@@ -67,7 +67,7 @@ use super::{
         CallerPresence, OperationStage, OperationState, OwnerState, RequestIdentity, ResultIdentity,
     },
     fixture::HeaderFixture,
-    lease::{Effects, LeaseEnd},
+    lease::{Effects, LeaseEnd, Registry},
     FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
     ADAPTER_DEADLINE,
 };
@@ -607,9 +607,15 @@ impl ControlledPort {
     /// takes both does. Every fact up to `through_seq` is reflected and none
     /// after, since each transaction publishes under these locks or where no
     /// task can run.
+    ///
+    /// # Panics
+    ///
+    /// If the owner state breaks an invariant of [`Self::assert_invariants`],
+    /// so every checker that reads the state checks them too.
     pub fn owner_state(&self) -> OwnerState {
         self.engine.with_registry(|registry| {
             let ops = self.ops();
+            assert_owner_invariants(registry, &ops);
             let mut state = OwnerState {
                 through_seq: ops.last_seq,
                 operations: ops
@@ -643,6 +649,16 @@ impl ControlledPort {
             registry.fill(&mut state);
             state
         })
+    }
+
+    /// Panics unless the port's owner state keeps its invariants:
+    /// - the lease registry's, which `Registry::assert_invariants` lists;
+    /// - storage holds a permit only for a pending locator;
+    /// - after shutdown, the port holds no operation, permit, lease or
+    ///   cached path: shutdown returns every resource.
+    pub fn assert_invariants(&self) {
+        self.engine
+            .with_registry(|registry| assert_owner_invariants(registry, &self.ops()));
     }
 
     /// Whether the port has never published a fact and holds no owner state:
@@ -1401,6 +1417,30 @@ impl ControlledPort {
             token: None,
             reply: PhantomData,
         })
+    }
+}
+
+/// [`ControlledPort::assert_invariants`], under the locks
+/// [`ControlledPort::owner_state`] holds.
+fn assert_owner_invariants(registry: &Registry, ops: &Ops) {
+    registry.assert_invariants();
+    for id in ops.permits.keys() {
+        assert!(
+            ops.slots.get(id).is_some_and(|slot| {
+                slot.identity == RequestIdentity::ContinuationLocator
+                    && matches!(slot.stage, Stage::Pending { .. })
+            }),
+            "storage holds a permit for {id:?}, which isn't a pending locator"
+        );
+    }
+    if ops.shut_down {
+        assert!(
+            ops.slots.is_empty()
+                && ops.permits.is_empty()
+                && registry.live() == 0
+                && registry.continued().is_empty(),
+            "shutdown left an owner behind"
+        );
     }
 }
 

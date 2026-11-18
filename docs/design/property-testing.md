@@ -77,8 +77,22 @@ Use short sequences that deliver messages, advance time, complete storage work, 
 capacity, reassign work, and close connections. Exercise production transitions. A test starting
 from a decoded message makes no framing or allocation claim.
 
-A small independent reference model is optional when it clarifies a race. It must not call the
-production transition under test. Compare relevant observations after each action:
+The pure machine is the one encoding of its rules, so tests drive it directly. A test never
+re-derives a decision the machine makes; a second encoding shares the first one's blind spots and
+doubles the cost of every rule change. Instead:
+
+- check the machine's invariants after every action, and check that a drain returns every
+  resource;
+- pin each rule, especially who gets charged or banned, with a named scenario;
+- compare outputs only with facts that follow from the inputs the test chose: what it sent, how
+  many, and in what order.
+
+A test may keep a small model when it only tracks simple state (inputs, outputs, counts, totals)
+to compare against, or when it recomputes an optimized result the slow, obvious way. The model
+never calls the production code under test. Keep it to a few hundred lines; a larger model is
+re-deriving the machine. `example_reactor/exchange/state/tests.rs` shows the pattern.
+
+Compare relevant observations after each action:
 
 - validation result and reservation consumption;
 - subscription identity and credit;

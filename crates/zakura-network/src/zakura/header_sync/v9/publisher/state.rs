@@ -221,19 +221,6 @@ pub(super) enum Recheck {
     Query,
 }
 
-/// What state is doing now, for a model to compare with its own view.
-#[cfg(any(test, feature = "p2p-fuzz"))]
-#[derive(Clone, Debug)]
-pub(super) struct Activity {
-    /// The subscription of the job in progress.
-    pub(super) job: Option<u64>,
-    /// Subscriptions whose terminal outcome waits to be written, in order.
-    pub(super) terminals: Vec<u64>,
-    /// Whether a terminal outcome is being written.
-    pub(super) writing: bool,
-    pub(super) exit: Option<Exit>,
-}
-
 /// The state shared between [`Publisher::apply`](super::Publisher::apply)
 /// and the publisher task.
 #[derive(Debug)]
@@ -709,28 +696,85 @@ impl PublisherState {
         &self.publications
     }
 
-    /// End `id` in the ledger alone, which plants lost credit for the model's
-    /// `publisher_witness_rejects_lost_credit`.
-    #[cfg(test)]
-    pub(super) fn lose_publication(&mut self, id: u64) {
-        self.publications.end(&id);
+    /// Slots this state's subscriptions and terminal outcomes hold: one per
+    /// live subscription, per queued terminal outcome, and for the one being
+    /// written.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn slots_owed(&self) -> usize {
+        self.subscriptions.len() + self.terminals.len() + usize::from(self.writing.is_some())
     }
 
-    /// What state is doing now.
+    /// Check the invariants that hold between any two calls, and panic with
+    /// the one that breaks:
+    ///
+    /// - state and the ledger hold the same live subscriptions;
+    /// - no subscription spent more credit than it was granted;
+    /// - a subscription that sent a page extends that page's last header;
+    /// - only a follower holds a checked tip or a pin, and a follower holds no
+    ///   `Open` locators;
+    /// - a queued outcome lies in its window;
+    /// - the job in progress serves a live subscription with no outcome
+    ///   queued.
     #[cfg(any(test, feature = "p2p-fuzz"))]
-    pub(super) fn activity(&self) -> Activity {
-        Activity {
-            job: self.in_progress.as_ref().map(|job| job.subscription),
-            terminals: self.terminals.iter().map(|terminal| terminal.id).collect(),
-            writing: self.writing.is_some(),
-            exit: self.exit,
+    pub(super) fn assert_invariants(&self) {
+        let mut ledger: Vec<u64> = self.publications.keys().copied().collect();
+        ledger.sort_unstable();
+        assert!(
+            ledger.iter().eq(self.subscriptions.keys()),
+            "state and the ledger hold the same subscriptions"
+        );
+        for (id, subscription) in &self.subscriptions {
+            let credit = self.publications.credit(id).expect("a live subscription");
+            let (granted, consumed) = (credit.granted(), credit.consumed());
+            assert!(
+                consumed.objects <= granted.objects && consumed.bytes <= granted.bytes,
+                "subscription {id} spent {consumed:?} of {granted:?}"
+            );
+            let pages_sent = self.pages_sent(id);
+            if pages_sent {
+                let last = self
+                    .publications
+                    .last_sent(id)
+                    .expect("a live subscription");
+                assert_eq!(
+                    subscription.position.last(),
+                    Some(Frontier::new(last.height, last.hash)),
+                    "subscription {id} extends its last page"
+                );
+            }
+            if !subscription.position.reached() {
+                assert!(
+                    subscription.checked_tip.is_none() && subscription.pin.is_none(),
+                    "subscription {id} checks a tip before it follows"
+                );
+            } else {
+                assert!(
+                    subscription.locators.is_empty(),
+                    "follower {id} keeps its Open locators"
+                );
+            }
+            if let Some(outcome) = subscription.end {
+                assert!(
+                    is_legal(outcome, pages_sent, subscription.reached(), false),
+                    "subscription {id} queued {outcome:?} outside its window"
+                );
+            }
+        }
+        if let Some(job) = &self.in_progress {
+            assert!(
+                self.subscriptions
+                    .get(&job.subscription)
+                    .is_some_and(|subscription| subscription.end.is_none()),
+                "the job in progress serves subscription {} with no outcome queued",
+                job.subscription
+            );
         }
     }
 
     /// The publication ledger's live and closing subscriptions, each with
     /// its unacknowledged sent pages, sorted, its tombstones, whether a page
     /// job is in progress, and the subscriptions this state tracks, sorted.
-    #[cfg(any(test, zakura_sim))]
+    #[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
     pub(super) fn serving(&self) -> (Vec<(u64, usize)>, usize, bool, Vec<u64>) {
         let mut live: Vec<(u64, usize)> = self
             .publications

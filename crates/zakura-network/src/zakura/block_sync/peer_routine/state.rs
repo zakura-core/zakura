@@ -114,6 +114,17 @@ pub(super) struct PeerState {
 }
 
 impl PeerState {
+    /// Panic if the state breaks a rule it keeps: the outstanding index is
+    /// consistent, and outstanding work keeps a liveness deadline.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        self.window.outstanding.assert_consistent();
+        assert!(
+            self.window.outstanding.is_empty() || self.window.block_liveness_deadline.is_some(),
+            "outstanding work keeps a liveness deadline"
+        );
+    }
+
     pub(super) fn new(
         config: &ZakuraBlockSyncConfig,
         allow_no_progress_park: bool,

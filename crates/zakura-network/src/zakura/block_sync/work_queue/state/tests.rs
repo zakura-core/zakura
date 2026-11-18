@@ -1,21 +1,26 @@
 //! Machine tests for [`WorkQueueState`].
 //!
-//! The proptest drives the pure state with legal input sequences and checks it
-//! after every step against an independent model. The model keeps one entry per
-//! height and a per-owner charge ledger. It never calls the state's helpers.
+//! The machine target drives the pure state with decoded inputs. After every
+//! input it checks [`WorkQueueState::assert_invariants`], that draining the
+//! state releases exactly the ledger's total, and that the ledger moved by the
+//! bytes the transition reported. It compares each output only with facts that
+//! follow from the input and the state before it: which heights the test
+//! offered, took, published, received and returned. Named scenarios pin the
+//! rules: which owner a return may touch, when a removal revokes, and which
+//! estimate a take and an extend use.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
 };
 
-#[cfg(test)]
-use proptest::prelude::*;
 use zakura_header_chain::{BodyWorkAuthority, HeaderGeneration, HeaderWorkAuthority};
-use zakura_rt::collections::HashMap;
 
 use super::*;
-use crate::zakura::block_sync::test_work_scope;
+use crate::zakura::{
+    block_sync::test_work_scope,
+    machine_test::{panic_text, with_property, MAX_HISTORY_BYTES},
+};
 
 /// Highest height any generated input touches.
 const MAX_HEIGHT: u32 = 20;
@@ -382,273 +387,86 @@ fn adjacent_takes_by_two_peers_stay_disjoint() {
     assert_eq!(state.reserved_bytes(), 200);
 }
 
-// ---- independent model ----
-
-/// The model's view of one queued height.
-#[derive(Copy, Clone, Debug)]
-struct ModelEntry {
-    in_flight: bool,
-    scope: BodyWorkAuthority,
-    owner: Option<BodyWorkOwner>,
-    provisional: bool,
-    estimate: u64,
-    /// Reserved bytes this height holds in the ledger.
-    charge: u64,
+/// A take always takes its first eligible height, then stops before the
+/// height that would pass its byte cap.
+#[test]
+fn a_take_stops_at_its_byte_cap_after_the_first_height() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 300), (2, 100), (3, 100)]);
+    let first = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MIN));
+    assert_eq!(heights_of(&first), BTreeSet::from([height(1)]));
+    let rest = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MAX));
+    assert_eq!(heights_of(&rest), BTreeSet::from([height(2), height(3)]));
 }
 
-/// Bytes each owner moved into the ledger and the bytes settled since.
-#[derive(Copy, Clone, Debug, Default)]
-struct OwnerLedger {
-    charged: u64,
-    settled: u64,
+/// A take rescopes pending work to the current authority before binding its
+/// owner, so work queued under an older snapshot runs under the new one.
+#[test]
+fn a_take_binds_the_owner_to_the_current_authority() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100)]);
+    extend(&mut state, authority(1), &[(2, 100)]);
+    let items = take(&mut state, 1, 1, 7, 3);
+    assert_eq!(
+        owner_of(&items),
+        authority(1).bind(7, NonZeroU64::new(3).unwrap())
+    );
+    assert_eq!(items[0].1.scope, authority(1));
 }
 
-#[derive(Debug, Default)]
-struct Model {
-    floor: u32,
-    current_authority: Option<BodyWorkAuthority>,
-    next_generation: u64,
-    entries: BTreeMap<u32, ModelEntry>,
-    ledgers: HashMap<BodyWorkOwner, OwnerLedger>,
+/// Extending a pending height under its own scope refreshes its estimate.
+/// Another scope, or an in-flight height, keeps the estimate it has.
+#[test]
+fn an_extend_refreshes_only_a_same_scope_pending_estimate() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100), (2, 100), (3, 100)]);
+    let _ = take(&mut state, 3, 3, 1, 1);
+    extend(&mut state, authority(0), &[(1, 250), (3, 250)]);
+    extend(&mut state, authority(1), &[(2, 250)]);
+    let estimate = |raw| state.item_for_height(height(raw)).unwrap().estimated_bytes;
+    assert_eq!([estimate(1), estimate(2), estimate(3)], [250, 100, 100]);
 }
 
-/// Expected counts of a `return_owned` call.
-#[derive(Debug, Default, Eq, PartialEq)]
-struct ModelReturn {
-    released_bytes: u64,
-    returned: u64,
-    committed: u64,
-    already_pending: u64,
-    received: u64,
-    missing: u64,
+/// A floor advance past a published claim releases its charge and revokes. A
+/// floor advance past an unpublished claim releases nothing and does not.
+#[test]
+fn a_floor_advance_revokes_only_reserved_work() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100), (2, 100)]);
+    let published = take(&mut state, 1, 1, 1, 1);
+    assert_eq!(publish(&mut state, &published), 100);
+    let _ = take(&mut state, 2, 2, 1, 2);
+    let delta = state.advance_floor(height(1));
+    assert_eq!(delta.released_bytes, 100);
+    assert!(delta.wake.revocation);
+    let delta = state.advance_floor(height(2));
+    assert_eq!(delta.released_bytes, 0);
+    assert!(!delta.wake.revocation);
 }
 
-impl Model {
-    fn authority(&self) -> BodyWorkAuthority {
-        authority(self.next_generation)
-    }
-
-    fn settle(&mut self, entry: ModelEntry) -> u64 {
-        if entry.charge == 0 {
-            return 0;
-        }
-        let owner = entry.owner.expect("only an owned height holds a charge");
-        let ledger = self
-            .ledgers
-            .get_mut(&owner)
-            .expect("a charge was recorded at publication");
-        ledger.settled += entry.charge;
-        assert!(
-            ledger.settled <= ledger.charged,
-            "an owner settled more than it charged"
-        );
-        entry.charge
-    }
-
-    fn extend(&mut self, low: u32, len: u32, estimate: u64) -> usize {
-        let scope = self.authority();
-        self.current_authority = Some(scope);
-        let mut inserted = 0;
-        for raw in low..=(low + len).min(MAX_HEIGHT) {
-            if raw <= self.floor {
-                continue;
-            }
-            match self.entries.get_mut(&raw) {
-                Some(entry) if !entry.in_flight && entry.scope == scope => {
-                    entry.estimate = estimate;
-                }
-                Some(_) => {}
-                None => {
-                    self.entries.insert(
-                        raw,
-                        ModelEntry {
-                            in_flight: false,
-                            scope,
-                            owner: None,
-                            provisional: false,
-                            estimate,
-                            charge: 0,
-                        },
-                    );
-                    inserted += 1;
-                }
-            }
-        }
-        inserted
-    }
-
-    /// Predict and apply a request take: the first contiguous pending run in
-    /// `low..=high` under one scope, within the count and byte caps.
-    fn take(
-        &mut self,
-        low: u32,
-        high: u32,
-        max_count: usize,
-        max_bytes: u64,
-        owner_ids: (u64, NonZeroU64),
-    ) -> Vec<u32> {
-        let mut taken = Vec::new();
-        let mut bytes = 0u64;
-        let mut run_scope = None;
-        for (raw, entry) in self.entries.range(low..=high) {
-            if entry.in_flight {
-                if !taken.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            if run_scope.is_some_and(|scope| scope != entry.scope) {
-                break;
-            }
-            if taken.last().is_some_and(|last: &u32| last + 1 != *raw) {
-                break;
-            }
-            if !taken.is_empty() && bytes + entry.estimate > max_bytes {
-                break;
-            }
-            taken.push(*raw);
-            run_scope = Some(entry.scope);
-            bytes += entry.estimate;
-            if taken.len() >= max_count {
-                break;
-            }
-        }
-        for raw in &taken {
-            let entry = self.entries.get_mut(raw).expect("taken from the model");
-            let scope = self.current_authority.unwrap_or(entry.scope);
-            entry.in_flight = true;
-            entry.scope = scope;
-            entry.owner = Some(scope.bind(owner_ids.0, owner_ids.1));
-            entry.provisional = true;
-        }
-        taken
-    }
-
-    fn is_unpublished(&self, owner: BodyWorkOwner, heights: &[u32]) -> bool {
-        !heights.is_empty()
-            && heights.iter().all(|raw| {
-                self.entries.get(raw).is_some_and(|entry| {
-                    entry.in_flight && entry.owner == Some(owner) && entry.provisional
-                })
-            })
-    }
-
-    fn is_published(&self, owner: BodyWorkOwner, heights: &[u32]) -> bool {
-        heights.iter().all(|raw| {
-            self.entries.get(raw).is_some_and(|entry| {
-                entry.in_flight && entry.owner == Some(owner) && entry.charge > 0
-            })
-        })
-    }
-
-    fn publish(&mut self, owner: BodyWorkOwner, heights: &[u32]) -> u64 {
-        let mut charged = 0;
-        for raw in heights {
-            let entry = self.entries.get_mut(raw).expect("checked unpublished");
-            entry.provisional = false;
-            entry.charge = entry.estimate;
-            charged += entry.estimate;
-        }
-        self.ledgers.entry(owner).or_default().charged += charged;
-        charged
-    }
-
-    fn return_unpublished(&mut self, owner: BodyWorkOwner, heights: &[u32]) {
-        for raw in heights {
-            if let Some(entry) = self.entries.get_mut(raw) {
-                if entry.in_flight && entry.owner == Some(owner) && entry.provisional {
-                    entry.in_flight = false;
-                    entry.owner = None;
-                    entry.provisional = false;
-                }
-            }
-        }
-    }
-
-    fn receive(&mut self, owner: BodyWorkOwner, raw: u32) -> Option<u64> {
-        let entry = *self.entries.get(&raw)?;
-        if !entry.in_flight || entry.owner != Some(owner) || entry.charge == 0 {
-            return None;
-        }
-        self.entries.insert(raw, ModelEntry { charge: 0, ..entry });
-        Some(self.settle(entry))
-    }
-
-    fn return_owned(&mut self, owner: BodyWorkOwner, heights: &BTreeSet<u32>) -> ModelReturn {
-        let mut expected = ModelReturn::default();
-        for raw in heights {
-            let Some(entry) = self.entries.get(raw).copied() else {
-                expected.missing += 1;
-                continue;
-            };
-            if !entry.in_flight {
-                expected.already_pending += 1;
-                continue;
-            }
-            if entry.owner != Some(owner) {
-                expected.missing += 1;
-                continue;
-            }
-            if *raw <= self.floor {
-                expected.released_bytes += self.settle(entry);
-                expected.committed += 1;
-                self.entries.remove(raw);
-                continue;
-            }
-            if entry.charge == 0 {
-                expected.received += 1;
-                continue;
-            }
-            expected.released_bytes += self.settle(entry);
-            expected.returned += 1;
-            let entry = self.entries.get_mut(raw).expect("checked above");
-            entry.in_flight = false;
-            entry.owner = None;
-            entry.charge = 0;
-        }
-        expected
-    }
-
-    /// Remove the heights `drop` selects. Returns released bytes and whether
-    /// any removed height still held a request reservation.
-    fn remove_where(&mut self, drop: impl Fn(u32) -> bool) -> (u64, bool) {
-        let removed: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(raw, _)| drop(**raw))
-            .map(|(raw, entry)| (*raw, *entry))
-            .collect();
-        let mut released = 0;
-        let mut revocation = false;
-        for (raw, entry) in removed {
-            self.entries.remove(&raw);
-            revocation |= entry.in_flight && entry.charge > 0;
-            released += self.settle(entry);
-        }
-        (released, revocation)
-    }
-
-    fn advance_floor(&mut self, floor: u32) -> (u64, bool) {
-        self.floor = self.floor.max(floor);
-        let floor = self.floor;
-        self.remove_where(|raw| raw <= floor)
-    }
-
-    fn reset_above(&mut self, floor: u32) -> (u64, bool) {
-        self.floor = floor;
-        self.next_generation += 1;
-        self.remove_where(|raw| raw > floor)
-    }
-
-    fn refresh_authority(&mut self) {
-        self.next_generation += 1;
-        let scope = self.authority();
-        self.current_authority = Some(scope);
-        for entry in self.entries.values_mut().filter(|entry| !entry.in_flight) {
-            entry.scope = scope;
-        }
-    }
+/// A forward reset leaves a received height at or below the new floor in
+/// flight. Its owner cannot defer it: the height is committed.
+#[test]
+fn a_committed_received_height_cannot_be_deferred() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100), (2, 100)]);
+    let items = take(&mut state, 1, 2, 1, 1);
+    assert_eq!(publish(&mut state, &items), 200);
+    let owner = owner_of(&items);
+    assert_eq!(
+        state.end_reservation_at_receipt(owner, height(1), false),
+        Some(100)
+    );
+    let _ = state.reset_above(height(2));
+    assert!(state.in_flight_contains(height(1)));
+    assert_eq!(
+        state.defer_received(owner, height(1), hash(1), 100, height(0)),
+        None
+    );
+    assert!(state.in_flight_contains(height(1)));
 }
+
+// ---- machine target ----
 
 /// One request attempt that a take created.
 #[derive(Debug)]
@@ -685,134 +503,118 @@ enum Op {
     RefreshAuthority,
 }
 
-#[cfg(test)]
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        3 => (1..=MAX_HEIGHT, 0..8u32, 1..300u64)
-            .prop_map(|(low, len, size)| Op::Extend { low, len, size }),
-        4 => (0..3u64, 1..=MAX_HEIGHT, 0..8u32, 1..6usize, 0..600u64).prop_map(
-            |(session, low, span, max_count, max_bytes)| Op::Take {
-                session,
-                low,
-                span,
-                max_count,
-                max_bytes,
-            }
-        ),
-        3 => any::<usize>().prop_map(Op::Publish),
-        1 => any::<usize>().prop_map(Op::ReturnUnpublished),
-        2 => (any::<usize>(), any::<usize>()).prop_map(|(claim, at)| Op::Receive(claim, at)),
-        2 => any::<usize>().prop_map(Op::Return),
-        1 => (any::<usize>(), any::<usize>()).prop_map(|(claim, at)| Op::Revoke(claim, at)),
-        1 => (0..=MAX_HEIGHT).prop_map(Op::AdvanceFloor),
-        1 => (0..=MAX_HEIGHT).prop_map(Op::Reset),
-        1 => Just(Op::RefreshAuthority),
-    ]
-}
-
-/// Compare every observation of the state with the model.
-fn check(state: &WorkQueueState, model: &Model) {
-    for raw in 0..=MAX_HEIGHT + 1 {
-        let pending = state.pending_contains(height(raw));
-        let in_flight = state.in_flight_contains(height(raw));
-        assert!(
-            !(pending && in_flight),
-            "{PROPERTY}: height {raw} is in both maps"
-        );
-        let Some(entry) = model.entries.get(&raw) else {
-            assert!(
-                !pending && !in_flight,
-                "{PROPERTY}: height {raw} should be absent"
-            );
-            continue;
-        };
-        assert_eq!(
-            in_flight, entry.in_flight,
-            "{PROPERTY}: location of height {raw}"
-        );
-        assert_eq!(
-            pending, !entry.in_flight,
-            "{PROPERTY}: location of height {raw}"
-        );
-        let item = state
-            .item_for_height(height(raw))
-            .unwrap_or_else(|| panic!("{PROPERTY}: a queued height has an item"));
-        assert_eq!(item.owner, entry.owner, "{PROPERTY}: owner of height {raw}");
-        assert_eq!(
-            item.provisional, entry.provisional,
-            "{PROPERTY}: publication of {raw}"
-        );
-        assert_eq!(item.scope, entry.scope, "{PROPERTY}: scope of height {raw}");
-        assert_eq!(
-            item.estimated_bytes, entry.estimate,
-            "{PROPERTY}: estimate of {raw}"
-        );
-        assert_eq!(
-            item.budget.reserved_charge(),
-            entry.charge,
-            "{PROPERTY}: charge of {raw}"
-        );
-        assert_eq!(
-            state.owner_for_height(height(raw)),
-            entry.owner.filter(|_| !entry.provisional),
-            "{PROPERTY}: published owner of height {raw}"
-        );
-    }
-
-    let total: u64 = model.entries.values().map(|entry| entry.charge).sum();
-    assert_eq!(state.reserved_bytes(), total, "{PROPERTY}");
-    assert_eq!(state.reserved_bytes_scanned(), total, "{PROPERTY}");
-    let above: Vec<_> = model
-        .entries
-        .iter()
-        .filter(|(raw, entry)| **raw > model.floor && entry.in_flight && entry.charge > 0)
-        .map(|(_, entry)| entry.charge)
-        .collect();
-    assert_eq!(
-        state.reserved_above(height(model.floor)),
-        (
-            above.iter().sum(),
-            u64::try_from(above.len()).expect("the model holds few heights")
-        ),
-        "{PROPERTY}"
-    );
-
-    let mut unsettled = 0;
-    for (owner, ledger) in &model.ledgers {
-        let outstanding: u64 = model
-            .entries
-            .values()
-            .filter(|entry| entry.owner == Some(*owner))
-            .map(|entry| entry.charge)
-            .sum();
-        assert_eq!(
-            ledger.charged,
-            ledger.settled + outstanding,
-            "{PROPERTY}: owner {owner:?} conserves its charge"
-        );
-        unsettled += ledger.charged - ledger.settled;
-    }
-    assert_eq!(state.reserved_bytes(), unsettled, "{PROPERTY}");
-    assert_eq!(actual_view(state), expected_view(model), "{PROPERTY}: view");
+/// What the history chose and what the machine reported, for the checks that
+/// follow from them.
+#[derive(Debug, Default)]
+struct Bookkeeping {
+    /// Generation of the authority the next extend installs.
+    generation: u64,
+    claims: Vec<Claim>,
+    /// Heights whose reservation a receipt ended, by the receiving owner.
+    received: Vec<(BodyWorkOwner, u32)>,
+    /// Bytes publications moved into the ledger.
+    charged: u64,
+    /// Bytes transitions reported leaving the ledger.
+    settled: u64,
 }
 
 fn pick<'a>(claims: &'a [Claim], index: &usize) -> Option<&'a Claim> {
     (!claims.is_empty()).then(|| &claims[*index % claims.len()])
 }
 
-fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>, op: Op) {
+/// Every queued item, by height, with whether it is in flight.
+fn items(state: &WorkQueueState) -> BTreeMap<u32, (bool, WorkItem)> {
+    state
+        .pending
+        .iter()
+        .map(|(height, item)| (height.0, (false, *item)))
+        .chain(
+            state
+                .in_flight
+                .iter()
+                .map(|(height, item)| (height.0, (true, *item))),
+        )
+        .collect()
+}
+
+/// The charges of the items `removed` selects from `before`.
+fn charges(before: &BTreeMap<u32, (bool, WorkItem)>, removed: impl Fn(u32) -> bool) -> u64 {
+    before
+        .iter()
+        .filter(|(raw, _)| removed(**raw))
+        .map(|(_, (_, item))| item.budget.reserved_charge())
+        .sum()
+}
+
+/// Check a floor advance or reset: it removed exactly the selected heights,
+/// released their charges, and reported a revocation only for dropped
+/// in-flight work, and always when a dropped height held a charge.
+fn check_removal(
+    before: &BTreeMap<u32, (bool, WorkItem)>,
+    state: &WorkQueueState,
+    delta: WorkDelta,
+    removed: impl Fn(u32) -> bool,
+) {
+    let after = items(state);
+    for (raw, item) in before {
+        assert_eq!(
+            after.get(raw),
+            (!removed(*raw)).then_some(item),
+            "{PROPERTY}: height {raw} after a removal"
+        );
+    }
+    assert_eq!(
+        delta.released_bytes,
+        charges(before, &removed),
+        "{PROPERTY}: removal releases each dropped charge"
+    );
+    let dropped_in_flight = before
+        .iter()
+        .any(|(raw, (in_flight, _))| *in_flight && removed(*raw));
+    assert!(
+        !delta.wake.revocation || dropped_in_flight,
+        "{PROPERTY}: a removal without in-flight work revokes"
+    );
+    assert!(
+        delta.released_bytes == 0 || delta.wake.revocation,
+        "{PROPERTY}: dropping a charged height does not revoke"
+    );
+    assert!(!delta.wake.available, "{PROPERTY}");
+}
+
+/// Apply `op`. Returns the bytes it moved into and out of the ledger.
+fn apply(state: &mut WorkQueueState, book: &mut Bookkeeping, op: Op) -> (u64, u64) {
+    let before = items(state);
     match op {
         Op::Extend { low, len, size } => {
-            let expected = model.extend(low, len, size);
-            let scope = model.authority();
+            let scope = authority(book.generation);
+            let offered: Vec<u32> = (low..=(low + len).min(MAX_HEIGHT)).collect();
+            let fresh: Vec<u32> = offered
+                .iter()
+                .copied()
+                .filter(|raw| *raw > state.floor.0 && !before.contains_key(raw))
+                .collect();
             let (inserted, wake) = state.extend(
                 scope,
-                (low..=(low + len).min(MAX_HEIGHT))
-                    .map(|raw| (height(raw), hash(raw), confirmed(size))),
+                offered
+                    .iter()
+                    .map(|raw| (height(*raw), hash(*raw), confirmed(size))),
             );
-            assert_eq!(inserted, expected, "{PROPERTY}");
-            assert_eq!(wake.available, expected > 0, "{PROPERTY}");
+            assert_eq!(
+                inserted,
+                fresh.len(),
+                "{PROPERTY}: extend inserts each new height above the floor"
+            );
+            for raw in fresh {
+                let item = state.pending.get(&height(raw));
+                assert!(
+                    item.is_some_and(|item| item.scope == scope && item.estimated_bytes == size),
+                    "{PROPERTY}: inserted {raw} carries the offered scope and estimate"
+                );
+            }
+            assert_eq!(wake.available, inserted > 0, "{PROPERTY}");
             assert!(!wake.revocation, "{PROPERTY}");
+            (0, 0)
         }
         Op::Take {
             session,
@@ -822,11 +624,16 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
             max_bytes,
         } => {
             let high = (low + span).min(MAX_HEIGHT);
-            let request = u64::try_from(claims.len() + 1)
+            let request = u64::try_from(book.claims.len() + 1)
                 .ok()
                 .and_then(NonZeroU64::new)
                 .expect("request ids start at one");
-            let expected = model.take(low, high, max_count, max_bytes, (session, request));
+            let eligible: Vec<u32> = before
+                .range(low..=high)
+                .filter(|(_, (in_flight, _))| !in_flight)
+                .map(|(raw, _)| *raw)
+                .collect();
+            let current = state.current_authority;
             let items = state.take_budgeted(
                 height(low),
                 height(high),
@@ -834,128 +641,263 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
                 max_bytes,
                 (session, request),
             );
-            let taken: Vec<_> = items.iter().map(|(height, _)| height.0).collect();
-            assert_eq!(taken, expected, "{PROPERTY}: take selects the model's run");
+            let taken: Vec<u32> = items.iter().map(|(height, _)| height.0).collect();
+            assert_eq!(
+                taken.first(),
+                eligible.first(),
+                "{PROPERTY}: a take starts at the lowest pending height in range"
+            );
+            assert!(taken.len() <= max_count, "{PROPERTY}: take count");
+            assert!(
+                taken.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "{PROPERTY}: a take is one contiguous run"
+            );
+            let estimates: u64 = items.iter().map(|(_, item)| item.estimated_bytes).sum();
+            assert!(
+                taken.len() <= 1 || estimates <= max_bytes,
+                "{PROPERTY}: a take of several heights stays within its byte cap"
+            );
+            assert!(
+                taken
+                    .iter()
+                    .all(|raw| before[raw].1.scope == before[&taken[0]].1.scope),
+                "{PROPERTY}: a take spans one scope"
+            );
+            for (height, item) in &items {
+                let owner = current.map(|scope| scope.bind(session, request));
+                assert_eq!(
+                    item.owner, owner,
+                    "{PROPERTY}: a take binds the current authority's owner"
+                );
+                assert_eq!(
+                    state.in_flight.get(height),
+                    Some(item),
+                    "{PROPERTY}: taken {height:?} is in flight as returned"
+                );
+                assert!(item.provisional, "{PROPERTY}: a take is provisional");
+            }
             if let Some(&(_, item)) = items.first() {
                 let owner = item
                     .owner
                     .unwrap_or_else(|| panic!("{PROPERTY}: a request take binds an owner"));
-                claims.push(Claim {
+                book.claims.push(Claim {
                     owner,
                     raw_heights: taken,
                     items,
                 });
             }
+            (0, 0)
         }
         Op::Publish(index) => {
-            let Some(claim) = pick(claims, &index) else {
-                return;
+            let Some(claim) = pick(&book.claims, &index) else {
+                return (0, 0);
             };
-            let current = model.is_unpublished(claim.owner, &claim.raw_heights);
-            assert_eq!(
-                state.is_unpublished_claim(claim.owner, &claim.items),
-                current,
-                "{PROPERTY}"
-            );
-            if current {
-                let expected = model.publish(claim.owner, &claim.raw_heights);
-                assert_eq!(
-                    state.publish_claim(&claim.items),
-                    Some(expected),
-                    "{PROPERTY}"
-                );
+            if !state.is_unpublished_claim(claim.owner, &claim.items) {
+                return (0, 0);
             }
+            let estimates = claim
+                .items
+                .iter()
+                .map(|(_, item)| item.estimated_bytes)
+                .sum();
+            let transferred = state.publish_claim(&claim.items);
             assert_eq!(
-                state.is_published_claim(claim.owner, heights_of(&claim.items)),
-                model.is_published(claim.owner, &claim.raw_heights),
-                "{PROPERTY}"
+                transferred,
+                Some(estimates),
+                "{PROPERTY}: publication transfers the take's estimates"
             );
+            assert!(
+                state.is_published_claim(claim.owner, heights_of(&claim.items)),
+                "{PROPERTY}: a published claim holds its heights"
+            );
+            (estimates, 0)
         }
         Op::ReturnUnpublished(index) => {
-            let Some(claim) = pick(claims, &index) else {
-                return;
+            let Some(claim) = pick(&book.claims, &index) else {
+                return (0, 0);
             };
-            model.return_unpublished(claim.owner, &claim.raw_heights);
             state.return_unpublished(&claim.items);
+            let after = items(state);
+            for (raw, (in_flight, item)) in &before {
+                let held = *in_flight && item.owner == Some(claim.owner) && item.provisional;
+                if held && claim.raw_heights.contains(raw) {
+                    assert!(
+                        after
+                            .get(raw)
+                            .is_some_and(|(in_flight, item)| !in_flight && item.owner.is_none()),
+                        "{PROPERTY}: the claim's provisional {raw} returns to pending"
+                    );
+                } else {
+                    assert_eq!(
+                        after.get(raw),
+                        Some(&(*in_flight, *item)),
+                        "{PROPERTY}: returning a claim leaves {raw} alone"
+                    );
+                }
+            }
+            (0, 0)
         }
         Op::Receive(index, at) => {
-            let Some(claim) = pick(claims, &index) else {
-                return;
+            let Some(claim) = pick(&book.claims, &index) else {
+                return (0, 0);
             };
             let raw = claim.raw_heights[at % claim.raw_heights.len()];
-            let expected = model.receive(claim.owner, raw);
+            let reserved = before.get(&raw).and_then(|(in_flight, item)| {
+                (*in_flight && item.owner == Some(claim.owner) && item.budget.is_reserved())
+                    .then_some(item.budget.reserved_charge())
+            });
             let ended = state.end_reservation_at_receipt(claim.owner, height(raw), false);
-            assert_eq!(ended, expected, "{PROPERTY}");
+            assert_eq!(
+                ended, reserved,
+                "{PROPERTY}: a receipt ends exactly the owner's reservation"
+            );
+            if ended.is_some() {
+                book.received.push((claim.owner, raw));
+            }
+            (0, ended.unwrap_or(0))
         }
         Op::Return(index) => {
-            let Some(claim) = pick(claims, &index) else {
-                return;
+            let Some(claim) = pick(&book.claims, &index) else {
+                return (0, 0);
             };
-            let heights: BTreeSet<_> = claim.raw_heights.iter().copied().collect();
-            return_owned(state, model, claim.owner, heights);
+            let heights = claim.raw_heights.iter().copied().collect();
+            let owner = claim.owner;
+            (0, return_owned(state, book, &before, owner, heights))
         }
         Op::Revoke(index, at) => {
-            let Some(claim) = pick(claims, &index) else {
-                return;
+            let Some(claim) = pick(&book.claims, &index) else {
+                return (0, 0);
             };
             let raw = claim.raw_heights[at % claim.raw_heights.len()];
-            return_owned(state, model, claim.owner, BTreeSet::from([raw]));
+            let owner = claim.owner;
+            (
+                0,
+                return_owned(state, book, &before, owner, BTreeSet::from([raw])),
+            )
         }
         Op::AdvanceFloor(floor) => {
-            let (released, revocation) = model.advance_floor(floor);
+            let floor = state.floor.0.max(floor);
             let delta = state.advance_floor(height(floor));
-            assert_eq!(delta.released_bytes, released, "{PROPERTY}");
-            assert_eq!(delta.wake.revocation, revocation, "{PROPERTY}");
-            assert!(!delta.wake.available, "{PROPERTY}");
+            check_removal(&before, state, delta, |raw| raw <= floor);
+            (0, delta.released_bytes)
         }
         Op::Reset(floor) => {
-            let (released, revocation) = model.reset_above(floor);
+            book.generation += 1;
             let delta = state.reset_above(height(floor));
-            assert_eq!(delta.released_bytes, released, "{PROPERTY}");
-            assert_eq!(delta.wake.revocation, revocation, "{PROPERTY}");
-            assert!(!delta.wake.available, "{PROPERTY}");
+            check_removal(&before, state, delta, |raw| raw > floor);
+            (0, delta.released_bytes)
         }
         Op::RefreshAuthority => {
-            model.refresh_authority();
-            let wake = state.refresh_authority(model.authority());
+            book.generation += 1;
+            let scope = authority(book.generation);
+            let wake = state.refresh_authority(scope);
             assert!(wake.available, "{PROPERTY}");
+            let after = items(state);
+            for (raw, (in_flight, item)) in &before {
+                let expected = WorkItem {
+                    scope: if *in_flight { item.scope } else { scope },
+                    ..*item
+                };
+                assert_eq!(
+                    after.get(raw),
+                    Some(&(*in_flight, expected)),
+                    "{PROPERTY}: a refresh rescopes only pending {raw}"
+                );
+            }
+            (0, 0)
         }
     }
 }
 
+/// Return `owner`'s `heights` and check the outcome. Returns the released bytes.
 fn return_owned(
     state: &mut WorkQueueState,
-    model: &mut Model,
+    book: &Bookkeeping,
+    before: &BTreeMap<u32, (bool, WorkItem)>,
     owner: BodyWorkOwner,
-    raw_heights: BTreeSet<u32>,
-) {
-    let expected = model.return_owned(owner, &raw_heights);
-    let (outcome, wake) =
-        state.return_owned(owner, raw_heights.iter().copied().map(height).collect());
+    heights: BTreeSet<u32>,
+) -> u64 {
+    let (outcome, wake) = state.return_owned(owner, heights.iter().copied().map(height).collect());
+    let counted = outcome.returned_count
+        + outcome.committed_count
+        + outcome.already_pending_count
+        + outcome.released_count
+        + outcome.missing_count;
     assert_eq!(
-        ModelReturn {
-            released_bytes: outcome.released_bytes,
-            returned: outcome.returned_count,
-            committed: outcome.committed_count,
-            already_pending: outcome.already_pending_count,
-            received: outcome.released_count,
-            missing: outcome.missing_count,
-        },
-        expected,
-        "{PROPERTY}"
+        counted,
+        u64::try_from(heights.len()).expect("few heights"),
+        "{PROPERTY}: a return classifies each height once"
     );
     assert_eq!(
         outcome.min_height,
-        raw_heights.first().copied().map(height),
+        heights.first().copied().map(height),
         "{PROPERTY}"
     );
     assert_eq!(
         outcome.max_height,
-        raw_heights.last().copied().map(height),
+        heights.last().copied().map(height),
         "{PROPERTY}"
     );
-    assert_eq!(wake.available, expected.returned > 0, "{PROPERTY}");
+    assert_eq!(wake.available, outcome.returned_count > 0, "{PROPERTY}");
     assert!(!wake.revocation, "{PROPERTY}");
+    let owned = |raw: u32| {
+        heights.contains(&raw)
+            && before
+                .get(&raw)
+                .is_some_and(|(in_flight, item)| *in_flight && item.owner == Some(owner))
+    };
+    assert_eq!(
+        outcome.released_bytes,
+        charges(before, owned),
+        "{PROPERTY}: a return releases the owner's charges on its heights"
+    );
+    let after = items(state);
+    for (raw, entry) in before {
+        let current = after.get(raw);
+        if !owned(*raw) {
+            assert_eq!(
+                current,
+                Some(entry),
+                "{PROPERTY}: a return by {owner:?} changed {raw}, which it did not own"
+            );
+            continue;
+        }
+        assert!(
+            current.is_none_or(|(_, item)| !item.budget.is_reserved()),
+            "{PROPERTY}: {raw} keeps a reservation after its owner returned it"
+        );
+        if book.received.contains(&(owner, *raw)) {
+            assert!(
+                current.is_none_or(|(in_flight, _)| *in_flight),
+                "{PROPERTY}: received {raw} returned to pending"
+            );
+        }
+    }
+    outcome.released_bytes
+}
+
+/// Check the machine's invariants, and that draining the state from here
+/// releases exactly the ledger's total.
+fn check(state: &WorkQueueState) {
+    with_property(PROPERTY, || {
+        state.assert_invariants();
+        if state.ledger_fault().is_some() {
+            return;
+        }
+        let mut drained = state.clone();
+        let reserved = drained.reserved_bytes();
+        let delta = drained.reset_above(height(0));
+        assert_eq!(
+            delta.released_bytes, reserved,
+            "a drain releases every charge"
+        );
+        assert_eq!(drained.reserved_bytes(), 0, "a drain empties the ledger");
+        assert_eq!(
+            drained.pending_len() + drained.in_flight_len(),
+            0,
+            "a drain empties the queue"
+        );
+    });
 }
 
 const PROPERTY: &str = "block/work-ownership";
@@ -979,7 +921,7 @@ pub struct WorkOwnershipEntry {
     pub charge: u64,
 }
 
-/// The actual owner state or the independent model's expected state.
+/// The owner state read from the machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkOwnershipView {
     /// Current download floor.
@@ -988,9 +930,9 @@ pub struct WorkOwnershipView {
     pub authority: Option<BodyWorkAuthority>,
     /// Items sorted by height and location. Duplicate heights remain visible.
     pub items: Vec<WorkOwnershipEntry>,
-    /// Maintained total, or the model's independently summed charges.
+    /// Maintained total.
     pub reserved: u64,
-    /// Charges read from the actual maps, or summed from model entries.
+    /// Charges summed from the items.
     pub scanned: u64,
     /// Reserved bytes and items above the floor.
     pub above_floor: (u64, u64),
@@ -1001,14 +943,14 @@ pub struct WorkOwnershipView {
 pub enum WorkOwnershipPhase {
     /// Applying an input and checking its immediate outcome.
     Transition,
-    /// Checking the resulting state against the independent model.
+    /// Checking the resulting state's invariants.
     Invariant,
 }
 
 /// A checked property failure or an unexpected driver panic.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkOwnershipFailure {
-    /// True only when the independent checker named its property.
+    /// True only when the checker named its property.
     pub property_failure: bool,
     /// The phase that stopped the transition.
     pub phase: WorkOwnershipPhase,
@@ -1035,19 +977,6 @@ impl WorkOwnershipFailure {
     }
 }
 
-/// A panic payload's text.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| {
-            payload
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-        })
-        .unwrap_or_else(|| "non-string panic payload".to_owned())
-}
-
 /// Semantic evidence from one operation in a decoder-v1 history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkOwnershipStep {
@@ -1057,8 +986,6 @@ pub struct WorkOwnershipStep {
     pub input: Vec<u8>,
     /// State read from the real pure owner after the operation or interruption.
     pub actual: WorkOwnershipView,
-    /// State derived independently by the model.
-    pub expected: WorkOwnershipView,
     /// The failure that interrupted this operation, if any.
     pub failure: Option<WorkOwnershipFailure>,
 }
@@ -1104,52 +1031,16 @@ fn actual_view(state: &WorkQueueState) -> WorkOwnershipView {
     }
 }
 
-fn expected_view(model: &Model) -> WorkOwnershipView {
-    let items: Vec<_> = model
-        .entries
-        .iter()
-        .map(|(height, entry)| WorkOwnershipEntry {
-            height: *height,
-            in_flight: entry.in_flight,
-            scope: entry.scope,
-            owner: entry.owner,
-            provisional: entry.provisional,
-            estimate: entry.estimate,
-            charge: entry.charge,
-        })
-        .collect();
-    let reserved = items.iter().map(|item| item.charge).sum();
-    let above: Vec<_> = items
-        .iter()
-        .filter(|item| item.height > model.floor && item.in_flight && item.charge > 0)
-        .collect();
-    WorkOwnershipView {
-        floor: model.floor,
-        authority: model.current_authority,
-        reserved,
-        scanned: reserved,
-        above_floor: (
-            above.iter().map(|item| item.charge).sum(),
-            u64::try_from(above.len()).expect("the model holds few heights"),
-        ),
-        items,
-    }
-}
-
 /// Capture decoder-v1 operations without changing the decoder or starting a runtime.
 /// The history contains at most 128 steps. Driver panics remain distinct from property failures.
 pub fn trace_work_ownership_bytes(data: &[u8]) -> WorkOwnershipHistory {
-    trace_with(data, |_, _| {})
+    trace_with(data, |_| {})
 }
 
-fn trace_with(
-    data: &[u8],
-    after_step: impl FnMut(&mut WorkQueueState, &Model),
-) -> WorkOwnershipHistory {
+fn trace_with(data: &[u8], after_step: impl FnMut(&mut WorkQueueState)) -> WorkOwnershipHistory {
     let mut steps = Vec::new();
-    let input = &data[..data.len().min(512)];
+    let input = &data[..data.len().min(MAX_HISTORY_BYTES)];
     let mut capture = |state: &WorkQueueState,
-                       model: &Model,
                        step: usize,
                        phase: WorkOwnershipPhase,
                        failure: Option<&(dyn std::any::Any + Send)>| {
@@ -1159,7 +1050,6 @@ fn trace_with(
             step,
             input: input[(step - 1) * 4..(step * 4).min(input.len())].to_vec(),
             actual: actual_view(state),
-            expected: expected_view(model),
             failure,
         });
     };
@@ -1170,7 +1060,7 @@ fn trace_with(
 /// Applicable operations and conserved bytes in a decoder-v1 work history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct WorkOwnershipReplaySummary {
-    /// Operations checked against the independent ledger.
+    /// Operations checked.
     pub transitions: usize,
     /// Nonempty takes that created a claim.
     pub claims: usize,
@@ -1178,154 +1068,153 @@ pub struct WorkOwnershipReplaySummary {
     pub resets: usize,
     /// Returns whose claim no longer owns all its heights.
     pub stale_returns: usize,
-    /// Bytes charged by all owners across the history.
+    /// Bytes publications moved into the ledger across the history.
     pub charged: u64,
-    /// Bytes settled by all owners across the history.
+    /// Bytes transitions reported leaving the ledger across the history.
     pub settled: u64,
 }
 
-/// Decode at most 512 bytes of decoder-v1 quadruples.
+/// Decode at most [`MAX_HISTORY_BYTES`] bytes of decoder-v1 quadruples.
 fn decode(data: &[u8]) -> impl Iterator<Item = Op> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        match a % 10 {
-            0 => Op::Extend {
-                low: u32::from(b) % MAX_HEIGHT + 1,
-                len: u32::from(c % 8),
-                size: u64::from(d) + 1,
-            },
-            1 => Op::Take {
-                session: u64::from(a / 10 % 3),
-                low: u32::from(b) % MAX_HEIGHT + 1,
-                span: u32::from(c % 8),
-                max_count: usize::from(c / 8 % 6) + 1,
-                max_bytes: u64::from(d) * 100,
-            },
-            2 => Op::Publish(usize::from(b)),
-            3 => Op::ReturnUnpublished(usize::from(b)),
-            4 => Op::Receive(usize::from(b), usize::from(c)),
-            5 => Op::Return(usize::from(b)),
-            6 => Op::Revoke(usize::from(b), usize::from(c)),
-            7 => Op::AdvanceFloor(u32::from(b) % (MAX_HEIGHT + 1)),
-            8 => Op::Reset(u32::from(b) % (MAX_HEIGHT + 1)),
-            _ => Op::RefreshAuthority,
-        }
-    })
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks(4)
+        .map(|chunk| {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            let d = chunk.get(3).copied().unwrap_or(0);
+            match a % 10 {
+                0 => Op::Extend {
+                    low: u32::from(b) % MAX_HEIGHT + 1,
+                    len: u32::from(c % 8),
+                    size: u64::from(d) + 1,
+                },
+                1 => Op::Take {
+                    session: u64::from(a / 10 % 3),
+                    low: u32::from(b) % MAX_HEIGHT + 1,
+                    span: u32::from(c % 8),
+                    max_count: usize::from(c / 8 % 6) + 1,
+                    max_bytes: u64::from(d) * 100,
+                },
+                2 => Op::Publish(usize::from(b)),
+                3 => Op::ReturnUnpublished(usize::from(b)),
+                4 => Op::Receive(usize::from(b), usize::from(c)),
+                5 => Op::Return(usize::from(b)),
+                6 => Op::Revoke(usize::from(b), usize::from(c)),
+                7 => Op::AdvanceFloor(u32::from(b) % (MAX_HEIGHT + 1)),
+                8 => Op::Reset(u32::from(b) % (MAX_HEIGHT + 1)),
+                _ => Op::RefreshAuthority,
+            }
+        })
 }
 
 #[cfg(test)]
 fn run(
     ops: impl IntoIterator<Item = Op>,
-    after_step: impl FnMut(&mut WorkQueueState, &Model),
+    after_step: impl FnMut(&mut WorkQueueState),
 ) -> WorkOwnershipReplaySummary {
-    match run_captured(ops, after_step, &mut |_, _, _, _, _| {}) {
+    match run_captured(ops, after_step, &mut |_, _, _, _| {}) {
         Ok(summary) => summary,
         Err(failure) => std::panic::resume_unwind(failure),
     }
 }
 
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the work
+/// state. Each quadruple is one input.
+#[cfg(test)]
+fn replay_work_ownership_bytes(data: &[u8]) -> WorkOwnershipReplaySummary {
+    run(decode(data), |_| {})
+}
+
 fn run_captured(
     ops: impl IntoIterator<Item = Op>,
-    mut after_step: impl FnMut(&mut WorkQueueState, &Model),
+    mut after_step: impl FnMut(&mut WorkQueueState),
     capture: &mut impl FnMut(
         &WorkQueueState,
-        &Model,
         usize,
         WorkOwnershipPhase,
         Option<&(dyn std::any::Any + Send)>,
     ),
 ) -> Result<WorkOwnershipReplaySummary, Box<dyn std::any::Any + Send>> {
     let mut state = new_state();
-    let mut model = Model::default();
-    let mut claims = Vec::new();
+    let mut book = Bookkeeping::default();
     let mut summary = WorkOwnershipReplaySummary::default();
     for op in ops {
         summary.transitions += 1;
         summary.resets += usize::from(matches!(op, Op::Reset(_)));
         if let Op::Return(index) = &op {
-            if let Some(claim) = pick(&claims, index) {
-                summary.stale_returns += usize::from(claim.raw_heights.iter().any(|height| {
-                    model
-                        .entries
-                        .get(height)
-                        .is_none_or(|entry| entry.owner != Some(claim.owner))
+            if let Some(claim) = pick(&book.claims, index) {
+                summary.stale_returns += usize::from(claim.raw_heights.iter().any(|raw| {
+                    state
+                        .item_for_height(height(*raw))
+                        .is_none_or(|item| item.owner != Some(claim.owner))
                 }));
             }
         }
         let mut phase = WorkOwnershipPhase::Transition;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply(&mut state, &mut model, &mut claims, op);
+            let reserved = state.reserved_bytes();
+            let (charged, settled) = apply(&mut state, &mut book, op);
+            if state.ledger_fault().is_none() {
+                assert_eq!(
+                    state.reserved_bytes(),
+                    reserved + charged - settled,
+                    "{PROPERTY}: the ledger moves by the reported bytes"
+                );
+            }
+            book.charged += charged;
+            book.settled += settled;
             phase = WorkOwnershipPhase::Invariant;
-            after_step(&mut state, &model);
-            check(&state, &model);
+            after_step(&mut state);
+            check(&state);
         }));
         capture(
             &state,
-            &model,
             summary.transitions,
             phase,
             result.as_ref().err().map(|error| &**error),
         );
         result?;
     }
-    summary.claims = claims.len();
-    summary.charged = model.ledgers.values().map(|ledger| ledger.charged).sum();
-    summary.settled = model.ledgers.values().map(|ledger| ledger.settled).sum();
+    summary.claims = book.claims.len();
+    summary.charged = book.charged;
+    summary.settled = book.settled;
     Ok(summary)
 }
 
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-    #[test]
-    fn work_ownership_and_charges_match_an_independent_ledger(ops in prop::collection::vec(op(), 1..80)) {
-        run(ops, |_, _| {});
-    }
-
-    #[test]
-    fn work_bytes_match_the_same_ledger(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        run(decode(&bytes), |_, _| {});
-    }
-}
-
+/// Extends, takes and publishes a claim, resets, then takes and publishes a
+/// replacement; the stale claim's return leaves the replacement, which
+/// receives and returns.
 #[cfg(test)]
 const WITNESS: &[u8] = &[
     0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 9, 1, 0, 0, 1, 2, 1, 0, 0, 5, 0, 0, 0,
     4, 1, 0, 0, 5, 1, 0, 0,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn work_witness_exercises_reset_stale_return_and_settlement() {
-    let summary = run(decode(WITNESS), |_, _| {});
-    assert_eq!(
-        summary,
-        WorkOwnershipReplaySummary {
+#[cfg(test)]
+mod ownership_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_work_ownership_bytes,
+        target: "block_work_ownership",
+        decoder: 1,
+        witness: WITNESS => WorkOwnershipReplaySummary {
             transitions: 10,
             claims: 2,
             resets: 1,
             stale_returns: 1,
             charged: 20,
             settled: 20,
-        }
-    );
-    assert_eq!(
-        run(decode(&[]), |_, _| {}),
-        WorkOwnershipReplaySummary::default()
-    );
-    println!("tier=Machine target=block_work_ownership decoder=1 {summary:?}");
+        },
+    }
 }
 
 #[test]
 #[should_panic(expected = "block/work-ownership")]
 fn work_witness_rejects_lost_charge() {
-    run(decode(WITNESS), |state, _| {
+    run(decode(WITNESS), |state| {
         state.reserved_bytes = 0;
     });
 }
@@ -1333,7 +1222,7 @@ fn work_witness_rejects_lost_charge() {
 #[test]
 #[should_panic(expected = "block/work-ownership")]
 fn work_witness_rejects_lost_owner() {
-    run(decode(WITNESS), |state, _| {
+    run(decode(WITNESS), |state| {
         for item in state.in_flight.values_mut() {
             item.owner = None;
         }
@@ -1341,18 +1230,18 @@ fn work_witness_rejects_lost_owner() {
 }
 
 #[test]
-fn semantic_history_keeps_inputs_and_independent_states() {
+fn semantic_history_keeps_inputs_and_states() {
     let history = trace_work_ownership_bytes(WITNESS);
-    assert_eq!(history.summary, Some(run(decode(WITNESS), |_, _| {})));
+    assert_eq!(history.summary, Some(replay_work_ownership_bytes(WITNESS)));
     assert_eq!(history.steps.len(), 10);
     for (step, input) in history.steps.iter().zip(WITNESS.chunks(4)) {
         assert_eq!(step.input, input);
-        assert_eq!(step.actual, step.expected);
+        assert_eq!(step.actual.reserved, step.actual.scanned);
         assert!(step.failure.is_none());
     }
     let short = trace_work_ownership_bytes(&[0, 0]);
     assert_eq!(short.steps[0].input, [0, 0]);
-    assert_eq!(short.steps[0].actual, short.steps[0].expected);
+    assert!(short.steps[0].failure.is_none());
     let empty = trace_work_ownership_bytes(&[]);
     assert!(empty.steps.is_empty());
     assert_eq!(empty.summary, Some(WorkOwnershipReplaySummary::default()));
@@ -1360,7 +1249,7 @@ fn semantic_history_keeps_inputs_and_independent_states() {
 
 #[test]
 fn semantic_history_retains_the_first_property_failure() {
-    let history = trace_with(WITNESS, |state, _| state.reserved_bytes = 0);
+    let history = trace_with(WITNESS, |state| state.reserved_bytes = 0);
     assert!(history.summary.is_none());
     let last = history.steps.last().unwrap();
     let failure = last.failure.as_ref().unwrap();
@@ -1368,7 +1257,7 @@ fn semantic_history_retains_the_first_property_failure() {
     assert_eq!(failure.phase, WorkOwnershipPhase::Invariant);
     assert!(failure.message.contains(PROPERTY));
     assert_eq!(last.actual.reserved, 0);
-    assert!(last.expected.reserved > 0);
+    assert!(last.actual.scanned > 0);
     assert!(history.steps[..history.steps.len() - 1]
         .iter()
         .all(|step| step.failure.is_none()));
@@ -1376,7 +1265,7 @@ fn semantic_history_retains_the_first_property_failure() {
 
 #[test]
 fn semantic_history_keeps_driver_failures_distinct() {
-    let history = trace_with(WITNESS, |_, _| {
+    let history = trace_with(WITNESS, |_| {
         panic!("driver failed while collecting block/work-ownership")
     });
     assert!(history.summary.is_none());
@@ -1399,8 +1288,8 @@ fn semantic_capture_runs_when_an_input_panics() {
             len: 1,
             size: 1,
         }],
-        |_, _| {},
-        &mut |_, _, step, phase, error| {
+        |_| {},
+        &mut |_, step, phase, error| {
             assert_eq!(step, 1);
             assert_eq!(phase, WorkOwnershipPhase::Transition);
             assert!(error.is_some());

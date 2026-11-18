@@ -1,5 +1,6 @@
 //! Cadence: bucket arithmetic, exemptions, the conformant-sender guarantee,
-//! and the sender's one-frame bound.
+//! and the sender's one-frame bound. Named tests pin each rule; one proptest
+//! compares the ledger with a naive interval-stepping bucket.
 
 use std::time::Duration;
 
@@ -399,7 +400,9 @@ fn ledger_op() -> impl Strategy<Value = LedgerOp> {
     ]
 }
 
-/// An independent bucket that steps one refill interval at a time.
+/// A naive bucket that steps one refill interval at a time, where the ledger
+/// divides. It tracks only the token count; the low-bucket threshold is pinned
+/// by `a_charge_reports_a_low_bucket_below_a_quarter_of_capacity`.
 struct BucketModel {
     cadence: Cadence,
     tokens: u32,
@@ -421,7 +424,7 @@ impl BucketModel {
 proptest! {
     /// The ledger, charged at explicit instants, matches a bucket that steps
     /// one refill interval at a time: refills cap at capacity, pause credit
-    /// exceeds it, and each charge reports exhaustion and low buckets.
+    /// exceeds it, and a charge is admitted exactly when a token remains.
     #[test]
     fn the_ledger_matches_an_interval_stepping_bucket(
         capacity in 1u32..8,
@@ -451,13 +454,11 @@ proptest! {
             bucket.refill(now);
             match op {
                 LedgerOp::Charge { .. } => {
-                    let expected = if bucket.tokens == 0 {
-                        Charged::Exhausted
-                    } else {
+                    let admitted = matches!(ledger.charge(key, cadence, now), Charged::Admit { .. });
+                    prop_assert_eq!(admitted, bucket.tokens > 0);
+                    if admitted {
                         bucket.tokens -= 1;
-                        Charged::Admit { low: bucket.tokens < capacity / 4 }
-                    };
-                    prop_assert_eq!(ledger.charge(key, cadence, now), expected);
+                    }
                 }
                 LedgerOp::Pause { paused, .. } => {
                     ledger.credit_pause(key, cadence, paused, now);
@@ -468,10 +469,9 @@ proptest! {
                     }
                 }
             }
-            prop_assert_eq!(
-                ledger.buckets.get(&key).map(|bucket| bucket.tokens),
-                Some(bucket.tokens)
-            );
+            let actual = ledger.buckets.get(&key).expect("the first input created the bucket");
+            actual.assert_invariants(now);
+            prop_assert_eq!(actual.tokens, bucket.tokens);
         }
     }
 }
@@ -652,4 +652,29 @@ proptest! {
             u128::from(admitted) <= u128::from(METERED_RATE.receiver_depth(WINDOW)) + earned
         );
     }
+#[test]
+fn a_charge_reports_a_low_bucket_below_a_quarter_of_capacity() {
+    let cadence = Cadence {
+        capacity: 8,
+        refill_interval: secs(15),
+        send_interval: secs(30),
+    };
+    let key = CadenceKey {
+        layout: LAYOUT,
+        message_type: STATUS.message_type,
+    };
+    let now = Instant::now();
+    let mut ledger = CadenceLedger::default();
+    // Tokens left after each charge: 7, 6, 5, 4, 3, 2, 1, 0.
+    for (charge, low) in [false, false, false, false, false, false, true, true]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            ledger.charge(key, cadence, now),
+            Charged::Admit { low },
+            "charge {charge}"
+        );
+    }
+    assert_eq!(ledger.charge(key, cadence, now), Charged::Exhausted);
 }

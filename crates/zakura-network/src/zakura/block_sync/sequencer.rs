@@ -402,6 +402,51 @@ impl Sequencer {
         self.in_flight_submission_count
     }
 
+    /// Check the maintained totals against the maps they summarize, and that
+    /// every applying body is at or below the download floor.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        let applying_bytes = self
+            .applying
+            .values()
+            .map(|applying| applying.bytes)
+            .fold(0u64, u64::saturating_add);
+        assert_eq!(
+            self.applying_buffered_bytes, applying_bytes,
+            "applying bytes"
+        );
+        let attached = self
+            .applying
+            .values()
+            .filter(|applying| applying.submitted)
+            .count();
+        assert_eq!(
+            self.attached_submission_count, attached,
+            "attached submissions"
+        );
+        assert_eq!(
+            self.in_flight_submission_count,
+            self.in_flight_submissions.len(),
+            "in-flight submissions"
+        );
+        let submission_bytes = self
+            .in_flight_submissions
+            .values()
+            .map(|submission| submission.bytes)
+            .fold(0u64, u64::saturating_add);
+        assert_eq!(
+            self.in_flight_submission_bytes, submission_bytes,
+            "in-flight submission bytes"
+        );
+        if let Some((height, _)) = self.applying.last_key_value() {
+            assert!(
+                *height <= self.body_download_floor,
+                "{height:?} is applying above the floor {:?}",
+                self.body_download_floor
+            );
+        }
+    }
+
     /// Ground-truth recomputations of the in-flight-submission counters, for tests.
     #[cfg(test)]
     pub(super) fn in_flight_submission_count_scanned(&self) -> usize {

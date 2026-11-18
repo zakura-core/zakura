@@ -367,6 +367,16 @@ smoke-secs = 60
 args = ["-len_control=0"]
 timeout-secs = 1800
 
+# `discovery/composed` runs `discovery/wire`'s node with one peer whose
+# script, holds, links and node limits its 17-byte prefix composes, so the
+# target fuzzes the order, count and mix of the peer's exchanges.
+[[target]]
+package = "sim"
+name = "discovery_composed"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
 # `header-sync/wire` runs the header-sync node behind its real transport on
 # simulated QUIC. Its two-byte prefix picks a saved Plan's scenario or the
 # default one, so the target fuzzes the schedule of each.

@@ -6,10 +6,10 @@
 //! A shell script stands in for the libFuzzer binary. It takes the flags
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
-//! say: crash once or always, end at the abandonment limit, exit 0 early,
-//! exit 1 once after its stats file is complete, log 8 MiB, log a feedback
-//! line, hang in a merge, or leave a merge process behind that writes a
-//! crash file later. With a `stats` control file, it writes
+//! say: fail its startup probe, crash once or always, end at the
+//! abandonment limit, exit 0 early, exit 1 once after its stats file is
+//! complete, log 8 MiB, log a feedback line, hang in a merge, or leave a
+//! merge process behind that writes a crash file later. With a `stats` control file, it writes
 //! that file to `$ZAKURA_SIM_STATS` as its stats file, incomplete at start
 //! and complete at a clean exit, as a real target does. It exits when its
 //! parent does, as a real fuzzer does when a terminal's interrupt reaches
@@ -76,7 +76,16 @@ stats() {
 if [ -e "$control/feedback" ]; then
   echo "zakura-sim feedback: backend=stub version=7 features=1 mode=on" >&2
 fi
-if [ "$runs" = 0 ]; then exit 0; fi
+if [ "$runs" = 0 ]; then
+  if [ -e "$control/probe-crash" ]; then
+    # libFuzzer writes a failed input to its artifact prefix, relative to
+    # its working directory, which the control directory stands in for.
+    ( cd "$control" && printf 'probe' > "${prefix}crash-probe" )
+    echo "==$$==ERROR: LeakSanitizer: detected memory leaks" >&2
+    exit 1
+  fi
+  exit 0
+fi
 if [ "$merge" = 1 ]; then
   if [ -n "$ZAKURA_SIM_STATS" ]; then touch "$control/merge-had-stats"; fi
   if [ -e "$control/merge-orphan" ]; then
@@ -1176,6 +1185,22 @@ fn a_run_names_the_harness_its_fuzzer_runs() {
             .contains("runs harness fixtures/all, not"),
         "{refused}"
     );
+    assert!(fixture.store.manifests().unwrap().is_empty());
+}
+
+/// A fuzzer that fails its startup probe keeps its crash file out of the
+/// working directory, which may be a checkout that a later frozen suite
+/// needs clean.
+#[test]
+fn a_failed_startup_probe_leaves_no_artifact_behind() {
+    let fixture = Fixture::new();
+    fixture.set("probe-crash");
+    let refused = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap_err();
+    assert!(
+        refused.to_string().contains("failed its startup probe"),
+        "{refused}"
+    );
+    assert!(!fixture.control.join("crash-probe").exists());
     assert!(fixture.store.manifests().unwrap().is_empty());
 }
 

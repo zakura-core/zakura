@@ -1,0 +1,13 @@
+# A submission that decodes a raw body leaves the policy entry's decoded
+# size at its raw value, while the payload table holds the decoded block.
+# The scenario's mirrors withhold heights 9 to 16 and close once storage
+# holds eight admits. mut-6's generator drew it (seed 11, run 1, family
+# peers-leave).
+# Besides sequencer.rs, which the patch changes, the rest of block sync
+# decides when a body is demoted to its raw bytes and decoded again.
+checks = ["crates/zakura-network/src/zakura/block_sync"]
+
+[typed]
+harness = "block-sync/storage"
+scenario = "qa/planted/block-sync/payload-inventory-agrees/stale-policy-decoded-size.scenario.json"
+plan = "qa/planted/block-sync/payload-inventory-agrees/stale-policy-decoded-size.plan.bin"

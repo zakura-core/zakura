@@ -10,6 +10,7 @@
 //! loop's own: [`NO_TASK_PANIC`] always, and [`NO_LIVELOCK`] while the
 //! scenario's [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
+pub mod block_hostile;
 pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;

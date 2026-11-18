@@ -119,14 +119,20 @@ pub struct WireWindows {
 /// behind its replacement's admission. The routine's drop then makes its
 /// generation-gated registry writes against the replacement's entry.
 ///
-/// The hold ends, for good, at that admission, or `steps` steps after the
-/// close. The routine also runs whenever nothing else can, since a
-/// [`TaskHold`] never ends a run.
+/// The hold ends, for good, at that admission, or, with `until_claimed`,
+/// once the replacement's routine reports a published claim, or `steps`
+/// steps after the close. The routine also runs whenever nothing else can,
+/// since a [`TaskHold`] never ends a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupersededHold {
     /// The most steps the hold lasts after the close.
     pub steps: u64,
+    /// Whether the hold lasts past the replacement's admission until the
+    /// replacement's routine reports a published claim, so the superseded
+    /// routine's drop meets an entry with claims.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub until_claimed: bool,
 }
 
 /// [`SupersededHold`]'s hold: the tasks of the closed peer's routines that
@@ -137,6 +143,7 @@ struct HeldSuperseded {
     closed: Rc<RefCell<Vec<ZakuraPeerId>>>,
     view: Rc<RefCell<BlockSyncView>>,
     steps: u64,
+    until_claimed: bool,
     /// The closed peer, its newest generation at the close, and the step
     /// after which the hold began, once a close happened.
     armed: RefCell<Option<(ZakuraPeerId, u64, u64)>>,
@@ -162,10 +169,17 @@ impl TaskHold for HeldSuperseded {
             *armed = Some((peer, generation, step));
         }
         let (peer, superseded, since) = armed.as_ref().expect("the hold armed above");
-        let replaced = self
-            .routines
-            .admitted(peer)
-            .is_some_and(|newest| newest > *superseded);
+        let replaced = if self.until_claimed {
+            self.view.borrow().routines.values().any(|routine| {
+                routine.peer == *peer
+                    && routine.generation > *superseded
+                    && !routine.claims.is_empty()
+            })
+        } else {
+            self.routines
+                .admitted(peer)
+                .is_some_and(|newest| newest > *superseded)
+        };
         if replaced || step >= since.saturating_add(self.steps) {
             self.over.set(true);
             return false;
@@ -348,7 +362,7 @@ fn redial(
 
 impl Subsystem for SyncWire {
     const NAME: &'static str = "sync/wire";
-    const GENERATOR: u32 = 4;
+    const GENERATOR: u32 = 5;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = SyncWireScenario;
     type Prepared = SyncPorts;
@@ -413,6 +427,7 @@ impl Subsystem for SyncWire {
                 closed: quic.closed.clone(),
                 view: view.clone(),
                 steps: hold.steps,
+                until_claimed: hold.until_claimed,
                 armed: RefCell::default(),
                 over: Cell::new(false),
             }));
@@ -595,6 +610,16 @@ pub enum SavedWire {
     /// [`STALL_GROWTH`] blocks, so the mirrors write header-sync pages while
     /// their block-sync writes saturate.
     Saturated,
+    /// [`SavedWire::Replace`] with one mirror, which the node dials: the
+    /// node's connection to it closes once the node has asked storage to
+    /// admit four bodies, and the node redials it. The mirror's chain grows
+    /// by [`REPLACE_GROWTH`] blocks [`REPLACE_GROWTH_MS`] into the run,
+    /// after the redial, so only the replacement's routine can request the
+    /// new bodies. The [`SupersededHold`] lasts until that routine reports a
+    /// published claim, so the superseded routine's drop meets an entry
+    /// with claims, and a write that clears them by peer ID alone changes
+    /// the entry.
+    ReplaceClaims,
 }
 
 /// Each body's size in [`SavedWire::Saturated`]: a quarter of the largest
@@ -630,11 +655,12 @@ const TAG: u8 = 0xFC;
 
 impl SavedWire {
     /// Every saved scenario, in tag order.
-    pub const ALL: [SavedWire; 4] = [
+    pub const ALL: [SavedWire; 5] = [
         SavedWire::Honest,
         SavedWire::Replace,
         SavedWire::StalledBlocks,
         SavedWire::Saturated,
+        SavedWire::ReplaceClaims,
     ];
 
     /// The fixture's name, `sync-wire-<name>.bin`.
@@ -644,6 +670,7 @@ impl SavedWire {
             SavedWire::Replace => "replace",
             SavedWire::StalledBlocks => "stalled-blocks",
             SavedWire::Saturated => "saturated",
+            SavedWire::ReplaceClaims => "replace-claims",
         }
     }
 
@@ -671,7 +698,9 @@ impl SavedWire {
     pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
         match self {
             SavedWire::Honest => &[],
-            SavedWire::Replace => &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")],
+            SavedWire::Replace | SavedWire::ReplaceClaims => {
+                &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")]
+            }
             SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, "holds")],
             SavedWire::Saturated => &[
                 (connection::CREDIT_ISOLATED, "holds"),
@@ -735,6 +764,26 @@ impl SavedWire {
                 }],
                 ..sync
             },
+            SavedWire::ReplaceClaims => SyncScenario {
+                mirrors: vec![SyncMirror {
+                    dialer: Dialer::Node,
+                }],
+                control: vec![
+                    SyncStep {
+                        action: SyncAction::Close {
+                            peer: "mirror-0".to_owned(),
+                        },
+                        when: Some(super::sync::admitted(4)),
+                    },
+                    SyncStep {
+                        action: SyncAction::Grow {
+                            len: REPLACE_GROWTH,
+                        },
+                        when: Some(Trigger::VirtualTime(REPLACE_GROWTH_MS)),
+                    },
+                ],
+                ..sync
+            },
             SavedWire::StalledBlocks => {
                 let read = block_policy::Select {
                     kind: Some(block_policy::BlockKind::MirrorRead),
@@ -757,9 +806,13 @@ impl SavedWire {
                 }
             }
         };
-        let superseded_hold = (self == SavedWire::Replace).then_some(SupersededHold {
-            steps: REPLACE_HOLD_STEPS,
-        });
+        let superseded_hold = match self {
+            SavedWire::Replace | SavedWire::ReplaceClaims => Some(SupersededHold {
+                steps: REPLACE_HOLD_STEPS,
+                until_claimed: self == SavedWire::ReplaceClaims,
+            }),
+            _ => None,
+        };
         SyncWireScenario {
             net,
             sync,
@@ -769,9 +822,20 @@ impl SavedWire {
     }
 }
 
-/// How many steps [`SavedWire::Replace`] holds the superseded routine at
-/// most: past the redial, [`REDIAL_SETTLE`] after the close.
+/// How many steps [`SavedWire::Replace`] and [`SavedWire::ReplaceClaims`]
+/// hold the superseded routine at most: past the redial, [`REDIAL_SETTLE`]
+/// after the close, and past the replacement's first claim, which follows
+/// the mirror's grown status 40 seconds into the run.
 const REPLACE_HOLD_STEPS: u64 = 40_000;
+
+/// When [`SavedWire::ReplaceClaims`] grows the mirror's chain, in
+/// milliseconds of virtual time from the run's start: a second after the
+/// redial, since the close comes before the clock first moves.
+pub const REPLACE_GROWTH_MS: u64 = 11_000;
+
+/// How many blocks [`SavedWire::ReplaceClaims`] grows the mirror's chain
+/// by.
+pub const REPLACE_GROWTH: u32 = 4;
 
 /// Curated combinations for the `sync_wire` fuzz target's seeds, each a
 /// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a

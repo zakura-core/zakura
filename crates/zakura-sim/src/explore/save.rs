@@ -28,6 +28,9 @@ use crate::{
 /// The directory under the artifacts root that holds saved inputs.
 pub const INPUTS_DIR: &str = "inputs";
 
+/// What follows the property in a [`violation_panic`] message.
+const VIOLATION_TRACE: &str = ": trace at ";
+
 /// The temporary file's number within this process.
 static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -40,13 +43,43 @@ pub fn input_path(
     property: Option<&PropertyId>,
     input: &[u8],
 ) -> PathBuf {
-    let dir = property
+    input_dir(root, bucket, property.map(PropertyId::as_str))
+        .join(format!("{}.bin", hex(&Sha256::digest(input))))
+}
+
+/// The directory that holds `bucket`'s saved inputs for `property`, with
+/// each segment of `property` a directory.
+fn input_dir(root: &Path, bucket: Bucket, property: Option<&str>) -> PathBuf {
+    property
         .into_iter()
-        .flat_map(|property| property.as_str().split('/'))
+        .flat_map(|property| property.split('/'))
         .fold(root.join(INPUTS_DIR).join(bucket.name()), |dir, segment| {
             dir.join(segment)
-        });
-    dir.join(format!("{}.bin", hex(&Sha256::digest(input))))
+        })
+}
+
+/// True if `root` holds an input saved under `bucket` for `property`.
+pub fn has_saved_input(root: &Path, bucket: Bucket, property: &str) -> bool {
+    fs::read_dir(input_dir(root, bucket, Some(property)))
+        .is_ok_and(|mut inputs| inputs.next().is_some())
+}
+
+/// The panic message a fuzz target raises for a run that violates the
+/// `Active` property `property`, once [`save_failure`] saved its input at
+/// `input` and recorded its trace in `trace`.
+pub fn violation_panic(property: &str, trace: &Path, input: &Path) -> String {
+    format!(
+        "{property}{VIOLATION_TRACE}{}; input at {}",
+        trace.display(),
+        input.display()
+    )
+}
+
+/// The property `line` names if it is a [`violation_panic`] message. A
+/// harness failure's panic, which starts with `harness:`, names none.
+pub fn violated_property(line: &str) -> Option<&str> {
+    let (property, _) = line.split_once(VIOLATION_TRACE)?;
+    (!property.is_empty() && !property.contains(char::is_whitespace)).then_some(property)
 }
 
 /// Saves `input` at [`input_path`], unless a file is already there, and

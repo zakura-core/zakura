@@ -38,7 +38,20 @@ fn load(dirs: &[PathBuf], harness: Option<&str>) -> SeedReport {
     seed::load(dirs, harness).expect("the directories list")
 }
 
-/// Every committed seed passes validation, and none is left out.
+/// The committed seeds that fail by design, outside the seed corpus.
+fn known_failures() -> PathBuf {
+    fixtures().join("known-failures")
+}
+
+/// The committed seeds that run too long for a fuzz input, outside the
+/// seed corpus.
+fn slow_seeds() -> PathBuf {
+    fixtures().join("slow-seeds")
+}
+
+/// Every committed seed passes validation, and none is left out. No seed
+/// in the corpus expects a violation, since fuzz campaigns and target
+/// checks run each one as an input that passes.
 #[test]
 fn committed_seeds_validate() {
     let report = load(&[fixtures()], None);
@@ -63,6 +76,66 @@ fn committed_seeds_validate() {
     assert_eq!(report.admitted.len(), inputs);
     assert!(inputs > 0, "the S4.7 input is committed");
     assert!(report.admitted.iter().all(|seed| seed.sidecar.required));
+    let failing: Vec<&Path> = report
+        .admitted
+        .iter()
+        .filter(|seed| seed.sidecar.expects_violation())
+        .map(|seed| seed.path.as_path())
+        .collect();
+    assert!(
+        failing.is_empty(),
+        "these seeds fail by design, so they belong in {}: {failing:?}",
+        known_failures().display()
+    );
+}
+
+/// Every seed in the known-failure directory validates, and each carries a
+/// witness that expects a violation, which its own test checks.
+#[test]
+fn known_failures_validate_and_expect_violations() {
+    let report = load(&[known_failures()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "zakura#2378's input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            seed.sidecar.expects_violation(),
+            "{} expects no violation, so it belongs in the seed corpus",
+            seed.path.display()
+        );
+    }
+}
+
+/// Every seed in the slow-seed directory validates, and none expects a
+/// violation: each runs clean, only too long for a fuzz input.
+#[test]
+fn slow_seeds_validate_and_expect_no_violation() {
+    let report = load(&[slow_seeds()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "the stuck-floor input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            !seed.sidecar.expects_violation(),
+            "{} expects a violation, so it belongs in {}",
+            seed.path.display(),
+            known_failures().display()
+        );
+    }
 }
 
 /// The scenario each committed seed is meant to run, by its file's stem,
@@ -120,10 +193,6 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
-        // The fork while storage holds a submission, with every read stalled.
-        "sync-wire-reset-mid-write" => {
-            value(sync_wire::combined(&[sync_wire::COMBINED_TAG, 0b0001_0100]))
-        }
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],
@@ -207,7 +276,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
 /// in [`intended`].
 #[test]
 fn committed_seeds_record_their_intended_scenarios() {
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     for seed in &report.admitted {
         let stem = seed.path.file_stem().and_then(|s| s.to_str()).unwrap();
         let scenario = intended(stem).unwrap_or_else(|| panic!("{stem} has no intended scenario"));
@@ -229,7 +298,7 @@ fn committed_seeds_record_their_intended_scenarios() {
 fn planted_inputs_carry_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let catalogue = root.join(planted::PLANTED_DIR);
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     let reported: BTreeSet<String> = HARNESSES
         .iter()
         .flat_map(|entry| (entry.properties)())
@@ -269,7 +338,7 @@ fn planted_inputs_carry_their_witnesses() {
         let seed = report
             .admitted
             .iter()
-            .find(|seed| seed.path == fixtures().join(input.file_name().unwrap()))
+            .find(|seed| seed.path.canonicalize().ok() == input.canonicalize().ok())
             .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
         assert!(
             seed.sidecar

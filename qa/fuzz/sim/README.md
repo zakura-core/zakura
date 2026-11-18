@@ -31,6 +31,12 @@ whose target has no harness or no campaign.
 
 ## Targets
 
+The storage and wire targets (`header_sync_storage`, `header_sync_wire`,
+`sync_storage`, `sync_wire`, `discovery_wire` and `block_sync_storage`) run
+about one input a second or slower. libFuzzer's default length control would
+hold their inputs at 4 bytes for a whole campaign, so their `qa/suite.toml`
+rows pass `-len_control=0`.
+
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
@@ -141,6 +147,13 @@ per feature into the `__libfuzzer_extra_counters` section. libFuzzer clears
 the section before each input and reads each nonzero counter as a feature,
 so an input that reaches a new state through covered code still joins the
 corpus. The section works on Linux only.
+
+`header_sync_storage`, `header_sync_wire`, `sync_storage`, `sync_wire` and
+`discovery_wire` pass `zakura_sim::explore::state::collector`, which reads
+the observations, obligations and run end that their harnesses log. The
+feedback comparison (fuzz-14, `qa/mutation-pilot/README.md`) runs planted
+cases on them with feedback on and off. Unset, `ZAKURA_SIM_FEEDBACK` means
+`on`, so their other campaigns read the collector's features too.
 
 `ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
 doesn't read. The collector still runs, so `on` and `off` runs take the same
@@ -360,12 +373,15 @@ cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|no
 ```
 
 For each target, it resolves the harness through
-`[package.metadata.zakura-sim.targets]`, runs each of the harness's admitted
-seeds in the `zakura-sim` process, builds the target with the pinned
-nightly, and runs the built target once on the seeds, with the suite row's
-libFuzzer arguments and `ZAKURA_SIM_STATS` set. The target's stats file
-must name the harness the table maps it to, so a target whose
-`sim_target!` runs another harness fails. Each target gets one status:
+`[package.metadata.zakura-sim.targets]`, loads the harness's admitted
+seeds, builds the target with the pinned nightly, and runs the built target
+once on the seeds, with the suite row's libFuzzer arguments and
+`ZAKURA_SIM_STATS` set. The target's stats file must name the harness the
+table maps it to, so a target whose `sim_target!` runs another harness
+fails, and its counts say which properties applied. The `zakura-sim`
+process runs no seed itself: Linux carries a process's peak resident size
+across `exec`, and `-rss_limit_mb` reads that peak, so a large checker
+would fail its targets out of memory. Each target gets one status:
 
 - `ready`: the target accepted every seed, its stats name its harness and
   count every seed, and a seed's run applied a property of the harness's
@@ -405,7 +421,10 @@ patched target must crash with the property alone and name the harness,
 replay must match Exact. It builds the patched `zakura-sim` and target in
 `target/planted/confirm-builds/`, outside the scratch worktree, so later
 runs reuse the builds, and both binaries must embed the patched checkout's
-source digest. It prints each target's bypasses, or that it has none.
+source digest. It prints each target's bypasses, or that it has none. A
+case whose file sets `no_target` to a reason, such as a patched run longer
+than the 300-second limit under AddressSanitizer, isn't confirmed through
+its target: `--targets` prints the case with the reason and runs the rest.
 
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs
 `cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
@@ -430,6 +449,21 @@ must give the seed's input. The `header-sync/storage` seeds were migrated
 from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
 another generator than its harness's is rejected, even when the harness
 would draw a fallback scenario for it.
+
+The seed corpus is the fixture directory's own seeds. Campaigns, `cargo
+xtask sim-targets` and `--out` run each one as an input that passes, so no
+corpus seed carries a witness with `expect = "violated"` or
+`"violated-set"`. A seed that fails by design, such as a pinned repro of an
+open bug, sits in a subdirectory with that witness, and only its own test
+loads it: `known-failures/` holds open-bug repros, and `race-schedules/`
+holds the planted races' violating schedules. The seed tests fail on a
+corpus seed that expects a violation and on a known failure that doesn't.
+
+A seed that runs clean but too long for a fuzz input sits in `slow-seeds/`.
+Each of its runs takes 20 minutes or more in a target's AddressSanitizer
+build, far past a campaign's 30-second input timeout, so the seed would
+fail every campaign's first pass over its corpus. Its own tests and its
+planted case still run it.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one

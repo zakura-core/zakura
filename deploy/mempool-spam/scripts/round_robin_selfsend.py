@@ -218,39 +218,37 @@ def first_seen_matrix(
     last: dict[str, str | None] = {}
     run_elapsed = False
 
-    def sample(node: dict) -> tuple[str | None, float | None]:
-        """One node's state and when it answered, or `(None, None)` if the
-        run's deadline cut the sample short."""
-        try:
-            # A sample begun inside the window finishes its first read, so the
-            # window's end never cuts that answer short. Only the run's own
-            # deadline does.
-            state = transaction_state(node, txid, deadline=run_deadline, start_by=deadline)
-        except RunDurationElapsed:
-            return None, None
-        return state, round(time.monotonic() - started, 3)
+    def poll(node: dict) -> tuple[str | None, float | None, bool]:
+        """Polls one node until it settles or the window ends. Returns its last
+        state, when that state settled it if it did, and whether the run's
+        deadline cut a sample short.
 
-    while time.monotonic() < deadline and not STOP:
-        pending = [
-            node for node in nodes
-            if node["name"] not in in_pool and node["name"] not in after_mined
-        ]
-        # Every unsettled node is sampled at once, so each pass starts inside
-        # the window and lasts one sample, however many nodes there are.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as pool:
-            answers = list(pool.map(sample, pending))
-        for node, (state, elapsed) in zip(pending, answers):
-            last[node["name"]] = state
-            if elapsed is None:
+        Each node has its own poller, so a slow node delays only itself.
+        """
+        state = None
+        while time.monotonic() < deadline and not STOP:
+            try:
+                # A sample begun inside the window finishes its first read, so
+                # the window's end never cuts that answer short. Only the
+                # run's own deadline does.
+                state = transaction_state(node, txid, deadline=run_deadline, start_by=deadline)
+            except RunDurationElapsed:
                 # The interrupted sample settles nothing, whatever came before.
-                run_elapsed = True
-            elif state == IN_POOL:
-                in_pool[node["name"]] = elapsed
-            elif state == IN_CHAIN:
-                after_mined[node["name"]] = elapsed
-        if run_elapsed or len(in_pool) + len(after_mined) == len(nodes):
-            break
-        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                return None, None, True
+            if state in (IN_POOL, IN_CHAIN):
+                return state, round(time.monotonic() - started, 3), False
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+        return state, None, False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        polled = list(pool.map(poll, nodes))
+    for node, (state, settled_at, cut) in zip(nodes, polled):
+        last[node["name"]] = state
+        run_elapsed = run_elapsed or cut
+        if state == IN_POOL:
+            in_pool[node["name"]] = settled_at
+        elif state == IN_CHAIN:
+            after_mined[node["name"]] = settled_at
     # A window the run's deadline or a stop cut short gave no node its full
     # time, so no absence in it is a miss.
     cut_short = STOP or run_elapsed or deadline < window_end

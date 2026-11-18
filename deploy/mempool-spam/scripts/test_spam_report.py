@@ -267,6 +267,29 @@ class MatrixTests(unittest.TestCase):
         # before a is sampled again.
         self.assertIn("a", in_pool)
 
+    def test_a_slow_node_does_not_hold_back_another(self):
+        nodes = [{"name": "a"}, {"name": "b"}]
+        samples = {"a": 0}
+        lock = threading.Lock()
+
+        def state(node, _txid, deadline=None, start_by=None):
+            if node["name"] == "b":
+                # b's one sample outlasts the window.
+                time.sleep(0.15)
+                return round_robin_selfsend.ABSENT
+            with lock:
+                samples["a"] += 1
+                count = samples["a"]
+            # a gets the transaction after its first sample.
+            return round_robin_selfsend.IN_POOL if count > 1 else round_robin_selfsend.ABSENT
+
+        with mock.patch.object(round_robin_selfsend, "transaction_state", state):
+            in_pool, _, _ = round_robin_selfsend.first_seen_matrix(
+                nodes, "t", duration=0.1, interval=0.01
+            )
+
+        self.assertIn("a", in_pool)
+
     def test_an_absence_in_a_window_the_run_cut_short_is_unobserved(self):
         nodes = [{"name": "a"}]
         with mock.patch.object(

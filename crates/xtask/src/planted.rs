@@ -61,9 +61,7 @@
 //! `cargo xtask sim-minimize` confirms an original: the patched target must
 //! crash with the case's property alone and name the harness,
 //! `zakura-sim confirm` must find the property's trigger history, and a
-//! fresh `zakura-sim replay` must match the trace Exact. A target panics
-//! only on an `Active` violation, so a case whose property is `Known` or
-//! `Draft` in the patched trace skips this step and says so. It builds
+//! fresh `zakura-sim replay` must match the trace Exact. It builds
 //! `zakura-sim` and the target in `target/planted/confirm-builds/`, outside
 //! the scratch worktree, so later cases and runs reuse the builds, and both
 //! binaries must embed the patched checkout's source digest. A check that
@@ -165,10 +163,7 @@ const CAMPAIGN_INPUTS: usize = 32;
 const CAMPAIGN_INPUT_BYTES: usize = 64;
 
 /// The longest one child of a confirmation through a fuzz target may run.
-/// The target runs under ASan, and a lost-wakeup bypass shows only once its
-/// run drains: `capacity-release-wakes/stale-completion-no-wake`'s input
-/// takes about 11 minutes on an M-series Mac, and longer on CI's runners.
-const TARGET_CHILD: Duration = Duration::from_secs(1800);
+const TARGET_CHILD: Duration = Duration::from_secs(300);
 
 /// The longest one `zakura-sim` run of a case may take: a baseline, patched
 /// or campaign recording, or a fresh replay. A run past it is killed and
@@ -915,38 +910,10 @@ fn check_case(
     let verdict = judge_patched(&patched, &harness, &input, case, scratch, RUN_DEADLINE)?;
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
-            let trace = scratch.join("patched").join("trace.jsonl");
-            if !active_in(&fs::read_to_string(&trace)?, &case.property)? {
-                println!(
-                    "{} {}: not confirmed through {fuzz}: the property isn't Active, and a \
-                     target's filter selects only Active violations",
-                    case.property,
-                    case.patch.display()
-                );
-                return Ok(verdict);
-            }
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
         }
         _ => Ok(verdict),
     }
-}
-
-/// Whether `property` is `Active` in `trace`, a trace's text, as its `meta`
-/// record lists it. A fuzz target panics only on an `Active` violation, so
-/// no target can confirm a bypass of a `Known` or `Draft` property
-/// (`zakura-sim`'s `ConfirmStatus::SelectionUnsupported`). Fails if the
-/// record doesn't list the property.
-fn active_in(trace: &str, property: &str) -> Result<bool, BoxError> {
-    let meta: Value = serde_json::from_str(trace.lines().next().ok_or("the trace is empty")?)?;
-    let status = meta
-        .pointer("/meta/properties")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|listed| listed.get("id").and_then(Value::as_str) == Some(property))
-        .and_then(|listed| listed.get("status"))
-        .ok_or_else(|| format!("the trace's meta record doesn't list {property}"))?;
-    Ok(status.as_str() == Some("active"))
 }
 
 /// Applies `case`'s patch to `worktree`, a checkout of `HEAD`. `Some` is
@@ -1898,25 +1865,6 @@ mod tests {
             .is_empty());
     }
 
-    /// Only an `Active` property goes through a target. A property the
-    /// meta record doesn't list is an error, not a skip.
-    #[test]
-    fn only_active_properties_go_through_a_target() {
-        let trace = concat!(
-            r#"{"meta":{"properties":["#,
-            r#"{"id":"a/active","status":"active"},"#,
-            r#"{"id":"a/draft","status":"draft"},"#,
-            r#"{"id":"a/known","status":{"known":{"issue":1}}}]}}"#,
-            "\n",
-            r#"{"end":{}}"#,
-        );
-        assert!(active_in(trace, "a/active").unwrap());
-        assert!(!active_in(trace, "a/draft").unwrap());
-        assert!(!active_in(trace, "a/known").unwrap());
-        assert!(active_in(trace, "a/missing").is_err());
-        assert!(active_in("", "a/active").is_err());
-    }
-
     /// Every simulator build warns rather than fails on warnings, so a
     /// patch that leaves code unused still builds where the environment
     /// sets `CARGO_BUILD_WARNINGS=deny`.
@@ -2113,7 +2061,7 @@ mod tests {
         );
         let built = confirm_builds(&work)
             .join("sim")
-            .join(PROFILE)
+            .join("debug")
             .join("zakura-sim");
         fs::create_dir_all(built.parent().expect("a parent")).expect("the directory is created");
         fs::write(&built, "binary").expect("the build is written");

@@ -205,7 +205,6 @@ impl Fake {
                 git: "0".repeat(40),
                 dirty: false,
             },
-            row: TargetRow::default(),
         }
     }
 
@@ -1202,65 +1201,4 @@ fn confirmation_builds_override_denied_warnings() {
         sanitizer: Sanitizer::Address,
     };
     assert_eq!(warnings(&fuzz.command("build")), Some("warn".into()));
-}
-
-/// The confirmation's `zakura-sim` is optimized, since an unoptimized one
-/// outruns the child limit.
-#[test]
-fn the_confirmation_builds_zakura_sim_with_the_planted_profile() {
-    let sim = sim_build(OsStr::new("cargo"), Path::new("repo"), Path::new("target"));
-    let args: Vec<_> = sim.get_args().collect();
-    assert!(args.windows(2).any(|pair| pair == ["--profile", PROFILE]));
-}
-
-/// A target's runs take its `qa/suite.toml` row's arguments and
-/// environment, and a target without a row takes none.
-#[test]
-fn fuzz_runs_take_their_suite_row() {
-    let suite = r#"
-[[ignored]]
-file = "x.rs"
-
-[[target]]
-package = "sim"
-name = "big"
-smoke-secs = 1
-args = ["-rss_limit_mb=8192"]
-env = ["ASAN_OPTIONS=detect_leaks=0"]
-timeout-secs = 60
-
-[[target]]
-package = "other"
-name = "plain"
-args = ["-max_len=1"]
-smoke-secs = 1
-timeout-secs = 60
-"#;
-    let row = TargetRow::read(suite, "big").unwrap();
-    assert_eq!(row.args, ["-rss_limit_mb=8192"]);
-    let mut command = Command::new("fuzz");
-    command.arg("-timeout=1");
-    row.apply(&mut command);
-    let args: Vec<_> = command.get_args().collect();
-    assert_eq!(args, ["-timeout=1", "-rss_limit_mb=8192"]);
-    let env: Vec<_> = command.get_envs().collect();
-    assert_eq!(
-        env,
-        [(OsStr::new("ASAN_OPTIONS"), Some(OsStr::new("detect_leaks=0")))]
-    );
-    // Another package's target of the same name isn't this one.
-    assert_eq!(
-        TargetRow::read(suite, "plain").unwrap(),
-        TargetRow::default()
-    );
-}
-
-/// The committed suite parses, and gives `block_sync_storage` its memory
-/// limit.
-#[test]
-fn the_committed_suite_gives_block_sync_storage_its_limit() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let suite = fs::read_to_string(root.join("qa/suite.toml")).unwrap();
-    let row = TargetRow::read(&suite, "block_sync_storage").unwrap();
-    assert!(row.args.iter().any(|arg| arg.starts_with("-rss_limit_mb=")));
 }

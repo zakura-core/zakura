@@ -45,11 +45,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{header_fuzz::PINNED_NIGHTLY, planted::PROFILE, sim::SIM_RUSTFLAGS, BoxError};
+use crate::{header_fuzz::PINNED_NIGHTLY, sim::SIM_RUSTFLAGS, BoxError};
 
 /// The fuzz package's metadata table that maps each target to the
 /// registered harness it runs.
@@ -353,61 +353,6 @@ pub(super) struct Tools {
     pub(super) tmin: Box<TminCommand>,
     /// The checkout's provenance.
     pub(super) source: Source,
-    /// The target's `qa/suite.toml` row, whose arguments and environment
-    /// every run of the fuzz target takes.
-    pub(super) row: TargetRow,
-}
-
-/// The libFuzzer arguments and environment that a sim fuzz target's
-/// `qa/suite.toml` row gives it, such as `block_sync_storage`'s
-/// `-rss_limit_mb=8192`. `zakura-sim targets` runs the target with them,
-/// and a run without them can fail where the target's own runs don't.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(super) struct TargetRow {
-    /// More libFuzzer arguments.
-    #[serde(default)]
-    pub(super) args: Vec<String>,
-    /// Environment variables, as `NAME=value`.
-    #[serde(default)]
-    pub(super) env: Vec<String>,
-}
-
-impl TargetRow {
-    /// The row of the `sim` package's target `target` in `suite`, the text
-    /// of `qa/suite.toml`. A target without a row runs with none.
-    fn read(suite: &str, target: &str) -> Result<TargetRow, BoxError> {
-        /// One `[[target]]` row: its name, package and run settings.
-        #[derive(Deserialize)]
-        struct Row {
-            package: String,
-            name: String,
-            #[serde(flatten)]
-            row: TargetRow,
-        }
-        /// The file's `[[target]]` rows. Its other tables are ignored.
-        #[derive(Deserialize)]
-        struct Suite {
-            #[serde(default)]
-            target: Vec<Row>,
-        }
-        let suite: Suite = toml::from_str(suite)?;
-        Ok(suite
-            .target
-            .into_iter()
-            .find(|row| row.package == "sim" && row.name == target)
-            .map(|row| row.row)
-            .unwrap_or_default())
-    }
-
-    /// Adds the row's environment and arguments to `command`, a run of the
-    /// fuzz target, after the arguments it already has.
-    fn apply(&self, command: &mut Command) {
-        for variable in &self.env {
-            let (name, value) = variable.split_once('=').unwrap_or((variable, ""));
-            command.env(name, value);
-        }
-        command.args(&self.args);
-    }
 }
 
 /// The checkout the tools were built from.
@@ -565,35 +510,25 @@ fn build_tools(
     let bin = request.out.join(BIN_DIR);
     fs::create_dir_all(&bin)?;
     let sim = bin.join("zakura-sim");
-    fs::copy(sim_target.join(PROFILE).join("zakura-sim"), &sim)?;
+    fs::copy(sim_target.join("debug").join("zakura-sim"), &sim)?;
     let tmin_binary = fuzz_binary(&fuzz_target, &request.target)?;
     let fuzz = bin.join(&request.target);
     fs::copy(&tmin_binary, &fuzz)?;
 
-    let row = TargetRow::read(
-        &fs::read_to_string(repo_root.join("qa/suite.toml"))?,
-        &request.target,
-    )?;
-    let (target, budget, tmin_row) = (request.target.clone(), request.budget, row.clone());
-    let tmin = move |input: &Path, artifacts: &Path| {
-        let mut command = fuzz_build.tmin(&target, budget, input, artifacts);
-        tmin_row.apply(&mut command);
-        command
-    };
+    let (target, budget) = (request.target.clone(), request.budget);
+    let tmin =
+        move |input: &Path, artifacts: &Path| fuzz_build.tmin(&target, budget, input, artifacts);
     Ok(Ok(Tools {
         sim,
         fuzz,
         tmin_binary,
         tmin: Box::new(tmin),
         source: source(repo_root),
-        row,
     }))
 }
 
 /// `cargo build` of `repo_root`'s `zakura-sim` binary with the simulator's
-/// flags and the planted profile (`crate::planted::PROFILE`), in `target`.
-/// An unoptimized `zakura-sim confirm` of a `block-sync/storage` input can
-/// take six times as long, past the confirmation's child limit.
+/// flags, in `target`.
 ///
 /// `cargo xtask planted --targets` confirms through a patched checkout, and
 /// a bypass patch can leave the code it bypasses unused. So the build
@@ -607,7 +542,6 @@ fn sim_build(cargo: &OsStr, repo_root: &Path, target: &Path) -> Command {
         .env("CARGO_BUILD_WARNINGS", "warn")
         .arg("build")
         .arg("--locked")
-        .args(["--profile", PROFILE])
         .arg("--manifest-path")
         .arg(repo_root.join("Cargo.toml"))
         .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
@@ -1502,9 +1436,8 @@ impl Checker<'_> {
         fuzz.env(EXPECT_VAR, &self.request.property)
             .env("ZAKURA_SIM_ARTIFACTS", dir.join("sim-artifacts"))
             .arg(format!("-timeout={}", child.as_secs().max(1)))
-            .arg(format!("-artifact_prefix={}/", crashes.display()));
-        self.tools.row.apply(&mut fuzz);
-        fuzz.arg(&input);
+            .arg(format!("-artifact_prefix={}/", crashes.display()))
+            .arg(&input);
         let crash = match run_child(
             &mut fuzz,
             &fuzz_log,

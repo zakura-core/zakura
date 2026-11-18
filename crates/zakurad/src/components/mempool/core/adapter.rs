@@ -229,11 +229,6 @@ async fn peer_batch(
         .into_iter()
         .filter(|item| snapshot.transaction(&item.id().mined_id()).is_none())
         .collect();
-    // Today's pool answers an id it is already bringing in as queued, before
-    // its limits, so such an id takes none of the peer's slots and is none
-    // of its refusals, whether it was queued when the advertisement arrived
-    // or while the lookup waited.
-    let queued_on_arrival = shared.fetching_among(&fresh);
     // A core that does not answer by the deadline gets the batch dropped, as
     // a reservation that does not come back in time would be.
     let Ok(rejected) = shared
@@ -250,9 +245,13 @@ async fn peer_batch(
     let mut held = Vec::new();
     for item in fresh {
         let id = item.id();
-        if rejected.contains(&id) || queued_on_arrival.contains(&id) {
+        if rejected.contains(&id) {
             continue;
         }
+        // Today's pool answers an id it is already bringing in as queued,
+        // before its limits, so such an id takes none of the peer's slots and
+        // is none of its refusals. This looks after the lookup, so a fetch
+        // that ended while it waited no longer hides the id.
         let (fetching, already) = Fetching::start(&shared, id);
         if already {
             continue;
@@ -773,30 +772,6 @@ impl Shared {
     fn supplier(&self, peer: PeerSocketAddr) -> Option<PeerSocketAddr> {
         (!self.exempt.contains(peer)).then_some(peer)
     }
-
-    /// Which of `items` this adapter is bringing in now. The lock is held for
-    /// at most as many ids as items are being brought in, however many a
-    /// peer advertises.
-    fn fetching_among(&self, items: &[Gossip]) -> std::collections::HashSet<UnminedTxId> {
-        let fetching = self
-            .fetching
-            .lock()
-            .expect("no code panics while holding the fetching ids");
-        if items.len() <= fetching.len() {
-            return items
-                .iter()
-                .map(Gossip::id)
-                .filter(|id| fetching.contains_key(id))
-                .collect();
-        }
-        let held: std::collections::HashSet<UnminedTxId> = fetching.keys().copied().collect();
-        drop(fetching);
-        items
-            .iter()
-            .map(Gossip::id)
-            .filter(|id| held.contains(id))
-            .collect()
-    }
 }
 
 /// Today's second-stage answer for a fetch or verification a block ended by
@@ -1041,6 +1016,39 @@ mod tests {
             Some(MAX_INBOUND_CONCURRENCY_PER_PEER),
             "only the test's own share is taken"
         );
+    }
+
+    /// An id whose fetch ends while the batch waits on its lookup is no
+    /// longer being brought in, so the batch reserves it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fetch_that_ends_during_the_lookup_does_not_hide_its_id() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let (fetching, _) = Fetching::start(&core.shared, filler_id(1));
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(filler_id(1))],
+            source: peer,
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its id up");
+        };
+        // The other fetch fails while the lookup waits.
+        drop(fetching);
+        let _ = reply.send(Default::default());
+        let reserve = tokio::time::timeout(std::time::Duration::from_secs(5), inbox.next())
+            .await
+            .expect("the batch reserves the id rather than skipping it");
+        let Some(PoolCommand::Reserve { tx_id, .. }) = reserve else {
+            panic!("the batch reserves the id");
+        };
+        assert_eq!(tx_id, filler_id(1));
+        // The reply is dropped, so the core reads as stopped and the batch ends.
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
     }
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.

@@ -79,7 +79,6 @@ fn should_replace_mining_template(
     submit_old != Some(true) || (current.transactions.len() == 1 && new.transactions.len() > 1)
 }
 
-/// Cancels mining when the current template changes or becomes unavailable.
 /// Whether the internal miner may keep solving work that a template update did not invalidate.
 ///
 /// An external long poll withdraws every old share when the server rejects a template. The
@@ -100,8 +99,13 @@ fn keep_validated_work(
         && chrono::Utc::now().timestamp() < i64::from(template.max_time().timestamp())
 }
 
+/// Cancels mining when the current template changes or becomes unavailable.
+///
+/// Never marks updates as seen, so `template_receiver` must belong to one solve. A changed header
+/// then keeps cancelling, which `Solution::solve` needs because it checks again after its nonce
+/// callback stops a pass.
 fn cancel_if_mining_template_changed(
-    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+    template_receiver: &WatchReceiver<Option<Arc<Block>>>,
     old_header: block::Header,
 ) -> Result<(), SolverCancelled> {
     match template_receiver.has_changed() {
@@ -109,8 +113,6 @@ fn cancel_if_mining_template_changed(
         // This could happen if something irrelevant to the block data changes,
         // the time was within 1 second, or there is a spurious channel change.
         Ok(has_changed) => {
-            template_receiver.mark_as_seen();
-
             // We only need to check header equality, because the block data is
             // bound to the header. An unavailable template has no header, so it
             // also cancels current work.
@@ -449,9 +451,9 @@ where
         let height = template.coinbase_height().expect("template is valid");
 
         // Set up the cancellation conditions for the miner.
-        let mut cancel_receiver = template_receiver.clone();
+        let cancel_receiver = template_receiver.clone();
         let old_header = *template.header;
-        let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
+        let cancel_fn = move || cancel_if_mining_template_changed(&cancel_receiver, old_header);
 
         // Mine at least one block using the equihash solver.
         let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
@@ -672,6 +674,24 @@ mod tests {
             &more,
             Some(true),
         ));
+    }
+
+    /// A template change keeps cancelling old work, so the solver can't resume it after its nonce
+    /// callback stops a pass. An update with the same header keeps the work running.
+    #[test]
+    fn template_change_keeps_cancelling_old_work() {
+        let old = coinbase_only_block(0);
+        let (sender, receiver) = watch::channel(Some(Arc::new(old.clone())));
+        let receiver = WatchReceiver::new(receiver);
+        let check = || cancel_if_mining_template_changed(&receiver, *old.header);
+
+        sender.send_replace(Some(Arc::new(old.clone())));
+        assert_eq!(check(), Ok(()));
+        assert_eq!(check(), Ok(()));
+
+        sender.send_replace(Some(Arc::new(coinbase_only_block(1))));
+        assert_eq!(check(), Err(SolverCancelled));
+        assert_eq!(check(), Err(SolverCancelled));
     }
 
     /// The internal miner switches from standard to minimum difficulty work on the same parent.

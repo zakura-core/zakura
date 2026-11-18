@@ -1132,8 +1132,8 @@ fn is_cadence_run(act: DiscoveryAct) -> bool {
 /// - Byte 0: the node's verification slots (bits 0 and 1, 1 to 4), its
 ///   `GetPeers` limit (bits 2 and 3: production's, 1, 2 or 8), whether it
 ///   dials a listening peer it holds as a static candidate (bit 4), and the
-///   links' delays (bits 5 and 6: 0 to 100 ms, 1 to 5 ms, 50 to 400 ms, or
-///   0 to 1,000 ms).
+///   links' delays (bits 5 and 6: 1 to 100 ms, 1 to 5 ms, 50 to 400 ms, or
+///   1 to 1,000 ms).
 /// - Byte 1: the records each `Peers` relays (bits 0 and 1, 0 to 3, at
 ///   most the node's limit), and whether the script may break rules
 ///   (bit 7).
@@ -1154,11 +1154,14 @@ pub fn composed_scenario(prefix: &[u8]) -> WireScenario {
     let (node, script, holds) = (byte(0), byte(1), byte(2));
     let base = WireScenario::default();
     let mut net = base.net.clone();
+    // At least a millisecond, so each round trip moves the clock, as
+    // `act_scenario`'s links do: a request run's exchanges would otherwise
+    // all land at one instant.
     (net.default_link.min_delay_ms, net.default_link.max_delay_ms) = match (node >> 5) & 3 {
-        0 => (0, 100),
+        0 => (1, 100),
         1 => (1, 5),
         2 => (50, 400),
-        _ => (0, 1_000),
+        _ => (1, 1_000),
     };
     let peer_sample_limit = [None, Some(1), Some(2), Some(8)][usize::from((node >> 2) & 3)];
     let limit = peer_sample_limit.unwrap_or(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
@@ -1258,6 +1261,13 @@ impl HasView for DiscoveryComposed {
 /// bytes of choices and [`COMPOSED_SLOTS`] action slots.
 pub const COMPOSED_BYTES: usize = 4 + COMPOSED_SLOTS;
 
+/// `discovery/composed`'s step budget: room for a script of
+/// [`COMPOSED_SLOTS`] acts, past [`wire_config`]'s 30,000 for one act. Its
+/// livelock limit, a tenth of the budget, leaves room for the two bursts of
+/// up to 64 frames the adversary's rate lets land at one instant, at about
+/// 40 steps a frame.
+pub const COMPOSED_BUDGET: u64 = 80_000;
+
 impl Subsystem for DiscoveryComposed {
     const NAME: &'static str = "discovery/composed";
     // A u8 always fits in a u32.
@@ -1266,9 +1276,12 @@ impl Subsystem for DiscoveryComposed {
     type Scenario = WireScenario;
     type Prepared = NodeHandle;
 
-    /// [`wire_config`].
+    /// [`wire_config`] with [`COMPOSED_BUDGET`] steps.
     fn config(_: &WireScenario) -> RunConfig {
-        wire_config()
+        RunConfig {
+            budget: COMPOSED_BUDGET,
+            ..wire_config()
+        }
     }
 
     /// [`wire_properties`].

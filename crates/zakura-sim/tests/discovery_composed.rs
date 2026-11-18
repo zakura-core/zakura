@@ -92,9 +92,14 @@ fn a_prefix_round_trips_its_steps() {
     );
 }
 
+/// Holds `Services` (bit 2) until 1,500 ms (bits 3 and 4: 1), which keeps
+/// the node's exchange, and so its session, open meanwhile.
+const HOLD_SERVICES: u8 = 0b0000_1100;
+
 /// The peer asks for one record and for the header-sync service, in both
-/// orders, on top of the node's own exchange. Every frame it sends is
-/// conformant, the run violates nothing, and the node answers both.
+/// orders, on top of the node's own exchange, which its held `Services`
+/// keeps open. Every frame it sends is conformant, the run violates
+/// nothing, and the node answers both.
 #[test]
 fn two_requests_in_either_order_are_both_answered() {
     let one_peer = PeerAction::Ask {
@@ -104,7 +109,7 @@ fn two_requests_in_either_order_are_both_answered() {
         request: Request::GetHeaderSyncService,
     };
     for steps in [[one_peer, header_sync], [header_sync, one_peer]] {
-        let report = run_clean(&composed_prefix(0, 1, 0, &steps).unwrap());
+        let report = run_clean(&composed_prefix(0, 1, HOLD_SERVICES, &steps).unwrap());
         let sent = sent(&report);
         assert!(
             sent.iter().all(|(_, label)| label == "conformant"),
@@ -133,8 +138,6 @@ fn two_requests_in_either_order_are_both_answered() {
 /// it, which the node answers.
 #[test]
 fn an_act_that_never_becomes_ready_is_skipped() {
-    // Hold `Services` (bit 2) until 1,500 ms (bits 3 and 4: 1).
-    const HOLD_SERVICES: u8 = 0b0000_1100;
     let steps = [
         PeerAction::Discover {
             act: DiscoveryAct::ExpiredRelay,

@@ -119,13 +119,14 @@ this chain.
 and blocks come as fast as the internal miner finds them there. Kresko's
 `generate` mode seeds at the easiest difficulty, which gave blocks about every
 7 s. The lab uses Kresko's `pow` mode instead, which seeds the chain at a
-difficulty sized for `--miner-sol-per-sec` at the 25 s target: 2.0 solutions a
-second by default, a little under the 2.3 one miner thread managed on a c-16
-under the default blast. That should give blocks about every 22 s. If a run's
-blocks drift, recompute the rate as 2^256 / `target_difficulty_limit` / mean
-block interval. Main has no `pow_start_height`, so the rewrite keeps
-`disable_pow = true`. Nodes then skip proof-of-work checks, but the internal
-miner still solves to the template's difficulty.
+difficulty sized for `--miner-sol-per-sec` at the 25 s target. The default of
+4.0 should give blocks about every 23 s on a c-16 under the default blast. One
+miner thread there fits about 5.4 solutions a second plus ~4 s of fixed delay
+per block, which Kresko's formula leaves out. If a run's blocks drift, multiply
+the rate by (wanted interval - 4 s) / (observed interval - 4 s). Main has no
+`pow_start_height`, so the rewrite keeps `disable_pow = true`. Nodes then skip
+proof-of-work checks, but the internal miner still solves to the template's
+difficulty.
 
 **Each leg runs one node setup.** `up --profile` sets the P2P stack, the
 mempool implementation and tx-relay in every run config. `legacy` is what

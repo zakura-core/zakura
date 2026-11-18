@@ -901,13 +901,14 @@ def build_parser() -> argparse.ArgumentParser:
     # it. The default matches NU7's 25 s target. A value off the chain's target
     # skews its first difficulty adjustments.
     gen.add_argument("--block-time-secs", type=int, default=25)
-    # Solutions per second of one internal-miner thread, which sets the chain's
-    # starting difficulty. One thread on a c-16 under the default blast managed
-    # about 2.3, measured as 2^256 / target_difficulty_limit / mean block
-    # interval. Kept a little low because the limit is the easiest difficulty
-    # the chain can use: too high a rate leaves every block slower than the
-    # target, too low only makes blocks faster.
-    gen.add_argument("--miner-sol-per-sec", type=float, default=2.0)
+    # The internal miner's rate Kresko sizes the starting difficulty for. On a
+    # c-16 under the default blast, blocks averaged 7.4 s at 17 solutions per
+    # block and 13.5 s at 50, which fits about 5.4 solutions/s plus ~4 s of
+    # fixed delay per block. Kresko's formula has no fixed delay, so this is
+    # the value that lands blocks near 23 s, a little under the 25 s target.
+    # The limit is the easiest difficulty the chain can use, so a rate set too
+    # high would leave every block slower than the target.
+    gen.add_argument("--miner-sol-per-sec", type=float, default=4.0)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)
     # 32, not Kresko's 384: every lane is proved during bootstrap, so a large
     # inventory means a bounded run never reaches steady state.

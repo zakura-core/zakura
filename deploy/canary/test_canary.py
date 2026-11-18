@@ -177,6 +177,35 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(report["answered"], {"can": 0.5, "n1": 1.0})
         self.assertEqual(report["verdict"], "fail")
 
+    def test_templates_read_seconds_apart_do_not_pair(self):
+        rows = []
+        for r in range(3):
+            rows += [
+                row(r, "n1", "h", set(),
+                    template={"prev": "p", "txids": ["a", "b"], "fees": 120, "t": 10.0}),
+                row(r, "can", "h", set(),
+                    template={"prev": "p", "txids": ["a"], "fees": 100, "t": 4.0}),
+            ]
+
+        report = canary.grade_templates(rows, "can", 1, 0.01)
+
+        self.assertEqual(report["neighbours"]["n1"]["skipped"], 3)
+        self.assertEqual(report["verdict"], "inconclusive")
+
+    def test_templates_are_read_after_every_pool_read(self):
+        order = []
+
+        def call(url, method, params=None, timeout=20.0):
+            order.append(method)
+            if method == "getblocktemplate":
+                return {"previousblockhash": "p", "transactions": []}
+            return {"getbestblockhash": "h", "getrawmempool": []}[method]
+
+        rows = canary.sample_round({"x": "u1", "y": "u2"}, "r", 0, True, call)
+
+        self.assertEqual(order[-2:], ["getblocktemplate", "getblocktemplate"])
+        self.assertTrue(all("t" in result["template"] for result in rows))
+
     def test_empty_templates_are_counted_apart(self):
         rows = []
         for r in range(3):

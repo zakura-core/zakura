@@ -44,8 +44,10 @@ python3 canary.py overlap --samples samples.jsonl --canary canary --min-pairs 10
 ```
 
 `templates` pairs the canary's template with each neighbour's when both build
-on the same block, counts pairs of empty templates apart, and passes when the canary's median fee total is at least
-`1 - --tolerance` of each neighbour's.
+on the same block and were read at most `--max-skew` seconds apart, counts
+pairs of empty templates apart, and passes when the canary's median fee total
+is at least `1 - --tolerance` of each neighbour's. `sample` reads every
+node's template at once, after all the pool reads, so the reads line up.
 
 ```sh
 python3 canary.py templates --samples samples.jsonl --canary canary --min-pairs 100

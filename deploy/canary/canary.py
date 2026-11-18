@@ -75,22 +75,29 @@ def read_pool(url, call=rpc, clock=time.time):
     return before, sorted(pool), at, err
 
 
-def read_template(url, call=rpc):
-    """Returns `url`'s block template as `{prev, txids, fees}`."""
+def read_template(url, call=rpc, clock=time.time):
+    """Returns `url`'s block template as `{prev, txids, fees, t, t_err}`, with
+    the read's midpoint and half its length as `read_pool` gives them."""
+    sent = clock()
     template = call(url, "getblocktemplate", [], timeout=30.0)
+    answered = clock()
     transactions = template.get("transactions", [])
     return {
         "prev": template.get("previousblockhash"),
         "txids": sorted(tx["hash"] for tx in transactions),
         "fees": sum(tx.get("fee", 0) for tx in transactions),
+        "t": round((sent + answered) / 2, 3),
+        "t_err": round((answered - sent) / 2, 3),
     }
 
 
 def sample_round(nodes, run, round_index, with_templates, call=rpc):
     """Reads every node at once and returns one row per node for this round.
 
-    `run` names the `sample` invocation, so rounds from runs appended to one
-    file never pair with each other.
+    Pool reads go first, then, once every node answered, template reads, again
+    all at once, so a slow pool read doesn't push one node's template later
+    than the others'. `run` names the `sample` invocation, so rounds from runs
+    appended to one file never pair with each other.
     """
 
     def one(name):
@@ -106,17 +113,21 @@ def sample_round(nodes, run, round_index, with_templates, call=rpc):
             row["tip_moved"] = True
         else:
             row["tip"], row["txids"] = tip, txids
-        if with_templates:
-            # Kept apart, so a failed template read leaves the pool read's
-            # time as it was.
+        return row
+
+    def template(row):
+        # Kept apart, so a failed template read leaves the pool read's time as
+        # it was. A node that didn't answer its pool read isn't asked.
+        if with_templates and "error" not in row:
             try:
-                row["template"] = read_template(nodes[name], call)
+                row["template"] = read_template(nodes[row["node"]], call)
             except Exception as error:
                 row["template_error"] = str(error)[:200]
         return row
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        return list(pool.map(one, nodes))
+        rows = list(pool.map(one, nodes))
+        return list(pool.map(template, rows))
 
 
 def cmd_sample(args):
@@ -258,13 +269,16 @@ def grade_overlap(rows, canary, max_skew, min_pairs, tolerance, max_missed=0.01)
     return report
 
 
-def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01):
+def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01, max_skew=3.0):
     """Grades the canary's templates against each neighbour's at the same tip.
 
     For each neighbour it pairs rounds where both templates build on the same
     previous block, and compares transaction sets and total fees. Pairs where
     both templates are empty are counted apart, since they can't show a
-    canary leaving transactions out. Passes when, over the pairs, the
+    canary leaving transactions out. Like `pair_overlap`, two templates read
+    more than `max_skew` seconds apart, allowing for how long each read took,
+    don't pair, since transactions that arrived between them would read as
+    fees one left out. Passes when, over the pairs, the
     canary's median fee total is at least `1 - tolerance` of every
     neighbour's. A canary that answered template reads less often fails. See
     `missed_too_often`.
@@ -282,6 +296,11 @@ def grade_templates(rows, canary, min_pairs, tolerance, max_missed=0.01):
             if not x or not y or x["prev"] != y["prev"]:
                 skipped += 1
                 continue
+            if "t" in x and "t" in y:
+                apart = abs(x["t"] - y["t"]) + x.get("t_err", 0.0) + y.get("t_err", 0.0)
+                if apart > max_skew:
+                    skipped += 1
+                    continue
             set_x, set_y = set(x["txids"]), set(y["txids"])
             union = set_x | set_y
             if not union:
@@ -427,7 +446,7 @@ def cmd_overlap(args):
 def cmd_templates(args):
     """Runs `templates` on a `sample` file."""
     report = grade_templates(load_rows(args.samples), args.canary, args.min_pairs,
-                             args.tolerance, args.max_missed)
+                             args.tolerance, args.max_missed, args.max_skew)
     return finish(report, args.out)
 
 
@@ -479,6 +498,8 @@ def build_parser():
     templates.add_argument("--samples", required=True)
     templates.add_argument("--canary", required=True)
     templates.add_argument("--min-pairs", type=int, default=20)
+    templates.add_argument("--max-skew", type=float, default=3.0,
+                           help="most seconds between two paired template reads")
     templates.add_argument("--tolerance", type=float, default=0.01,
                            help="how far below a neighbour's fees the canary's median may be")
     templates.add_argument("--max-missed", type=float, default=0.01,

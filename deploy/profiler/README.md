@@ -65,9 +65,8 @@ come from" panel):
   time, for first and second requests and by block size;
 - how many second requests were sent, for which reason, how many arrived
   before the first request's block, and the time they saved;
-- how often a peer that announced a block did not deliver it, how far that
-  raised its score, how many samples the score rested on, and how long the
-  score took to come back;
+- how often a peer that announced a block did not deliver it, and how long
+  block routing passed it over before it delivered a block again;
 - what the scores were made of: pings, transaction replies and small blocks.
 
 The last two need a node build that writes the `delivery_score` trace table.

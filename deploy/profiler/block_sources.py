@@ -8,8 +8,10 @@ answers, per node, whether that is working:
 - `legacy_peer_request` `block_request_finish` rows of first (`advertised`) and second
   (`hedge`) block requests: how far each download was from its peer's score, by block size,
   and how often second requests were sent, delivered and won;
-- `delivery_score` `delivery_sample` rows, one per sample that changed a peer's score: what the
-  scores are made of, how far a missed block moves a score, and how soon it comes back.
+- `delivery_score` `delivery_sample` rows, one per sample that changed a peer's score, which show
+  what the scores are made of;
+- `delivery_score` `block_missed` rows, one per announced block a peer did not deliver: block
+  routing stops preferring that peer until it delivers a block, and these show how soon it did.
 
 Everything is kept in memory for at most `MAX_HOURS`; a restarted profiler starts from the
 last part of each table that it reads back.
@@ -28,11 +30,8 @@ MAX_SAMPLES = 300_000
 # up to 256 KiB, so larger blocks show how much transfer time it leaves out.
 SIZE_BUCKETS = ((50_000, "under 50 KB"), (256 * 1024, "50-256 KB"), (None, "over 256 KB"))
 UNKNOWN_SIZE = "size not traced"
-SAMPLE_KINDS = ("ping", "transaction", "block", "missed_block", "missed_second_block", "carried_over")
-PENALTY_KINDS = ("missed_block", "missed_second_block")
-# A penalised score counts as recovered once it is back within this of where it was.
-RECOVERED_FACTOR = 1.25
-RECOVERED_SLACK_MS = 20
+SAMPLE_KINDS = ("ping", "transaction", "block", "carried_over")
+MISSED_REQUESTS = ("first", "second")
 
 
 def quantile(values, share):
@@ -70,6 +69,7 @@ class BlockSources:
         self._lock = threading.Lock()
         self._requests = collections.deque(maxlen=MAX_REQUESTS)
         self._samples = collections.deque(maxlen=MAX_SAMPLES)
+        self._misses = collections.deque(maxlen=MAX_REQUESTS)
 
     def _when(self, row):
         """The unix time of a row, from its run's start and its `ts`, or now if unknown."""
@@ -95,6 +95,7 @@ class BlockSources:
                 "bytes": row.get("block_bytes"),
                 "reason": row.get("hedge_reason"),
                 "waited_ms": row.get("first_request_waited_ms"),
+                "connection": (row.get("process_trace_id"), row.get("connection_id")),
             }
             with self._lock:
                 self._requests.append(request)
@@ -111,6 +112,10 @@ class BlockSources:
             )
             with self._lock:
                 self._samples.append(sample)
+        elif event == "block_missed" and row.get("request") in MISSED_REQUESTS:
+            miss = (self._when(row), (row.get("process_trace_id"), row.get("connection_id")), row["request"])
+            with self._lock:
+                self._misses.append(miss)
 
     def summary(self, hours):
         """What the last `hours` (at most `MAX_HOURS`) of requests and samples show."""
@@ -120,6 +125,8 @@ class BlockSources:
         with self._lock:
             requests = [r for r in self._requests if r["when"] >= since]
             samples = list(self._samples)
+            misses = [m for m in self._misses if m[0] >= since]
+            all_requests = list(self._requests)
         return {
             "hours": hours,
             "since": since,
@@ -127,7 +134,7 @@ class BlockSources:
             "prediction": prediction_errors(requests),
             "second_requests": second_request_outcomes(requests),
             "samples": sample_mix([s for s in samples if s[0] >= since]),
-            "penalties": penalties(samples, since),
+            "missed_blocks": missed_blocks(misses, all_requests, samples),
         }
 
 
@@ -208,47 +215,41 @@ def sample_mix(samples):
     }
 
 
-def penalties(samples, since):
-    """How far missed blocks moved scores, and how soon the scores came back.
+def missed_blocks(misses, requests, samples):
+    """Announced blocks peers did not deliver, and how soon each peer delivered a block again.
 
-    A penalised score has recovered once a later sample leaves it within `RECOVERED_FACTOR`
-    or `RECOVERED_SLACK_MS` of the score before the penalty. A connection with no later
-    sample has most likely closed.
+    After a miss, block routing stops preferring the peer until it delivers a block. A later
+    delivered block request, or a small-block score sample, on the same connection ends that.
+    A connection with no later row at all has most likely closed.
     """
-    by_connection = collections.defaultdict(list)
-    for s in samples:
-        by_connection[s[1]].append(s)
+    delivered = collections.defaultdict(list)
+    seen = collections.defaultdict(list)
+    for r in requests:
+        seen[r["connection"]].append(r["when"])
+        if r["delivered"]:
+            delivered[r["connection"]].append(r["when"])
+    for when, connection, kind, *_ in samples:
+        seen[connection].append(when)
+        if kind == "block":
+            delivered[connection].append(when)
     result = {}
-    for kind in PENALTY_KINDS:
-        jumps, before_scores, weights, recovery_s = [], [], [], []
-        still_raised = closed = 0
-        for connection, rows in by_connection.items():
-            for index, (when, _, sample_kind, before, score, weight) in enumerate(rows):
-                if sample_kind != kind or when < since:
-                    continue
-                if isinstance(weight, (int, float)):
-                    weights.append(weight)
-                if type(before) is not int:
-                    continue
-                jumps.append(score - before)
-                before_scores.append(before)
-                limit = max(before * RECOVERED_FACTOR, before + RECOVERED_SLACK_MS)
-                later = rows[index + 1:]
-                back = next((row for row in later if row[4] <= limit), None)
-                if back is not None:
-                    recovery_s.append(back[0] - when)
-                elif later:
-                    still_raised += 1
-                else:
-                    closed += 1
-        result[kind] = {
-            "count": sum(1 for rows in by_connection.values() for s in rows if s[2] == kind and s[0] >= since),
-            "score_before_ms": spread(before_scores),
-            "jump_ms": spread(jumps),
-            "weight": spread(weights),
-            "recovered": len(recovery_s),
-            "recovery_s": spread(recovery_s),
-            "still_raised": still_raised,
+    for request in MISSED_REQUESTS:
+        delays, waiting, closed = [], 0, 0
+        for when, connection, kind in misses:
+            if kind != request:
+                continue
+            again = min((t for t in delivered[connection] if t > when), default=None)
+            if again is not None:
+                delays.append(again - when)
+            elif any(t > when for t in seen[connection]):
+                waiting += 1
+            else:
+                closed += 1
+        result[request] = {
+            "count": len(delays) + waiting + closed,
+            "delivered_again": len(delays),
+            "delivered_again_s": spread(delays),
+            "waiting": waiting,
             "closed": closed,
         }
     return result

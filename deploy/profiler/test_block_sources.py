@@ -103,37 +103,45 @@ class SecondRequestTest(unittest.TestCase):
         self.assertEqual(outcomes["stalled"]["won"], 1, "the first request never delivered")
 
 
-class PenaltyTest(unittest.TestCase):
-    def test_restoring_a_score_is_counted_without_another_measurement_or_penalty(self):
+def missed(seconds, connection, request):
+    return {
+        "event": "block_missed",
+        "process_trace_id": RUN,
+        "ts": at(seconds),
+        "connection_id": connection,
+        "request": request,
+    }
+
+
+class MissedBlockTest(unittest.TestCase):
+    def test_restoring_a_score_is_counted_without_another_measurement(self):
         restored = sample(30, 2, "carried_over", None, 1000, weight=2.0)
         del restored["sample_ms"]
-        summary = sources_at(100, [sample(20, 1, "missed_block", 5, 1000), restored]).summary(1)
+        summary = sources_at(100, [sample(20, 1, "ping", None, 5), restored]).summary(1)
         self.assertEqual(summary["samples"]["counts"]["carried_over"], 1)
         self.assertEqual(summary["samples"]["weight"]["p50"], 1.0)
-        self.assertEqual(summary["penalties"]["missed_block"]["count"], 1)
-        self.assertEqual(summary["penalties"]["missed_second_block"]["count"], 0)
 
-    def test_a_penalty_reports_its_jump_and_when_the_score_came_back(self):
+    def test_a_miss_reports_when_the_peer_delivered_a_block_again(self):
         sources = sources_at(2000, [
-            sample(10, 1, "ping", None, 5),
-            sample(20, 1, "missed_second_block", 5, 1000, weight=2.0, sample_ms=2000),
-            sample(80, 1, "transaction", 1000, 400),
-            sample(620, 1, "ping", 400, 6),
-            sample(30, 2, "missed_block", 240, 600, weight=5.0, sample_ms=2000),
-            sample(40, 2, "ping", 600, 520),
-            sample(50, 3, "missed_block", 250, 700, sample_ms=2000),
+            missed(20, 1, "second"),
+            sample(80, 1, "ping", 5, 5),
+            sample(620, 1, "block", 5, 6),
+            missed(30, 2, "first"),
+            dict(request(130, "x", elapsed=50), connection_id=2),
+            missed(50, 3, "first"),
+            sample(60, 3, "ping", 200, 200),
+            missed(70, 4, "first"),
         ])  # fmt: skip
-        summary = sources.summary(1)
-        second = summary["penalties"]["missed_second_block"]
-        self.assertEqual(second["count"], 1)
-        self.assertEqual(second["jump_ms"]["p50"], 995)
-        self.assertEqual(second["recovered"], 1)
-        self.assertEqual(second["recovery_s"]["p50"], 600)
-        first = summary["penalties"]["missed_block"]
-        self.assertEqual(first["count"], 2)
-        self.assertEqual(first["still_raised"], 1)
-        self.assertEqual(first["closed"], 1)
-        self.assertEqual(summary["samples"]["counts"]["ping"], 3)
+        summary = sources.summary(1)["missed_blocks"]
+        self.assertEqual(summary["second"]["count"], 1)
+        self.assertEqual(summary["second"]["delivered_again"], 1)
+        self.assertEqual(summary["second"]["delivered_again_s"]["p50"], 600, "a small block sample counts")
+        first = summary["first"]
+        self.assertEqual(first["count"], 3)
+        self.assertEqual(first["delivered_again"], 1, "a delivered request counts")
+        self.assertEqual(first["delivered_again_s"]["p50"], 100)
+        self.assertEqual(first["waiting"], 1, "still connected, no block yet")
+        self.assertEqual(first["closed"], 1, "nothing after the miss")
 
 
 class TraceFollowerTest(unittest.TestCase):

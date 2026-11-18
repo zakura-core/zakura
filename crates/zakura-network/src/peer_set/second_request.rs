@@ -20,11 +20,6 @@ const MARGIN_SHARE: u32 = 4;
 /// How long past its expected answer time a first request may run before it counts as stalled.
 const STALL_SLACK: Duration = Duration::from_millis(500);
 
-/// The expected answer time assumed for a first peer whose answers have not been measured: a
-/// typical download from a far peer. Assuming nothing would let any measured announcer, however
-/// far, replace it.
-const UNSCORED_FIRST_SCORE: Duration = Duration::from_millis(250);
-
 /// Why a second request was sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SecondRequestReason {
@@ -46,8 +41,9 @@ impl SecondRequestReason {
 
 /// Decides whether to send a second request for a block.
 ///
-/// - `first_score` is the first peer's expected answer time when it was asked, if measured, or
-///   else [`UNSCORED_FIRST_SCORE`];
+/// - `first_score` is the first peer's expected answer time when it was asked. A first peer
+///   with no measured answers gets no second request, because there is nothing to compare a
+///   candidate with;
 /// - `waited` is how long the first request has been outstanding;
 /// - `best_candidate_score` is the expected answer time of the best other idle announcer, if
 ///   there is one and it has been measured.
@@ -58,11 +54,10 @@ impl SecondRequestReason {
 /// Returns `None` when the first request is still expected to arrive sooner, or when no other
 /// announcer is known to be faster and the first request has not stalled.
 pub(super) fn second_request_reason(
-    first_score: Option<Duration>,
+    first_score: Duration,
     waited: Duration,
     best_candidate_score: Option<Duration>,
 ) -> Option<SecondRequestReason> {
-    let first_score = first_score.unwrap_or(UNSCORED_FIRST_SCORE);
     let stall_after = (first_score * 2).max(first_score + STALL_SLACK);
     if waited >= stall_after {
         return Some(SecondRequestReason::Stalled);
@@ -102,7 +97,7 @@ mod tests {
         // The first peer should answer in 230 ms; 70 ms in, a peer expected to take 50 ms
         // would deliver about 110 ms sooner.
         assert_eq!(
-            second_request_reason(Some(ms(230)), ms(70), Some(ms(50))),
+            second_request_reason(ms(230), ms(70), Some(ms(50))),
             Some(SecondRequestReason::Predicted)
         );
     }
@@ -110,27 +105,18 @@ mod tests {
     #[test]
     fn an_announcer_that_is_not_clearly_faster_is_not_asked() {
         // 160 ms are left, and the candidate's 120 ms plus the 57 ms margin is more.
-        assert_eq!(
-            second_request_reason(Some(ms(230)), ms(70), Some(ms(120))),
-            None
-        );
+        assert_eq!(second_request_reason(ms(230), ms(70), Some(ms(120))), None);
         // A fast first peer leaves little to win.
-        assert_eq!(
-            second_request_reason(Some(ms(40)), ms(20), Some(ms(5))),
-            None
-        );
+        assert_eq!(second_request_reason(ms(40), ms(20), Some(ms(5))), None);
     }
 
     #[test]
     fn the_margin_is_at_least_twenty_milliseconds() {
         // A quarter of 40 ms is 10 ms, so the 20 ms minimum applies: 5 + 20 is not under the
         // 25 ms left after 15 ms, but is under the 26 ms left after 14 ms.
+        assert_eq!(second_request_reason(ms(40), ms(15), Some(ms(5))), None);
         assert_eq!(
-            second_request_reason(Some(ms(40)), ms(15), Some(ms(5))),
-            None
-        );
-        assert_eq!(
-            second_request_reason(Some(ms(40)), ms(14), Some(ms(5))),
+            second_request_reason(ms(40), ms(14), Some(ms(5))),
             Some(SecondRequestReason::Predicted)
         );
     }
@@ -140,17 +126,17 @@ mod tests {
         // From the asia-scored load test: a far peer expected in 242 ms was still sending a
         // 1.5 MB block when same-city peers expected in 3 ms announced.
         assert_eq!(
-            second_request_reason(Some(ms(242)), ms(195), Some(ms(3))),
+            second_request_reason(ms(242), ms(195), Some(ms(3))),
             None,
             "before it is overdue, only 47 ms are left, less than the 3 ms plus a 60 ms margin"
         );
         assert_eq!(
-            second_request_reason(Some(ms(242)), ms(242), Some(ms(3))),
+            second_request_reason(ms(242), ms(242), Some(ms(3))),
             Some(SecondRequestReason::Predicted),
             "once overdue, 3 ms plus the margin is well under the whole 242 ms"
         );
         assert_eq!(
-            second_request_reason(Some(ms(242)), ms(300), Some(ms(190))),
+            second_request_reason(ms(242), ms(300), Some(ms(190))),
             None,
             "a candidate about as far away is still not asked"
         );
@@ -158,33 +144,15 @@ mod tests {
 
     #[test]
     fn without_a_measured_candidate_only_a_stall_sends_a_second_request() {
-        assert_eq!(second_request_reason(Some(ms(230)), ms(100), None), None);
+        assert_eq!(second_request_reason(ms(230), ms(100), None), None);
         // A stall is the larger of twice the expected time and the expected time plus 500 ms.
-        assert_eq!(second_request_reason(Some(ms(230)), ms(729), None), None);
+        assert_eq!(second_request_reason(ms(230), ms(729), None), None);
         assert_eq!(
-            second_request_reason(Some(ms(230)), ms(730), None),
+            second_request_reason(ms(230), ms(730), None),
             Some(SecondRequestReason::Stalled)
         );
         assert_eq!(
-            second_request_reason(Some(ms(800)), ms(1600), None),
-            Some(SecondRequestReason::Stalled)
-        );
-    }
-
-    #[test]
-    fn an_unmeasured_first_peer_is_treated_as_a_typical_far_peer() {
-        // It loses to a clearly faster measured announcer...
-        assert_eq!(
-            second_request_reason(None, ms(10), Some(ms(50))),
-            Some(SecondRequestReason::Predicted)
-        );
-        // ...but not to one about as far away.
-        assert_eq!(second_request_reason(None, ms(10), Some(ms(190))), None);
-        assert_eq!(second_request_reason(None, ms(10), None), None);
-        // Its stall point is that of a 250 ms peer: 250 ms plus 500 ms.
-        assert_eq!(second_request_reason(None, ms(749), None), None);
-        assert_eq!(
-            second_request_reason(None, ms(750), None),
+            second_request_reason(ms(800), ms(1600), None),
             Some(SecondRequestReason::Stalled)
         );
     }

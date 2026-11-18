@@ -74,8 +74,8 @@ pub(super) struct SecondRequestChoice {
     pub(super) candidates: usize,
     /// The chosen peer's expected answer time, if it has been measured.
     pub(super) score: Option<Duration>,
-    /// The first peer's expected answer time when it was asked, if it had been measured.
-    pub(super) first_score: Option<Duration>,
+    /// The first peer's expected answer time when it was asked.
+    pub(super) first_score: Duration,
 }
 
 /// The idle announcers a block request chose among, and their expected answer times.
@@ -360,9 +360,7 @@ impl LegacyPeerTrace {
                 hedge_reason: hedge.map(|choice| choice.reason.label()),
                 first_request_waited_ms: hedge
                     .map(|choice| saturating_millis(choice.first_request_waited)),
-                first_score_ms: hedge
-                    .and_then(|choice| choice.first_score)
-                    .map(saturating_millis),
+                first_score_ms: hedge.map(|choice| saturating_millis(choice.first_score)),
                 result,
             }
         });
@@ -621,7 +619,7 @@ mod tests {
                 reason: SecondRequestReason::Predicted,
                 candidates: 2,
                 score: Some(Duration::from_millis(50)),
-                first_score: Some(Duration::from_millis(230)),
+                first_score: Duration::from_millis(230),
             }),
             Duration::from_millis(48),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![

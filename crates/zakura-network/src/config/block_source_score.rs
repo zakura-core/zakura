@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// requested from one other idle peer that announced it, but only when that peer is expected to
 /// deliver it clearly sooner than the first, or when the first request has run well past its
 /// expected time. The first copy to arrive is used. A block is never requested more than twice
-/// this way.
+/// this way, and never when the first peer's answer times have not been measured yet.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockSourceScoreConfig {

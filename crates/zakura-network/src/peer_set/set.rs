@@ -1632,7 +1632,13 @@ where
             return not_yet();
         };
         let first_peer = first.legacy_peer;
-        let first_score = first.score;
+        // A first peer with no measured answers leaves nothing to compare a candidate with, so
+        // its request is left to the normal request timeout. Scored announcers are asked first,
+        // so this happens only when none of them was idle.
+        let Some(first_score) = first.score else {
+            metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
+            return not_yet();
+        };
         let candidates: Vec<(D::Key, Option<Duration>)> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))

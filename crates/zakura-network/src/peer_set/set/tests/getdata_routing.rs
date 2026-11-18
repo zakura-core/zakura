@@ -1736,40 +1736,32 @@ async fn a_later_announcer_that_is_not_clearly_faster_is_asked_only_after_a_stal
     );
 }
 
-/// A first peer whose answers have not been measured is treated as a typical far peer: a later
-/// announcer about as far away is not asked, and a clearly faster one is.
+/// A first peer whose answers have not been measured gets no second request, even from a much
+/// faster announcer and long after a measured peer's request would have stalled.
 #[tokio::test(start_paused = true)]
-async fn an_unmeasured_first_peer_is_replaced_only_by_a_clearly_faster_announcer() {
+async fn an_unmeasured_first_peer_gets_no_second_request() {
     let _init_guard = zakura_test::init();
     let registry = crate::peer_registry::PeerRegistry::default();
     let mut unmeasured = TestPeer::spawn(1);
-    let mut far = TestPeer::spawn(2);
-    let mut near = TestPeer::spawn(3);
+    let mut near = TestPeer::spawn(2);
     let _measured = [
         measured_peer(&mut unmeasured, &registry, None),
-        measured_peer(&mut far, &registry, Some(190)),
         measured_peer(&mut near, &registry, Some(5)),
     ];
     let (mut peer_set, mut guard) =
-        peer_set_with_second_requests(&mut [&mut unmeasured, &mut far, &mut near]);
+        peer_set_with_second_requests(&mut [&mut unmeasured, &mut near]);
 
     announce_block(&mut peer_set, &mut guard, &unmeasured).await;
     let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
     let _first = request_primary(&mut peer_set, &attempt).await;
-    announce_block(&mut peer_set, &mut guard, &far).await;
+    announce_block(&mut peer_set, &mut guard, &near).await;
 
     assert_not_yet(request_block_again(&mut peer_set, &attempt, 10).await).await;
-    assert_eq!(
-        far.written_now().await,
-        None,
-        "a far announcer is not asked"
-    );
-
-    announce_block(&mut peer_set, &mut guard, &near).await;
-    let _second = request_block_again(&mut peer_set, &attempt, 10).await;
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 2_000).await).await;
     assert_eq!(
         near.written_now().await,
-        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+        None,
+        "nothing says the near announcer is faster than an unmeasured first peer"
     );
 }
 

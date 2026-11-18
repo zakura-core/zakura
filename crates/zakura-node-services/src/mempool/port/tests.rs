@@ -352,5 +352,96 @@ fn a_snapshot_says_whether_the_pool_is_on() {
     assert!(snapshot_at(ChangeSeq(0)).active);
     let off = PoolSnapshot::inactive(tip, ChangeSeq(0));
     assert!(!off.active);
-    assert!(off.transactions.is_empty());
+    assert!(off.is_empty());
+}
+
+/// The outpoint `n` names.
+fn outpoint(n: u16) -> zakura_chain::transparent::OutPoint {
+    zakura_chain::transparent::OutPoint {
+        hash: hash(n),
+        index: 0,
+    }
+}
+
+/// A transaction that spends `outpoint(n)`, as a verifier passes it.
+fn spending(n: u16) -> zakura_chain::transaction::VerifiedUnminedTx {
+    use zakura_chain::{
+        amount::Amount,
+        transaction::{LockTime, Transaction, VerifiedUnminedTx},
+        transparent::{Input, Script},
+    };
+    let transaction = Transaction::V4 {
+        inputs: vec![Input::PrevOut {
+            outpoint: outpoint(n),
+            unlock_script: Script::new(&[]),
+            sequence: 0,
+        }],
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1_000_000),
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    };
+    VerifiedUnminedTx::new(
+        transaction.into(),
+        Amount::try_from(10_000).expect("a valid fee"),
+        0,
+        0,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .expect("the fee pays for the transaction")
+}
+
+#[test]
+fn a_snapshot_after_changes_matches_one_built_from_scratch() {
+    let tip = ChainTip {
+        hash: zakura_chain::block::Hash([0; 32]),
+        height: Height(100),
+    };
+    let [a, b, c, d] = [1, 2, 3, 4].map(spending);
+    let mined = |tx: &zakura_chain::transaction::VerifiedUnminedTx| tx.transaction.id().mined_id();
+    let before = PoolSnapshot::new(
+        tip,
+        ChangeSeq(1),
+        vec![a.clone(), b.clone()],
+        TransactionDependencies::default(),
+    );
+
+    // The step removes `a`, adds `c`, and adds `d` and evicts it again.
+    let pool = [b.clone(), c.clone()];
+    let changes = [
+        Change::Removed {
+            id: a.transaction.id(),
+            reason: super::RemovalReason::Mined,
+        },
+        Change::Added(c.transaction.id()),
+        Change::Added(d.transaction.id()),
+        Change::Removed {
+            id: d.transaction.id(),
+            reason: super::RemovalReason::Evicted,
+        },
+    ];
+    let after = before.after(
+        tip,
+        ChangeSeq(5),
+        &changes,
+        |id| pool.iter().find(|tx| mined(tx) == *id),
+        vec![mined(&c), mined(&b)],
+        TransactionDependencies::default(),
+    );
+
+    let fresh = PoolSnapshot::new(
+        tip,
+        ChangeSeq(5),
+        vec![c.clone(), b.clone()],
+        TransactionDependencies::default(),
+    );
+    assert!(after.transactions().eq(fresh.transactions()));
+    for (n, tx) in [(1, &a), (2, &b), (3, &c), (4, &d)] {
+        assert_eq!(after.spends(&outpoint(n)), fresh.spends(&outpoint(n)));
+        assert_eq!(after.transaction(&mined(tx)), fresh.transaction(&mined(tx)));
+    }
+    // The earlier snapshot still reads as it was published.
+    assert!(before.transactions().eq([&a, &b]));
+    assert!(before.spends(&outpoint(1)) && !before.spends(&outpoint(3)));
 }

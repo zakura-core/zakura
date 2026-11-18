@@ -766,6 +766,11 @@ impl<E: Clone> Storage<E> {
         self.verified.mining_transactions()
     }
 
+    /// The mined ids of [`Self::mining_transactions`], in the same order.
+    pub fn mining_order(&self) -> impl Iterator<Item = transaction::Hash> + '_ {
+        self.verified.mining_order()
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the verified set.
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         self.verified.transaction_dependencies()

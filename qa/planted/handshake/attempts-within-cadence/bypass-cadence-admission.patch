@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
-index 24b0818881..1af4d8cb98 100644
+index e900df8252..10ef20796d 100644
 --- a/crates/zakura-network/src/zakura/handler.rs
 +++ b/crates/zakura-network/src/zakura/handler.rs
-@@ -5057,48 +5057,8 @@ impl Acceptor for ZakuraProtocolHandler {
+@@ -5055,45 +5055,8 @@ impl Acceptor for ZakuraProtocolHandler {
                  "zakura.p2p.conn.rejected.pending_handshake",
              );
          }
@@ -10,8 +10,6 @@ index 24b0818881..1af4d8cb98 100644
 -        // Initial, which is never validated, can't take a validated source's
 -        // tokens. An unvalidated source that runs out gets a stateless Retry
 -        // below, which an honest peer answers with a validated Initial.
--        #[cfg(any(test, zakura_sim))]
--        let fresh = !counts.has_cadence_host(incoming.remote.ip(), incoming.validated);
 -        let cadence = counts.admit_cadence(
 -            incoming.remote.ip(),
 -            incoming.validated,
@@ -36,7 +34,6 @@ index 24b0818881..1af4d8cb98 100644
 -                super::HandshakeCadenceAdmission::Exhausted => "exhausted",
 -                super::HandshakeCadenceAdmission::Capacity => "capacity",
 -            },
--            fresh && cadence == super::HandshakeCadenceAdmission::Admit,
 -            hosts,
 -        );
 -        match cadence {

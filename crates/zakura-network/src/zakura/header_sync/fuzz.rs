@@ -771,7 +771,7 @@ impl PursuitHarness {
         let mut parent_hash = anchor.hash;
         let mut entries = Vec::new();
         for index in 0..4_u8 {
-            let mut header = *regtest_genesis_block().header;
+            let mut header = regtest_genesis_block().header.as_ref().clone();
             header.previous_block_hash = parent_hash;
             header.nonce.0[0] = index.saturating_add(1);
             let header = Arc::new(header);

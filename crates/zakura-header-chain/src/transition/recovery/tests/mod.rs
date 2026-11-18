@@ -372,7 +372,7 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
         Vec::new(),
     )
     .expect("the canonical anchor fields agree");
-    let mut child_header = *block.header;
+    let mut child_header = block.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += Duration::seconds(1);
     child_header.nonce = [1; 32].into();

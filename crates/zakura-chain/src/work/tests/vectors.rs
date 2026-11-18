@@ -83,7 +83,7 @@ fn equihash_solver_reproduces_a_historical_solution() {
     let _init_guard = zakura_test::init();
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
-    let mut template = *block.header;
+    let mut template = block.header.as_ref().clone();
 
     // The miner increments before solving, so start just before the known
     // nonce. Limit cancellation checks to one nonce to bound the test's work.
@@ -126,7 +126,7 @@ fn equihash_solver_honors_cancellation() {
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
     assert!(matches!(
-        Solution::solve(*block.header, || Err(SolverCancelled)),
+        Solution::solve(block.header.as_ref().clone(), || Err(SolverCancelled)),
         Err(SolverCancelled)
     ));
 }
@@ -204,7 +204,7 @@ fn regtest_solution_is_rejected_off_regtest() {
 
     let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
         .expect("block test vector should deserialize");
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
 
     // A short Regtest-shaped solution, as a malicious peer would send it.
     header.solution = Solution::Regtest([0; REGTEST_SOLUTION_SIZE]);

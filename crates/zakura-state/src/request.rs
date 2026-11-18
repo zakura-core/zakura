@@ -777,7 +777,7 @@ impl ContextuallyVerifiedBlock {
         )?;
 
         Ok(Self {
-            header: Arc::new(*block.header()),
+            header: Arc::new(block.header().clone()),
             block,
             hash,
             height,
@@ -831,7 +831,7 @@ impl ContextuallyVerifiedBlock {
         } = solved;
 
         Self {
-            header: Arc::new(*block.header()),
+            header: Arc::new(block.header().clone()),
             block,
             hash,
             height: proposal.height,

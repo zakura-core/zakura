@@ -218,7 +218,7 @@ pub fn proposal_block_from_template(
     .into();
 
     Ok(Block {
-        header: Arc::new(block::Header {
+        header: Arc::new(block::Header::new(zakura_chain::block::HeaderData {
             version,
             previous_block_hash,
             merkle_root,
@@ -227,7 +227,7 @@ pub fn proposal_block_from_template(
             difficulty_threshold,
             nonce: [0; 32].into(),
             solution: Solution::for_proposal_for_network(net),
-        }),
+        })),
         transactions,
     })
 }

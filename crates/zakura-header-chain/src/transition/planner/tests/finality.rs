@@ -1579,7 +1579,7 @@ fn checkpoint_retained_floor_matches_graph_minimum_after_fork_pruning() {
         .expect("the selected path is admitted");
     store.commit(&plan);
     let anchor = store.graph.finalized_frontier();
-    let mut sibling = *regtest_genesis_block().header;
+    let mut sibling = regtest_genesis_block().header.as_ref().clone();
     sibling.previous_block_hash = anchor.hash;
     sibling.nonce.0[0] = 0xf1;
     let sibling_hash = sibling.hash();

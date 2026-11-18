@@ -394,7 +394,7 @@ mod tests {
             header: genesis.header.clone(),
         }];
         for height in 1..=max_height {
-            let mut header = *genesis.header;
+            let mut header = genesis.header.as_ref().clone();
             header.previous_block_hash = facts
                 .last()
                 .expect("the context chain starts at genesis")
@@ -532,7 +532,7 @@ mod tests {
         );
 
         let mut broken_link = baseline.predecessors.clone();
-        let mut alternate = *regtest_genesis_block().header;
+        let mut alternate = regtest_genesis_block().header.as_ref().clone();
         alternate.previous_block_hash = broken_link[2].frontier.hash;
         alternate.nonce = [0xee; 32].into();
         let alternate = Arc::new(alternate);
@@ -596,7 +596,7 @@ mod tests {
         let mut headers = Vec::with_capacity(count);
         for offset in 1..=count {
             let height = u32::try_from(offset).expect("the fixture count fits in u32");
-            let mut header = *genesis.header;
+            let mut header = genesis.header.as_ref().clone();
             header.previous_block_hash = parent_hash;
             let mut nonce = [0; 32];
             nonce[..4].copy_from_slice(&height.to_le_bytes());

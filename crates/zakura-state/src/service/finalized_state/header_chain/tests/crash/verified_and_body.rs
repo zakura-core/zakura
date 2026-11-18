@@ -22,7 +22,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
                 .height
                 .next()
                 .expect("the genesis anchor has a next height");
-            let mut incumbent_header = *anchor.header;
+            let mut incumbent_header = anchor.header.as_ref().clone();
             incumbent_header.previous_block_hash = anchor.hash;
             incumbent_header.time += chrono::Duration::seconds(1);
             incumbent_header.nonce.0[0] ^= 1;
@@ -32,7 +32,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
                 hash: incumbent_header.hash(),
                 header: incumbent_header,
             };
-            let mut replacement_header = *anchor.header;
+            let mut replacement_header = anchor.header.as_ref().clone();
             replacement_header.previous_block_hash = anchor.hash;
             replacement_header.time += chrono::Duration::seconds(1);
             replacement_header.nonce.0[0] ^= 2;
@@ -507,7 +507,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 .expect("the authenticated regtest policy is valid");
             let marker = u8::try_from(index + if consensus_invalid { 0xc0 } else { 0x40 })
                 .expect("the fault-point list fits in u8");
-            let mut child_header = *anchor.header;
+            let mut child_header = anchor.header.as_ref().clone();
             child_header.previous_block_hash = anchor.hash;
             child_header.time += chrono::Duration::seconds(1);
             child_header.nonce.0[0] = marker;

@@ -982,7 +982,7 @@ mod tests {
             let previous = headers
                 .last()
                 .expect("the generated chain always starts at genesis");
-            let mut header = **previous;
+            let mut header = previous.as_ref().clone();
             header.previous_block_hash = previous.hash();
             header.time += Duration::seconds(1);
             header.nonce.0[0] = u8::try_from(height).expect("the test chain is shorter than 256");

@@ -45,7 +45,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
                 .with_nanosecond(0)
                 .expect("the fixture time has a valid zero nanosecond field"),
         );
-        let mut future_header = *anchor.header;
+        let mut future_header = anchor.header.as_ref().clone();
         future_header.previous_block_hash = anchor.hash;
         future_header.time = preparation_clock.0 + chrono::Duration::hours(3);
         future_header.nonce.0[0] = marker;

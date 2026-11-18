@@ -1593,7 +1593,7 @@ async fn tcp_headers_response_holds_read_admission_through_the_send() {
             zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
         )
         .unwrap()
-        .retain(*block.header)
+        .retain(block.header.as_ref().clone())
         .unwrap();
 
     let known_blocks = vec![block.hash()];
@@ -1878,7 +1878,7 @@ async fn tcp_header_copies_charge_only_their_new_allocations() {
                 zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*first.header),
             )
             .unwrap()
-            .retain(*first.header)
+            .retain(first.header.as_ref().clone())
             .unwrap();
         let headers = vec![
             HeaderHandle::from(read_header),

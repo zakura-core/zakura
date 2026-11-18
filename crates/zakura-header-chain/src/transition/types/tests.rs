@@ -54,7 +54,7 @@ fn body_owner() -> BodyWorkOwner {
 fn prepared_batch(evidence: EvidenceId) -> PreparedHeaderBatch {
     let genesis = regtest_genesis_block();
     let parent = Frontier::new(block::Height(0), genesis.hash());
-    let mut header = *genesis.header;
+    let mut header = genesis.header.as_ref().clone();
     header.previous_block_hash = parent.hash;
     header.nonce = [8; 32].into();
     let header = Arc::new(header);

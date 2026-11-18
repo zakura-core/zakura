@@ -806,7 +806,7 @@ fn synthetic_block_at_height(
     }
 
     let merkle_root = block.transactions.iter().collect::<block::merkle::Root>();
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
     header.previous_block_hash = previous_hash;
     header.merkle_root = merkle_root;
     header.nonce = zakura_chain::fmt::HexDebug(nonce_bytes(height, random));

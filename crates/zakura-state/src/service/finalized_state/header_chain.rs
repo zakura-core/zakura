@@ -3967,7 +3967,7 @@ pub fn benchmark_finality_witness(
         )?;
         let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)
             .map_err(|_| HeaderChainStoreError::Incoherent("benchmark rules are invalid"))?;
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[..4].copy_from_slice(&height.to_be_bytes());
@@ -4062,7 +4062,7 @@ pub fn benchmark_finality_witness(
         let mut fork_parent = base;
         for offset in 1..=replaced_suffix.saturating_add(1) {
             let height = u32::from(base.height).saturating_add(offset);
-            let mut header = *fork_parent_header;
+            let mut header = fork_parent_header.as_ref().clone();
             header.previous_block_hash = fork_parent.hash;
             header.time += chrono::Duration::seconds(1);
             header.nonce.0[0] = 0xd0_u8.saturating_add(u8::try_from(round).unwrap_or(0));

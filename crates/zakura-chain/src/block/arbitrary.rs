@@ -745,7 +745,7 @@ impl Arbitrary for Header {
                         previous_block_hash = GENESIS_PREVIOUS_BLOCK_HASH;
                     }
 
-                    Header {
+                    Header::new(crate::block::HeaderData {
                         version,
                         previous_block_hash,
                         merkle_root,
@@ -754,7 +754,7 @@ impl Arbitrary for Header {
                         difficulty_threshold,
                         nonce,
                         solution,
-                    }
+                    })
                 },
             )
             .boxed()

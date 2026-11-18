@@ -27,7 +27,7 @@ fn test_headers() -> Vec<block::Header> {
         .map(|block_bytes| {
             let block = Block::zcash_deserialize(&block_bytes[..])
                 .expect("block test vector should deserialize");
-            *block.header
+            block.header.as_ref().clone()
         })
         .collect()
 }
@@ -49,14 +49,14 @@ fn equihash_solution_roundtrip() {
 }
 
 prop_compose! {
-    fn randomized_solutions(real_header: block::Header)
+    fn randomized_solutions(real_header: block::HeaderData)
         (fake_solution in any::<equihash::Solution>()
             .prop_filter("solution must not be the actual solution", move |s| {
                 s != &real_header.solution
             })
         ) -> Arc<block::Header> {
 
-        let mut fake_header = real_header;
+        let mut fake_header = block::Header::new(real_header);
         fake_header.solution = fake_solution;
 
         Arc::new(fake_header)
@@ -72,7 +72,7 @@ fn equihash_prop_test_solution() -> eyre::Result<()> {
     // Every test vector gets a deterministic invalid solution, so vector
     // coverage does not depend on random case selection.
     for real_header in &headers {
-        let mut fake_header = *real_header;
+        let mut fake_header = real_header.clone();
         fake_header.solution = equihash::Solution::for_proposal();
         assert_ne!(fake_header.solution, real_header.solution);
         fake_header
@@ -83,7 +83,8 @@ fn equihash_prop_test_solution() -> eyre::Result<()> {
 
     // Randomized cases sample across the complete vector set instead of
     // multiplying the same case budget by every vector.
-    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_solutions);
+    let randomized_headers = proptest::sample::select(headers)
+        .prop_flat_map(|header| randomized_solutions(header.fields()));
     proptest!(Config::with_cases(equihash_proptest_cases()),
         |(fake_header in randomized_headers)| {
         fake_header.solution
@@ -95,14 +96,14 @@ fn equihash_prop_test_solution() -> eyre::Result<()> {
 }
 
 prop_compose! {
-    fn randomized_nonce(real_header: block::Header)
+    fn randomized_nonce(real_header: block::HeaderData)
         (fake_nonce in proptest::array::uniform32(any::<u8>())
             .prop_filter("nonce must not be the actual nonce", move |fake_nonce| {
                 fake_nonce != &real_header.nonce.0
             })
         ) -> Arc<block::Header> {
 
-        let mut fake_header = real_header;
+        let mut fake_header = block::Header::new(real_header);
         fake_header.nonce = fake_nonce.into();
 
         Arc::new(fake_header)
@@ -116,7 +117,7 @@ fn equihash_prop_test_nonce() -> eyre::Result<()> {
     let headers = test_headers();
 
     for real_header in &headers {
-        let mut fake_header = *real_header;
+        let mut fake_header = real_header.clone();
         fake_header.nonce.0[0] ^= 1;
         assert_ne!(fake_header.nonce, real_header.nonce);
         fake_header
@@ -125,7 +126,8 @@ fn equihash_prop_test_nonce() -> eyre::Result<()> {
             .expect_err("block header should not validate with a changed nonce");
     }
 
-    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_nonce);
+    let randomized_headers =
+        proptest::sample::select(headers).prop_flat_map(|header| randomized_nonce(header.fields()));
     proptest!(Config::with_cases(equihash_proptest_cases()),
         |(fake_header in randomized_headers)| {
         fake_header.solution
@@ -137,7 +139,7 @@ fn equihash_prop_test_nonce() -> eyre::Result<()> {
 }
 
 prop_compose! {
-    fn randomized_input(real_header: block::Header)
+    fn randomized_input(real_header: block::HeaderData)
         (fake_header in any::<block::Header>()
             .prop_map(move |mut fake_header| {
                 fake_header.nonce = real_header.nonce;
@@ -145,7 +147,7 @@ prop_compose! {
                 Arc::new(fake_header)
             })
             .prop_filter("input must not be the actual input", move |fake_header| {
-                fake_header.as_ref() != &real_header
+                fake_header.fields() != real_header
             })
         ) -> Arc<block::Header> {
 
@@ -160,7 +162,7 @@ fn equihash_prop_test_input() -> eyre::Result<()> {
     let headers = test_headers();
 
     for real_header in &headers {
-        let mut fake_header = *real_header;
+        let mut fake_header = real_header.clone();
         fake_header.previous_block_hash.0[0] ^= 1;
         assert_ne!(fake_header, *real_header);
         fake_header
@@ -169,7 +171,8 @@ fn equihash_prop_test_input() -> eyre::Result<()> {
             .expect_err("equihash solution should not validate with changed input");
     }
 
-    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_input);
+    let randomized_headers =
+        proptest::sample::select(headers).prop_flat_map(|header| randomized_input(header.fields()));
     proptest!(Config::with_cases(equihash_proptest_cases()),
         |(fake_header in randomized_headers)| {
         fake_header.solution

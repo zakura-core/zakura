@@ -776,7 +776,7 @@ impl HeaderChainWriter {
         let path = vec![VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: Arc::new(*block.block.header()),
+            header: Arc::new(block.block.header().clone()),
         }];
         let evidence = checkpoint_finality_evidence(snapshot.state_version, accepted);
         let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {

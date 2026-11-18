@@ -17,7 +17,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             .initialize(metadata, anchor.clone())
             .expect("the empty schema initializes");
         let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-        let mut child_header = *anchor.header;
+        let mut child_header = anchor.header.as_ref().clone();
         child_header.previous_block_hash = anchor.hash;
         child_header.time += chrono::Duration::seconds(1);
         let child_header = Arc::new(child_header);
@@ -29,7 +29,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             hash: child_header.hash(),
             header: child_header,
         };
-        let mut grandchild_header = *child.header;
+        let mut grandchild_header = child.header.as_ref().clone();
         grandchild_header.previous_block_hash = child.hash;
         grandchild_header.time += chrono::Duration::seconds(1);
         let grandchild_header = Arc::new(grandchild_header);
@@ -259,11 +259,11 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                 .height
                 .next()
                 .expect("the genesis anchor has a next height");
-            let mut first_header = *anchor.header;
+            let mut first_header = anchor.header.as_ref().clone();
             first_header.previous_block_hash = anchor.hash;
             first_header.time += chrono::Duration::seconds(1);
             let first_header = Arc::new(first_header);
-            let mut second_header = *first_header;
+            let mut second_header = first_header.as_ref().clone();
             second_header.nonce.0[0] ^= 1;
             let second_header = Arc::new(second_header);
             let (lower_header, higher_header) = if first_header.hash().0 < second_header.hash().0 {

@@ -46,7 +46,7 @@ fn insert_deferred_chain(
     let mut headers = insert.batch.headers().to_vec();
     let mut parent_hash = store.lease.parent.hash;
     for (header, deadline) in headers.iter_mut().zip(deadlines) {
-        let mut raw_header = *header.header;
+        let mut raw_header = header.header.as_ref().clone();
         raw_header.previous_block_hash = parent_hash;
         raw_header.nonce.0[31] = nonce_seed;
         header.header = Arc::new(raw_header);

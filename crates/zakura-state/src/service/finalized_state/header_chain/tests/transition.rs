@@ -817,7 +817,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
         .expect("the initialized anchor is retained");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the authenticated regtest policy is valid");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     let child_header = Arc::new(child_header);
@@ -933,7 +933,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
         .expect("the initialized anchor is retained");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the authenticated regtest policy is valid");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     let child_header = Arc::new(child_header);
@@ -1041,11 +1041,11 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
         .expect("the initialized anchor is retained");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the authenticated regtest policy is valid");
-    let mut first_header = *anchor.header;
+    let mut first_header = anchor.header.as_ref().clone();
     first_header.previous_block_hash = anchor.hash;
     first_header.time += chrono::Duration::seconds(1);
     let first_header = Arc::new(first_header);
-    let mut second_header = *first_header;
+    let mut second_header = first_header.as_ref().clone();
     second_header.previous_block_hash = first_header.hash();
     second_header.time += chrono::Duration::seconds(1);
     let second_header = Arc::new(second_header);
@@ -1560,14 +1560,14 @@ fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence(
         .expect("the initialized anchor is retained");
     let rules = HeaderRules::for_validation_lease(&lease)
         .expect("the authenticated regtest policy is valid");
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     child_header.nonce.0[0] = 0x81;
     let child_header = Arc::new(child_header);
     // Authenticating a VCT delivery reads the delivery's direct successor on the owned
     // branch, so the fixture admits one header past the checkpoint target.
-    let mut successor_header = *child_header;
+    let mut successor_header = child_header.as_ref().clone();
     successor_header.previous_block_hash = child_header.hash();
     successor_header.time += chrono::Duration::seconds(1);
     successor_header.nonce.0[0] = 0x85;

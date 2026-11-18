@@ -249,7 +249,7 @@ impl FuzzStore {
         let mut headers = Vec::with_capacity(usize::try_from(count).unwrap_or(8));
         let mut parent_hash = parent.hash;
         for offset in 1..=count {
-            let mut header = *regtest_genesis_block().header;
+            let mut header = regtest_genesis_block().header.as_ref().clone();
             header.previous_block_hash = parent_hash;
             if hard_work {
                 header.difficulty_threshold =
@@ -1331,7 +1331,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let clock = ManualClock::new();
 
     let child = |seconds: i64| {
-        let mut header = *anchor_header;
+        let mut header = anchor_header.as_ref().clone();
         header.previous_block_hash = anchor.hash;
         header.time = anchor_header.time + Duration::seconds(seconds);
         header.nonce.0[0] = u8::try_from(seconds).unwrap_or(u8::MAX);
@@ -1350,7 +1350,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
         prepared.headers()[0].validation,
         HeaderValidationState::Valid
     );
-    let mut historical_version = *valid;
+    let mut historical_version = valid.as_ref().clone();
     historical_version.version = 5;
     let historical_version = Arc::new(historical_version);
     crate::prepare_headers(
@@ -1376,7 +1376,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     );
 
     let mut cases = Vec::new();
-    let mut wrong_parent = *valid;
+    let mut wrong_parent = valid.as_ref().clone();
     let mut wrong_parent_hash = block::Hash([parameter(1, 0x41); 32]);
     if wrong_parent_hash == anchor.hash {
         wrong_parent_hash.0[0] ^= 1;
@@ -1390,19 +1390,19 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
         &clock,
     )
     .expect("prepare does not claim parent-link continuity");
-    let mut bad_version = *valid;
+    let mut bad_version = valid.as_ref().clone();
     bad_version.version = if parameter(2, 0) & 1 == 0 {
         u32::from(parameter(2, 0) % 4)
     } else {
         0x8000_0000 | u32::from(parameter(2, 0))
     };
     cases.push((Arc::new(bad_version), HeaderRule::EncodingVersionHash));
-    let mut bad_commitment = *valid;
+    let mut bad_commitment = valid.as_ref().clone();
     let mut commitment = [parameter(3, 0x42); 32];
     commitment[0] |= 1;
     bad_commitment.commitment_bytes = commitment.into();
     cases.push((Arc::new(bad_commitment), HeaderRule::CommitmentStructure));
-    let mut bad_target = *valid;
+    let mut bad_target = valid.as_ref().clone();
     bad_target.difficulty_threshold =
         zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([
             parameter(4, 0),

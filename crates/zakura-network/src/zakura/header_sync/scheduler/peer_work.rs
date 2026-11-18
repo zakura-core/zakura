@@ -1701,7 +1701,7 @@ mod tests {
     fn aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement() {
         let local = snapshot();
         let entry = HeaderEntry {
-            header: Arc::new(*regtest_genesis_block().header),
+            header: regtest_genesis_block().header.clone(),
             body_size: 0,
             tree_aux: None,
         };
@@ -1915,7 +1915,7 @@ mod tests {
 
     /// A page entry whose header `version` sets its hash apart.
     fn versioned_entry(version: u32) -> HeaderEntry {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.version = version;
         HeaderEntry {
             header: Arc::new(header),

@@ -466,7 +466,7 @@ mod tests {
         parent_hash: block::Hash,
         nonce: u8,
     ) -> block::Hash {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent_hash;
         header.nonce.0[0] = nonce;
         let header = Arc::new(header);
@@ -574,7 +574,7 @@ mod tests {
     fn graph_error_fallback_prefers_updated_deleted_tombstone_then_finalized() {
         let fixture = fixture(EngineMode::HeadersOnly);
         let mut graph = fixture.engine.graph().clone();
-        let mut sibling_header = *regtest_genesis_block().header;
+        let mut sibling_header = regtest_genesis_block().header.as_ref().clone();
         sibling_header.previous_block_hash = fixture.anchor.hash;
         sibling_header.nonce.0[0] = 0x30;
         let sibling = match graph

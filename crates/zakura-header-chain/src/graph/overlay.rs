@@ -1596,7 +1596,7 @@ mod tests {
     }
 
     fn header(parent: block::Hash, marker: u8) -> Arc<block::Header> {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent;
         header.nonce = [marker; 32].into();
         Arc::new(header)

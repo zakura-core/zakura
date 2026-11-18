@@ -386,7 +386,7 @@ impl EvictionFixture {
             .peer_work_queue
             .active(&self.peer)
             .expect("the started request is active");
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = anchor.hash;
         header.time += chrono::Duration::seconds(1);
         let response = Headers {

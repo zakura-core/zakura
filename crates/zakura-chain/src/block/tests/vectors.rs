@@ -584,15 +584,20 @@ fn header_serialized_size_matches_encoding() {
         .flat_map(|net| {
             net.block_iter()
                 .map(|(_, bytes)| {
-                    *bytes
+                    bytes
                         .zcash_deserialize_into::<Block>()
                         .expect("block test vectors are structurally valid")
                         .header
+                        .as_ref()
+                        .clone()
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
-    let regtest_header = *crate::block::genesis::regtest_genesis_block().header;
+    let regtest_header = crate::block::genesis::regtest_genesis_block()
+        .header
+        .as_ref()
+        .clone();
     assert!(matches!(regtest_header.solution, Solution::Regtest(_)));
     assert!(headers
         .iter()

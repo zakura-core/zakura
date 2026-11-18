@@ -303,7 +303,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut repair_block_header = *regtest_genesis_block().header;
+    let mut repair_block_header = regtest_genesis_block().header.as_ref().clone();
     repair_block_header.previous_block_hash = anchor.hash;
     repair_block_header.time += chrono::Duration::seconds(1);
     let repair_block_header = Arc::new(repair_block_header);
@@ -682,7 +682,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut repair_block_header = *regtest_genesis_block().header;
+    let mut repair_block_header = regtest_genesis_block().header.as_ref().clone();
     repair_block_header.previous_block_hash = anchor.hash;
     repair_block_header.time += chrono::Duration::seconds(1);
     let repair_block_header = Arc::new(repair_block_header);
@@ -830,7 +830,7 @@ async fn repair_awaiting_supplier(
     supplier_status: impl FnOnce(zakura_header_chain::Frontier) -> Status,
 ) -> RepairAwaitingSupplier {
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut repair_block_header = *regtest_genesis_block().header;
+    let mut repair_block_header = regtest_genesis_block().header.as_ref().clone();
     repair_block_header.previous_block_hash = anchor.hash;
     repair_block_header.time += chrono::Duration::seconds(1);
     let repair_block_header = Arc::new(repair_block_header);
@@ -1076,11 +1076,11 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut target_header = *regtest_genesis_block().header;
+    let mut target_header = regtest_genesis_block().header.as_ref().clone();
     target_header.previous_block_hash = anchor.hash;
     target_header.time += chrono::Duration::seconds(1);
     let target_header = Arc::new(target_header);
-    let mut successor_header = *target_header;
+    let mut successor_header = target_header.as_ref().clone();
     successor_header.previous_block_hash = target_header.hash();
     successor_header.time += chrono::Duration::seconds(1);
     let successor_header = Arc::new(successor_header);

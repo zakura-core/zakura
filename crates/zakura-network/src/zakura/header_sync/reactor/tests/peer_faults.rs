@@ -17,7 +17,7 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
         snapshot.frontiers.finalized.height,
         block::Hash([0x41; 32]),
     );
-    let mut wrong_ancestor_header = *active.entries[0].header;
+    let mut wrong_ancestor_header = active.entries[0].header.as_ref().clone();
     wrong_ancestor_header.previous_block_hash = wrong_ancestor.hash;
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;
@@ -51,7 +51,7 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
         .active_mut(&peer)
         .expect("the fixture has active work");
     let header = active.entries[0].header.clone();
-    let mut wrong_target_header = *header;
+    let mut wrong_target_header = header.as_ref().clone();
     wrong_target_header.time += chrono::Duration::seconds(1);
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;

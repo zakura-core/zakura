@@ -658,7 +658,7 @@ fn fixture_block(height: u32) -> Arc<block::Block> {
         panic!("block 1 starts with a coinbase input");
     };
     *coinbase_height = block::Height(height);
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
     header.merkle_root = block.transactions.iter().collect();
     block.header = Arc::new(header);
     Arc::new(block)

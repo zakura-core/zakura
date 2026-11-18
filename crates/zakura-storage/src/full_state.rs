@@ -369,7 +369,7 @@ fn header_ref(committed: &Committed) -> VerifiedHeaderRef {
     VerifiedHeaderRef {
         height: committed.height,
         hash: committed.hash,
-        header: Arc::new(*committed.block.header()),
+        header: Arc::new(committed.block.header().clone()),
     }
 }
 

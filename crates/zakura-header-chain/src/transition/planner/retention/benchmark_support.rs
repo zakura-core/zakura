@@ -32,7 +32,7 @@ impl RetentionBenchmarkFixture {
             crate::MAX_NON_FINALIZED_NODES_V1.saturating_mul(percent) / 100;
         let mut header_best = finalized;
         for index in 0..retained_non_finalized_nodes {
-            let mut header = *regtest_genesis_block().header;
+            let mut header = regtest_genesis_block().header.as_ref().clone();
             header.previous_block_hash = header_best.hash;
             let nonce_marker = (index % 251) as u8;
             header.nonce = [nonce_marker; 32].into();

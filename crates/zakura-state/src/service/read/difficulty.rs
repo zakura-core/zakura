@@ -548,13 +548,13 @@ mod tests {
                     .try_into()
                     .unwrap();
             let limit = network.target_difficulty_limit();
-            let mut header = *block.header;
+            let mut header = block.header.as_ref().clone();
             header.time = tip_time.to_chrono();
             header.difficulty_threshold = (limit / 4_u32).to_compact();
             let span = pow_adjustment_block_span_for_height(&network, candidate_height);
             let relevant_chain: Vec<_> = (0..span)
                 .map(|index| {
-                    let mut header = header;
+                    let mut header = header.clone();
                     let age = u32::try_from(index).unwrap() * spacing.seconds();
                     header.time = tip_time
                         .checked_sub(Duration32::from_seconds(age))
@@ -665,7 +665,7 @@ mod tests {
         let min_time = after_tip(1);
         let max_time = after_tip(BLOCK_MAX_TIME_SINCE_MEDIAN);
         let tip_height = Height(3_000_000);
-        let mut header = *block.header;
+        let mut header = block.header.as_ref().clone();
         header.time = tip_time.to_chrono();
         let header = Arc::new(header);
 

@@ -30,7 +30,7 @@ fn pow_policy_waiver_is_derived_only_from_custom_network_identity() {
         PowPolicy::for_network(&regtest).expect("regtest is an authenticated custom network");
     assert!(regtest_policy.is_authenticated_custom_waiver());
     assert!(validate_compact_target(&regtest_genesis_block().header, &regtest).is_ok());
-    let mut wrong_shape = *regtest_genesis_block().header;
+    let mut wrong_shape = regtest_genesis_block().header.as_ref().clone();
     wrong_shape.solution = equihash::Solution::for_proposal();
     assert!(matches!(
         regtest_policy.validate_solution(&wrong_shape),
@@ -46,9 +46,9 @@ fn pow_policy_waiver_is_derived_only_from_custom_network_identity() {
     let custom_policy = PowPolicy::for_network(&pow_disabled_custom)
         .expect("configured custom networks may authenticate a PoW waiver");
     assert!(custom_policy.is_authenticated_custom_waiver());
-    let proposal_header = block::Header {
+    let proposal_header = block::Header::new(zakura_chain::block::HeaderData {
         solution: equihash::Solution::for_proposal(),
-        ..*regtest_genesis_block().header
-    };
+        ..(regtest_genesis_block().header).fields()
+    });
     assert!(custom_policy.validate_solution(&proposal_header).is_ok());
 }

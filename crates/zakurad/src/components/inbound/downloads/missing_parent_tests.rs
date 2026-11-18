@@ -61,7 +61,7 @@ fn block_3() -> Arc<Block> {
 ///
 /// The block no longer has valid proof of work, so it needs a network that waives it.
 fn with_parent(block: &Block, parent: block::Hash) -> Arc<Block> {
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
     header.previous_block_hash = parent;
 
     Arc::new(Block {
@@ -72,7 +72,7 @@ fn with_parent(block: &Block, parent: block::Hash) -> Arc<Block> {
 
 /// Returns `block` with a different nonce, so it is a distinct sibling with the same parent.
 fn sibling_of(block: &Block, nonce_byte: u8) -> Arc<Block> {
-    let mut header = *block.header;
+    let mut header = block.header.as_ref().clone();
     header.nonce = [nonce_byte; 32].into();
 
     Arc::new(Block {

@@ -125,7 +125,7 @@ impl ZcashDeserialize for Header {
         let version = reader.read_u32::<LittleEndian>()?;
         validate_header_version(version).map_err(SerializationError::Parse)?;
 
-        Ok(Header {
+        Ok(Header::new(crate::block::HeaderData {
             version,
             previous_block_hash: reader.read_value::<Hash>()?,
             merkle_root: merkle::Root(reader.read_32_bytes()?),
@@ -140,7 +140,7 @@ impl ZcashDeserialize for Header {
             difficulty_threshold: CompactDifficulty(reader.read_u32::<LittleEndian>()?),
             nonce: reader.read_32_bytes()?.into(),
             solution: reader.read_value::<equihash::Solution>()?,
-        })
+        }))
     }
 }
 

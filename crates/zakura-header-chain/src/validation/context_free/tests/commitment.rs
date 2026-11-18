@@ -19,7 +19,7 @@ fn custom_overlapping_activations_select_the_configured_commitment_variant() {
         .clear_funding_streams()
         .to_network()
         .expect("the custom-network parameters are valid");
-    let mut header = *regtest_genesis_block().header;
+    let mut header = regtest_genesis_block().header.as_ref().clone();
     header.commitment_bytes = [0; 32].into();
     assert_eq!(
         validate_commitment_structure(&header, &heartwood_canopy, activation_height),

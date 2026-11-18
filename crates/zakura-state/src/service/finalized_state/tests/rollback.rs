@@ -541,10 +541,10 @@ pub(super) fn child_block(
     parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
 ) -> Arc<Block> {
-    let header = block::Header {
+    let header = block::Header::new(zakura_chain::block::HeaderData {
         previous_block_hash: parent.hash(),
-        ..*parent.header()
-    };
+        ..(parent.header()).fields()
+    });
     Arc::new(Block {
         header: Arc::new(header),
         transactions,

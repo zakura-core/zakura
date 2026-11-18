@@ -122,7 +122,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
     });
     let blocks: Vec<Arc<Block>> = (0..3)
         .map(|nonce| {
-            let mut header = *genesis.header;
+            let mut header = genesis.header.as_ref().clone();
             header.nonce.0 = [nonce; 32];
             Arc::new(Block {
                 header: Arc::new(header),

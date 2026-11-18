@@ -164,11 +164,12 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
     )
     .expect("the test supplies the complete late-chain difficulty context")
     .expected_difficulty_threshold();
-    let mut candidate = *zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+    let mut candidate = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes")
         .header
-        .as_ref();
+        .as_ref()
+        .clone();
     candidate.time = candidate_time;
     candidate.difficulty_threshold = expected;
 
@@ -258,14 +259,14 @@ fn block_daa_enforces_the_post_nu7_context() {
     let relevant_headers: Vec<block::Header> = context
         .iter()
         .map(|(threshold, time)| {
-            let mut header = *candidate.header;
+            let mut header = candidate.header.as_ref().clone();
             header.difficulty_threshold = *threshold;
             header.time = *time;
             header
         })
         .collect();
     let mut candidate = (*candidate).clone();
-    let mut header = *candidate.header;
+    let mut header = candidate.header.as_ref().clone();
     header.time = candidate_time;
     header.difficulty_threshold = expected;
     candidate.header = Arc::new(header);
@@ -281,7 +282,7 @@ fn block_daa_enforces_the_post_nu7_context() {
     .expect("the independently calculated post-NU7 threshold is accepted");
 
     let mut wrong_window_candidate = candidate.clone();
-    let mut header = *wrong_window_candidate.header;
+    let mut header = wrong_window_candidate.header.as_ref().clone();
     header.difficulty_threshold = compact(0x1e0af369);
     wrong_window_candidate.header = Arc::new(header);
     assert!(matches!(
@@ -308,11 +309,12 @@ fn header_daa_rejects_bad_threshold_with_full_context() {
     let previous_block_height = block::Height(99);
     let candidate_time = DateTime::from_timestamp(15_000, 0).expect("test timestamp is in-range");
     let relevant_headers = daa_context(&network, previous_block_height, candidate_time);
-    let mut candidate = *zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+    let mut candidate = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes")
         .header
-        .as_ref();
+        .as_ref()
+        .clone();
     candidate.time = candidate_time;
     candidate.difficulty_threshold = network.target_difficulty_limit().to_compact();
 
@@ -336,7 +338,7 @@ fn height_one_header_skips_max_time_limit_but_later_mainnet_headers_do_not() {
     let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes");
-    let mut candidate = *block1.header;
+    let mut candidate = block1.header.as_ref().clone();
     candidate.time = genesis.header.time + Duration::hours(24);
     let context = [(genesis.header.difficulty_threshold, genesis.header.time)];
 
@@ -346,7 +348,7 @@ fn height_one_header_skips_max_time_limit_but_later_mainnet_headers_do_not() {
     let block2 = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 2 deserializes");
-    let mut candidate = *block2.header;
+    let mut candidate = block2.header.as_ref().clone();
     candidate.time = block1.header.time + Duration::hours(24);
     let context = [
         (block1.header.difficulty_threshold, block1.header.time),

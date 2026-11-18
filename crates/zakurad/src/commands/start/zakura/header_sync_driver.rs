@@ -1507,10 +1507,10 @@ mod tests {
     }
 
     fn two_page_headers() -> [Arc<block::Header>; 2] {
-        let mut first = *regtest_genesis_block().header;
+        let mut first = regtest_genesis_block().header.as_ref().clone();
         first.previous_block_hash = block::Hash([0; 32]);
         let first = Arc::new(first);
-        let mut second = *first;
+        let mut second = first.as_ref().clone();
         second.previous_block_hash = first.hash();
         [first, Arc::new(second)]
     }
@@ -2080,7 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn finalized_body_sizes_follow_the_state_reply_and_drop_zero_sizes() {
         let genesis = regtest_genesis_block().header.clone();
-        let mut sibling = *genesis;
+        let mut sibling = genesis.as_ref().clone();
         sibling.nonce.0[0] = sibling.nonce.0[0].wrapping_add(1);
         let headers: Vec<Arc<block::Header>> = vec![genesis, Arc::new(sibling)];
         let expected_hashes: Vec<block::Hash> =

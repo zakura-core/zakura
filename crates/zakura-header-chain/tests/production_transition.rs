@@ -115,7 +115,7 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
     let mut parent_hash = lease.parent().hash;
     let mut headers = Vec::new();
     for marker in 1..=2 {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent_hash;
         header.time = header
             .time

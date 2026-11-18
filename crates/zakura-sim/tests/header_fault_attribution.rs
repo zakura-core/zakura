@@ -34,7 +34,7 @@ fn storage_config() -> RunConfig {
 /// `header` with a target easier than Regtest's proof-of-work limit, a fault
 /// preparation finds in the header alone.
 fn easy_target(header: &block::Header) -> Arc<block::Header> {
-    let mut header = *header;
+    let mut header = header.as_ref().clone();
     header.difficulty_threshold = CompactDifficulty::from_le_bytes(0x207f_ffff_u32.to_le_bytes());
     Arc::new(header)
 }
@@ -43,7 +43,7 @@ fn easy_target(header: &block::Header) -> Arc<block::Header> {
 /// of its predecessors' times, a fault only admission against the retained
 /// chain finds.
 fn stale_time(header: &block::Header, parent: &block::Header) -> Arc<block::Header> {
-    let mut header = *header;
+    let mut header = header.as_ref().clone();
     header.time = parent.time;
     Arc::new(header)
 }

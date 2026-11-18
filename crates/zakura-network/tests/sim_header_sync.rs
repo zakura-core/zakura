@@ -1133,7 +1133,7 @@ fn shutdown_stops_a_maintained_dial() {
 fn codec_builds_every_row_from_outside_the_crate() {
     let genesis = zakura_chain::block::genesis::regtest_genesis_block();
     let parent = (zakura_chain::block::Height(0), genesis.hash());
-    let mut header = *genesis.header;
+    let mut header = genesis.header.as_ref().clone();
     header.previous_block_hash = parent.1;
     let target = header.hash();
     let status = v9::Status {

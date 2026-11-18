@@ -21,7 +21,7 @@ fn saturated_store_admits_commit_window_repairs_after_reopen() {
         let mut selected = Vec::new();
         let mut parent = anchor.clone();
         for height in 1..=5 {
-            let mut header = *parent.header;
+            let mut header = parent.header.as_ref().clone();
             header.previous_block_hash = parent.hash;
             header.time += chrono::Duration::seconds(1);
             let header = Arc::new(header);
@@ -228,7 +228,7 @@ fn commit_deferral(
         .expect("the initial store audits");
     let before = runtime.publisher().snapshot();
     let insertion_clock = FixedClock(insertion_time);
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time = insertion_clock.0 + chrono::Duration::hours(3);
     child_header.nonce.0[0] = 0x51;
@@ -380,7 +380,7 @@ fn startup_rejects_an_ineligible_verified_projection_before_publication() {
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
 
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     child_header.nonce.0[0] = 0x71;
@@ -498,7 +498,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     let mut parent = anchor.hash;
     let mut parent_header = anchor.header;
     for nonce in [0x61, 0x62] {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent;
         header.time += chrono::Duration::seconds(1);
         header.nonce.0[0] = nonce;
@@ -1892,7 +1892,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
 
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     let child_header = Arc::new(child_header);
@@ -1987,7 +1987,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     let mut parent = Frontier::new(anchor.height, anchor.hash);
     let mut parent_header = anchor.header;
     for _ in 0..5 {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);
@@ -2068,7 +2068,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     let mut parent = Frontier::new(anchor.height, anchor.hash);
     let mut parent_header = anchor.header;
     for _ in 0..5 {
-        let mut header = *parent_header;
+        let mut header = parent_header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);
@@ -2252,7 +2252,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
     let mut corrupt = DiskWriteBatch::new();
     let bogus_parent = block::Hash([0x11; 32]);
     let bogus_child = block::Hash([0x22; 32]);
-    let mut child_header = *anchor.header;
+    let mut child_header = anchor.header.as_ref().clone();
     child_header.previous_block_hash = anchor.hash;
     child_header.time += chrono::Duration::seconds(1);
     let child_hash = child_header.hash();

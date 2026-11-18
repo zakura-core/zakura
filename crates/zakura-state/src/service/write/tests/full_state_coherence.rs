@@ -418,7 +418,7 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
             let time =
                 chrono::DateTime::from_timestamp(1_700_000_000_i64 + i64::from(height.0) * 150, 0)
                     .expect("the deterministic timestamp is in range");
-            let header = zakura_chain::block::Header {
+            let header = zakura_chain::block::Header::new(zakura_chain::block::HeaderData {
                 version: 4,
                 previous_block_hash: previous_hash,
                 merkle_root,
@@ -427,7 +427,7 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
                 difficulty_threshold: network.target_difficulty_limit().to_compact(),
                 nonce: HexDebug([0; 32]),
                 solution: equihash::Solution::for_proposal(),
-            };
+            });
             let mut block = Arc::new(Block {
                 header: Arc::new(header),
                 transactions,

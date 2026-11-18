@@ -527,11 +527,13 @@ mod tests {
         let mut labeller = ContentLabeller::default();
         labeller.received(&open(vec![target, other]));
         let header = |parent| {
-            let mut header = *zakura_storage::header::fixture::HeaderFixture::regtest().extend(
+            let mut header = zakura_storage::header::fixture::HeaderFixture::regtest().extend(
                 zakura_storage::header::fixture::HeaderFixture::regtest().anchor(),
                 1,
                 0,
-            )[0];
+            )[0]
+            .as_ref()
+            .clone();
             header.previous_block_hash = parent;
             header
         };

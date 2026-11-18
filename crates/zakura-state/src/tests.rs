@@ -86,7 +86,7 @@ impl FakeChainHelper for Arc<Block> {
 /// Copies fixture data so a test can mutate it before submitting a new block.
 pub fn copy_block_fixture(block: &zakura_chain::block::BlockRef) -> Arc<Block> {
     Arc::new(Block {
-        header: Arc::new(*block.header()),
+        header: Arc::new(block.header().clone()),
         transactions: block
             .transactions()
             .map(|tx| Arc::new(tx.clone()))

@@ -380,7 +380,7 @@ fn batch(
     let mut headers = Vec::new();
     let mut parent_hash = parent.hash;
     for offset in 1..=count {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent_hash;
         let seconds = i64::from(parent.height.0)
             .checked_add(i64::from(offset))
@@ -504,7 +504,7 @@ fn insert_verified_branch(
 ) -> Frontier {
     let mut parent = parent;
     for offset in 0..count {
-        let mut header = *regtest_genesis_block().header;
+        let mut header = regtest_genesis_block().header.as_ref().clone();
         header.previous_block_hash = parent.hash;
         header.difficulty_threshold = difficulty;
         header.nonce.0[0] = nonce_seed;

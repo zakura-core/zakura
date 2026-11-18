@@ -30,6 +30,7 @@
 
 pub mod feedback;
 pub mod generate;
+pub mod pct;
 mod process;
 mod save;
 pub mod state;
@@ -57,10 +58,10 @@ pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
 
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport},
-    harness::{run_harness, HarnessEntry, HarnessError, Subsystem},
+    harness::{self, run_harness, HarnessEntry, HarnessError, Subsystem},
     property::Status,
     record::EndRecord,
-    Plan, RecordSink, RunReport,
+    Plan, RecordSink, RunReport, Steer,
 };
 
 /// One run of a fuzz input.
@@ -112,6 +113,44 @@ pub fn run_bytes<S: Subsystem>(
     prefix[..n].copy_from_slice(&input[..n]);
     let scenario = S::draw(&prefix);
     let result = run_harness::<S>(&scenario, Plan::from_fuzz(&input[n..]), sink, extra);
+    explored::<S>(&scenario, result)
+}
+
+/// [`run_bytes`] with `steer` making the live picks in place of the Plan
+/// bytes, which still answer the run's draws. Also returns the input that
+/// replays the run with no steer: the zero-padded prefix, then the Plan
+/// bytes the steered run recorded ([`crate::Sim::steer`]). That is `input`
+/// itself if the harness couldn't run the scenario.
+pub fn run_steered_bytes<S: Subsystem>(
+    input: &[u8],
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (ExploreRun, Vec<u8>) {
+    let mut prefix = vec![0u8; S::SCENARIO_BYTES];
+    let n = input.len().min(S::SCENARIO_BYTES);
+    prefix[..n].copy_from_slice(&input[..n]);
+    let scenario = S::draw(&prefix);
+    let steered = harness::run_steered::<S>(
+        &scenario,
+        S::prepare(&scenario),
+        Plan::from_fuzz(&input[n..]),
+        sink,
+        steer,
+    );
+    let (result, replay) = match steered {
+        Ok((report, bytes)) => (Ok(report), [prefix, bytes].concat()),
+        Err(error) => (Err(error), input.to_vec()),
+    };
+    (explored::<S>(&scenario, result), replay)
+}
+
+/// The run `result` of `scenario`, with the scenario kept for a run
+/// [`classify`] may not call clean: one that reports a violation, failed,
+/// or abandoned tasks.
+fn explored<S: Subsystem>(
+    scenario: &S::Scenario,
+    result: Result<RunReport, HarnessError>,
+) -> ExploreRun {
     let unclean = match &result {
         Ok(report) => {
             report.cleanup.leaked > 0
@@ -122,7 +161,7 @@ pub fn run_bytes<S: Subsystem>(
     };
     ExploreRun {
         scenario: unclean.then(|| {
-            serde_json::to_value(&scenario)
+            serde_json::to_value(scenario)
                 .expect("scenarios are plain data, and serde_json serializes plain data")
         }),
         result,

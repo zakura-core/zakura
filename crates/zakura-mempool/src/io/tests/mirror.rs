@@ -435,7 +435,12 @@ impl Mirror {
         let id = self.txs[tx].id();
         let (expected, step) = self.reference.reserve(id, Instant::now());
         self.absorb(step);
-        match (expected, answered(self.handle.reserve(id)).await) {
+        match (
+            expected,
+            answered(self.handle.reserve(id, far()))
+                .await
+                .expect("the test's deadline is far off"),
+        ) {
             (Ok(granted), Ok(reservation)) => {
                 assert_eq!(
                     (reservation.id(), reservation.tx_id()),
@@ -468,7 +473,12 @@ impl Mirror {
             .reference
             .submit(reservation.id(), body.clone(), Instant::now());
         let handle = self.handle.clone();
-        let task = tokio::spawn(async move { handle.submit(reservation, body).await });
+        let task = tokio::spawn(async move {
+            handle
+                .submit(reservation, body, far())
+                .await
+                .expect("the test's deadline is far off")
+        });
         self.verdicts.insert(waiter, task);
         self.absorb(step);
     }
@@ -625,7 +635,7 @@ impl Mirror {
                     .reference
                     .fetch_failed(reservation.id(), Instant::now());
                 self.absorb(step);
-                answered(self.handle.fetch_failed(reservation)).await;
+                answered(self.handle.fetch_failed(reservation, far())).await;
                 self.compare("a failed fetch").await;
             }
             50..=53 if !self.held.is_empty() => {
@@ -659,8 +669,8 @@ impl Mirror {
                 }
                 answered(async {
                     futures::join!(
-                        self.handle.fetch_failed(first),
-                        self.handle.fetch_failed(second)
+                        self.handle.fetch_failed(first, far()),
+                        self.handle.fetch_failed(second, far())
                     )
                 })
                 .await;
@@ -687,7 +697,9 @@ impl Mirror {
                     .collect();
                 let expected = self.reference.rejected_ids(ids.clone(), Instant::now());
                 assert_eq!(
-                    answered(self.handle.rejected_ids(ids)).await,
+                    answered(self.handle.rejected_ids(ids, far()))
+                        .await
+                        .expect("the test's deadline is far off"),
                     expected,
                     "{}: a lookup",
                     self.at
@@ -707,6 +719,11 @@ impl Mirror {
             }
         }
     }
+}
+
+/// A deadline no test reaches, for calls whose test is not about deadlines.
+fn far() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
 }
 
 /// `call`'s answer, which the core gives without time passing. A call it

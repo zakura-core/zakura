@@ -227,13 +227,10 @@ async fn peer_batch(
         .collect();
     // A core that does not answer by the deadline gets the batch dropped, as
     // a reservation that does not come back in time would be.
-    let Ok(rejected) = tokio::time::timeout_at(
-        deadline,
-        shared
-            .handle
-            .rejected_ids(fresh.iter().map(Gossip::id).collect()),
-    )
-    .await
+    let Ok(rejected) = shared
+        .handle
+        .rejected_ids(fresh.iter().map(Gossip::id).collect(), deadline)
+        .await
     else {
         return Ok(Response::Queued(Vec::new()));
     };
@@ -399,7 +396,16 @@ async fn answer(
             last_seen_tip_hash: snapshot.tip.hash,
         },
         Request::RejectedTransactionIds(ids) => {
-            Response::RejectedTransactionIds(shared.handle.rejected_ids(ids).await)
+            // A core that does not answer in time knows of no rejection, as a
+            // stopped one.
+            let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
+            Response::RejectedTransactionIds(
+                shared
+                    .handle
+                    .rejected_ids(ids, deadline)
+                    .await
+                    .unwrap_or_default(),
+            )
         }
         Request::Queue(_) | Request::QueueFromPeer { .. } => {
             unreachable!("`CoreMempool::call` answers submissions itself")
@@ -485,7 +491,7 @@ async fn queue(
     slot: Option<PeerSlot>,
     deadline: tokio::time::Instant,
 ) -> Result<Receiver, BoxError> {
-    let reserved = tokio::time::timeout_at(deadline, shared.handle.reserve(item.id())).await;
+    let reserved = shared.handle.reserve(item.id(), deadline).await;
     let reservation = match reserved {
         Ok(Ok(reservation)) => reservation,
         Ok(Err(refused)) => return first_stage_refusal(refused),
@@ -633,7 +639,7 @@ async fn bring_in(
                 }
             };
             let Ok(fetched) = fetched else {
-                fetch_failed(&shared, reservation, deadline).await;
+                shared.handle.fetch_failed(reservation, deadline).await;
                 return Err(timed_out());
             };
             match fetched {
@@ -649,7 +655,7 @@ async fn bring_in(
                         );
                     metrics::counter!("mempool.failed.verify.tasks.total", "reason" => reason)
                         .increment(1);
-                    fetch_failed(&shared, reservation, deadline).await;
+                    shared.handle.fetch_failed(reservation, deadline).await;
                     return Err(format!("failed to validate tx: {tx_id}, error: {error}").into());
                 }
             }
@@ -671,7 +677,7 @@ async fn bring_in(
         && sender.is_some_and(|addr| shared.cooldowns.is_cooling_down(addr.ip(), Instant::now()))
     {
         metrics::counter!("mempool.peer_cooldown.ignored.transactions.total").increment(1);
-        fetch_failed(&shared, reservation, deadline).await;
+        shared.handle.fetch_failed(reservation, deadline).await;
         return Err(format!(
             "failed to validate tx: {tx_id}, error: {}",
             TransactionDownloadVerifyError::PeerCoolingDown
@@ -683,8 +689,7 @@ async fn bring_in(
         Some(QueueSource::Zakura(_)) => None,
         _ => sender.and_then(|addr| shared.supplier(addr)),
     };
-    let submitted = tokio::time::timeout_at(deadline, shared.handle.submit(reservation, tx)).await;
-    let Ok(verdict) = submitted else {
+    let Ok(verdict) = shared.handle.submit(reservation, tx, deadline).await else {
         return Err(timed_out());
     };
     // The charge goes to the peer that served the body, here, in the
@@ -773,14 +778,6 @@ fn second_stage(tx_id: UnminedTxId, verdict: Verdict) -> Result<(), BoxError> {
             Err(format!("the pool core could not decide transaction {tx_id}: {fault:?}").into())
         }
     }
-}
-
-/// Tells the core that `reservation`'s fetch ended without a body, unless
-/// the core's command queue stays full past `deadline`. Then the reservation
-/// is dropped, which still frees its slot, and only the refusal goes
-/// unlogged.
-async fn fetch_failed(shared: &Shared, reservation: Reservation, deadline: tokio::time::Instant) {
-    let _ = tokio::time::timeout_at(deadline, shared.handle.fetch_failed(reservation)).await;
 }
 
 /// Fetches `tx_id`, unless the best chain already holds it.

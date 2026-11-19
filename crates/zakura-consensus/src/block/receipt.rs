@@ -6,11 +6,12 @@
 //! whose header arrived earlier.
 //!
 //! Priority belongs to the block, not to a delivery attempt. [`AnnouncementClaims`] holds at most
-//! one claim per block hash, never replaces it, and does not consume it when a body reads it. A
-//! block announced once and withheld therefore cannot renew its place by being announced again.
+//! one claim per block hash, never replaces or renews it, and does not consume it when a body
+//! reads it. A block announced and withheld therefore cannot regain its place by being announced
+//! again.
 //!
-//! - `claims`: the claim table header sync writes, the body deadline, and the mined-block
-//!   watermark.
+//! - `claims`: the claim table header sync writes, the body deadline, and the blocks this node
+//!   mined, which outrank rivals' claims at their heights.
 //! - `registry`: the receipts the verifier gives bodies, shared by overlapping deliveries and
 //!   resolved against the claims.
 //! - `order`: the process-wide order both draw from, so claims and receipts compare.
@@ -23,4 +24,4 @@ mod registry;
 mod tests;
 
 pub use claims::{AnnouncementClaims, PendingClaims};
-pub(crate) use registry::ReceiptRegistry;
+pub(in crate::block) use registry::ReceiptRegistry;

@@ -13,7 +13,9 @@ fn a_claim_is_shared_by_every_body_delivered_under_its_header() {
     claims
         .begin_at([(block.hash(), block::Height(1))], block::Height(0), now)
         .commit();
-    let claimed = claimed_order(&claims, block.hash()).expect("the header was claimed");
+    let claimed = claims
+        .claimed_order(block.hash())
+        .expect("the header was claimed");
     let variant = |count: usize| {
         let mut variant = block.clone();
         for _ in 0..count {
@@ -53,7 +55,7 @@ fn a_claimed_body_shares_its_order_with_overlapping_deliveries() {
         .commit();
     let handle = BlockHandle::from(block.clone());
     let first = registry.register_at(block.hash(), &handle, now);
-    assert_eq!(Some(first.order), claimed_order(&claims, block.hash()));
+    assert_eq!(Some(first.order), claims.claimed_order(block.hash()));
 
     // An overlapping delivery shares the receipt even after the claim's deadline.
     let late = now + MAX_CLAIM_BODY_DEADLINE + Duration::from_millis(1);

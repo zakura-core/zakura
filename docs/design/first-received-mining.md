@@ -23,25 +23,33 @@ That penalizes including transactions.
 The reservation is called a claim. Four rules define it:
 
 - **A claim needs a fully validated header.** Native header sync reserves the
-  order and the time when it starts applying a header, and the claim takes
-  effect once state has accepted that header. By then the header has passed
-  Equihash, its target, parent linkage and contextual difficulty. A header
+  order and the time when it starts applying a header, so a body that arrives
+  during the apply already takes them. The claim is kept once state has
+  accepted the header, by which point the header has passed Equihash, its
+  target, parent linkage and contextual difficulty. If state refuses the
+  header, the claim is removed. A body that used it during the apply fails
+  verification anyway, because its header is invalid. A header
   deferred for a future timestamp gets no claim. Only headers one or two
   blocks above the verified tip are claimed, so catch-up creates none.
-- **A block has one claim, and it is permanent.** Delivering the header again
-  changes nothing, and reading the claim does not use it up, so an invalid
+- **A block has one claim, and it is permanent.** A claim, once made, is never
+  replaced or renewed by delivering the header again, and reading it does not
+  use it up, so an invalid
   body under the same header cannot take it. The table holds 64 claims. When
   it is full it refuses new claims and never drops old ones. A claim is
   removed only when its height falls below the verified tip, where no new
-  claim can be made.
+  claim can be made. That floor never goes down, so after a rollback claims
+  resume once the tip passes it again.
 - **The body has a deadline.** It is 500 ms plus the body's serialized size at
   1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
   body that arrives later draws a fresh order, as if its header had never been
   seen.
 - **A node keeps the block it mined.** A locally submitted block has no claim
   and draws its order at submission. A rival's earlier claim at the same
-  height is ignored from that moment. If the submitted block fails
-  verification, the rival's claim is back in force.
+  height is ignored from that moment, for every mined block that is still
+  verifying or has verified, until the verified tip passes that height. If
+  the submitted block fails verification, rival bodies that arrive afterwards
+  take their claims again. A rival body that arrived while it was verifying
+  keeps its arrival order.
 
 The verifier looks a claim up by block hash, so native block sync, legacy
 gossip and the legacy syncer follow the same rule. The deadline is measured

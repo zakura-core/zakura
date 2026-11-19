@@ -332,7 +332,8 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
     /// Build the port over the state services. `selected_chain` is state's
     /// committed snapshot watch, which [`Port::selected_chain`] hands out. `announcement_claims`
-    /// receives a claim for each header applied just above the verified tip.
+    /// receives a claim for each valid header applied just above the verified tip, unless its
+    /// table is full.
     pub(crate) fn new(
         state: State,
         read_state: ReadState,
@@ -771,8 +772,8 @@ where
         ))
     })?;
     let (owner, source, target_tip_hash) = (insert.owner, insert.source, insert.target_tip_hash);
-    // Reserved before the wait on the state writer, so a rival body that reaches the verifier
-    // during that wait does not overtake a header that arrived first.
+    // Reserved before the wait on the state writer, so a body that reaches the verifier during
+    // that wait, the block's own or a rival's, is ranked by when this header arrived.
     let claims = begin_announcement_claims(&announcement_claims, &selected_chain, &insert.batch);
     let prepared = authority.from_registered_header_attempt(insert);
     match wait_for_header_target_apply(
@@ -786,7 +787,7 @@ where
             | zakura_header_chain::ApplyResult::NoChange(_),
         )) => {
             // State has now checked contextual difficulty, the last header rule, so the claims
-            // can take effect. Any other outcome drops them.
+            // are kept. Any other outcome removes them.
             if let Some(claims) = claims {
                 claims.commit();
             }

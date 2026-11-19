@@ -18,7 +18,7 @@ use super::order;
 /// tie. A block padded to about 1.5 MiB gets all of it. The value is an estimate of honest
 /// full-block delivery, to be revisited against the `sync.block.announcement_claim.age.seconds`
 /// histogram.
-pub(crate) const MAX_CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
+pub(super) const MAX_CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The part of [`body_deadline`] that does not depend on body size: scheduling, the round trip
 /// of the body request, and the wait for the verifier.
@@ -33,7 +33,7 @@ const CLAIM_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// bodies cannot arrive inside a deadline anyway.
 const MAX_CLAIM_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 
-/// The most claims [`AnnouncementClaims`] holds.
+/// The most claims [`AnnouncementClaims`] holds, counting those still being applied.
 ///
 /// A full table refuses new claims instead of dropping old ones, so flooding it cannot remove a
 /// claim that is already in force. A refused block is ranked by body arrival.
@@ -52,25 +52,25 @@ pub(super) fn body_deadline(bytes: usize) -> Duration {
         .min(MAX_CLAIM_BODY_DEADLINE)
 }
 
-/// A place in receipt order reserved for a block when its header was admitted.
+/// A place in receipt order reserved for a block when its header arrived.
 #[derive(Copy, Clone, Debug)]
 struct Claim {
     height: block::Height,
     order: u64,
     seen_at: Instant,
+    /// The header apply that reserved this claim, while that apply is still running. `None` once
+    /// the header chain has accepted the header.
+    applying: Option<u64>,
 }
 
-/// The receipt order of the most recent locally mined block.
+/// A block this node mined, and the order its submission took.
 ///
 /// A node does not abandon a block it mined because a rival's header arrived first, so a claim
-/// at this height with an earlier order is not honoured while this is set.
+/// at the same height with an earlier order is not honoured while this is held.
 #[derive(Debug)]
-struct MinedWatermark {
-    hash: block::Hash,
+struct MinedBlock {
     height: block::Height,
     order: u64,
-    /// Identifies this watermark to the [`MinedGuard`]s that hold it.
-    epoch: u64,
     /// The requests still verifying this block.
     pending: usize,
     /// Whether a request for this block has verified it.
@@ -79,13 +79,16 @@ struct MinedWatermark {
 
 #[derive(Debug)]
 struct ClaimTable {
-    /// The highest verified tip height seen. Claims are created only above it and dropped once
-    /// they are below it, so a dropped hash can never be claimed again.
+    /// The highest verified tip height seen. Claims and mined blocks below it are dropped, and
+    /// no claim is made at or below it, so a dropped hash can never be claimed again.
+    ///
+    /// It never goes down: after a rollback below it, claims resume once the tip passes it.
     floor: block::Height,
     by_hash: HashMap<block::Hash, Claim>,
-    mined: Option<MinedWatermark>,
-    /// The epoch given to the next [`MinedWatermark`].
-    next_mined_epoch: u64,
+    /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
+    mined: HashMap<block::Hash, MinedBlock>,
+    /// The id given to the next header apply's reservations.
+    next_apply: u64,
 }
 
 impl Default for ClaimTable {
@@ -93,9 +96,18 @@ impl Default for ClaimTable {
         Self {
             floor: block::Height::MIN,
             by_hash: HashMap::new(),
-            mined: None,
-            next_mined_epoch: 0,
+            mined: HashMap::new(),
+            next_apply: 0,
         }
+    }
+}
+
+impl ClaimTable {
+    /// Whether a mined block other than `hash` outranks `claim`.
+    fn is_voided(&self, hash: block::Hash, claim: &Claim) -> bool {
+        self.mined.iter().any(|(mined_hash, mined)| {
+            *mined_hash != hash && mined.height == claim.height && claim.order < mined.order
+        })
     }
 }
 
@@ -112,7 +124,7 @@ pub(super) enum ClaimOutcome {
     },
     /// The body arrived after its deadline and is ranked by its arrival.
     Expired { age: Duration, bytes: usize },
-    /// A locally mined block at the claim's height outranks it, so the body is ranked by its
+    /// A block this node mined at the claim's height outranks it, so the body is ranked by its
     /// arrival.
     Voided { age: Duration, bytes: usize },
 }
@@ -134,7 +146,7 @@ impl ClaimOutcome {
             Self::Expired { age, bytes } => ("expired", Some((age, bytes))),
             Self::Voided { age, bytes } => ("voided", Some((age, bytes))),
         };
-        let size = claim.map_or("unclaimed", |(_, bytes)| size_label(bytes));
+        let size = claim.map_or("none", |(_, bytes)| size_label(bytes));
         metrics::counter!(
             "sync.block.announcement_claim",
             "outcome" => outcome,
@@ -164,18 +176,21 @@ pub(super) fn size_label(bytes: usize) -> &'static str {
 /// Receipt-order claims for blocks whose headers were admitted before their bodies arrived.
 ///
 /// Header sync creates claims with [`AnnouncementClaims::begin`], and the block verifier reads
-/// them by block hash, so every body transport follows the same rule.
+/// them by block hash, so every body transport follows the same rule. A claim, once made, is
+/// never replaced or renewed.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
 /// Claims reserved for headers that are being applied to the header chain.
 ///
-/// They take effect only with [`PendingClaims::commit`]. Dropping this discards them.
+/// Bodies already take the reserved orders. [`PendingClaims::commit`] keeps the claims once the
+/// header chain accepts the headers, and dropping this removes them.
 #[derive(Debug)]
-#[must_use = "reserved claims take effect only when committed"]
+#[must_use = "reserved claims are removed unless committed"]
 pub struct PendingClaims {
     claims: AnnouncementClaims,
-    reserved: Vec<(block::Hash, Claim)>,
+    apply: u64,
+    reserved: Vec<block::Hash>,
 }
 
 impl AnnouncementClaims {
@@ -183,8 +198,10 @@ impl AnnouncementClaims {
     /// `verified_tip` and has no claim yet.
     ///
     /// Call this when a header apply starts and commit the result once the header chain has
-    /// accepted the headers. The order and time are taken now, so a rival body that arrives
-    /// during the apply does not overtake a header that arrived first.
+    /// accepted the headers. The order and time are taken now, and bodies take them from now
+    /// on, so neither a rival body nor the block's own body arriving during the apply ranks it
+    /// behind a header that arrived later. A header that fails the apply is also invalid as a
+    /// block, so a body that used its reservation is rejected anyway.
     pub fn begin(
         &self,
         headers: impl IntoIterator<Item = (block::Hash, block::Height)>,
@@ -203,23 +220,39 @@ impl AnnouncementClaims {
         table.floor = table.floor.max(verified_tip);
         let floor = table.floor;
         table.by_hash.retain(|_, claim| claim.height >= floor);
-        let reserved = headers
-            .into_iter()
-            .filter(|(hash, height)| {
-                (1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(*height - floor))
-                    && !table.by_hash.contains_key(hash)
-            })
-            .map(|(hash, height)| {
-                let claim = Claim {
-                    height,
-                    order: order::next(),
-                    seen_at: now,
-                };
-                (hash, claim)
-            })
-            .collect();
+        table.mined.retain(|_, mined| mined.height >= floor);
+        let apply = table.next_apply;
+        table.next_apply = apply.wrapping_add(1);
+
+        let mut reserved = Vec::new();
+        let mut refused: u64 = 0;
+        for (hash, height) in headers {
+            if !(1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - floor))
+                || table.by_hash.contains_key(&hash)
+            {
+                continue;
+            }
+            if table.by_hash.len() >= MAX_ANNOUNCEMENT_CLAIMS {
+                refused = refused.saturating_add(1);
+                continue;
+            }
+            let claim = Claim {
+                height,
+                order: order::next(),
+                seen_at: now,
+                applying: Some(apply),
+            };
+            table.by_hash.insert(hash, claim);
+            reserved.push(hash);
+        }
+        drop(table);
+
+        if refused > 0 {
+            metrics::counter!("sync.block.announcement_claim.refused").increment(refused);
+        }
         PendingClaims {
             claims: self.clone(),
+            apply,
             reserved,
         }
     }
@@ -241,10 +274,7 @@ impl AnnouncementClaims {
             let Some(claim) = table.by_hash.get(&hash).copied() else {
                 return ClaimOutcome::Unclaimed;
             };
-            let voided = table.mined.as_ref().is_some_and(|mined| {
-                mined.hash != hash && mined.height == claim.height && claim.order < mined.order
-            });
-            (claim, voided)
+            (claim, table.is_voided(hash, &claim))
         };
         let age = now.saturating_duration_since(claim.seen_at);
         let bytes = bytes();
@@ -261,10 +291,11 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Records that the locally mined block `hash` took `order`, so that a rival's earlier claim
-    /// at `height` is not honoured. The record lasts while the returned guard, or any other
-    /// guard for the same block, is alive. Once one of them is kept, it stays until a newer
-    /// mined block replaces it.
+    /// Records that the locally mined block `hash` at `height` took `order`, so that a rival's
+    /// earlier claim at `height` is not honoured.
+    ///
+    /// The record lasts while the returned guard, or any other guard for the same block, is
+    /// alive. Once one of them is kept, it lasts until the verified tip passes `height`.
     pub(super) fn mark_mined(
         &self,
         hash: block::Hash,
@@ -272,28 +303,16 @@ impl AnnouncementClaims {
         order: u64,
     ) -> MinedGuard {
         let mut table = self.table();
-        let epoch = match &mut table.mined {
-            Some(mined) if mined.hash == hash => {
-                mined.pending = mined.pending.saturating_add(1);
-                mined.epoch
-            }
-            _ => {
-                let epoch = table.next_mined_epoch;
-                table.next_mined_epoch = epoch.wrapping_add(1);
-                table.mined = Some(MinedWatermark {
-                    hash,
-                    height,
-                    order,
-                    epoch,
-                    pending: 1,
-                    verified: false,
-                });
-                epoch
-            }
-        };
+        let mined = table.mined.entry(hash).or_insert(MinedBlock {
+            height,
+            order,
+            pending: 0,
+            verified: false,
+        });
+        mined.pending = mined.pending.saturating_add(1);
         MinedGuard {
             claims: self.clone(),
-            epoch,
+            hash,
         }
     }
 
@@ -317,48 +336,50 @@ impl AnnouncementClaims {
 }
 
 impl PendingClaims {
-    /// Puts the reserved claims in force. A hash that gained a claim in the meantime keeps its
-    /// first one, and a full table refuses the rest.
-    pub fn commit(self) {
-        if self.reserved.is_empty() {
-            return;
-        }
-        let mut refused: u64 = 0;
-        {
-            let mut table = self.claims.table();
-            for (hash, claim) in self.reserved {
-                // A claim below the floor would be dropped by the next `begin`.
-                if claim.height < table.floor || table.by_hash.contains_key(&hash) {
-                    continue;
+    /// Keeps the reserved claims, because the header chain accepted their headers.
+    pub fn commit(mut self) {
+        let mut table = self.claims.table();
+        for hash in std::mem::take(&mut self.reserved) {
+            if let Some(claim) = table.by_hash.get_mut(&hash) {
+                if claim.applying == Some(self.apply) {
+                    claim.applying = None;
                 }
-                if table.by_hash.len() >= MAX_ANNOUNCEMENT_CLAIMS {
-                    refused = refused.saturating_add(1);
-                    continue;
-                }
-                table.by_hash.insert(hash, claim);
             }
-        }
-        if refused > 0 {
-            metrics::counter!("sync.block.announcement_claim.refused").increment(refused);
         }
     }
 }
 
-/// Keeps a locally mined block's watermark while its verification is active.
+impl Drop for PendingClaims {
+    fn drop(&mut self) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let mut table = self.claims.table();
+        for hash in &self.reserved {
+            if table
+                .by_hash
+                .get(hash)
+                .is_some_and(|claim| claim.applying == Some(self.apply))
+            {
+                table.by_hash.remove(hash);
+            }
+        }
+    }
+}
+
+/// Keeps a locally mined block's record while its verification is active.
 ///
-/// Dropping the last guard for a block removes its watermark, unless one of them was kept.
-pub(crate) struct MinedGuard {
+/// Dropping the last guard for a block removes its record, unless one of them was kept.
+pub(in crate::block) struct MinedGuard {
     claims: AnnouncementClaims,
-    epoch: u64,
+    hash: block::Hash,
 }
 
 impl MinedGuard {
-    /// Keeps the watermark after this guard is gone, because the mined block verified.
-    pub(crate) fn keep(self) {
-        if let Some(mined) = &mut self.claims.table().mined {
-            if mined.epoch == self.epoch {
-                mined.verified = true;
-            }
+    /// Keeps the record after this guard is gone, because the mined block verified.
+    pub(in crate::block) fn keep(self) {
+        if let Some(mined) = self.claims.table().mined.get_mut(&self.hash) {
+            mined.verified = true;
         }
     }
 }
@@ -366,16 +387,12 @@ impl MinedGuard {
 impl Drop for MinedGuard {
     fn drop(&mut self) {
         let mut table = self.claims.table();
-        let Some(mined) = &mut table.mined else {
+        let Some(mined) = table.mined.get_mut(&self.hash) else {
             return;
         };
-        // A newer mined block has replaced the watermark this guard was holding.
-        if mined.epoch != self.epoch {
-            return;
-        }
         mined.pending = mined.pending.saturating_sub(1);
         if mined.pending == 0 && !mined.verified {
-            table.mined = None;
+            table.mined.remove(&self.hash);
         }
     }
 }

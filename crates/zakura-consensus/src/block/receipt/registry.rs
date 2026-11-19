@@ -36,9 +36,10 @@ type Active = Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>;
 /// only in that data share a block hash but not a receipt.
 ///
 /// A body that shares no active receipt takes the order of its block's announcement claim if it
-/// arrived inside the claim's deadline, and the next order otherwise.
+/// arrived inside the claim's deadline and no block this node mined at that height outranks the
+/// claim. Otherwise it takes the next order.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReceiptRegistry {
+pub(in crate::block) struct ReceiptRegistry {
     pub(super) active: Active,
     claims: AnnouncementClaims,
 }
@@ -53,16 +54,16 @@ pub(super) struct Entry {
 }
 
 /// Keeps a block's receipt active until its verification finishes or is cancelled.
-pub(crate) struct ReceiptGuard {
+pub(in crate::block) struct ReceiptGuard {
     active: Active,
     /// The hash and body this receipt is registered under, or `None` for an untracked receipt.
     pub(super) registered: Option<(block::Hash, BlockHandle)>,
-    pub(crate) order: u64,
+    pub(in crate::block) order: u64,
 }
 
 impl ReceiptRegistry {
     /// A registry that ranks bodies by the claims header sync writes to `claims`.
-    pub(crate) fn new(claims: AnnouncementClaims) -> Self {
+    pub(in crate::block) fn new(claims: AnnouncementClaims) -> Self {
         Self {
             active: Active::default(),
             claims,
@@ -72,7 +73,11 @@ impl ReceiptRegistry {
     /// Gives a receipt to `block`, whose hash is `hash`.
     ///
     /// Called synchronously by the verifier before returning its request future.
-    pub(crate) fn register(&self, hash: block::Hash, block: &BlockHandle) -> ReceiptGuard {
+    pub(in crate::block) fn register(
+        &self,
+        hash: block::Hash,
+        block: &BlockHandle,
+    ) -> ReceiptGuard {
         self.register_at(hash, block, Instant::now())
     }
 
@@ -124,7 +129,7 @@ impl ReceiptRegistry {
 
     /// Records that the locally mined block `hash` at `height` took `order`. See
     /// [`AnnouncementClaims::mark_mined`].
-    pub(crate) fn mark_mined(
+    pub(in crate::block) fn mark_mined(
         &self,
         hash: block::Hash,
         height: block::Height,

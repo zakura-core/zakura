@@ -50,7 +50,3 @@ fn body_order(claims: &AnnouncementClaims, hash: block::Hash, bytes: usize, now:
         .claimed_order()
         .unwrap_or_else(order::next)
 }
-
-fn claimed_order(claims: &AnnouncementClaims, hash: block::Hash) -> Option<u64> {
-    claims.claimed_order(hash)
-}

@@ -25,7 +25,7 @@ fn a_body_inside_its_deadline_keeps_the_order_of_its_header() {
     let at_the_bound = now + body_deadline(0);
     let order = body_order(&claims, hash(1), 0, at_the_bound);
     assert!(order < competitor);
-    assert_eq!(Some(order), claimed_order(&claims, hash(1)));
+    assert_eq!(Some(order), claims.claimed_order(hash(1)));
     assert!(
         body_order(&claims, hash(2), 0, now) > competitor,
         "a claim only reserves priority for the hash it was made for",
@@ -70,18 +70,18 @@ fn announcing_a_withheld_block_again_does_not_renew_its_claim() {
 }
 
 #[test]
-fn a_claim_keeps_the_order_reserved_before_its_header_apply() {
+fn a_body_arriving_during_its_header_apply_takes_the_reserved_order() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
-    let arrived_during_apply = order::next();
-    assert!(
-        claims.claimed_order(hash(1)).is_none(),
-        "a claim is not in force until its header is applied",
-    );
+    let rival_during_apply = order::next();
+
+    // The block's own body arrives before the header chain has accepted its header.
+    let during = body_order(&claims, hash(1), 0, now);
+    assert!(during < rival_during_apply);
 
     pending.commit();
-    assert!(body_order(&claims, hash(1), 0, now) < arrived_during_apply);
+    assert_eq!(body_order(&claims, hash(1), 0, now), during);
 }
 
 #[test]
@@ -151,7 +151,11 @@ fn a_full_table_refuses_new_claims_and_keeps_the_old_ones() {
     }
     let orders = || -> Vec<_> {
         (0..MAX_ANNOUNCEMENT_CLAIMS)
-            .map(|index| claimed_order(&claims, hash(index)).expect("the claim is held"))
+            .map(|index| {
+                claims
+                    .claimed_order(hash(index))
+                    .expect("the claim is held")
+            })
             .collect()
     };
     let before = orders();
@@ -201,8 +205,12 @@ fn a_mined_block_outranks_an_earlier_claim_at_its_height() {
     claims
         .begin_at([(hash(2), block::Height(CLAIMED.0 + 1))], TIP, now)
         .commit();
-    let rival = claimed_order(&claims, hash(1)).expect("the rival was claimed");
-    let above = claimed_order(&claims, hash(2)).expect("the next height was claimed");
+    let rival = claims
+        .claimed_order(hash(1))
+        .expect("the rival was claimed");
+    let above = claims
+        .claimed_order(hash(2))
+        .expect("the next height was claimed");
 
     let mined_order = order::next();
     let mined = claims.mark_mined(hash(3), CLAIMED, mined_order);
@@ -222,11 +230,10 @@ fn a_mined_block_outranks_an_earlier_claim_at_its_height() {
 }
 
 #[test]
-fn a_mined_watermark_lasts_while_any_request_for_the_block_is_active() {
+fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_verifies() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     claim(&claims, hash(1), now);
-    let rival = claimed_order(&claims, hash(1)).expect("the rival was claimed");
     let voided = || {
         matches!(
             claims.resolve(hash(1), now, || 0),
@@ -241,15 +248,14 @@ fn a_mined_watermark_lasts_while_any_request_for_the_block_is_active() {
     drop(duplicate);
     assert!(voided());
 
-    // The first submission verified, so the watermark outlives its request.
+    // The first submission verified, so the record outlives its request.
     first.keep();
     assert!(voided());
 
-    // A newer mined block replaces the watermark, and its failure removes it.
+    // A mined block at the next height that fails leaves this one's record in place.
     let next = claims.mark_mined(hash(4), block::Height(CLAIMED.0 + 1), mined_order + 1);
-    assert!(!voided(), "the watermark names one height");
     drop(next);
-    assert_eq!(body_order(&claims, hash(1), 0, now), rival);
+    assert!(voided());
 }
 
 #[test]
@@ -259,4 +265,20 @@ fn size_labels_split_at_their_bounds() {
     assert_eq!(size_label(499_999), "under_500kB");
     assert_eq!(size_label(999_999), "under_1MB");
     assert_eq!(size_label(1_000_000), "1MB_or_more");
+}
+
+#[test]
+fn concurrent_applies_of_one_header_keep_the_first_reservation() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let first = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    let reserved = claims
+        .claimed_order(hash(1))
+        .expect("the first apply reserved it");
+    let second = claims.begin_at([(hash(1), CLAIMED)], TIP, now + CLAIM_BASE_GRACE);
+
+    // The later apply finishes first. The claim keeps the earlier reservation.
+    second.commit();
+    first.commit();
+    assert_eq!(used(&claims, hash(1), now).order, reserved);
 }

@@ -159,8 +159,9 @@ impl EnginePort {
             HeaderChainEngine::from_audited_state(graph, metadata, vec![anchor], vec![anchor], [])
                 .expect("a one-node engine is coherent");
         // Production mirrors the current snapshot as soon as it attaches.
-        let (selected, _) = watch::channel(Some(engine.snapshot()));
-        let views = ViewPublisher::new(engine.body_download_anchor(), engine.snapshot());
+        let view = engine.committed_view();
+        let (selected, _) = watch::channel(Some(view.snapshot.clone()));
+        let views = ViewPublisher::new(view);
         EnginePort {
             key: AdapterKey::new(),
             config,
@@ -895,7 +896,6 @@ impl EnginePort {
                 None => ApplyHeaderTargetOutcome::Applied,
             });
         }
-        let after = transition.snapshot_after_commit().clone();
         // A stalled transition publishes no hint changes.
         let hints = if stalled.is_none() {
             hint_hashes(&engine, transition.change_set())
@@ -906,7 +906,7 @@ impl EnginePort {
             .install_committed_transition(transition)
             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
         let updates = hint_updates(&engine, hints);
-        self.publish_locked(engine.body_download_anchor(), after, effect, updates);
+        self.publish_locked(engine.committed_view(), effect, updates);
         drop(engine);
         Ok(match stalled {
             Some(receipt) => ApplyHeaderTargetOutcome::ResourceStalled(receipt),
@@ -1091,20 +1091,16 @@ impl EnginePort {
     /// meet only each other here, and park.
     fn publish_locked(
         &self,
-        anchor: zakura_header_chain::Frontier,
-        snapshot: EngineSnapshot,
+        view: CommittedHeaderChainView,
         effect: TransitionEffect,
         updates: Vec<(block::Height, block::Hash, BodySizeHint)>,
     ) -> CommittedHeaderChainView {
         let (view, views) = {
             let mut publisher = self.views();
-            (
-                publisher.next(anchor, snapshot.clone(), effect, updates),
-                publisher.sender(),
-            )
+            (publisher.next(view, effect, updates), publisher.sender())
         };
         if let Some(selected) = self.selected_sender() {
-            selected.send_replace(Some(self.published(snapshot)));
+            selected.send_replace(Some(self.published(view.snapshot.clone())));
         }
         if let Some(views) = views {
             views.send_replace(Some(view.clone()));

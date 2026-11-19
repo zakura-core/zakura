@@ -44,13 +44,12 @@ use zakura_chain::{
     parameters::constants::{MAX_BLOCK_REORG_HEIGHT, MAX_NON_FINALIZED_CHAIN_FORKS},
 };
 use zakura_header_chain::{
-    AuxDelivery, AuxDelta, BodySizeHint, BodySizeHintBatch, BodyWorkEpoch, ChangeSet,
-    CommittedHeaderChainView, CommittedTransitionError, EligibilityReason, EngineSnapshot,
-    EvidenceId, FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError,
-    TransitionEffect, TransitionEvent, TransitionFailure, TransitionFingerprint, TransitionRequest,
-    ValidationLease, VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedHeaderRef,
+    AuxDelivery, AuxDelta, BodySizeHint, BodySizeHintBatch, ChangeSet, CommittedHeaderChainView,
+    CommittedTransitionError, EligibilityReason, EngineSnapshot, EvidenceId,
+    FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, TransitionEffect,
+    TransitionEvent, TransitionFailure, TransitionFingerprint, TransitionRequest, ValidationLease,
+    VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 use zakura_network::zakura::{BlockSizeEstimate, BlockSyncBlockMeta};
 use zakura_node_services::block_memory::BlockHandle;
@@ -911,10 +910,8 @@ pub(crate) struct ViewPublisher {
 const RETAINED_HINT_BATCHES: usize = 16;
 
 impl ViewPublisher {
-    /// A publisher whose first view is `snapshot` at the first body-work
-    /// epoch, as `Publisher::new` builds it.
-    pub(crate) fn new(anchor: zakura_header_chain::Frontier, snapshot: EngineSnapshot) -> Self {
-        let view = CommittedHeaderChainView::new(anchor, snapshot, BodyWorkEpoch::default());
+    /// Start the watch at the engine's initial committed view.
+    pub(crate) fn new(view: CommittedHeaderChainView) -> Self {
         let (sender, _) = watch::channel(Some(view.clone()));
         ViewPublisher {
             view,
@@ -937,19 +934,18 @@ impl ViewPublisher {
         self.sender.take()
     }
 
-    /// The next view, for a committed `snapshot` whose transition had
+    /// The next view, for an installed engine view whose transition had
     /// `effect` and changed `updates`' size hints. A port of
     /// `publish_with_hint_changes`: an effect that invalidates body work
     /// starts the next epoch, and nonempty updates start the next hint
     /// revision and add a batch. The caller sends the view.
     pub(crate) fn next(
         &mut self,
-        anchor: zakura_header_chain::Frontier,
-        snapshot: EngineSnapshot,
+        mut view: CommittedHeaderChainView,
         effect: TransitionEffect,
         updates: Vec<(block::Height, block::Hash, BodySizeHint)>,
     ) -> CommittedHeaderChainView {
-        let body_work_epoch = if effect.invalidates_body_work() {
+        view.body_work_epoch = if effect.invalidates_body_work() {
             self.view
                 .body_work_epoch
                 .checked_next()
@@ -957,7 +953,6 @@ impl ViewPublisher {
         } else {
             self.view.body_work_epoch
         };
-        let mut view = CommittedHeaderChainView::new(anchor, snapshot, body_work_epoch);
         view.body_size_hint_batches = self.view.body_size_hint_batches.clone();
         view.body_size_hint_revision = self.view.body_size_hint_revision;
         if !updates.is_empty() {

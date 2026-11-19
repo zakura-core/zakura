@@ -616,24 +616,19 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
 
 #[test]
 fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
-    let (_, _, metadata) = fixture();
-    let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.frontiers.verified_best, initial.clone());
+    let initial = initial_publisher_view();
+    let publisher = Publisher::new(initial.clone());
     let (mirror_sender, mirror_receiver) = watch::channel(None);
 
     assert_eq!(*mirror_receiver.borrow(), None);
 
     publisher.mirror_to(mirror_sender);
-    assert_eq!(*mirror_receiver.borrow(), Some(initial.clone()));
+    assert_eq!(*mirror_receiver.borrow(), Some(initial.snapshot.clone()));
 
     let mut committed = initial;
-    committed.state_version = StateVersion::new(2);
-    publisher.publish(
-        committed.frontiers.verified_best,
-        committed.clone(),
-        TransitionEffect::none(),
-    );
-    assert_eq!(*mirror_receiver.borrow(), Some(committed));
+    committed.snapshot.state_version = StateVersion::new(2);
+    publisher.publish(committed.clone(), TransitionEffect::none());
+    assert_eq!(*mirror_receiver.borrow(), Some(committed.snapshot));
 }
 
 #[test]

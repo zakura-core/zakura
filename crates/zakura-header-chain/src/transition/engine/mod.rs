@@ -439,9 +439,16 @@ impl HeaderChainEngine {
         self.metadata.snapshot()
     }
 
-    /// Highest verified block on the selected header chain.
-    pub fn body_download_anchor(&self) -> crate::Frontier {
-        super::common_body_frontier(self.selected_projection(), self.verified_projection())
+    /// Capture the installed snapshot and its shared download anchor together.
+    /// Publishers supply the process-local work epoch and size hints before broadcasting.
+    pub fn committed_view(&self) -> crate::CommittedHeaderChainView {
+        let anchor =
+            super::common_body_frontier(self.selected_projection(), self.verified_projection());
+        crate::CommittedHeaderChainView::new(
+            anchor,
+            self.snapshot(),
+            crate::BodyWorkEpoch::default(),
+        )
     }
 
     /// Return complete engine metadata.

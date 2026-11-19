@@ -101,8 +101,7 @@ impl ReactorState {
 
     /// Panic if the state breaks a rule it keeps: the query state keeps its
     /// own invariants, the pending query carries the current body-work
-    /// authority, the needed heights are sorted and distinct, and the
-    /// mirrored serving tip follows verified progress.
+    /// authority, and the needed heights are sorted and distinct.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn assert_invariants(&self) {
         self.queries.assert_invariants();
@@ -117,14 +116,6 @@ impl ReactorState {
             self.needed_heights.windows(2).all(|pair| pair[0] < pair[1]),
             "needed heights are sorted and distinct: {:?}",
             self.needed_heights
-        );
-        assert_eq!(
-            (self.progress.servable_high, self.progress.servable_hash),
-            (
-                self.progress.verified_block_tip,
-                self.progress.verified_block_hash
-            ),
-            "the mirrored serving tip follows verified progress"
         );
     }
 
@@ -860,9 +851,6 @@ pub(super) struct ReactorProgress {
     /// Mirror of the Sequencer's verified tip.
     pub(super) verified_block_tip: block::Height,
     pub(super) verified_block_hash: block::Hash,
-    /// Serving tip from the sequencer's last verified progress update.
-    pub(super) servable_high: block::Height,
-    pub(super) servable_hash: block::Hash,
     /// Scheduler and query lower bound. It follows the Sequencer's download
     /// floor, but it is not verified state and never reaches status.
     pub(super) request_floor: block::Height,
@@ -888,8 +876,6 @@ impl ReactorProgress {
             finalized_height: frontiers.finalized_height,
             verified_block_tip: frontiers.verified_block_tip,
             verified_block_hash: frontiers.verified_block_hash,
-            servable_high: frontiers.verified_block_tip,
-            servable_hash: frontiers.verified_block_hash,
             request_floor: frontiers.verified_block_tip,
             best_header_tip: best_header_tip.0,
             best_header_hash: best_header_tip.1,
@@ -918,8 +904,6 @@ impl ReactorProgress {
         self.verified_block_tip = view.verified_tip;
         self.request_floor = view.download_floor;
         self.verified_block_hash = view.verified_hash;
-        self.servable_high = view.verified_tip;
-        self.servable_hash = view.verified_hash;
     }
 
     /// The height whose expired claims the floor watchdog cancels.
@@ -935,18 +919,16 @@ impl ReactorProgress {
     ) -> BlockSyncStatus {
         // Range reads follow the selected headers. While full state is on a rival
         // branch, only advertise through the block both chains share.
-        let (servable_high, tip_hash) = committed
+        let tip = committed
             .filter(|view| view.frontiers.verified_best != view.body_download_anchor)
-            .map_or((self.servable_high, self.servable_hash), |view| {
-                (
-                    view.body_download_anchor.height,
-                    view.body_download_anchor.hash,
-                )
-            });
+            .map_or(
+                Frontier::new(self.verified_block_tip, self.verified_block_hash),
+                |view| view.body_download_anchor,
+            );
         BlockSyncStatus {
             servable_low: block::Height::MIN,
-            servable_high,
-            tip_hash,
+            servable_high: tip.height,
+            tip_hash: tip.hash,
             max_blocks_per_response: config.advertised_max_blocks_per_response(),
             max_inflight_requests: config.advertised_max_inflight_requests(),
             max_response_bytes: config.advertised_max_response_bytes(),

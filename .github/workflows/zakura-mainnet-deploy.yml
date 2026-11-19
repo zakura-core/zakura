@@ -531,7 +531,7 @@ jobs:
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
           # Keep the build that supports this node's hand-written experiment config.
-          commit     = "6d234e29ae6eb519573b28cfbfce63d8d741f7de"
+          commit     = "b67299d1588b097da4713ceaa71abdd59bd193f0"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

@@ -2443,15 +2443,18 @@ async fn cancelling_the_earlier_second_request_preserves_the_later_deadline() {
 
     peers.announce(BLOCK_HASH, &early);
     let (_early_attempt, _early_first, early_second) = peers.download(BLOCK_HASH, &mut early).await;
-    peers.announce(OTHER_BLOCK_HASH, &late);
-    let (_late_attempt, _late_first, _late_second) =
-        peers.download(OTHER_BLOCK_HASH, &mut late).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    peers.announce(hash, &late);
+    let (_late_attempt, _late_first, late_second) = peers.download(hash, &mut late).await;
 
     // Both first requests are overdue. This alternate qualifies for each only at its stall deadline.
     tokio::time::advance(Duration::from_millis(250)).await;
     peers.announce(BLOCK_HASH, &alternate);
     assert_eq!(alternate.written_now().await, None);
-    peers.announce(OTHER_BLOCK_HASH, &alternate);
+    peers.announce(hash, &alternate);
     assert_eq!(alternate.written_now().await, None);
     early_second.abort();
     assert!(early_second.await.unwrap_err().is_cancelled());
@@ -2471,7 +2474,19 @@ async fn cancelling_the_earlier_second_request_preserves_the_later_deadline() {
     tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(
         alternate.written_now().await,
-        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()]))
+        Some(Message::GetData(vec![hash.into()]))
+    );
+    alternate
+        .peer_inbound
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .unwrap();
+    assert_eq!(
+        late_second.await.unwrap().unwrap(),
+        Response::Blocks(vec![crate::InventoryResponse::Available((
+            block.into(),
+            Some(alternate.addr)
+        ))])
     );
 }
 

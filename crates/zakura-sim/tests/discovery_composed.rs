@@ -191,3 +191,15 @@ fn a_crossed_request_counts_toward_the_margin() {
         "the refused request is judged over the margin: {sent:?}"
     );
 }
+
+/// A request run, found by the generator (seed 4203, run 416), whose last
+/// `GetPeers` reaches the evidence only after the node tore its connection
+/// down. The evidence logs it unjudged, as the teardown left the others.
+/// Before it did, it held the request back for a count that never came,
+/// and the run failed `WithheldFrames`.
+#[test]
+fn a_request_placed_after_its_teardown_is_logged() {
+    run_clean(include_bytes!(
+        "fixtures/discovery-composed-late-request.bin"
+    ));
+}

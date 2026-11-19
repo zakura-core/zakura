@@ -3,11 +3,7 @@
 //! The node uses the first announcement of a block to rank its body, so this module only
 //! forwards hashes. It does not depend on what the node does with them.
 
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use tokio::time::Instant;
 use zakura_chain::block;
@@ -40,7 +36,7 @@ impl BlockAnnouncementHook {
     pub(crate) fn for_connection(&self) -> ConnectionAnnouncements {
         ConnectionAnnouncements {
             hook: self.clone(),
-            window: Arc::default(),
+            window: Window::default(),
         }
     }
 }
@@ -54,10 +50,10 @@ impl fmt::Debug for BlockAnnouncementHook {
 }
 
 /// One connection's announcements to a [`BlockAnnouncementHook`].
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ConnectionAnnouncements {
     hook: BlockAnnouncementHook,
-    window: Arc<Mutex<Window>>,
+    window: Window,
 }
 
 /// The current fixed window of hook calls.
@@ -70,17 +66,11 @@ struct Window {
 impl ConnectionAnnouncements {
     /// Passes the announced block `hash` to the hook, unless this connection has used its
     /// share of the current window.
-    pub(crate) fn announce(&self, hash: block::Hash) {
+    pub(crate) fn announce(&mut self, hash: block::Hash) {
         let Some(hook) = &self.hook.0 else {
             return;
         };
-        let admitted = self
-            .window
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .admit(Instant::now());
-        // Called after the window lock is released, so a slow hook does not hold it.
-        if admitted {
+        if self.window.admit(Instant::now()) {
             hook(hash);
         }
     }

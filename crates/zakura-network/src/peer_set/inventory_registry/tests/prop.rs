@@ -32,38 +32,16 @@ proptest! {
     ) {
         prop_assert!(MAX_HASH_COUNT <= MAX_PENDING_CHANGES, "channel must not block in tests");
 
-        // Start the runtime
+        // Polling the inventory registry needs a Tokio timer.
         let (runtime, _init_guard) = zakura_test::init_async();
-
-        runtime.block_on(async move {
-            // Check all combinations of:
-            //
-            // Inventory availability:
-            // - Available
-            // - Missing
-            //
-            // Inventory multiplicity:
-            // - Empty messages are ignored without errors
-            // - Single is handled correctly
-            // - Multiple are handled correctly
-            //
-            // And inventory variants:
-            // - Block (empty and single only)
-            // - Tx for legacy v4 and earlier transactions
-            // - Wtx for v5 and later transactions
-            //
-            // Using randomised proptest inventory data.
-            inv_registry_inbound_wrapper_with(status, test_hashes).await;
-        })
+        let _entered = runtime.enter();
+        inv_registry_inbound_wrapper_with(status, test_hashes);
     }
 }
 
 /// Check inventory registration works via the inbound peer message channel wrapper.
 #[tracing::instrument]
-async fn inv_registry_inbound_wrapper_with(
-    status: InventoryMarker,
-    test_hashes: HashSet<InventoryHash>,
-) {
+fn inv_registry_inbound_wrapper_with(status: InventoryMarker, test_hashes: HashSet<InventoryHash>) {
     let test_peer: PeerSocketAddr = "1.1.1.1:1"
         .parse()
         .expect("unexpected invalid peer address");
@@ -81,12 +59,11 @@ async fn inv_registry_inbound_wrapper_with(
     let forwarded_msg = register_inventory_status(
         Ok(test_msg.clone()),
         test_peer,
-        inv_stream_tx.clone(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-    )
-    .await;
+        &inv_stream_tx,
+        &Default::default(),
+        &mut Default::default(),
+        &Default::default(),
+    );
     assert_eq!(
         test_msg.clone(),
         forwarded_msg.expect("unexpected forwarded error result"),

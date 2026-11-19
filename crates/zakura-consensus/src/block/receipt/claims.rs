@@ -15,6 +15,11 @@ use zakura_chain::block::{self, HeightDiff};
 use super::order;
 
 mod announced;
+mod resolution;
+
+pub(super) use resolution::ClaimOutcome;
+#[cfg(test)]
+pub(super) use resolution::{size_label, ClaimSource};
 
 use announced::Announcements;
 #[cfg(test)]
@@ -115,158 +120,6 @@ impl ClaimTable {
         let floor = self.floor;
         self.by_hash.retain(|_, claim| claim.height >= floor);
         self.mined.retain(|_, mined| mined.height >= floor);
-    }
-
-    /// Whether a mined block other than `hash` outranks a claim on `order` at `height`.
-    fn is_voided(&self, hash: block::Hash, height: block::Height, order: u64) -> bool {
-        self.mined.iter().any(|(mined_hash, mined)| {
-            *mined_hash != hash && mined.height == height && order < mined.order
-        })
-    }
-
-    /// The claims `hash` holds for a body at `height`, each with whether it is voided.
-    ///
-    /// An announcement has no height of its own, so the body's height must be claimable.
-    fn candidates(
-        &self,
-        hash: block::Hash,
-        height: Option<block::Height>,
-    ) -> [Option<(Candidate, bool)>; 2] {
-        let header = self.by_hash.get(&hash).map(|claim| Candidate {
-            source: ClaimSource::Header,
-            height: claim.height,
-            order: claim.order,
-            seen_at: claim.seen_at,
-        });
-        let inv = height
-            .filter(|height| *height >= self.floor)
-            .and_then(|height| {
-                let announced = self.announced.get(hash)?;
-                in_claim_window(height, announced.tip_at_announcement).then_some(Candidate {
-                    source: ClaimSource::Inv,
-                    height,
-                    order: announced.order,
-                    seen_at: announced.seen_at,
-                })
-            });
-        [header, inv].map(|candidate| {
-            candidate.map(|candidate| {
-                let voided = self.is_voided(hash, candidate.height, candidate.order);
-                (candidate, voided)
-            })
-        })
-    }
-}
-
-/// One way a block was announced, as a body resolving its claim sees it.
-#[derive(Copy, Clone, Debug)]
-struct Candidate {
-    source: ClaimSource,
-    height: block::Height,
-    order: u64,
-    seen_at: Instant,
-}
-
-/// How the claim a body resolved was made.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum ClaimSource {
-    /// Native header sync admitted the block's header.
-    Header,
-    /// A legacy peer sent the first `inv` for the block.
-    Inv,
-}
-
-impl ClaimSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Header => "header",
-            Self::Inv => "inv",
-        }
-    }
-}
-
-/// How a body that shares no active receipt resolved its block's claim.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum ClaimOutcome {
-    /// The block has no claim, so the body is ranked by its arrival.
-    Unclaimed,
-    /// The body arrived inside its deadline and takes the claimed order.
-    Used {
-        source: ClaimSource,
-        order: u64,
-        age: Duration,
-        bytes: usize,
-    },
-    /// The body arrived after its deadline and is ranked by its arrival.
-    Expired {
-        source: ClaimSource,
-        age: Duration,
-        bytes: usize,
-    },
-    /// A block this node mined at the claim's height outranks it, so the body is ranked by its
-    /// arrival.
-    Voided {
-        source: ClaimSource,
-        age: Duration,
-        bytes: usize,
-    },
-}
-
-impl ClaimOutcome {
-    /// The order this body takes from its claim, if it keeps the claim.
-    pub(super) fn claimed_order(&self) -> Option<u64> {
-        match self {
-            Self::Used { order, .. } => Some(*order),
-            _ => None,
-        }
-    }
-
-    /// Records this outcome for the body of `hash`, which was given `order`.
-    pub(super) fn record(&self, hash: block::Hash, order: u64) {
-        let (outcome, claim) = match *self {
-            Self::Unclaimed => ("none", None),
-            Self::Used {
-                source, age, bytes, ..
-            } => ("used", Some((source, age, bytes))),
-            Self::Expired { source, age, bytes } => ("expired", Some((source, age, bytes))),
-            Self::Voided { source, age, bytes } => ("voided", Some((source, age, bytes))),
-        };
-        let size = claim.map_or("none", |(_, _, bytes)| size_label(bytes));
-        let source = claim.map_or("none", |(source, _, _)| source.label());
-        metrics::counter!(
-            "sync.block.announcement_claim",
-            "outcome" => outcome,
-            "size" => size,
-            "source" => source,
-        )
-        .increment(1);
-        if let Some((_, age, _)) = claim {
-            metrics::histogram!(
-                "sync.block.announcement_claim.age.seconds",
-                "size" => size,
-                "source" => source,
-            )
-            .record(age.as_secs_f64());
-        }
-        tracing::trace!(
-            %hash,
-            outcome,
-            source,
-            order,
-            "resolved the announcement claim for a block body"
-        );
-    }
-}
-
-/// The metric label for a block of `bytes` serialized bytes.
-///
-/// Transfer time grows with size, so the claim metrics are split by it.
-pub(super) fn size_label(bytes: usize) -> &'static str {
-    match bytes {
-        0..100_000 => "under_100kB",
-        100_000..500_000 => "under_500kB",
-        500_000..1_000_000 => "under_1MB",
-        _ => "1MB_or_more",
     }
 }
 
@@ -391,55 +244,11 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Resolves the claims held for `hash` against a body arriving at `now`, whose coinbase
-    /// `height` places an announcement and whose serialized size `bytes` gives for the claim
-    /// metrics.
-    ///
-    /// A block can hold a header claim and an announcement. The body takes the earlier order of
-    /// those still in force, so a second claim never makes the outcome worse than the first
-    /// alone. If neither is in force, the outcome reports the earlier one.
-    ///
-    /// Resolving does not use a claim up, so an invalid body under the same hash cannot take it
-    /// from the real one. `bytes` is called only for a claimed block, after the table lock is
-    /// released, because sizing a block walks its transactions.
-    pub(super) fn resolve(
-        &self,
-        hash: block::Hash,
-        height: Option<block::Height>,
-        now: Instant,
-        bytes: impl FnOnce() -> usize,
-    ) -> ClaimOutcome {
-        let mut candidates = self.table().candidates(hash, height);
-        candidates.sort_by_key(|held| held.map_or(u64::MAX, |(candidate, _)| candidate.order));
-        let age = |candidate: &Candidate| now.saturating_duration_since(candidate.seen_at);
-        let mut held = candidates.iter().flatten();
-        let in_force = held
-            .clone()
-            .find(|(candidate, voided)| !voided && age(candidate) <= CLAIM_BODY_DEADLINE);
-        let Some(&(claim, voided)) = in_force.or_else(|| held.next()) else {
-            return ClaimOutcome::Unclaimed;
-        };
-
-        let (source, age, bytes) = (claim.source, age(&claim), bytes());
-        if voided {
-            ClaimOutcome::Voided { source, age, bytes }
-        } else if age <= CLAIM_BODY_DEADLINE {
-            ClaimOutcome::Used {
-                source,
-                order: claim.order,
-                age,
-                bytes,
-            }
-        } else {
-            ClaimOutcome::Expired { source, age, bytes }
-        }
-    }
-
     /// Records that the locally mined block `hash` at `height` took `order`, so that a rival's
     /// earlier claim at `height` is not honoured.
     ///
     /// The record lasts while the returned guard, or any other guard for the same block, is
-    /// alive. Once one of them is kept, it lasts until header sync reports a verified tip above
+    /// alive. Once one of them is kept, it lasts until a header or legacy announcement raises the floor above
     /// `height`, or this node mines a block more than [`MAX_CLAIM_HEIGHT_ABOVE_TIP`] above it.
     pub(super) fn mark_mined(
         &self,
@@ -555,7 +364,7 @@ impl MinedGuard {
         if let Some(mined) = self.own_entry(&mut table) {
             mined.verified = true;
             mined.height = self.height;
-            // Without header sync the floor never moves. Prune using the body that verified.
+            // Bound the records even when no announcements advance the floor.
             table
                 .mined
                 .retain(|_, other| self.height - other.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);

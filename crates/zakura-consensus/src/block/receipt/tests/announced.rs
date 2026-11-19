@@ -145,6 +145,13 @@ fn an_expired_inv_does_not_cost_a_later_header_claim_its_deadline() {
         used(&claims, hash(1), CLAIMED, inv_expired),
         Some((ClaimSource::Header, header))
     );
+
+    // Once both expire, the metrics report the first announcement.
+    let both_expired = header_at + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    assert!(matches!(
+        claims.resolve(hash(1), Some(CLAIMED), both_expired, || 0),
+        ClaimOutcome::Expired { source: ClaimSource::Inv, age, .. } if age == both_expired - now
+    ));
 }
 
 #[test]

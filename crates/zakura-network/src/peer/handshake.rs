@@ -1860,7 +1860,7 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
-            let block_announcements = block_announcement_hook.for_connection();
+            let mut block_announcements = block_announcement_hook.for_connection();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
             let peer_registry_updater = peer_registry_updater
@@ -1921,21 +1921,18 @@ where
                     }
                     .instrument(span)
                 })
-                .then(move |msg| {
-                    let inbound_inv_collector = inbound_inv_collector.clone();
-                    let inbound_announced_blocks = inbound_announced_blocks.clone();
-                    let block_announcements = block_announcements.clone();
-                    let inbound_gossip_trace = inbound_gossip_trace.clone();
+                .map(move |msg| {
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
-                    register_inventory_status(
-                        msg,
-                        connected_addr,
-                        inbound_inv_collector,
-                        inbound_announced_blocks,
-                        block_announcements,
-                        inbound_gossip_trace,
-                    )
-                    .instrument(span)
+                    span.in_scope(|| {
+                        register_inventory_status(
+                            msg,
+                            connected_addr,
+                            &inbound_inv_collector,
+                            &inbound_announced_blocks,
+                            &mut block_announcements,
+                            &inbound_gossip_trace,
+                        )
+                    })
                 })
                 .boxed();
 
@@ -2098,13 +2095,13 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 /// An `inv` that names exactly one block is a new block announcement, and is passed to
 /// `block_announcements` and written to `gossip_trace`. One that names several is the answer to
 /// a query.
-pub(crate) async fn register_inventory_status(
+pub(crate) fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
-    inv_collector: broadcast::Sender<InventoryChange>,
-    announced_blocks: AnnouncedBlocks,
-    block_announcements: ConnectionAnnouncements,
-    gossip_trace: PeerGossipTrace,
+    inv_collector: &broadcast::Sender<InventoryChange>,
+    announced_blocks: &AnnouncedBlocks,
+    block_announcements: &mut ConnectionAnnouncements,
+    gossip_trace: &PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {
         Ok(Message::Inv(items)) => {

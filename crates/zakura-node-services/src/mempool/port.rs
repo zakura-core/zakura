@@ -592,6 +592,13 @@ pub enum PoolCommand {
     /// A reservation was dropped before the core accepted it. No caller
     /// sends this. [`PoolInbox::next`] yields it.
     Released(ReservationId),
+    /// [`PoolHandle::known_ids`].
+    KnownIds {
+        /// The ids to check.
+        ids: HashSet<UnminedTxId>,
+        /// The ids the core already knows.
+        reply: oneshot::Sender<HashSet<UnminedTxId>>,
+    },
     /// [`PoolHandle::rejected_ids`].
     RejectedIds {
         /// The ids to check.
@@ -844,6 +851,28 @@ impl PoolHandle {
         by(deadline, async {
             let (reply, answer) = oneshot::channel();
             let command = PoolCommand::RejectedIds { ids, reply };
+            if self.commands.send(command).await.is_err() {
+                return HashSet::new();
+            }
+            answer.await.unwrap_or_default()
+        })
+        .await
+    }
+
+    /// The members of `ids` that [`Self::reserve`] would refuse without
+    /// taking a slot: pooled, undecided, waiting to be verified again after a
+    /// reset, or covered by a cached rejection. A caller that shares out
+    /// slots of its own asks this first, so an id someone else is bringing
+    /// in costs none of them. Waits until `deadline`, and is empty when the
+    /// core has stopped. See [`PoolHandle`].
+    pub async fn known_ids(
+        &self,
+        ids: HashSet<UnminedTxId>,
+        deadline: Instant,
+    ) -> Result<HashSet<UnminedTxId>, Elapsed> {
+        by(deadline, async {
+            let (reply, answer) = oneshot::channel();
+            let command = PoolCommand::KnownIds { ids, reply };
             if self.commands.send(command).await.is_err() {
                 return HashSet::new();
             }

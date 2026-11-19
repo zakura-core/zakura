@@ -516,6 +516,50 @@ fn an_undecided_id_is_not_fetched_twice() {
     assert!(matches!(bench.reserve(&tx).0, Err(Unreserved::Pending)));
 }
 
+/// The ids `reserve` would refuse without a slot are known to a caller that
+/// asks first: pooled, undecided, waiting after a reset, or rejected.
+#[test]
+fn the_ids_a_reservation_would_refuse_are_known() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 5);
+    let mut bench = Bench::new();
+    bench.admit(&txs[0]);
+    bench.reserved(&txs[1]);
+    let (_, job) = bench.start(&txs[2]);
+    bench.fail(
+        job,
+        ExactTipRejectionError::FailedVerification(TestVerifyError),
+        Charge::None,
+    );
+    let ids = |txs: &[Tx]| {
+        txs.iter()
+            .map(Tx::id)
+            .collect::<zakura_rt::collections::HashSet<_>>()
+    };
+    assert_eq!(
+        bench.machine.known_ids(ids(&txs), bench.at()),
+        ids(&txs[..3])
+    );
+
+    // A reset puts the pooled one back in line to be verified again.
+    let readmitting = Bench::with(
+        Config::default(),
+        Limits {
+            pending: 1,
+            readmitting: 1,
+        },
+    );
+    let mut bench = readmitting;
+    bench.admit(&txs[3]);
+    bench.admit(&txs[4]);
+    bench.reset();
+    assert_eq!(bench.machine.queued_count(), 1);
+    assert_eq!(
+        bench.machine.known_ids(ids(&txs[3..]), bench.at()),
+        ids(&txs[3..])
+    );
+}
+
 /// A fetch that is still out when its admission ends keeps its slot: a
 /// decoded body is still on its way. Its caller gets the admission's verdict
 /// when it comes back.

@@ -297,6 +297,16 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                 let step = self.machine.release(id, now);
                 self.finish(step);
             }
+            PoolCommand::KnownIds { ids, reply } => {
+                // A caller that gave up on the lookup costs the core no scan.
+                if reply.is_closed() {
+                    return;
+                }
+                let answer = self.machine.known_ids(ids, now);
+                self.reply(move || {
+                    let _ = reply.send(answer);
+                });
+            }
             PoolCommand::RejectedIds { ids, reply } => {
                 // A caller that gave up on the lookup costs the core no scan.
                 if reply.is_closed() {

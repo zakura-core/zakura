@@ -36,9 +36,7 @@ use zakura_chain::{
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    port::{
-        Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved, Verdict, MAX_PENDING,
-    },
+    port::{Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved, Verdict},
     CreatedOrSpent, Gossip, MempoolDisabledError, OutputNotInPool, QueueSource, Request, Response,
 };
 
@@ -233,59 +231,41 @@ async fn peer_batch(
         .filter(|item| snapshot.transaction(&item.id().mined_id()).is_none())
         .collect();
     // A core that does not answer by the deadline gets the batch dropped, as
-    // a reservation that does not come back in time would be.
-    let Ok(rejected) = shared
+    // a reservation that does not come back in time would be. An id the core
+    // already knows takes none of the peer's slots, as today's pool skips a
+    // queued or rejected id before it counts the peer's limit. That covers an
+    // id another peer, or tx-relay, is bringing in.
+    let Ok(known) = shared
         .handle
-        .rejected_ids(fresh.iter().map(Gossip::id).collect(), deadline)
+        .known_ids(fresh.iter().map(Gossip::id).collect(), deadline)
         .await
     else {
         return Ok(Response::Queued(Vec::new()));
     };
-    // The batch takes its peer's free slots now, in one pass, as today's
-    // pool queues a batch at once, and the ids that find none are dropped
-    // without asking the core. Slots that free up while the batch is worked
-    // on take nothing more from it.
-    let mut candidates = fresh
+    // The rest take their peer's slots now, in one pass, as today's pool
+    // queues a batch at once: at most the peer's limit of them, and the rest
+    // are dropped without asking the core. Slots that free up while the
+    // batch is worked on take nothing more from it.
+    let held: Vec<(Gossip, PeerSlot)> = fresh
         .into_iter()
-        .filter(|item| !rejected.contains(&item.id()))
-        .peekable();
-    let mut slots: Vec<PeerSlot> =
-        std::iter::from_fn(|| PeerSlot::take(&shared, &source)).collect();
-    // An id another caller is bringing in hands its slot back, as today's
-    // pool skips a queued id before it counts the peer's limit. The core
-    // holds at most `MAX_PENDING` undecided ids, so a batch stops skipping
-    // after that many, which bounds what one batch costs the core.
-    let mut skipped = 0;
-    while candidates.peek().is_some() {
-        let Some(slot) = slots.pop() else {
-            break;
-        };
-        let item = candidates.next().expect("a candidate was peeked");
-        match shared.handle.reserve(item.id(), deadline).await {
-            Ok(Ok(reservation)) => {
-                start(
-                    shared.clone(),
-                    reservation,
-                    item,
-                    Some(source.clone()),
-                    Some(slot),
-                    deadline,
-                );
+        .filter(|item| !known.contains(&item.id()))
+        .filter_map(|item| match PeerSlot::take(&shared, &source) {
+            Some(slot) => Some((item, slot)),
+            None => {
+                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                None
             }
-            Ok(Err(Unreserved::Pending)) if skipped < MAX_PENDING => {
-                skipped += 1;
-                slots.push(slot);
-            }
-            Ok(Err(_)) => {}
-            Err(_elapsed) => {
-                let _timeout = timed_out();
-            }
-        }
-    }
-    let dropped = candidates.count();
-    if dropped > 0 {
-        metrics::counter!("mempool.full_queue.per_peer.total")
-            .increment(u64::try_from(dropped).unwrap_or(u64::MAX));
+        })
+        .collect();
+    for (item, slot) in held {
+        let _ = queue(
+            shared.clone(),
+            item,
+            Some(source.clone()),
+            Some(slot),
+            deadline,
+        )
+        .await;
     }
     Ok(Response::Queued(Vec::new()))
 }
@@ -525,19 +505,6 @@ async fn queue(
         Ok(Err(refused)) => return first_stage_refusal(refused),
         Err(_elapsed) => return Err(timed_out()),
     };
-    Ok(start(shared, reservation, item, from, slot, deadline))
-}
-
-/// Starts the task that brings `item` in under `reservation` and answers its
-/// second stage on the returned receiver. `slot` is held until then.
-fn start(
-    shared: Arc<Shared>,
-    reservation: Reservation,
-    item: Gossip,
-    from: Option<QueueSource>,
-    slot: Option<PeerSlot>,
-    deadline: tokio::time::Instant,
-) -> Receiver {
     metrics::counter!("mempool.queued.transactions.total").increment(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
@@ -548,7 +515,7 @@ fn start(
         drop(slot);
         let _ = answer.send(result);
     });
-    receiver
+    Ok(receiver)
 }
 
 /// One undecided transaction counted against a peer, from its reservation
@@ -1513,7 +1480,7 @@ mod tests {
             source: peer(),
         }));
         let soon = std::time::Duration::from_millis(1);
-        let Ok(Some(PoolCommand::RejectedIds { reply, .. })) =
+        let Ok(Some(PoolCommand::KnownIds { reply, .. })) =
             tokio::time::timeout(soon, inbox.next()).await
         else {
             panic!("the push asks the core without waiting for the tip");
@@ -1578,12 +1545,12 @@ mod tests {
             source: peer(),
         }));
 
-        let Some(PoolCommand::RejectedIds {
+        let Some(PoolCommand::KnownIds {
             ids: looked_up,
             reply,
         }) = inbox.next().await
         else {
-            panic!("the batch asks once which ids are rejected");
+            panic!("the batch asks once which ids the core knows");
         };
         let _ = reply.send(
             looked_up
@@ -1680,9 +1647,9 @@ mod tests {
             transactions: bodies,
             source: QueueSource::Zakura(vec![7; 32]),
         }));
-        // The batch asks once which of its bodies the core has rejected.
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch asks which ids are rejected");
+        // The batch asks once which of its bodies the core already knows.
+        let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids the core knows");
         };
         let _ = reply.send(Default::default());
         // Its bodies are queued one after another. Each within the peer's
@@ -1753,8 +1720,8 @@ mod tests {
             transactions: vec![Gossip::Id(id)],
             source: QueueSource::Zakura(v2_peer.clone()),
         }));
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch asks which ids are rejected");
+        let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids the core knows");
         };
         let _ = reply.send(Default::default());
         let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
@@ -1862,11 +1829,11 @@ mod tests {
         drop(unpolled);
     }
 
-    /// An id another caller reserved straight through the pool handle, as
-    /// tx-relay does, takes none of a peer's slots: the core answers it as
-    /// pending, and the batch goes on to fetch five new ids.
+    /// An id the core already knows, such as one tx-relay reserved straight
+    /// through the pool handle, takes none of a peer's slots: the batch asks
+    /// the core once, skips it, and fetches five new ids.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_id_another_caller_reserved_takes_none_of_the_batch() {
+    async fn an_id_the_core_already_knows_takes_none_of_the_batch() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
 
         let (handle, mut inbox) = pool_port();
@@ -1882,23 +1849,19 @@ mod tests {
             transactions: (0..=5).map(|n| Gossip::Id(id(n))).collect(),
             source: peer(),
         }));
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch asks which ids are rejected");
+        let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids the core knows");
         };
-        let _ = reply.send(Default::default());
-        let mut granted = Vec::new();
+        let _ = reply.send([elsewhere].into_iter().collect());
+        let mut reserved = Vec::new();
         while let Ok(Some(PoolCommand::Reserve { tx_id, reply })) =
             tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
         {
-            if tx_id == elsewhere {
-                let _ = reply.send(Err(Unreserved::Pending));
-            } else {
-                let reservation = ReservationId(u64::from(tx_id.mined_id().0[0]));
-                let _ = reply.send(Ok(inbox.grant(reservation, tx_id, Default::default())));
-                granted.push(tx_id);
-            }
+            let reservation = ReservationId(u64::from(tx_id.mined_id().0[0]));
+            let _ = reply.send(Ok(inbox.grant(reservation, tx_id, Default::default())));
+            reserved.push(tx_id);
         }
-        assert_eq!(granted, (1..=5).map(id).collect::<Vec<_>>());
+        assert_eq!(reserved, (1..=5).map(id).collect::<Vec<_>>());
         let answer = request.await.expect("the task does not panic");
         assert!(matches!(answer, Ok(Response::Queued(_))));
     }
@@ -1924,8 +1887,8 @@ mod tests {
             transactions: ids,
             source: peer(),
         }));
-        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
-            panic!("the batch asks which ids are rejected");
+        let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids the core knows");
         };
         let _ = reply.send(Default::default());
         let mut reserved = 0;

@@ -743,6 +743,18 @@ impl<E: VerifyError> MempoolState<E> {
             .collect()
     }
 
+    /// The members of `ids` that [`Self::reserve`] would refuse without
+    /// taking a slot. See `PoolHandle::known_ids`.
+    pub fn known_ids(&self, ids: HashSet<UnminedTxId>, now: Instant) -> HashSet<UnminedTxId> {
+        let (mut known, rest): (HashSet<_>, HashSet<_>) = ids.into_iter().partition(|id| {
+            self.pooled.contains_key(&id.mined_id())
+                || self.admission_of.contains_key(id)
+                || self.queued.contains_key(&id.mined_id())
+        });
+        known.extend(self.rejected_ids(rest, now));
+        known
+    }
+
     // Observations.
 
     /// Whether the pool is on.

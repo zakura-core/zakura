@@ -501,7 +501,7 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
 /// A parked child ends at its submitter's deadline, long before its wait
 /// for a parent would, and a parent admitted after that does not bring it
 /// back.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_submitters_deadline_ends_a_parked_child_before_a_late_parent() {
     let (parent, child) = parent_and_child();
     let harness = Harness::start(&[parent.clone(), child.clone()]);

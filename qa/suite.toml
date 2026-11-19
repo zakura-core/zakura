@@ -259,9 +259,9 @@ reason = "a tool, not a test: it rewrites the committed frontier-first input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_flood_watch.rs"
-test = "regenerate_flood_seeds"
+test = "regenerate_flood_seed"
 run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
+reason = "a tool, not a test: it rewrites the committed input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_release_wake.rs"

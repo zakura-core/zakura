@@ -1647,10 +1647,6 @@ fn retirement_applied<V: RetirementView>(view: &V, _: &ObservationLog) -> bool {
     view.retirement().applicable() || view.retirement().opened_before(shutdown_stamp(view.ends()))
 }
 
-/// Under a wire flood, the run loop reads each externally published
-/// committed state from its watch before it takes a third wire event.
-pub const WATCH_OBSERVED_UNDER_FLOOD: &str = "header-sync/watch-observed-under-flood";
-
 /// Under lifecycle churn, the run loop reads each externally published
 /// committed state from its watch before it takes a third lifecycle event.
 pub const WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD: &str =
@@ -1663,88 +1659,41 @@ pub trait AdoptionView {
     fn adoption(&self) -> &AdoptionEvidence;
 }
 
-/// [`WATCH_OBSERVED_UNDER_FLOOD`], as a harness whose view is an
-/// [`AdoptionView`] registers it.
-pub fn watch_observed_under_flood<S>() -> Property<S>
-where
-    S: HasView,
-    S::View: AdoptionView,
-{
-    watch_observed(
-        WATCH_OBSERVED_UNDER_FLOOD,
-        "the run loop reads each externally published committed state from its watch \
-         before it takes a third wire event",
-        check_watch_under_flood::<S>,
-        published_under_wire_flood::<S::View>,
-    )
-}
-
 /// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`], as a harness whose view is an
-/// [`AdoptionView`] registers it.
+/// [`AdoptionView`] registers it. A view check that marks its own open
+/// obligations, since the registry's bounds can't count taken events.
 pub fn watch_observed_under_lifecycle_flood<S>() -> Property<S>
 where
     S: HasView,
     S::View: AdoptionView,
 {
-    watch_observed(
-        WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
-        "the run loop reads each externally published committed state from its watch \
-         before it takes a third lifecycle event",
-        check_watch_under_lifecycle_flood::<S>,
-        published_under_lifecycle_flood::<S::View>,
-    )
-}
-
-/// One watch property: `id`, claiming `claim`, checked by `check`, with
-/// trigger history `triggered`. A view check that marks its own open
-/// obligations, since the registry's bounds can't count taken events.
-fn watch_observed<S: HasView>(
-    id: &'static str,
-    claim: &'static str,
-    check: fn(&mut CheckCtx<'_, S>) -> Verdict,
-    triggered: fn(&S::View, &ObservationLog) -> bool,
-) -> Property<S> {
     Property {
-        id: PropertyId::new(id),
-        claim,
+        id: PropertyId::new(WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD),
+        claim: "the run loop reads each externally published committed state from its watch \
+                before it takes a third lifecycle event",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
         status: Status::Active,
-        check,
-        witness: Some(TriggerHistory::View(triggered)),
+        check: check_watch_under_lifecycle_flood::<S>,
+        witness: Some(TriggerHistory::View(
+            published_under_lifecycle_flood::<S::View>,
+        )),
     }
 }
 
-/// Checks [`WATCH_OBSERVED_UNDER_FLOOD`] after each step.
-fn check_watch_under_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
-where
-    S: HasView,
-    S::View: AdoptionView,
-{
-    check_watch_read(cx, EventQueue::Wire)
-}
-
-/// Checks [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`] after each step.
+/// Checks [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`] after each step over the
+/// view's adoption evidence ([`AdoptionEvidence::watch_read`]). It applies
+/// once a state is published. A publication still waiting for its read or
+/// its third lifecycle event stays pending ([`Pending::WatchOpen`]) if the
+/// run ends there, unless [`watch_end_violations`] breaks it at a settled
+/// end.
 fn check_watch_under_lifecycle_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: AdoptionView,
 {
-    check_watch_read(cx, EventQueue::Lifecycle)
-}
-
-/// Checks the watch rule for `queue` over the view's adoption evidence
-/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
-/// published. A publication still waiting for its read or its third event
-/// stays pending ([`Pending::WatchOpen`]) if the run ends there, unless
-/// [`watch_end_violations`] breaks it at a settled end.
-fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
-where
-    S: HasView,
-    S::View: AdoptionView,
-{
-    match cx.view().adoption().watch_read(queue) {
+    match cx.view().adoption().watch_read(EventQueue::Lifecycle) {
         WatchRead::Nothing => Verdict::NotApplicable,
         WatchRead::Holds => Verdict::Holds,
         WatchRead::Open => {
@@ -1759,8 +1708,8 @@ where
     }
 }
 
-/// The watch property for the flooded `queue`'s violation at the run's end:
-/// a publication still unread when the run settled
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s violation at the run's end: a
+/// publication still unread when the run settled
 /// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
 /// stop the node (`stopping`). A correct loop with an unread publication
 /// always has its watch arm ready, so it can't settle with one. Only a
@@ -1768,20 +1717,13 @@ where
 /// ([`EndedBy`](crate::property::EndedBy)). A harness whose view is an
 /// [`AdoptionView`] reports these from [`HasView::end_violations`], after it
 /// handed the run's end to [`AdoptionEvidence::end`].
-pub fn watch_end_violations(
-    adoption: &AdoptionEvidence,
-    queue: EventQueue,
-    stopping: bool,
-) -> Vec<EndViolation> {
+pub fn watch_end_violations(adoption: &AdoptionEvidence, stopping: bool) -> Vec<EndViolation> {
+    let queue = EventQueue::Lifecycle;
     if stopping || !adoption.unread_at_settled_end(queue) {
         return Vec::new();
     }
-    let property = match queue {
-        EventQueue::Wire => WATCH_OBSERVED_UNDER_FLOOD,
-        EventQueue::Lifecycle => WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
-    };
     vec![EndViolation {
-        property: PropertyId::new(property),
+        property: PropertyId::new(WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD),
         expected: "each published state is read from the committed watch before the run \
                    settles"
             .to_owned(),
@@ -1793,19 +1735,10 @@ pub fn watch_end_violations(
     }]
 }
 
-/// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
-/// whose wire queue competed with its watch read
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
+/// state whose lifecycle queue competed with its watch read
 /// ([`AdoptionEvidence::published_into_flood`]), or that the run settled
 /// with unread ([`AdoptionEvidence::unread_at_settled_end`]).
-fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
-    let adoption = view.adoption();
-    adoption.published_into_flood(EventQueue::Wire)
-        || adoption.unread_at_settled_end(EventQueue::Wire)
-}
-
-/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
-/// state whose lifecycle queue competed with its watch read, or that the
-/// run settled with unread.
 fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
     let adoption = view.adoption();
     adoption.published_into_flood(EventQueue::Lifecycle)

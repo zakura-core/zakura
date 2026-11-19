@@ -1579,7 +1579,7 @@ async fn without_scoring_an_announcer_that_missed_its_block_is_still_preferred()
         !missed.is_preferred_block_source(true),
         "the miss is recorded, for when scoring is switched on"
     );
-    assert!(missed.is_preferred_block_source(peer_set.block_source_score));
+    assert!(missed.is_preferred_block_source(peer_set.block_download_score_and_hedge));
     let (_, choice) = peer_set
         .select_block_advertiser(&HashSet::from([missing.addr, other.addr]))
         .expect("both announcers are idle");
@@ -1642,7 +1642,8 @@ async fn an_announcer_that_does_not_deliver_a_second_request_is_not_preferred_ne
     assert_eq!(near.written_now().await, None);
 }
 
-/// A peer set with block source scores on, which also sends second block requests, built from `peers`.
+/// A peer set built from `peers` with `[network.block_download_score_and_hedge]` enabled, so it
+/// chooses announcers by score and sends second block requests.
 fn peer_set_with_second_requests(
     peers: &mut [&mut TestPeer],
 ) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {

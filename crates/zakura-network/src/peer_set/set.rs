@@ -312,7 +312,7 @@ where
     /// Whether announced blocks are requested from the announcer expected to answer sooner,
     /// rather than the less loaded one, and also from a second announcer expected to deliver
     /// them sooner. See [`crate::config::BlockDownloadScoreAndHedgeConfig`].
-    block_source_score: bool,
+    block_download_score_and_hedge: bool,
 
     /// The network of this peer set.
     network: Network,
@@ -415,7 +415,7 @@ where
 
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
-            block_source_score: config.block_download_score_and_hedge.enabled,
+            block_download_score_and_hedge: config.block_download_score_and_hedge.enabled,
 
             network: config.network.clone(),
         }
@@ -1194,8 +1194,8 @@ where
     /// Chooses one of the ready block `advertisers`, and describes the choice for the trace.
     ///
     /// Among the advertisers that are preferred block sources, it draws two at random and takes
-    /// the less loaded one, or, with `[network.block_download_score_and_hedge]` enabled, the one expected to
-    /// answer sooner. Falls back to load-based P2C over all `advertisers` if none is preferred.
+    /// the less loaded one, or, with `[network.block_download_score_and_hedge]` enabled, the one
+    /// expected to answer sooner. Falls back to load-based P2C over all `advertisers` if none is preferred.
     ///
     /// A ready client only has space in its request channel. If its connection is awaiting a
     /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
@@ -1212,12 +1212,14 @@ where
                     .get(*key)
                     // Passing over a peer that missed an announced block is part of block
                     // source scoring, so with scoring off routing matches the default.
-                    .is_some_and(|svc| svc.is_preferred_block_source(self.block_source_score))
+                    .is_some_and(|svc| {
+                        svc.is_preferred_block_source(self.block_download_score_and_hedge)
+                    })
             })
             .copied()
             .collect();
 
-        let peer = if self.block_source_score {
+        let peer = if self.block_download_score_and_hedge {
             self.select_p2c_peer_by_delivery_score(&preferred_advertisers)
         } else {
             self.select_p2c_peer_from_list(&preferred_advertisers)
@@ -1625,7 +1627,7 @@ where
         attempt: crate::BlockHedge,
     ) -> <Self as tower::Service<Request>>::Future {
         let not_yet = || async { Err(NoFasterBlockSource.into()) }.boxed();
-        if !self.block_source_score {
+        if !self.block_download_score_and_hedge {
             return not_yet();
         }
 

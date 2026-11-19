@@ -2811,7 +2811,7 @@ trace_peer_names = { "not-an-ip" = "us-0" }
 }
 
 #[test]
-fn block_source_score_is_off_by_default_and_rejects_unknown_keys() {
+fn block_download_score_and_hedge_is_off_by_default_and_rejects_unknown_keys() {
     let _init_guard = zakura_test::init();
 
     assert!(!Config::default().block_download_score_and_hedge.enabled);

@@ -290,9 +290,9 @@ impl PeerState {
         now: Instant,
         liveness_timeout: Duration,
     ) -> bool {
-        self.window.note_block_progress(now, liveness_timeout);
         self.window.outstanding.record_body_bytes(key, body_bytes);
         self.window.outstanding.mark_received(key, height);
+        self.window.note_block_progress(now, liveness_timeout);
         self.window
             .outstanding
             .get(key)
@@ -307,11 +307,13 @@ impl PeerState {
         &mut self,
         key: RequestKey,
         height: block::Height,
+        body_bytes: u64,
         now: Instant,
         liveness_timeout: Duration,
     ) -> Option<bool> {
-        self.window.note_block_progress(now, liveness_timeout);
+        self.window.outstanding.record_body_bytes(key, body_bytes);
         self.window.outstanding.mark_received(key, height);
+        self.window.note_block_progress(now, liveness_timeout);
         self.window
             .outstanding
             .get(key)
@@ -446,7 +448,7 @@ impl PeerState {
             .is_some_and(|deadline| deadline <= now)
             || self
                 .window
-                .block_liveness_deadline
+                .block_liveness_deadline()
                 .is_some_and(|deadline| deadline <= now)
     }
 
@@ -539,7 +541,7 @@ impl PeerState {
     pub(in super::super) fn next_wake(&self, shared: SharedDeadlines) -> Option<Instant> {
         [
             self.window.outstanding.earliest_deadline(),
-            self.window.block_liveness_deadline,
+            self.window.block_liveness_deadline(),
             shared.requester_retirement,
             self.retry_avoid_expiry(),
             shared.floor_watchdog_avoid,

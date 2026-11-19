@@ -199,6 +199,7 @@ impl Harness {
             queued_at: now,
             deadline,
             delivery_snapshot: window.delivery_snapshot(now),
+            max_response_bytes: 1,
             delivered_bytes: 0,
             received: ReceivedBlockTracker::default(),
         });
@@ -498,7 +499,7 @@ fn check(model: &Model, harness: &Harness) {
         .outstanding
         .entries()
         .map(|(_, request)| request.deadline)
-        .chain(window.block_liveness_deadline)
+        .chain(window.block_liveness_deadline())
         .min();
     assert_eq!(
         harness.state.next_wake(SharedDeadlines::default()),
@@ -756,8 +757,8 @@ fn the_liveness_deadline_runs_from_the_first_unanswered_request() {
     harness.issue(1, 1, 1, start, far);
     harness.issue(2, 2, 1, later, far);
     assert_eq!(
-        harness.state.window.block_liveness_deadline,
-        Some(start + LIVENESS_TIMEOUT)
+        harness.state.window.block_liveness_deadline(),
+        Some(start + LIVENESS_TIMEOUT + super::super::super::admission::min_rate_transfer_time(2))
     );
 
     let key = harness.keys[&1];
@@ -766,8 +767,8 @@ fn the_liveness_deadline_runs_from_the_first_unanswered_request() {
         .record_body(key, block::Height(1), 1, later, LIVENESS_TIMEOUT));
     harness.finish(key, Disposition::Satisfied);
     assert_eq!(
-        harness.state.window.block_liveness_deadline,
-        Some(later + LIVENESS_TIMEOUT)
+        harness.state.window.block_liveness_deadline(),
+        Some(later + LIVENESS_TIMEOUT + super::super::super::admission::min_rate_transfer_time(1))
     );
 
     let key = harness.keys[&2];
@@ -775,7 +776,7 @@ fn the_liveness_deadline_runs_from_the_first_unanswered_request() {
         .state
         .record_body(key, block::Height(2), 1, later, LIVENESS_TIMEOUT));
     harness.finish(key, Disposition::Satisfied);
-    assert_eq!(harness.state.window.block_liveness_deadline, None);
+    assert_eq!(harness.state.window.block_liveness_deadline(), None);
 }
 
 #[test]
@@ -790,7 +791,7 @@ fn lifecycle_witness_rejects_lost_no_progress_charge() {
 #[should_panic(expected = "outstanding work keeps a liveness deadline")]
 fn lifecycle_witness_rejects_lost_liveness_deadline() {
     run(decode(WITNESS), |harness| {
-        harness.state.window.block_liveness_deadline = None;
+        harness.state.window.liveness_base_deadline = None;
     });
 }
 
@@ -841,7 +842,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     harness.issue(1, 1, 1, start, far);
 
     // Congestion at the deadline earns the episode's one grace.
-    let deadline = start + LIVENESS_TIMEOUT;
+    let deadline = harness.state.window.block_liveness_deadline().unwrap();
     harness.state.note_outbound_capacity(false, deadline);
     assert_eq!(
         harness
@@ -868,7 +869,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
         .state
         .window
         .note_block_progress(extended, LIVENESS_TIMEOUT);
-    let next_deadline = extended + LIVENESS_TIMEOUT;
+    let next_deadline = harness.state.window.block_liveness_deadline().unwrap();
     harness.state.note_outbound_capacity(true, next_deadline);
     harness.state.note_outbound_capacity(false, next_deadline);
     assert_eq!(
@@ -884,7 +885,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     harness.state.window.clear_liveness_if_idle();
     let reissued = next_deadline + Duration::from_millis(1);
     harness.issue(2, 2, 1, reissued, far);
-    let last_deadline = reissued + LIVENESS_TIMEOUT;
+    let last_deadline = harness.state.window.block_liveness_deadline().unwrap();
     harness.state.note_outbound_capacity(true, last_deadline);
     harness.state.note_outbound_capacity(false, last_deadline);
     assert_eq!(

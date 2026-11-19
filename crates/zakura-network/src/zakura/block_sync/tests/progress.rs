@@ -29,18 +29,21 @@ enum MissingBound {
 /// each hold one session, when the honest peer must move `bytes`.
 ///
 /// A session that delivers no body is parked by its liveness deadline: the
-/// allowance plus its outstanding bytes at the minimum rate. An adversary
-/// holds at most every needed body, so its deadline is at most
-/// `liveness(bytes)`. In the worst case the adversaries hold work one after
-/// another. The honest peer then moves every body at the minimum rate within
-/// one more deadline. The figure holds only while no parked adversary
-/// returns, so it must end before the park cooldown does.
+/// allowance, its next owed body at the minimum rate, and at most one
+/// local-write grace of `request_timeout`. An adversary owes at most every
+/// needed body, so its deadline is at most `liveness(bytes)`. In the worst
+/// case the adversaries hold work one after another. The honest peer then
+/// moves every body at the minimum rate within one more deadline. The figure
+/// holds only while no parked adversary returns, so it must end before the
+/// park cooldown does.
 fn progress_deadline(
     config: &ZakuraBlockSyncConfig,
     adversaries: u32,
     bytes: u64,
 ) -> Result<Duration, MissingBound> {
-    let liveness = config.effective_liveness_timeout() + admission::min_rate_transfer_time(bytes);
+    let liveness = config.effective_liveness_timeout()
+        + admission::min_rate_transfer_time(bytes)
+        + config.request_timeout;
     let deadline = liveness * adversaries.saturating_add(1);
     if deadline > config.effective_no_progress_peer_cooldown() {
         return Err(MissingBound::ParkEnds);
@@ -343,13 +346,15 @@ async fn run(roles: &[Role]) -> Run {
 fn the_deadline_follows_the_liveness_rule_and_park_cooldown() {
     let config = ZakuraBlockSyncConfig::default();
     let bytes = 2_000_000;
-    let liveness = config.effective_liveness_timeout() + admission::min_rate_transfer_time(bytes);
+    let liveness = config.effective_liveness_timeout()
+        + admission::min_rate_transfer_time(bytes)
+        + config.request_timeout;
     assert_eq!(progress_deadline(&config, 0, bytes), Ok(liveness));
-    assert_eq!(progress_deadline(&config, 3, bytes), Ok(liveness * 4));
-    // Five adversaries in a row outlast the 180 s park, so the first can
+    assert_eq!(progress_deadline(&config, 2, bytes), Ok(liveness * 3));
+    // Three adversaries in a row outlast the 180 s park, so the first can
     // return before the honest peer's turn.
     assert_eq!(
-        progress_deadline(&config, 5, bytes),
+        progress_deadline(&config, 3, bytes),
         Err(MissingBound::ParkEnds)
     );
 }
@@ -409,7 +414,8 @@ async fn a_proven_liar_at_the_request_cap_is_bounded_and_parked() {
     assert!(
         parked
             <= config.effective_liveness_timeout()
-                + admission::min_rate_transfer_time(u64::from(bytes)),
+                + admission::min_rate_transfer_time(u64::from(bytes))
+                + config.request_timeout,
         "the liar was parked after {parked:?}"
     );
 }

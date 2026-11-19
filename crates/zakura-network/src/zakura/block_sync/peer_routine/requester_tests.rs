@@ -579,7 +579,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         .state
         .window
         .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
-    assert!(routine.state.window.block_liveness_deadline.is_none());
+    assert!(routine.state.window.block_liveness_deadline().is_none());
     routine.state.retry_avoid.clear();
     let deadline = routine
         .io
@@ -971,7 +971,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
             .outstanding
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
-    routine.state.window.block_liveness_deadline = None;
+    routine.state.window.liveness_base_deadline = None;
     time::advance(retirement.saturating_duration_since(time::Instant::now())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {

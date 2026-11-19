@@ -69,7 +69,7 @@ impl PeerState {
                 // extension: a peer that stopped reading holds outbound full past
                 // `request_timeout`, falls through to the park arm, and is parked at the
                 // liveness deadline — it cannot dodge the timer.
-                self.window.extend_liveness_deadline(now, request_timeout);
+                self.window.extend_liveness_deadline(request_timeout);
                 LivenessDecision::Continue
             }
             LivenessOutcome::Park => LivenessDecision::Stall,
@@ -89,7 +89,7 @@ impl PeerState {
         &self,
         failure: OrderedStreamFailure,
     ) -> Option<&'static str> {
-        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
+        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline().is_none() {
             return None;
         }
         Some(match failure {

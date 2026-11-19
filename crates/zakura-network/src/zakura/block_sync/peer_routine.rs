@@ -1191,7 +1191,7 @@ impl PeerRoutine {
                 serialized_bytes,
                 "block-sync body already settled by another peer; marking received"
             );
-            self.accept_already_settled_height(key, outstanding_owner, height);
+            self.accept_already_settled_height(key, outstanding_owner, height, serialized_bytes);
             return;
         };
         let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
@@ -1444,10 +1444,12 @@ impl PeerRoutine {
         key: RequestKey,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
+        serialized_bytes: u64,
     ) {
         let Some(complete) = self.state.record_settled_body(
             key,
             height,
+            serialized_bytes,
             Instant::now(),
             self.config.effective_liveness_timeout(),
         ) else {
@@ -2904,7 +2906,7 @@ mod tests {
             .unwrap()
             .request
             .owner;
-        let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
+        let liveness_deadline = routine.state.window.block_liveness_deadline().unwrap();
         let deadline = routine
             .state
             .window
@@ -3132,7 +3134,7 @@ mod tests {
         );
         match order {
             ReceiptCleanup::BeforeWriter => {
-                let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
+                let liveness_deadline = routine.state.window.block_liveness_deadline().unwrap();
                 // The liveness deadline covers the request's transfer time, so
                 // it never precedes the request's own deadline. Move the request
                 // deadline past it, so only liveness is due.
@@ -3204,7 +3206,7 @@ mod tests {
             assert_eq!(routine.state.window.outstanding.len(), 1);
             assert_eq!(routine.state.window.requests_without_block_progress, 1);
             assert!(registry.peer_has_outstanding_height(&peer, block::Height(3)));
-            let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
+            let liveness_deadline = routine.state.window.block_liveness_deadline().unwrap();
             assert_eq!(
                 routine.state.window.check_liveness(liveness_deadline),
                 super::super::state::LivenessOutcome::Park
@@ -3213,7 +3215,7 @@ mod tests {
         } else {
             assert!(routine.state.window.outstanding.is_empty());
             assert_eq!(routine.state.window.requests_without_block_progress, 0);
-            assert!(routine.state.window.block_liveness_deadline.is_none());
+            assert!(routine.state.window.block_liveness_deadline().is_none());
             routine
                 .handle_deadlines(deadline + liveness_timeout)
                 .unwrap();
@@ -3593,7 +3595,7 @@ mod tests {
                     + Duration::from_millis(1);
                 routine.expire_due_timeouts(after_deadline);
                 assert!(routine.state.window.outstanding.is_empty());
-                assert!(routine.state.window.block_liveness_deadline.is_some());
+                assert!(routine.state.window.block_liveness_deadline().is_some());
             }
         }
         match buffered {

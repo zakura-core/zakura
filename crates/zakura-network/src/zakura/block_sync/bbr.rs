@@ -1097,6 +1097,7 @@ mod bbr_tests {
                 queued_at: now,
                 deadline: now,
                 delivery_snapshot: window.delivery_snapshot(now),
+                max_response_bytes: 1,
                 delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
             });
@@ -1206,6 +1207,7 @@ mod bbr_tests {
                 queued_at: now,
                 deadline: now,
                 delivery_snapshot: window.delivery_snapshot(now),
+                max_response_bytes: 1,
                 delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
             });

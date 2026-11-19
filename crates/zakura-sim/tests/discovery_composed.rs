@@ -180,6 +180,30 @@ fn request_run(row: DiscoveryRow) -> PeerAction {
     act(DiscoveryAct::RequestRun { row })
 }
 
+/// A peer that holds its `Peers` tries an over-owed `Peers` against the
+/// node's default `GetPeers` limit, which already owes the row's largest
+/// payload, so the act fails and the peer skips it. The failed act puts
+/// back the held `Peers` it took, and the peer still sends it when the hold
+/// passes.
+#[test]
+fn a_skipped_act_keeps_the_held_answer() {
+    let over_owed = act(DiscoveryAct::OverOwed {
+        row: DiscoveryRow::Peers,
+    });
+    // Rule-breaking acts allowed; `Peers` held until 500 ms.
+    let report = run_clean(&composed_prefix(0, 0x80, 0b0000_0010, &[over_owed]).unwrap());
+    let skipped = report.log.entries().iter().any(
+        |entry| matches!(&entry.obs, Observation::ActSkipped { act, .. } if act == "over-owed"),
+    );
+    assert!(skipped, "the over-owed act is skipped");
+    let sent = sent(&report);
+    assert!(
+        sent.iter()
+            .any(|(row, label)| row == "peers" && label == "conformant"),
+        "the held Peers still goes out: {sent:?}"
+    );
+}
+
 /// The input of a run the generator found: the prefix [`composed_prefix`]
 /// encodes from bytes `node`, `script` and `holds` and the peer's `steps`,
 /// then the Plan bytes the generator drew, which pick the order the run's

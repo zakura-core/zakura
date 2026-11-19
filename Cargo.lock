@@ -2857,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "17.1.1"
+version = "18.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.3.1"
+version = "6.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "18.2.0"
+version = "19.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "18.0.1"
+version = "19.0.0"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3611,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.4.0"
+version = "2.4.1"
 dependencies = [
  "clap",
  "eyre",

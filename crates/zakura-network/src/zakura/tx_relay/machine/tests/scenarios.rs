@@ -615,7 +615,11 @@ fn sessions_past_the_pending_cap_keep_only_their_share() {
     let silent = bench.connect(fillers + 2, false);
     bench.inv(silent, &pool);
     let state = bench.machine.session(silent).expect("open");
-    assert_eq!(state.waiting.len(), PENDING_SHARE, "its share while it waits");
+    assert_eq!(
+        state.waiting.len(),
+        PENDING_SHARE,
+        "its share while it waits"
+    );
     assert_eq!(state.overflow, dropped);
 }
 

@@ -230,9 +230,11 @@ node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
 Mainnet Linux nodes use the selected deployment ref except for `asia-scored`,
-which stays pinned to the build that supports its experiment config. Operators
-enable scoring and hedging in the other nodes' configs, including the separately
-deployed Mac verifier:
+which stays pinned to the build that supports its experiment config. The default
+deployment template enables scoring and hedging when it renders a Mainnet node
+config. Set `manage_config = true` on a new fleet entry if the deployer will
+install its config and service. For a hand-provisioned node, include the same
+setting in its initial config, as on the Mac verifier:
 
 ```toml
 [network.block_download_score_and_hedge]

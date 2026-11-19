@@ -330,6 +330,18 @@ class MountRenderingTests(NodeBuilder, unittest.TestCase):
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
 
 
+class BlockDownloadConfigTests(NodeBuilder, unittest.TestCase):
+    def test_mainnet_configs_enable_block_download_scoring_and_hedging(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(network="Mainnet")))
+        self.assertIs(config["network"]["block_download_score_and_hedge"]["enabled"], True)
+
+    def test_other_networks_keep_their_binary_default(self):
+        for network in ("Testnet", "Regtest"):
+            with self.subTest(network=network):
+                config = tomllib.loads(deploy.render_node_config(self.node(network=network)))
+                self.assertNotIn("block_download_score_and_hedge", config["network"])
+
+
 class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
     """The [metrics] and [health] sections are opt-in and must round-trip as TOML."""
 

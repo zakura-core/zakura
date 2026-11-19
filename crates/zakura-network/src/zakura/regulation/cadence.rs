@@ -311,6 +311,11 @@ impl Bucket {
         self.tokens = self.tokens.saturating_add(1).min(self.cadence.capacity);
     }
 
+    /// The tokens the bucket holds after its latest refill.
+    pub(crate) fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
     /// Whether the bucket retains no debt after its latest refill.
     pub(crate) fn is_full(&self) -> bool {
         self.tokens >= self.cadence.capacity
@@ -349,6 +354,49 @@ impl Bucket {
         let earned = u32::try_from(earned).unwrap_or(u32::MAX);
         self.tokens = self.tokens.saturating_add(earned);
         self.paused = self.paused.saturating_sub(interval.saturating_mul(earned));
+    }
+}
+
+/// One [`Bucket`] that every session of a connection shares, made full at
+/// its first use. A peer that reopens a session gets no fresh burst.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedBucket {
+    cadence: Cadence,
+    bucket: Arc<std::sync::Mutex<Option<Bucket>>>,
+}
+
+impl SharedBucket {
+    /// A bucket that `cadence` paces, not yet used.
+    pub(crate) fn new(cadence: Cadence) -> Self {
+        Self {
+            cadence,
+            bucket: Arc::default(),
+        }
+    }
+
+    /// Takes one token at `now`, or returns when the next one comes.
+    pub(crate) fn take(&self, now: Instant) -> Result<(), Instant> {
+        let mut bucket = self
+            .bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bucket = bucket.get_or_insert_with(|| Bucket::new(self.cadence, now));
+        bucket.refill(now);
+        if bucket.take() {
+            Ok(())
+        } else {
+            Err(bucket.next_token_at())
+        }
+    }
+
+    /// When the bucket earns its next token, as of its latest refill, or
+    /// `None` before its first use.
+    pub(crate) fn next_token_at(&self) -> Option<Instant> {
+        self.bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Bucket::next_token_at)
     }
 }
 

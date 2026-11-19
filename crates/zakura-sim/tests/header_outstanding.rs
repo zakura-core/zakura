@@ -18,8 +18,15 @@ use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::OUTSTANDING_WORK_BOUNDED,
     harness::{
-        header_node::outstanding::OutstandingEvidence,
-        header_sync::{Storage, StorageScenario},
+        header_node::{
+            outstanding::OutstandingEvidence,
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            Chain, ControlAction, Policy,
+        },
+        header_sync::{
+            storage_witnesses::{mirror, step},
+            Dialer, NodeSettings, PageDelay, Storage, StorageScenario,
+        },
         run_prepared, HarnessError, Subsystem,
     },
     observe::{Entry, ReactorFact, StorageFact, StorageResult},
@@ -119,20 +126,12 @@ fn the_witnesses_hold_under_generated_plans() {
 /// reads fill the 16 permits and the 17th waits. In the serving fixture 11
 /// mirrors sit below the node, so the node serves each of them, and storage
 /// holds every serving read until 8 are submitted, so the reads fill the
-/// node's 8 execution slots and the rest wait. In the peer-execution
-/// fixture one mirror sits below the node and relinks twice. Storage holds
-/// its first session's page read and its second session's lease acquire,
-/// so those two page jobs hold the peer's 2 execution slots, and the third
-/// session's job waits for one ([`the_peer_execution_fixture_waits_at_its_full_slots`]).
-/// In the departed-limit fixture the node admits 4 inbound peers, drops a
-/// peer at its first request timeout and holds its entries for 120 s, and
-/// every mirror's first page on a link arrives past that timeout. So two
-/// waves of 4 mirrors, each linked as the one before is dropped, fill the
-/// departed strikes and cooldowns to their limit, the admitted peer limit's
-/// floor of 8 ([`the_departed_rows_evict_their_earliest_entry_then_fall_and_rise`]).
-/// Each row reaches its limit and no further. The harness's step budget
-/// ends the first three runs before release and reuse, which the committed
-/// witnesses cover at their own scale.
+/// node's 8 execution slots and the rest wait. [`peer_execution`] fills
+/// the peer's 2 execution slots, and [`departed_limit`] fills the departed
+/// strikes and cooldowns to the admitted peer limit's floor of 8. Each row
+/// reaches its limit and no further. The harness's step budget ends the
+/// first three runs before release and reuse, which the committed witnesses
+/// cover at their own scale.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
     for (stem, row, limit, sessions) in [
@@ -148,7 +147,12 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
         (DEPARTED_FIXTURE, "departed strikes", 8, 4),
         (DEPARTED_FIXTURE, "cooldowns", 8, 4),
     ] {
-        let (report, evidence) = run_limit_fixture(stem);
+        let scenario = match stem {
+            EXECUTION_WAIT_FIXTURE => peer_execution(),
+            DEPARTED_FIXTURE => departed_limit(),
+            committed => scenario(committed),
+        };
+        let (report, evidence) = run_limit_fixture(stem, &scenario);
         held(stem, &report);
         let peaks = evidence.peaks();
         assert_eq!(peaks.get(row), Some(&limit), "{stem}: {peaks:?}");
@@ -160,21 +164,98 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
     }
 }
 
-/// The peer-execution limit fixture's stem.
+/// [`peer_execution`]'s name in failures.
 const EXECUTION_WAIT_FIXTURE: &str = "header-outstanding-peer-execution";
 
-/// The departed-limit fixture's stem.
+/// [`departed_limit`]'s name in failures.
 const DEPARTED_FIXTURE: &str = "header-outstanding-departed-limit";
 
-/// Runs the limit fixture `stem` under the empty Plan, which must end
-/// without a violation or harness failure, with its outstanding-work
-/// evidence.
-fn run_limit_fixture(stem: &str) -> (RunReport, OutstandingEvidence) {
-    let scenario = scenario(stem);
-    let prepared = Storage::prepare(&scenario);
+/// The node at A8 serving `mirror-0` at A2, which dials it. Storage holds
+/// the node's first page read and its second lease acquire. The mirror's
+/// link closes once each of those is submitted and relinks after each
+/// close, so the first two sessions' page jobs hold the peer's 2 execution
+/// slots and the third session's job waits for one
+/// ([`the_peer_execution_fixture_waits_at_its_full_slots`]).
+fn peer_execution() -> StorageScenario {
+    let peer = "mirror-0";
+    let held = |kind, nth| Hold {
+        select: Select::nth(kind, nth),
+        until: Trigger::Released,
+        then: vec![Allow::Engine],
+        deadline_ms: Some(1_000),
+    };
+    let submitted = |kind, nth| Some(Trigger::Submitted(Select::nth(kind, nth)));
+    let closed = || Trigger::Closed(peer.to_owned());
+    StorageScenario {
+        node: Chain::main(8),
+        mirrors: vec![mirror(Chain::main(2), Dialer::Mirror)],
+        policy: Policy {
+            holds: vec![held(OpKind::Read, 1), held(OpKind::Acquire, 2)],
+            ..Policy::converging()
+        },
+        controls: vec![
+            step(peer, ControlAction::Close, submitted(OpKind::Read, 1)),
+            step(peer, ControlAction::Relink, Some(closed())),
+            step(peer, ControlAction::Close, submitted(OpKind::Acquire, 2)),
+            step(
+                peer,
+                ControlAction::Relink,
+                Some(Trigger::Count(2, Box::new(closed()))),
+            ),
+        ],
+        ..StorageScenario::default()
+    }
+}
+
+/// The node at A2 with 9 mirrors at A3 to A11 that dial it. The node admits
+/// 4 inbound peers, drops a peer at its first request timeout and holds its
+/// departed strike and cooldown for 120 s. Each mirror's first page on a
+/// link arrives 40 s late, past that timeout, so the node drops every
+/// mirror it admits. Mirrors 0 to 3 fill the inbound slots, and mirror
+/// `i + 4` relinks once the node retires a round from mirror `i`, so two
+/// waves of 4 fill the departed strikes and cooldowns and mirror 8 is a 9th
+/// drop. Mirrors 0 to 2 relink at 180 s, after their entries end, and are
+/// dropped again. The run needs a larger step budget than the default
+/// ([`the_departed_rows_evict_their_earliest_entry_then_fall_and_rise`]).
+fn departed_limit() -> StorageScenario {
+    let name = |index: usize| format!("mirror-{index}");
+    let relink = |index, when| step(&name(index), ControlAction::Relink, Some(when));
+    let mut controls: Vec<_> = (4..9)
+        .map(|index| relink(index, Trigger::Retired(name(index - 4))))
+        .collect();
+    controls.extend((0..3).map(|index| relink(index, Trigger::VirtualTime(180_000))));
+    StorageScenario {
+        node: Chain::main(2),
+        mirrors: (3..12)
+            .map(|main| mirror(Chain::main(main), Dialer::Mirror))
+            .collect(),
+        policy: Policy::converging(),
+        controls,
+        node_settings: NodeSettings {
+            max_inbound_peers: Some(4),
+            max_outbound_peers: Some(0),
+            max_unproductive_header_requests: Some(1),
+            unproductive_peer_cooldown_ms: Some(120_000),
+        },
+        page_delays: (0..9)
+            .map(|index| PageDelay {
+                mirror: name(index),
+                by_ms: 40_000,
+            })
+            .collect(),
+        budget: Some(80_000),
+        ..StorageScenario::default()
+    }
+}
+
+/// Runs the limit fixture `scenario`, named `stem` in failures, under the
+/// empty Plan, which must end without a violation or harness failure, with
+/// its outstanding-work evidence.
+fn run_limit_fixture(stem: &str, scenario: &StorageScenario) -> (RunReport, OutstandingEvidence) {
+    let prepared = Storage::prepare(scenario);
     let evidence = prepared.outstanding.clone();
     let report = run_prepared::<Storage>(
-        &scenario,
+        scenario,
         prepared,
         Plan::from_fuzz(&[]),
         &mut MemorySink::default(),
@@ -245,7 +326,7 @@ fn waited_at_full_execution(
 #[test]
 fn the_peer_execution_fixture_waits_at_its_full_slots() {
     let stem = EXECUTION_WAIT_FIXTURE;
-    let (report, evidence) = run_limit_fixture(stem);
+    let (report, evidence) = run_limit_fixture(stem, &peer_execution());
     let released = first_page_returned_at(report.log.entries())
         .unwrap_or_else(|| panic!("{stem}: a page read returned"));
     let acquisitions = evidence.acquisitions();
@@ -326,8 +407,8 @@ fn sizes_fall_and_rise(sizes: &[usize], limit: usize) -> bool {
 fn the_departed_rows_evict_their_earliest_entry_then_fall_and_rise() {
     let stem = DEPARTED_FIXTURE;
     let limit = 8;
-    let scenario = scenario(stem);
-    let (report, evidence) = run_limit_fixture(stem);
+    let scenario = departed_limit();
+    let (report, evidence) = run_limit_fixture(stem, &scenario);
     let config = scenario.node_settings.config();
     let per_direction = config
         .peer_limits

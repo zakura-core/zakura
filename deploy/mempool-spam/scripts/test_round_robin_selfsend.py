@@ -12,18 +12,25 @@ TXID = "ab" * 32
 
 def fake_rpc(nodes: dict):
     """An `rpc_call` stand-in. `nodes` maps an RPC URL to where it holds TXID:
-    "mempool", "block" (best chain), "side" (only a side-chain block), or
-    "dead" (never answers, so every call waits out its timeout)."""
+    "mempool", "block" (best chain), "side" (only a side-chain block), "dead"
+    (never answers), or "slow" (finds it mined, but each answer takes 0.2 s).
+    A call that would answer after its timeout waits it out and raises."""
+
+    def answer(delay, timeout, value):
+        time.sleep(min(delay, timeout))
+        if delay > timeout:
+            raise TimeoutError("timed out")
+        return value
 
     def call(url, method, params=None, timeout=30, auth=None):
         behaviour = nodes[url]
         if behaviour == "dead":
-            time.sleep(timeout)
-            raise TimeoutError("timed out")
+            return answer(float("inf"), timeout, None)
+        delay = 0.2 if behaviour == "slow" else 0.0
         if method == "getrawmempool":
-            return [TXID] if behaviour == "mempool" else []
-        if behaviour == "block":
-            return {"txid": TXID, "confirmations": 1, "blockhash": "11" * 32}
+            return answer(delay, timeout, [TXID] if behaviour == "mempool" else [])
+        if behaviour in ("block", "slow"):
+            return answer(delay, timeout, {"txid": TXID, "confirmations": 1, "blockhash": "11" * 32})
         if behaviour == "side":
             return {"txid": TXID, "confirmations": 0, "height": -1, "blockhash": "22" * 32}
         raise RuntimeError("No such mempool or main chain transaction")
@@ -63,6 +70,17 @@ class FirstSeenMatrix(unittest.TestCase):
 
         self.assertEqual(set(in_mempool), {"a"})
         self.assertEqual(set(in_block), {"late", "side"})
+
+    def test_an_answer_after_the_window_is_a_miss(self):
+        # The mempool check takes 0.2 s of a 0.3 s window, so the fallback
+        # check gets only what's left and can't count a sighting at 0.4 s.
+        rpc = fake_rpc({"http://slow": "slow"})
+        with mock.patch.object(harness, "rpc_call", rpc):
+            in_mempool, in_block = harness.first_seen_matrix(
+                [node("slow")], TXID, duration=0.3, interval=0.05
+            )
+
+        self.assertEqual((in_mempool, in_block), ({}, {}))
 
 
 class Report(unittest.TestCase):

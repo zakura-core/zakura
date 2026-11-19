@@ -127,20 +127,34 @@ def wait_next_block(
     raise TimeoutError(f"no new block after height {start_height}")
 
 
-def transaction_state(node: dict, txid: str, timeout: float) -> str | None:
+def transaction_state(node: dict, txid: str, deadline: float) -> str | None:
     """Where `node` holds `txid`: "mempool", "block", or None.
 
     "block" covers side-chain blocks too, which come back with a block hash
-    and zero confirmations. None also covers a node that did not answer
-    within `timeout`.
+    and zero confirmations. Each RPC waits at most `POLL_RPC_TIMEOUT` and never
+    past `deadline`, and raises `RunDurationElapsed` rather than start after
+    it. None also covers a node that did not answer in time.
     """
     try:
-        if txid in rpc_call(node["rpc_url"], "getrawmempool", timeout=timeout):
+        if txid in rpc_call(
+            node["rpc_url"],
+            "getrawmempool",
+            timeout=remaining_timeout(deadline, POLL_RPC_TIMEOUT),
+        ):
             return "mempool"
+    except RunDurationElapsed:
+        raise
     except Exception:  # noqa: BLE001
         pass
     try:
-        tx = rpc_call(node["rpc_url"], "getrawtransaction", [txid, 1], timeout=timeout)
+        tx = rpc_call(
+            node["rpc_url"],
+            "getrawtransaction",
+            [txid, 1],
+            timeout=remaining_timeout(deadline, POLL_RPC_TIMEOUT),
+        )
+    except RunDurationElapsed:
+        raise
     except Exception:  # noqa: BLE001
         return None
     if isinstance(tx, dict) and (tx.get("blockhash") or int(tx.get("confirmations") or 0) > 0):
@@ -169,10 +183,10 @@ def first_seen_matrix(
     def poll(node: dict) -> tuple[str, float] | None:
         """Where and when `node` first held `txid`, or None by the deadline."""
         while not STOP:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            try:
+                where = transaction_state(node, txid, deadline)
+            except RunDurationElapsed:
                 return None
-            where = transaction_state(node, txid, timeout=min(POLL_RPC_TIMEOUT, remaining))
             if where:
                 return where, round(time.monotonic() - started, 3)
             time.sleep(min(interval, max(0, deadline - time.monotonic())))

@@ -193,12 +193,23 @@ class MainnetWorkflowMonitoringTests(unittest.TestCase):
         self.assertIn("if: inputs.operation == 'monitoring'", self.job)
         self.assertIn('if [ "${NODE}" != "zakura-compat" ]; then', self.job)
         self.assertIn("^[0-9a-f]{40}$", self.job)
-        self.assertIn(
-            "if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'",
-            self.workflow,
-        )
         for stage in ("install", "validate", "cutover", "soak", "finalize", "rollback"):
             self.assertIn(stage, self.workflow.split("monitoring_stage:", 1)[1].split("\n\n", 1)[0])
+
+    def test_fleet_job_runs_for_dashboard_or_non_mac_deploys(self):
+        fleet_job = self.workflow.split("\n  deploy:\n", 1)[1]
+        self.assertEqual(
+            fleet_job.splitlines()[0].strip(),
+            "if: inputs.operation == 'dashboard' || (inputs.operation == 'deploy' && inputs.node != 'zakura-mac-os')",
+        )
+
+    def test_only_mac_deploy_status_bypasses_fleet_serialization(self):
+        concurrency = self.workflow.split("\nconcurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
+        self.assertIn(
+            "inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status'",
+            concurrency,
+        )
+        self.assertIn("|| 'zakura-mainnet-deploy'", concurrency)
 
     def test_monitoring_never_touches_nodes_dashboard_or_gateway(self):
         for forbidden in ("python3 deploy.py", "deploy/deployer", "cargo", "zakurad", "dashboard", "broadcast",

@@ -370,8 +370,39 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),
         "header-repair-apply-departs" => value(RepairScenario::ApplyDeparts),
         "header-repair-supplier-pruned" => value(RepairScenario::SupplierPruned),
-        _ => None,
+        _ => composed(stem),
     }
+}
+
+/// The intended scenario of a `discovery/composed` seed: the one its steps'
+/// encoding draws.
+fn composed(stem: &str) -> Option<serde_json::Value> {
+    use discovery_service::{composed_prefix, DiscoveryComposed};
+    use zakura_sim::{
+        harness::Subsystem,
+        peer::{
+            discovery::{DiscoveryAct, Request},
+            PeerAction,
+        },
+    };
+    let ask = |request| PeerAction::Ask { request };
+    let undeclared = PeerAction::Discover {
+        act: DiscoveryAct::UndeclaredType { message_type: 0 },
+    };
+    let scenario = match stem {
+        "discovery-composed-two-requests" => {
+            let steps = [ask(Request::GetOnePeer), ask(Request::GetHeaderSyncService)];
+            let prefix = composed_prefix(0, 1, 0b0000_1100, &steps).unwrap();
+            serde_json::to_value(DiscoveryComposed::draw(&prefix))
+        }
+        "discovery-composed-undeclared" => {
+            let prefix =
+                composed_prefix(0, 0x81, 0, &[ask(Request::GetPeers), undeclared]).unwrap();
+            serde_json::to_value(DiscoveryComposed::draw(&prefix))
+        }
+        _ => return None,
+    };
+    Some(scenario.expect("scenarios serialize"))
 }
 
 /// Each committed seed's sidecar records its intended scenario, so a seed

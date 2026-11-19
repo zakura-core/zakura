@@ -207,7 +207,25 @@ pub struct PeerSpec {
     /// ones keep their form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryScript>,
+    /// Whether a discovery act that isn't ready within [`STALE_ACT_WAIT`]
+    /// of becoming the script's next action is offered anyway, and skipped
+    /// once picked if it still isn't ready, as is one whose precondition
+    /// ended after its offer or that its state can't build. A skip logs
+    /// `ActSkipped` on the discovery stream. An act whose frame the models
+    /// label otherwise than the act's own label still sends, with the
+    /// models' labels. The script also ends with its connection, unless a
+    /// `Redial` comes next. Without it, such an act stalls the script or
+    /// fails the run, as does any step after a close but a `Redial`. A
+    /// composed script sets it, since its acts aren't tuned to their
+    /// scenario. Left out of a serialized scenario when false, so saved
+    /// ones keep their form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_stale_acts: bool,
 }
+
+/// How long a discovery act may wait to become ready before a peer with
+/// [`PeerSpec::skip_stale_acts`] offers it anyway.
+pub const STALE_ACT_WAIT: Duration = Duration::from_secs(1);
 
 impl PeerSpec {
     /// The endpoint address, with a distinct port when peers share an IP.
@@ -235,6 +253,7 @@ impl PeerSpec {
             adversary: None,
             invalid_tip: false,
             discovery: None,
+            skip_stale_acts: false,
         }
     }
 
@@ -1400,7 +1419,10 @@ impl PeerTask {
             (Some(script), Some(stream)) => {
                 let secret = SeededInputs::node_key(self.seed, key_index(self.index));
                 match DiscoveryPeer::new(stream, script, secret, peer_addr(self.index, 0)) {
-                    Ok(peer) => Some(peer),
+                    Ok(mut peer) => {
+                        peer.lenient = self.spec.skip_stale_acts;
+                        Some(peer)
+                    }
                     Err(why) => {
                         self.fail(why);
                         return std::future::pending().await;
@@ -1552,7 +1574,14 @@ impl PeerTask {
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
                 return;
             }
-            // Only a redial may follow a closed connection.
+            // Only a redial may follow a closed connection. A script that
+            // skips stale acts ends with its connection instead, since its
+            // steps aren't tuned to the connection's lifetime.
+            if self.spec.skip_stale_acts
+                && !matches!(self.spec.script.get(self.taken), Some(PeerAction::Redial))
+            {
+                return;
+            }
             self.readiness.set(true);
             let next = self.commands.recv().await;
             self.readiness.taken();
@@ -1617,7 +1646,12 @@ impl PeerTask {
                     Ended::Closed
                 }
             };
+            // A script that skips stale acts ends with its connection, as a
+            // dialer's does, so it takes no steps on the node's redials.
             if let Ended::Failed = ended {
+                return;
+            }
+            if self.spec.skip_stale_acts {
                 return;
             }
         }
@@ -1810,17 +1844,39 @@ impl PeerTask {
         // their frames are read as discovery's.
         let mut discovery_ids = BTreeSet::new();
         discovery_ids.extend(discovery.as_ref().map(|stream| stream.id));
+        // The script index whose discovery act waits to become ready, and
+        // when its wait ends ([`PeerSpec::skip_stale_acts`]).
+        let mut stale_wait: Option<(usize, Instant)> = None;
         loop {
             let now = Instant::now();
             let next = self.spec.script.get(self.taken).copied();
             let wake = scripts.wake(next);
             let discovery_ready = match next {
-                Some(PeerAction::Discover { act }) => scripts
-                    .discovery
-                    .as_ref()
-                    .is_some_and(|script| discovery.is_some() && script.ready(act)),
+                Some(PeerAction::Discover { act }) => {
+                    scripts.discovery.as_ref().is_some_and(|script| {
+                        if discovery.is_none() {
+                            return false;
+                        }
+                        if script.ready(act) || !self.spec.skip_stale_acts {
+                            return script.ready(act);
+                        }
+                        let until = match stale_wait {
+                            Some((index, until)) if index == self.taken => until,
+                            _ => {
+                                let until = now + STALE_ACT_WAIT;
+                                stale_wait = Some((self.taken, until));
+                                until
+                            }
+                        };
+                        now >= until
+                    })
+                }
                 _ => true,
             };
+            // The wait still to run out, which the peer's one timer serves.
+            let stale_deadline = stale_wait
+                .filter(|(index, until)| *index == self.taken && *until > now && !discovery_ready)
+                .map(|(_, until)| until);
             let ready = settled
                 && discovery_settled
                 && discovery_ready
@@ -1836,6 +1892,10 @@ impl PeerTask {
                     .map_or(honest.deadline(), |wake| wake.min(honest.deadline()))
             });
             let held = scripts.discovery.as_ref().and_then(DiscoveryPeer::deadline);
+            let held = match (held, stale_deadline) {
+                (Some(held), Some(stale)) => Some(held.min(stale)),
+                (deadline, None) | (None, deadline) => deadline,
+            };
             let deadline = match (honest_deadline, held) {
                 (Some(honest), Some(held)) => Some(honest.min(held)),
                 (deadline, None) | (None, deadline) => deadline,
@@ -2015,9 +2075,23 @@ impl PeerTask {
                                     act.name()
                                 ));
                             };
-                            match script.act(act) {
-                                Ok(acted) => answers = acted,
-                                Err(why) => return self.fail(why),
+                            let stream = discovery
+                                .as_ref()
+                                .expect("the act's script runs on a discovery stream")
+                                .id;
+                            let skip = RecordBody::ActSkipped { act: act.name() };
+                            if self.spec.skip_stale_acts && !script.ready(act) {
+                                self.record(remote, stream, skip);
+                            } else {
+                                match script.act(act) {
+                                    Ok(acted) => answers = acted,
+                                    // An act its state can't build sends
+                                    // nothing, so a composed script skips it.
+                                    Err(_) if self.spec.skip_stale_acts => {
+                                        self.record(remote, stream, skip);
+                                    }
+                                    Err(why) => return self.fail(why),
+                                }
                             }
                         }
                     }

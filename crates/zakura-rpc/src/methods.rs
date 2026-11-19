@@ -63,7 +63,7 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
             parent_nsm_value_balance, FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade,
+        ConsensusBranchId, Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     serialization::{BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -2353,6 +2353,9 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
+            nsm_value_balance: nsm_value_balance_zat
+                .and_then(|balance| balance.constrain().ok())
+                .map(|balance| GetBlockchainInfoBalance::nsm(network, tip_height, balance, None)),
             nsm_value_balance_zat,
             upgrades,
             consensus,
@@ -2657,15 +2660,31 @@ where
                 unreachable!("unmatched response to a BlockInfo request");
             };
 
+            // The parent's balances can be missing if it left the non-finalized state between
+            // the two reads. Then the change is unknown, except before genesis, where it is zero.
             let delta = block_info.as_ref().and_then(|d| {
                 let value_pools = d.value_pools().constrain::<NegativeAllowed>().ok()?;
-                let prev_value_pools = prev_block_info
-                    .map(|d| d.value_pools().constrain::<NegativeAllowed>())
-                    .unwrap_or(Ok(ValueBalance::<NegativeAllowed>::zero()))
-                    .ok()?;
+                let prev_value_pools = match prev_block_info {
+                    Some(prev) => prev.value_pools().constrain::<NegativeAllowed>().ok()?,
+                    None if previous_block_hash == GENESIS_PREVIOUS_BLOCK_HASH => {
+                        ValueBalance::<NegativeAllowed>::zero()
+                    }
+                    None => return None,
+                };
                 (value_pools - prev_value_pools).ok()
             });
             let size = size.or(block_info.as_ref().map(|d| d.size() as usize));
+            let nsm_value_balance = block_info.as_ref().and_then(|d| {
+                let balance = d
+                    .value_pools()
+                    .nsm_value_balance_amount()
+                    .constrain()
+                    .ok()?;
+                let change = delta.map(|delta| delta.nsm_value_balance_amount());
+                Some(GetBlockchainInfoBalance::nsm(
+                    &network, height, balance, change,
+                ))
+            });
 
             Ok(GetBlockResponse::Object(Box::new(BlockObject {
                 hash,
@@ -2684,6 +2703,7 @@ where
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
+                nsm_value_balance,
                 value_pools: block_info
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
                 size: size.map(|size| size as i64),
@@ -4980,6 +5000,16 @@ pub struct GetBlockchainInfoResponse {
     #[getset(get = "pub")]
     value_pools: BlockchainValuePoolBalances,
 
+    /// The NSM value balance after the tip, in the same shape as a `valuePools` entry. Absent
+    /// when `nsm_value_balance_zat` is.
+    #[serde(
+        rename = "nsmValueBalance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get = "pub")]
+    nsm_value_balance: Option<GetBlockchainInfoBalance>,
+
     /// The ZIP 234 NSM value balance, in zatoshis.
     ///
     /// This is an accounting counter rather than a pool of spendable value: it tracks
@@ -5168,6 +5198,7 @@ impl Default for GetBlockchainInfoResponse {
             estimated_height: Height(1),
             chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
             value_pools: GetBlockchainInfoBalance::zero_pools(),
+            nsm_value_balance: None,
             nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
@@ -5219,6 +5250,7 @@ impl GetBlockchainInfoResponse {
             value_pools,
             // Left unset so this constructor's signature stays stable; callers that
             // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
+            nsm_value_balance: None,
             nsm_value_balance_zat: None,
             upgrades,
             consensus,
@@ -5555,6 +5587,7 @@ impl Default for GetBlockResponse {
             difficulty: None,
             chain_supply: None,
             value_pools: None,
+            nsm_value_balance: None,
             previous_block_hash: None,
             next_block_hash: None,
             solution: None,
@@ -5680,6 +5713,16 @@ pub struct BlockObject {
     )]
     #[getset(get = "pub")]
     value_pools: Option<BlockchainValuePoolBalances>,
+
+    /// The NSM value balance after this block and the block's change to it, in the same shape
+    /// as a `valuePools` entry.
+    #[serde(
+        rename = "nsmValueBalance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get = "pub")]
+    nsm_value_balance: Option<GetBlockchainInfoBalance>,
 
     /// Information about the note commitment trees.
     #[getset(get_copy = "pub")]

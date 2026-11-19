@@ -24,4 +24,17 @@ fn named_active_properties_become_known() {
     );
     std::env::remove_var(KNOWN_VAR);
     assert_eq!(entry.status(isolated), Some(Status::Active));
+
+    // A machine harness builds its own properties, and takes the override
+    // too.
+    let machine = harness::find("handshake/counts").unwrap();
+    let id = (machine.properties)()
+        .into_iter()
+        .find(|property| property.status == Status::Active)
+        .expect("the machine has an Active property")
+        .id;
+    std::env::set_var(KNOWN_VAR, format!("{id}=7"));
+    assert_eq!(machine.status(&id), Some(Status::Known { issue: 7 }));
+    std::env::remove_var(KNOWN_VAR);
+    assert_eq!(machine.status(&id), Some(Status::Active));
 }

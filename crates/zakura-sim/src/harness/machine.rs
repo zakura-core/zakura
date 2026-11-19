@@ -146,6 +146,7 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     } else {
         machine.rules
     };
+    let known = super::treated_as_known();
     rules
         .iter()
         .map(|&(id, claim, status)| Property {
@@ -154,7 +155,7 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
-            status,
+            status: super::known_status(&known, id, status),
             check,
             witness: None,
         })

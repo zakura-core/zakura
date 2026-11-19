@@ -9,10 +9,11 @@ use crate::constants::{MAX_PING_PADDING, REQUEST_TIMEOUT};
 /// Settings for warming the send direction of new legacy TCP connections.
 ///
 /// A new TCP connection starts with a small congestion window, so the first full block it
-/// carries takes several extra round trips. When enabled, each new connection sends a short
-/// series of `ping` messages padded with zero bytes. Each ping is sent once the peer's `pong`
-/// for the previous one arrives, and each is twice the size of the previous one, so the window
-/// reaches block size within seconds of the handshake.
+/// carries takes several extra round trips. When enabled, each new connection sends two `ping`
+/// messages padded with zero bytes, the second once the peer's `pong` for the first arrives.
+/// In slow start the window grows by the bytes the peer acknowledges, so the defaults, 2.4 MB
+/// in total, grow it past a full 2 MB block within seconds of the handshake. A ping can carry
+/// at most about 2 MiB, so a warm-up larger than that needs two.
 ///
 /// The warmth lasts only while the kernel keeps the window across idle periods, which needs
 /// `net.ipv4.tcp_slow_start_after_idle = 0`.
@@ -24,13 +25,11 @@ pub struct TcpWarmupConfig {
 
     /// The padding bytes in the first padded ping.
     ///
-    /// The default fits the first ping, with its header and nonce, in a new connection's
-    /// initial window of 10 segments (about 14,000 bytes). Each padded ping then fits the
-    /// window that the previous one doubled, so each takes one round trip. A larger first ping
-    /// spills past the window, and every step takes two round trips.
+    /// A peer too slow to answer it within [`Self::chunk_timeout`] is not sent the second.
     pub first_chunk_bytes: u32,
 
-    /// The padding bytes in the last padded ping. Doubling stops at this size.
+    /// The padding bytes in the second and last padded ping. If it equals
+    /// [`Self::first_chunk_bytes`], the warm-up sends only one padded ping.
     ///
     /// The largest allowed value is the protocol message limit minus the 8-byte nonce.
     pub max_chunk_bytes: u32,
@@ -53,8 +52,9 @@ pub struct TcpWarmupConfig {
     /// closes the connection.
     ///
     /// It must be less than half of [`REQUEST_TIMEOUT`], the time a connection allows for each
-    /// write. Each ping is twice the size of the last one, so a peer whose link stays as fast
-    /// as its last answer showed takes at most about twice this time to accept the next one.
+    /// write. With the defaults the second ping is twice the size of the first, so a peer whose
+    /// link stays as fast as its first answer showed takes at most about twice this time to
+    /// accept the second.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub chunk_timeout: Duration,
 }
@@ -63,8 +63,8 @@ impl Default for TcpWarmupConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            first_chunk_bytes: 14_000,
-            max_chunk_bytes: MAX_PING_PADDING,
+            first_chunk_bytes: 800_000,
+            max_chunk_bytes: 1_600_000,
             max_concurrent: 16,
             peer_cooldown: Duration::from_secs(24 * 60 * 60),
             tip_quiet: Duration::from_secs(2),
@@ -107,16 +107,13 @@ impl TcpWarmupConfig {
     /// Returns the padding of each ping in a warm-up, in sending order.
     ///
     /// The first ping has no padding. Its `pong` shows that the peer has finished the
-    /// handshake and accepts full-size messages. The padded pings then double from
-    /// `first_chunk_bytes` and end with one ping of `max_chunk_bytes`.
+    /// handshake and accepts full-size messages. Then come a ping of `first_chunk_bytes` and,
+    /// if it is larger, a ping of `max_chunk_bytes`.
     pub fn schedule(&self) -> Vec<u32> {
-        let mut schedule = vec![0];
-        let mut padding = self.first_chunk_bytes;
-        while padding < self.max_chunk_bytes {
-            schedule.push(padding);
-            padding = padding.saturating_mul(2);
+        let mut schedule = vec![0, self.first_chunk_bytes];
+        if self.max_chunk_bytes > self.first_chunk_bytes {
+            schedule.push(self.max_chunk_bytes);
         }
-        schedule.push(self.max_chunk_bytes);
         schedule
     }
 }

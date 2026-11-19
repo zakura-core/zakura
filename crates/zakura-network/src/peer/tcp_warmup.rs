@@ -3,8 +3,9 @@
 //! A new TCP connection starts in slow start, so the first full block it carries waits several
 //! extra round trips for the congestion window to grow. Each warm-up sends the pings that
 //! [`TcpWarmupConfig::schedule`] lists, one at a time, and sends the next only once the peer's
-//! `pong` for the previous one arrives. Each padded ping fills the current window, so each one
-//! about doubles it. Peers ignore a ping body's trailing bytes, so receivers need no change.
+//! `pong` for the previous one arrives. In slow start the window grows by the bytes the peer
+//! acknowledges, so it ends about as large as the total padding. Peers ignore a ping body's
+//! trailing bytes, so receivers need no change.
 //!
 //! [`TcpWarmup`] limits warm-ups across the node: one per peer IP per
 //! [`TcpWarmupConfig::peer_cooldown`], at most [`TcpWarmupConfig::max_concurrent`] at a time,
@@ -120,11 +121,10 @@ impl TcpWarmup {
     ///
     /// Returns when the warm-up completes or stops. It stops if a `pong` takes longer than the
     /// chunk timeout, or if the connection closes, and it never closes the connection itself.
-    /// The chunk timeout is less than half the connection's send timeout, and each ping is at
-    /// most twice the size of the last one that the peer answered in time. A peer whose link
-    /// stays as fast as its last `pong` showed therefore accepts the next ping within the send
-    /// timeout. A write that stalls past the send timeout still fails the connection, as any
-    /// write does.
+    /// The chunk timeout is less than half the connection's send timeout, and with the default
+    /// sizes the second padded ping is twice the first. A peer whose link stays as fast as its
+    /// first `pong` showed therefore accepts the second ping within the send timeout. A write
+    /// that stalls past the send timeout still fails the connection, as any write does.
     pub(crate) async fn run(self, peer_ip: IpAddr, link: mpsc::Sender<WarmupChunk>) {
         let Some(mut claim) = self.claim(peer_ip) else {
             metrics::counter!("peer.tcp_warmup.skipped", "reason" => "cooldown").increment(1);

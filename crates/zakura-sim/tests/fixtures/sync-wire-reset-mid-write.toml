@@ -4,7 +4,7 @@
 # block request mid-write, the schedule of zakura#2378.
 harness = "sync/wire"
 generator = 5
-sha256 = "5f0b60f285a443423335be75c95239db5b79689b48a0cdc1eb6e8b31cbfc88d4"
+sha256 = "548decf0d54c682e4df2b0c15130a3e81660ee92c3bf845ef15112b6be6ec8f7"
 scenario_sha256 = "784be2ca7bbb2e844ea0896ccb491a7f08219c9bc7b14792e190661e6ccc3164"
 source = "crates/zakura-sim/tests/sync_wire.rs"
 

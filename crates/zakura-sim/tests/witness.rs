@@ -12,15 +12,19 @@ use zakura_sim::{
         HasView, Kind, Pending, Property, PropertyId, Source, Sources, Status, TriggerHistory,
         Verdict,
     },
+    seed,
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig,
     Sim,
 };
 
-/// The committed input that holds discovery's source back at its
-/// `notified` until the sink has run all three marks (`tests/discovery.rs`
-/// builds it).
-const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
+/// The `discovery-wait-complete` seed's input, which holds discovery's
+/// source back at its `notified` until the sink has run all three marks.
+fn input() -> Vec<u8> {
+    seed::find("discovery-wait-complete")
+        .expect("the seed is registered")
+        .input
+}
 
 /// S4.7's scenario under `input`.
 fn lost_wakeup(input: PlanInput) -> WitnessScenario<WaitComplete> {
@@ -38,25 +42,25 @@ fn lost_wakeup(input: PlanInput) -> WitnessScenario<WaitComplete> {
 #[test]
 fn discovery_wait_complete_lost_wakeup() {
     check_witness(
-        lost_wakeup(Plan::from_fuzz(INPUT)),
+        lost_wakeup(Plan::from_fuzz(&input())),
         WAIT_COMPLETE_WAKES,
         Expect::Holds,
     );
 }
 
-/// The byte of [`INPUT`] that picks the sink's first step of the final
+/// The byte of [`input`] that picks the sink's first step of the final
 /// mark. Each later byte picks between the sink and the source, and 1 picks
 /// the source.
 const FINAL_MARK_STARTS: usize = 147;
 
-/// S4.7's sink side: [`INPUT`] up to the sink's first step of the final
+/// S4.7's sink side: [`input`] up to the sink's first step of the final
 /// mark, then four picks of the source. The source's check lands while the
 /// final mark is half done. The sink records before it notifies, so the
 /// check passes. A sink that notifies first strands the source: its check
 /// fails, and its next `Notified` comes after the last notify.
 #[test]
 fn discovery_wait_complete_check_inside_final_mark() {
-    let mut input = INPUT[..=FINAL_MARK_STARTS].to_vec();
+    let mut input = input()[..=FINAL_MARK_STARTS].to_vec();
     input.extend([1; 4]);
     check_witness(
         lost_wakeup(Plan::from_fuzz(&input)),
@@ -70,7 +74,7 @@ fn discovery_wait_complete_check_inside_final_mark() {
 fn violated_witness_fails_while_fixed() {
     assert_eq!(
         witness(
-            lost_wakeup(Plan::from_fuzz(INPUT)),
+            lost_wakeup(Plan::from_fuzz(&input())),
             WAIT_COMPLETE_WAKES,
             Expect::Violated
         ),
@@ -117,7 +121,7 @@ fn harness_end_fails() {
 fn unregistered_property_fails() {
     assert_eq!(
         witness(
-            lost_wakeup(Plan::from_fuzz(INPUT)),
+            lost_wakeup(Plan::from_fuzz(&input())),
             "discovery/no-such-property",
             Expect::Holds
         ),
@@ -410,7 +414,7 @@ fn recorded_witness_judges_its_own_trace() {
 
     let (trace, result) = harness::record_witness(
         entry,
-        harness::RecordInput::Input(INPUT),
+        harness::RecordInput::Input(&input()),
         &dir.path().join("holds"),
         WAIT_COMPLETE_WAKES,
         Expect::Holds,
@@ -422,7 +426,7 @@ fn recorded_witness_judges_its_own_trace() {
 
     let (trace, result) = harness::record_witness(
         entry,
-        harness::RecordInput::Input(INPUT),
+        harness::RecordInput::Input(&input()),
         &dir.path().join("violated"),
         WAIT_COMPLETE_WAKES,
         Expect::Violated,
@@ -439,7 +443,7 @@ fn recorded_witness_judges_its_own_trace() {
 
     let error = harness::record_witness(
         entry,
-        harness::RecordInput::Input(INPUT),
+        harness::RecordInput::Input(&input()),
         &dir.path().join("unregistered"),
         "discovery/no-such-property",
         Expect::Holds,

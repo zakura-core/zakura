@@ -422,8 +422,7 @@ fn versions_print_key_value_lines() {
 }
 
 /// `seeds --sim` writes each admitted seed's full fuzz input to `--out`,
-/// named by its SHA-256, and a JSON report that gives paths in the
-/// repository relative to its root.
+/// named by its SHA-256, and a JSON report with one row per seed.
 #[test]
 fn seeds_fill_a_corpus() {
     let dir = TempDir::new().unwrap();
@@ -439,10 +438,9 @@ fn seeds_fill_a_corpus() {
         report.to_str().unwrap(),
     ]);
     assert!(output.status.success(), "{output:?}");
-    let input = std::fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-wait-complete.bin"),
-    )
-    .unwrap();
+    let input = zakura_sim::seed::find("discovery-wait-complete")
+        .expect("the seed is registered")
+        .input;
     let digest: String = Sha256::digest(&input)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -451,17 +449,15 @@ fn seeds_fill_a_corpus() {
     assert_eq!(corpus.len(), 1);
     assert_eq!(std::fs::read(out.join(&digest)).unwrap(), input);
     let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(report["set"], "corpus");
     assert_eq!(report["seeds"][0]["status"], "admitted");
+    assert_eq!(report["seeds"][0]["name"], "discovery-wait-complete");
+    assert_eq!(report["seeds"][0]["harness"], "discovery/wait-complete");
     assert_eq!(
-        report["seeds"][0]["file"],
-        "crates/zakura-sim/tests/fixtures/discovery-wait-complete.bin"
+        report["seeds"][0]["source"],
+        "crates/zakura-sim/tests/witness.rs"
     );
-    assert_eq!(report["fixtures"][0], "crates/zakura-sim/tests/fixtures");
     assert_eq!(report["seeds"][0]["input_sha256"], digest);
-    assert_eq!(
-        report["seeds"][0]["sidecar"]["harness"],
-        "discovery/wait-complete"
-    );
     assert!(report["other_harnesses"].as_u64().unwrap() > 0);
 }
 

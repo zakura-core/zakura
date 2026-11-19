@@ -11,14 +11,11 @@ use serde_json::Value;
 use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{discovery::WaitComplete, run_harness},
+    seed,
     trace::end_records::END_RECORDS_VAR,
     witness::{witness, Expect, WitnessScenario},
     MemorySink, Plan,
 };
-
-/// The committed input that reaches discovery's lost-wakeup race
-/// (`tests/witness.rs` runs it).
-const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
 
 /// Each record file in `dir`, parsed, in the order the process wrote them.
 fn records(dir: &Path) -> Vec<Value> {
@@ -36,10 +33,15 @@ fn records(dir: &Path) -> Vec<Value> {
 fn the_hook_writes_one_record_per_run_and_nothing_when_unset() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("records");
+    // The seed reaches discovery's lost-wakeup race (`tests/witness.rs`
+    // runs it).
+    let input = seed::find("discovery-wait-complete")
+        .expect("the seed is registered")
+        .input;
     let run = || {
         run_harness::<WaitComplete>(
             &Default::default(),
-            Plan::from_fuzz(INPUT),
+            Plan::from_fuzz(&input),
             &mut MemorySink::default(),
             None,
         )

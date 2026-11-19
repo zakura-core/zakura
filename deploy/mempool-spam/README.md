@@ -2,7 +2,8 @@
 
 This harness submits zecd self-sends through alternating Zakura and Zebra
 upstreams, measures propagation across the selected environment, waits for
-mining, and writes machine- and human-readable reports.
+mining, and writes machine- and human-readable reports. The testnet set has
+only Zakura nodes since the Zebra testnet hosts were retired.
 
 It uses a spend-capable wallet already installed on the controller. Wallet
 material is not stored in this directory and must never be copied into CI
@@ -58,8 +59,11 @@ The driver:
 
 1. Restarts one zecd process against each submit node in round-robin order.
 2. Self-sends using normal zecd coin selection (Ironwood and Orchard allowed).
-3. Counts a transaction as seen when it is in a node's mempool or that node
-   reports it through `getrawtransaction`.
+3. Polls every node in parallel and records when each first holds the
+   transaction in its mempool. A node that first finds it already mined counts
+   as seen, but the report lists it under "First seen in a block" and leaves it
+   out of the spread, since that time says when the block came, not how gossip
+   did.
 4. After submission ends, drains for up to 10 minutes and records mining.
 5. Restores zecd to the controller's loopback Zakura RPC.
 

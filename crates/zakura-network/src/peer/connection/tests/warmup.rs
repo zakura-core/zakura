@@ -57,6 +57,7 @@ async fn warmup_pong_is_delivered_while_a_heartbeat_is_pending() {
     let (heartbeat_tx, heartbeat_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
+            advertised_block: None,
             request: Request::Ping(heartbeat_nonce),
             tx: heartbeat_tx,
             inv_collector: None,
@@ -115,7 +116,11 @@ async fn block_advert_is_written_before_a_queued_warmup_ping() {
     let hash = block::Hash([7; 32]);
     let (result, _delivery) = tokio::sync::oneshot::channel();
     advert_tx
-        .try_send(crate::peer::block_gossip::BlockAdvert { hash, result })
+        .try_send(crate::peer::block_gossip::BlockAdvert {
+            hash,
+            push: false,
+            result,
+        })
         .unwrap();
 
     let connection = tokio::spawn(connection.run(peer_rx));
@@ -150,6 +155,7 @@ async fn warmup_pong_is_delivered_while_a_block_request_is_pending() {
     let (block_tx, mut block_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
+            advertised_block: None,
             request: Request::BlocksByHash(IndexSet::from([hash])),
             tx: block_tx,
             inv_collector: None,

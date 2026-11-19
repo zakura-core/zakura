@@ -1,0 +1,28 @@
+--- a/crates/zakura-quic/src/tls/verifier.rs
++++ b/crates/zakura-quic/src/tls/verifier.rs
+@@ -59,12 +59,6 @@
+ 
+         // Comparing whole SPKI encodings checks both the constant Ed25519
+         // prefix and the key bytes.
+-        let expected = super::ed25519_spki(&self.expected);
+-        if expected.as_ref() != end_entity.as_ref() {
+-            return Err(rustls::Error::InvalidCertificate(
+-                CertificateError::UnknownIssuer,
+-            ));
+-        }
+ 
+         Ok(ServerCertVerified::assertion())
+     }
+--- a/crates/zakura-quic/src/endpoint.rs
++++ b/crates/zakura-quic/src/endpoint.rs
+@@ -753,10 +753,6 @@
+         });
+     };
+     // The verifier already enforced TLS-7; this guards against a verifier bug.
+-    if handshake.remote_id != Some(expected) {
+-        close(b"identity");
+-        return Err(ConnectError::WrongIdentity);
+-    }
+     let Some(alpn) = handshake.alpn else {
+         close(b"alpn");
+         return Err(ConnectError::AlpnMismatch);

@@ -99,12 +99,18 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `setup` — optionally put the selected node on `legacy` (legacy P2P and the
+  classic pool) or `v2` (dual P2P, the pool core and tx-relay), for comparing
+  pools on real peers. The default `auto` keeps the fleet's setup, and
+  deploying a node with `auto` again restores it. It can't be combined with
+  `p2p_stack`.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
-Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
-explicit `node`, preventing canary settings from being applied fleet-wide.
+Explicit `p2p_stack` or `setup` overrides and `header_sync_trace = true`
+require an explicit `node`, preventing canary settings from being applied
+fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
@@ -205,6 +211,8 @@ and deploys it to:
 - `asia-pacific-0` — `root@168.144.173.250`
 - `zakura-compat` — `root@159.203.113.196`
 - `archive-vct-off` — `root@104.131.174.28`
+- `asia-hedged` — `root@68.183.178.89`
+- `asia-scored` — `root@206.189.45.15`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
@@ -220,6 +228,13 @@ coordinator logged `accepted block apply lost terminal observation; apply
 lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
+
+`asia-hedged` and `asia-scored` are legacy-only nodes in Singapore that each
+measure one experimental setting from an open PR: `[network.block_hedge]` from
+PR 2548 and `[network.block_source_score]` from PR 2558. Their configs enable those
+settings, so each entry is pinned to the build the node runs instead of the
+deployed ref: a build from `main` would refuse the config. Unpin an entry when
+its PR merges, or remove it when the experiment ends.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated

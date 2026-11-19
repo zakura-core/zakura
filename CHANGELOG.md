@@ -11,6 +11,135 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.9] - 2026-11-16
+
+### Added
+
+- `network.unconditional_peers` now also takes a DNS name with a port, such as
+  `"peer.example.com:8233"`. Zakura looks the name up before each dial, and
+  never while that peer is connected, so it follows a peer that comes back at a
+  new address without a config change or a restart. It dials one address from
+  the answer at a time, starting with the first it can dial and moving to the
+  next on each later attempt, so each peer needs a name of its own. The address
+  it dialed last is treated like a listed address. When a lookup fails, Zakura
+  dials the last address again. A name without a port fails config load
+  ([#2478](https://github.com/zakura-core/zakura/pull/2478)).
+- A listener now keeps the inbound seat of a peer that was connected for 2
+  hours reserved for that peer's IP for 3 minutes after the connection
+  closes, so a node that restarts can reconnect to a full listener. At most a
+  tenth of the inbound limit is held at once. The new counters
+  `peer.inbound.held_seats.held`, `peer.inbound.held_seats.taken_back` and
+  `peer.inbound.held_seats.refused` count the holds
+  ([#2493](https://github.com/zakura-core/zakura/pull/2493)).
+- A node now dials a peer before other candidates for 5 minutes after an
+  outbound connection to it that was open for 10 minutes ends, so a node that
+  restarts gets back the peers that had dialed it. Each redial still waits the
+  119 s reconnection delay. The new counters
+  `address_book.redial.started.total` and
+  `address_book.redial.reconnected.total` count these peers
+  ([#2497](https://github.com/zakura-core/zakura/pull/2497)).
+- A DNS name in `network.unconditional_peers` can be pinned to the peer's node
+  ID, such as `"<node id>@peer.example.com:8233"`. The name's address is then
+  only exempt from scoring and bans while a P2P v2 connection proves that node
+  ID, so a changed DNS answer, or someone else at the peer's old address, gets
+  no exemption. A connection to the name that stays on the legacy protocol
+  can't prove the node ID, so Zakura closes it. A pin needs
+  `network.p2p_stack = "dual"`, and config load fails
+  without it. A node that runs both stacks warns about each unpinned name
+  ([#2505](https://github.com/zakura-core/zakura/pull/2505)).
+
+### Changed
+
+- Reduced state-service overhead when processing new blocks by comparing the
+  verified best chain by block hash instead of copying every retained header
+  reference
+  ([#1444](https://github.com/zakura-core/zakura/pull/1444)).
+- Blocks and transactions from peers and RPC requests that are larger than the
+  2,000,000-byte block size limit are now rejected before they are parsed,
+  including legacy `block` and `tx` messages whose bodies exceed the limit
+  ([#1491](https://github.com/zakura-core/zakura/pull/1491)).
+- `zakura-chain`: the block and transaction parsers no longer enforce the block
+  size limit. Decode untrusted input with the new `Block::zcash_deserialize_bounded`
+  and `Transaction::zcash_deserialize_bounded`. `ZcashReader::with_limit` is
+  removed ([#1491](https://github.com/zakura-core/zakura/pull/1491)).
+- Builds without the `sprout` feature no longer build the Sprout note
+  commitment tree. The first block whose Sprout commitments they skip marks
+  the database, and a build with `sprout` refuses to open a marked database
+  until its tip is past NU7 and the last checkpoint. The state database
+  format moves to 31.0.0; existing databases are reused in place, and older
+  releases cannot open them
+  ([#2204](https://github.com/zakura-core/zakura/pull/2204)).
+- `getblocktemplate` builds a template for a miner paid to a transparent
+  address without handing the build to another thread, which removes a wait
+  that was longer than the build itself when a new block arrives. Templates
+  that need a proof for a shielded miner reward are built as before, and
+  templates are still built one at a time
+  ([#2342](https://github.com/zakura-core/zakura/pull/2342)).
+- Reduced CPU use at the chain tip by no longer re-checking the keys of
+  already authenticated peers on every peer-discovery message
+  ([#2407](https://github.com/zakura-core/zakura/pull/2407)).
+- Reduced CPU use under transaction load by no longer copying the chain tip
+  block's transaction list on every chain tip read
+  ([#2419](https://github.com/zakura-core/zakura/pull/2419)).
+- Reduced the CPU a node at the chain tip spends on each new block by no longer
+  visiting every block and every index partition when it copies its in-memory
+  chains ([#2433](https://github.com/zakura-core/zakura/pull/2433)).
+- Peer misbehavior reports on the legacy P2P stack are no longer batched or
+  dropped. Scores add up per IP address across ports, and a peer is banned as
+  soon as its score reaches the threshold, instead of up to five seconds
+  later. Previously, reports that arrived while the address book was busy
+  could be lost, so some misbehaving peers were never banned. The new
+  `address_book.misbehavior.banned.total` metric counts bans
+  ([#2444](https://github.com/zakura-core/zakura/pull/2444)).
+- `zakura-network`: misbehavior reporting moves to a new `MisbehaviorReporter`.
+  `zakura_network::init` and `init_with_zakura` return it instead of an
+  `mpsc::Sender<(PeerSocketAddr, u32)>`, and the handshake builder takes it
+  with `with_misbehavior` instead of `with_bans`. `MetaAddr::misbehavior`,
+  `MetaAddr::new_misbehavior`, `MetaAddrChange::UpdateMisbehavior` and
+  `MetaAddrChange::misbehavior_score` are gone
+  ([#2444](https://github.com/zakura-core/zakura/pull/2444)).
+
+<!-- release-readiness: allow-patch; reason: The release owner approved v1.8.9 as a patch. Node operators get backwards-compatible additions and behavior changes, and library crates keep independent SemVer bumps for their API changes. -->
+- `zcash.net.peers.cache` no longer has a `remote_ip` label: each peer cache
+  write adds the number of cached peers to one series per cache file. The
+  per-address series grew with uptime and were never removed, so long-running
+  nodes served a much larger metrics page. Update dashboards and alerts that
+  select or group this metric by `remote_ip`
+  ([#2477](https://github.com/zakura-core/zakura/pull/2477)).
+- `zakura-rpc`: the indexer client's `BlockAndHash::decode` and
+  `BlockAndHeight::decode` now reject blocks larger than the 2,000,000-byte
+  block size limit before parsing them
+  ([#2489](https://github.com/zakura-core/zakura/pull/2489)).
+- Reduced CPU use during block sync by no longer re-checking the keys of
+  already authenticated peers each time block-sync candidates are published
+  ([#2490](https://github.com/zakura-core/zakura/pull/2490)).
+- A long-polling `getblocktemplate` request now checks the mempool every
+  2 seconds instead of every 5, so new transactions reach miners' templates
+  sooner ([#2526](https://github.com/zakura-core/zakura/pull/2526)).
+
+### Fixed
+
+- The inbound service now answers an empty `getheaders` request with an empty
+  `headers` message instead of no reply, so a zcashd-compat sidecar peer no
+  longer times out and churns through reconnects at tip-parity
+  ([#1180](https://github.com/zakura-core/zakura/pull/1180)).
+- Fixed `getblockheader` and `getblock` (verbosity 1 and 2), so that they do
+  not report a failure of the state service as a missing block. They now
+  return -1 with the original error message. A block that is not in the best
+  chain still gives -5 for a hash and -8 for a height
+  ([#2482](https://github.com/zakura-core/zakura/pull/2482)).
+- Extended the bundled Testnet checkpoints past NU7 activation to height
+  4,618,666, so default builds without the `sprout` feature can sync Testnet
+  from genesis again ([#2494](https://github.com/zakura-core/zakura/pull/2494)).
+
+### Security
+
+- The Prometheus metrics endpoint now serves at most 16 connections at once,
+  closes connections that send no request headers within 30 seconds or stay
+  open longer than 120 seconds, and waits before retrying failed accepts, so
+  idle clients can no longer exhaust the node's file descriptors
+  ([#1615](https://github.com/zakura-core/zakura/pull/1615)).
+
 ## [1.8.8] - 2026-11-14
 
 ### Added

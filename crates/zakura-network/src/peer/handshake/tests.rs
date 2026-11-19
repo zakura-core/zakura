@@ -920,6 +920,40 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
+
+    // Another service bit neither starts nor blocks the upgrade.
+    assert!(!should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH),
+    ));
+    assert!(should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(
+            PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2 | PeerServices::NODE_BLOCK_PUSH
+        ),
+    ));
+}
+
+/// The handshake advertises `NODE_BLOCK_PUSH` on every P2P stack, and sets `NODE_P2P_V2` only
+/// from the stack.
+#[test]
+fn block_push_service_bit_is_independent_of_the_p2p_stack() {
+    let _init_guard = zakura_test::init();
+
+    for stack in [P2pStack::Legacy, P2pStack::Zakura, P2pStack::Dual] {
+        let config = test_config(stack);
+        let services =
+            config.handshake_services(PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH);
+        assert!(
+            services.contains(PeerServices::NODE_BLOCK_PUSH),
+            "{stack:?}"
+        );
+        assert_eq!(
+            services.contains(PeerServices::NODE_P2P_V2),
+            config.v2_p2p(),
+            "{stack:?}"
+        );
+    }
 }
 
 /// A configured inbound peer is recognized as protected, including when it
@@ -1002,6 +1036,51 @@ async fn remote_p2p_v2_with_local_disabled_continues_legacy() {
 
     drop(local_client);
     drop(remote_client);
+}
+
+/// Each connection a handshaker makes gets its own trace number, the one its gossip trace
+/// rows carry, and the client keeps it for the peer set's request rows.
+#[tokio::test]
+async fn each_connection_keeps_its_gossip_trace_number() {
+    let _init_guard = zakura_test::init();
+
+    let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let local_handshake = test_handshake(
+        test_config(P2pStack::Legacy),
+        address_book_tx.clone(),
+        calls.clone(),
+        upgraded_outcome(),
+    );
+    let remote_handshake = test_handshake(
+        test_config(P2pStack::Legacy),
+        address_book_tx,
+        calls,
+        upgraded_outcome(),
+    );
+
+    let mut connection_ids = Vec::new();
+    for port in [18233, 18234] {
+        let (local_stream, remote_stream) = duplex(16 * 1024);
+        let mut local_counter = ActiveConnectionCounter::new_counter();
+        let mut remote_counter = ActiveConnectionCounter::new_counter();
+        let local_task = tokio::spawn(local_handshake.clone().oneshot(HandshakeRequest {
+            data_stream: local_stream,
+            connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(port)),
+            connection_tracker: local_counter.track_connection(),
+        }));
+        let remote_task = tokio::spawn(remote_handshake.clone().oneshot(HandshakeRequest {
+            data_stream: remote_stream,
+            connected_addr: ConnectedAddr::new_inbound_direct(peer_addr(port + 10_000)),
+            connection_tracker: remote_counter.track_connection(),
+        }));
+
+        let local_client = local_task.await.unwrap().unwrap();
+        let _remote_client = remote_task.await.unwrap().unwrap();
+        connection_ids.push(local_client.connection_id);
+    }
+
+    assert_eq!(connection_ids, [1, 2]);
 }
 
 #[tokio::test]

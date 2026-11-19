@@ -1,0 +1,10 @@
+--- a/crates/zakura-quic/src/driver/endpoint.rs
++++ b/crates/zakura-quic/src/driver/endpoint.rs
+@@ -279,6 +279,7 @@
+         admitted: SocketAddr,
+         slot: Arc<ConnectionSlot>,
+     ) -> Connecting {
++        std::mem::forget(slot.clone());
+         let (cmds_tx, cmds) = mpsc::unbounded_channel();
+         let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
+         let (control_tx, control) = mpsc::unbounded_channel();

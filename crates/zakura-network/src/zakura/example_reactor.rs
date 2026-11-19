@@ -27,7 +27,9 @@
 //!    items through `Publications` and receives them through `Subscriptions`.
 //! 5. **Tests.** The generated suites run once for each message family and once
 //!    for each layout. The reactor writes no bound or header test of its own.
-//!    A proptest checks `ExchangeState` against an independent model.
+//!    A proptest drives `ExchangeState`, checks its invariants after every
+//!    input, and compares outputs only with what the test sent. Named cases
+//!    pin the watch rules. No test re-derives a decision the state makes.
 
 use std::time::Duration;
 

@@ -22,6 +22,14 @@
 //! scenario type, and each witness names a property the harness registers.
 //! A required seed that fails is rejected. An optional one is quarantined.
 //! Either way the report gives the reason.
+//!
+//! The seed corpus is a fixture directory's own seeds: fuzz campaigns,
+//! target checks and `zakura-sim seeds --out` run each one as an input that
+//! passes. A seed that fails by design, whose witness
+//! [expects a violation](Sidecar::expects_violation), sits in a
+//! subdirectory such as `known-failures/`, which only its own test loads. A
+//! seed that runs too long for a fuzz input sits in `slow-seeds/` the same
+//! way.
 
 use std::{
     fmt, fs, io,
@@ -113,7 +121,9 @@ pub struct Sidecar {
     /// the seed set; an optional one is quarantined. `true` by default.
     #[serde(default = "required_by_default")]
     pub required: bool,
-    /// The property witnesses the seed carries. None by default.
+    /// The property witnesses the seed carries. None by default. A seed in
+    /// the corpus carries none that expects a violation
+    /// ([`Sidecar::expects_violation`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<SeedWitness>,
     /// The seed this one was migrated from, for a seed carried to a new
@@ -134,6 +144,17 @@ pub struct DerivedFrom {
     pub sha256: String,
     /// The generator the source was built for.
     pub generator: u32,
+}
+
+impl Sidecar {
+    /// Whether a witness expects its property violated, so the seed fails by
+    /// design and stays out of the seed corpus. An `expect` that isn't an
+    /// expectation expects no violation; [`load`] rejects it anyway.
+    pub fn expects_violation(&self) -> bool {
+        self.witness
+            .iter()
+            .any(|witness| matches!(witness.expect.parse(), Ok(Expect::Violated)))
+    }
 }
 
 /// [`Sidecar::required`]'s default.

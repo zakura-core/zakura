@@ -1,10 +1,13 @@
 //! Zebra's internal peer message response format.
 
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use zakura_node_services::block_memory::BlockHandle;
 
-#[cfg(any(test, feature = "proptest-impl"))]
-use std::sync::Arc;
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::block::Block;
 
@@ -21,6 +24,79 @@ use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 
 use InventoryResponse::*;
+
+/// A received body together with the connection's optional timing observation.
+#[derive(Clone, Debug)]
+pub struct DeliveredBlock {
+    block: BlockHandle,
+    observation: Option<Arc<BlockObservation>>,
+}
+
+#[derive(Debug)]
+struct BlockObservation {
+    recorded: OnceLock<()>,
+    slot: crate::peer::RequestSlot,
+    missed: Option<Arc<tokio::time::Instant>>,
+    registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+    duration: Duration,
+    received_at: Instant,
+}
+
+impl DeliveredBlock {
+    /// Returns the body with its original decoded-memory ownership.
+    pub fn into_block(self) -> BlockHandle {
+        self.block
+    }
+
+    /// Credits a legacy delivery once its exact body has passed verification.
+    /// Clones share the same observation. Other transports carry no observation.
+    pub fn record_verified(&self) {
+        if let Some(observation) = &self.observation {
+            observation.recorded.get_or_init(|| {
+                if let Some(missed) = &observation.missed {
+                    observation.slot.clear_miss_at_receipt(missed);
+                }
+                if let Some(registry) = &observation.registry {
+                    registry.record_delivery_sample(
+                        crate::peer_registry::DeliverySampleKind::Block,
+                        observation.duration,
+                        observation.received_at,
+                    );
+                }
+            });
+        }
+    }
+
+    /// Credits a competing delivery only if it matches the complete verified body.
+    pub fn record_verified_copy(&self, verified: &BlockHandle) {
+        if self.observation.is_some() && self.block == *verified {
+            self.record_verified();
+        }
+    }
+}
+
+impl Deref for DeliveredBlock {
+    type Target = BlockHandle;
+    fn deref(&self) -> &BlockHandle {
+        &self.block
+    }
+}
+
+impl<T: Into<BlockHandle>> From<T> for DeliveredBlock {
+    fn from(block: T) -> Self {
+        Self {
+            block: block.into(),
+            observation: None,
+        }
+    }
+}
+
+impl PartialEq for DeliveredBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.block == other.block
+    }
+}
+impl Eq for DeliveredBlock {}
 
 /// A response to a network request, represented in internal format.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,7 +169,7 @@ pub enum Response {
             any(test, feature = "proptest-impl"),
             proptest(strategy = "block_responses()")
         )]
-        Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>,
+        Vec<InventoryResponse<(DeliveredBlock, Option<PeerSocketAddr>), block::Hash>>,
     ),
 
     /// A list of found unmined transactions, and missing unmined transaction IDs.
@@ -151,6 +227,34 @@ impl fmt::Display for Response {
 }
 
 impl Response {
+    /// Share one transfer-time sample across the available bodies in this reply.
+    /// Any verified body can confirm the delivery, once for the whole batch.
+    pub(crate) fn observe_block_delivery(
+        &mut self,
+        slot: &crate::peer::RequestSlot,
+        registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+        duration: Duration,
+    ) {
+        let Self::Blocks(blocks) = self else { return };
+        let missed = slot.miss_at_receipt();
+        if missed.is_none() && registry.is_none() {
+            return;
+        }
+        let observation = Arc::new(BlockObservation {
+            recorded: OnceLock::new(),
+            slot: slot.clone(),
+            missed,
+            registry,
+            duration,
+            received_at: Instant::now(),
+        });
+        for entry in blocks {
+            if let Available((block, _)) = entry {
+                block.observation = Some(observation.clone());
+            }
+        }
+    }
+
     /// Returns the Zebra internal response type as a string.
     pub fn command(&self) -> &'static str {
         match self {
@@ -188,7 +292,7 @@ fn header_responses() -> impl Strategy<Value = Vec<zakura_node_services::block_m
 
 #[cfg(any(test, feature = "proptest-impl"))]
 fn block_responses(
-) -> impl Strategy<Value = Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>>
+) -> impl Strategy<Value = Vec<InventoryResponse<(DeliveredBlock, Option<PeerSocketAddr>), block::Hash>>>
 {
     any::<Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>>().prop_map(
         |responses| {

@@ -3,10 +3,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -17,11 +14,32 @@ use tower::{
 
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
-    peer::{Client, ConnectedAddr, ConnectionInfo},
+    peer::{AdvertisedBlockRequest, Client, ConnectedAddr, ConnectionInfo},
+    peer_registry::trace_user_agent,
     protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
+    Request,
 };
 
-static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+/// Carries the peer set's routing decision through the load tracker to the client.
+#[derive(Debug)]
+struct RoutedClient(Client);
+
+impl Service<(Request, Option<AdvertisedBlockRequest>)> for RoutedClient {
+    type Response = <Client as Service<Request>>::Response;
+    type Error = <Client as Service<Request>>::Error;
+    type Future = <Client as Service<Request>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(
+        &mut self,
+        (request, advertised): (Request, Option<AdvertisedBlockRequest>),
+    ) -> Self::Future {
+        self.0.send_request(request, advertised)
+    }
+}
 
 /// A client service wrapper that keeps track of its load.
 ///
@@ -32,7 +50,7 @@ pub struct LoadTrackedClient {
     pub(crate) block_gossip: super::block_gossip::BlockGossipPeer,
 
     /// A service representing a connected peer, wrapped in a load tracker.
-    service: PeakEwma<Client>,
+    service: PeakEwma<RoutedClient>,
 
     /// Reports whether the connection can write a request as soon as it is sent.
     ///
@@ -42,8 +60,11 @@ pub struct LoadTrackedClient {
     /// The metadata for the connected peer `service`.
     connection_info: Arc<ConnectionInfo>,
 
-    /// A process-local identifier for correlating privacy-preserving peer traces.
-    trace_id: u64,
+    /// The connection's process-local number in the trace files.
+    connection_id: u64,
+
+    /// The sanitized user agent the peer advertised in its handshake, for peer traces.
+    user_agent: Arc<str>,
 }
 
 /// Create a new [`LoadTrackedClient`] wrapping the provided `client` service.
@@ -58,12 +79,18 @@ impl From<Client> for LoadTrackedClient {
             registry: client.peer_registry_updater.clone(),
             version: connection_info.remote.version,
             sidecar: false,
+            accepts_block_push: connection_info
+                .remote
+                .services
+                .contains(PeerServices::NODE_BLOCK_PUSH),
         };
 
         let request_slot = client.request_slot.clone();
+        let connection_id = client.connection_id;
+        let user_agent = trace_user_agent(&connection_info.remote.user_agent).into();
 
         let service = PeakEwma::new(
-            client,
+            RoutedClient(client),
             EWMA_DEFAULT_RTT,
             EWMA_DECAY_TIME_NANOS,
             tower::load::CompleteOnResponse::default(),
@@ -74,8 +101,8 @@ impl From<Client> for LoadTrackedClient {
             service,
             request_slot,
             connection_info,
-            // Wrap-around is unreachable for a process-local u64 counter.
-            trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+            connection_id,
+            user_agent,
         }
     }
 }
@@ -125,10 +152,23 @@ impl LoadTrackedClient {
     /// Returns true if block routing should prefer this advertiser over its busy advertisers.
     ///
     /// A connection can write a request now, and the peer did not leave its last block request
-    /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
-    /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
-    pub(crate) fn is_preferred_block_source(&self) -> bool {
-        self.can_send_request_now() && !self.has_unanswered_block_request()
+    /// unanswered. With `skip_missed_announcers`, which block source scoring sets, the peer must
+    /// also be free of a recent miss. A subsequent verified delivery clears that miss. Otherwise
+    /// routing only offers this advertiser through ordinary load balancing, so a peer that
+    /// withholds blocks can't win every retry while other advertisers are busy.
+    pub(crate) fn is_preferred_block_source(&self, skip_missed_announcers: bool) -> bool {
+        self.can_send_request_now()
+            && !self.has_unanswered_block_request()
+            && !(skip_missed_announcers && self.request_slot.announced_block_missed())
+    }
+
+    /// Sends the request with the reason this particular peer was chosen.
+    pub(crate) fn call_routed(
+        &mut self,
+        request: Request,
+        advertised: Option<AdvertisedBlockRequest>,
+    ) -> <Self as Service<Request>>::Future {
+        self.service.call((request, advertised))
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.
@@ -136,9 +176,14 @@ impl LoadTrackedClient {
         self.connection_info.remote.start_height
     }
 
-    /// Retrieve a process-local identifier used to correlate peer trace events.
-    pub(crate) fn trace_id(&self) -> u64 {
-        self.trace_id
+    /// Retrieve the connection's process-local number, shared by every trace row about it.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
+    /// Retrieve the sanitized user agent the peer advertised in its handshake.
+    pub(crate) fn remote_user_agent(&self) -> Arc<str> {
+        self.user_agent.clone()
     }
 
     /// Returns true if this peer connected directly to us from `ip`.
@@ -153,10 +198,7 @@ impl LoadTrackedClient {
     }
 }
 
-impl<Request> Service<Request> for LoadTrackedClient
-where
-    Client: Service<Request>,
-{
+impl Service<Request> for LoadTrackedClient {
     type Response = <Client as Service<Request>>::Response;
     type Error = <Client as Service<Request>>::Error;
     type Future = <PeakEwma<Client> as Service<Request>>::Future;
@@ -166,7 +208,7 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        self.service.call(request)
+        self.call_routed(request, None)
     }
 }
 

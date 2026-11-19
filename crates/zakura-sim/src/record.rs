@@ -73,9 +73,12 @@ use crate::{
 /// Version 43 types `NotApplicable`'s reason, adds `drain-bound`.
 /// Version 44 adds the run's wire-event `order` stamp to `frame-written`,
 /// `peer-written` and `peer-received`.
-/// Version 45 adds a datagram's payload `digest` and `init.obs`, the
+/// Version 45 drops each machine step's model view, `expected`: a machine
+/// target checks the production machine's invariants and the facts its inputs
+/// fix, so it records only what the machine did.
+/// Version 46 adds a datagram's payload `digest` and `init.obs`, the
 /// digest of setup's step 0 observations.
-pub const FORMAT_VERSION: u32 = 45;
+pub const FORMAT_VERSION: u32 = 46;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.

@@ -1,12 +1,18 @@
-//! Unit tests and witnesses for the requester's queries and their settlement.
+//! Named scenarios for the requester's queries and their settlement, and the
+//! `discovery_query` machine target under both decoders.
+//!
+//! The replays drive the production [`QueryState`] and [`Queries`] and check
+//! their invariants after every operation (see `replay.rs`). The scenarios
+//! pin each rule with literal inputs and outputs.
 
-use super::model::*;
+use super::replay::*;
 use super::*;
 use crate::zakura::{
     discovery::protocol::{
         DiscoveryServiceSummary, ServiceSummaryEnvelope, Services, ZakuraServiceId,
     },
     framed_channel,
+    machine_test::machine_target_tests,
     regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
     CloseCause,
 };
@@ -332,7 +338,7 @@ async fn an_unwritten_query_gives_its_reservation_back() {
         Err(QueryUnsent::Closed)
     ));
     assert_eq!(pool.held(), 0);
-    assert_eq!(queries.lock().state.len(), 0);
+    assert_eq!(queries.lock().state.live.len(), 0);
 
     let Session {
         queries, written, ..
@@ -343,7 +349,22 @@ async fn an_unwritten_query_gives_its_reservation_back() {
         Err(QueryUnsent::Closed)
     ));
     assert_eq!(pool.held(), 0);
-    assert_eq!(queries.lock().state.len(), 0);
+    assert_eq!(queries.lock().state.live.len(), 0);
+}
+
+/// A retired session sends nothing more: its writer fence refuses the next
+/// query, so no frame reaches a replacement session on the connection.
+#[tokio::test]
+async fn a_retired_session_refuses_the_next_query() {
+    let pool = reservation_pool();
+    // The session keeps its stream and cancellation open.
+    let session = session(&pool);
+    session.queries.retire();
+    assert!(matches!(
+        session.queries.send_get_peers(get_peers(1)).await,
+        Err(QueryUnsent::Closed)
+    ));
+    assert_eq!(pool.held(), 0);
 }
 
 /// A full node-wide pool defers the query to the next exchange.
@@ -594,28 +615,6 @@ async fn answers_settled_sees_a_claim_that_takes_the_queued_frame() {
     settled.join().expect("the wait does not panic");
 }
 
-fn query_kind() -> impl proptest::strategy::Strategy<Value = QueryKind> {
-    proptest::sample::select(QUERY_KINDS.to_vec())
-}
-
-fn query_op() -> impl proptest::strategy::Strategy<Value = QueryOp> {
-    use proptest::prelude::*;
-    prop_oneof![
-        3 => (query_kind(), 0usize..4).prop_map(|(kind, size)| QueryOp::Reserve { kind, size }),
-        2 => query_kind().prop_map(QueryOp::Queued),
-        1 => query_kind().prop_map(QueryOp::ReleaseUnsent),
-        3 => (query_kind(), proptest::option::of(0u64..2))
-            .prop_map(|(kind, excess)| QueryOp::Claim { kind, excess }),
-    ]
-}
-
-proptest::proptest! {
-    #[test]
-    fn settlement_bytes_match_the_model(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=SETTLEMENT_MAX_OPS)) {
-        replay_discovery_settlement_bytes(&bytes);
-    }
-}
-
 /// Exercises each hold: a live query and an unsettled answer each refuse
 /// the next query of their kind, an answer outlives its retired session, a
 /// retirement with a written unanswered query closes its connection, and the
@@ -624,16 +623,14 @@ const SETTLEMENT_WITNESS: [u8; 21] = [
     16, 2, 4, 16, 6, 16, 10, 14, 12, 16, 2, 14, 24, 17, 21, 7, 16, 4, 4, 10, 12,
 ];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn settlement_witness_exercises_holds_and_retirement() {
-    let summary = replay_discovery_settlement_bytes(&SETTLEMENT_WITNESS);
-    assert_eq!(
-        summary,
-        DiscoverySettlementReplaySummary {
+mod settlement_target {
+    use super::*;
+
+    machine_target_tests! {
+        replay: replay_discovery_settlement_bytes,
+        target: "discovery_query",
+        decoder: 2,
+        witness: &SETTLEMENT_WITNESS => DiscoverySettlementReplaySummary {
             transitions: 21,
             sent: 4,
             not_due: 2,
@@ -647,13 +644,8 @@ fn settlement_witness_exercises_holds_and_retirement() {
             stale: 1,
             retired: 2,
             closed: 1,
-        }
-    );
-    assert_eq!(
-        replay_discovery_settlement_bytes(&[]),
-        DiscoverySettlementReplaySummary::default()
-    );
-    println!("tier=Machine target=discovery_query decoder=2 {summary:?}");
+        },
+    }
 }
 
 /// The pool bounds a session's queries while answers of retired sessions
@@ -674,7 +666,8 @@ fn settlement_pool_defers_a_query_behind_retired_answers() {
 #[test]
 #[should_panic(expected = "discovery/answer-settlement")]
 fn settlement_witness_rejects_a_ledger_that_counts_a_phantom_hello() {
-    run_settlement(decode_settlement(&[10]), |queries, _| {
+    // A `Hello` begins and settles, so nothing should hold the close wait.
+    run_settlement(decode_settlement(&[10, 12]), |queries, _| {
         queries
             .settling
             .send_modify(|settling| settling.hellos += 1);
@@ -689,28 +682,20 @@ fn settlement_witness_rejects_leaking_a_pool_entry() {
     });
 }
 
-proptest::proptest! {
-    #[test]
-    fn live_queries_match_independent_model(ops in proptest::collection::vec(query_op(), 1..96)) {
-        run(ops, |_| {});
-    }
+/// Reserves `Peers`, refuses a second, queues it so it cannot be released,
+/// and admits its answer at its cap. The next `Peers` claim finds no live
+/// query, a `Services` answer above its cap is refused, and an unsent `Peers`
+/// is reserved and released.
+const QUERY_WITNESS: &[u8] = &[8, 24, 2, 4, 14, 6, 1, 23, 0, 4];
 
-    #[test]
-    fn query_bytes_match_the_same_model(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=512)) {
-        replay_discovery_query_bytes(&bytes);
-    }
-}
+mod query_target {
+    use super::*;
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "CI retains these applicability counters"
-)]
-fn query_witness_exercises_ownership_and_caps() {
-    let summary = replay_discovery_query_bytes(&[8, 24, 2, 4, 14, 6, 1, 23, 0, 4]);
-    assert_eq!(
-        summary,
-        DiscoveryQueryReplaySummary {
+    machine_target_tests! {
+        replay: replay_discovery_query_bytes,
+        target: "discovery_query",
+        decoder: 1,
+        witness: QUERY_WITNESS => DiscoveryQueryReplaySummary {
             transitions: 10,
             reserved: 3,
             refused: 1,
@@ -718,19 +703,31 @@ fn query_witness_exercises_ownership_and_caps() {
             admitted: 1,
             oversized: 1,
             stale: 1,
-        }
-    );
-    assert_eq!(
-        replay_discovery_query_bytes(&[]),
-        DiscoveryQueryReplaySummary::default()
-    );
-    println!("tier=Machine target=discovery_query decoder=1 {summary:?}");
+        },
+    }
+}
+
+/// The peer can answer before the writer learns that the queue accepted the
+/// query. The claim ends the unsent query, so the later `queued` changes
+/// nothing and `release_unsent` releases nothing.
+#[test]
+fn an_answer_that_claims_an_unsent_query_ends_it() {
+    let mut state = QueryState::default();
+    state
+        .reserve(Asked::Peers { limit: 1 })
+        .expect("a fresh state has no live query");
+    assert!(matches!(state.claim(QueryKind::Peers, 0), Some(Ok(_))));
+    state.queued(QueryKind::Peers);
+    assert!(!state.release_unsent(QueryKind::Peers));
+    assert!(state.claim(QueryKind::Peers, 0).is_none());
+    assert_eq!(state.reserve(Asked::Peers { limit: 1 }), Ok(()));
 }
 
 #[test]
 #[should_panic(expected = "discovery/query-ownership")]
 fn query_witness_rejects_losing_a_reservation() {
-    run(decode(&[0]), |state| {
+    // Reserve `Peers`, then claim it.
+    run(decode(&[0, 6]), |state| {
         state.live.clear();
     });
 }
@@ -738,7 +735,8 @@ fn query_witness_rejects_losing_a_reservation() {
 #[test]
 #[should_panic(expected = "discovery/query-ownership")]
 fn query_witness_rejects_releasing_a_queued_query() {
-    run(decode(&[0, 2]), |state| {
+    // Reserve `Peers`, queue it, then claim it.
+    run(decode(&[0, 2, 6]), |state| {
         state
             .live
             .retain(|_, query| query.phase != QueryPhase::Queued);

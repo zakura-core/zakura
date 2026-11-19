@@ -1,17 +1,18 @@
 //! Machine tests for the pure fill planners.
 //!
-//! The proptest runs one attempt's selection, retry filter, and funding in the
-//! production order against a simple work-queue environment. Another routine
-//! can take the probed floor height between the probe and the take. An
-//! independent model checks each decision. It never calls the planners or the
-//! admission helpers they use.
+//! The proptest runs one attempt's selection, retry filter, and funding through
+//! production's [`take_lanes`] against a real work queue. Another routine can
+//! take the probed floor height between the probe and the take. The checks
+//! bound each plan by the limits the test chose, and
+//! [`expected_retry_run`](super::model::expected_retry_run) recomputes the
+//! retry filter's run the slow, obvious way.
 //!
 //! Production requests one block at a time (`BS_BLOCKS_PER_RESPONSE`), so a
 //! production take holds one item. The tests prefixed `multi_item_` exercise
 //! planner behavior for longer takes, which the wire protocol permits but no
 //! current production path reaches. They do not claim production reachability.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc};
 
 use proptest::prelude::*;
 
@@ -19,8 +20,10 @@ use super::model::{expected_retry_run, fund_through_queue};
 use super::*;
 use crate::zakura::{
     block_sync::{
+        admission::request_priority,
         config::{BS_BLOCKS_PER_RESPONSE, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
         request::BlockSizeEstimate,
+        test_work_scope,
         work_queue::WorkQueue,
     },
     transport::ByteBudget,
@@ -73,7 +76,8 @@ fn above_commit_window() -> u32 {
     u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES).unwrap() + 1
 }
 
-/// One attempt's inputs. Raw heights are offsets from `base`.
+/// One attempt's inputs. Raw heights are offsets from `base`, which is above
+/// genesis, since the work queue owns no genesis height.
 #[derive(Clone, Debug)]
 struct Scenario {
     /// Whether every height sits above the commit window, so the resident
@@ -104,7 +108,7 @@ impl Scenario {
         if self.above_window {
             above_commit_window()
         } else {
-            0
+            1
         }
     }
 
@@ -198,48 +202,11 @@ fn scenario() -> impl Strategy<Value = Scenario> {
     )
 }
 
-/// The work-queue environment: pending heights and their estimates.
-struct Queue(BTreeMap<u32, u64>);
-
-impl Queue {
-    fn first_pending(&self, low: u32, high: u32) -> Option<u32> {
-        (low <= high)
-            .then(|| self.0.range(low..=high).next().map(|(raw, _)| *raw))
-            .flatten()
-    }
-
-    /// A contiguous ascending take that always admits its first item.
-    fn take(&mut self, scenario: &Scenario, plan: TakePlan) -> Vec<(u32, u64)> {
-        let (low, high) = (scenario.raw(plan.low), scenario.raw(plan.high));
-        let mut taken: Vec<(u32, u64)> = Vec::new();
-        let mut bytes = 0u64;
-        for (raw, estimate) in self.0.range(low..=high) {
-            if taken.last().is_some_and(|(last, _)| raw - last != 1)
-                || taken.len() >= plan.max_count
-                || (!taken.is_empty() && bytes + estimate > plan.max_bytes)
-            {
-                break;
-            }
-            bytes += estimate;
-            taken.push((*raw, *estimate));
-        }
-        for (raw, _) in &taken {
-            self.0.remove(raw);
-        }
-        taken
-    }
-}
-
-/// Which lane produced the take.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Lane {
-    Floor,
-    AboveFloor,
-}
-
 /// One attempt through selection, retry filtering, and funding.
 #[derive(Clone, Debug)]
 struct Attempt {
+    /// The probed floor height, unless a preferred carrier serves it.
+    floor_start: Option<u32>,
     floor_plan: Result<Option<TakePlan>, FillStop>,
     above_floor_plan: Option<Result<TakePlan, FillStop>>,
     above_floor_start: Option<u32>,
@@ -264,30 +231,21 @@ fn admit_kept(
     kept: &[(block::Height, u64)],
     budget_bytes: u64,
 ) -> Option<Funded> {
-    let queue = std::sync::Arc::new(WorkQueue::new(
+    let queue = Arc::new(WorkQueue::new(
         block::Height(0),
         ByteBudget::new(budget_bytes),
     ));
     queue.set_estimate_floor_for_tests(1);
-    // The queue owns only heights above genesis, and raw scenario heights can be
-    // zero. Shifting the floor and the run together keeps their priority.
-    let shifted = |height: block::Height| block::Height(height.0 + 1);
     let wanted: Vec<_> = kept
         .iter()
         .map(|(height, estimate)| {
             (
-                shifted(*height),
+                *height,
                 BlockSizeEstimate::Confirmed(u32::try_from(*estimate).unwrap()),
             )
         })
         .collect();
-    let (_, funding) = fund_through_queue(
-        &queue,
-        shifted(download_floor),
-        &[],
-        &wanted,
-        0..wanted.len(),
-    )?;
+    let (_, funding) = fund_through_queue(&queue, download_floor, &[], &wanted, 0..wanted.len())?;
     Some(Funded {
         priority: funding.priority,
         reserved_bytes: funding.reserved_bytes,
@@ -305,51 +263,93 @@ fn fund_retained(download_floor: block::Height, kept: &[(block::Height, u64)]) -
     }
 }
 
-/// Run the planners in the order `PeerRoutine::select_work`, `filter_retry`,
-/// and `try_issue_one` call them.
+fn request_id(id: u64) -> NonZeroU64 {
+    NonZeroU64::new(id).expect("request IDs start at one")
+}
+
+/// Run one attempt the way `PeerRoutine::select_work`, `filter_retry`, and
+/// `try_issue_one` do, against a real work queue.
 fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
     let limits = scenario.limits();
     let snapshot = scenario.snapshot();
-    let mut queue = Queue(scenario.pending.clone());
-    let probe = queue.first_pending(
-        scenario.servable_low,
-        scenario.servable_high.min(scenario.floor + 1),
+    let work = Arc::new(WorkQueue::new(
+        block::Height(0),
+        ByteBudget::new(u64::MAX / 2),
+    ));
+    work.set_estimate_floor_for_tests(1);
+    let _ = work.extend(
+        test_work_scope(),
+        scenario.pending.iter().map(|(raw, estimate)| {
+            (
+                scenario.height(*raw),
+                block::Hash([7; 32]),
+                BlockSizeEstimate::Confirmed(u32::try_from(*estimate).unwrap()),
+            )
+        }),
     );
-    let floor_start = probe
-        .filter(|_| !scenario.floor_deferred)
-        .map(|raw| scenario.height(raw));
-    if let (Some(raw), true) = (probe, scenario.floor_raced) {
-        queue.0.remove(&raw);
-    }
+    // `PeerRoutine::probe_floor`, with the preferred-carrier answer the
+    // scenario chose.
+    let probe = work.first_pending_in_range(
+        limits.servable_low,
+        limits
+            .servable_high
+            .min(floor_rescue_high(snapshot.download_floor)),
+    );
+    let floor_start = probe.filter(|_| !scenario.floor_deferred);
+    // Another routine takes the probed height before this attempt's take.
+    let rival = probe
+        .filter(|_| scenario.floor_raced)
+        .map(|height| work.take_request(height, height, 1, u64::MAX, 1, request_id(1)));
 
+    let mut taken = None;
+    let mut above_floor_start = None;
+    let lane = take_lanes(
+        config,
+        &limits,
+        snapshot,
+        floor_start,
+        |_, plan| {
+            let request = work.take_request(
+                plan.low,
+                plan.high,
+                plan.max_count,
+                plan.max_bytes,
+                2,
+                request_id(2),
+            );
+            let first = request.items().first().map(|(height, _)| *height);
+            taken = Some(request);
+            first
+        },
+        || {
+            above_floor_start =
+                Some(work.first_pending_in_range(limits.servable_low, limits.servable_high));
+            above_floor_start.flatten()
+        },
+    );
     let mut attempt = Attempt {
+        floor_start: floor_start.map(|height| scenario.raw(height)),
         floor_plan: plan_floor(config, &limits, snapshot, floor_start),
-        above_floor_plan: None,
-        above_floor_start: None,
-        selected: Err(FillStop::NoWork),
+        above_floor_plan: above_floor_start
+            .map(|start| plan_above_floor(config, &limits, snapshot, start)),
+        above_floor_start: above_floor_start
+            .flatten()
+            .map(|height| scenario.raw(height)),
+        selected: lane.map(|lane| {
+            let items = taken
+                .as_ref()
+                .expect("`take_lanes` succeeds only after a take returned work")
+                .items()
+                .iter()
+                .map(|(height, item)| (scenario.raw(*height), item.estimated_bytes))
+                .collect();
+            (lane, items)
+        }),
         retry: None,
         visits: Vec::new(),
         funding: None,
     };
-    attempt.selected = (|| {
-        if let Some(plan) = attempt.floor_plan? {
-            let items = queue.take(scenario, plan);
-            if !items.is_empty() {
-                return Ok((Lane::Floor, items));
-            }
-        }
-        limits.above_floor_slot()?;
-        attempt.above_floor_start =
-            queue.first_pending(scenario.servable_low, scenario.servable_high);
-        let start = attempt.above_floor_start.map(|raw| scenario.height(raw));
-        let plan = plan_above_floor(config, &limits, snapshot, start);
-        attempt.above_floor_plan = Some(plan);
-        let items = queue.take(scenario, plan?);
-        if items.is_empty() {
-            return Err(FillStop::NoWork);
-        }
-        Ok((Lane::AboveFloor, items))
-    })();
+    drop((taken, rival));
 
     let Ok((_, items)) = &attempt.selected else {
         return attempt;
@@ -374,9 +374,9 @@ fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
     attempt
 }
 
-/// Check one attempt against the model.
+/// Check one attempt's plans against the limits the scenario chose.
 fn check(scenario: &Scenario, attempt: &Attempt) {
-    let floor_rescue_high = scenario.floor + 1;
+    let floor_rescue_high = scenario.raw(floor_rescue_high(scenario.height(scenario.floor)));
     // Lookahead refusal needs a start above the commit window and a full gate.
     let gated = scenario.above_window && scenario.lookahead_full;
     let min_cap = |cwnd: Option<u64>| {
@@ -386,18 +386,9 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
             .min(cwnd.unwrap_or(u64::MAX))
     };
 
-    // The floor lane plans only for an undeferred floor height this peer can reach.
-    let floor_high = scenario.servable_high.min(floor_rescue_high);
-    let floor_start = (scenario.servable_low <= floor_high && !scenario.floor_deferred)
-        .then(|| {
-            scenario
-                .pending
-                .range(scenario.servable_low..=floor_high)
-                .next()
-                .map(|(raw, _)| *raw)
-        })
-        .flatten();
-    match (&attempt.floor_plan, floor_start) {
+    // The floor lane plans exactly when the probe found an undeferred floor
+    // height.
+    match (&attempt.floor_plan, attempt.floor_start) {
         (Ok(None), None) => {}
         (Ok(None), Some(_)) => panic!("an undeferred floor height must be planned"),
         (Ok(Some(_)) | Err(_), None) => panic!("no floor height may be planned"),
@@ -444,8 +435,14 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
             Err(stop) => panic!("unexpected above-floor refusal {stop:?}"),
         }
     }
+    // A floor-bypass slot takes only floor work, whichever lane took it.
     match &attempt.selected {
-        Ok((Lane::AboveFloor, _)) => assert!(!scenario.floor_bypass_only),
+        Ok((_, items)) if scenario.floor_bypass_only => {
+            assert!(
+                items[0].0 <= floor_rescue_high,
+                "the floor bypass took above-floor work"
+            );
+        }
         Err(FillStop::CwndSaturated) => assert!(scenario.floor_bypass_only),
         _ => {}
     }
@@ -483,14 +480,20 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
     assert_eq!(attempt.visits, expected_visits);
     assert_eq!(retry.timed_rejection, expected.timed_rejection);
 
-    // Funding follows the retained run's first height, never the lane or the probe.
+    // Funding follows the retained run's first height, never the lane or the
+    // probe, and only floor work may overdraft.
     match (&expected_keep, attempt.funding) {
         (None, None) => {}
         (Some(keep), Some(funding)) => {
             let kept = &items[keep.clone()];
-            let floor_work = kept[0].0 <= floor_rescue_high;
-            assert_eq!(funding.priority == RequestPriority::Floor, floor_work);
-            assert_eq!(funding.overdrafts, floor_work);
+            assert_eq!(
+                funding.priority,
+                request_priority(scenario.height(scenario.floor), scenario.height(kept[0].0))
+            );
+            assert_eq!(
+                funding.overdrafts,
+                funding.priority == RequestPriority::Floor
+            );
             assert_eq!(
                 funding.reserved_bytes,
                 kept.iter().map(|(_, estimate)| estimate).sum::<u64>()
@@ -506,7 +509,7 @@ proptest! {
     /// Every production take: one block, because the production request cap
     /// is `BS_BLOCKS_PER_RESPONSE`.
     #[test]
-    fn one_block_fill_attempt_decisions_match_an_independent_model(
+    fn one_block_fill_attempts_keep_their_limits(
         mut scenario in scenario(),
     ) {
         scenario.max_count = usize::try_from(BS_BLOCKS_PER_RESPONSE).unwrap();
@@ -517,10 +520,10 @@ proptest! {
         }
     }
 
-    /// Lane selection, retry filtering, and funding match an independent model,
+    /// Lane selection, retry filtering, and funding keep their limits,
     /// including when another routine takes the probed floor height first.
     #[test]
-    fn multi_item_fill_attempt_decisions_match_an_independent_model(scenario in scenario()) {
+    fn multi_item_fill_attempts_keep_their_limits(scenario in scenario()) {
         let config = ZakuraBlockSyncConfig::default();
         check(&scenario, &attempt(&config, &scenario));
     }
@@ -605,6 +608,47 @@ fn multi_item_a_retry_filter_that_removes_the_floor_item_funds_above_floor() {
     let funding = attempt.funding.unwrap();
     assert_eq!(funding.priority, RequestPriority::AboveFloor);
     assert_eq!(funding.reserved_bytes, 2_000);
+}
+
+/// A floor take with no congestion headroom still asks for one byte, so it
+/// takes the floor body that the floor overdraft funds.
+#[test]
+fn a_floor_take_without_headroom_still_takes_one_body() {
+    let config = ZakuraBlockSyncConfig::default();
+    let mut scenario = worked_scenario(&[1, 2, 3]);
+    scenario.floor_cwnd_bytes = Some(0);
+    let attempt = attempt(&config, &scenario);
+    check(&scenario, &attempt);
+    assert_eq!(
+        attempt
+            .floor_plan
+            .map(|plan| plan.map(|plan| plan.max_bytes)),
+        Ok(Some(1))
+    );
+    let Ok((lane, items)) = &attempt.selected else {
+        panic!("the floor lane takes the floor body");
+    };
+    assert_eq!(*lane, Lane::Floor);
+    assert_eq!(items, &[(1, 1_000)]);
+    assert!(attempt.funding.unwrap().overdrafts);
+}
+
+/// A peer that serves nothing in the floor-rescue window plans no floor take,
+/// even from a start the caller probed outside that window.
+#[test]
+fn a_peer_above_the_rescue_window_plans_no_floor_take() {
+    let config = ZakuraBlockSyncConfig::default();
+    let mut scenario = worked_scenario(&[3]);
+    scenario.servable_low = 2;
+    assert_eq!(
+        plan_floor(
+            &config,
+            &scenario.limits(),
+            scenario.snapshot(),
+            Some(scenario.height(3))
+        ),
+        Ok(None)
+    );
 }
 
 /// A floor-bypass slot cannot fall back to above-floor work when the floor

@@ -9,6 +9,10 @@ scenario_sha256 = "1a36944b15806be8d9162387983fb18d8bb101ce335cba8cbf2662ee12757
 source = "crates/zakura-sim/tests/sync_harness.rs"
 
 [[witness]]
+property = "block-sync/frontier-work-consistent"
+expect = "holds"
+
+[[witness]]
 property = "sync/block-requests-follow-headers"
 expect = "holds"
 

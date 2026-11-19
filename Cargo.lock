@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.8"
+version = "1.8.9"
 dependencies = [
  "bytes",
  "chrono",
@@ -2710,6 +2710,7 @@ dependencies = [
  "zakura-consensus",
  "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-mempool",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
@@ -2737,9 +2738,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3565551.0"
+version = "0.3573390.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c6484bb11b0d5322f8c3024146a54d58930de416560a888420488d20a9822"
+checksum = "bf7e62f2fddf5f4943bc6f2cef767cb9f7fb1946ac1bf096999800ebb9575b2a"
 
 [[package]]
 name = "zakura-bellman"
@@ -2800,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "15.0.0"
+version = "16.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -2856,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "17.0.2"
+version = "17.1.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -2955,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.3.1"
+version = "5.3.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -3007,6 +3008,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-mempool"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "futures",
+ "metrics",
+ "proptest",
+ "proptest-derive",
+ "thiserror",
+ "tokio",
+ "zakura-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-script",
+ "zakura-test",
+ "zakura-zcash-script",
+]
+
+[[package]]
 name = "zakura-mmr-tree"
 version = "0.1.0"
 dependencies = [
@@ -3018,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "17.0.0"
+version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -3063,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.2.3"
+version = "5.3.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3198,7 +3219,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-quic"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "curve25519-dalek",
@@ -3264,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "18.0.1"
+version = "18.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3376,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.7"
+version = "5.0.8"
 dependencies = [
  "hex",
  "ripemd",
@@ -3481,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "17.0.0"
+version = "18.0.0"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3590,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.3.3"
+version = "2.4.0"
 dependencies = [
  "clap",
  "eyre",

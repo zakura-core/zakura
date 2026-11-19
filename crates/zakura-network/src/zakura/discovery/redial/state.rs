@@ -160,6 +160,31 @@ impl RedialState {
         next
     }
 
+    /// Checks the state's invariants: the backoff stays between the policy's
+    /// initial backoff and its maximum, it is the initial backoff while no
+    /// failure is counted, and a bounded policy counts at most its maximum.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        let (initial, max) = (self.policy.initial_backoff, self.policy.max_backoff);
+        assert!(
+            initial.min(max) <= self.backoff && self.backoff <= initial.max(max),
+            "discovery/redial-policy: backoff {:?} outside [{initial:?}, {max:?}]",
+            self.backoff
+        );
+        assert!(
+            self.failures > 0 || self.backoff == initial,
+            "discovery/redial-policy: backoff {:?} with no counted failure",
+            self.backoff
+        );
+        if let Some(max_attempts) = self.policy.max_attempts {
+            assert!(
+                self.failures <= max_attempts,
+                "discovery/redial-policy: {} failures past the bound {max_attempts}",
+                self.failures
+            );
+        }
+    }
+
     fn reset(&mut self) {
         self.backoff = self.policy.initial_backoff;
         self.failures = 0;

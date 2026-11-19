@@ -1,19 +1,19 @@
 //! Machine tests for [`SequencerState`].
 //!
-//! Each proptest drives the state with legal input sequences and plays the
+//! Each machine target drives the state with decoded inputs and plays the
 //! driver itself: it accepts or refuses submissions and delivers or withholds
-//! required evidence. After every step it compares the state with an independent
-//! model. The models track heights, epochs, and submission identities. They never
-//! call the state's helpers.
+//! required evidence. After every step it checks the state's invariants and
+//! compares its outputs with bookkeeping: the heights the test delivered, the
+//! heights the driver accepted and in what order, and the attempts still in
+//! flight. Contiguity is recomputed the slow way, as the longest delivered
+//! prefix. Named scenarios pin the retry episode and the authority rebind.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeSet, VecDeque},
     num::NonZeroU64,
 };
 
 use chrono::TimeZone;
-#[cfg(test)]
-use proptest::prelude::*;
 use zakura_chain::serialization::ZcashDeserializeInto;
 use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkEpoch, BodyWorkOwner, HeaderGeneration, HeaderWorkAuthority,
@@ -21,7 +21,10 @@ use zakura_header_chain::{
 };
 
 use super::*;
-use crate::zakura::block_sync::{test_work_scope, BlockSyncFrontiers};
+use crate::zakura::{
+    block_sync::{test_work_scope, BlockSyncFrontiers},
+    machine_test::MAX_HISTORY_BYTES,
+};
 
 /// Highest height any generated input touches.
 const MAX_HEIGHT: u32 = 12;
@@ -198,58 +201,39 @@ fn changes_shared_work(operation: &SequencerOperation) -> bool {
     )
 }
 
-/// Independent model of body sequencing within one body-work epoch.
+/// Bookkeeping of body sequencing within one body-work epoch.
 #[derive(Debug, Default)]
 struct SequencingModel {
-    /// Delivered heights and the authority each body carried into the pipeline.
-    received: BTreeMap<u32, BodyWorkAuthority>,
+    /// Heights the test delivered.
+    received: BTreeSet<u32>,
     /// Heights the driver accepted, in acceptance order.
     accepted: Vec<u32>,
-    retry_at: Option<time::Instant>,
-    retry_started_at: Option<time::Instant>,
-    retry_attempt: u64,
 }
 
 impl SequencingModel {
     /// The highest height whose every predecessor above genesis was delivered.
     fn contiguous(&self) -> u32 {
         (1..=MAX_HEIGHT)
-            .take_while(|height| self.received.contains_key(height))
+            .take_while(|height| self.received.contains(height))
             .last()
             .unwrap_or(0)
     }
 
-    fn deliver(&mut self, height: u32, current: BodyWorkAuthority) {
-        self.received.entry(height).or_insert(current);
-    }
-
-    /// Model one driver pass with an unbounded submission window.
-    fn submission_pass(&mut self, now: time::Instant, accepts: usize) {
+    /// Record one driver pass with an unbounded submission window that accepts
+    /// the first `accepts` bodies. The driver sees the delivered prefix in height
+    /// order, so the pass accepts the lowest unsubmitted heights. Returns them
+    /// and whether the pass refused a body.
+    fn submission_pass(&mut self, accepts: usize) -> (Vec<u32>, bool) {
         let unsubmitted: Vec<u32> = (1..=self.contiguous())
             .filter(|height| !self.accepted.contains(height))
             .collect();
-        if unsubmitted.is_empty() {
-            self.retry_at = None;
-            self.retry_started_at = None;
-            self.retry_attempt = 0;
-            return;
-        }
-        self.retry_at = None;
-        for (index, height) in unsubmitted.into_iter().enumerate() {
-            if index == accepts {
-                self.retry_started_at.get_or_insert(now);
-                self.retry_attempt += 1;
-                self.retry_at = Some(now + Duration::from_millis(100));
-                return;
-            }
-            self.accepted.push(height);
-            if self.retry_started_at.take().is_some() {
-                self.retry_attempt = 0;
-            }
-        }
+        let accepted: Vec<u32> = unsubmitted.iter().copied().take(accepts).collect();
+        self.accepted.extend(&accepted);
+        (accepted, unsubmitted.len() > accepts)
     }
 
     fn check(&self, state: &SequencerState, expected_epoch: u64) {
+        state.assert_invariants();
         let sequencer = state.sequencer();
         let contiguous = self.contiguous();
         assert_eq!(
@@ -264,23 +248,20 @@ impl SequencingModel {
         );
         for raw in 1..=MAX_HEIGHT {
             let height = block::Height(raw);
-            let delivered = self.received.get(&raw);
+            let delivered = self.received.contains(&raw);
             assert_eq!(
                 sequencer.applying_contains(height),
-                delivered.is_some() && raw <= contiguous,
+                delivered && raw <= contiguous,
                 "{ORDER_PROPERTY}: applying membership at {}",
                 raw
             );
             assert_eq!(
                 sequencer.reorder_contains(height),
-                delivered.is_some() && raw > contiguous,
+                delivered && raw > contiguous,
                 "{ORDER_PROPERTY}: reorder membership at {}",
                 raw
             );
-            if let (Some(authority), Some((owner, ..))) =
-                (delivered, sequencer.applying_identity(height))
-            {
-                assert_eq!(owner.authority, *authority, "{ORDER_PROPERTY}");
+            if let Some((owner, ..)) = sequencer.applying_identity(height) {
                 assert_eq!(
                     owner.authority.body_work_epoch,
                     BodyWorkEpoch::new(expected_epoch),
@@ -288,9 +269,6 @@ impl SequencingModel {
                 );
             }
         }
-        // The driver sees bodies in height order, without gaps or repeats.
-        let in_order: Vec<u32> = (1..).take(self.accepted.len()).collect();
-        assert_eq!(&self.accepted, &in_order, "{ORDER_PROPERTY}");
         let accepted = to_u64(self.accepted.len());
         let view = state.view(0, 0, 0);
         assert_eq!(
@@ -300,16 +278,6 @@ impl SequencingModel {
         assert_eq!(
             view.unsubmitted_applying_count,
             u64::from(contiguous) - accepted,
-            "{ORDER_PROPERTY}"
-        );
-        assert_eq!(
-            state.submission_retry_at(),
-            self.retry_at,
-            "{ORDER_PROPERTY}"
-        );
-        assert_eq!(
-            state.submission_retry_attempt(),
-            self.retry_attempt,
             "{ORDER_PROPERTY}"
         );
     }
@@ -323,18 +291,6 @@ enum SequencingStep {
     Submit { accepts: usize, after_ms: u64 },
 }
 
-#[cfg(test)]
-fn sequencing_step() -> impl Strategy<Value = SequencingStep> {
-    let max_accepts = to_usize(MAX_HEIGHT);
-    prop_oneof![
-        4 => (1..=MAX_HEIGHT).prop_map(SequencingStep::Deliver),
-        1 => any::<u64>().prop_map(SequencingStep::RefreshStateVersion),
-        1 => (1..8u64).prop_map(SequencingStep::RefreshAuthority),
-        2 => (0..=max_accepts, 0..300u64)
-            .prop_map(|(accepts, after_ms)| SequencingStep::Submit { accepts, after_ms }),
-    ]
-}
-
 fn run_sequencing(
     steps: Vec<SequencingStep>,
     mut after_step: impl FnMut(&mut SequencerState),
@@ -343,7 +299,6 @@ fn run_sequencing(
     let window = to_usize(MAX_HEIGHT);
     let mut state = new_state(window);
     let mut model = SequencingModel::default();
-    let mut current = authority(0, 0);
     let mut now = time::Instant::now();
     let mut summary = SequencerReplaySummary::default();
     for step in steps {
@@ -352,14 +307,13 @@ fn run_sequencing(
             SequencingStep::Deliver(height) => {
                 // Bodies keep the authority their request was issued under.
                 let acceptance = state.accept_body(received(&block, height, 0)).acceptance;
-                let expected = if model.received.contains_key(&height) {
+                let expected = if model.received.contains(&height) {
                     BodyAcceptance::Redundant
                 } else {
                     BodyAcceptance::Buffered
                 };
                 assert_eq!(acceptance, expected, "{ORDER_PROPERTY}");
-                summary.bodies += usize::from(!model.received.contains_key(&height));
-                model.deliver(height, current);
+                summary.bodies += usize::from(model.received.insert(height));
             }
             SequencingStep::RefreshStateVersion(version) => {
                 let outputs = state.on_control_input(
@@ -370,9 +324,10 @@ fn run_sequencing(
                 assert!(outputs.operations.is_empty(), "{ORDER_PROPERTY}");
             }
             SequencingStep::RefreshAuthority(generation) => {
-                current = authority(0, generation);
                 let outputs = state.on_control_input(
-                    SequencerControlInput::WorkAuthorityRefreshed { authority: current },
+                    SequencerControlInput::WorkAuthorityRefreshed {
+                        authority: authority(0, generation),
+                    },
                     wall_now(),
                 );
                 assert!(!outputs.needs_reaction, "{ORDER_PROPERTY}");
@@ -392,8 +347,20 @@ fn run_sequencing(
                     );
                 }
                 summary.submitted += accepted.len();
-                model.submission_pass(now, accepts);
-                summary.backpressure += usize::from(model.retry_at.is_some());
+                let (expected, refused) = model.submission_pass(accepts);
+                let heights: Vec<u32> = accepted.iter().map(|accepted| accepted.height.0).collect();
+                assert_eq!(
+                    heights, expected,
+                    "{ORDER_PROPERTY}: the pass accepts the lowest unsubmitted heights in order"
+                );
+                // A refusal with work left schedules the next pass; a pass that
+                // refuses nothing leaves none scheduled.
+                assert_eq!(
+                    state.submission_retry_at().is_some_and(|at| at > now),
+                    refused,
+                    "{ORDER_PROPERTY}: retry scheduling"
+                );
+                summary.backpressure += usize::from(refused);
             }
         }
         after_step(&mut state);
@@ -414,18 +381,6 @@ enum Completion {
     TamperedBody,
     Unavailable,
     TimedOut,
-}
-
-#[cfg(test)]
-fn completion() -> impl Strategy<Value = Completion> {
-    prop_oneof![
-        Just(Completion::Committed),
-        Just(Completion::Duplicate),
-        any::<bool>().prop_map(|attributed| Completion::ConsensusInvalid { attributed }),
-        Just(Completion::TamperedBody),
-        Just(Completion::Unavailable),
-        Just(Completion::TimedOut),
-    ]
 }
 
 fn outcome(completion: Completion, accepted: Accepted) -> BlockApplyOutcome {
@@ -481,22 +436,6 @@ enum ResetStep {
     },
 }
 
-#[cfg(test)]
-fn reset_step() -> impl Strategy<Value = ResetStep> {
-    prop_oneof![
-        3 => (1..=MAX_HEIGHT).prop_map(ResetStep::DeliverCurrent),
-        1 => (1..=MAX_HEIGHT).prop_map(ResetStep::DeliverRetired),
-        1 => Just(ResetStep::SubmitCurrent),
-        3 => (any::<usize>(), completion(), any::<bool>()).prop_map(
-            |(attempt, completion, semantic)| ResetStep::FinishRetired {
-                attempt,
-                completion,
-                semantic,
-            }
-        ),
-    ]
-}
-
 fn run_authority_reset(
     retired_bodies: u32,
     steps: Vec<ResetStep>,
@@ -546,16 +485,20 @@ fn run_authority_reset(
         match step {
             ResetStep::DeliverCurrent(height) => {
                 let _ = state.accept_body(received(&block, height, 1));
-                summary.bodies += usize::from(!model.received.contains_key(&height));
-                model.deliver(height, current);
+                summary.bodies += usize::from(model.received.insert(height));
             }
             ResetStep::DeliverRetired(height) => {
                 let acceptance = state.accept_body(received(&block, height, 0)).acceptance;
                 assert_eq!(acceptance, BodyAcceptance::StaleScope, "{RESET_PROPERTY}");
             }
             ResetStep::SubmitCurrent => {
-                summary.submitted += submission_pass(&mut state, now, usize::MAX).len();
-                model.submission_pass(now, usize::MAX);
+                let heights: Vec<u32> = submission_pass(&mut state, now, usize::MAX)
+                    .iter()
+                    .map(|accepted| accepted.height.0)
+                    .collect();
+                summary.submitted += heights.len();
+                let (expected, _) = model.submission_pass(usize::MAX);
+                assert_eq!(heights, expected, "{RESET_PROPERTY}");
             }
             ResetStep::FinishRetired {
                 attempt,
@@ -598,6 +541,7 @@ fn run_authority_reset(
 impl SequencingModel {
     /// [`Self::check`] for the current epoch while `retired` older attempts stay in flight.
     fn check_with_retired(&self, state: &SequencerState, retired: usize) {
+        state.assert_invariants();
         let sequencer = state.sequencer();
         let contiguous = self.contiguous();
         assert_eq!(
@@ -607,7 +551,7 @@ impl SequencingModel {
         );
         for raw in 1..=MAX_HEIGHT {
             let height = block::Height(raw);
-            let delivered = self.received.contains_key(&raw);
+            let delivered = self.received.contains(&raw);
             assert_eq!(
                 sequencer.applying_contains(height),
                 delivered && raw <= contiguous,
@@ -627,8 +571,6 @@ impl SequencingModel {
                 assert_eq!(applying_hash, hash(raw, 1), "{RESET_PROPERTY}");
             }
         }
-        let in_order: Vec<u32> = (1..).take(self.accepted.len()).collect();
-        assert_eq!(&self.accepted, &in_order, "{RESET_PROPERTY}");
         assert_eq!(
             sequencer.in_flight_submission_count(),
             self.accepted.len() + retired,
@@ -677,21 +619,6 @@ enum EvidenceStep {
     Deliver,
     /// The action channel is full, so IO delivers nothing.
     Full,
-}
-
-#[cfg(test)]
-fn evidence_step() -> impl Strategy<Value = EvidenceStep> {
-    prop_oneof![
-        3 => (any::<usize>(), completion(), any::<bool>()).prop_map(
-            |(attempt, completion, semantic)| EvidenceStep::Finish {
-                attempt,
-                completion,
-                semantic,
-            }
-        ),
-        1 => Just(EvidenceStep::Deliver),
-        2 => Just(EvidenceStep::Full),
-    ]
 }
 
 fn run_required_evidence(
@@ -807,6 +734,7 @@ fn run_required_evidence(
             }
         }
         after_step(&mut state);
+        state.assert_invariants();
         assert_eq!(
             state.pending_evidence_len(),
             pending.len(),
@@ -828,34 +756,6 @@ fn run_required_evidence(
         }
     }
     summary
-}
-
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// Out-of-order bodies submit only as a contiguous prefix, refreshes keep
-    /// retained bodies, and refused submissions retry on the model's schedule.
-    #[test]
-    fn bodies_submit_in_contiguous_order(steps in prop::collection::vec(sequencing_step(), 1..80)) {
-        run_sequencing(steps, |_| {});
-    }
-
-    /// A retired apply result settles only its own attempt and leaves the
-    /// replacement epoch's ordering intact.
-    #[test]
-    fn retired_results_keep_current_ordering(
-        retired_bodies in 1..=MAX_HEIGHT,
-        steps in prop::collection::vec(reset_step(), 1..80),
-    ) {
-        run_authority_reset(retired_bodies, steps, |_| {});
-    }
-
-    /// Required evidence stays pending, in order, until IO delivers it.
-    #[test]
-    fn required_evidence_waits_for_delivery(steps in prop::collection::vec(evidence_step(), 1..60)) {
-        run_required_evidence(steps, |_| {});
-    }
 }
 
 #[test]
@@ -916,6 +816,51 @@ fn predecessor_releases_retained_successors_in_order() {
         .map(|accepted| accepted.height.0)
         .collect();
     assert_eq!(heights, [1, 2, 3]);
+}
+
+/// Each refusal of a retry episode counts one attempt and schedules the next
+/// pass one retry delay later. The first acceptance ends the episode.
+#[test]
+fn a_retry_episode_counts_refusals_until_an_acceptance() {
+    let block = test_block();
+    let mut state = new_state(4);
+    let start = time::Instant::now();
+    let _ = state.accept_body(received(&block, 1, 0));
+    for (pass, attempt) in [(0, 1), (1, 2)] {
+        let now = start + Duration::from_secs(pass);
+        assert!(submission_pass(&mut state, now, 0).is_empty());
+        assert_eq!(state.submission_retry_attempt(), attempt);
+        assert_eq!(
+            state.submission_retry_at(),
+            Some(now + SUBMISSION_RETRY_DELAY)
+        );
+        state.submission_retry_due();
+    }
+    let accepted = submission_pass(&mut state, start + Duration::from_secs(2), 1);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(state.submission_retry_attempt(), 0);
+    assert_eq!(state.submission_retry_at(), None);
+}
+
+/// A body requested under an older snapshot of the current epoch applies
+/// under the authority current when it arrives.
+#[test]
+fn a_body_applies_under_the_authority_current_at_arrival() {
+    let block = test_block();
+    let mut state = new_state(4);
+    let refreshed = authority(0, 3);
+    let _ = state.on_control_input(
+        SequencerControlInput::WorkAuthorityRefreshed {
+            authority: refreshed,
+        },
+        wall_now(),
+    );
+    let _ = state.accept_body(received(&block, 1, 0));
+    let (owner, ..) = state
+        .sequencer()
+        .applying_identity(block::Height(1))
+        .expect("body 1 is applying");
+    assert_eq!(owner.authority, refreshed);
 }
 
 /// A full action channel keeps both evidence records pending, oldest first.
@@ -981,7 +926,7 @@ const EVIDENCE_PROPERTY: &str = "block/required-evidence";
 /// Applicable transitions in one decoder-v1 sequencer history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct SequencerReplaySummary {
-    /// Generated operations checked against the model.
+    /// Decoded operations checked.
     pub transitions: usize,
     /// New current bodies delivered by ordering or reset histories.
     pub bodies: usize,
@@ -998,7 +943,7 @@ pub struct SequencerReplaySummary {
 }
 
 fn decode_order(data: &[u8]) -> Vec<SequencingStep> {
-    data[..data.len().min(512)]
+    data[..data.len().min(MAX_HISTORY_BYTES)]
         .chunks(3)
         .map(|chunk| {
             let a = chunk[0];
@@ -1030,7 +975,7 @@ fn decode_completion(byte: u8) -> Completion {
 }
 
 fn decode_reset(data: &[u8]) -> Vec<ResetStep> {
-    data[..data.len().min(511)]
+    data[..data.len().min(MAX_HISTORY_BYTES - 1)]
         .chunks(3)
         .map(|chunk| {
             let a = chunk[0];
@@ -1051,7 +996,7 @@ fn decode_reset(data: &[u8]) -> Vec<ResetStep> {
 }
 
 fn decode_evidence(data: &[u8]) -> Vec<EvidenceStep> {
-    data[..data.len().min(512)]
+    data[..data.len().min(MAX_HISTORY_BYTES)]
         .chunks(3)
         .map(|chunk| {
             let a = chunk[0];
@@ -1070,13 +1015,15 @@ fn decode_evidence(data: &[u8]) -> Vec<EvidenceStep> {
         .collect()
 }
 
-/// Replay at most 512 decoder-v1 bytes against the contiguous-submission model.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the
+/// contiguous-submission history. Each triple is one input.
 pub fn replay_sequencer_order_bytes(data: &[u8]) -> SequencerReplaySummary {
     run_sequencing(decode_order(data), |_| {})
 }
 
-/// Replay at most 512 decoder-v1 bytes against the retired-apply model.
-/// The first byte chooses the number of retired applies; triples choose operations.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the
+/// retired-apply history. The first byte chooses the number of retired
+/// applies; triples choose operations.
 pub fn replay_sequencer_reset_bytes(data: &[u8]) -> SequencerReplaySummary {
     let Some((&first, rest)) = data.split_first() else {
         return SequencerReplaySummary::default();
@@ -1088,100 +1035,81 @@ pub fn replay_sequencer_reset_bytes(data: &[u8]) -> SequencerReplaySummary {
     )
 }
 
-/// Replay at most 512 decoder-v1 bytes against the required-evidence model.
+/// Replay at most [`MAX_HISTORY_BYTES`] decoder-v1 bytes through the
+/// required-evidence history. Each triple is one input.
 pub fn replay_sequencer_evidence_bytes(data: &[u8]) -> SequencerReplaySummary {
     run_required_evidence(decode_evidence(data), |_| {})
 }
 
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn sequencer_bytes_use_the_existing_models(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_sequencer_order_bytes(&bytes);
-        replay_sequencer_reset_bytes(&bytes);
-        replay_sequencer_evidence_bytes(&bytes);
-    }
-}
-
+/// Delivers bodies 1 and 2, refreshes the state version and the authority,
+/// and refuses a pass after accepting both bodies.
 #[cfg(test)]
 const ORDER_WITNESS: &[u8] = &[0, 1, 0, 0, 0, 0, 3, 0, 0, 2, 1, 0, 3, 2, 10];
+/// Retires one apply, delivers and submits a current body, then finishes the
+/// retired apply.
 #[cfg(test)]
 const RESET_WITNESS: &[u8] = &[0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 3, 0, 2];
+/// Finishes an apply as attributed invalid, holds its evidence while the
+/// channel is full, then delivers it.
 #[cfg(test)]
 const EVIDENCE_WITNESS: &[u8] = &[0, 0, 2, 2, 0, 0, 1, 0, 0];
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn sequencer_order_witness_retries_a_refused_contiguous_prefix() {
-    let summary = replay_sequencer_order_bytes(ORDER_WITNESS);
-    assert_eq!(
-        summary,
-        SequencerReplaySummary {
+#[cfg(test)]
+mod order_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_sequencer_order_bytes,
+        target: "block_sequencer_order",
+        decoder: 1,
+        witness: ORDER_WITNESS => SequencerReplaySummary {
             transitions: 5,
             bodies: 2,
             submitted: 2,
             backpressure: 1,
             ..SequencerReplaySummary::default()
-        }
-    );
-    assert_eq!(
-        replay_sequencer_order_bytes(&[]),
-        SequencerReplaySummary::default()
-    );
-    println!("tier=Machine target=block_sequencer_order decoder=1 {summary:?}");
+        },
+    }
 }
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn sequencer_reset_witness_isolates_a_retired_completion() {
-    let summary = replay_sequencer_reset_bytes(RESET_WITNESS);
-    assert_eq!(
-        summary,
-        SequencerReplaySummary {
+#[cfg(test)]
+mod reset_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_sequencer_reset_bytes,
+        target: "block_sequencer_reset",
+        decoder: 1,
+        witness: RESET_WITNESS => SequencerReplaySummary {
             transitions: 4,
             bodies: 1,
             submitted: 1,
             completions: 1,
             ..SequencerReplaySummary::default()
-        }
-    );
-    assert_eq!(
-        replay_sequencer_reset_bytes(&[]),
-        SequencerReplaySummary::default()
-    );
-    println!("tier=Machine target=block_sequencer_reset decoder=1 {summary:?}");
+        },
+    }
 }
 
-#[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn sequencer_evidence_witness_retains_evidence_while_full() {
-    let summary = replay_sequencer_evidence_bytes(EVIDENCE_WITNESS);
-    assert_eq!(
-        summary,
-        SequencerReplaySummary {
+#[cfg(test)]
+mod evidence_target {
+    use super::*;
+    use crate::zakura::machine_test::machine_target_tests;
+
+    machine_target_tests! {
+        replay: replay_sequencer_evidence_bytes,
+        target: "block_sequencer_evidence",
+        decoder: 1,
+        witness: EVIDENCE_WITNESS => SequencerReplaySummary {
             transitions: 3,
             completions: 1,
             evidence_queued: 1,
             evidence_delivered: 1,
             backpressure: 1,
             ..SequencerReplaySummary::default()
-        }
-    );
-    assert_eq!(
-        replay_sequencer_evidence_bytes(&[]),
-        SequencerReplaySummary::default()
-    );
-    println!("tier=Machine target=block_sequencer_evidence decoder=1 {summary:?}");
+        },
+    }
 }
 
 #[test]

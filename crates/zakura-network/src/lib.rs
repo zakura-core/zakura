@@ -183,22 +183,31 @@ pub use crate::{
     protocol::external::canonical_peer_addr,
 };
 
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::{Codec, HashedBlock, Message};
+
 pub use crate::{
     address_book::{AddressBook, BannedIps, MisbehaviorReporter},
     address_book_peers::AddressBookPeers,
     config::{CacheDir, Config, P2pStack, UnconditionalPeerName, UnconditionalPeers},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
-        Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
-        SharedPeerError,
+        Client, ConnectedAddr, ConnectionInfo, HandshakeError, NoFasterBlockSource, NotFoundClass,
+        PeerError, SharedPeerError,
     },
     peer_registry::ConnectedPeer,
     peer_set::init_with_zakura,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
-        internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},
+        internal::{
+            AdvertisedBlock, BlockHedge, DeliveredBlock, InventoryResponse, PeerSource, Request,
+            Response,
+        },
     },
 };
+
+#[cfg(feature = "internal-bench")]
+pub use crate::protocol::external::codec::checksum_bench;
 
 /// Types used in the definition of [`Request`], [`Response`], and [`VersionMessage`].
 pub mod types {

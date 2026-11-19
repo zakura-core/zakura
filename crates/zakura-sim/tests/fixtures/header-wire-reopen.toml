@@ -7,3 +7,7 @@ generator = 4
 sha256 = "daa8f7989723ece3994f83cf48ef6bdf9a9a2f6ef1ba6096276943652a2de244"
 scenario_sha256 = "c527b0eeaf6725adb571f404d24b571def41ff74f0d324db9546d567d8029f4f"
 source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
+
+[[witness]]
+property = "header-sync/commit-only-authorized"
+expect = "holds"

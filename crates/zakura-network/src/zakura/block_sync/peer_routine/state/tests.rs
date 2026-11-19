@@ -1,10 +1,13 @@
-//! The request lifecycle of [`PeerState`] checked against an independent model.
+//! The request lifecycle of [`PeerState`].
 //!
-//! The harness plays the routine's part: it settles writes, removes finished
-//! requests, and feeds bodies, endings, expiry, and resets. The model tracks
-//! the same requests and the no-progress accounting on its own. After every
-//! input, the test checks request isolation, deadline choice, and fault
-//! attribution.
+//! [`replay_request_lifecycle_bytes`] is a machine target (see
+//! [`machine_test`](crate::zakura::machine_test)). The harness plays the
+//! routine's part: it settles writes, removes finished requests, and feeds
+//! bodies, endings, expiry, and resets. A ledger records the requests the test
+//! issued, the writes it started, the bodies it delivered, and the requests
+//! sent since the last delivered body. After every input, the test checks
+//! [`PeerState::assert_invariants`], request isolation, the next wake, and
+//! fault attribution against that ledger. Named cases pin the ending rules.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,8 +15,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use proptest::prelude::*;
 use zakura_chain::block;
 use zakura_rt::time::Instant;
 
@@ -26,6 +27,9 @@ use super::{
     },
     BodyMatch, Disposition, PeerState, SharedDeadlines,
 };
+#[cfg(test)]
+use crate::zakura::machine_test::machine_target_tests;
+use crate::zakura::machine_test::MAX_HISTORY_BYTES;
 
 const GENERATION: u64 = 9;
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,28 +58,12 @@ enum Input {
     Reset,
 }
 
-#[cfg(test)]
-fn input() -> impl Strategy<Value = Input> {
-    prop_oneof![
-        3 => (1..=MAX_HEIGHT, 1u32..=2, 1u64..3_000)
-            .prop_map(|(start, count, due_ms)| Input::Issue { start, count, due_ms }),
-        3 => any::<usize>().prop_map(|pick| Input::WriteStarted { pick }),
-        3 => (1..=MAX_HEIGHT, prop::bool::weighted(0.2))
-            .prop_map(|(height, tampered)| Input::Body { height, tampered }),
-        2 => (any::<usize>(), any::<bool>(), 0..=MAX_HEIGHT)
-            .prop_map(|(pick, unavailable, floor)| Input::Ending { pick, unavailable, floor }),
-        1 => (1..=MAX_HEIGHT).prop_map(|start| Input::LateEnding { start }),
-        2 => (0u64..4_000).prop_map(|advance_ms| Input::Expire { advance_ms }),
-        1 => Just(Input::Reset),
-    ]
-}
-
 fn hash(height: u32, tampered: bool) -> block::Hash {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     block::Hash([if tampered { byte | 0x80 } else { byte }; 32])
 }
 
-/// One live request as the model sees it.
+/// One live request as the test issued it.
 #[derive(Debug)]
 struct ModelRequest {
     start: u32,
@@ -91,20 +79,18 @@ impl ModelRequest {
     }
 }
 
-/// The model. Requests are keyed by issue sequence, which is also the
-/// request ID in their work owner.
+/// The ledger: what the test issued, wrote, and delivered. Requests are keyed
+/// by issue sequence, which is also the request ID in their work owner.
 #[derive(Debug)]
 struct Model {
     now: Instant,
     requests: BTreeMap<u64, ModelRequest>,
     next_sequence: u64,
-    /// Requests sent since the last accepted body.
+    /// Requests sent since the last delivered body, less those whose frame
+    /// never reached the wire.
     streak: u32,
-    /// Requests that still count toward `streak`.
+    /// Live requests sent since the last delivered body.
     charged: BTreeSet<u64>,
-    last_request_at: Option<Instant>,
-    last_block_at: Option<Instant>,
-    liveness: Option<Instant>,
 }
 
 impl Model {
@@ -115,9 +101,6 @@ impl Model {
             next_sequence: 1,
             streak: 0,
             charged: BTreeSet::new(),
-            last_request_at: None,
-            last_block_at: None,
-            liveness: None,
         }
     }
 
@@ -142,32 +125,13 @@ impl Model {
         self.charged.remove(&sequence);
         self.requests
             .remove(&sequence)
-            .expect("the model removes only live requests")
+            .expect("the ledger removes only live requests")
     }
 
+    /// A delivered body proves progress: no sent request counts toward a stall.
     fn progress(&mut self) {
-        self.last_block_at = Some(self.now);
         self.streak = 0;
         self.charged.clear();
-        self.liveness = (!self.requests.is_empty()).then(|| self.now + LIVENESS_TIMEOUT);
-    }
-
-    /// A satisfied request leaving an idle window disarms liveness when the
-    /// last body came after the last request.
-    fn disarm_if_idle_after_progress(&mut self) {
-        if self.requests.is_empty()
-            && matches!((self.last_request_at, self.last_block_at), (Some(request), Some(body)) if body >= request)
-        {
-            self.liveness = None;
-        }
-    }
-
-    fn earliest_deadline(&self) -> Option<Instant> {
-        self.requests
-            .values()
-            .map(|request| request.deadline)
-            .chain(self.liveness)
-            .min()
     }
 }
 
@@ -285,8 +249,6 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
             );
             model.streak += 1;
             model.charged.insert(sequence);
-            model.last_request_at = Some(model.now);
-            model.liveness.get_or_insert(model.now + LIVENESS_TIMEOUT);
         }
         Input::WriteStarted { pick } => {
             let Some(sequence) = model.pick(pick, false) else {
@@ -362,7 +324,6 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
                     if complete {
                         harness.finish(matched.key, Disposition::Satisfied);
                         model.remove(sequence);
-                        model.disarm_if_idle_after_progress();
                     }
                 }
             }
@@ -386,34 +347,32 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
                 .on_ending(block::Height(start), outcome, block::Height(floor))
                 .expect("a live request accepts its ending");
             let request = &model.requests[&sequence];
+            // The heights the test neither delivered nor left above the floor.
             let stale: Vec<_> = request
                 .heights()
                 .filter(|height| *height <= floor && !request.received.contains(height))
                 .map(block::Height)
                 .collect();
-            let expected = if start <= floor {
-                if request
-                    .heights()
-                    .all(|height| height <= floor || request.received.contains(&height))
-                {
-                    Disposition::Satisfied
-                } else {
-                    Disposition::RetryMissing
-                }
-            } else if unavailable {
-                Disposition::RetryOriginal
-            } else {
-                Disposition::RetryMissing
-            };
+            let missing = request
+                .heights()
+                .any(|height| height > floor && !request.received.contains(&height));
             assert_eq!(ending.key, harness.keys[&sequence], "{PROPERTY}");
             assert_eq!(ending.owner, Harness::owner(sequence), "{PROPERTY}");
             assert_eq!(&ending.stale_heights, &stale, "{PROPERTY}");
-            assert_eq!(ending.disposition, expected, "{PROPERTY}");
+            // Only an ending that leaves no height missing above the floor is
+            // satisfied, and only `RangeUnavailable` retries the original range.
+            assert_eq!(
+                ending.disposition == Disposition::Satisfied,
+                !missing,
+                "{PROPERTY}: {:?} with heights missing: {missing}",
+                ending.disposition
+            );
+            assert!(
+                ending.disposition != Disposition::RetryOriginal || unavailable,
+                "{PROPERTY}: a short `BlocksDone` retried the original range"
+            );
             harness.finish(ending.key, ending.disposition);
             model.remove(sequence);
-            if expected == Disposition::Satisfied {
-                model.disarm_if_idle_after_progress();
-            }
         }
         Input::LateEnding { start } => {
             if model
@@ -469,9 +428,6 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
                     model.streak = model.streak.saturating_sub(1);
                 }
                 model.remove(*sequence);
-                if model.streak == 0 && model.requests.is_empty() {
-                    model.liveness = None;
-                }
             }
             for (sequence, _) in model_due.iter().filter(|(_, started)| *started) {
                 model.remove(*sequence);
@@ -486,16 +442,16 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) {
             model.requests.clear();
             model.charged.clear();
             model.streak = 0;
-            model.liveness = None;
         }
     }
     check(model, harness)
 }
 
-/// Compare every live request and the no-progress accounting with the model.
+/// Check the state's invariants, and compare every live request and the
+/// no-progress accounting with the ledger.
 fn check(model: &Model, harness: &Harness) {
+    harness.state.assert_invariants();
     let window = &harness.state.window;
-    window.outstanding.assert_consistent();
     // Request isolation: each live request holds exactly its own facts.
     let live: Vec<_> = window
         .outstanding
@@ -536,9 +492,14 @@ fn check(model: &Model, harness: &Harness) {
         window.requests_without_block_progress, model.streak,
         "{PROPERTY}"
     );
-    assert_eq!(window.block_liveness_deadline, model.liveness, "{PROPERTY}");
-    // Deadline choice: the next wake is the earliest owed deadline.
-    let earliest = model.earliest_deadline();
+    // Deadline choice: the next wake is the earliest owed deadline, found here
+    // by scanning every request.
+    let earliest = window
+        .outstanding
+        .entries()
+        .map(|(_, request)| request.deadline)
+        .chain(window.block_liveness_deadline)
+        .min();
     assert_eq!(
         harness.state.next_wake(SharedDeadlines::default()),
         earliest,
@@ -565,7 +526,7 @@ const PROPERTY: &str = "block/request-lifecycle";
 /// Applicable request operations in a decoder-v1 history.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct RequestLifecycleReplaySummary {
-    /// Inputs checked against the independent model.
+    /// Inputs checked.
     pub transitions: usize,
     /// Nonoverlapping requests issued.
     pub issued: u64,
@@ -581,44 +542,53 @@ pub struct RequestLifecycleReplaySummary {
     pub resets: usize,
 }
 
-/// Replay decoder-v1 quadruples against the existing request lifecycle model.
-/// Read at most 512 bytes. Requests and logical time stay bounded by the decoder.
+/// Replay at most [`MAX_HISTORY_BYTES`] bytes of decoder-v1 quadruples
+/// through [`PeerState`]. Requests and logical time stay bounded by the decoder.
+///
+/// The state keeps its invariants after every input. A body matches exactly
+/// the written request that covers its height, and a tampered body names that
+/// request's owner. Only a started write that expires charges the peer with a
+/// timeout, and only requests the peer saw count toward its stall.
 pub fn replay_request_lifecycle_bytes(data: &[u8]) -> RequestLifecycleReplaySummary {
     run(decode(data), |_| {})
 }
 
+/// Decoder v1: each four bytes are one input. The first byte chooses the input;
+/// the others choose its arguments.
 fn decode(data: &[u8]) -> impl Iterator<Item = Input> + '_ {
-    data[..data.len().min(512)].chunks(4).map(|chunk| {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        let height = u32::from(b) % MAX_HEIGHT + 1;
-        match a % 7 {
-            0 => Input::Issue {
-                start: height,
-                count: u32::from(c % 2) + 1,
-                due_ms: u64::from(d) * 10 + 1,
-            },
-            1 => Input::WriteStarted {
-                pick: usize::from(b),
-            },
-            2 => Input::Body {
-                height,
-                tampered: c & 1 != 0,
-            },
-            3 => Input::Ending {
-                pick: usize::from(b),
-                unavailable: c & 1 != 0,
-                floor: u32::from(d) % (MAX_HEIGHT + 1),
-            },
-            4 => Input::LateEnding { start: height },
-            5 => Input::Expire {
-                advance_ms: u64::from(b) * 10 + 1,
-            },
-            _ => Input::Reset,
-        }
-    })
+    data[..data.len().min(MAX_HISTORY_BYTES)]
+        .chunks(4)
+        .map(|chunk| {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            let d = chunk.get(3).copied().unwrap_or(0);
+            let height = u32::from(b) % MAX_HEIGHT + 1;
+            match a % 7 {
+                0 => Input::Issue {
+                    start: height,
+                    count: u32::from(c % 2) + 1,
+                    due_ms: u64::from(d) * 10 + 1,
+                },
+                1 => Input::WriteStarted {
+                    pick: usize::from(b),
+                },
+                2 => Input::Body {
+                    height,
+                    tampered: c & 1 != 0,
+                },
+                3 => Input::Ending {
+                    pick: usize::from(b),
+                    unavailable: c & 1 != 0,
+                    floor: u32::from(d) % (MAX_HEIGHT + 1),
+                },
+                4 => Input::LateEnding { start: height },
+                5 => Input::Expire {
+                    advance_ms: u64::from(b) * 10 + 1,
+                },
+                _ => Input::Reset,
+            }
+        })
 }
 
 fn run(
@@ -674,53 +644,138 @@ fn run(
     summary
 }
 
-#[cfg(test)]
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Writes, bodies, endings, expiry, resets, and replacements keep each
-    /// request's facts, the next deadline, and the stall accounting equal to
-    /// the model's.
-    #[test]
-    fn request_lifecycle_matches_the_model(inputs in prop::collection::vec(input(), 1..80)) {
-        run(inputs, |_| {});
-    }
-    #[test]
-    fn lifecycle_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
-        replay_request_lifecycle_bytes(&bytes);
-    }
-}
-
+/// Expires a written request and an unwritten one, matches a replacement
+/// request, refuses a stale ending, and resets the remaining window.
 #[cfg(test)]
 const WITNESS: &[u8] = &[
     0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0,
     5, 0, 0, 0, 0, 2, 0, 0, 6, 0, 0, 0,
 ];
 
+#[cfg(test)]
+machine_target_tests! {
+    replay: replay_request_lifecycle_bytes,
+    target: "block_request_lifecycle",
+    decoder: 1,
+    witness: WITNESS => RequestLifecycleReplaySummary {
+        transitions: 11,
+        issued: 4,
+        written_timeouts: 1,
+        skipped_writes: 1,
+        matched_bodies: 1,
+        stale_endings: 1,
+        resets: 1,
+    },
+}
+
+/// An ending retries the original range only for `RangeUnavailable` above the
+/// floor. A short `BlocksDone` retries the missing heights, and so does an
+/// ending the floor partly covered. An ending the floor and the received
+/// bodies cover is satisfied, and its unreceived heights at or below the floor
+/// return without a retry.
 #[test]
-#[allow(
-    clippy::print_stdout,
-    reason = "witnesses print applicability counters"
-)]
-fn lifecycle_witness_exercises_replacement_timeout_and_skipped_write() {
-    let summary = replay_request_lifecycle_bytes(WITNESS);
-    assert_eq!(
-        summary,
-        RequestLifecycleReplaySummary {
-            transitions: 11,
-            issued: 4,
-            written_timeouts: 1,
-            skipped_writes: 1,
-            matched_bodies: 1,
-            stale_endings: 1,
-            resets: 1,
+fn an_ending_retries_by_its_outcome_and_the_floor() {
+    use Disposition::{RetryMissing, RetryOriginal, Satisfied};
+    // (start, count, received, outcome is unavailable, floor, disposition, stale)
+    let cases: [(u32, u32, &[u32], bool, u32, Disposition, &[u32]); 8] = [
+        (3, 2, &[], true, 0, RetryOriginal, &[]),
+        (3, 2, &[], false, 0, RetryMissing, &[]),
+        (3, 2, &[3], true, 0, RetryOriginal, &[]),
+        (3, 2, &[], true, 3, RetryMissing, &[3]),
+        (3, 2, &[], false, 3, RetryMissing, &[3]),
+        (3, 2, &[], true, 4, Satisfied, &[3, 4]),
+        (3, 2, &[4], false, 3, Satisfied, &[3]),
+        (3, 1, &[], false, 3, Satisfied, &[3]),
+    ];
+    for (start, count, received, unavailable, floor, disposition, stale) in cases {
+        let mut harness = Harness::new();
+        let now = Instant::now();
+        harness.issue(1, start, count, now, now + LIVENESS_TIMEOUT);
+        let key = harness.keys[&1];
+        for height in received {
+            harness
+                .state
+                .record_body(key, block::Height(*height), 1, now, LIVENESS_TIMEOUT);
         }
-    );
+        let outcome = if unavailable {
+            Outcome::Unavailable
+        } else {
+            Outcome::Done
+        };
+        let ending = harness
+            .state
+            .on_ending(block::Height(start), outcome, block::Height(floor))
+            .expect("a live request accepts its ending");
+        let case = format!("{start}+{count}, received {received:?}, {outcome:?}, floor {floor}");
+        assert_eq!(ending.disposition, disposition, "{case}");
+        assert_eq!(
+            ending.stale_heights,
+            stale.iter().copied().map(block::Height).collect::<Vec<_>>(),
+            "{case}"
+        );
+    }
+}
+
+/// A body for a height its request already received is a duplicate, whether
+/// or not its hash matches: the repeat is checked before the hash.
+#[test]
+fn a_repeated_height_is_a_duplicate_before_its_hash_is_compared() {
+    for tampered in [false, true] {
+        let summary = run(
+            [
+                Input::Issue {
+                    start: 1,
+                    count: 2,
+                    due_ms: 1_000,
+                },
+                Input::WriteStarted { pick: 0 },
+                Input::Body {
+                    height: 1,
+                    tampered: false,
+                },
+                Input::Body {
+                    height: 1,
+                    tampered,
+                },
+            ],
+            |_| {},
+        );
+        assert_eq!(summary.matched_bodies, 1, "tampered repeat: {tampered}");
+    }
+}
+
+/// The liveness deadline runs from the first request since the last body, so
+/// later requests cannot push it out. A body restarts it while work is
+/// outstanding, and a body that leaves the window idle disarms it.
+#[test]
+fn the_liveness_deadline_runs_from_the_first_unanswered_request() {
+    let start = Instant::now();
+    let far = start + Duration::from_secs(3_600);
+    let later = start + Duration::from_secs(1);
+    let mut harness = Harness::new();
+    harness.issue(1, 1, 1, start, far);
+    harness.issue(2, 2, 1, later, far);
     assert_eq!(
-        replay_request_lifecycle_bytes(&[]),
-        RequestLifecycleReplaySummary::default()
+        harness.state.window.block_liveness_deadline,
+        Some(start + LIVENESS_TIMEOUT)
     );
-    println!("tier=Machine target=block_request_lifecycle decoder=1 {summary:?}");
+
+    let key = harness.keys[&1];
+    assert!(harness
+        .state
+        .record_body(key, block::Height(1), 1, later, LIVENESS_TIMEOUT));
+    harness.finish(key, Disposition::Satisfied);
+    assert_eq!(
+        harness.state.window.block_liveness_deadline,
+        Some(later + LIVENESS_TIMEOUT)
+    );
+
+    let key = harness.keys[&2];
+    assert!(harness
+        .state
+        .record_body(key, block::Height(2), 1, later, LIVENESS_TIMEOUT));
+    harness.finish(key, Disposition::Satisfied);
+    assert_eq!(harness.state.window.block_liveness_deadline, None);
 }
 
 #[test]
@@ -732,7 +787,7 @@ fn lifecycle_witness_rejects_lost_no_progress_charge() {
 }
 
 #[test]
-#[should_panic(expected = "block/request-lifecycle")]
+#[should_panic(expected = "outstanding work keeps a liveness deadline")]
 fn lifecycle_witness_rejects_lost_liveness_deadline() {
     run(decode(WITNESS), |harness| {
         harness.state.window.block_liveness_deadline = None;

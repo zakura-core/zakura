@@ -58,6 +58,17 @@ impl ZakuraTestNode {
         self.endpoint.supervisor()
     }
 
+    /// Wrap a test legacy service with the node's production dual-stack inventory router.
+    pub fn dual_stack_inventory(
+        &self,
+        legacy: tower::util::BoxCloneService<crate::Request, crate::Response, BoxError>,
+    ) -> tower::util::BoxCloneService<crate::Request, crate::Response, BoxError> {
+        tower::util::BoxCloneService::new(crate::zakura::ZakuraDualStackService::new_with_trace(
+            legacy, self.supervisor(), true, ZakuraTrace::noop(),
+            Config::default().zakura.stream_open_rate_per_second,
+        ))
+    }
+
     /// Clone the underlying endpoint for test-only external drivers.
     #[cfg(test)]
     pub(crate) fn endpoint(&self) -> ZakuraEndpoint {
@@ -220,6 +231,9 @@ pub struct ZakuraTestNodeBuilder {
     tracer: JsonlTracer,
     service: Option<Arc<dyn Service>>,
     service_factory: Option<Box<dyn FnOnce(ZakuraSupervisorHandle) -> Arc<dyn Service> + Send>>,
+    /// Real services registered beside the base service, as the
+    /// application registers its own.
+    custom_services: Vec<crate::zakura::CustomService>,
     discovery_direct_addrs: Vec<SocketAddr>,
     extra_advertised_services: Vec<ZakuraServiceId>,
     header_sync: Option<TestHeaderSyncStartup>,
@@ -284,6 +298,7 @@ impl ZakuraTestNodeBuilder {
             tracer: JsonlTracer::noop(),
             service: None,
             service_factory: None,
+            custom_services: Vec::new(),
             discovery_direct_addrs: Vec::new(),
             extra_advertised_services: Vec::new(),
             header_sync: None,
@@ -346,6 +361,16 @@ impl ZakuraTestNodeBuilder {
     /// Install a custom service instead of the default recorder.
     pub fn service(mut self, service: Arc<dyn Service>) -> Self {
         self.service = Some(service);
+        self
+    }
+
+    /// Register `service` beside the base service, as the application
+    /// registers its own. A `tx-relay` service's live-session record reaches
+    /// the node's supervisor, so a legacy adapter installed with
+    /// [`Self::service_from_supervisor`] leaves each peer with a live session
+    /// to it.
+    pub fn custom_service(mut self, service: crate::zakura::CustomService) -> Self {
+        self.custom_services.push(service);
         self
     }
 
@@ -453,7 +478,12 @@ impl ZakuraTestNodeBuilder {
             factory = factory.quic_config(quic);
         }
         let endpoint = factory.endpoint(self.seed).await?;
-        let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip);
+        let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip)
+            .with_tx_relay_sessions(
+                self.custom_services
+                    .iter()
+                    .find_map(|custom| custom.tx_relay_sessions.clone()),
+            );
         let recorder = InboundRecorder::new(usize::from(self.limits.max_inbound_queue_depth));
         let base_service = if let Some(factory) = self.service_factory {
             factory(supervisor.clone())
@@ -615,7 +645,7 @@ impl ZakuraTestNodeBuilder {
             base_service,
             discovery_service,
             None,
-            Vec::new(),
+            self.custom_services,
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),

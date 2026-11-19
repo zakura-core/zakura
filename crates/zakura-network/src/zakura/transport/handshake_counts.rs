@@ -22,6 +22,19 @@ pub enum HandshakeCadenceAdmission {
 /// TLS attempts the node starts per second, per source validation state.
 const NODE_HANDSHAKES_PER_SECOND: u32 = 24;
 
+/// The node tokens that only a host within its share may take (F-800).
+///
+/// Above it, any host takes tokens, so one host's default burst of 16
+/// (`DEFAULT_ZAKURA_MAX_CONNS_PER_IP`) fits in a full bucket. In it, each
+/// host draws on its [`host_share_cadence`], an eighth of the node's rate.
+/// A few busy hosts then keep the bucket near the reserve, and the reserve
+/// stays open to every other host while fewer than eight hosts spend their
+/// whole share.
+const NODE_HANDSHAKE_RESERVE: u32 = 8;
+
+/// The hosts whose shares add up to the node's rate.
+const NODE_HANDSHAKE_SHARES: u32 = 8;
+
 /// Bounds the TLS attempts the whole node starts, per source validation
 /// state, whatever their addresses. A full bucket admits the default inbound
 /// handshake share, 24, back to back.
@@ -29,6 +42,18 @@ pub fn node_handshake_cadence() -> Cadence {
     let interval = Duration::from_secs(1) / NODE_HANDSHAKES_PER_SECOND;
     Cadence {
         capacity: NODE_HANDSHAKES_PER_SECOND,
+        refill_interval: interval,
+        send_interval: interval,
+    }
+}
+
+/// One host's share of the node's reserve: one token, refilling at an
+/// eighth of the node's rate. One token, not a burst, so busy hosts can't
+/// save up shares and empty the reserve together.
+fn host_share_cadence() -> Cadence {
+    let interval = node_handshake_cadence().refill_interval * NODE_HANDSHAKE_SHARES;
+    Cadence {
+        capacity: 1,
         refill_interval: interval,
         send_interval: interval,
     }
@@ -79,48 +104,74 @@ pub struct HandshakeCounts {
 /// The handshake charges of one source validation state.
 #[derive(Debug, Default)]
 struct CadenceLedger {
-    /// One bucket per admission host that still owes tokens.
-    hosts: HashMap<IpAddr, Bucket>,
+    /// The buckets of each admission host that still owes tokens.
+    hosts: HashMap<IpAddr, HostBuckets>,
     /// The node's bucket, created full at the first charge.
     node: Option<Bucket>,
 }
 
+/// One admission host's handshake charges.
+#[derive(Debug)]
+struct HostBuckets {
+    /// The host's own cadence, [`handshake_cadence`].
+    cadence: Bucket,
+    /// The host's share of the node's reserve, [`host_share_cadence`].
+    share: Bucket,
+}
+
+impl HostBuckets {
+    fn new(max_connections_per_ip: usize, now: Instant) -> Self {
+        Self {
+            cadence: Bucket::new(handshake_cadence(max_connections_per_ip), now),
+            share: Bucket::new(host_share_cadence(), now),
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        self.cadence.refill_capped(now);
+        self.share.refill_capped(now);
+    }
+
+    fn is_full(&self) -> bool {
+        self.cadence.is_full() && self.share.is_full()
+    }
+}
+
 impl CadenceLedger {
-    /// Takes one token from `host`'s bucket. A new host enters only while the
-    /// ledger, after it drops full buckets, holds fewer than `max_hosts`.
-    fn admit_host(
+    /// The buckets of `host`, refilled at `now`. A new host enters only
+    /// while the ledger, after it drops full buckets, holds fewer than
+    /// `max_hosts`.
+    fn host(
         &mut self,
         host: IpAddr,
         max_connections_per_ip: usize,
         max_hosts: usize,
         now: Instant,
-    ) -> HandshakeCadenceAdmission {
+    ) -> Option<&mut HostBuckets> {
         if !self.hosts.contains_key(&host) && self.hosts.len() >= max_hosts {
-            self.hosts.retain(|_, bucket| {
-                bucket.refill_capped(now);
-                !bucket.is_full()
+            self.hosts.retain(|_, buckets| {
+                buckets.refill(now);
+                !buckets.is_full()
             });
             if self.hosts.len() >= max_hosts {
-                return HandshakeCadenceAdmission::Capacity;
+                return None;
             }
         }
-        let bucket = self
+        let buckets = self
             .hosts
             .entry(host)
-            .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
-        bucket.refill_capped(now);
-        if bucket.take() {
-            HandshakeCadenceAdmission::Admit
-        } else {
-            HandshakeCadenceAdmission::Exhausted
-        }
+            .or_insert_with(|| HostBuckets::new(max_connections_per_ip, now));
+        buckets.refill(now);
+        Some(buckets)
     }
 }
 
 impl HandshakeCounts {
     /// Charges an attempt to the ledger of its source's validation state,
-    /// `validated`: one token from the node's bucket, then one from the
-    /// source's admission host. A refused attempt keeps neither token.
+    /// `validated`: one token from the node's bucket and one from the
+    /// source's admission host. While the node's bucket is in its reserve,
+    /// the host also spends a token of its share. A refused attempt keeps
+    /// no token.
     ///
     /// The ledger retains every depleted address bucket. Full buckets can be
     /// discarded because a new bucket starts full. Each ledger holds at most
@@ -138,17 +189,25 @@ impl HandshakeCounts {
             .node
             .get_or_insert_with(|| Bucket::new(node_handshake_cadence(), now));
         node.refill_capped(now);
-        if !node.take() {
+        let in_reserve = node.tokens() <= NODE_HANDSHAKE_RESERVE;
+        if node.tokens() == 0 {
             return HandshakeCadenceAdmission::NodeExhausted;
         }
-        let admission =
-            ledger.admit_host(admission_host(ip), max_connections_per_ip, max_hosts, now);
-        if admission != HandshakeCadenceAdmission::Admit {
-            if let Some(node) = ledger.node.as_mut() {
-                node.refund();
-            }
+        let Some(host) =
+            ledger.host(admission_host(ip), max_connections_per_ip, max_hosts, now)
+        else {
+            return HandshakeCadenceAdmission::Capacity;
+        };
+        if host.cadence.tokens() == 0 {
+            return HandshakeCadenceAdmission::Exhausted;
         }
-        admission
+        if in_reserve && !host.share.take() {
+            return HandshakeCadenceAdmission::NodeExhausted;
+        }
+        let host_took = host.cadence.take();
+        let node_took = ledger.node.as_mut().is_some_and(Bucket::take);
+        debug_assert!(host_took && node_took, "both buckets held a token");
+        HandshakeCadenceAdmission::Admit
     }
 
     /// Refunds an attempt QUIC cancelled before TLS to the ledger
@@ -159,9 +218,10 @@ impl HandshakeCounts {
             node.refill_capped(now);
             node.refund();
         }
-        if let Some(bucket) = ledger.hosts.get_mut(&admission_host(ip)) {
-            bucket.refill_capped(now);
-            bucket.refund();
+        if let Some(host) = ledger.hosts.get_mut(&admission_host(ip)) {
+            host.refill(now);
+            host.cadence.refund();
+            host.share.refund();
         }
     }
 
@@ -648,7 +708,8 @@ mod tests {
     /// One address retries every millisecond for ten seconds. It stays
     /// within its own cadence, and a fresh address's first attempt is
     /// admitted at any point, because one address's rate is below the
-    /// node's (conn-7).
+    /// node's (conn-7). The busy address's burst can reach the node's
+    /// reserve, where its share refuses it.
     #[test]
     fn a_fresh_address_admits_while_another_is_saturated() {
         let host = handshake_cadence(16);
@@ -663,8 +724,11 @@ mod tests {
                 let now = start + Duration::from_millis(u64::from(ms));
                 match counts.admit_cadence(attacker, validated, 16, 124, now) {
                     HandshakeCadenceAdmission::Admit => entries += 1,
-                    HandshakeCadenceAdmission::Exhausted => exhausted += 1,
-                    other => panic!("one address never reaches {other:?}"),
+                    HandshakeCadenceAdmission::Exhausted
+                    | HandshakeCadenceAdmission::NodeExhausted => exhausted += 1,
+                    HandshakeCadenceAdmission::Capacity => {
+                        panic!("one address never fills the ledger")
+                    }
                 }
                 assert_within_cadence(entries, host, now - start, "attacker");
                 if ms % 997 == 0 {
@@ -677,6 +741,50 @@ mod tests {
                 }
             }
             assert!(exhausted > 9_000, "the attacker is saturated");
+        }
+    }
+
+    /// F-800: seven addresses each retry every millisecond, far above
+    /// their own cadence and together above the node's rate. They keep the
+    /// node's bucket near its reserve, but each spends at most its share of
+    /// the reserve, so a fresh address and a returning one that retries once
+    /// a second are always admitted.
+    #[test]
+    fn seven_busy_addresses_cannot_refuse_another() {
+        let busy: Vec<IpAddr> = (1..=7u8)
+            .map(|index| IpAddr::from([203, 0, 113, index]))
+            .collect();
+        let returning = "192.0.2.200".parse().unwrap();
+        for validated in [false, true] {
+            let mut counts = HandshakeCounts::default();
+            let start = Instant::now();
+            let mut node_refusals = 0;
+            for ms in 0..10_000u32 {
+                let now = start + Duration::from_millis(u64::from(ms));
+                for ip in &busy {
+                    if counts.admit_cadence(*ip, validated, 16, 124, now)
+                        == HandshakeCadenceAdmission::NodeExhausted
+                    {
+                        node_refusals += 1;
+                    }
+                }
+                if ms % 997 == 0 {
+                    let fresh = IpAddr::from([192, 0, 2, u8::try_from(ms / 997).unwrap()]);
+                    assert_eq!(
+                        counts.admit_cadence(fresh, validated, 16, 124, now),
+                        HandshakeCadenceAdmission::Admit,
+                        "a fresh address at {ms} ms"
+                    );
+                }
+                if ms % 1_000 == 500 {
+                    assert_eq!(
+                        counts.admit_cadence(returning, validated, 16, 124, now),
+                        HandshakeCadenceAdmission::Admit,
+                        "a returning address at {ms} ms"
+                    );
+                }
+            }
+            assert!(node_refusals > 0, "the busy addresses reach the reserve");
         }
     }
 

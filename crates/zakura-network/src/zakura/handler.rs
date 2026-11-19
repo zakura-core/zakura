@@ -15673,15 +15673,17 @@ mod tests {
             handler.finish_admission(false);
         }
         assert_ne!(handler.admit(&incoming), Admit::Accept);
-        let other_host = IncomingInfo {
-            remote: "198.51.100.42:8234".parse()?,
+        // The node's bucket kept all 16 charges, so 8 tokens remain. They
+        // are its reserve, where each other address gets one.
+        let other_host = |host: u8| IncomingInfo {
+            remote: std::net::SocketAddr::from(([198, 51, 100, host], 8234)),
             ..incoming
         };
-        for _ in DEFAULT_ZAKURA_MAX_CONNS_PER_IP..24 {
-            assert_eq!(handler.admit(&other_host), Admit::Accept);
+        for host in 0..8 {
+            assert_eq!(handler.admit(&other_host(host)), Admit::Accept);
             handler.finish_admission(false);
         }
-        assert_ne!(handler.admit(&other_host), Admit::Accept);
+        assert_ne!(handler.admit(&other_host(8)), Admit::Accept);
         timeout(Duration::from_secs(10), refusal).await?;
         Ok(())
     }

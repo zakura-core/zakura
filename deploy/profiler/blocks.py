@@ -166,7 +166,10 @@ TRACE_TABLES = {
     "handshake": ("peer_upgraded",),
     "commit_state": ("commit_start", "commit_finish"),
     "chain_tip": ("tip_published",),
+    # Read only by the block source summary (`block_sources.py`), not by the stage timeline.
+    "delivery_score": ("delivery_sample", "block_missed"),
 }
+STAGE_TABLES = frozenset(TRACE_TABLES) - {"delivery_score"}
 # Rows that say a peer and this node exchanged word of a block, and which step each is:
 # the peer told us ("heard"), we announced the block's header to the peer before having
 # the block ("announced"), we told the peer we had the block ("told"), the peer asked us
@@ -633,8 +636,10 @@ class TraceFollower:
     waits while bounded reads drain the old file, temporarily allowing a larger table.
     """
 
-    def __init__(self, trace_dir, table_cap_bytes):
+    def __init__(self, trace_dir, table_cap_bytes, also_feed=()):
+        """`also_feed` are functions that also get every parsed row, from every table."""
         self.trim_failure = None
+        self._also_feed = tuple(also_feed)
         self.trace_dir = trace_dir
         self.table_cap_bytes = table_cap_bytes
         self._followers = {}
@@ -662,7 +667,10 @@ class TraceFollower:
                 except ValueError:
                     continue
                 if isinstance(row, dict):
-                    self._stages.feed(row)
+                    if table in STAGE_TABLES:
+                        self._stages.feed(row)
+                    for feed in self._also_feed:
+                        feed(row)
         self._rotate_full_tables()
         return self._stages.finished()
 

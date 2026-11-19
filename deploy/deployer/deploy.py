@@ -658,6 +658,9 @@ def render_node_config(node: Node) -> str:
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
         "ZAKURA_BLOCK": render_table_block("network.zakura", node.zakura),
+        "BLOCK_DOWNLOAD_SCORE_AND_HEDGE": render_table_block(
+            "network.block_download_score_and_hedge", {"enabled": True}
+        ) if node.network == "Mainnet" else "",
         "MEMPOOL_BLOCK": render_table_block("mempool", node.mempool),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,

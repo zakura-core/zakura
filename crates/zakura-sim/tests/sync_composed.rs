@@ -45,7 +45,7 @@ fn each_slot_decodes_to_its_step() {
         [3, 1, 0],
         // Reset to a fork at height 1 + 9 % 7 = 3, ending one above the tip.
         [4, 9, 0],
-        // Hold every mirror range read until 6 s into the run.
+        // Hold every mirror range read for 6 s after its submission.
         [5, 0b0000_0100, 2],
         // Tear down; the rest is never read.
         [7, 0, 0],
@@ -103,7 +103,7 @@ fn each_slot_decodes_to_its_step() {
 }
 
 /// Mirror 0's connection closes after the second admission, the chain
-/// grows by one block, and mirror range reads stall until 3 s in. The run
+/// grows by one block, and each mirror range read stalls for 3 s. The run
 /// violates nothing and reaches no harness failure.
 #[test]
 fn a_composed_close_growth_and_stall_holds() {

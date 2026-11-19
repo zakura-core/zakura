@@ -1,7 +1,7 @@
 //! Claims on receipt order made when a block's header is admitted, and the deadline for its body.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -73,9 +73,9 @@ struct Claim {
 struct MinedBlock {
     height: block::Height,
     order: u64,
-    /// Identifies this record to its guards, so a guard for a pruned record leaves a newer
-    /// record for the same block alone.
-    record: u64,
+    /// Identifies this entry to its guards, so a guard for a pruned entry leaves a newer entry
+    /// for the same block alone.
+    id: u64,
     /// The requests still verifying this block.
     pending: usize,
     /// Whether a request for this block has verified it.
@@ -87,13 +87,14 @@ struct ClaimTable {
     /// The highest verified tip height seen. Claims and mined blocks below it are dropped, and
     /// no claim is made at or below it, so a dropped hash can never be claimed again.
     ///
-    /// It never goes down: after a rollback below it, claims resume once the tip passes it.
+    /// It never goes down. After a rollback below it, blocks at or below it get no claim and are
+    /// ranked by arrival until the tip passes it again.
     floor: block::Height,
     by_hash: HashMap<block::Hash, Claim>,
     /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
     mined: HashMap<block::Hash, MinedBlock>,
-    /// The id of the next [`MinedBlock`] record.
-    next_record: u64,
+    /// The id given to the next [`MinedBlock`].
+    next_mined_id: u64,
 }
 
 impl Default for ClaimTable {
@@ -102,7 +103,7 @@ impl Default for ClaimTable {
             floor: block::Height::MIN,
             by_hash: HashMap::new(),
             mined: HashMap::new(),
-            next_record: 0,
+            next_mined_id: 0,
         }
     }
 }
@@ -199,8 +200,8 @@ pub struct PendingClaims {
 }
 
 impl AnnouncementClaims {
-    /// Reserves a place in receipt order for each of `headers` that is just above
-    /// `verified_tip` and has no claim yet.
+    /// Reserves a place in receipt order for each of `headers` that is one or two blocks above
+    /// the highest verified tip seen, including `verified_tip`, and has no claim yet.
     ///
     /// Call this when a header apply starts and commit the result once the header chain has
     /// accepted the headers. The order and time are taken now, and bodies take them from now
@@ -316,23 +317,26 @@ impl AnnouncementClaims {
         table
             .mined
             .retain(|_, mined| height - mined.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
-        let next_record = table.next_record;
-        let mined = table.mined.entry(hash).or_insert(MinedBlock {
-            height,
-            order,
-            record: next_record,
-            pending: 0,
-            verified: false,
-        });
+        let table = &mut *table;
+        let next_mined_id = table.next_mined_id;
+        let mined = match table.mined.entry(hash) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                table.next_mined_id = next_mined_id.wrapping_add(1);
+                entry.insert(MinedBlock {
+                    height,
+                    order,
+                    id: next_mined_id,
+                    pending: 0,
+                    verified: false,
+                })
+            }
+        };
         mined.pending = mined.pending.saturating_add(1);
-        let record = mined.record;
-        if record == next_record {
-            table.next_record = next_record.wrapping_add(1);
-        }
         MinedGuard {
             claims: self.clone(),
             hash,
-            record,
+            id: mined.id,
         }
     }
 
@@ -398,32 +402,30 @@ impl Drop for PendingClaims {
 pub(in crate::block) struct MinedGuard {
     claims: AnnouncementClaims,
     hash: block::Hash,
-    record: u64,
-}
-
-impl MinedGuard {
-    /// This guard's record, unless it was pruned.
-    fn record<'a>(&self, table: &'a mut ClaimTable) -> Option<&'a mut MinedBlock> {
-        table
-            .mined
-            .get_mut(&self.hash)
-            .filter(|mined| mined.record == self.record)
-    }
+    id: u64,
 }
 
 impl MinedGuard {
     /// Keeps the record after this guard is gone, because the mined block verified.
     pub(in crate::block) fn keep(self) {
-        if let Some(mined) = self.record(&mut self.claims.table()) {
+        if let Some(mined) = self.own_entry(&mut self.claims.table()) {
             mined.verified = true;
         }
+    }
+
+    /// The entry this guard holds, unless it was pruned.
+    fn own_entry<'a>(&self, table: &'a mut ClaimTable) -> Option<&'a mut MinedBlock> {
+        table
+            .mined
+            .get_mut(&self.hash)
+            .filter(|mined| mined.id == self.id)
     }
 }
 
 impl Drop for MinedGuard {
     fn drop(&mut self) {
         let mut table = self.claims.table();
-        let Some(mined) = self.record(&mut table) else {
+        let Some(mined) = self.own_entry(&mut table) else {
             return;
         };
         mined.pending = mined.pending.saturating_sub(1);

@@ -1130,10 +1130,10 @@ impl ControlledBlockService {
                 let slot = ops.slots.get_mut(&id).expect("a running slot stays");
                 match slot.caller.take() {
                     Some(waker) => {
-                        slot.stage = SlotStage::Replied(read);
+                        slot.stage = SlotStage::Replied(*read);
                         (true, Some(waker), None, None)
                     }
-                    None => (false, None, ops.slots.remove(&id), Some(read)),
+                    None => (false, None, ops.slots.remove(&id), Some(*read)),
                 }
             }
         };
@@ -1383,7 +1383,7 @@ impl ControlledBlockService {
                     // blocking job does.
                     Err(error) => (ResultIdentity::ReadFailed, Err(error)),
                 };
-                Ok((identity, Reply::Read(read)))
+                Ok((identity, Reply::Read(Box::new(read))))
             }
             (request, outcome) => unreachable!(
                 "the contract allowed {} for {} at {stage:?}",
@@ -1755,8 +1755,9 @@ enum Reply {
     Handle(bool),
     /// Nowhere.
     None,
-    /// To a read's caller.
-    Read(Result<BlockRangeReadResult, BoxError>),
+    /// To a read's caller. Boxed because a read's blocks dwarf the other
+    /// variants.
+    Read(Box<Result<BlockRangeReadResult, BoxError>>),
 }
 
 /// The engine request a record carries, as the driver's record arms and

@@ -2638,48 +2638,24 @@ fn work_queue_first_unclaimed_above_is_floor_anchored_not_frontier_anchored() {
 }
 
 #[test]
-fn work_queue_first_unclaimed_above_ignores_entries_retained_at_or_below_a_forward_reset() {
-    // A *forward* destructive reset pins the floor and pops only the `> floor`
-    // suffix, so the whole `(old_floor, new_floor]` prefix stays claimed at or
-    // below the new floor. Those entries must not count toward the contiguity
-    // check, or they inflate it until a sparse range above the floor reads as
-    // gap-free and the cursor skips the very holes it exists to find.
+fn work_queue_first_unclaimed_above_ignores_entries_at_or_below_a_leading_caller_floor() {
+    // A caller floor ahead of the queue's own floor sits above some entries.
+    // Those entries must not count toward the contiguity check, or they
+    // inflate it until a sparse range above the caller floor reads as gap-free
+    // and the cursor skips the very holes it exists to find.
     let queue = work_queue_with(
         5,
-        (6..=20).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+        [11, 12, 15, 16].map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
     );
-    queue.reset_above(block::Height(12));
-    queue.extend(
-        test_work_scope(),
-        [
-            needed(15, BlockSizeEstimate::Advertised(100)),
-            needed(16, BlockSizeEstimate::Advertised(100)),
-        ],
-    );
+    // Keep one entry at or below the caller floor in each map.
+    queue.take_in_range(block::Height(12), block::Height(12), 1);
     assert_eq!(
         queue.first_unclaimed_above(block::Height(12)),
         Some(block::Height(13)),
-        "13 is unclaimed; the retained 6..=12 prefix must not hide it",
+        "13 is unclaimed; the entries at 11 and 12 must not hide it",
     );
 
-    // The same holds once the retained prefix is in flight rather than pending.
-    let queue = work_queue_with(
-        5,
-        (6..=20).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
-    );
-    queue.take_in_range(block::Height(6), block::Height(12), 7);
-    queue.reset_above(block::Height(12));
-    queue.extend(
-        test_work_scope(),
-        [needed(15, BlockSizeEstimate::Advertised(100))],
-    );
-    assert_eq!(
-        queue.first_unclaimed_above(block::Height(12)),
-        Some(block::Height(13)),
-    );
-
-    // With the hole filled, the fast path still reports the forward cursor even
-    // though the retained prefix is present.
+    // With the holes filled, the walk still reports the forward cursor.
     queue.extend(
         test_work_scope(),
         [
@@ -2689,7 +2665,7 @@ fn work_queue_first_unclaimed_above_ignores_entries_retained_at_or_below_a_forwa
     );
     assert_eq!(
         queue.first_unclaimed_above(block::Height(12)),
-        Some(block::Height(16)),
+        Some(block::Height(17)),
     );
 }
 
@@ -3813,9 +3789,10 @@ fn work_queue_advance_floor_and_reset_above_gc_both_maps() {
     assert!(queue.pending_contains(block::Height(4)));
 
     // reset_above drops > floor from both maps (reset dropped their buffers).
+    // Raising the floor also drops the committed h4, as advance_floor would.
     queue.take_in_range(block::Height(4), block::Height(4), 1); // h4 → in flight
     queue.reset_above(block::Height(4));
-    assert!(queue.in_flight_contains(block::Height(4)));
+    assert!(!queue.in_flight_contains(block::Height(4)));
     assert!(!queue.pending_contains(block::Height(5)));
     assert!(!queue.pending_contains(block::Height(6)));
     assert_eq!(queue.pending_len(), 0);

@@ -20,4 +20,3 @@ also_violates = ["header-sync/outstanding-work-bounded"]
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.json"
-plan = "crates/zakura-sim/tests/fixtures/header-retire-receiving-close.plan"

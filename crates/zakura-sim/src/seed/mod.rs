@@ -281,22 +281,15 @@ pub fn load(set: SeedSet, harness: Option<&str>) -> SeedReport {
         .collect();
     let duplicates: BTreeSet<String> = duplicates.into_iter().map(str::to_owned).collect();
     for seed in seeds.into_iter().filter(|seed| seed.set == set) {
-        let entry = match harness::find(&seed.harness) {
-            Ok(entry) => entry,
-            Err(_) => {
-                let error = SeedError::UnknownHarness(seed.harness.clone());
-                report.rejected.push(Failed { seed, error });
-                continue;
-            }
-        };
-        if harness.is_some_and(|name| name != entry.name) {
+        let known = harness::find(&seed.harness).is_ok();
+        if known && harness.is_some_and(|name| name != seed.harness) {
             report.other_harnesses += 1;
             continue;
         }
         let checked = if duplicates.contains(&seed.name) {
             Err(SeedError::DuplicateName)
         } else {
-            validate(entry, &seed)
+            check(&seed)
         };
         match checked {
             Ok(()) => report.admitted.push(seed),
@@ -376,8 +369,13 @@ pub fn from_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_owned())
 }
 
-/// Checks `seed` against `entry`.
-fn validate(entry: &HarnessEntry, seed: &Seed) -> Result<(), SeedError> {
+/// Checks `seed` on its own: its harness is registered and accepts its
+/// input, the decoded scenario round-trips, it names its source, and its
+/// witnesses are registered, unique and fit its set. [`load`] also checks
+/// that no other seed has its name.
+pub fn check(seed: &Seed) -> Result<(), SeedError> {
+    let entry = harness::find(&seed.harness)
+        .map_err(|_| SeedError::UnknownHarness(seed.harness.clone()))?;
     if !entry.accepts_input(&seed.input) {
         return Err(SeedError::OtherGenerator);
     }

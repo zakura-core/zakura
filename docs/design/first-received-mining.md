@@ -23,16 +23,17 @@ That penalizes including transactions.
 
 The reservation is called a claim. Five rules define it:
 
-- **A header claim needs a fully validated header.** Native header sync reserves the
-  order and the time when it starts applying a header, so a body that arrives
-  during the apply already takes them. The claim is kept once state has
-  accepted the header, by which point the header has passed Equihash, its
-  target, parent linkage and the contextual difficulty and time rules. Applies
-  of the same header from several peers share the first reservation. If none
-  of them succeeds, the claim is removed, and a later apply of that header
-  claims from its own start, which can only rank the block later. A header
-  deferred for a future timestamp gets no claim. Only headers one or two
-  blocks above the verified tip are claimed, so catch-up creates none.
+- **A header claim needs a fully validated header.** Native header sync
+  reserves the order and the time when it starts applying a header, so a body
+  that arrives during the apply already takes them. The claim is kept once
+  state has accepted the header, by which point the header has passed
+  Equihash, its target, parent linkage and the contextual difficulty and time
+  rules. Applies of the same header from several peers share the first
+  reservation. If none of them succeeds, the claim is removed, and a later
+  apply of that header claims from its own start, which can only rank the
+  block later. A header deferred for a future timestamp gets no claim. Only
+  headers one or two blocks above the verified tip are claimed, so catch-up
+  creates none.
 - **A legacy `inv` claims without a header check.** The first `inv` that names
   only one block records the order and the time it arrived. An `inv` naming
   several blocks answers a query and records nothing. This is safe without
@@ -50,20 +51,24 @@ The reservation is called a claim. Five rules define it:
   `inv` record records nothing. Reading a claim does not use it up, so an
   invalid body under the same hash cannot take it. A body whose block holds
   both takes the earlier order among those still in force, so an `inv` never
-  makes the outcome worse than the header claim alone. The header table holds
-  64 claims. When it is full it refuses new claims and never
-  drops old ones. A claim is removed when no apply covering it succeeds, or
-  at the first header apply after the verified tip passes its height, where
-  no new claim can be made. That floor is the highest verified tip seen and
-  never goes down, so after a rollback blocks at or below it get no claim and
-  are ranked by arrival until the tip passes it again.
-  The `inv` store holds 512 blocks, and each entry lasts 4 seconds, twice the
-  body deadline, so a late body is still counted as expired. When it is full
-  of unexpired entries it refuses new blocks. Each legacy connection passes at
-  most 2 `inv`s per 2 seconds to the store, so one peer cannot fill it. A
-  sustained flood can at worst return blocks to arrival order. A block
-  announced again after its entry has gone counts as newly announced, which
-  gives a withholder nothing it could not get by announcing late.
+  makes the outcome worse than the header claim alone.
+
+  The header table holds 64 claims. When it is full it refuses new claims and
+  never drops old ones. A claim is removed when no apply covering it
+  succeeds, or at the first header apply or legacy `inv` after the verified
+  tip passes its height, where no new claim can be made. That floor is the
+  highest verified tip seen and never goes down, so after a rollback blocks at
+  or below it get no claim and are ranked by arrival until the tip passes it
+  again.
+
+  The `inv` store holds 512 blocks. Entries older than 4 seconds, twice the
+  body deadline, are dropped when a new block is recorded, so a late body is
+  still counted as expired. A store full of newer entries refuses new blocks.
+  Each legacy connection passes at most 2 `inv`s per 2 seconds to the store,
+  so one peer cannot fill it, and a sustained flood can at worst return blocks
+  to arrival order. A block announced again after its entry was dropped counts
+  as newly announced, which gives a withholder nothing it could not get by
+  announcing late.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.

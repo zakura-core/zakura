@@ -49,12 +49,16 @@ impl Pct {
             step: 0,
             demoted: u64::from(u32::MAX),
         };
-        let mut changes: Vec<u64> = (0..CHANGES)
-            .map(|_| {
-                let scale = 4 << (2 * (pct.next() % SCALES));
-                1 + pct.next() % scale
-            })
-            .collect();
+        let mut changes: Vec<u64> = Vec::with_capacity(CHANGES);
+        for _ in 0..CHANGES {
+            let scale = 4 << (2 * (pct.next() % SCALES));
+            let mut change = 1 + pct.next() % scale;
+            // Each change point demotes once, so two can't share a step.
+            while changes.contains(&change) {
+                change += 1;
+            }
+            changes.push(change);
+        }
         changes.sort_unstable();
         pct.changes = changes;
         pct
@@ -115,4 +119,23 @@ fn mix(x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pct, CHANGES};
+
+    /// Every seed draws [`CHANGES`] distinct change points, seed 18 among
+    /// them, whose two draws both land on step 3.
+    #[test]
+    fn change_points_are_distinct() {
+        for seed in 0..10_000 {
+            let changes = Pct::new(seed).changes;
+            assert_eq!(changes.len(), CHANGES, "seed {seed}");
+            assert!(
+                changes.windows(2).all(|pair| pair[0] < pair[1]),
+                "seed {seed}: {changes:?}"
+            );
+        }
+    }
 }

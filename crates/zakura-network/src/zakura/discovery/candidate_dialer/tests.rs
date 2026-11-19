@@ -12,7 +12,7 @@ use zakura_quic::NodeId;
 
 use super::replay::*;
 use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
-use super::state::{CandidateAddress, CandidateDialerState};
+use super::state::{CandidateAddress, CandidateDialerState, MAX_DIAL_BACKOFF_ENTRIES};
 use super::*;
 use crate::zakura::{canonical_ip, machine_test::machine_target_tests};
 
@@ -270,6 +270,70 @@ async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
         second_attempt,
     );
     assert!(!state.is_backed_off(failing_node, ip, second_attempt + Duration::from_secs(60)));
+}
+
+/// disco-23: a failure past the cap evicts the entry with the earliest
+/// `retry_at`, ties broken by node and then IP, and keeps the rest.
+#[tokio::test(start_paused = true)]
+async fn a_full_dial_history_evicts_the_earliest_retry() {
+    let node = node_id(1);
+    let start = Instant::now();
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let ips_per_attempt = 8;
+    let ip = |index: usize| {
+        IpAddr::from(std::net::Ipv4Addr::from(
+            u32::try_from(index).expect("the test index fits u32"),
+        ))
+    };
+    // Each attempt fails a millisecond after the last, so earlier attempts
+    // retry earlier.
+    let attempts = MAX_DIAL_BACKOFF_ENTRIES / ips_per_attempt;
+    for attempt in 0..attempts {
+        let ips: Vec<_> = (0..ips_per_attempt)
+            .map(|offset| ip(attempt * ips_per_attempt + offset))
+            .collect();
+        let failed_at = start + Duration::from_millis(u64::try_from(attempt).expect("fits u64"));
+        settle(
+            &mut state,
+            node,
+            &ips,
+            None,
+            DiscoveryDialResult::Failed,
+            failed_at,
+        );
+    }
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+
+    let late = start + Duration::from_secs(1);
+    let newest = ip(MAX_DIAL_BACKOFF_ENTRIES);
+    settle(
+        &mut state,
+        node,
+        &[newest],
+        None,
+        DiscoveryDialResult::Failed,
+        late,
+    );
+    state.assert_invariants();
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+    assert!(state.is_backed_off(node, newest, late));
+    assert!(
+        !state.is_backed_off(node, ip(0), late),
+        "the earliest retry left"
+    );
+    assert!(state.is_backed_off(node, ip(1), late));
+
+    // A repeat failure updates its entry in place and evicts nothing.
+    settle(
+        &mut state,
+        node,
+        &[newest],
+        None,
+        DiscoveryDialResult::Failed,
+        late,
+    );
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+    assert!(state.is_backed_off(node, ip(1), late));
 }
 
 // V12 F-305587: an ALPN mismatch from one stale address used to put every

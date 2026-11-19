@@ -1,4 +1,11 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use tokio::time::Instant;
 
 use indexmap::IndexSet;
 use zakura_chain::{
@@ -19,6 +26,152 @@ use proptest_derive::Arbitrary;
 fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
     vec(any::<block::Hash>(), 0..100).prop_map(|hashes| hashes.into_iter().collect())
 }
+
+/// The lifetime of a possible second block request, shared by the downloader and peer set.
+#[derive(Clone, Debug)]
+pub struct BlockHedge {
+    started: Instant,
+    state: Arc<Mutex<BlockDownloadState>>,
+}
+
+#[derive(Debug, Default)]
+struct BlockDownloadState {
+    first: Option<FirstDispatch>,
+    hedge: HedgeDispatch,
+    satisfied: bool,
+    legacy_timed_out: bool,
+    legacy_written_before_timeout: bool,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+enum HedgeDispatch {
+    #[default]
+    Open,
+    Closed,
+    Dispatched,
+}
+
+/// The first handoff of this download to a peer. Native peers have no legacy address or score.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FirstDispatch {
+    pub(crate) at: Instant,
+    pub(crate) legacy_peer: Option<PeerSocketAddr>,
+    pub(crate) score: Option<Duration>,
+}
+
+impl BlockHedge {
+    /// How long after starting a download the peer set may dispatch a second request.
+    pub const WINDOW: Duration = Duration::from_secs(5);
+
+    /// Open a second-request window for the download started at `started`.
+    pub fn new(started: Instant) -> Self {
+        Self {
+            started,
+            state: Arc::default(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, BlockDownloadState> {
+        self.state
+            .lock()
+            .expect("block download state is never poisoned")
+    }
+
+    /// Stop new legacy hedges when the primary switches to native or finishes.
+    /// Repeated calls report the same outcome: whether a hedge was already dispatched.
+    pub fn close(&self) -> bool {
+        let mut state = self.state();
+        if state.hedge == HedgeDispatch::Open {
+            state.hedge = HedgeDispatch::Closed;
+        }
+        state.hedge == HedgeDispatch::Dispatched
+    }
+
+    /// Return the age of the download while another request may still be dispatched.
+    pub fn elapsed_if_open(&self) -> Option<Duration> {
+        let state = self.state();
+        let age = self.started.elapsed();
+        (state.hedge == HedgeDispatch::Open && !state.satisfied && age < Self::WINDOW)
+            .then_some(age)
+    }
+
+    /// Claim dispatch at most once, unless completion or expiry has closed the window.
+    pub fn claim_dispatch(&self) -> bool {
+        let mut state = self.state();
+        if state.hedge != HedgeDispatch::Open
+            || state.satisfied
+            || self.started.elapsed() >= Self::WINDOW
+        {
+            return false;
+        }
+        state.hedge = HedgeDispatch::Dispatched;
+        true
+    }
+
+    /// Record that a reply contained the requested block. Already-dispatched exchanges can drain.
+    pub fn mark_satisfied(&self) {
+        self.state().satisfied = true;
+    }
+
+    pub(crate) fn is_satisfied(&self) -> bool {
+        self.state().satisfied
+    }
+
+    pub(crate) fn first_dispatch(&self) -> Option<FirstDispatch> {
+        self.state().first
+    }
+
+    /// Publish the dual-stack deadline before the legacy future is dropped.
+    pub(crate) fn legacy_timeout(&self) {
+        self.state().legacy_timed_out = true;
+    }
+
+    pub(crate) fn legacy_request_written(&self) {
+        let mut state = self.state();
+        state.legacy_written_before_timeout = !state.legacy_timed_out;
+    }
+
+    pub(crate) fn timed_out_after_write(&self) -> bool {
+        let state = self.state();
+        state.legacy_timed_out && state.legacy_written_before_timeout
+    }
+
+    /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
+    /// The closure only enqueues work in a ready service or reserved channel slot.
+    pub(crate) fn dispatch_if_needed<T>(
+        &self,
+        peer: Option<PeerSocketAddr>,
+        score: Option<Duration>,
+        dispatch: impl FnOnce() -> T,
+    ) -> Result<T, crate::BoxError> {
+        let mut state = self.state();
+        if peer.is_some() && state.legacy_timed_out {
+            return Err("legacy block request expired".into());
+        }
+        if state.satisfied {
+            return Err("block already delivered".into());
+        }
+        if state.first.is_none() && score.is_none() && state.hedge == HedgeDispatch::Open {
+            metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
+            // The first dispatch fixes the score used by every later comparison.
+            state.hedge = HedgeDispatch::Closed;
+        }
+        state.first.get_or_insert_with(|| FirstDispatch {
+            at: Instant::now(),
+            legacy_peer: peer,
+            score,
+        });
+        Ok(dispatch())
+    }
+}
+
+impl PartialEq for BlockHedge {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for BlockHedge {}
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -154,6 +307,46 @@ pub enum Request {
         hashes: IndexSet<block::Hash>,
         /// Peer that advertised the inventory.
         source: PeerSource,
+    },
+
+    /// First request for an advertised block with a shared second-request window.
+    BlockByHashPrimary {
+        /// The block to request.
+        hash: block::Hash,
+        /// Preferred source when known.
+        source: Option<PeerSource>,
+        /// Shared with the downloader and the optional second request.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(value = "BlockHedge::new(Instant::now())")
+        )]
+        attempt: BlockHedge,
+    },
+
+    /// Request one block a legacy peer announced, as a second request while a first request for
+    /// it is still outstanding.
+    ///
+    /// The legacy peer set considers only ready peers that announced the block, have no request
+    /// outstanding, and did not get the first request. It sends the request to the one expected
+    /// to answer soonest, but only if that peer should deliver the block clearly before the first
+    /// request does, or if the first request has run well past its expected time (see
+    /// `[network.block_download_score_and_hedge]`). It sends at most one such request per
+    /// block.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks), or fails at once with
+    /// [`NoFasterBlockSource`](crate::NoFasterBlockSource) when no peer was asked, so the caller
+    /// can ask again later.
+    BlockByHashHedge {
+        /// The block to request.
+        hash: block::Hash,
+        /// Shared dispatch window, checked by the peer set after any queue wait.
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(value = "BlockHedge::new(Instant::now())")
+        )]
+        attempt: BlockHedge,
     },
 
     /// Request transactions by their unmined transaction ID.
@@ -363,6 +556,8 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::BlockByHashPrimary { .. } => "BlockByHashPrimary".to_string(),
+            Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
                 format!("TransactionsByIdFrom({})", ids.len())
@@ -401,7 +596,10 @@ impl Request {
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
+            Request::BlocksByHash(_)
+            | Request::BlocksByHashFrom { .. }
+            | Request::BlockByHashPrimary { .. }
+            | Request::BlockByHashHedge { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -426,6 +624,8 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::BlockByHashPrimary { .. }
+                | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
         )
@@ -439,6 +639,9 @@ impl Request {
                 hashes: block_hashes,
                 ..
             } => block_hashes.iter().copied().collect(),
+            Request::BlockByHashPrimary { hash, .. } | Request::BlockByHashHedge { hash, .. } => {
+                HashSet::from([*hash])
+            }
             _ => HashSet::new(),
         }
     }
@@ -455,11 +658,21 @@ impl Request {
         }
     }
 
+    /// Ordinary single-block inventory sent to a peer once a route is selected.
+    pub fn block_by_hash(hash: block::Hash, source: Option<PeerSource>) -> Self {
+        let hashes = std::iter::once(hash).collect();
+        match source {
+            Some(source) => Self::BlocksByHashFrom { hashes, source },
+            None => Self::BlocksByHash(hashes),
+        }
+    }
+
     /// Returns the source attached to a source-aware inventory request.
     pub fn inventory_source(&self) -> Option<PeerSource> {
         match self {
             Request::BlocksByHashFrom { source, .. }
             | Request::TransactionsByIdFrom { source, .. } => Some(source.clone()),
+            Request::BlockByHashPrimary { source, .. } => source.clone(),
             _ => None,
         }
     }

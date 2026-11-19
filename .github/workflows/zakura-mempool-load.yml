@@ -6,12 +6,15 @@ name: Mempool load
 # Boots a droplet from the pre-baked PR-node image (deps + warm cargo cache, see
 # zakura-pr-node-bake.yml), builds zakurad from the chosen ref, generates an
 # isolated local-genesis chain with synthetic premine funds, runs `node_count`
-# zakurad nodes peered on loopback, and blasts funded Orchard transactions at
+# zakurad nodes peered on loopback, and blasts funded shielded transactions at
 # them for `duration_minutes`. Grades throughput, propagation latency,
 # backpressure, and tip convergence, then posts a summary as a PR comment.
 #
-# Set `baseline_ref` to run the same workload twice on the same droplet
-# (baseline first, then the target ref) and get a side-by-side regression table.
+# A run does up to two legs on one droplet, baseline first, and posts a
+# side-by-side table when it has both. By default (`setups: legacy-vs-v2`) both legs build the
+# same commit and differ in node setup: legacy P2P and the classic pool against
+# P2P v2, tx-relay and the pool core. With `setups: v2` or `legacy`, every leg
+# runs that setup: one leg, or two commits when `baseline_ref` is set.
 #
 # The chain is synthetic and isolated: local genesis, a per-run network magic,
 # and no public peers. No Mainnet state and no real funds are involved.
@@ -26,8 +29,13 @@ on:
         description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
         required: false
       baseline_ref:
-        description: "Optional second ref to A/B against (e.g. the merge base)"
+        description: "Optional ref for the baseline leg (default: the target commit)"
         required: false
+      setups:
+        description: "legacy-vs-v2: baseline leg legacy, target leg v2. v2 or legacy: that setup for every leg"
+        type: choice
+        options: [legacy-vs-v2, v2, legacy]
+        default: legacy-vs-v2
       duration_minutes:
         description: "How long to sustain the transaction blast, per leg"
         required: false
@@ -86,11 +94,16 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           REF: ${{ inputs.ref }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
+          SETUPS: ${{ inputs.setups || 'legacy-vs-v2' }}
           NODE_COUNT: ${{ inputs.node_count || '2' }}
           TX_RATE: ${{ inputs.tx_rate || '2' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
         run: |
           set -euo pipefail
+          case "${SETUPS}" in
+            legacy-vs-v2) BASELINE_PROFILE=legacy; TARGET_PROFILE=v2 ;;
+            *) BASELINE_PROFILE="${SETUPS}"; TARGET_PROFILE="${SETUPS}" ;;
+          esac
           if { [ -n "${PR_NUMBER}" ] && [ -n "${REF}" ]; } || { [ -z "${PR_NUMBER}" ] && [ -z "${REF}" ]; }; then
             echo "provide exactly one of pr_number / ref" >&2
             exit 1
@@ -128,12 +141,17 @@ jobs:
           BASELINE_SHA=""
           if [ -n "${BASELINE_REF}" ]; then
             BASELINE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASELINE_REF}" --jq .sha)
+          elif [ "${SETUPS}" = "legacy-vs-v2" ]; then
+            # Same commit, other node setup.
+            BASELINE_SHA="${SHA}"
           fi
-          echo "Testing ${SHA} (${REFSPEC}), baseline: ${BASELINE_SHA:-none}, PR: ${PR:-none}"
+          echo "Testing ${SHA} (${REFSPEC}, ${TARGET_PROFILE}), baseline: ${BASELINE_SHA:-none} (${BASELINE_PROFILE}), PR: ${PR:-none}"
           {
             echo "sha=${SHA}"
             echo "refspec=${REFSPEC}"
             echo "baseline_sha=${BASELINE_SHA}"
+            echo "target_profile=${TARGET_PROFILE}"
+            echo "baseline_profile=${BASELINE_PROFILE}"
             echo "pr=${PR}"
             echo "slug=${SLUG}"
           } >> "$GITHUB_OUTPUT"
@@ -174,6 +192,8 @@ jobs:
           TX_RATE: ${{ inputs.tx_rate || '2' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
           KRESKO_REF: ${{ inputs.kresko_ref || 'main' }}
+          TARGET_PROFILE: ${{ steps.target.outputs.target_profile }}
+          BASELINE_PROFILE: ${{ steps.target.outputs.baseline_profile }}
         run: |
           set -euo pipefail
           umask 077
@@ -188,6 +208,8 @@ jobs:
             printf 'DURATION_SECS=%q\n'  "$(( DURATION_MINUTES * 60 ))"
             printf 'KRESKO_REPO=%q\n'    "https://github.com/valargroup/kresko.git"
             printf 'KRESKO_REF=%q\n'     "${KRESKO_REF}"
+            printf 'TARGET_PROFILE=%q\n' "${TARGET_PROFILE}"
+            printf 'BASELINE_PROFILE=%q\n' "${BASELINE_PROFILE}"
           } > /tmp/run.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env \

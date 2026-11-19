@@ -165,7 +165,9 @@ where
         return None;
     };
     blocks.into_iter().find_map(|block| match block {
-        InventoryResponse::Available((block, _)) if block.hash() == hash => Some(block),
+        InventoryResponse::Available((block, _)) if block.hash() == hash => {
+            Some(block.into_block())
+        }
         _ => None,
     })
 }

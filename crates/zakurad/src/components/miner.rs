@@ -60,17 +60,25 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
-/// Returns `true` if `new_header` should replace the internal miner's current
-/// block template.
+/// Returns `true` if `new` should replace the internal miner's current block template.
+///
+/// A mempool-only update (`submit_old` is `true`) keeps the current work, except when that work
+/// holds only its coinbase and the update brings transactions. The first template after a new
+/// tip is often coinbase-only, so keeping it would mine an empty block on every tip.
 fn should_replace_mining_template(
-    current_header: Option<block::Header>,
-    new_header: block::Header,
+    current: Option<&Block>,
+    new: &Block,
     submit_old: Option<bool>,
 ) -> bool {
-    current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
+    let Some(current) = current else {
+        return true;
+    };
+    if current.header == new.header {
+        return false;
+    }
+    submit_old != Some(true) || (current.transactions.len() == 1 && new.transactions.len() > 1)
 }
 
-/// Cancels mining when the current template changes or becomes unavailable.
 /// Whether the internal miner may keep solving work that a template update did not invalidate.
 ///
 /// An external long poll withdraws every old share when the server rejects a template. The
@@ -91,8 +99,13 @@ fn keep_validated_work(
         && chrono::Utc::now().timestamp() < i64::from(template.max_time().timestamp())
 }
 
+/// Cancels mining when the current template changes or becomes unavailable.
+///
+/// Never marks updates as seen, so `template_receiver` must belong to one solve. A changed header
+/// then keeps cancelling, which `Solution::solve` needs because it checks again after its nonce
+/// callback stops a pass.
 fn cancel_if_mining_template_changed(
-    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+    template_receiver: &WatchReceiver<Option<Arc<Block>>>,
     old_header: block::Header,
 ) -> Result<(), SolverCancelled> {
     match template_receiver.has_changed() {
@@ -100,8 +113,6 @@ fn cancel_if_mining_template_changed(
         // This could happen if something irrelevant to the block data changes,
         // the time was within 1 second, or there is a spurious channel change.
         Ok(has_changed) => {
-            template_receiver.mark_as_seen();
-
             // We only need to check header equality, because the block data is
             // bound to the header. An unavailable template has no header, so it
             // also cancels current work.
@@ -339,11 +350,7 @@ where
         // Mempool-only updates set `submit_old` to true, so cancelling for them
         // would discard useful solver work.
         let template_replaced = template_sender.send_if_modified(|old_block| {
-            if !should_replace_mining_template(
-                old_block.as_ref().map(|block| *block.header),
-                *block.header,
-                submit_old,
-            ) {
+            if !should_replace_mining_template(old_block.as_deref(), &block, submit_old) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
@@ -444,9 +451,9 @@ where
         let height = template.coinbase_height().expect("template is valid");
 
         // Set up the cancellation conditions for the miner.
-        let mut cancel_receiver = template_receiver.clone();
+        let cancel_receiver = template_receiver.clone();
         let old_header = *template.header;
-        let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
+        let cancel_fn = move || cancel_if_mining_template_changed(&cancel_receiver, old_header);
 
         // Mine at least one block using the equihash solver.
         let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
@@ -608,36 +615,83 @@ mod tests {
 
     use super::*;
 
+    /// Returns mainnet block 1, which holds only its coinbase, with its header's `nonce` byte 0
+    /// set to `nonce`, so each call can make a distinct header.
+    fn coinbase_only_block(nonce: u8) -> Block {
+        let mut block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block 1 deserializes");
+        Arc::make_mut(&mut block.header).nonce.0[0] = nonce;
+        block
+    }
+
     #[test]
     fn mining_template_updates_respect_submit_old() {
-        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into::<Arc<Block>>()
-            .expect("block 1 deserializes");
-        let current_header = *block.header;
-        let mut changed_header = current_header;
-        changed_header.nonce.0[0] ^= 1;
+        let current = coinbase_only_block(0);
+        let changed = coinbase_only_block(1);
 
-        assert!(should_replace_mining_template(None, current_header, None));
+        assert!(should_replace_mining_template(None, &current, None));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            current_header,
+            Some(&current),
+            &current,
             Some(false),
         ));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             Some(true),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             Some(false),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some(&current),
+            &changed,
             None,
         ));
+    }
+
+    /// A mempool-only update replaces coinbase-only work once it brings transactions, but keeps
+    /// work that already has them.
+    #[test]
+    fn mempool_update_replaces_coinbase_only_work() {
+        let empty = coinbase_only_block(0);
+        let mut filled = coinbase_only_block(1);
+        filled.transactions.push(filled.transactions[0].clone());
+        let mut more = coinbase_only_block(2);
+        more.transactions = filled.transactions.clone();
+        more.transactions.push(filled.transactions[0].clone());
+
+        assert!(should_replace_mining_template(
+            Some(&empty),
+            &filled,
+            Some(true),
+        ));
+        assert!(!should_replace_mining_template(
+            Some(&filled),
+            &more,
+            Some(true),
+        ));
+    }
+
+    /// A template change keeps cancelling old work, so the solver can't resume it after its nonce
+    /// callback stops a pass. An update with the same header keeps the work running.
+    #[test]
+    fn template_change_keeps_cancelling_old_work() {
+        let old = coinbase_only_block(0);
+        let (sender, receiver) = watch::channel(Some(Arc::new(old.clone())));
+        let receiver = WatchReceiver::new(receiver);
+        let check = || cancel_if_mining_template_changed(&receiver, *old.header);
+
+        sender.send_replace(Some(Arc::new(old.clone())));
+        assert_eq!(check(), Ok(()));
+        assert_eq!(check(), Ok(()));
+
+        sender.send_replace(Some(Arc::new(coinbase_only_block(1))));
+        assert_eq!(check(), Err(SolverCancelled));
+        assert_eq!(check(), Err(SolverCancelled));
     }
 
     /// The internal miner switches from standard to minimum difficulty work on the same parent.
@@ -645,22 +699,20 @@ mod tests {
     fn mining_template_replaces_harder_work_at_testnet_switch() {
         use zakura_chain::work::difficulty::ParameterDifficulty;
 
-        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into::<Arc<Block>>()
-            .expect("block 1 deserializes");
-        let mut standard = *block.header;
         let limit = Network::new_default_testnet().target_difficulty_limit();
-        standard.difficulty_threshold = (limit / 4_u32).to_compact();
-        let mut minimum = standard;
-        minimum.time += chrono::Duration::seconds(1);
-        minimum.difficulty_threshold = limit.to_compact();
+        let mut standard = coinbase_only_block(0);
+        Arc::make_mut(&mut standard.header).difficulty_threshold = (limit / 4_u32).to_compact();
+        let mut minimum = standard.clone();
+        let minimum_header = Arc::make_mut(&mut minimum.header);
+        minimum_header.time += chrono::Duration::seconds(1);
+        minimum_header.difficulty_threshold = limit.to_compact();
 
         // The GBT time-range change sets submitold=false on the same parent.
         // It must replace the harder header even though that fixed header would
         // still be valid to submit.
         assert!(should_replace_mining_template(
-            Some(standard),
-            minimum,
+            Some(&standard),
+            &minimum,
             Some(false),
         ));
     }
@@ -672,18 +724,18 @@ mod tests {
             .expect("block 1 deserializes");
         let old_header = *block.header;
         let (template_sender, template_receiver) = watch::channel(Some(block.clone()));
-        let mut template_receiver = WatchReceiver::new(template_receiver);
+        let template_receiver = WatchReceiver::new(template_receiver);
 
         template_sender
             .send(Some(block))
             .expect("template receiver remains open");
-        assert!(cancel_if_mining_template_changed(&mut template_receiver, old_header).is_ok());
+        assert!(cancel_if_mining_template_changed(&template_receiver, old_header).is_ok());
 
         template_sender
             .send(None)
             .expect("template receiver remains open");
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut template_receiver, old_header),
+            cancel_if_mining_template_changed(&template_receiver, old_header),
             Err(SolverCancelled)
         ));
     }
@@ -935,7 +987,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let old_header = *receiver.borrow_and_update().as_ref().unwrap().header;
-        let mut solver_receiver = WatchReceiver::new(receiver.clone());
+        let solver_receiver = WatchReceiver::new(receiver.clone());
         let preparation = verifier
             .expect_request_that(|request| {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
@@ -959,7 +1011,7 @@ mod tests {
             .unwrap();
         assert!(receiver.borrow_and_update().is_none());
         assert!(matches!(
-            cancel_if_mining_template_changed(&mut solver_receiver, old_header),
+            cancel_if_mining_template_changed(&solver_receiver, old_header),
             Err(SolverCancelled)
         ));
         let recovery = verifier

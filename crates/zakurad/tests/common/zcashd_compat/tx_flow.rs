@@ -21,6 +21,7 @@ use zakura_test::net::random_known_port;
 use super::{
     config::{read_test_network_kind, MINER_PRIV_WIF},
     launch::{spawn_zakurad_with_zcashd_compat_config, ZcashdCompatSetup},
+    nu7::zatoshis,
     setup_zcashd_compat, wait_for_zcashd_height, zakura_skip_zcashd_compat_tests,
 };
 use crate::common::regtest::MiningRpcMethods;
@@ -78,16 +79,27 @@ async fn signed_transparent_transaction(setup: &ZcashdCompatSetup) -> Result<(St
         .await
         .map_err(|e| eyre!("fundrawtransaction: {e}"))?;
 
-    let sign_params = serde_json::json!([funded.hex]).to_string();
+    let signed = sign(setup, serde_json::json!([funded.hex]).to_string()).await?;
+    let txid = decode(setup, &signed).await?["txid"]
+        .as_str()
+        .ok_or_else(|| eyre!("decoderawtransaction response is missing `txid`"))?
+        .to_string();
+
+    Ok((signed, txid))
+}
+
+/// Signs a raw transaction with zcashd's wallet, passing `params` to the
+/// signing RPC, and returns its hex. Fails unless every input is signed.
+async fn sign(setup: &ZcashdCompatSetup, params: String) -> Result<String> {
     let signed: SignRawTransactionResponse = match setup
         .zcashd_client
-        .json_result_from_call("signrawtransactionwithwallet", &sign_params)
+        .json_result_from_call("signrawtransactionwithwallet", &params)
         .await
     {
         Ok(signed) => signed,
         Err(with_wallet_error) => setup
             .zcashd_client
-            .json_result_from_call("signrawtransaction", sign_params)
+            .json_result_from_call("signrawtransaction", params)
             .await
             .map_err(|legacy_error| {
                 eyre!(
@@ -99,20 +111,16 @@ async fn signed_transparent_transaction(setup: &ZcashdCompatSetup) -> Result<(St
     if !signed.complete {
         return Err(eyre!("zcashd did not completely sign the transaction"));
     }
+    Ok(signed.hex)
+}
 
-    let decode_params = serde_json::json!([&signed.hex]).to_string();
-    let decoded: serde_json::Value = setup
+/// zcashd's decoding of the raw transaction `hex`.
+async fn decode(setup: &ZcashdCompatSetup, hex: &str) -> Result<serde_json::Value> {
+    setup
         .zcashd_client
-        .json_result_from_call("decoderawtransaction", decode_params)
+        .json_result_from_call("decoderawtransaction", serde_json::json!([hex]).to_string())
         .await
-        .map_err(|e| eyre!("decoderawtransaction: {e}"))?;
-    let txid = decoded
-        .get("txid")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| eyre!("decoderawtransaction response is missing `txid`: {decoded}"))?
-        .to_string();
-
-    Ok((signed.hex, txid))
+        .map_err(|e| eyre!("decoderawtransaction: {e}"))
 }
 
 async fn single_zcashd_peer(setup: &ZcashdCompatSetup) -> Result<serde_json::Value> {
@@ -545,4 +553,205 @@ pub async fn transparent_tx_confirms() -> Result<()> {
     );
 
     setup.teardown()
+}
+
+/// The ZIP 317 fee for one transparent input and one transparent output.
+const FEE_ZAT: i64 = 10_000;
+
+/// A signed transaction that was not broadcast, and its one output in the
+/// shape `listunspent` reports and the signing RPC takes as a previous
+/// output.
+struct SignedSpend {
+    hex: String,
+    txid: String,
+    output: serde_json::Value,
+}
+
+/// Builds and signs a transaction that spends `input` to a new address in
+/// zcashd's wallet, paying [`FEE_ZAT`], without broadcasting it. `input` is
+/// passed as a previous output, so it need not be mined or in a mempool.
+async fn signed_spend(setup: &ZcashdCompatSetup, input: &serde_json::Value) -> Result<SignedSpend> {
+    let txid = input["txid"]
+        .as_str()
+        .ok_or_else(|| eyre!("unspent output has no txid: {input}"))?;
+    let vout = input["vout"]
+        .as_u64()
+        .ok_or_else(|| eyre!("unspent output has no vout: {input}"))?;
+    let address: String = setup
+        .zcashd_client
+        .json_result_from_call("getnewaddress", "[]")
+        .await
+        .map_err(|e| eyre!("getnewaddress: {e}"))?;
+    let value = zatoshis(&input["amount"])? - FEE_ZAT;
+    #[allow(clippy::cast_precision_loss)]
+    let value = value as f64 / 100_000_000.0;
+    let raw: String = setup
+        .zcashd_client
+        .json_result_from_call(
+            "createrawtransaction",
+            format!(r#"[[{{"txid":"{txid}","vout":{vout}}}], {{"{address}": {value:.8}}}]"#),
+        )
+        .await
+        .map_err(|e| eyre!("createrawtransaction: {e}"))?;
+    let previous = serde_json::json!([{
+        "txid": txid,
+        "vout": vout,
+        "scriptPubKey": input["scriptPubKey"],
+        "amount": input["amount"],
+    }]);
+    let hex = sign(setup, serde_json::json!([raw, previous]).to_string()).await?;
+    let decoded = decode(setup, &hex).await?;
+    let spent_txid = decoded["txid"]
+        .as_str()
+        .ok_or_else(|| eyre!("decoderawtransaction response is missing `txid`: {decoded}"))?
+        .to_string();
+    let output = serde_json::json!({
+        "txid": spent_txid,
+        "vout": 0,
+        "scriptPubKey": decoded["vout"][0]["scriptPubKey"]["hex"],
+        "amount": decoded["vout"][0]["value"],
+    });
+    Ok(SignedSpend {
+        hex,
+        txid: spent_txid,
+        output,
+    })
+}
+
+/// Where a test submits its transactions.
+#[derive(Clone, Copy, Debug)]
+enum SubmitPath {
+    /// Zakura's own `sendrawtransaction`.
+    Zakura,
+    /// zcashd's `sendrawtransaction`, so Zakura learns of them from its peer.
+    ZcashdAdvert,
+}
+
+/// Signs a parent spending a mature coinbase output and a child spending
+/// the parent's output, submits both by `path`, and checks that Zakura's
+/// pool holds both exact transactions and that both leave it once mined.
+///
+/// Both go through the node's real transaction verifier, and the child's
+/// input is found only in the pool, which today's pool and the pool core
+/// wire up differently. On the advert path the child may be verified before
+/// its parent arrives, and either order must work. The mempool crawler can
+/// also bring them in from zcashd, which still fetches them from the peer.
+async fn parent_and_child(path: SubmitPath) -> Result<()> {
+    let Some(setup) = setup_zcashd_compat().await? else {
+        return Ok(());
+    };
+
+    if !setup.can_mutate() {
+        return setup.teardown();
+    }
+
+    setup.zakura_client.generate(110).await?;
+    wait_for_zcashd_height(&setup.zcashd_client, 110).await?;
+    import_miner_key(&setup).await?;
+
+    let unspent: Vec<serde_json::Value> = setup
+        .zcashd_client
+        .json_result_from_call("listunspent", "[100]")
+        .await
+        .map_err(|e| eyre!("listunspent: {e}"))?;
+    let coinbase = unspent
+        .iter()
+        .find(|output| output["generated"].as_bool() == Some(true))
+        .ok_or_else(|| eyre!("zcashd's wallet has no mature coinbase output"))?;
+    let parent = signed_spend(&setup, coinbase).await?;
+    let child = signed_spend(&setup, &parent.output).await?;
+
+    for tx in [&parent, &child] {
+        let params = serde_json::json!([&tx.hex]).to_string();
+        let txid: String = match path {
+            SubmitPath::Zakura => setup
+                .zakura_client
+                .json_result_from_call("sendrawtransaction", params)
+                .await
+                .map_err(|e| eyre!("Zakura sendrawtransaction: {e}"))?,
+            SubmitPath::ZcashdAdvert => setup
+                .zcashd_client
+                .json_result_from_call("sendrawtransaction", params)
+                .await
+                .map_err(|e| eyre!("zcashd sendrawtransaction: {e}"))?,
+        };
+        assert_eq!(txid, tx.txid, "{path:?} returned an unexpected txid");
+    }
+
+    for tx in [&parent, &child] {
+        wait_for_zakura_mempool_tx(&setup, &tx.txid).await?;
+    }
+    let mempool: Vec<String> = setup
+        .zakura_client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|e| eyre!("Zakura getrawmempool: {e}"))?;
+    // The same bytes are the same txid and authorizing data: the full
+    // unmined id.
+    for tx in [&parent, &child] {
+        assert!(mempool.contains(&tx.txid), "both are pooled together");
+        let pooled: serde_json::Value = setup
+            .zakura_client
+            .json_result_from_call(
+                "getrawtransaction",
+                serde_json::json!([&tx.txid, 1]).to_string(),
+            )
+            .await
+            .map_err(|e| eyre!("Zakura getrawtransaction: {e}"))?;
+        assert_eq!(
+            pooled["hex"].as_str(),
+            Some(tx.hex.as_str()),
+            "the pool holds the signed bytes"
+        );
+    }
+
+    setup.zakura_client.generate(1).await?;
+    wait_for_zcashd_height(&setup.zcashd_client, 111).await?;
+    wait_for_zakura_mempool_without(&setup, &[&parent.txid, &child.txid]).await?;
+    for tx in [&parent, &child] {
+        let mined: serde_json::Value = setup
+            .zakura_client
+            .json_result_from_call(
+                "getrawtransaction",
+                serde_json::json!([&tx.txid, 1]).to_string(),
+            )
+            .await
+            .map_err(|e| eyre!("Zakura getrawtransaction: {e}"))?;
+        assert!(
+            mined["confirmations"]
+                .as_u64()
+                .is_some_and(|confirmations| confirmations >= 1),
+            "it left the pool by being mined: {mined}"
+        );
+    }
+
+    setup.teardown()
+}
+
+/// Polls Zakura's `getrawmempool` until it holds none of `txids` (up to 30 s).
+async fn wait_for_zakura_mempool_without(setup: &ZcashdCompatSetup, txids: &[&str]) -> Result<()> {
+    for _ in 0..30u32 {
+        let mempool: Vec<String> = setup
+            .zakura_client
+            .json_result_from_call("getrawmempool", "[]")
+            .await
+            .map_err(|e| eyre!("getrawmempool: {e}"))?;
+        if !mempool.iter().any(|entry| txids.contains(&entry.as_str())) {
+            return Ok(());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    Err(eyre!("{txids:?} were still in Zakura's mempool after 30 s"))
+}
+
+/// Submits a signed parent and child through Zakura's `sendrawtransaction`.
+/// See [`parent_and_child`].
+pub async fn parent_and_child_submitted_to_zakura() -> Result<()> {
+    parent_and_child(SubmitPath::Zakura).await
+}
+
+/// Has zcashd advertise a signed parent and child to Zakura. See
+/// [`parent_and_child`].
+pub async fn parent_and_child_advertised_by_zcashd() -> Result<()> {
+    parent_and_child(SubmitPath::ZcashdAdvert).await
 }

@@ -108,7 +108,7 @@ async fn mine_and_agree(setup: &ZcashdCompatSetup, blocks: u32) -> Result<ChainS
 }
 
 /// Returns an amount in ZEC from an RPC result as zatoshis.
-fn zatoshis(value: &Value) -> Result<i64> {
+pub(super) fn zatoshis(value: &Value) -> Result<i64> {
     let zec = value
         .as_f64()
         .ok_or_else(|| eyre!("not an amount: {value}"))?;

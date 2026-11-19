@@ -54,9 +54,8 @@ const STREAM: StreamId = StreamId {
 /// A header-sync reader's fault close of an undeclared message type.
 const FAULT: CloseOutcome = CloseOutcome::fault(STREAM.kind, STREAM.version, CloseRow::REG_CLOSE_2);
 
-/// A neutral read-timeout close.
-const READ_TIMEOUT: CloseOutcome =
-    CloseOutcome::neutral(NeutralCause::Timeout, "ordered_read_timeout");
+/// A neutral idle-timeout close.
+const IDLE_TIMEOUT: CloseOutcome = CloseOutcome::neutral(NeutralCause::Timeout, "idle_timeout");
 
 /// The node's chain at the start of most witnesses.
 const PRELOAD: u32 = 50;
@@ -873,7 +872,7 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
             "{name}"
         );
     }
-    let neutral = vec![vec![registered()], vec![closed(READ_TIMEOUT)]];
+    let neutral = vec![vec![registered()], vec![closed(IDLE_TIMEOUT)]];
     let report = run_marked(true, true, neutral);
     assert!(
         matches!(

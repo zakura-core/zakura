@@ -227,7 +227,6 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "block-sync/frontier-work-consistent",
             "session/connection-shares-bound",
             "session/credit-isolated",
-            "session/replacement-preserves-authorization",
             "session/send-isolated",
         ],
     ),

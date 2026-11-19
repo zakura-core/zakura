@@ -38,17 +38,18 @@ use zakura_network::zakura::{
 };
 use zakura_quic::{sim::SeededInputs, NodeAddr};
 use zakura_rt::sync::watch;
-use zakura_scheduler::{At, TaskId};
+use zakura_scheduler::{At, SimInstant, TaskId};
 
 use super::{
     block_node::{
         control::Fork,
-        policy::{self as block_policy, Trigger},
+        policy::{self as block_policy, Predicates, Trigger},
         tap::TapRoutines,
         view::BlockSyncView,
         LateHandle,
     },
     header_sync::Dialer,
+    policy::LinkEffect,
     sync::{
         spawn_actors, sync_config, sync_properties, Control, QuicLinks, SavedSync, SyncAction,
         SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView,
@@ -66,9 +67,11 @@ use crate::{
         header_sync::TeardownView as _,
         session,
     },
-    peer::{key_index, peer_addr, peer_id, NODE_ADDR},
+    observe::TransportFact,
+    peer::{key_index, peer_addr, peer_id, peer_of, NODE_ADDR},
     property::{Capture, HasView, Property, PropertyId, Source, Sources},
-    RunConfig, Sim, TaskHold,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, RunConfig, Sim,
+    TaskHold,
 };
 
 /// How long a dialer waits after its connection ends before it dials
@@ -256,6 +259,70 @@ impl TransportObserver for Unobserved {
     fn observe(&self, _: TransportEvent) {}
 }
 
+/// Counts each connection the node registers as a link to the mirror it
+/// comes from, for the block policy's [`Trigger::Linked`]. A wire run's
+/// dialers make its connections, so no `sync/storage` link records them.
+/// It's added after the node's tap, so a connection counts in the step the
+/// tap logs its registration.
+struct RegisteredLinks {
+    predicates: Rc<RefCell<Predicates>>,
+    /// Each mirror's name, by index.
+    names: Vec<String>,
+    /// The log entries already read.
+    seen: usize,
+}
+
+impl ActionSource for RegisteredLinks {
+    /// Nothing.
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    /// Nothing.
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    /// Never called, since it offers nothing.
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        unreachable!("the link count offers no action")
+    }
+
+    /// Records a [`LinkEffect::Linked`] for each `registered` row logged
+    /// since the last observation. A row from no mirror's address fails the
+    /// run.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let entries = log.entries();
+        for entry in &entries[self.seen..] {
+            if let Observation::Transport {
+                remote,
+                event: TransportFact::Registered,
+                ..
+            } = &entry.obs
+            {
+                let name = remote
+                    .parse()
+                    .ok()
+                    .and_then(peer_of)
+                    .and_then(|index| self.names.get(index))
+                    .ok_or_else(|| format!("AmbiguousIdentity: no mirror binds {remote}"))?;
+                self.predicates
+                    .borrow_mut()
+                    .record_link(LinkEffect::Linked, name);
+            }
+        }
+        self.seen = entries.len();
+        Ok(())
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
+}
+
 /// Live steps a wire run allows per fixture block, past
 /// [`sync_config`]'s: each frame crosses QUIC's handshakes, acknowledgements
 /// and timers.
@@ -388,8 +455,9 @@ impl Subsystem for SyncWire {
     }
 
     /// Adds the network, spawns `sync/storage`'s actors, puts each behind a
-    /// handler on its own endpoint, the node's tapped, and starts each
-    /// connection's dialer. Then adds the `Control` source.
+    /// handler on its own endpoint, the node's tapped and its connections
+    /// counted as links ([`RegisteredLinks`]), and starts each connection's
+    /// dialer. Then adds the `Control` source.
     fn build(sim: &mut Sim, scenario: &SyncWireScenario, ports: SyncPorts) -> Self {
         let net = scenario.net.net();
         sim.add_source(Box::new(net.clone()));
@@ -405,6 +473,11 @@ impl Subsystem for SyncWire {
         };
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
+        sim.add_source(Box::new(RegisteredLinks {
+            predicates: predicates.clone(),
+            names: names.clone(),
+            seen: 0,
+        }));
         let mut mirror_observers = Vec::new();
         if scenario.windows.is_some() {
             for name in &names {

@@ -16,7 +16,7 @@
 use super::*;
 use crate::zakura::{
     discovery::protocol::ZakuraServiceId, framed_channel, machine_test::MAX_HISTORY_BYTES,
-    regulation::PrecheckSlot, CloseCause,
+    regulation::PrecheckSlot,
 };
 use futures::FutureExt;
 use std::collections::VecDeque;
@@ -356,7 +356,7 @@ impl SettlementSession {
         let answer_recv = answer_recv.with_precheck(precheck.clone());
         let (send, written) = framed_channel(SETTLEMENT_MAX_OPS);
         let connection = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::new());
+        let fence = WriterFence::new(connection.clone());
         let queries = Queries::new(
             pool.clone(),
             fence,

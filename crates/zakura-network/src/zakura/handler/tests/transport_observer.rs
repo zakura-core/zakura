@@ -778,8 +778,7 @@ impl TransportObserver for EndWatcher {
 fn end_claimed_precedes_the_exchange_end() {
     let watcher = Arc::new(EndWatcher::default());
     let tap = Arc::new(StreamTap::new(registered_tap(watcher.clone()), 4));
-    let fence =
-        crate::zakura::regulation::WriterFence::new(CancellationToken::new(), CloseCause::new());
+    let fence = crate::zakura::regulation::WriterFence::new(CancellationToken::new());
     let exchange = fence.open().expect("a fresh fence opens");
     *watcher.writer.lock().expect("no test panics holding it") = Some(exchange.writer());
     let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
@@ -814,8 +813,7 @@ fn end_claimed_precedes_the_exchange_end() {
 fn open_retracted_precedes_the_exchange_drop() {
     let watcher = Arc::new(EndWatcher::default());
     let tap = Arc::new(StreamTap::new(registered_tap(watcher.clone()), 4));
-    let fence =
-        crate::zakura::regulation::WriterFence::new(CancellationToken::new(), CloseCause::new());
+    let fence = crate::zakura::regulation::WriterFence::new(CancellationToken::new());
     let exchange = fence.open().expect("a fresh fence opens");
     *watcher.writer.lock().expect("no test panics holding it") = Some(exchange.writer());
     let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)

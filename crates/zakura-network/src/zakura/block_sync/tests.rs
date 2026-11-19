@@ -1489,6 +1489,53 @@ fn short_response_charges_one_reliability_failure_per_request_not_per_height() {
     );
 }
 
+/// The liveness deadline is the 32 s allowance plus the outstanding bytes'
+/// transfer time at 256 KiB/s. A 2 MB body adds 7.629 s, so a peer that
+/// delivers one every 39.6 s keeps its session.
+#[test]
+fn block_liveness_deadline_adds_transfer_time_at_the_minimum_rate() {
+    let allowance = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    assert_eq!(allowance, Duration::from_secs(32));
+    let body = |height| {
+        let mut request = window_request(height);
+        request.request.estimated_bytes = 2_000_000;
+        request.request.expected_blocks[0].estimated_bytes = 2_000_000;
+        request
+    };
+    let transfer = Duration::from_millis(7_629);
+    let mut now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(body(1));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline,
+        Some(now + allowance + transfer)
+    );
+
+    // A second request in the same episode adds only its own transfer time.
+    window.outstanding.push(body(2));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline,
+        Some(now + allowance + transfer * 2)
+    );
+
+    // Slow, continuous progress: one body just inside each deadline.
+    for height in 3..8 {
+        let deadline = window.block_liveness_deadline.unwrap();
+        now = deadline - Duration::from_millis(1);
+        assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+        let key = window.outstanding.first_key().unwrap();
+        window.outstanding.remove(key);
+        window.outstanding.push(body(height));
+        window.note_block_progress(now, allowance);
+        assert_eq!(
+            window.block_liveness_deadline,
+            Some(now + allowance + transfer * 2)
+        );
+    }
+}
+
 #[test]
 fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
@@ -4404,7 +4451,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 #[tokio::test]
 async fn block_liveness_parks_silent_peer_and_traces_reason() {
     // The first no-progress deadline parks the peer for its cooldown. Its
-    // unended request then closes the connection (see `WriterFence`).
+    // unended request resets the session and keeps the connection (see
+    // `regulation::stall`).
     let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
@@ -4482,8 +4530,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     .await
     .expect("silent active peer is parked by block-progress liveness");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     capture.flush().await;
@@ -4625,8 +4673,8 @@ async fn check_cold_probe_deadline(expired: bool) {
     .await
     .expect("an unproven peer is still parked at its liveness deadline");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     reactor_task.abort();
@@ -12203,7 +12251,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 }
 
 #[tokio::test]
-async fn mismatched_header_retires_the_connection_without_a_fault_report() {
+async fn mismatched_header_retires_the_session_without_a_fault_report() {
     let (tip_tx, handle, mut actions, reactor_task) =
         spawn_genesis_reactor(immediate_body_download_config());
     let service = BlockSyncService::new_with_handle_for_test(
@@ -12277,9 +12325,17 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
 
     // Height-only requests do not commit the supplier to our chain, so this is
     // a local incompatibility rather than a peer fault.
-    tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
-        .await
-        .expect("a header that does not match the next expected hash retires the connection");
+    await_until(
+        "a mismatched header retires the session",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("a header that does not match the next expected hash retires the session");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "retiring the session keeps the connection"
+    );
     while let Ok(action) = actions.try_recv() {
         assert!(
             !matches!(action, BlockSyncAction::Misbehavior { .. }),

@@ -10,6 +10,7 @@
 //! responses.
 
 use std::{
+    collections::HashSet,
     marker::PhantomData,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -28,11 +29,11 @@ use super::{
 use crate::{
     zakura::{
         regulation::{
-            sizing, Applied, Current, PrecheckByRequest, Produce, Publications, Push, Replacement,
+            sizing, Applied, Current, PrecheckByRequest, Produce, Publications, Push,
             ReservationPool, Reservations, Responded, ResponseCap, ResponsePrecheck, ResponseSink,
             Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey, SessionTable,
-            SharedReservations, SharedSubscriptions, SinkError, SinkProgress, SubscribeRefused,
-            Subscriptions, Update, WorkLease, WriterFence,
+            SharedReservations, SharedSubscriptions, SinkError, SinkProgress, StallClose,
+            SubscribeRefused, Subscriptions, Update, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
         CloseCause, CloseOutcome, CloseRow, Credit, Frame, FramedRecv, FramedSend, MessageRole,
@@ -363,6 +364,8 @@ pub(crate) struct LayoutShared<A: StreamConformance> {
     pub(crate) violations: Mutex<Vec<String>>,
     /// While true, session tasks stop reading.
     pub(crate) paused: watch::Sender<bool>,
+    /// Connections whose session stalled once.
+    stalled: Mutex<HashSet<ZakuraConnId>>,
 }
 
 impl<A: StreamConformance> LayoutShared<A> {
@@ -481,8 +484,28 @@ impl<A: StreamConformance> LayoutService<A> {
                     .collect(),
                 violations: Mutex::new(Vec::new()),
                 paused: watch::channel(false).0,
+                stalled: Mutex::new(HashSet::new()),
             }),
         }
+    }
+
+    /// Apply the shared stall rule (`regulation::stall`) to `peer`'s session,
+    /// as a family does when its liveness deadline passes: end the session,
+    /// and close the connection under the stall policy if that connection
+    /// stalled before.
+    pub(crate) fn stall(&self, peer: &ZakuraPeerId) -> Result<(), BoxError> {
+        let shared = &self.shared;
+        let (key, session) = shared.table.get(peer).ok_or("the peer has no session")?;
+        let first = shared
+            .stalled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.conn_id);
+        if !first {
+            StallClose::new(session.connection.clone(), session.close_cause.clone()).close();
+        }
+        shared.table.remove(peer, key);
+        Ok(())
     }
 
     /// Reserve exchange `exchange` of `request_type` with `peer`, then write
@@ -516,7 +539,7 @@ impl<A: StreamConformance> LayoutService<A> {
     /// Open subscription `key` of `subscription_type` with `peer`, granting
     /// `credit` from cursor 0, then write its `Open` under the session's
     /// fence. Its ending ends the exchange; until then, retiring the session
-    /// closes the connection.
+    /// resets it.
     pub(crate) async fn subscribe(
         &self,
         peer: &ZakuraPeerId,
@@ -730,7 +753,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             conn_id: peer.conn_id,
             session_id,
         };
-        let fence = WriterFence::new(peer.cancel_token(), peer.close_cause());
+        let fence = WriterFence::new(cancel.clone());
         let session = Arc::new(LayoutSession {
             key,
             peer: peer.id.clone(),
@@ -754,12 +777,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             fence,
             session: session.clone(),
         };
-        if matches!(
-            shared.table.replace(peer.id.clone(), current),
-            Replacement::Refused
-        ) {
-            return;
-        }
+        shared.table.replace(peer.id.clone(), current);
         tokio::spawn(run_session(shared, session, recvs));
     }
 

@@ -5,9 +5,16 @@
 //! therefore retire or replace a session while the old session's requests are
 //! still queued or being written. A queued request can be skipped safely if
 //! its first byte has not been written. Once the first byte is written, the
-//! peer may answer, and no receiver owns that answer. The connection must then
-//! close, so the answer is never charged to the peer as unsolicited or matched
-//! to a newer session.
+//! peer may answer, and no receiver owns that answer. The session's streams
+//! must then reset, so the answer is never charged to the peer as unsolicited
+//! or matched to a newer session.
+//!
+//! Each session has its own QUIC streams and its own cancellation token, a
+//! child of the connection's. Cancelling the session token resets every member
+//! stream with a neutral code, and the peer reads the reset as a clean end of
+//! that session. A newer session opens fresh streams, so a late answer on a
+//! reset stream can never reach it. The connection and its other services
+//! keep running.
 //!
 //! [`WriterFence`] is one session's fence. Each request opens an [`Exchange`]
 //! with one owner. The owner hands cloneable [`ExchangeWriter`]s to the code
@@ -16,12 +23,11 @@
 //! things happens:
 //!
 //! - The write claims its first byte first. The exchange has started, so
-//!   retirement closes the connection.
+//!   retirement cancels the session.
 //! - Retirement comes first. The claim fails, and the transport skips the
 //!   frame without writing a byte.
 //!
-//! The close records the local cause `unfinished_exchange`. It assigns the
-//! peer no fault: the peer did nothing wrong.
+//! The reset assigns the peer no fault: the peer did nothing wrong.
 //!
 //! [`Reservations::reserve_fenced`](super::Reservations::reserve_fenced) makes
 //! each reservation own its exchange. The ending's claim ends the exchange, so
@@ -33,15 +39,15 @@
 //!
 //! | Property | Test |
 //! | --- | --- |
-//! | After retirement, no exchange opens, publishes, or starts | `retirement_fences_prepared_and_queued_writes_without_closing` |
+//! | After retirement, no exchange opens, publishes, or starts | `retirement_fences_prepared_and_queued_writes_without_resetting` |
 //! | Retirement and a first byte have one winner | `retirement_and_first_write_have_one_winner` |
 //! | Retirement waits for a publication in progress | `publication_is_complete_before_retirement_returns` |
-//! | A failed work claim leaves the connection reusable | `a_failed_work_claim_leaves_the_connection_reusable` |
-//! | Dropping a started, unended exchange closes the connection | `owner_drop_fences_unstarted_writes_and_closes_started_exchanges` |
+//! | A failed work claim leaves the session running | `a_failed_work_claim_leaves_the_session_running` |
+//! | Dropping a started, unended exchange resets the session | `owner_drop_fences_unstarted_writes_and_resets_started_exchanges` |
 //! | Only an ending releases a started exchange | `only_endings_release_started_exchanges` |
-//! | Every writer of an old or closed fence stays fenced | `exchange_histories_keep_old_writers_fenced` |
+//! | Every writer of an old or reset fence stays fenced, and no reset reaches the connection | `exchange_histories_keep_old_writers_fenced` |
 //! | A following frame is written only after its request started | `a_following_frame_needs_its_request_started` |
-//! | Retirement during a following frame's write closes the connection | `retirement_during_a_following_write_closes_the_connection` |
+//! | Retirement during a following frame's write resets the session | `retirement_during_a_following_write_resets_the_session` |
 
 use std::sync::Arc;
 
@@ -49,16 +55,11 @@ use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, PoisonError};
 
 use crate::zakura::{
     transport::{FrameWriteClaim, GuardedFrameSlot},
-    CloseCause, CloseOutcome, Frame, FramedSend, NeutralCause,
+    Frame, FramedSend,
 };
 
 #[cfg(test)]
 mod tests;
-
-/// The close outcome a fence records: this node retired the session, so the
-/// close is neutral.
-pub(crate) const UNFINISHED_EXCHANGE: CloseOutcome =
-    CloseOutcome::neutral(NeutralCause::LocalCancellation, "unfinished_exchange");
 
 /// One session's fence over its request writers.
 #[derive(Clone, Debug)]
@@ -67,8 +68,8 @@ pub(crate) struct WriterFence(Arc<Fence>);
 #[derive(Debug)]
 struct Fence {
     state: Mutex<FenceState>,
-    connection: CancellationToken,
-    close_cause: CloseCause,
+    /// The session's token. Cancelling it resets the session's streams.
+    session: CancellationToken,
 }
 
 #[derive(Debug, Default)]
@@ -99,8 +100,8 @@ struct ExchangeState {
 
 /// One request's exchange, with one owner.
 ///
-/// Dropping it after its first byte is written, without an ending, closes the
-/// connection: no receiver remains for the peer's answer.
+/// Dropping it after its first byte is written, without an ending, resets the
+/// session: no receiver remains for the peer's answer.
 #[derive(Debug)]
 pub(crate) struct Exchange(Arc<ExchangeState>);
 
@@ -110,12 +111,11 @@ pub(crate) struct Exchange(Arc<ExchangeState>);
 pub(crate) struct ExchangeWriter(Arc<ExchangeState>);
 
 impl WriterFence {
-    /// A fence that closes `connection`, recording its cause in `close_cause`.
-    pub(crate) fn new(connection: CancellationToken, close_cause: CloseCause) -> Self {
+    /// A fence over the session that `session` cancels.
+    pub(crate) fn new(session: CancellationToken) -> Self {
         Self(Arc::new(Fence {
             state: Mutex::new(FenceState::default()),
-            connection,
-            close_cause,
+            session,
         }))
     }
 
@@ -124,10 +124,10 @@ impl WriterFence {
     }
 
     /// Open an exchange before taking local work for it. `None` once the
-    /// fence retired or the connection closed.
+    /// fence retired or the session ended.
     pub(crate) fn open(&self) -> Option<Exchange> {
         let state = self.lock();
-        if state.retired || self.0.connection.is_cancelled() {
+        if state.retired || self.0.session.is_cancelled() {
             return None;
         }
         Some(Exchange(Arc::new(ExchangeState {
@@ -136,22 +136,25 @@ impl WriterFence {
         })))
     }
 
-    /// Fence every unstarted write. Close the connection if an exchange
-    /// started and has no ending, or a following frame is being written.
+    /// Fence every unstarted write. Reset the session if an exchange started
+    /// and has no ending, or a following frame is being written.
     ///
-    /// Returns whether the connection can host a replacement session.
+    /// Returns whether the session is still running.
     pub(crate) fn retire(&self) -> bool {
         let mut state = self.lock();
         state.retired = true;
         if state.started != 0 || state.following != 0 {
-            self.close_unfinished();
+            self.reset_unfinished();
         }
-        !self.0.connection.is_cancelled()
+        !self.0.session.is_cancelled()
     }
 
-    fn close_unfinished(&self) {
-        self.0.close_cause.record(UNFINISHED_EXCHANGE);
-        self.0.connection.cancel();
+    /// End the session with a neutral stream reset. The connection stays.
+    fn reset_unfinished(&self) {
+        if !self.0.session.is_cancelled() {
+            tracing::debug!("resetting a Zakura session with an unfinished exchange");
+        }
+        self.0.session.cancel();
     }
 }
 
@@ -195,7 +198,7 @@ impl ExchangeWriter {
     /// or drop an exchange of it.
     pub(crate) fn publish(&self, publish: impl FnOnce()) -> bool {
         let (state, mut phase) = self.0.lock();
-        if state.retired || self.0.fence.0.connection.is_cancelled() || *phase != Phase::Opened {
+        if state.retired || self.0.fence.0.session.is_cancelled() || *phase != Phase::Opened {
             return false;
         }
         *phase = Phase::Queued;
@@ -206,11 +209,11 @@ impl ExchangeWriter {
     /// Claim the request's first byte. `claim` runs under the fence's lock and
     /// may take the caller's own work claim.
     ///
-    /// A failed `claim` starts nothing and leaves the connection reusable.
+    /// A failed `claim` starts nothing and leaves the session running.
     pub(crate) fn try_start(&self, claim: impl FnOnce() -> bool) -> bool {
         let (mut state, mut phase) = self.0.lock();
         if state.retired
-            || self.0.fence.0.connection.is_cancelled()
+            || self.0.fence.0.session.is_cancelled()
             || *phase != Phase::Queued
             || !claim()
         {
@@ -226,13 +229,13 @@ impl ExchangeWriter {
 
     /// Claim a later frame's write, if the request's first byte was written,
     /// the exchange is still owned, and the fence has neither retired nor
-    /// seen its connection close. The claim holds the fence until
-    /// [`Self::follow_written`], so retirement during the write closes the
-    /// connection rather than let the frame reach a replacement session.
+    /// seen its session end. The claim holds the fence until
+    /// [`Self::follow_written`], so retirement during the write resets the
+    /// session rather than let the frame reach a replacement session.
     fn try_follow(&self) -> bool {
         let (mut state, phase) = self.0.lock();
         if state.retired
-            || self.0.fence.0.connection.is_cancelled()
+            || self.0.fence.0.session.is_cancelled()
             || !matches!(*phase, Phase::Started | Phase::Ended)
         {
             return false;
@@ -256,8 +259,8 @@ impl Drop for Exchange {
     fn drop(&mut self) {
         let (mut state, mut phase) = self.0.lock();
         if *phase == Phase::Started {
-            // Close before the last record of the started exchange goes.
-            self.0.fence.close_unfinished();
+            // Reset before the last record of the started exchange goes.
+            self.0.fence.reset_unfinished();
             state.started -= 1;
         }
         *phase = Phase::Dropped;
@@ -297,7 +300,7 @@ impl FrameWriteClaim for FollowingWrite {
 /// Why a fenced request was not queued.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum FencedSendError {
-    /// The fence retired, the connection closed, or the exchange was already
+    /// The fence retired, the session ended, or the exchange was already
     /// published.
     #[error("the exchange is fenced")]
     Fenced,

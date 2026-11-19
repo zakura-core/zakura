@@ -13,8 +13,7 @@ use crate::zakura::{
     },
     framed_channel,
     machine_test::machine_target_tests,
-    regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-    CloseCause,
+    regulation::PrecheckSlot,
 };
 
 const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
@@ -42,7 +41,6 @@ struct Session {
     /// The peer's end of the stream that carries this node's queries.
     written: FramedRecv,
     connection: CancellationToken,
-    close_cause: CloseCause,
     cancel: CancellationToken,
 }
 
@@ -50,14 +48,12 @@ struct Session {
 fn session_with(pool: ReservationPool, recv: &FramedRecv) -> Session {
     let (send, written) = framed_channel(4);
     let connection = CancellationToken::new();
-    let close_cause = CloseCause::new();
-    let cancel = CancellationToken::new();
-    let fence = WriterFence::new(connection.clone(), close_cause.clone());
+    let cancel = connection.child_token();
+    let fence = WriterFence::new(cancel.clone());
     Session {
         queries: Queries::new(pool, fence, recv, send, cancel.clone()),
         written,
         connection,
-        close_cause,
         cancel,
     }
 }
@@ -367,6 +363,21 @@ async fn a_retired_session_refuses_the_next_query() {
     assert_eq!(pool.held(), 0);
 }
 
+/// disco-14: silent sessions cannot starve the query pool. A session holds
+/// at most one reservation per query kind, so 92 sessions (the default
+/// connection limit) hold at most 184 entries. The derived pool covers twice
+/// that, 368 entries, so an honest session always reserves at once.
+#[test]
+fn the_query_pool_covers_twice_every_sessions_queries() {
+    let pool = reservation_pool();
+    let needed = 2 * crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS * QUERY_KINDS.len();
+    assert_eq!(needed, 368);
+    let entries: Vec<_> = std::iter::from_fn(|| pool.try_entry())
+        .take(needed)
+        .collect();
+    assert_eq!(entries.len(), needed);
+}
+
 /// A full node-wide pool defers the query to the next exchange.
 #[tokio::test]
 async fn a_full_pool_defers_the_query() {
@@ -422,12 +433,12 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     queries.retire();
     assert!(!connection.is_cancelled());
 
-    // Written and unanswered.
+    // Written and unanswered: the session resets, and the connection stays.
     let Session {
         queries,
         mut written,
         connection,
-        close_cause,
+        cancel,
         ..
     } = session(&pool);
     queries
@@ -436,8 +447,8 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
         .expect("the query is queued");
     written.recv().await.expect("the query is written");
     queries.retire();
-    assert!(connection.is_cancelled());
-    assert_eq!(close_cause.get(), Some(UNFINISHED_EXCHANGE));
+    assert!(cancel.is_cancelled());
+    assert!(!connection.is_cancelled());
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
 }
 

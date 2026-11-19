@@ -146,9 +146,15 @@ struct DiscoverySessionRecord {
 }
 
 /// Consecutive failed sessions on one `(peer, connection)` before discovery
-/// retires it. Generous: an honest peer completes the exchange on the first
-/// session, and a fresh connection always starts a fresh record.
-const MAX_DISCOVERY_SESSION_FAILURES: u32 = 3;
+/// retires it, as the shared stall rule (`regulation::stall`) counts: the
+/// first failed session ends alone, and the second seals discovery on the
+/// connection. An honest peer completes the exchange on the first session,
+/// and a fresh connection always starts a fresh record.
+///
+/// Discovery seals rather than closes: a session also fails when this node
+/// cancels it, so its failures are not the peer's alone. Ending a failed
+/// session resets its streams and keeps the connection.
+const MAX_DISCOVERY_SESSION_FAILURES: u32 = 2;
 
 /// Discovery's session records, one per `(peer, connection)`.
 ///
@@ -605,7 +611,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
-        WriterFence::new(connection_cancel.clone(), close_cause.clone()),
+        WriterFence::new(service_cancel.clone()),
         &recv,
         discovery_session.send.clone(),
         service_cancel.clone(),
@@ -1714,7 +1720,7 @@ mod tests {
         let (_unused, recv) = framed_channel(1);
         Queries::new(
             reservation_pool(),
-            WriterFence::new(CancellationToken::new(), CloseCause::new()),
+            WriterFence::new(CancellationToken::new()),
             &recv,
             send.clone(),
             cancel.clone(),
@@ -3053,8 +3059,8 @@ mod tests {
         }
     }
 
-    /// A record retires at its third failure, and only its connection's end
-    /// lets the peer open a session there again.
+    /// A record retires at its second failure, as the stall rule counts, and
+    /// only its connection's end lets the peer open a session there again.
     #[test]
     fn the_bound_failure_retires_a_record_until_its_connection_ends() {
         let peer = ZakuraPeerId::new(vec![82; 32]).expect("test peer id is within bounds");
@@ -3063,10 +3069,9 @@ mod tests {
         assert!(states.open(&key(1)));
         assert_eq!(states.record_failure(&key(1)), SessionFailure::Counted);
         assert!(states.open(&key(2)));
-        assert_eq!(states.record_failure(&key(2)), SessionFailure::Counted);
         assert_eq!(
             states.record_failure(&key(2)),
-            SessionFailure::Retired { attempts: 3 }
+            SessionFailure::Retired { attempts: 2 }
         );
         assert!(!states.open(&key(3)));
         states.remove_connection(&peer, 4);
@@ -4251,7 +4256,7 @@ mod tests {
         let (_unused, recv) = framed_channel(1);
         io.queries = Queries::new(
             reservation_pool(),
-            WriterFence::new(io.connection_cancel.clone(), io.close_cause.clone()),
+            WriterFence::new(io.connection_cancel.clone()),
             &recv,
             io.session.send.clone(),
             io.session.cancel_token(),

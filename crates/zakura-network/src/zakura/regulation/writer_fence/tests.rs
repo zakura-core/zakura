@@ -8,20 +8,17 @@ use proptest::prelude::*;
 use super::*;
 use crate::zakura::{framed_channel, transport::worker_framed_channel};
 
-fn fence() -> (WriterFence, CancellationToken, CloseCause) {
+/// A fence over a session of a fresh connection, with both tokens.
+fn fence() -> (WriterFence, CancellationToken, CancellationToken) {
     let connection = CancellationToken::new();
-    let cause = CloseCause::new();
-    (
-        WriterFence::new(connection.clone(), cause.clone()),
-        connection,
-        cause,
-    )
+    let session = connection.child_token();
+    (WriterFence::new(session.clone()), session, connection)
 }
 
 #[test]
-fn retirement_fences_prepared_and_queued_writes_without_closing() {
+fn retirement_fences_prepared_and_queued_writes_without_resetting() {
     for queued in [false, true] {
-        let (fence, connection, _) = fence();
+        let (fence, session, _) = fence();
         let exchange = fence.open().unwrap();
         let writer = exchange.writer();
         if queued {
@@ -32,14 +29,14 @@ fn retirement_fences_prepared_and_queued_writes_without_closing() {
         assert!(!writer.publish(|| panic!("a retired fence cannot publish")));
         assert!(!writer.try_start(|| panic!("a retired fence cannot start")));
         drop(exchange);
-        assert!(!connection.is_cancelled());
+        assert!(!session.is_cancelled());
     }
 }
 
 #[test]
-fn owner_drop_fences_unstarted_writes_and_closes_started_exchanges() {
+fn owner_drop_fences_unstarted_writes_and_resets_started_exchanges() {
     for started in [false, true] {
-        let (fence, connection, cause) = fence();
+        let (fence, session, connection) = fence();
         let exchange = fence.open().unwrap();
         let writer = exchange.writer();
         assert!(writer.publish(|| {}));
@@ -48,10 +45,10 @@ fn owner_drop_fences_unstarted_writes_and_closes_started_exchanges() {
         }
         drop(exchange);
         assert!(!writer.try_start(|| panic!("the exchange's owner has gone")));
-        assert_eq!(connection.is_cancelled(), started);
+        assert_eq!(session.is_cancelled(), started);
         assert_eq!(fence.retire(), !started);
         if started {
-            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
+            assert!(!connection.is_cancelled(), "a reset keeps the connection");
         }
     }
 }
@@ -59,7 +56,7 @@ fn owner_drop_fences_unstarted_writes_and_closes_started_exchanges() {
 #[test]
 fn only_endings_release_started_exchanges() {
     for end_both in [false, true] {
-        let (fence, connection, _) = fence();
+        let (fence, session, _) = fence();
         let mut first = fence.open().unwrap();
         let mut second = fence.open().unwrap();
         let first_writer = first.writer();
@@ -75,25 +72,25 @@ fn only_endings_release_started_exchanges() {
             second.end();
         }
         assert_eq!(fence.retire(), end_both);
-        assert_eq!(connection.is_cancelled(), !end_both);
+        assert_eq!(session.is_cancelled(), !end_both);
     }
 }
 
 #[test]
-fn a_failed_work_claim_leaves_the_connection_reusable() {
-    let (fence, connection, _) = fence();
+fn a_failed_work_claim_leaves_the_session_running() {
+    let (fence, session, _) = fence();
     let exchange = fence.open().unwrap();
     let writer = exchange.writer();
     assert!(writer.publish(|| {}));
     assert!(!writer.try_start(|| false));
     assert!(fence.retire());
-    assert!(!connection.is_cancelled());
+    assert!(!session.is_cancelled());
 }
 
 #[test]
 fn retirement_and_first_write_have_one_winner() {
     for _ in 0..128 {
-        let (fence, connection, _) = fence();
+        let (fence, session, _) = fence();
         let exchange = fence.open().unwrap();
         let writer = exchange.writer();
         assert!(writer.publish(|| {}));
@@ -106,7 +103,7 @@ fn retirement_and_first_write_have_one_winner() {
         barrier.wait();
         let reusable = fence.retire();
         let started = racer.join().unwrap();
-        assert_eq!(connection.is_cancelled(), started);
+        assert_eq!(session.is_cancelled(), started);
         assert_eq!(reusable, !started);
     }
 }
@@ -151,7 +148,7 @@ async fn a_fenced_send_writes_only_before_retirement() {
         payload: vec![7],
     };
     for retire_first in [false, true] {
-        let (fence, connection, _) = fence();
+        let (fence, session, _) = fence();
         let (send, mut output) = framed_channel(2);
         let mut exchange = fence.open().unwrap();
         send.send_fenced(frame(), &exchange.writer()).await.unwrap();
@@ -165,22 +162,22 @@ async fn a_fenced_send_writes_only_before_retirement() {
             // The queued frame's claim fails, so the reader skips it.
             drop(send);
             assert_eq!(output.recv().await, None);
-            assert!(!connection.is_cancelled());
+            assert!(!session.is_cancelled());
         } else {
             assert_eq!(output.recv().await, Some(frame()));
             exchange.end();
             assert!(fence.retire());
-            assert!(!connection.is_cancelled());
+            assert!(!session.is_cancelled());
         }
     }
 }
 
 /// A fenced request that fails to encode starts no exchange, so retiring its
-/// session leaves the connection up.
+/// session leaves the session running.
 #[tokio::test]
 async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
     for encodes in [false, true] {
-        let (fence, connection, cause) = fence();
+        let (fence, session, connection) = fence();
         let (send, mut output) = worker_framed_channel(1);
         let exchange = fence.open().unwrap();
         let frame = Frame {
@@ -204,9 +201,9 @@ async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
             .await;
         assert_eq!(result.is_ok(), encodes);
         assert_eq!(fence.retire(), !encodes);
-        assert_eq!(connection.is_cancelled(), encodes);
+        assert_eq!(session.is_cancelled(), encodes);
         if encodes {
-            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
+            assert!(!connection.is_cancelled(), "a reset keeps the connection");
         }
     }
 }
@@ -225,7 +222,7 @@ async fn a_following_frame_needs_its_request_started() {
     // Retire before the request, retire after the request ended, never
     // retire, or end the exchange before the request's first byte.
     for case in 0..4 {
-        let (fence, connection, _) = fence();
+        let (fence, session, _) = fence();
         let (send, mut output) = framed_channel(2);
         let mut exchange = fence.open().unwrap();
         let writer = exchange.writer();
@@ -240,23 +237,23 @@ async fn a_following_frame_needs_its_request_started() {
             assert_eq!(output.recv().await, Some(frame()));
             exchange.end();
             if case == 1 {
-                assert!(fence.retire(), "an ended exchange leaves it reusable");
+                assert!(fence.retire(), "an ended exchange leaves it running");
             }
         }
         drop(send);
         let follow_up = output.recv().await;
         assert_eq!(follow_up.is_some(), case == 2, "case {case}");
-        assert!(!connection.is_cancelled());
+        assert!(!session.is_cancelled());
     }
 }
 
 /// A following frame's claim holds the fence until its write finishes, so
-/// retirement in between closes the connection, even after the request's
-/// exchange ended. A finished write leaves the connection reusable.
+/// retirement in between resets the session, even after the request's
+/// exchange ended. A finished write leaves the session running.
 #[test]
-fn retirement_during_a_following_write_closes_the_connection() {
+fn retirement_during_a_following_write_resets_the_session() {
     for written in [false, true] {
-        let (fence, connection, cause) = fence();
+        let (fence, session, connection) = fence();
         let mut exchange = fence.open().unwrap();
         let writer = exchange.writer();
         assert!(writer.publish(|| {}));
@@ -268,11 +265,17 @@ fn retirement_during_a_following_write_closes_the_connection() {
             follow.written();
         }
         assert_eq!(fence.retire(), written);
-        assert_eq!(connection.is_cancelled(), !written);
+        assert_eq!(session.is_cancelled(), !written);
         if !written {
-            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
+            assert!(!connection.is_cancelled(), "a reset keeps the connection");
         }
     }
+}
+
+/// Whether `generation`'s session ended: the connection closed or the
+/// session was reset.
+fn ended(closed: bool, reset: &[bool], generation: usize) -> bool {
+    closed || reset[generation]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -284,17 +287,20 @@ struct ExpectedExchange {
 }
 
 proptest! {
-    /// Random histories of eight exchanges over retiring fences on one
-    /// connection. After every step, every writer of a retired fence or of a
-    /// closed connection stays fenced, and the connection is closed exactly
-    /// when a started exchange lost its owner or its fence without an ending.
+    /// Random histories of eight exchanges over retiring fences, one session
+    /// per fence, on one connection. After every step, every writer of a
+    /// retired fence or of an ended session stays fenced, a session is reset
+    /// exactly when a started exchange lost its owner or its fence without an
+    /// ending, and no reset reaches the connection.
     #[test]
     fn exchange_histories_keep_old_writers_fenced(
         actions in prop::collection::vec((0u8..7, 0usize..8, any::<bool>()), 1..192),
     ) {
         let connection = CancellationToken::new();
-        let cause = CloseCause::new();
-        let mut fences = vec![WriterFence::new(connection.clone(), cause.clone())];
+        let mut sessions = vec![connection.child_token()];
+        let mut fences = vec![WriterFence::new(sessions[0].clone())];
+        // Whether each generation's session was reset.
+        let mut reset = vec![false];
         let mut owners: [Option<Exchange>; 8] = std::array::from_fn(|_| None);
         // Writers outlive owners, endings, and retirement.
         let mut writers: [Option<ExchangeWriter>; 8] = std::array::from_fn(|_| None);
@@ -306,7 +312,7 @@ proptest! {
             match action {
                 0 if owners[index].is_none() => {
                     let opened = fences[generation].open();
-                    prop_assert_eq!(opened.is_some(), !closed);
+                    prop_assert_eq!(opened.is_some(), !ended(closed, &reset, generation));
                     if let Some(opened) = opened {
                         if let Some(old_writer) = &writers[index] {
                             prop_assert!(!old_writer.try_start(|| true));
@@ -323,7 +329,7 @@ proptest! {
                 }
                 1 => {
                     if let (Some(writer), Some(exchange)) = (&writers[index], &mut expected[index]) {
-                        let allowed = owners[index].is_some() && !closed
+                        let allowed = owners[index].is_some() && !ended(closed, &reset, generation)
                             && exchange.generation == generation && !exchange.published
                             && !exchange.ended;
                         let mut published = false;
@@ -335,7 +341,7 @@ proptest! {
                 }
                 2 => {
                     if let (Some(writer), Some(exchange)) = (&writers[index], &mut expected[index]) {
-                        let eligible = owners[index].is_some() && !closed
+                        let eligible = owners[index].is_some() && !ended(closed, &reset, generation)
                             && exchange.generation == generation && exchange.published
                             && !exchange.sent && !exchange.ended;
                         let mut claimed = false;
@@ -356,23 +362,25 @@ proptest! {
                 }
                 4 => {
                     if owners[index].is_some() {
-                        closed |= expected[index].is_some_and(|exchange| exchange.sent && !exchange.ended);
+                        if let Some(exchange) = expected[index] {
+                            reset[exchange.generation] |= exchange.sent && !exchange.ended;
+                        }
                     }
                     drop(owners[index].take());
                 }
                 5 => {
-                    // Only a started, unended exchange stops a replacement on
-                    // the same connection.
-                    closed |= expected.iter().zip(&owners).any(|(exchange, owner)| {
+                    // Only a started, unended exchange resets the session.
+                    reset[generation] |= expected.iter().zip(&owners).any(|(exchange, owner)| {
                         owner.is_some() && exchange.is_some_and(|exchange| {
                             exchange.generation == generation && exchange.sent && !exchange.ended
                         })
                     });
-                    prop_assert_eq!(fences[generation].retire(), !closed);
+                    prop_assert_eq!(fences[generation].retire(), !ended(closed, &reset, generation));
                     prop_assert!(fences[generation].open().is_none());
-                    if !closed {
-                        fences.push(WriterFence::new(connection.clone(), cause.clone()));
-                    }
+                    // A replacement session always opens on the same connection.
+                    sessions.push(connection.child_token());
+                    fences.push(WriterFence::new(sessions[generation + 1].clone()));
+                    reset.push(false);
                 }
                 6 => {
                     connection.cancel();
@@ -381,21 +389,29 @@ proptest! {
                 _ => {}
             }
             prop_assert_eq!(connection.is_cancelled(), closed);
+            for (session, reset) in sessions.iter().zip(&reset) {
+                prop_assert_eq!(session.is_cancelled(), closed || *reset);
+            }
             // Every old generation stays fenced while its writers and owners live.
             for (writer, exchange) in writers.iter().zip(&expected) {
                 if let (Some(writer), Some(exchange)) = (writer, exchange) {
-                    if closed || exchange.generation < fences.len() - 1 {
+                    if ended(closed, &reset, exchange.generation) || exchange.generation < fences.len() - 1 {
                         prop_assert!(!writer.try_start(|| panic!("a fenced writer reached local work")));
                     }
                 }
             }
         }
 
-        closed |= expected.iter().zip(&owners).any(|(exchange, owner)| {
-            owner.is_some() && exchange.is_some_and(|exchange| exchange.sent && !exchange.ended)
-        });
+        for (exchange, owner) in expected.iter().zip(&owners) {
+            if let (Some(exchange), Some(_)) = (exchange, owner) {
+                reset[exchange.generation] |= exchange.sent && !exchange.ended;
+            }
+        }
         drop(owners);
         prop_assert_eq!(connection.is_cancelled(), closed);
+        for (session, reset) in sessions.iter().zip(&reset) {
+            prop_assert_eq!(session.is_cancelled(), closed || *reset);
+        }
         for writer in writers.iter().flatten() {
             prop_assert!(!writer.try_start(|| panic!("dropping the owner fences its writer")));
         }

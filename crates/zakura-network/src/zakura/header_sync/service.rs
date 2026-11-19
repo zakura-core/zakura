@@ -28,8 +28,8 @@ use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
     handle_pipe_exit,
     regulation::{
-        CadenceSendError, CadenceSender, Current, ExchangeWriter, Replacement, SessionKey,
-        SessionTable, WriterFence,
+        CadenceSendError, CadenceSender, Current, ExchangeWriter, SessionKey, SessionTable,
+        StallClose, WriterFence,
     },
     spawn_supervised_pipe,
     transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
@@ -86,12 +86,13 @@ mod session_tests {
         for retire in [false, true] {
             let connection = CancellationToken::new();
             let close_cause = CloseCause::new();
-            let fence = WriterFence::new(connection.clone(), close_cause.clone());
+            let fence = WriterFence::new(connection.clone());
             let (send, mut outbound) = framed_channel(8);
             let subscriber =
                 Subscriber::new(REGTEST_HEADER_BYTES, fence.clone(), &framed_channel(1).1);
             let session = PeerSession::new(
                 ZakuraPeerId::new(vec![0x71; 32]).expect("the peer ID has 32 bytes"),
+                0,
                 1,
                 ServicePeerDirection::Outbound,
                 send,
@@ -133,6 +134,8 @@ mod session_tests {
 #[derive(Clone, Debug)]
 pub struct PeerSession {
     peer_id: ZakuraPeerId,
+    /// The connection that carries this session.
+    conn_id: ZakuraConnId,
     session_id: u64,
     direction: ServicePeerDirection,
     inner: Arc<PeerSessionInner>,
@@ -169,6 +172,7 @@ impl PeerSession {
     #[allow(clippy::too_many_arguments)]
     fn new(
         peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
         session_id: u64,
         direction: ServicePeerDirection,
         send: FramedSend,
@@ -180,6 +184,7 @@ impl PeerSession {
     ) -> Self {
         Self {
             peer_id,
+            conn_id,
             session_id,
             direction,
             inner: Arc::new(PeerSessionInner {
@@ -200,6 +205,12 @@ impl PeerSession {
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn with_origin(self, origin: Option<SessionOrigin>) -> Self {
         Self { origin, ..self }
+    }
+
+    /// This session, carried by connection `conn_id`.
+    #[cfg(test)]
+    pub(crate) fn with_conn_id(self, conn_id: ZakuraConnId) -> Self {
+        Self { conn_id, ..self }
     }
 
     /// Where the transport got this session, if its [`Peer`] said.
@@ -284,11 +295,13 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
     ) -> Self {
-        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        let fence = WriterFence::new(cancel_token.clone());
         // An in-process reader with no frame header check.
         let subscriber = Subscriber::new(REGTEST_HEADER_BYTES, fence, &framed_channel(1).1);
+        // Test sessions share one connection.
         Self::new(
             peer_id,
+            0,
             session_id,
             direction,
             send,
@@ -310,6 +323,11 @@ impl PeerSession {
         self.session_id
     }
 
+    /// The connection that carries this session.
+    pub(super) fn conn_id(&self) -> ZakuraConnId {
+        self.conn_id
+    }
+
     /// Direction of the underlying connection.
     pub fn direction(&self) -> ServicePeerDirection {
         self.direction
@@ -318,6 +336,15 @@ impl PeerSession {
     /// Peer disconnect/local shutdown token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    /// Close the connection after its second stall.
+    pub(super) fn close_after_repeated_stall(&self) {
+        StallClose::new(
+            self.inner.connection_cancel_token.clone(),
+            self.inner.close_cause.clone(),
+        )
+        .close();
     }
 
     pub(super) fn disconnect_for_port_panic(&self) {
@@ -743,7 +770,7 @@ impl Service for HeaderSyncService {
         let service_cancel_token = peer.service_cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        let fence = WriterFence::new(service_cancel_token.clone());
         {
             let _admission = self
                 .admission
@@ -763,12 +790,7 @@ impl Service for HeaderSyncService {
                 fence: fence.clone(),
                 session: peer.direction,
             };
-            if matches!(
-                self.sessions.replace(peer_id.clone(), current),
-                Replacement::Refused
-            ) {
-                return;
-            }
+            self.sessions.replace(peer_id.clone(), current);
         }
 
         #[cfg(not(any(test, zakura_sim)))]
@@ -804,6 +826,7 @@ impl Service for HeaderSyncService {
         let subscriber = subscriber.observed_by(self.header_sync.credit_tap(&peer_id, session_id));
         let session = PeerSession::new(
             peer_id.clone(),
+            conn_id,
             session_id,
             peer.direction,
             send.clone(),

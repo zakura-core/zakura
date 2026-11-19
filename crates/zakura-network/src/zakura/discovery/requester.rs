@@ -586,7 +586,7 @@ impl Queries {
     }
 
     /// Ends the session's queries: an unwritten query is skipped, and an
-    /// unanswered written query closes the connection. The reservations
+    /// unanswered written query resets the session. The reservations
     /// return to the pool, even while the transport reader outlives the
     /// session.
     pub(super) fn retire(&self) {

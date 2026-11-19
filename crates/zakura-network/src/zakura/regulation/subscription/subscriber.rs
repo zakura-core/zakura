@@ -162,7 +162,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
     /// terminal outcome ends it.
     ///
     /// The session owns this table, so the session's end drops every live
-    /// exchange. One whose `Open` was written then closes the connection.
+    /// exchange. One whose `Open` was written then resets the session.
     pub(crate) fn open_fenced(
         &mut self,
         key: K,

@@ -1674,10 +1674,9 @@ impl HeaderSyncReactor {
             self.reject_page(peer, session_id);
             return;
         }
-        self.reset_unproductive_requests(&peer, session_id);
-        self.state
-            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
-
+        // A staged page is not progress yet (#2248): a peer could drip one
+        // header per deadline and hold its reservation. Progress is a
+        // prepared target, or a filled reservation that continues the round.
         let active = self
             .peer_work_queue
             .active(&peer)
@@ -1701,8 +1700,19 @@ impl HeaderSyncReactor {
                 }
                 self.prepare_staged_work(&peer, bounded_prefix);
             }
-            PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+            PageNext::Continue { staged_tip } => {
+                self.note_request_progress(&peer, session_id);
+                self.continue_round(&peer, staged_tip);
+            }
         }
+    }
+
+    /// Count progress on `peer`'s request from `session_id`: clear its
+    /// strikes and give the request a full timeout.
+    fn note_request_progress(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        self.reset_unproductive_requests(peer, session_id);
+        self.state
+            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
     }
 
     /// Judge a page for `peer`'s selected-range repair, and retry the repair
@@ -2296,11 +2306,7 @@ impl HeaderSyncReactor {
                         return;
                     }
                 }
-                self.state.arm_request_deadline(
-                    peer.clone(),
-                    Instant::now(),
-                    self.startup.request_timeout,
-                );
+                self.note_request_progress(&peer, active.owner.session_id());
                 assert!(
                     self.peer_work_queue.begin_apply(&peer),
                     "the exact preparing request passed the completion gate"
@@ -3190,8 +3196,29 @@ impl HeaderSyncReactor {
         if !self.state.charge_unproductive_request(peer, limit) {
             return false;
         }
-        self.drop_unproductive_peer(peer, session_id, reason);
+        self.stall_session(peer, session_id, reason);
         true
+    }
+
+    /// Apply the shared stall rule (`regulation::stall`) to `peer`'s exact
+    /// session: drop it and start the readmission cooldown, and close its
+    /// connection if that connection stalled before.
+    fn stall_session(&mut self, peer: &ZakuraPeerId, session_id: u64, reason: &'static str) {
+        let Some(handles) = self.sessions.get(peer) else {
+            return;
+        };
+        if handles.session.session_id() != session_id {
+            return;
+        }
+        let session = handles.session.clone();
+        let limit = self.admitted_peer_limit();
+        if self
+            .state
+            .note_stall(peer, session.conn_id(), Instant::now(), limit)
+        {
+            session.close_after_repeated_stall();
+        }
+        self.drop_unproductive_peer(peer, session_id, reason);
     }
 
     /// Clears `peer`'s strike count after its session supplies usable work.
@@ -3208,7 +3235,9 @@ impl HeaderSyncReactor {
             .is_some_and(|handles| handles.session.session_id() == session_id)
     }
 
-    /// Closes one exact unproductive session and blocks its readmission for the cooldown.
+    /// Ends one exact unproductive session and blocks its readmission for the
+    /// cooldown. The session's fence resets any open subscription's streams;
+    /// the connection stays.
     fn drop_unproductive_peer(
         &mut self,
         peer: &ZakuraPeerId,
@@ -3278,8 +3307,8 @@ impl HeaderSyncReactor {
     /// its target after a committed prefix.
     ///
     /// A subscription kept for the next round still holds its `Open`'s
-    /// started exchange, so retiring the session while it is open closes the
-    /// connection, as during a round. The next round resumes it, or the peer's
+    /// started exchange, so retiring the session while it is open resets the
+    /// session, as during a round. The next round resumes it, or the peer's
     /// next status that cannot closes it; see
     /// [`Self::consider_advertised_header_target`].
     fn cancel_active_request(&mut self, active: &ActiveHeaderRequest) {

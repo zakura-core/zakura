@@ -2,6 +2,7 @@ use zakura_node_services::block_memory::DecodedBlockPool;
 use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
 use super::{
+    admission::min_rate_transfer_time,
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
@@ -533,7 +534,10 @@ pub(super) struct DownloadWindow {
     cwnd_unit: CwndUnit,
     /// Request-count cap used while byte-cwnd has no fresh BDP sample.
     pub(super) startup_request_cap: usize,
-    /// Deadline by which an active peer must send another accepted full block.
+    /// Deadline by which an active peer must send another accepted full block:
+    /// a fixed allowance, plus the outstanding authorized bytes at
+    /// [`DEADLINE_MIN_BYTES_PER_SEC`](super::admission::DEADLINE_MIN_BYTES_PER_SEC),
+    /// from the episode's start.
     pub(super) block_liveness_deadline: Option<Instant>,
     /// Whether the current no-progress episode already spent its one congestion
     /// grace. Block progress and disarm start a new episode.
@@ -875,17 +879,30 @@ impl DownloadWindow {
         }
     }
 
-    pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+    /// Count the request just issued. A new episode's deadline is `allowance`
+    /// plus every outstanding byte's transfer time; a running episode's
+    /// deadline grows by the new request's transfer time only.
+    pub(super) fn arm_liveness(&mut self, now: Instant, allowance: Duration) {
         self.outstanding.charge_last_for_liveness();
         self.last_request_at = Some(now);
         self.requests_without_block_progress =
             self.requests_without_block_progress.saturating_add(1);
-        if self.block_liveness_deadline.is_none() {
-            self.block_liveness_deadline = Some(now + timeout);
-        }
+        self.block_liveness_deadline = Some(match self.block_liveness_deadline {
+            None => now + allowance + min_rate_transfer_time(self.outstanding.reserved_bytes()),
+            Some(deadline) => {
+                let issued = self
+                    .outstanding
+                    .last_key()
+                    .and_then(|key| self.outstanding.get(key))
+                    .map_or(0, OutstandingBlockRange::reserved_bytes);
+                deadline + min_rate_transfer_time(issued)
+            }
+        });
     }
 
-    pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
+    /// Start a new episode after an accepted body. Its deadline is
+    /// `allowance` plus the remaining outstanding bytes' transfer time.
+    pub(super) fn note_block_progress(&mut self, now: Instant, allowance: Duration) {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
         self.outstanding.clear_liveness_charges();
@@ -893,7 +910,7 @@ impl DownloadWindow {
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
-            Some(now + timeout)
+            Some(now + allowance + min_rate_transfer_time(self.outstanding.reserved_bytes()))
         };
     }
 

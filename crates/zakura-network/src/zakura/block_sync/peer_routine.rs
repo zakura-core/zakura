@@ -586,6 +586,8 @@ impl PeerRoutine {
                 // Height-only requests cannot identify which live range the
                 // unexpected header belongs to. Defer each still-wanted
                 // body for this supplier without delaying other suppliers.
+                // The session ends without a fault, and its heights return
+                // to scheduling when the routine drops.
                 let bodies = self
                     .io
                     .requester
@@ -848,10 +850,17 @@ impl PeerRoutine {
         self.state.avoid_retry(heights, until);
     }
 
-    fn check_request_liveness(&self, now: Instant) -> Result<(), SinkReject> {
-        self.io
+    /// A peer that withholds endings stalls even while its bodies arrive
+    /// (#1438): an overdue ending is a stall under the shared rule.
+    fn check_request_liveness(&mut self, now: Instant) -> Result<(), SinkReject> {
+        if self
+            .io
             .requester
-            .check_liveness(now, self.config.effective_liveness_timeout())
+            .endings_overdue(now, self.config.effective_liveness_timeout())
+        {
+            return self.no_progress_stall(now, "GetBlocks exchanges did not finish");
+        }
+        Ok(())
     }
 
     fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
@@ -920,9 +929,10 @@ impl PeerRoutine {
         }
     }
 
-    /// Apply the no-progress stall protocol: disconnect on a repeated stall,
-    /// otherwise park the session for the cooldown and exit locally. An unended
-    /// request still closes the connection (see `WriterFence`).
+    /// Apply the shared stall rule (`regulation::stall`): close the
+    /// connection on a repeated stall, otherwise park the session for the
+    /// cooldown and exit locally. Either way the session ends, and its fence
+    /// resets any unended exchange's streams without closing the connection.
     fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
         if self.state.no_progress_response() == NoProgressResponse::Disconnect {
             tracing::debug!(
@@ -930,6 +940,7 @@ impl PeerRoutine {
                 outstanding = self.state.outstanding_len(),
                 "disconnecting Zakura block-sync peer after repeated no-progress stall"
             );
+            self.io.requester.close_after_repeated_stall();
             return Err(SinkReject::local(error));
         }
         self.io.registry.park_session(
@@ -1592,7 +1603,7 @@ mod tests {
     use super::PeerRoutine;
     use super::RoutineToReactor;
     use crate::zakura::framed_channel;
-    use crate::zakura::regulation::{ReservationPool, WriterFence};
+    use crate::zakura::regulation::{ReservationPool, StallClose, WriterFence};
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::CloseCause;
     use crate::zakura::ZakuraPeerId;
@@ -1603,7 +1614,8 @@ mod tests {
     }
 
     /// Production response authorization and serving for a test routine. Both
-    /// write through `session`, and the requester's fence closes `connection`.
+    /// write through `session`. The requester's fence resets `session`, and a
+    /// repeated stall closes `connection`.
     pub(super) fn test_authorization(
         session: &BlockSyncPeerSession,
         recv: &crate::zakura::FramedRecv,
@@ -1614,7 +1626,8 @@ mod tests {
         let close_cause = CloseCause::default();
         let requester = LiveRequester::new(
             pool,
-            WriterFence::new(connection.clone(), close_cause.clone()),
+            WriterFence::new(session.cancel_token()),
+            StallClose::new(connection.clone(), close_cause.clone()),
             recv,
             session.request_sender(),
         );
@@ -1668,6 +1681,7 @@ mod tests {
         /// An admitted routine for peer `[7; 32]` with default config, a private
         /// pool and connection, writing its requests to `out_send`.
         pub(super) fn new(out_send: crate::zakura::FramedSend) -> Self {
+            let connection = CancellationToken::new();
             Self {
                 config: ZakuraBlockSyncConfig::default(),
                 peer: ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds"),
@@ -1677,8 +1691,8 @@ mod tests {
                 work: None,
                 registry: Arc::new(PeerRegistry::new()),
                 pool: test_request_pool(),
-                connection: CancellationToken::new(),
-                cancel: CancellationToken::new(),
+                cancel: connection.child_token(),
+                connection,
                 out_send,
                 failure_cause: None,
                 channels: 16,
@@ -1782,6 +1796,7 @@ mod tests {
         let (routine, ends) = TestRoutine {
             pool,
             connection: connection.clone(),
+            cancel: connection.child_token(),
             ..TestRoutine::new(out_send)
         }
         .build();
@@ -3118,10 +3133,16 @@ mod tests {
         match order {
             ReceiptCleanup::BeforeWriter => {
                 let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
-                assert!(
-                    liveness_deadline < deadline,
-                    "transfer allowance outlasts liveness"
-                );
+                // The liveness deadline covers the request's transfer time, so
+                // it never precedes the request's own deadline. Move the request
+                // deadline past it, so only liveness is due.
+                assert!(liveness_deadline >= deadline);
+                let key = routine.state.window.outstanding.first_key().unwrap();
+                routine
+                    .state
+                    .window
+                    .outstanding
+                    .set_deadline(key, liveness_deadline + Duration::from_secs(1));
                 assert_eq!(work.owner_for_height(block::Height(2)), Some(owner));
                 assert_eq!(budget.reserved(), 0);
                 routine.gc_obsolete_outstanding();

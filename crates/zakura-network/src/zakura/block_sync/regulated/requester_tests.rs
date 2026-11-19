@@ -5,17 +5,11 @@ use super::{
     requester::{RequestError, Requester, ResponseError},
     wire::{Range, RangeEnding},
 };
-use crate::zakura::{
-    regulation::{ReservationPool, WriterFence},
-    CloseCause,
-};
+use crate::zakura::regulation::{ReservationPool, WriterFence};
 
 fn fence() -> (WriterFence, CancellationToken) {
     let connection = CancellationToken::new();
-    (
-        WriterFence::new(connection.clone(), CloseCause::default()),
-        connection,
-    )
+    (WriterFence::new(connection.clone()), connection)
 }
 
 fn range(start: u32, count: u32) -> Range {

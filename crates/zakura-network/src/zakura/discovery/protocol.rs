@@ -6748,6 +6748,68 @@ mod tests {
         assert!(full.get(&relayed_node_id).is_none());
     }
 
+    /// disco-18: relayed records never evict confirmed entries. Sybil relays,
+    /// each at its quota, send more records than a full production book holds.
+    /// Every confirmed entry stays, even the least recently seen, and the book
+    /// stays at its limit.
+    #[test]
+    fn sybil_relays_cannot_evict_confirmed_entries_from_a_full_book() {
+        use rayon::prelude::*;
+
+        const CONFIRMED: u8 = 64;
+        let mut book = ZakuraDiscoveryBook::default();
+        let limits = book.limits;
+        let confirmed: Vec<_> = (1..=CONFIRMED)
+            .map(|index| {
+                let record = long_lived_record_with(1, service(index.into()), test_addr(index));
+                import_hello(&mut book, record.clone(), NOW - 1)
+                    .expect("a first-party record imports");
+                record.body.node_id
+            })
+            .collect();
+
+        // Enough relays at quota to replace every entry in the book. Each
+        // record is verified before the book takes it, as a relayed batch
+        // is, and in parallel, because signatures dominate a debug build.
+        let relays = limits.max_records / limits.max_records_per_source + 1;
+        let records: Vec<_> = (0..relays * limits.max_records_per_source)
+            .into_par_iter()
+            .map(|index| {
+                let octet = u8::try_from(index % 250 + 1).expect("the octet fits in u8");
+                let record = long_lived_record_with(1, service(index), test_addr(octet));
+                VerifiedRecord::verify(record, &context()).expect("a sybil record is authentic")
+            })
+            .collect();
+        let mut refused = 0;
+        for batch in records.chunks(limits.max_records_per_source) {
+            let relay = secret_key().public();
+            for record in batch {
+                match book.import_verified_record(
+                    record.clone(),
+                    Some(relay),
+                    None,
+                    NOW,
+                    &context(),
+                    &mut Vec::new(),
+                ) {
+                    Ok(ImportOutcome::Added) => {}
+                    Err(DiscoveryBookError::Limit { .. }) => refused += 1,
+                    other => panic!("a new relayed record adds or is refused: {other:?}"),
+                }
+            }
+        }
+
+        assert!(refused > 0, "the relays overfilled the book");
+        assert_eq!(book.discovered_len(), limits.max_records);
+        for node_id in &confirmed {
+            assert!(
+                book.get(node_id)
+                    .is_some_and(ZakuraDiscoveryEntry::is_confirmed),
+                "a relayed record evicted a confirmed entry"
+            );
+        }
+    }
+
     /// A small snapshot is rebuilt when an entry it left out for expiry gets a
     /// new record, so the entry returns to samples within the epoch.
     #[test]

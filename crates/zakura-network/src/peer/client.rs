@@ -96,8 +96,7 @@ pub struct Client {
 /// The connection records block outcomes in reply order before waking their callers.
 ///
 /// The peer set can ask to be woken when the connection becomes usable as a block source again:
-/// it is free, or an unanswered or missed block mark clears. See
-/// [`RequestSlot::notify_when_usable`].
+/// it is free, or its missed block mark clears. See [`RequestSlot::notify_when_usable`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
@@ -140,13 +139,13 @@ impl RequestSlot {
     }
 
     /// Records whether the connection's last block request ended unanswered.
+    ///
+    /// Clearing the mark wakes nobody. Only a finished block reply clears it, and the
+    /// connection is busy until that reply is handed over, so the wake-up from
+    /// [`Self::set_busy`] that follows is the first time the peer is usable again.
     pub(crate) fn set_block_request_unanswered(&self, unanswered: bool) {
-        let was_unanswered = self
-            .block_request_unanswered
-            .swap(unanswered, Ordering::AcqRel);
-        if was_unanswered && !unanswered {
-            self.usable_waker.wake();
-        }
+        self.block_request_unanswered
+            .store(unanswered, Ordering::Release);
     }
 
     /// Returns true if the connection's last block request ended unanswered.
@@ -192,7 +191,9 @@ impl RequestSlot {
     }
 
     /// Registers the task polling with `cx` to be woken the next time this connection becomes
-    /// free, or one of its block marks clears. Only the last registered task is woken, once.
+    /// free, or a verified delivery clears its missed block mark. Only the last registered task
+    /// is woken, once. A connection that becomes free has also cleared any unanswered block
+    /// mark it is going to clear (see [`Self::set_block_request_unanswered`]).
     ///
     /// Register before reading the slot, so that a change between the read and the task going
     /// to sleep still wakes it.

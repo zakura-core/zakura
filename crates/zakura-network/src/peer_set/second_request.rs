@@ -11,8 +11,9 @@
 //! [`HeldSecondRequest`]) and decides again only when an input to the decision changes:
 //!
 //! - another peer announces the block;
-//! - an announcer becomes a better source: its connection is free again, an unanswered or
-//!   missed block mark clears, a miss expires, or its expected answer time is measured again;
+//! - an announcer becomes a better source: its connection is free again, which is also when
+//!   an unanswered block mark clears, a missed block mark clears or expires, or its expected
+//!   answer time is measured again;
 //! - the first request becomes overdue, and later stalls (see [`decision_times`]).
 //!
 //! Between those events a candidate can only look worse, because the time left on the first

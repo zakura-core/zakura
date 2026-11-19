@@ -2351,6 +2351,68 @@ async fn a_held_second_request_is_sent_when_a_busy_announcer_becomes_free() {
     assert!(matches!(tx_response.await, Ok(Response::Transactions(_))));
 }
 
+/// An announcer passed over for leaving a block request unanswered is asked as soon as it
+/// delivers a block.
+///
+/// The mark has no wake-up of its own. The reply that clears it also frees the connection, and
+/// that wakes the peer set.
+#[tokio::test(start_paused = true)]
+async fn a_held_second_request_is_sent_when_an_unanswered_announcer_delivers_a_block() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(230)),
+        measured_peer(&mut near, &registry, Some(3)),
+    ];
+
+    let (unanswered, getdata) = near
+        .send_direct(Request::BlocksByHash(
+            iter::once(OTHER_BLOCK_HASH).collect(),
+        ))
+        .await;
+    assert_eq!(getdata, Message::GetData(vec![OTHER_BLOCK_HASH.into()]));
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(unanswered.await.is_err());
+    let near_client = near
+        .client
+        .as_ref()
+        .expect("peer is not yet in the peer set");
+    assert!(near_client.has_unanswered_block_request());
+    assert!(near_client.can_send_request_now());
+
+    // The near peer is asked for another block, and has not answered yet.
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    let (delivered, getdata) = near
+        .send_direct(Request::BlocksByHash(iter::once(block.hash()).collect()))
+        .await;
+    assert_eq!(getdata, Message::GetData(vec![block.hash().into()]));
+    let mut peers = OwnedPeerSet::spawn(&mut [&mut far, &mut near]);
+
+    peers.announce(BLOCK_HASH, &far);
+    let (_attempt, _first, _second) = peers.download(BLOCK_HASH, &mut far).await;
+    peers.announce(BLOCK_HASH, &near);
+    assert_eq!(
+        near.written_now().await,
+        None,
+        "an announcer that left a block request unanswered is not asked"
+    );
+
+    near.peer_inbound
+        .send(Ok(Message::Block(block.into())))
+        .await
+        .expect("connection is open");
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the announcer is asked once it delivers a block"
+    );
+    assert!(matches!(delivered.await, Ok(Response::Blocks(_))));
+}
+
 /// An idle announcer with no measured answers is asked once its first answer is measured.
 #[tokio::test(start_paused = true)]
 async fn a_held_second_request_is_sent_when_an_announcer_is_first_measured() {

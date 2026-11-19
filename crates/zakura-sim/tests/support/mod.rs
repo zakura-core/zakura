@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 pub mod feed;
-pub mod handshake_seeds;
 pub mod prepare_fault;
 pub mod script;
 pub mod steer;

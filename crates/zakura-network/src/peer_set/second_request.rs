@@ -6,9 +6,28 @@
 //! now, is clearly shorter than what is left of the first request's. Otherwise the second copy
 //! would only cost bandwidth, because a legacy block request cannot be cancelled.
 //!
-//! The downloader shares the first dispatch with the peer set for each individual attempt.
+//! The downloader shares the first dispatch with the peer set for each individual attempt, and
+//! asks for a second request once. The peer set holds that request (see
+//! [`ParkedSecondRequest`]) and decides again only when an input to the decision changes:
+//!
+//! - another peer announces the block;
+//! - an announcer becomes a better source: its connection is free again, an unanswered or
+//!   missed block mark clears, or its expected answer time is measured again;
+//! - the first request becomes overdue, and later stalls (see [`decision_times`]).
+//!
+//! Between those events a candidate can only look worse, because the time left on the first
+//! request only shrinks.
 
-use std::time::Duration;
+use std::{future::Future, pin::Pin, task::Context, time::Duration};
+
+use futures::future::BoxFuture;
+use tokio::{
+    sync::oneshot,
+    time::{sleep_until, Instant, Sleep},
+};
+use zakura_chain::block;
+
+use crate::{BlockHedge, BoxError, Response};
 
 /// The least a candidate must be expected to beat the first request by, so that small errors
 /// in the expected answer times do not send second requests that lose.
@@ -46,6 +65,15 @@ impl SecondRequestReason {
     }
 }
 
+/// How long after the first request was sent waiting alone changes the decision: when the
+/// first request becomes overdue, and when it counts as stalled.
+///
+/// Before the first, the time left on the first request only shrinks, so a candidate that does
+/// not qualify now will not qualify by waiting. Between the two, nothing changes with time.
+fn decision_times(first_score: Duration) -> [Duration; 2] {
+    [first_score, first_score + STALL_SLACK]
+}
+
 /// Decides whether to send a second request for a block.
 ///
 /// - `first_score` is the first peer's expected answer time when it was asked. A first peer
@@ -64,7 +92,8 @@ pub(super) fn second_request_reason(
     waited: Duration,
     best_candidate_score: Duration,
 ) -> Option<SecondRequestReason> {
-    if waited >= first_score + STALL_SLACK {
+    let [overdue_after, stalled_after] = decision_times(first_score);
+    if waited >= stalled_after {
         return Some(SecondRequestReason::Stalled);
     }
 
@@ -79,13 +108,99 @@ pub(super) fn second_request_reason(
     // announced 193-196 ms after the first request, when less than the margin was left, so no
     // second request was sent. Once the first request is overdue, a candidate is compared with
     // the first peer's whole expected time instead, as if the first request were starting over.
-    let remaining = if waited >= first_score {
+    let remaining = if waited >= overdue_after {
         first_score
     } else {
         first_score - waited
     };
     let margin = MIN_MARGIN.max(first_score / MARGIN_SHARE);
     (best_candidate_score + margin < remaining).then_some(SecondRequestReason::Predicted)
+}
+
+/// The response to a second request that was sent to a peer.
+pub(super) type SecondResponse = BoxFuture<'static, Result<Response, BoxError>>;
+
+/// A download's request for a second copy of its block, held by the peer set until an announcer
+/// qualifies or the download stops accepting a second request.
+pub(super) struct ParkedSecondRequest {
+    hash: block::Hash,
+    attempt: BlockHedge,
+    /// Receives the response of the second request, once one is sent. Dropping it tells the
+    /// download that no peer was asked.
+    reply: oneshot::Sender<SecondResponse>,
+    /// Fires at the next time waiting alone changes the decision, or when the window ends.
+    timer: Pin<Box<Sleep>>,
+}
+
+impl ParkedSecondRequest {
+    /// Holds a second request for `hash`, and returns it with the receiver of its response.
+    pub(super) fn new(
+        hash: block::Hash,
+        attempt: BlockHedge,
+    ) -> (Self, oneshot::Receiver<SecondResponse>) {
+        let (reply, response) = oneshot::channel();
+        let timer = Box::pin(sleep_until(attempt.window_end()));
+        let parked = Self {
+            hash,
+            attempt,
+            reply,
+            timer,
+        };
+        (parked, response)
+    }
+
+    /// The block to request.
+    pub(super) fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// The download this request belongs to.
+    pub(super) fn attempt(&self) -> &BlockHedge {
+        &self.attempt
+    }
+
+    /// Returns whether the download still accepts a second request: its window is open and it
+    /// is still waiting for the response.
+    ///
+    /// While it does, registers the task polling with `cx` to be woken when the download stops
+    /// waiting.
+    pub(super) fn poll_open(&mut self, cx: &mut Context<'_>) -> bool {
+        self.attempt.elapsed_if_open().is_some() && self.reply.poll_closed(cx).is_pending()
+    }
+
+    /// Hands the download the response of the second request that was just sent.
+    pub(super) fn send(self, response: SecondResponse) {
+        // A download that stopped waiting since `poll_open` no longer needs the response.
+        let _ = self.reply.send(response);
+    }
+
+    /// Registers the task polling with `cx` to be woken at the next time waiting alone changes
+    /// the decision (see [`decision_times`]), or when the window ends.
+    pub(super) fn poll_next_decision(&mut self, cx: &mut Context<'_>) {
+        self.timer.as_mut().reset(next_decision_at(&self.attempt));
+        if self.timer.as_mut().poll(cx).is_ready() {
+            // That time arrived while the request was being considered, so consider it again.
+            cx.waker().wake_by_ref();
+        }
+    }
+}
+
+/// The next time waiting alone changes the decision for `attempt`, or the end of its window
+/// when no such time is left, or the first request has not been sent yet.
+fn next_decision_at(attempt: &BlockHedge) -> Instant {
+    let window_end = attempt.window_end();
+    let Some(first) = attempt.first_dispatch() else {
+        return window_end;
+    };
+    let Some(first_score) = first.score else {
+        return window_end;
+    };
+    let now = Instant::now();
+    decision_times(first_score)
+        .into_iter()
+        .map(|after| first.at + after)
+        .find(|at| *at > now)
+        .map_or(window_end, |at| at.min(window_end))
 }
 
 #[cfg(test)]
@@ -144,6 +259,28 @@ mod tests {
             None,
             "a candidate about as far away is still not asked"
         );
+    }
+
+    /// A held second request is reconsidered at the decision times instead of on a short
+    /// interval, so waiting must not turn a refusal into a request at any other time.
+    #[test]
+    fn waiting_alone_changes_the_decision_only_at_the_decision_times() {
+        let first_score = ms(242);
+        assert_eq!(decision_times(first_score), [ms(242), ms(742)]);
+
+        for candidate in [3, 50, 120, 190, 400] {
+            let mut previous = second_request_reason(first_score, ms(0), ms(candidate));
+            for waited in 1..=800 {
+                let decision = second_request_reason(first_score, ms(waited), ms(candidate));
+                if previous.is_none() && decision.is_some() {
+                    assert!(
+                        decision_times(first_score).contains(&ms(waited)),
+                        "a {candidate} ms candidate became eligible after {waited} ms"
+                    );
+                }
+                previous = decision;
+            }
+        }
     }
 
     #[test]

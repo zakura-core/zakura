@@ -116,6 +116,16 @@ directly, without a legacy handshake first, sends no name at all and gets no
 upgrade row, so its downloads read "address hidden" and "Zakura, version not
 recorded".
 
+An outside peer's location (city and country) comes from DB-IP's free "IP to
+City Lite" database, read on the dashboard host with the `python3-maxminddb`
+package (`peer_location.py`, `--geo-db`); no address is sent anywhere to be
+located. The mainnet deploy keeps the database in
+`/var/lib/zakura-mainnet-dashboard/geo/` and downloads a new one when the
+installed copy is not this month's. Locations are approximate and the page
+credits DB-IP, as its licence asks. Only peers that may be shown are located,
+so a private peer has no location. Without the database or the reader, the
+column reads "unknown" and the page is otherwise unchanged.
+
 Limits: a legacy download time is in whole milliseconds and includes any wait
 behind other requests on the same connection. A peer that connects to us does
 so from a temporary port, so peers are told apart by IP address alone and two
@@ -149,9 +159,9 @@ build that writes `legacy_gossip.jsonl` and know each other's names
 (`fleet.py peer-names`). Without those, a legacy node still appears with its
 own stage times, and its source shows as outside the fleet.
 
-`propagation.py`, `propagation.html`, and the shared `peer_addresses.py` are
-installed beside `zakura-cluster-status.py`; the dashboard loads them only when a node in its
-list has a `profiler_url`.
+`propagation.py`, `propagation.html`, `peer_location.py`, and the shared
+`peer_addresses.py` are installed beside `zakura-cluster-status.py`; the
+dashboard loads them only when a node in its list has a `profiler_url`.
 
 ### Tip Agreement and Orphan Pairs
 

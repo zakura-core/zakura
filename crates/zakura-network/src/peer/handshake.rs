@@ -1864,6 +1864,8 @@ where
             let inbound_announced_blocks = announced_blocks.clone();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
+            let peer_registry_updater = peer_registry_updater
+                .map(|updater| updater.with_delivery_trace(gossip_trace.delivery_trace()));
             let inbound_gossip_trace = gossip_trace.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
@@ -1980,7 +1982,8 @@ where
                 alternate_addrs.collect(),
                 inbound_budget,
             )
-            .with_gossip_trace(gossip_trace);
+            .with_gossip_trace(gossip_trace)
+            .with_delivery_samples(peer_registry_updater.clone());
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
@@ -2328,6 +2331,7 @@ async fn send_one_heartbeat(
     let request = Request::Ping(Nonce::default());
     tracing::trace!(?request, "queueing heartbeat request");
     match server_tx.try_send(ClientRequest {
+        advertised_block: None,
         request,
         tx,
         // we're not requesting inventory, so we don't need to update the registry

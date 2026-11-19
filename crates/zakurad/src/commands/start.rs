@@ -677,7 +677,8 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
-                .with_early_relay(early_relay.clone()),
+                .with_early_relay(early_relay.clone())
+                .with_second_block_request(config.network.block_source_score.second_request),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,

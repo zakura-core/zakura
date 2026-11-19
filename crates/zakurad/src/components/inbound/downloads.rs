@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{
@@ -59,6 +60,15 @@ pub struct GossipedTipChildHeightMismatch {
     ///
     /// A failed recovery is left to the syncer, so it stays within [`MAX_PARENT_RECOVERIES`].
     pub parent_recovery: bool,
+}
+
+/// The height claimed by this body is outside the local gossip admission window.
+#[derive(Debug, thiserror::Error)]
+enum GossipHeightWindowError {
+    #[error("gossiped block height too far ahead")]
+    Ahead,
+    #[error("gossiped block height behind the finalized tip")]
+    Behind,
 }
 
 /// Source key used for inbound block download ordering.
@@ -445,6 +455,11 @@ struct TaskSpawner<ZN, ZV, ZS> {
     /// Hands handles of tasks spawned by other tasks to the stream, which collects their
     /// results.
     spawned_sender: mpsc::UnboundedSender<DownloadHandle>,
+
+    /// Whether an advertised block can also be requested from a second announcer expected to
+    /// deliver it sooner.
+    second_block_request: bool,
+    misbehavior: zn::MisbehaviorReporter,
 }
 
 impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
@@ -458,6 +473,8 @@ impl<ZN: Clone, ZV: Clone, ZS: Clone> Clone for TaskSpawner<ZN, ZV, ZS> {
             chain_network: self.chain_network.clone(),
             admission: self.admission.clone(),
             spawned_sender: self.spawned_sender.clone(),
+            second_block_request: self.second_block_request,
+            misbehavior: self.misbehavior.clone(),
         }
     }
 }
@@ -586,7 +603,9 @@ where
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        misbehavior: zn::MisbehaviorReporter,
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
         network: ZN,
@@ -612,11 +631,22 @@ where
                 chain_network,
                 admission: Arc::default(),
                 spawned_sender,
+                second_block_request: false,
+                misbehavior,
             },
             pending: FuturesUnordered::new(),
             spawned_receiver,
             poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Lets an advertised block that has not arrived yet also be requested from another peer that
+    /// announced it, when the peer set expects that peer to deliver it sooner (see
+    /// [`zn::Request::BlockByHashHedge`]). The first eligible copy goes to verification. A
+    /// body-specific rejection can use the other dispatched copy. Parent recoveries send one request.
+    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
+        self.spawner.second_block_request = enabled;
+        self
     }
 
     /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
@@ -838,6 +868,42 @@ where
     }
 }
 
+/// How often a block download asks the peer set whether another announcer should deliver the
+/// block sooner than the first request.
+const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
+/// until it sends one, and returns that request's result.
+///
+/// Returns [`zn::NoFasterBlockSource`] once the dispatch window closes without a second request.
+async fn request_block_again<ZN>(
+    network: ZN,
+    hash: block::Hash,
+    attempt: zn::BlockHedge,
+) -> Result<zn::Response, BoxError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    loop {
+        tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
+        if attempt.elapsed_if_open().is_none() {
+            return Err(zn::NoFasterBlockSource.into());
+        }
+        let result = network
+            .clone()
+            .oneshot(zn::Request::BlockByHashHedge {
+                hash,
+                attempt: attempt.clone(),
+            })
+            .await;
+        match result {
+            Err(error) if error.is::<zn::NoFasterBlockSource>() => continue,
+            result => return result,
+        }
+    }
+}
+
 impl<ZN, ZV, ZS> TaskSpawner<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -924,6 +990,159 @@ where
         ParentRecovery::Requested
     }
 
+    /// Applies gossip admission and submits one candidate to the verifier. A successful commit
+    /// credits the connection that delivered this body.
+    async fn verify_candidate(
+        self,
+        (block, advertiser_addr, block_height, early_relay_delivery): BlockCandidate,
+        hash: block::Hash,
+        download_source: Option<zn::PeerSource>,
+        kind: DownloadKind,
+        source_lock: Option<Arc<Mutex<()>>>,
+    ) -> Result<(block::Hash, block::Height), DownloadError> {
+        let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let chain_network = self.chain_network.clone();
+        // # Security & Performance
+        //
+        // Reject blocks that are too far ahead of our tip,
+        // and blocks that are behind the finalized tip.
+        //
+        // Avoids denial of service attacks. Also reduces wasted work on high blocks
+        // that will timeout before being verified, and low blocks that can never be finalized.
+        let tip_height = self.latest_chain_tip.best_tip_height();
+
+        let max_lookahead_height =
+            max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
+
+        // Get the finalized tip height, assuming we're using the non-finalized state.
+        //
+        // It doesn't matter if we're a few blocks off here, because blocks this low
+        // are part of a fork with much less work. So they would be rejected anyway.
+        //
+        // And if we're still checkpointing, the checkpointer will reject blocks behind
+        // the finalized tip anyway.
+        //
+        // TODO: get the actual finalized tip height
+        let min_accepted_height = tip_height
+            .map(|tip_height| {
+                block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
+            })
+            .unwrap_or(block::Height(0));
+
+        if block_height > max_lookahead_height {
+            debug!(
+                ?hash,
+                ?block_height,
+                ?tip_height,
+                ?max_lookahead_height,
+                lookahead_limit = full_verify_concurrency_limit,
+                "gossiped block height too far ahead of the tip: dropped downloaded block",
+            );
+            metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
+
+            return Err((GossipHeightWindowError::Ahead.into(), None));
+        } else if block_height < min_accepted_height {
+            debug!(
+                ?hash,
+                ?block_height,
+                ?tip_height,
+                ?min_accepted_height,
+                behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                "gossiped block height behind the finalized tip: dropped downloaded block",
+            );
+            metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+            return Err((GossipHeightWindowError::Behind.into(), None));
+        }
+
+        if !has_sufficient_work(
+            &chain_network,
+            tip_height,
+            block_height,
+            block.header().difficulty_threshold,
+        ) {
+            metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
+            return Err((
+                "gossiped block target is easier than the Mainnet admission floor".into(),
+                advertiser_addr,
+            ));
+        }
+
+        // The parent is checked after the height policies, so only blocks this node would
+        // verify can start a recovery, and before the source lock, so a recovery is not
+        // delayed by earlier blocks from the same source.
+        if kind == DownloadKind::Advertised {
+            let parent = block.header().previous_block_hash;
+            let one_hop_from_tip = tip_height
+                .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
+                .is_some_and(|max_height| block_height <= max_height);
+
+            // A failed read only skips the recovery: the verifier still waits for the
+            // parent as before.
+            let parent_is_missing = one_hop_from_tip
+                && matches!(
+                    self.state
+                        .clone()
+                        .oneshot(zs::Request::KnownBlock(parent))
+                        .await,
+                    Ok(zs::Response::KnownBlock(None))
+                );
+
+            if parent_is_missing {
+                let header = *block.header();
+                let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
+                    zakura_consensus::proof_of_work_is_valid(
+                        &header,
+                        &chain_network,
+                        &block_height,
+                        &hash,
+                    )
+                })
+                .await
+                .unwrap_or(false);
+
+                let recovery = if proof_of_work_is_valid {
+                    self.recover_parent(parent, download_source)
+                } else {
+                    ParentRecovery::InvalidProofOfWork
+                };
+                debug!(
+                    ?hash,
+                    ?parent,
+                    ?block_height,
+                    ?recovery,
+                    "gossiped block's parent is missing",
+                );
+                metrics::counter!(
+                    "gossip.missing.parent.count",
+                    "outcome" => recovery.metric_label(),
+                )
+                .increment(1);
+            }
+        }
+
+        let _source_guard = match source_lock {
+            Some(source_lock) => Some(source_lock.lock_owned().await),
+            None => None,
+        };
+
+        // A pushed block takes the ordinary commit path. Only an `EarlyBlocks` response is an
+        // early-relay body.
+        let request = if early_relay_delivery {
+            zakura_consensus::Request::CommitEarlyRelay(block.clone().into_block())
+        } else {
+            zakura_consensus::Request::Commit(block.clone().into_block())
+        };
+        self.verifier
+            .oneshot(request)
+            .await
+            .map(|hash| {
+                block.record_verified();
+                (hash, block_height)
+            })
+            .map_err(|e| (e, advertiser_addr))
+    }
+
     /// Spawns the download and verify task for `download`, and records it in `admission`.
     fn spawn_download_task(
         &self,
@@ -961,12 +1180,7 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let spawner = self.clone();
-        let network = self.network.clone();
-        let chain_network = self.chain_network.clone();
-        let verifier = self.verifier.clone();
-        let state = self.state.clone();
-        let latest_chain_tip = self.latest_chain_tip.clone();
-        let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let second_request = self.second_block_request && kind == DownloadKind::Advertised;
 
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
@@ -974,7 +1188,8 @@ where
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
-            match state
+            match spawner
+                .state
                 .clone()
                 .oneshot(zs::Request::AnyChainBlock(hash.into()))
                 .await
@@ -986,203 +1201,87 @@ where
             }
             .map_err(|e| (e, None))?;
 
-            // A pushed block takes the ordinary commit path. Only an `EarlyBlocks` response is an
-            // early-relay body.
-            let (block, advertiser_addr, early_relay_delivery) = match pushed {
+            let checks = CandidateChecks {
+                tip: spawner.latest_chain_tip.clone(),
+                misbehavior: spawner.misbehavior.clone(),
+                kind,
+            };
+            let candidates = match pushed {
                 Some(block) => {
                     metrics::counter!("gossip.pushed.block.count").increment(1);
                     let pusher_addr = match &download_source {
                         Some(zn::PeerSource::LegacySocket(addr)) => Some(*addr),
                         _ => None,
                     };
-                    (block, pusher_addr, false)
+                    DownloadedCandidates::single(checks.check(block.into(), pusher_addr, false)?)
                 }
-                None => download_block(network, hash, download_source.clone()).await?,
-            };
-
-            // # Security & Performance
-            //
-            // Reject blocks that are too far ahead of our tip,
-            // and blocks that are behind the finalized tip.
-            //
-            // Avoids denial of service attacks. Also reduces wasted work on high blocks
-            // that will timeout before being verified, and low blocks that can never be finalized.
-            let tip_height = latest_chain_tip.best_tip_height();
-
-            // Read separately from `tip_height`, and used only by the new tip-child height check
-            // below. Deriving `tip_height` from this pair instead would couple the existing
-            // lookahead and behind-tip policies to hash availability: a chain tip reporting a
-            // height but not yet a hash would fall into the no-tip regime.
-            let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
-            let max_lookahead_height =
-                max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
-
-            // Get the finalized tip height, assuming we're using the non-finalized state.
-            //
-            // It doesn't matter if we're a few blocks off here, because blocks this low
-            // are part of a fork with much less work. So they would be rejected anyway.
-            //
-            // And if we're still checkpointing, the checkpointer will reject blocks behind
-            // the finalized tip anyway.
-            //
-            // TODO: get the actual finalized tip height
-            let min_accepted_height = tip_height
-                .map(|tip_height| {
-                    block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
-                })
-                .unwrap_or(block::Height(0));
-
-            let block_height = block
-                .coinbase_height()
-                .ok_or_else(|| {
-                    debug!(
-                        ?hash,
-                        "gossiped block with no height: dropped downloaded block"
-                    );
-                    metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
-
-                    BoxError::from("gossiped block with no height")
-                })
-                .map_err(|e| (e, advertiser_addr))?;
-
-            // Security: authenticate the claimed coinbase height against our own tip before the
-            // height policies below run. See `crate::components::auth_download_height`.
-            //
-            // This matters more here than on the syncer path: an `inv` for the new tip normally
-            // reaches gossip before the syncer asks for it, and `download_and_verify` drops
-            // honest peers' `inv`s for the same hash as `AlreadyQueued` while a download is
-            // outstanding. So a single poisoned response can consume the node's only chance at
-            // the new block until the next sync round, which is what leaves a mining backend
-            // issuing work on an obsolete tip.
-            if let Some(expected_height) =
-                tip_child_mismatch(block.header().previous_block_hash, block_height, best_tip)
-            {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?expected_height,
-                    "gossiped tip child claimed the wrong coinbase height: \
-                     dropped downloaded block"
-                );
-                metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
-
-                Err((
-                    BoxError::from(GossipedTipChildHeightMismatch {
-                        height: block_height,
-                        expected_height,
+                None => {
+                    let downloaded = download_block(
+                        spawner.network.clone(),
                         hash,
-                        parent_recovery: kind == DownloadKind::ParentRecovery,
-                    }),
-                    advertiser_addr,
-                ))?;
-            }
-
-            if block_height > max_lookahead_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?max_lookahead_height,
-                    lookahead_limit = full_verify_concurrency_limit,
-                    "gossiped block height too far ahead of the tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
-            } else if block_height < min_accepted_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?min_accepted_height,
-                    behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                    "gossiped block height behind the finalized tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height behind the finalized tip")
-                    .map_err(|e| (e.into(), None))?;
-            }
-
-            if !has_sufficient_work(
-                &chain_network,
-                tip_height,
-                block_height,
-                block.header().difficulty_threshold,
-            ) {
-                metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
-                return Err((
-                    "gossiped block target is easier than the Mainnet admission floor".into(),
-                    advertiser_addr,
-                ));
-            }
-
-            // The parent is checked after the height policies, so only blocks this node would
-            // verify can start a recovery, and before the source lock, so a recovery is not
-            // delayed by earlier blocks from the same source.
-            if kind == DownloadKind::Advertised {
-                let parent = block.header().previous_block_hash;
-                let one_hop_from_tip = tip_height
-                    .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
-                    .is_some_and(|max_height| block_height <= max_height);
-
-                // A failed read only skips the recovery: the verifier still waits for the
-                // parent as before.
-                let parent_is_missing = one_hop_from_tip
-                    && matches!(
-                        state.oneshot(zs::Request::KnownBlock(parent)).await,
-                        Ok(zs::Response::KnownBlock(None))
-                    );
-
-                if parent_is_missing {
-                    let header = *block.header();
-                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
-                        zakura_consensus::proof_of_work_is_valid(
-                            &header,
-                            &chain_network,
-                            &block_height,
-                            &hash,
-                        )
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
-                    } else {
-                        ParentRecovery::InvalidProofOfWork
-                    };
-                    debug!(
-                        ?hash,
-                        ?parent,
-                        ?block_height,
-                        ?recovery,
-                        "gossiped block's parent is missing",
-                    );
-                    metrics::counter!(
-                        "gossip.missing.parent.count",
-                        "outcome" => recovery.metric_label(),
+                        download_source.clone(),
+                        second_request,
+                        checks,
                     )
-                    .increment(1);
+                    .await?;
+                    metrics::counter!("gossip.downloaded.block.count").increment(1);
+                    downloaded
                 }
+            };
+
+            let first = candidates.first;
+            let Some(other) = candidates.other else {
+                return spawner
+                    .verify_candidate(first, hash, download_source, kind, source_lock)
+                    .await;
+            };
+            let winner = first.0.clone();
+            let first_result = spawner
+                .clone()
+                .verify_candidate(
+                    first,
+                    hash,
+                    download_source.clone(),
+                    kind,
+                    source_lock.clone(),
+                )
+                .await;
+
+            match first_result {
+                Ok(accepted) => {
+                    if let CompetingReply::Pending(task) = other {
+                        tokio::spawn(async move {
+                            if let Ok(Ok((body, _, _, _))) = task.await {
+                                body.record_verified_copy(&winner);
+                            }
+                        });
+                    }
+                    Ok(accepted)
+                }
+                Err((error, source)) if another_copy_can_verify(&error) => {
+                    // The header can still have a valid body. Use only the copy already requested.
+                    let candidate = match other.result().await {
+                        Ok(candidate) => candidate,
+                        Err(other_error) => {
+                            let (selected, discarded) =
+                                prioritize_race_errors((error, source), other_error);
+                            if let Some((addr, score)) =
+                                super::block_misbehavior(discarded.0, discarded.1)
+                            {
+                                spawner.misbehavior.report(addr, score);
+                            }
+                            return Err(selected);
+                        }
+                    };
+                    if let Some((addr, score)) = super::block_misbehavior(error, source) {
+                        spawner.misbehavior.report(addr, score);
+                    }
+                    spawner
+                        .verify_candidate(candidate, hash, download_source, kind, source_lock)
+                        .await
+                }
+                Err(error) => Err(error),
             }
-
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
-            };
-
-            let request = if early_relay_delivery {
-                zakura_consensus::Request::CommitEarlyRelay(block)
-            } else {
-                zakura_consensus::Request::Commit(block)
-            };
-            verifier
-                .oneshot(request)
-                .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
         }
         .map_ok(move |(hash, height)| {
             match kind {
@@ -1261,7 +1360,101 @@ where
     }
 }
 
+/// A delivered body, its supplier, its claimed height, and whether the supplier sent it as an
+/// early-relay body.
+type BlockCandidate = (
+    zn::DeliveredBlock,
+    Option<PeerSocketAddr>,
+    block::Height,
+    bool,
+);
+type DownloadError = (BoxError, Option<PeerSocketAddr>);
+
+#[derive(Clone)]
+struct CandidateChecks {
+    tip: zs::LatestChainTip,
+    misbehavior: zn::MisbehaviorReporter,
+    kind: DownloadKind,
+}
+
+impl CandidateChecks {
+    /// Check a body's claimed height before selecting it or discarding its competitor.
+    fn check(
+        &self,
+        block: zn::DeliveredBlock,
+        source: Option<PeerSocketAddr>,
+        early_relay_delivery: bool,
+    ) -> Result<BlockCandidate, DownloadError> {
+        let height = block.coinbase_height().ok_or_else(|| {
+            metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
+            (BoxError::from("gossiped block with no height"), source)
+        })?;
+        if let Some(expected_height) = tip_child_mismatch(
+            block.header().previous_block_hash,
+            height,
+            self.tip.best_tip_height_and_hash(),
+        ) {
+            metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
+            if let Some(addr) = source {
+                self.misbehavior
+                    .report(addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
+            }
+            return Err((
+                BoxError::from(GossipedTipChildHeightMismatch {
+                    height,
+                    expected_height,
+                    hash: block.hash(),
+                    parent_recovery: self.kind == DownloadKind::ParentRecovery,
+                }),
+                source,
+            ));
+        }
+        Ok((block, source, height, early_relay_delivery))
+    }
+}
+
+/// The first usable reply and the other exchange if both requests were dispatched.
+#[derive(Debug)]
+struct DownloadedCandidates {
+    first: BlockCandidate,
+    other: Option<CompetingReply>,
+}
+
+#[derive(Debug)]
+enum CompetingReply {
+    Pending(JoinHandle<Result<BlockCandidate, DownloadError>>),
+    Failed(DownloadError),
+}
+
+impl CompetingReply {
+    async fn result(self) -> Result<BlockCandidate, DownloadError> {
+        match self {
+            Self::Pending(task) => task.await.map_err(|error| (BoxError::from(error), None))?,
+            Self::Failed(error) => Err(error),
+        }
+    }
+}
+
+impl DownloadedCandidates {
+    fn single(first: BlockCandidate) -> Self {
+        Self { first, other: None }
+    }
+
+    /// A height rejection can still determine the retry if this candidate fails verification.
+    fn after_failure(first: BlockCandidate, error: DownloadError) -> Self {
+        let other = error
+            .0
+            .is::<GossipedTipChildHeightMismatch>()
+            .then_some(CompetingReply::Failed(error));
+        Self { first, other }
+    }
+}
+
 /// Downloads the block `hash` from `download_source`, or from any peer without a source.
+///
+/// With `second_request`, another peer that announced the block may also be asked while the first
+/// request is outstanding. Only a reply carrying the requested block wins. An already-sent
+/// request can finish even after the other peer delivers the block.
 ///
 /// Returns the block, the address of the peer that sent it, and whether the peer sent it as an
 /// early-relay body. Fails unless the peer sends exactly the block `hash`.
@@ -1269,49 +1462,132 @@ async fn download_block<ZN>(
     network: ZN,
     hash: block::Hash,
     download_source: Option<zn::PeerSource>,
-) -> Result<(BlockHandle, Option<PeerSocketAddr>, bool), (BoxError, Option<PeerSocketAddr>)>
+    second_request: bool,
+    checks: CandidateChecks,
+) -> Result<DownloadedCandidates, DownloadError>
 where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
 {
-    let request_hashes = std::iter::once(hash).collect();
-    let request = match download_source {
-        Some(source) => zn::Request::BlocksByHashFrom {
-            hashes: request_hashes,
-            source,
-        },
-        None => zn::Request::BlocksByHash(request_hashes),
+    let validate = move |result| {
+        let (block, source, early_relay_delivery) = requested_block(hash, result)?;
+        checks.check(block, source, early_relay_delivery)
     };
+    if !second_request {
+        let request = zn::Request::block_by_hash(hash, download_source);
+        return validate(network.oneshot(request).await).map(DownloadedCandidates::single);
+    }
 
-    let response = network.oneshot(request).await.map_err(|e| (e, None))?;
-    let early_relay_delivery = matches!(response, zn::Response::EarlyBlocks(_));
-    let (block, advertiser_addr) = if let zn::Response::Blocks(blocks)
-    | zn::Response::EarlyBlocks(blocks) = response
-    {
-        // A peer must answer a single-hash block request with exactly one
-        // block entry. A malformed or empty response is a peer fault (e.g.
-        // a Zakura peer that tore its connection down mid-response), not a
-        // local invariant, so fail the download gracefully rather than
-        // panicking the task.
-        if blocks.len() != 1 {
-            return Err((
-                format!(
-                    "wrong number of blocks in response to a single hash: got {}",
-                    blocks.len()
-                )
-                .into(),
-                None,
-            ));
+    let attempt = zn::BlockHedge::new(tokio::time::Instant::now());
+    let primary = zn::Request::BlockByHashPrimary {
+        hash,
+        source: download_source,
+        attempt: attempt.clone(),
+    };
+    let validate = {
+        let attempt = attempt.clone();
+        move |result| validate(result).inspect(|_| attempt.mark_satisfied())
+    };
+    let mut first = network
+        .clone()
+        .oneshot(primary)
+        .map(validate.clone())
+        .boxed();
+    let mut second = request_block_again(network, hash, attempt.clone())
+        .map(validate)
+        .boxed();
+
+    tokio::select! {
+        biased;
+        result = &mut first => {
+            // A queued check can be dropped. A dispatched request can still supply or
+            // finish transferring the block.
+            if !attempt.close() {
+                return result.map(DownloadedCandidates::single);
+            }
+            match result {
+                Ok(first) => Ok(DownloadedCandidates { first, other: Some(CompetingReply::Pending(tokio::spawn(second))) }),
+                Err(first_error) => match second.await {
+                    Ok(block) => {
+                        metrics::counter!("gossip.hedge.won.count").increment(1);
+                        Ok(DownloadedCandidates::after_failure(block, first_error))
+                    }
+                    Err(second_error) => Err(prioritize_race_errors(first_error, second_error).0),
+                },
+            }
         }
+        result = &mut second => match result {
+            Ok(response) => {
+                metrics::counter!("gossip.hedge.won.count").increment(1);
+                Ok(DownloadedCandidates { first: response, other: Some(CompetingReply::Pending(tokio::spawn(first))) })
+            }
+            Err(second_error) => match first.await {
+                Ok(block) => Ok(DownloadedCandidates::after_failure(block, second_error)),
+                Err(first_error) => Err(prioritize_race_errors(first_error, second_error).0),
+            }
+        },
+    }
+}
 
-        let Some(available) = blocks.first().expect("just checked length").available() else {
-            return Err((
-                "unexpected missing block status: single block failures should be errors".into(),
-                None,
-            ));
-        };
-        available
+/// Another body for this header can pass the local height window or correct a commitment
+/// mismatch or duplicate-transaction rejection.
+fn another_copy_can_verify(error: &BoxError) -> bool {
+    use zakura_header_chain::BodyVerificationClass;
+    if error.is::<GossipHeightWindowError>() {
+        return true;
+    }
+
+    match crate::commands::start::zakura::block_verify_error_class(error) {
+        BodyVerificationClass::PayloadMismatch(_) => true,
+        BodyVerificationClass::ConsensusInvalid(rule) => matches!(
+            rule.as_str(),
+            "block.duplicate_transaction" | "checkpoint.duplicate_transaction"
+        ),
+        BodyVerificationClass::Duplicate | BodyVerificationClass::Retryable(_) => false,
+    }
+}
+
+/// Return the error for inbound handling first, retaining the other for supplier attribution.
+/// A tip-child height error carries the signal for the existing bounded replacement request.
+fn prioritize_race_errors(
+    first: DownloadError,
+    second: DownloadError,
+) -> (DownloadError, DownloadError) {
+    if second.0.is::<GossipedTipChildHeightMismatch>() {
+        (second, first)
     } else {
-        unreachable!("wrong response to block request");
+        (first, second)
+    }
+}
+
+/// Extracts the one requested block before a response can win the download race. A wrong hash
+/// retains the supplying peer's address so the caller can attribute the error.
+///
+/// Also returns whether the peer sent the block as an early-relay body.
+fn requested_block(
+    hash: block::Hash,
+    result: Result<zn::Response, BoxError>,
+) -> Result<(zn::DeliveredBlock, Option<PeerSocketAddr>, bool), DownloadError> {
+    let response = result.map_err(|e| (e, None))?;
+    let early_relay_delivery = matches!(response, zn::Response::EarlyBlocks(_));
+    let (zn::Response::Blocks(blocks) | zn::Response::EarlyBlocks(blocks)) = response else {
+        return Err(("wrong response to block request".into(), None));
+    };
+    let [entry] = blocks.as_slice() else {
+        return Err((
+            format!(
+                "wrong number of blocks in response to a single hash: got {}",
+                blocks.len()
+            )
+            .into(),
+            None,
+        ));
+    };
+    let Some((block, advertiser_addr)) = entry.available() else {
+        return Err((
+            format!("peer reported requested block {hash} missing").into(),
+            None,
+        ));
     };
 
     // Bind the delivered block to the hash we requested. A peer that
@@ -1329,12 +1605,14 @@ where
             advertiser_addr,
         ));
     }
-    metrics::counter!("gossip.downloaded.block.count").increment(1);
     Ok((block, advertiser_addr, early_relay_delivery))
 }
 
 #[cfg(test)]
 mod missing_parent_tests;
+
+#[cfg(test)]
+mod hedge_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1380,6 +1658,7 @@ mod tests {
         latest_chain_tip: zs::LatestChainTip,
     ) -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             BoxCloneService::new(service_fn(|_request| {
@@ -1501,6 +1780,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MIN_CONCURRENCY_LIMIT,
             false,
             BoxCloneService::new(service_fn(|_request| {
@@ -1604,6 +1884,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             network,
@@ -1706,6 +1987,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             BoxCloneService::new(service_fn(move |request| {
@@ -1792,6 +2074,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             network,
@@ -1860,6 +2143,7 @@ mod tests {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             network,
@@ -1969,6 +2253,7 @@ mod tests {
             let (_tip_sender, latest_chain_tip, _tip_change) =
                 zs::ChainTipSender::new(None, &Network::Mainnet);
             let mut downloads = Downloads::new(
+                crate::components::test_misbehavior::reporter(),
                 MAX_INBOUND_CONCURRENCY,
                 false,
                 network,
@@ -2038,7 +2323,7 @@ mod tests {
     ///
     /// The tip block's contents are irrelevant to the height check, so an arbitrary block is
     /// reused and its identity fields overridden.
-    fn chain_tip_at(
+    pub(super) fn chain_tip_at(
         height: block::Height,
         hash: block::Hash,
     ) -> (zs::ChainTipSender, zs::LatestChainTip) {
@@ -2059,7 +2344,11 @@ mod tests {
     }
 
     /// Moves the tip reported by a [`chain_tip_at`] sender.
-    fn set_tip(tip_sender: &mut zs::ChainTipSender, height: block::Height, hash: block::Hash) {
+    pub(super) fn set_tip(
+        tip_sender: &mut zs::ChainTipSender,
+        height: block::Height,
+        hash: block::Hash,
+    ) {
         let any_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .expect("test vector deserializes");
@@ -2079,6 +2368,7 @@ mod tests {
         latest_chain_tip: zs::LatestChainTip,
     ) -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         Downloads::new(
+            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             BoxCloneService::new(service_fn(move |_request| {

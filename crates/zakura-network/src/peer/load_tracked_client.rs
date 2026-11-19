@@ -14,10 +14,32 @@ use tower::{
 
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
-    peer::{Client, ConnectedAddr, ConnectionInfo},
+    peer::{AdvertisedBlockRequest, Client, ConnectedAddr, ConnectionInfo},
     peer_registry::trace_user_agent,
     protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
+    Request,
 };
+
+/// Carries the peer set's routing decision through the load tracker to the client.
+#[derive(Debug)]
+struct RoutedClient(Client);
+
+impl Service<(Request, Option<AdvertisedBlockRequest>)> for RoutedClient {
+    type Response = <Client as Service<Request>>::Response;
+    type Error = <Client as Service<Request>>::Error;
+    type Future = <Client as Service<Request>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(
+        &mut self,
+        (request, advertised): (Request, Option<AdvertisedBlockRequest>),
+    ) -> Self::Future {
+        self.0.send_request(request, advertised)
+    }
+}
 
 /// A client service wrapper that keeps track of its load.
 ///
@@ -28,7 +50,7 @@ pub struct LoadTrackedClient {
     pub(crate) block_gossip: super::block_gossip::BlockGossipPeer,
 
     /// A service representing a connected peer, wrapped in a load tracker.
-    service: PeakEwma<Client>,
+    service: PeakEwma<RoutedClient>,
 
     /// Reports whether the connection can write a request as soon as it is sent.
     ///
@@ -69,7 +91,7 @@ impl From<Client> for LoadTrackedClient {
         let user_agent = trace_user_agent(&connection_info.remote.user_agent).into();
 
         let service = PeakEwma::new(
-            client,
+            RoutedClient(client),
             EWMA_DEFAULT_RTT,
             EWMA_DECAY_TIME_NANOS,
             tower::load::CompleteOnResponse::default(),
@@ -131,10 +153,23 @@ impl LoadTrackedClient {
     /// Returns true if block routing should prefer this advertiser over its busy advertisers.
     ///
     /// A connection can write a request now, and the peer did not leave its last block request
-    /// unanswered. Otherwise routing only offers this advertiser through ordinary load balancing,
-    /// so a peer that withholds blocks can't win every retry while other advertisers are busy.
-    pub(crate) fn is_preferred_block_source(&self) -> bool {
-        self.can_send_request_now() && !self.has_unanswered_block_request()
+    /// unanswered. With `skip_missed_announcers`, which block source scoring sets, the peer must
+    /// also be free of a recent miss. A subsequent verified delivery clears that miss. Otherwise
+    /// routing only offers this advertiser through ordinary load balancing, so a peer that
+    /// withholds blocks can't win every retry while other advertisers are busy.
+    pub(crate) fn is_preferred_block_source(&self, skip_missed_announcers: bool) -> bool {
+        self.can_send_request_now()
+            && !self.has_unanswered_block_request()
+            && !(skip_missed_announcers && self.request_slot.announced_block_missed())
+    }
+
+    /// Sends the request with the reason this particular peer was chosen.
+    pub(crate) fn call_routed(
+        &mut self,
+        request: Request,
+        advertised: Option<AdvertisedBlockRequest>,
+    ) -> <Self as Service<Request>>::Future {
+        self.service.call((request, advertised))
     }
 
     /// Retrieve the peer's self-reported chain height from its handshake.
@@ -164,10 +199,7 @@ impl LoadTrackedClient {
     }
 }
 
-impl<Request> Service<Request> for LoadTrackedClient
-where
-    Client: Service<Request>,
-{
+impl Service<Request> for LoadTrackedClient {
     type Response = <Client as Service<Request>>::Response;
     type Error = <Client as Service<Request>>::Error;
     type Future = <PeakEwma<Client> as Service<Request>>::Future;
@@ -177,7 +209,7 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        self.service.call(request)
+        self.call_routed(request, None)
     }
 }
 

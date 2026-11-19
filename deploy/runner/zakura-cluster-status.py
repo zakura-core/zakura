@@ -359,12 +359,14 @@ class PropagationView:
     address nor anything else about such a peer.
     """
 
-    def __init__(self, nodes: list[Node], join):
+    def __init__(self, nodes: list[Node], join, locate=None):
         self.nodes = [node for node in nodes if node.profiler_url]
         # Every node in the list is ours, with a profiler or not, so a download from
         # any of them is shown under its name.
         self.fleet_addresses = {ssh_host(node.ssh_string): node.name for node in nodes}
         self.join = join
+        # Where an outside peer is (`peer_location.open_locator`); none when off.
+        self.locate = locate
         self._lock = threading.Lock()
         self._joined: dict | None = None
         self._fetched_at = 0.0
@@ -417,6 +419,7 @@ class PropagationView:
                     limit=PROPAGATION_BLOCKS,
                     fleet_addresses=self.fleet_addresses,
                     is_private=is_private,
+                    locate=self.locate,
                 )
                 self._fetched_at, self._joined_for = time.monotonic(), protected
             return self._joined
@@ -5802,6 +5805,8 @@ def main() -> None:
                         help="approved profile/selector JSON; serves coherent /v1/dashboard")
     parser.add_argument("--trusted-proxy", action="append", default=[], type=ipaddress.ip_address,
                         help="explicit reverse-proxy IP allowed to supply X-Forwarded-For; repeat per IP")
+    parser.add_argument("--geo-db", default="",
+                        help="DB-IP City Lite .mmdb that locates outside peers on the propagation page")
     args = parser.parse_args()
     TRUSTED_PROXY_IPS = set(args.trusted_proxy)
     DASHBOARD_LOGIN = dashboard_login_from_env(os.environ)
@@ -5826,8 +5831,9 @@ def main() -> None:
     if any(node.profiler_url for node in nodes):
         # Only a fleet with profilers has a cluster view, so only its dashboard host
         # needs the module that builds it.
+        from peer_location import open_locator
         from propagation import join
-        PROPAGATION = PropagationView(nodes, join)
+        PROPAGATION = PropagationView(nodes, join, open_locator(args.geo_db))
     if args.nu7_activation_config:
         from nu7_activation import ActivationFeed
         ACTIVATION_FEED = ActivationFeed(args.nu7_activation_config, nu7)

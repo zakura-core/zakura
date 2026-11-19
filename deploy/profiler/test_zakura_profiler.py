@@ -1032,6 +1032,87 @@ class TraceFollowingTests(unittest.TestCase):
         # The failed attempt does not move the block's own download time.
         self.assertEqual(record["ms"]["body_download"], 40)
 
+    def test_a_hedged_block_s_download_runs_from_the_first_request(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "legacy_peer_request",
+            # Asked at 0.6 s; the hedge went out at 0.65 s and won at 0.67 s.
+            trace_row("block_request_finish", 670_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
+                      user_agent="/Zakura:1.8.7/", elapsed_ms=20, route="hedge"),
+            # The first request's answer arrived later, at 1.0 s.
+            trace_row("block_request_finish", 1_000_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="198.51.100.3:8233",
+                      user_agent="/Zakura:1.8.5/", elapsed_ms=400, route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(1_010_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual([download["route"] for download in record["downloads"]], ["hedge", "advertised"])
+        self.assertEqual(record["ms"]["body_download"], 70)
+
+    def test_a_hedged_block_s_download_counts_a_first_request_that_failed_after_the_hedge_won(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append(
+            "legacy_peer_request",
+            # Asked at 0.6 s; the hedge went out at 0.65 s and won at 0.67 s. Its row does not
+            # say how long the first request had waited, as on nodes from before that field.
+            trace_row("block_request_finish", 670_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
+                      user_agent="/Zakura:1.8.7/", elapsed_ms=20, route="hedge"),
+            # The first request failed at 1.0 s, after the block had arrived.
+            trace_row("block_request_finish", 1_000_000, result="error", requested_hash=BLOCK_HASH,
+                      peer="198.51.100.3:8233", user_agent="/Zakura:1.8.5/", elapsed_ms=400,
+                      route="advertised"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(680_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+
+        self.assertEqual(record["ms"]["body_download"], 70)
+
+    def test_a_hedge_inherits_the_start_of_a_primary_that_failed_during_the_race(self):
+        for timing in [{}, {"first_request_waited_ms": 50}]:
+            with self.subTest(timing=timing):
+                stages = blocks.BlockStages()
+                for row in [
+                    trace_row("block_request_finish", 590_000, result="error",
+                              requested_hash=BLOCK_HASH, elapsed_ms=400, route="advertised"),
+                    trace_row("block_request_finish", 660_000, result="error",
+                              requested_hash=BLOCK_HASH, elapsed_ms=60, route="advertised"),
+                    trace_row("block_request_finish", 670_000, result="available",
+                              requested_hash=BLOCK_HASH, returned_hash=BLOCK_HASH,
+                              returned_height=10, elapsed_ms=20, route="hedge", **timing),
+                    tip_row(680_000), tip_row(9_000_000, height=11, block_hash="ef" * 32),
+                ]:
+                    stages.feed(row)
+                self.assertEqual(stages.finished()[0]["ms"]["body_download"], 70)
+
+    def test_a_hedged_block_s_download_is_timed_before_the_first_request_answers(self):
+        follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
+        self.append("legacy_gossip", trace_row("block_inv_received", 100_000, hash=BLOCK_HASH))
+        self.append(
+            "legacy_peer_request",
+            # Announced at 0.1 s and dispatched at 0.6 s; the hedge went out at 0.65 s, when the first request had waited
+            # 50 ms, and won at 0.67 s.
+            trace_row("block_request_finish", 670_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="192.0.2.7:8233",
+                      user_agent="/Zakura:1.8.7/", elapsed_ms=20, first_request_waited_ms=50,
+                      route="hedge"),
+        )  # fmt: skip
+        self.append("chain_tip", tip_row(680_000), tip_row(9_000_000, height=11, block_hash="ef" * 32))
+        (record,) = follower.poll()
+        # The first request answers only after the record was published.
+        self.append(
+            "legacy_peer_request",
+            trace_row("block_request_finish", 9_500_000, result="available", requested_hash=BLOCK_HASH,
+                      returned_hash=BLOCK_HASH, returned_height=10, peer="198.51.100.3:8233",
+                      user_agent="/Zakura:1.8.5/", elapsed_ms=8_900, route="advertised"),
+        )  # fmt: skip
+        follower.poll()
+
+        self.assertEqual(record["ms"]["body_download"], 70)
+        self.assertAlmostEqual(record["wall"]["asked"], blocks.process_started(NODE_RUN) + 0.6)
+
     def test_the_first_outside_announcer_is_named_from_its_connection_s_request_rows(self):
         follower = blocks.TraceFollower(str(self.directory), table_cap_bytes=1 << 20)
         self.append(

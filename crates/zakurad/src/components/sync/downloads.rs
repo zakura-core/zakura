@@ -919,9 +919,9 @@ where
                     // Verify the block.
                     verify_start = std::time::Instant::now();
                     let request = if early_relay_delivery {
-                        zakura_consensus::Request::CommitEarlyRelay(block.clone())
+                        zakura_consensus::Request::CommitEarlyRelay(block.clone().into_block())
                     } else {
-                        zakura_consensus::Request::Commit(block.clone())
+                        zakura_consensus::Request::Commit(block.clone().into_block())
                     };
                     let mut rsp = verifier
                         .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
@@ -974,6 +974,7 @@ where
                     .record(verify_elapsed.as_secs_f64());
 
                 if verification.is_ok() {
+                    block.record_verified();
                     metrics::counter!("sync.verified.block.count").increment(1);
                 }
 

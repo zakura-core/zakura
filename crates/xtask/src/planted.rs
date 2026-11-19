@@ -22,7 +22,8 @@
 //!
 //! 1. records the witness with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
-//!    expecting `holds`;
+//!    expecting `holds`. A seed's witness is the input the unpatched build
+//!    writes, since a seed's builder can run the code the patch changes;
 //! 2. applies the patch, which must not change, delete or rename the
 //!    case's witness files (the seed registry's source, or its scenario and
 //!    Plan bytes), so both runs read the same witness. It then rebuilds and
@@ -995,7 +996,17 @@ fn check_case(
     case: &Case,
 ) -> Result<Verdict, BoxError> {
     let harness = case.witness.harness(&baseline.registry)?;
-    let input = case.witness.located(worktree);
+    let input = match &case.witness {
+        // A seed's builder can run the code the patch changes, so a seed
+        // built on the patched tree could be another input. Both runs take
+        // the unpatched build's input.
+        Witness::Seed(name) => Located::Input(seeds::write_input(
+            &baseline.binary,
+            baseline.registry.seed(name)?,
+            &scratch.join("seed"),
+        )?),
+        witness => witness.located(worktree),
+    };
     let unpatched = record(
         Command::new(&baseline.binary),
         &harness,

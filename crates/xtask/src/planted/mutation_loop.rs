@@ -10,7 +10,8 @@
 //! must violate, and one witness: a planted case's seed or typed scenario,
 //! a seed of the simulator's registry by name, or one `zakura-sim` test.
 //! The unpatched build lists the registry, which names each seed's
-//! harness ([`super::seeds`]).
+//! harness, and writes each seed's input, which every slot runs
+//! ([`super::seeds`]).
 //!
 //! The runner checks out `HEAD`, the pinned revision, once per worker slot
 //! under `--work`. Each slot owns its worktree and target directory, and
@@ -63,7 +64,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     process::Command,
     sync::{atomic::Ordering, Mutex},
     thread,
@@ -972,13 +973,19 @@ impl Runner {
         // Only the simulator lists the registry, and a build without it
         // runs only tests, so no seed.
         let registry = match &built.sim {
-            Some(sim) => Some(Registry::read(sim, &baseline_dir.join("seeds"))?),
+            Some(sim) => Some((sim, Registry::read(sim, &baseline_dir.join("seeds"))?)),
             None => None,
         };
         let slot_runnables = match &registry {
-            Some(registry) => resolve_seeds(slot_runnables, registry)?,
+            Some((sim, registry)) => resolve_seeds(
+                slot_runnables,
+                sim,
+                registry,
+                &baseline_dir.join("seed-inputs"),
+            )?,
             None => slot_runnables,
         };
+        let registry = registry.map(|(_, registry)| registry);
         let runnables = &slot_runnables[0];
         // Every slot starts from slot 0's dependencies, so a slot's first
         // mutant rebuilds only the workspace crates.
@@ -1639,23 +1646,44 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
 }
 
 /// Each slot's runnables of `slot_runnables` with every seed's run a
-/// `zakura-sim record --seed` on the harness `registry` names. Fails on a
-/// seed the registry lacks or rejects.
+/// `zakura-sim record --input` of the seed's input, on the harness
+/// `registry` names. `sim`, the unpatched build's `zakura-sim`, writes each
+/// input under `inputs`: a seed's builder can run the code a mutant
+/// changes, so every slot runs the unpatched build's input. Fails on a seed
+/// the registry lacks or rejects.
 fn resolve_seeds(
     slot_runnables: Vec<Vec<Runnable>>,
+    sim: &Path,
     registry: &Registry,
+    inputs: &Path,
 ) -> Result<Vec<Vec<Runnable>>, BoxError> {
+    let mut written: BTreeMap<String, PathBuf> = BTreeMap::new();
     slot_runnables
         .into_iter()
         .map(|runnables| {
             runnables
                 .into_iter()
                 .map(|runnable| match runnable {
-                    Runnable::Seed { name, property } => Ok(Runnable::Record {
-                        harness: registry.harness(&name)?,
-                        args: vec!["--seed".to_owned(), name],
-                        property,
-                    }),
+                    Runnable::Seed { name, property } => {
+                        let file = match written.get(&name) {
+                            Some(file) => file.clone(),
+                            None => {
+                                let seed = registry.seed(&name)?;
+                                let file = path::absolute(seeds::write_input(
+                                    sim,
+                                    seed,
+                                    &inputs.join(&name),
+                                )?)?;
+                                written.insert(name.clone(), file.clone());
+                                file
+                            }
+                        };
+                        Ok(Runnable::Record {
+                            harness: registry.harness(&name)?,
+                            args: vec!["--input".to_owned(), file.display().to_string()],
+                            property,
+                        })
+                    }
                     runnable => Ok(runnable),
                 })
                 .collect()

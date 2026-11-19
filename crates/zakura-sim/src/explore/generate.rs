@@ -77,7 +77,9 @@ pub struct GenerateOptions {
     pub runs: u64,
     /// The longest input to draw.
     pub max_bytes: usize,
-    /// The SHA-256 digests, in lowercase hex, of the inputs to skip.
+    /// The SHA-256 digests, in lowercase hex, of the drawn inputs to skip:
+    /// a report's [`GenerateReport::draw_sha256`], or its `input_sha256`
+    /// when it has none.
     pub exclude: BTreeSet<String>,
     /// Where the report and the stopping run's input go.
     pub out: PathBuf,
@@ -239,6 +241,11 @@ pub struct GenerateReport {
     /// Its SHA-256.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
+    /// The SHA-256 of the drawn input whose run stopped the search, which
+    /// `--exclude` takes. Left out when it is `input_sha256`: a steered run
+    /// saves its replay, whose bytes differ from its draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw_sha256: Option<String>,
     /// The scenario family whose tag starts that input, or [`UNTAGGED`].
     /// `None` for a harness without families, or a clean search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,6 +494,7 @@ pub fn generate(
         violated: None,
         input: None,
         input_sha256: None,
+        draw_sha256: None,
         family: None,
         families: BTreeMap::new(),
         record: false,
@@ -524,7 +532,15 @@ pub fn generate(
                     .map(|text| (*text).to_owned())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
-                stopped = Some((index, family, input, digest, Stop::Panic { message }, None));
+                stopped = Some((
+                    index,
+                    family,
+                    input,
+                    digest,
+                    None,
+                    Stop::Panic { message },
+                    None,
+                ));
                 break;
             }
         };
@@ -557,12 +573,13 @@ pub fn generate(
             ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => None,
         };
         if let Some(stop) = stop {
-            let digest = hex(&Sha256::digest(&ran.replay));
-            stopped = Some((index, family, ran.replay, digest, stop, ran.end));
+            let saved = hex(&Sha256::digest(&ran.replay));
+            let draw = (saved != digest).then_some(digest);
+            stopped = Some((index, family, ran.replay, saved, draw, stop, ran.end));
             break;
         }
     }
-    if let Some((index, family, input, digest, stop, end)) = stopped {
+    if let Some((index, family, input, digest, draw, stop, end)) = stopped {
         // The input goes to disk before anything else, as a fuzz target
         // saves its failures.
         let path = options.out.join(format!("{digest}.bin"));
@@ -577,6 +594,7 @@ pub fn generate(
         report.kill_run = Some(index);
         report.input = Some(path);
         report.input_sha256 = Some(digest);
+        report.draw_sha256 = draw;
         report.family = family.map(str::to_owned);
         report.stop = stop;
     }

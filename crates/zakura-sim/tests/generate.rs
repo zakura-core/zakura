@@ -391,6 +391,23 @@ fn a_pct_search_saves_an_input_that_replays_unsteered() {
             property: property.clone()
         }
     );
+    // The saved replay isn't the draw, so excluding the reported draw digest
+    // skips that run on the same seed.
+    let draw = report
+        .draw_sha256
+        .clone()
+        .expect("a steered run's replay differs from its draw");
+    let again = generate(
+        entry,
+        &GenerateOptions {
+            schedule: Schedule::Pct,
+            exclude: BTreeSet::from([draw]),
+            ..options(&root.path().join("again"), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(again.skipped, 1, "{again:?}");
+    assert_ne!(again.kill_run, report.kill_run, "{again:?}");
 }
 
 fn hex(bytes: &[u8]) -> String {

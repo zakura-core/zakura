@@ -263,6 +263,7 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
+        budget: None,
     }
 }
 

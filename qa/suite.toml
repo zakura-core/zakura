@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_planted_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_authority.rs"
 test = "regenerate_authority_witnesses"
 run = false
@@ -166,6 +172,12 @@ file = "crates/zakura-sim/tests/header_recovery_progress.rs"
 test = "regenerate_recovery_fixtures"
 run = false
 reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
+test = "regenerate_late_fault_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"
@@ -295,6 +307,22 @@ timeout-secs = 2700
 id = "sim-asan/zakura-rt-zakura-scheduler"
 build = "sim-asan"
 args = "test --locked -p zakura-rt -p zakura-scheduler --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests"
+timeout-secs = 2700
+
+# zakura-sim's own release and AddressSanitizer runs (sim-7.2): the
+# library's unit tests and the scheduler, race and replay test targets.
+# `cli` spawns the `zakura-sim` binary, which Cargo builds with the same
+# flags.
+[[lane]]
+id = "sim-release/zakura-sim"
+build = "sim-release"
+args = "test --locked -p zakura-sim --release --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test replay_exact --test idle --test time --test race_schedules"
+timeout-secs = 2700
+
+[[lane]]
+id = "sim-asan/zakura-sim"
+build = "sim-asan"
+args = "test --locked -p zakura-sim --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test race_schedules"
 timeout-secs = 2700
 
 # Fuzz targets. A `sim` target runs the one harness that

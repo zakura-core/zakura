@@ -1,0 +1,10 @@
+# The reader skips a frame whose header the frame filter refuses for a
+# message type no row declares, reading and dropping its payload, instead
+# of closing the connection. Its input is the saved undeclared-type Plan,
+# whose adversary sends one `Status` payload under message type 0, so
+# `header-sync/s5v9/undeclared-type-closes` is the only ID it breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+input = "crates/zakura-sim/tests/fixtures/header-wire-undeclared-type.bin"
+checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync"]

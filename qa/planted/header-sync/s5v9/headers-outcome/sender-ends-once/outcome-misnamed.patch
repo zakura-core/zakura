@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+index c847aa6cfc..3f768b66ec 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher.rs
+@@ -267,7 +267,8 @@ impl PublisherOwner {
+             .terminal(terminal.slot)
+             .expect("each subscription's slot stays here until its one terminal outcome");
+         let frame = encode_frame(&Message::<HEADER_BYTES>::HeadersOutcome(HeadersOutcome {
+-            subscription_id: terminal.id,
++            // Mutation: the outcome names the next subscription ID, not its own.
++            subscription_id: terminal.id.wrapping_add(1),
+             initial_target_tip_hash: terminal.target,
+             outcome: terminal.outcome,
+         }))

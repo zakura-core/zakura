@@ -17,19 +17,9 @@
       "rpc_url": "http://164.92.209.78:18232"
     },
     {
-      "name": "zebra-testnet-eu",
-      "impl": "zebra",
-      "rpc_url": "http://165.22.204.93:18232"
-    },
-    {
       "name": "zakura-testnet-as",
       "impl": "zakura",
       "rpc_url": "http://206.189.148.0:18232"
-    },
-    {
-      "name": "zebra-testnet-as",
-      "impl": "zebra",
-      "rpc_url": "http://167.71.209.44:18232"
     }
   ]
 }

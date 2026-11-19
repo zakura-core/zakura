@@ -1,0 +1,16 @@
+# Takes a second permit from the reactor's locator semaphore each time
+# dispatch takes one, outside dispatch's own accounting, and consumes it
+# with `OwnedSemaphorePermit::forget`. That never returns the permit and
+# lets go of the semaphore, so once the reactor drops the semaphore no
+# stray permit keeps it alive. The resource probe holds the semaphore
+# itself, so the teardown read still sees the permit missing. The
+# reactor reports no permits, and the ownership ledger doesn't count
+# them. `forgotten-locator-permit` covers a permit that keeps the
+# semaphore alive. The required failure is `TeardownLocatorPermits`, once
+# the stopped reactor's task ends. The input's node reads a locator and
+# then shuts down.
+input = "crates/zakura-sim/tests/fixtures/header-storage-w-stop-storage.bin"
+# Besides dispatch.rs, which the patch changes, the rest of header sync
+# decides when the node reads a locator and when it stops. A change there
+# can move the input off a locator read before its shutdown.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -1,0 +1,10 @@
+# The reader skips a frame longer than the cap the frame filter returns
+# for its row, reading and dropping its payload, instead of closing the
+# connection. Its input is the saved long-payload Plan, whose adversary
+# sends one `Status` a byte past the row's maximum, so
+# `header-sync/s5v9/status/long-payload-closes` is the only ID it breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+input = "crates/zakura-sim/tests/fixtures/header-wire-long-payload.bin"
+checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync"]

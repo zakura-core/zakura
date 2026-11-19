@@ -372,11 +372,11 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The intended scenario of a `discovery/composed` or `sync/composed` seed:
-/// the one its steps' encoding draws, or for a found input, the one its bytes
-/// draw.
+/// The intended scenario of a `discovery/composed`, `discovery/spam` or
+/// `sync/composed` seed: the one its steps' encoding draws, or for a found
+/// input, the one its bytes draw.
 fn composed(stem: &str) -> Option<serde_json::Value> {
-    use discovery_service::{composed_prefix, DiscoveryComposed};
+    use discovery_service::{composed_prefix, spam_prefix, DiscoveryComposed, DiscoverySpam};
     use sync_wire::{SyncComposed, SYNC_COMPOSED_BYTES, SYNC_COMPOSED_VERSION};
     use zakura_sim::{
         harness::Subsystem,
@@ -388,6 +388,9 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
     let ask = |request| PeerAction::Ask { request };
     let undeclared = PeerAction::Discover {
         act: DiscoveryAct::UndeclaredType { message_type: 0 },
+    };
+    let hello_burst = PeerAction::Discover {
+        act: DiscoveryAct::HelloBurst,
     };
     // Two mirrors, one each way, on the default chain, then the events.
     let sync = |events: &[[u8; 3]]| {
@@ -412,6 +415,31 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
             let prefix =
                 composed_prefix(0, 0x81, 0, &[ask(Request::GetPeers), undeclared]).unwrap();
             serde_json::to_value(DiscoveryComposed::draw(&prefix))
+        }
+        "discovery-spam-reconnect" => {
+            let steps = [
+                undeclared,
+                undeclared,
+                PeerAction::Disconnect,
+                undeclared,
+                undeclared,
+            ];
+            let prefix = spam_prefix(0, 1, &[Request::GetPeers], &steps).unwrap();
+            serde_json::to_value(DiscoverySpam::draw(&prefix))
+        }
+        "discovery-spam-bursts" => {
+            let steps = [
+                hello_burst,
+                hello_burst,
+                ask(Request::GetPeers),
+                ask(Request::GetPeers),
+                ask(Request::GetServices),
+                ask(Request::GetServices),
+                ask(Request::GetPeers),
+            ];
+            let asks = [Request::GetServices, Request::GetPeers];
+            let prefix = spam_prefix(0, 3, &asks, &steps).unwrap();
+            serde_json::to_value(DiscoverySpam::draw(&prefix))
         }
         "sync-composed-honest" => serde_json::to_value(sync(&[])),
         "sync-composed-close-growth-stall" => {

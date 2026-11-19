@@ -1750,50 +1750,6 @@ fn reactor_machine_records_and_replays_query_identities() {
     ));
 }
 
-const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
-
-/// The committed record-book input is the witness `zakura-network` encodes
-/// under the current decoder.
-#[test]
-fn discovery_book_input_is_the_encoded_witness() {
-    assert_eq!(
-        DISCOVERY_BOOK_INPUT,
-        zakura_network::zakura::discovery_book_witness_bytes(),
-        "the committed input changed; regenerate it with regenerate_discovery_book_input if \
-         that's intended"
-    );
-}
-
-/// Rewrites `fixtures/discovery-record-book.{bin,toml}` from the witness
-/// `zakura-network` encodes. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo
-/// test -p zakura-sim --test replay_exact -- --ignored
-/// regenerate_discovery_book_input`.
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_discovery_book_input() {
-    let entry = harness::find("discovery/record-book").unwrap();
-    let input = zakura_network::zakura::discovery_book_witness_bytes();
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-record-book");
-    std::fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-    let sidecar = format!(
-        "harness = \"{harness}\"\n\
-         generator = {generator}\n\
-         sha256 = \"{digest}\"\n\
-         scenario_sha256 = \"{scenario}\"\n\
-         source = \"crates/zakura-sim/tests/replay_exact.rs\"\n\
-         \n\
-         [[witness]]\n\
-         property = \"{harness}\"\n\
-         expect = \"holds\"\n",
-        harness = entry.name,
-        generator = entry.generator,
-        digest = zakura_sim::seed::sha256(&input),
-        scenario = zakura_sim::seed::scenario_sha256(&(entry.draw)(&input)),
-    );
-    std::fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
-}
-const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
-
 #[test]
 fn discovery_machine_replay_child() {
     if let Some(dir) = std::env::var_os("ZAKURA_DISCOVERY_MACHINE_CHILD") {
@@ -1820,7 +1776,8 @@ fn replay_in_child(dir: &Path) {
 fn discovery_book_records_and_replays_signed_samples() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("discovery/record-book").unwrap();
-    let dir = record(entry, DISCOVERY_BOOK_INPUT);
+    let input = zakura_network::zakura::discovery_book_witness_bytes();
+    let dir = record(entry, &input);
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1832,7 +1789,7 @@ fn discovery_book_records_and_replays_signed_samples() {
     )
     .unwrap();
     assert_eq!(trace.meta.generator, 3);
-    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 2);
+    assert_eq!(trace.steps.len(), input.len() / 2);
     assert!(trace
         .steps
         .iter()
@@ -1878,7 +1835,7 @@ fn discovery_book_records_and_replays_signed_samples() {
 #[test]
 fn discovery_state_records_and_replays_installations() {
     let entry = harness::find("discovery/session-installation").unwrap();
-    let dir = record(entry, DISCOVERY_STATE_INPUT);
+    let dir = record(entry, zakura_network::zakura::DISCOVERY_STATE_WITNESS);
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1889,7 +1846,10 @@ fn discovery_state_records_and_replays_installations() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), DISCOVERY_STATE_INPUT.len() / 4);
+    assert_eq!(
+        trace.steps.len(),
+        zakura_network::zakura::DISCOVERY_STATE_WITNESS.len() / 4
+    );
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     replay_in_child(dir.path());

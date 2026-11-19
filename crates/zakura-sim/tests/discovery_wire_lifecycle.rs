@@ -1,5 +1,5 @@
-//! disc-2.3: `discovery/wire`'s saved Plans. Each committed Plan replays to
-//! its pinned end record, and shows the history its scenario exists for: a
+//! disc-2.3: `discovery/wire`'s saved Plans. Each Plan's seed runs clean
+//! and shows the history its scenario exists for: a
 //! completed exchange, a timed-out one, verification on `discovery_verify`
 //! tasks, a dial of a static candidate, and a late answer (disc-3.4). A
 //! run repeats under its Plan
@@ -9,9 +9,10 @@
 #![cfg(zakura_sim)]
 
 use std::{
+    collections::BTreeMap,
     fs,
     future::Future,
-    path::{Path, PathBuf},
+    path::Path,
     pin::pin,
     process::{Command, Output},
     task::{Context, Poll, Waker},
@@ -24,7 +25,6 @@ use zakura_network::zakura::{
 };
 use zakura_quic::NodeId;
 use zakura_sim::{
-    check::after_step,
     domain::discovery::{is_source, late_answer, LateAnswer, LATE_RESPONSE_ADMITTED},
     harness::{
         discovery_service::{DiscoveryWire, NodeHandle, SavedPlan, WireScenario, RELAYED},
@@ -32,23 +32,13 @@ use zakura_sim::{
     },
     observe::TransportFact,
     peer::{discovery::relayed_node, peer_addr},
-    record::{DrawRecord, Record},
-    seed, Checker, MemorySink, NoChecks, Observation, Plan, RunReport,
+    seed, MemorySink, Observation, Outcome, Plan, PropertyOutcome, RunReport,
 };
 
 /// Runs `scenario` under the Plan `plan`, and returns the report, even of a
 /// run that ended in a harness failure, with its records and the node's
 /// handle.
 fn run(scenario: &WireScenario, plan: &[u8]) -> (RunReport, Vec<String>, NodeHandle) {
-    run_with(scenario, plan, &mut NoChecks)
-}
-
-/// [`run`], with `extra` checking each step beside the harness's checks.
-fn run_with(
-    scenario: &WireScenario,
-    plan: &[u8],
-    extra: &mut dyn Checker,
-) -> (RunReport, Vec<String>, NodeHandle) {
     let node = DiscoveryWire::prepare(scenario);
     let mut sink = MemorySink::default();
     let ran = run_prepared::<DiscoveryWire>(
@@ -56,7 +46,7 @@ fn run_with(
         node.clone(),
         Plan::from_fuzz(plan),
         &mut sink,
-        Some(extra),
+        None,
     );
     let report = match ran {
         Ok(report) => report,
@@ -66,31 +56,14 @@ fn run_with(
     (report, sink.lines(), node)
 }
 
-/// Runs a committed input as `zakura-sim record --input` does: its prefix
-/// picks the scenario, and the rest is the Plan.
-fn replay(input: &[u8]) -> (RunReport, Vec<String>, NodeHandle) {
+/// Runs saved Plan `plan`'s seed as `zakura-sim record --seed` does: its
+/// prefix picks the scenario, and the rest is the Plan.
+fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
+    let input = seed::find(&format!("discovery-wire-{}", plan.name()))
+        .expect("each saved Plan has a seed")
+        .input;
     let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
     run(&DiscoveryWire::draw(prefix), plan)
-}
-
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// Saved Plan `plan`'s fixture path, without an extension.
-fn base(plan: SavedPlan) -> PathBuf {
-    fixtures().join(format!("discovery-wire-{}", plan.name()))
-}
-
-/// Saved Plan `plan`'s committed input and pinned end record.
-fn committed(plan: SavedPlan) -> (Vec<u8>, String) {
-    let base = base(plan);
-    let input = fs::read(base.with_extension("bin"))
-        .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
-    let end = fs::read_to_string(base.with_extension("end.json"))
-        .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
-    (input, end.trim_end().to_owned())
 }
 
 /// A run's end record: its last line.
@@ -246,13 +219,6 @@ fn registered_from_peer_0(report: &RunReport) -> Vec<u64> {
         .collect()
 }
 
-/// The task an identity runs, if it runs one: `<task>` of
-/// `task:<task>:<point>`.
-fn task_of(identity: &str) -> Option<&str> {
-    let rest = identity.strip_prefix("task:")?;
-    Some(&rest[..rest.rfind(':')?])
-}
-
 /// The log index where the node's discovery source ended its initial wait
 /// on the wait's timer: the source's first entry after it reached its
 /// `sleep` point at or after the session's admission plus
@@ -286,126 +252,72 @@ fn first_late_answer(report: &RunReport) -> Option<(usize, LateAnswer)> {
     })
 }
 
-/// Each step's option count, the index it picked, and, where it picked the
-/// node's discovery source while [`late_response_plan`] holds the source
-/// back, the first other option.
-type Choices = Vec<(usize, usize, Option<usize>)>;
+/// The properties each discovery session applies once on the node's
+/// requests: one `Hello`, one `GetPeers` and one `GetServices`.
+const SENDERS: [&str; 5] = [
+    "discovery/s4v2/hello/sender-cadence",
+    "discovery/s4v2/get-peers/sender-within-limit",
+    "discovery/s4v2/get-peers/sender-cadence",
+    "discovery/s4v2/get-services/sender-within-limit",
+    "discovery/s4v2/get-services/sender-cadence",
+];
 
-/// Runs [`SavedPlan::LateResponse`]'s scenario under the Plan `plan`, and
-/// records each step's choices. The source is held back from the step
-/// after it took its initial wait's timeout until the node's reader has the
-/// late `Peers` header or the node closes the connection.
-fn steer_late_response(plan: &[u8]) -> (RunReport, Vec<String>, Choices) {
-    let mut choices = Choices::new();
-    let mut admitted = None;
-    let mut timed_out = false;
-    let mut settled = false;
-    let source = |identity: &str| task_of(identity).is_some_and(is_source);
-    let mut steering = after_step(|cx| {
-        let enabled: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
-        let pick = cx.pick.to_string();
-        // The loop picks from the enabled set, so the pick is always in it.
-        let index = enabled.iter().position(|e| *e == pick).unwrap_or_default();
-        let hold = (timed_out && !settled && source(&pick))
-            .then(|| enabled.iter().position(|e| !source(e)))
-            .flatten();
-        choices.push((enabled.len(), index, hold));
-        let discovery_session = |obs: &Observation| matches!(obs, Observation::Session { kind, .. } if *kind == ZAKURA_STREAM_DISCOVERY);
-        if admitted.is_none() && cx.observations().any(discovery_session) {
-            admitted = Some(cx.now);
-        }
-        timed_out |= source(&pick)
-            && pick
-                .rsplit(':')
-                .next()
-                .is_some_and(|point| point.starts_with("sleep"))
-            && admitted.is_some_and(|at| {
-                cx.now.saturating_duration_since(at) >= DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
-            });
-        let entries = cx.log.entries();
-        let start = entries.partition_point(|entry| entry.step < cx.step);
-        settled |= (start..entries.len()).any(|at| {
-            matches!(entries[at].obs, Observation::ConnectionClosed { .. })
-                || matches!(late_answer(entries, at), Ok(Some(_)))
-        });
-        None
-    });
-    let (report, lines, _) = run_with(&SavedPlan::LateResponse.scenario(), plan, &mut steering);
-    drop(steering);
-    (report, lines, choices)
+/// The discovery sessions the node admitted.
+fn sessions(report: &RunReport) -> u32 {
+    let admitted = report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(entry.obs, Observation::Session { kind, .. } if kind == ZAKURA_STREAM_DISCOVERY)
+        })
+        .count();
+    u32::try_from(admitted).expect("a run admits few sessions")
 }
 
-/// How many bytes choose among `range` values, as the `Plan` decodes them.
-fn width(range: u128) -> usize {
-    match range {
-        0..=0x100 => 1,
-        0x101..=0x1_0000 => 2,
-        0x1_0001..=0x1_0000_0000 => 4,
-        _ => 8,
+/// Asserts that saved Plan `plan`'s run ran to its budget with no task
+/// panicked or leaked, and applied exactly the properties its history
+/// shows: each of [`SENDERS`] once per session,
+/// `discovery/s4v2/conformant-never-closes` once per conformant answer
+/// (three per session, two in `timed-out`, whose peer holds its `Hello`),
+/// and, in `late-response`, [`LATE_RESPONSE_ADMITTED`] once. Each held, and
+/// every other property had nothing to judge.
+fn assert_applied(plan: SavedPlan, report: &RunReport) {
+    let name = plan.name();
+    assert_eq!(report.end.outcome, Outcome::Budget, "{name}");
+    assert_eq!(
+        (report.cleanup.panicked, report.cleanup.leaked),
+        (0, 0),
+        "{name}: {:?}",
+        report.cleanup
+    );
+    let sessions = sessions(report);
+    let answers = if plan == SavedPlan::TimedOut { 2 } else { 3 };
+    let mut expected: BTreeMap<&str, u32> = SENDERS.map(|id| (id, sessions)).into();
+    expected.insert("discovery/s4v2/conformant-never-closes", answers * sessions);
+    if plan == SavedPlan::LateResponse {
+        expected.insert(LATE_RESPONSE_ADMITTED, 1);
     }
-}
-
-/// Appends `value` as `width(range)` little-endian bytes.
-fn push(bytes: &mut Vec<u8>, value: u64, range: u128) {
-    bytes.extend_from_slice(&value.to_le_bytes()[..width(range)]);
-}
-
-/// Appends a draw's answer, unless its bound makes it forced.
-fn push_draw(bytes: &mut Vec<u8>, draw: &DrawRecord) {
-    match draw.bound.0 {
-        1 => {}
-        0 => push(bytes, draw.value.0, 1 << 64),
-        bound => push(bytes, draw.value.0, u128::from(bound)),
-    }
-}
-
-/// Builds [`SavedPlan::LateResponse`]'s Plan, as `tests/discovery.rs`
-/// builds its input: from the step after the node's discovery source took
-/// its initial wait's timeout, it picks another action over the source
-/// until the node's reader has the late `Peers` header. Each round reruns
-/// the Plan, finds the first step where the round-robin default ran the
-/// source then, and rewrites the Plan from there.
-fn late_response_plan() -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for _ in 0..1_000 {
-        let (_, lines, choices) = steer_late_response(&bytes);
-        let Some(deviation) = choices.iter().position(|(.., hold)| hold.is_some()) else {
-            return bytes;
-        };
-        let records: Vec<Record> = lines
-            .iter()
-            .map(|line| serde_json::from_str(line).expect("a run writes valid records"))
-            .collect();
-        let mut next = Vec::new();
-        for record in &records {
-            if let Record::Init(init) = record {
-                init.draws.iter().for_each(|d| push_draw(&mut next, d));
+    for property in &report.properties {
+        let id = property.property.as_str();
+        match &property.outcome {
+            PropertyOutcome::Held { .. } if id == "sim/no-task-panic" => {}
+            PropertyOutcome::Held { applicable } => {
+                assert_eq!(expected.remove(id), Some(*applicable), "{name}: {id}");
             }
+            PropertyOutcome::NotApplicable { reason } => {
+                assert!(reason.is_benign(), "{name}: {id}: {reason:?}");
+            }
+            PropertyOutcome::Violated { .. } => panic!("{name}: {id} was violated"),
         }
-        let steps = records.iter().filter_map(|record| match record {
-            Record::Step(step) => Some(step),
-            _ => None,
-        });
-        for (at, (step, (options, picked, hold))) in steps.zip(&choices).enumerate() {
-            if *options > 1 {
-                let index = hold.unwrap_or(*picked);
-                // A step's index and option count fit in u64 and u128.
-                push(&mut next, index as u64, *options as u128);
-            }
-            if at == deviation {
-                break;
-            }
-            step.draws.iter().for_each(|d| push_draw(&mut next, d));
-        }
-        bytes = next;
     }
-    panic!("no Plan found in 1,000 rounds");
+    assert!(expected.is_empty(), "{name}: never applied {expected:?}");
 }
 
-/// Each saved Plan, committed under `tests/fixtures/discovery-wire-*.bin`
-/// with its sidecar, replays to its pinned end record,
-/// `discovery-wire-*.end.json`. Its prefix picks the saved scenario. No run
-/// fails or violates a property, and each shows its history:
+/// Each saved Plan's seed, `discovery-wire-<name>`, runs to its budget, and
+/// its prefix picks the saved scenario. No run fails, violates a property
+/// or applies one its history doesn't ([`assert_applied`]), and each shows
+/// its history:
 ///
 /// - `exchange`: the peer's three answers are conformant, and the node
 ///   closes with `discovery_exchange_complete` before any timer fires after
@@ -431,18 +343,16 @@ fn late_response_plan() -> Vec<u8> {
 ///   late answer. The answer completes the exchange, and the node closes
 ///   with `discovery_exchange_complete`.
 ///
-/// This fails if a saved Plan's end record changes. After a deliberate
-/// change, regenerate them with `regenerate_saved_plans`.
 #[test]
-fn saved_plans_replay_their_end_records() {
+fn saved_plans_show_their_histories() {
     let mut waits = Vec::new();
     for plan in SavedPlan::ALL {
         let name = plan.name();
-        let (input, pinned) = committed(plan);
-        assert_eq!(DiscoveryWire::draw(&input[..2]), plan.scenario(), "{name}");
-        let (report, lines, node) = replay(&input);
+        assert_eq!(DiscoveryWire::draw(&plan.tag()), plan.scenario(), "{name}");
+        let (report, _, node) = replay(plan);
         assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
         assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
+        assert_applied(plan, &report);
         let closes = closes(&report);
         let handle = node.get().expect("the run built the node's handle");
         match plan {
@@ -541,12 +451,6 @@ fn saved_plans_replay_their_end_records() {
                 );
             }
         }
-        assert_eq!(
-            end(&lines),
-            pinned,
-            "{name}: the saved Plan's end record changed; regenerate the saved Plans if that's \
-             intended"
-        );
     }
     let [(SavedPlan::Exchange, completed), (SavedPlan::TimedOut, timed_out)] = waits[..] else {
         panic!("{waits:?}");
@@ -567,7 +471,7 @@ fn saved_plans_repeat_a_a_and_a_b_a() {
         let b = SavedPlan::ALL[(index + 1) % SavedPlan::ALL.len()];
         let runs: Vec<Vec<String>> = [a, a, b, a]
             .into_iter()
-            .map(|plan| replay(&committed(plan).0).1)
+            .map(|plan| replay(plan).1)
             .collect();
         assert_eq!(runs[0], runs[1], "{} twice", a.name());
         assert_eq!(
@@ -595,27 +499,19 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record` runs each saved Plan's committed input in one
-/// process, to its pinned end record, and `zakura-sim replay` reruns its
-/// trace Exact in another.
+/// `zakura-sim record --seed` runs each saved Plan's seed in a fresh
+/// process to the end record an in-process run writes, and `zakura-sim
+/// replay` reruns its trace Exact in another.
 #[test]
 fn saved_plans_replay_exact_in_a_fresh_process() {
     for plan in SavedPlan::ALL {
         let name = plan.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
-        let input = base(plan).with_extension("bin");
-        let recorded = zakura_sim(&[
-            "record",
-            "--sim",
-            DiscoveryWire::NAME,
-            "--input",
-            input.to_str().unwrap(),
-            "--out",
-            trace.to_str().unwrap(),
-        ]);
+        let seed = format!("discovery-wire-{name}");
+        let recorded = zakura_sim(&["record", "--seed", &seed, "--out", trace.to_str().unwrap()]);
         assert!(recorded.status.success(), "{name}: {recorded:?}");
-        assert_eq!(trace_end(&trace), committed(plan).1, "{name}");
+        assert_eq!(trace_end(&trace), end(&replay(plan).1), "{name}");
         let replayed = zakura_sim(&["replay", trace.to_str().unwrap()]);
         let stdout = String::from_utf8_lossy(&replayed.stdout);
         assert!(
@@ -623,55 +519,5 @@ fn saved_plans_replay_exact_in_a_fresh_process() {
                 && stdout.contains("every pick, draw and observation matched"),
             "{name}: {replayed:?}"
         );
-    }
-}
-
-/// Rewrites every saved Plan: its input, its sidecar and its end record.
-/// Each input is its tag and the default Plan, the one disc-2.2's tests
-/// run, except `late-response`'s, whose Plan [`late_response_plan`] builds.
-/// Run it with `RUSTFLAGS="--cfg zakura_sim" cargo test
-/// --manifest-path crates/zakura-sim/Cargo.toml --test
-/// discovery_wire_lifecycle -- --ignored regenerate_saved_plans`.
-#[test]
-#[ignore = "rewrites the committed saved Plans"]
-fn regenerate_saved_plans() {
-    for plan in SavedPlan::ALL {
-        let mut input = plan.tag().to_vec();
-        if plan == SavedPlan::LateResponse {
-            input.extend(late_response_plan());
-        }
-        let (_, lines, _) = replay(&input);
-        let base = base(plan);
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        let mut sidecar = format!(
-            "# The committed fuzz input `discovery-wire-{name}.bin`: the harness that\n\
-             # runs it, the generator version it was built for, and its SHA-256. Its\n\
-             # first two bytes pick the saved `{name}` scenario, and\n\
-             # `discovery-wire-{name}.end.json` is its pinned end record.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/discovery_wire_lifecycle.rs\"\n",
-            name = plan.name(),
-            harness = DiscoveryWire::NAME,
-            generator = DiscoveryWire::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(&scenario),
-        );
-        // The planted case's input carries the witness `cargo xtask planted`
-        // checks unpatched.
-        if plan == SavedPlan::LateResponse {
-            sidecar.push_str(&format!(
-                "\n[[witness]]\nproperty = \"{LATE_RESPONSE_ADMITTED}\"\nexpect = \"holds\"\n"
-            ));
-        }
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
-        fs::write(
-            base.with_extension("end.json"),
-            format!("{}\n", end(&lines)),
-        )
-        .expect("the fixture directory exists");
     }
 }

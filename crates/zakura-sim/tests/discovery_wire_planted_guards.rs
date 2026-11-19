@@ -201,8 +201,7 @@ fn case(suffix: &str, name: &str) -> String {
 
 /// Each ID whose guard is discovery's own has a planted case, in
 /// registration order, and each case runs its scenario under the default
-/// Plan, the empty Plan
-/// bytes. Its case file names the harness, the scenario and the Plan bytes.
+/// Plan, the empty Plan. Its case file names the harness and the scenario.
 ///
 /// This fails if a case's scenario changes or stops parsing; rerun
 /// `regenerate_planted_guard_scenarios` then.
@@ -228,19 +227,16 @@ fn each_planted_guard_case_runs_its_scenario() {
                 .unwrap_or_else(|error| panic!("{case}: {error}"));
         let typed = file["typed"].as_table().expect("a typed case");
         let scenario_file = format!("{case}.scenario.json");
-        let plan = format!("{case}.plan.bin");
         assert_eq!(typed["harness"].as_str(), Some(HARNESS), "{case}");
         assert_eq!(typed["scenario"].as_str(), Some(scenario_file.as_str()));
-        assert_eq!(typed["plan"].as_str(), Some(plan.as_str()));
         let committed: WireScenario =
             serde_json::from_str(&fs::read_to_string(root.join(&scenario_file)).unwrap())
                 .unwrap_or_else(|error| panic!("{scenario_file}: {error}"));
         assert_eq!(committed, scenario.build(), "{scenario_file}");
-        assert_eq!(fs::read(root.join(&plan)).unwrap(), Vec::<u8>::new());
     }
 }
 
-/// Rewrites each case's scenario and its empty Plan bytes. Run it with
+/// Rewrites each case's scenario. Run it with
 /// `cargo test -p zakura-sim --test discovery_wire_planted_guards --
 /// --ignored regenerate_planted_guard_scenarios`.
 #[test]
@@ -251,6 +247,5 @@ fn regenerate_planted_guard_scenarios() {
         let case = case(suffix, name);
         let json = serde_json::to_string(&scenario.build()).unwrap();
         fs::write(root.join(format!("{case}.scenario.json")), json + "\n").unwrap();
-        fs::write(root.join(format!("{case}.plan.bin")), []).unwrap();
     }
 }

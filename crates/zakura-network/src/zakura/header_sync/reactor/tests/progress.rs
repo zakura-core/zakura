@@ -6,9 +6,8 @@
 //! pages with the production header rules and publishes each applied target
 //! as a new committed snapshot. A run holds when that snapshot reaches the
 //! honest tip by the deadline [`progress_deadline`] derives, and is violated
-//! otherwise. The oracle reads only the committed snapshot, the clock, the
-//! reactor's actions and the honest session's tokens. It never picks a
-//! supplier.
+//! otherwise. The oracle reads only the committed snapshot, the clock and
+//! each peer's session and connection tokens. It never picks a supplier.
 
 use std::time::Duration;
 
@@ -74,7 +73,7 @@ impl Chain {
         let mut headers = vec![genesis.clone()];
         for seconds in 1..=i64::from(len) {
             let parent = headers.last().expect("the chain starts at genesis");
-            let mut header = (*genesis).clone();
+            let mut header = *genesis;
             header.previous_block_hash = parent.hash();
             header.time += chrono::Duration::seconds(seconds);
             headers.push(Arc::new(header));
@@ -89,7 +88,7 @@ impl Chain {
         let mut headers = vec![regtest_genesis_block().header.clone()];
         for (index, honest) in Self::honest(len).0.iter().enumerate().skip(1) {
             let parent = headers.last().expect("the chain starts at genesis");
-            let mut header = (**honest).clone();
+            let mut header = **honest;
             header.previous_block_hash = parent.hash();
             if index == 1 {
                 header.difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
@@ -445,8 +444,10 @@ async fn run(roles: &[Role]) -> Run {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let adversaries = u32::try_from(roles.len() - 1).expect("a test runs few peers");
+    // Each turn also waits for the port's own locator read.
     let deadline = progress_deadline(&startup, adversaries, false)
-        .expect("one-session adversaries have a bounded deadline");
+        .expect("one-session adversaries have a bounded deadline")
+        + LOCATOR_READ * adversaries.saturating_add(1);
     let honest = Arc::new(Chain::honest(HONEST_LEN));
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let (snapshots, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));

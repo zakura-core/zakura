@@ -398,7 +398,7 @@ async fn a_proven_liar_at_the_request_cap_is_bounded_and_parked() {
     let seen = run.adversaries[0].1.lock().expect("unpoisoned");
     let cap = config
         .max_requests_without_block_progress
-        .min(u32::from(MAX_BS_INFLIGHT_REQUESTS));
+        .min(MAX_BS_INFLIGHT_REQUESTS);
     assert!(
         seen.most_unserved <= cap,
         "the liar held {} requests, more than {cap}",

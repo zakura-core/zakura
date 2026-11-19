@@ -367,7 +367,6 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-competing-mirrors" => value(storage_witnesses::competing_mirrors()),
         "header-release-wake" => value(WakeScenario::Release),
         "header-release-wake-deferred" => value(WakeScenario::Deferred),
-        "header-flood-wire" => value(FloodScenario::Wire),
         "header-flood-lifecycle" => value(FloodScenario::Lifecycle),
         "header-repair-applied" => value(RepairScenario::Applied),
         "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),

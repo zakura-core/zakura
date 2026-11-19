@@ -192,6 +192,18 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved scenarios"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_reorg_stale_body_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reorg stale-body input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_reorg_verdict_republish_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reorg verdict-republish input under a planted patch"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -259,9 +271,9 @@ reason = "a tool, not a test: it rewrites the committed frontier-first input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_flood_watch.rs"
-test = "regenerate_flood_seeds"
+test = "regenerate_flood_seed"
 run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
+reason = "a tool, not a test: it rewrites the committed input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_release_wake.rs"

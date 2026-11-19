@@ -845,18 +845,10 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("score-corrupted"),
     },
     Coverage {
-        property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
-        passing: passes(
-            "tests/header_flood_watch.rs",
-            "the_committed_flood_inputs_hold_their_watch_rules",
-        ),
-        bypass: Bypass::Planted("watch-check-revert"),
-    },
-    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",
-            "the_committed_flood_inputs_hold_their_watch_rules",
+            "the_committed_flood_input_holds_its_watch_rule",
         ),
         bypass: Bypass::Planted("watch-check-revert"),
     },

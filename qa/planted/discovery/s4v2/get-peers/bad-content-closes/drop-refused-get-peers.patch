@@ -1,10 +1,10 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
-index 99db2077fe..830e94588a 100644
+index 1c04c67b6e..e4f7bf3493 100644
 --- a/crates/zakura-network/src/zakura/discovery/service.rs
 +++ b/crates/zakura-network/src/zakura/discovery/service.rs
-@@ -766,7 +766,13 @@ async fn read_frame(
-             )
-         })?
+@@ -738,7 +738,13 @@ async fn read_frame(
+         .claim(frame.message_type, frame.payload.len())
+         .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?
          .map(|claimed| TracedAnswer::claimed(claimed, sink));
 +    let message_type = frame.message_type;
      if let Flow::Reject(reject) = pipe.run_one(frame) {

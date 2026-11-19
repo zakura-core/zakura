@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index 01137ee7b4..c833957a86 100644
+index fda0a9c4a4..b6cd0bb677 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -2306,6 +2306,11 @@ impl HeaderSyncReactor {
+@@ -1970,6 +1970,11 @@ impl HeaderSyncReactor {
                          return;
                      }
                  }
@@ -11,6 +11,6 @@ index 01137ee7b4..c833957a86 100644
 +                    end_retained(&mut retained, HeaderWorkEnd::Stale);
 +                    return;
 +                }
-                 self.note_request_progress(&peer, active.owner.session_id());
-                 assert!(
-                     self.peer_work_queue.begin_apply(&peer),
+                 self.state.arm_request_deadline(
+                     peer.clone(),
+                     Instant::now(),

@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
-index 99db2077fe..525ce43b62 100644
+index 1c04c67b6e..c2f9421d6b 100644
 --- a/crates/zakura-network/src/zakura/discovery/service.rs
 +++ b/crates/zakura-network/src/zakura/discovery/service.rs
-@@ -891,11 +891,10 @@ impl DiscoverySink {
+@@ -861,10 +861,10 @@ impl DiscoverySink {
  
      /// Imports the peer's own summaries.
      async fn handle_services(&self, services: Services) -> Result<(), SinkReject> {
@@ -10,7 +10,6 @@ index 99db2077fe..525ce43b62 100644
 +        // instead of closing.
          if services.node_id != self.peer_node_id {
 -            return Err(SinkReject::protocol(
--                CloseRow::DISCO_CLOSE_16,
 -                "Zakura discovery SERVICES authored by a different node id",
 -            ));
 +            return Ok(());

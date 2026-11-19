@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
-index cc0caf7ba4..7271335b5c 100644
+index e900df8252..10ef20796d 100644
 --- a/crates/zakura-network/src/zakura/handler.rs
 +++ b/crates/zakura-network/src/zakura/handler.rs
-@@ -5251,51 +5251,8 @@ impl Acceptor for ZakuraProtocolHandler {
+@@ -5055,45 +5055,8 @@ impl Acceptor for ZakuraProtocolHandler {
                  "zakura.p2p.conn.rejected.pending_handshake",
              );
          }
@@ -33,7 +33,6 @@ index cc0caf7ba4..7271335b5c 100644
 -                super::HandshakeCadenceAdmission::Admit => "admitted",
 -                super::HandshakeCadenceAdmission::Exhausted => "exhausted",
 -                super::HandshakeCadenceAdmission::Capacity => "capacity",
--                super::HandshakeCadenceAdmission::NodeExhausted => "node-exhausted",
 -            },
 -            hosts,
 -        );
@@ -44,11 +43,6 @@ index cc0caf7ba4..7271335b5c 100644
 -                incoming,
 -                "zakura.p2p.conn.retried.cadence",
 -                "zakura.p2p.conn.rejected.cadence",
--            ),
--            super::HandshakeCadenceAdmission::NodeExhausted => retry_or_refuse(
--                incoming,
--                "zakura.p2p.conn.retried.node_cadence",
--                "zakura.p2p.conn.rejected.node_cadence",
 -            ),
 -        }
 +        Admit::Accept

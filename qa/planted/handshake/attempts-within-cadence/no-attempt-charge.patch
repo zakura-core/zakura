@@ -3,7 +3,7 @@
 @@ -77,7 +77,7 @@
              .entry(host)
              .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
-         bucket.refill_capped(now);
+         bucket.refill(now);
 -        if bucket.take() {
 +        if true {
              HandshakeCadenceAdmission::Admit

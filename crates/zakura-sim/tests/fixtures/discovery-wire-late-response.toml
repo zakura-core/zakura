@@ -4,7 +4,7 @@
 # `discovery-wire-late-response.end.json` is its pinned end record.
 harness = "discovery/wire"
 generator = 2
-sha256 = "ff3d749514caa15d8ba4d14a64097c78047b1ff718d7eb8667901057fba3f3f7"
+sha256 = "4ee94cea690e717362022b42095d2372124ad3ad2ff6f3721fb6131661e442b6"
 scenario_sha256 = "09ec52af109b37bc9d99ca39b7de789d5f43cacf34136c4374e715496ce90776"
 source = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 

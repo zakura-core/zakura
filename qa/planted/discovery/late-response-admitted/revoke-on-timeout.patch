@@ -1,5 +1,4 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/peer.rs b/crates/zakura-network/src/zakura/discovery/peer.rs
-index 34506f9c9b..d2ec27c039 100644
 --- a/crates/zakura-network/src/zakura/discovery/peer.rs
 +++ b/crates/zakura-network/src/zakura/discovery/peer.rs
 @@ -179,7 +179,10 @@ impl PeerIO {
@@ -15,10 +14,9 @@ index 34506f9c9b..d2ec27c039 100644
      }
  
 diff --git a/crates/zakura-network/src/zakura/discovery/requester.rs b/crates/zakura-network/src/zakura/discovery/requester.rs
-index 8633b47360..b2425deb5f 100644
 --- a/crates/zakura-network/src/zakura/discovery/requester.rs
 +++ b/crates/zakura-network/src/zakura/discovery/requester.rs
-@@ -585,6 +585,15 @@ impl Queries {
+@@ -553,6 +553,15 @@ impl Queries {
          }
      }
  
@@ -32,5 +30,5 @@ index 8633b47360..b2425deb5f 100644
 +    }
 +
      /// Ends the session's queries: an unwritten query is skipped, and an
-     /// unanswered written query resets the session. The reservations
+     /// unanswered written query closes the connection. The reservations
      /// return to the pool, even while the transport reader outlives the

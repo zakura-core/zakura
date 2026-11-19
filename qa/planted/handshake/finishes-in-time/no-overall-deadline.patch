@@ -1,20 +1,14 @@
-diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
-index cc0caf7ba4..6db5036751 100644
---- a/crates/zakura-network/src/zakura/handler.rs
-+++ b/crates/zakura-network/src/zakura/handler.rs
-@@ -3747,22 +3747,9 @@ impl ZakuraProtocolHandler {
+diff --git b/crates/zakura-network/src/zakura/handler.rs a/crates/zakura-network/src/zakura/handler.rs
+index 8405e8f5c9..55747df809 100644
+--- b/crates/zakura-network/src/zakura/handler.rs
++++ a/crates/zakura-network/src/zakura/handler.rs
+@@ -3459,16 +3459,9 @@ impl ZakuraProtocolHandler {
          };
          let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
  
--        // One deadline from admission bounds the whole handshake: the control
--        // exchange gets what TLS left of `control_timeout`, so a peer that
--        // paces each stage holds the slot for `control_timeout` at most.
--        let remaining = self
--            .limits
--            .control_timeout
--            .saturating_sub(connection.admitted_at().elapsed());
+-        // The overall deadline bounds peers that pace each control step.
 -        let result = match timeout(
--            remaining,
+-            self.limits.control_timeout,
 -            self.run_native_responder_handshake(connection, remote_peer_id, conn),
 -        )
 -        .await

@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index 01137ee7b4..2a91ea269d 100644
+index 9f71e35495..af8244f0dd 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -2081,13 +2081,7 @@ impl HeaderSyncReactor {
+@@ -2069,13 +2069,7 @@ impl HeaderSyncReactor {
                      owner,
                      None,
                  );
@@ -17,10 +17,10 @@ index 01137ee7b4..2a91ea269d 100644
                  // An admitted ordinary round ends the peer's `HistoryPruned`
                  // pause, and one with records ends its schema fallback.
                  if active.purpose == HeaderTargetPurpose::Normal {
-@@ -2307,6 +2301,16 @@ impl HeaderSyncReactor {
-                     }
-                 }
-                 self.note_request_progress(&peer, active.owner.session_id());
+@@ -2299,6 +2293,16 @@ impl HeaderSyncReactor {
+                     Instant::now(),
+                     self.startup.request_timeout,
+                 );
 +                // Mutation: accept the round's cursor before its apply runs.
 +                if let (Some(active), Some(handles)) =
 +                    (self.peer_work_queue.active(&peer), self.sessions.get(&peer))

@@ -26,13 +26,16 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
-            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, SCRIPTED,
+            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, OWED_PEERS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
-    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
+    peer::{
+        discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
+        public_peer_addr,
+    },
     table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
@@ -369,22 +372,54 @@ const EXPIRED_HELLO_SCENARIO: &str = include_str!(
 /// The node's answers carry only what their requests asked for:
 /// `sender-within-owed` applies and holds on a `Peers` that answers a
 /// `GetPeers` for one record, and on a `Services` that answers a
-/// `GetServices` for header sync alone, which the node doesn't run.
-/// `services/sender-within-owed`'s planted case makes the node ignore the
-/// wanted list, and the same scenario then violates the ID.
-/// `peers/sender-within-owed` stays a `Draft`: every simulated peer binds
-/// an RFC 1918 address, which the book's sampler refuses, so the `Peers`
-/// answer carries no records.
+/// `GetServices` for header sync alone, which the node doesn't run. Each
+/// ID's planted case makes the node ignore what its request asked, and a
+/// search finds an input that then violates the ID.
 ///
-/// This fails if the node's answer passes its request, or a witness stops
-/// reaching its ID.
+/// The `GetPeers` scenario's other peers listen on public addresses, so
+/// the node dials them and confirms their records, and its book can sample
+/// more records than the request asks for (#2267).
+///
+/// This fails if the node's answer passes its request, a witness stops
+/// reaching its ID, or the node's book stops confirming the public peers'
+/// records.
 #[test]
 fn answers_within_their_requests_hold_sender_within_owed() {
     for (suffix, request) in OWED {
-        let report = run(&asking_scenario(request));
+        let (report, node) = run_node(&asking_scenario(request));
         witnessed(&report, request, &[id(suffix)]);
         assert_eq!(fault_closes(&report), Vec::<String>::new(), "{request:?}");
+        if request == Request::GetOnePeer {
+            assert_eq!(
+                confirmed_public_records(&node),
+                OWED_PEERS - 1,
+                "the node confirms each public peer's record"
+            );
+        }
     }
+}
+
+/// How many records in the node's book name only public peer addresses
+/// ([`public_peer_addr`]) and have a confirmed address, read once the run
+/// has ended, as [`book_holds_relayed`] reads.
+fn confirmed_public_records(node: &NodeHandle) -> usize {
+    let handle = node.get().expect("the run built the node");
+    let read = pin!(handle.persisted_entries());
+    let entries = match read.poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(entries) => entries,
+        Poll::Pending => panic!("the book's lock is free after the run"),
+    };
+    let public = |addr: &std::net::SocketAddr| {
+        (0..OWED_PEERS).any(|index| *addr == public_peer_addr(index, 0))
+    };
+    entries
+        .iter()
+        .filter(|entry| {
+            !entry.confirmed_addrs.is_empty()
+                && !entry.record.body.direct_addrs.is_empty()
+                && entry.record.body.direct_addrs.iter().all(public)
+        })
+        .count()
 }
 
 /// `undeclared-type-closes` and each `hello` ID apply and hold in their

@@ -112,13 +112,15 @@ impl NodeHandle {
 /// Binds the discovery node to [`NODE_ADDR`] on `net` as
 /// [`WireEndpoint::spawn`] does, with discovery alone at production defaults
 /// on `network`, and `spec`'s verification slots, static candidates and
-/// peer limit. It
+/// peer limit. A static candidate's address is the one its peer in `peers`
+/// listens on. It
 /// reports to `observer`, with failed dials to `dials`, and keeps a clone of
 /// its handle in `node`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_node(
     sim: &mut Sim,
     spec: &NodeSpec,
+    peers: &[PeerSpec],
     network: &Network,
     net: SimNet,
     seed: [u8; 32],
@@ -126,7 +128,7 @@ pub fn spawn_node(
     dials: DialReporter,
     node: NodeHandle,
 ) {
-    let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates);
+    let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates, peers);
     let slots = spec.verification_slots;
     let peer_sample_limit = spec.peer_sample_limit;
     let handshake = ZakuraHandshakeConfig::for_network(network);
@@ -204,13 +206,18 @@ pub fn spawn_node(
 }
 
 /// The bootstrap entries, `<node_id>@<addr>`, for scripted peers `indexes`
-/// under `seed`: each peer's key and the address it listens on.
-fn bootstrap_peers(seed: [u8; 32], indexes: &[usize]) -> Vec<String> {
+/// of `peers` under `seed`: each peer's key and the address it listens on
+/// ([`PeerSpec::listen_addr`]). An index no peer takes names
+/// [`peer_addr`], where nobody listens.
+fn bootstrap_peers(seed: [u8; 32], indexes: &[usize], peers: &[PeerSpec]) -> Vec<String> {
     indexes
         .iter()
         .map(|&index| {
             let id = SeededInputs::node_key(seed, key_index(index)).public();
-            format!("{id}@{}", peer_addr(index, 0))
+            let addr = peers
+                .get(index)
+                .map_or_else(|| peer_addr(index, 0), |peer| peer.listen_addr(index, 0));
+            format!("{id}@{addr}")
         })
         .collect()
 }
@@ -247,7 +254,17 @@ fn spawn_with(
     let dials = tap.dials();
     let shared_ids = tap.shared_ids();
     sim.add_source(Box::new(tap));
-    spawn_node(sim, spec, &network, net.sim(), seed, observer, dials, node);
+    spawn_node(
+        sim,
+        spec,
+        peers,
+        &network,
+        net.sim(),
+        seed,
+        observer,
+        dials,
+        node,
+    );
     // Read before any task runs, since building it draws from the run.
     let stream = discovery_stream();
     let failure = PeerFailure::default();
@@ -750,10 +767,32 @@ fn drawn_scenario(prefix: &[u8]) -> Option<WireScenario> {
         .map(|(_, _, drawn)| drawn.scenario())
 }
 
-/// The honest exchange, with the peer sending `request` once.
+/// The peers of [`asking_scenario`] for [`Request::GetOnePeer`]: the one
+/// that asks, and two the node dials at public addresses, so the node's
+/// book can sample more records than that request asks for.
+pub const OWED_PEERS: usize = 3;
+
+/// The honest exchange, with the first peer sending `request` once. For
+/// [`Request::GetOnePeer`], the node also holds [`OWED_PEERS`]` - 1`
+/// listening peers as static candidates. Each binds a public address
+/// ([`PeerSpec::public`]), so the node dials it there, its `Hello`
+/// confirms its record, and the node's book can sample the record for the
+/// first peer's request (#2267).
 pub fn asking_scenario(request: Request) -> WireScenario {
     let mut scenario = WireScenario::default();
     scenario.peers[0].script.push(PeerAction::Ask { request });
+    if request == Request::GetOnePeer {
+        scenario.node.static_candidates = (1..OWED_PEERS).collect();
+        scenario.peers.extend((1..OWED_PEERS).map(|_| {
+            discovering(
+                PeerSpec {
+                    public: true,
+                    ..PeerSpec::listening()
+                },
+                DiscoveryScript::default(),
+            )
+        }));
+    }
     scenario
 }
 
@@ -871,15 +910,10 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
             }
         }
         Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
-        Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
-            SENT_TRIGGERS.get(row()?).copied()
-        }
-        // Every simulated peer binds an RFC 1918 address, which the book's
-        // sampler refuses, so the node's `Peers` answers carry no records,
-        // and `peers/sender-within-owed` stays a `Draft`.
-        Template::SenderWithinOwed if id.row == Some(DiscoveryRow::Services.name()) => {
-            SENT_TRIGGERS.get(row()?).copied()
-        }
+        Template::SenderWithinLimit
+        | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
+        | Template::SenderCadence => SENT_TRIGGERS.get(row()?).copied(),
         _ => None,
     }
 }
@@ -1571,7 +1605,7 @@ impl HasView for DiscoveryWire {
 
 impl Subsystem for DiscoveryWire {
     const NAME: &'static str = "discovery/wire";
-    const GENERATOR: u32 = 2;
+    const GENERATOR: u32 = 3;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = NodeHandle;

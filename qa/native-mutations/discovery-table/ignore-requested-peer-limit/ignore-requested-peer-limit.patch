@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/state.rs b/crates/zakura-network/src/zakura/discovery/state.rs
+index ce75dfca7e..21877ec2e2 100644
+--- a/crates/zakura-network/src/zakura/discovery/state.rs
++++ b/crates/zakura-network/src/zakura/discovery/state.rs
+@@ -722,7 +722,7 @@ impl DiscoveryState {
+         now: u64,
+         rng: &mut R,
+     ) -> Vec<ZakuraNodeRecord> {
+-        let limit = limit.min(self.config.peer_sample_limit);
++        let limit = self.config.peer_sample_limit;
+         self.book.sample_peers_with_rng(
+             limit,
+             wanted_services,

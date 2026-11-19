@@ -3411,18 +3411,15 @@ impl ZakuraProtocolHandler {
         self
     }
 
-    /// Returns an inbound attempt's cadence token. `action` names the reason in
-    /// the sim's cadence observation.
-    fn refund_cadence(&self, remote: SocketAddr, validated: bool, action: &'static str) {
+    /// Return both cadence charges for an admission cancelled before TLS.
+    fn refund_cadence(&self, remote: SocketAddr, validated: bool) {
         let mut counts = self.supervisor.ip_slots.counts();
         counts.refund_cadence(remote.ip(), validated, Instant::now());
         #[cfg(any(test, zakura_sim))]
         let hosts = counts.cadence_hosts(validated);
         drop(counts);
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(remote, validated, action, hosts);
-        #[cfg(not(any(test, zakura_sim)))]
-        let _ = action;
+        self.observe_handshake_cadence(remote, validated, "cancelled", hosts);
     }
 
     /// Reports a handshake cadence decision for `remote`. The caller reads
@@ -5305,7 +5302,7 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
         self.finish_admission(false);
-        self.refund_cadence(incoming.remote, incoming.validated, "cancelled");
+        self.refund_cadence(incoming.remote, incoming.validated);
     }
 
     fn finish_admission(&self, handed_off: bool) {
@@ -5328,13 +5325,8 @@ impl Acceptor for ZakuraProtocolHandler {
         let handler = self.clone();
         let claim = handler.claim_inbound(&connection, true);
         if claim.is_err() {
+            // TLS already ran. Return the pending slot and keep both rate charges.
             handler.finish_admission(false);
-            // Dials took the room during TLS, so the refusal is local.
-            handler.refund_cadence(
-                connection.admitted_addr(),
-                connection.source_validated(),
-                "refused",
-            );
         }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
@@ -15551,17 +15543,14 @@ mod tests {
         Ok(())
     }
 
-    /// Dials can take the room an inbound attempt saw at admission while its
-    /// TLS runs. The node then refuses the attempt itself, so the attempt's
-    /// cadence token returns to its address.
+    /// An inbound claim can lose its slot while TLS runs. The refusal returns
+    /// the pending permit and keeps both charges for the completed TLS start.
     #[tokio::test]
-    async fn a_local_refusal_after_tls_returns_the_cadence_token() -> Result<(), BoxError> {
+    async fn a_local_refusal_after_tls_keeps_both_cadence_charges() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
-        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
-        limits.max_connections = 4;
-        limits.max_pending_handshakes = 4;
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
         let handler = ZakuraProtocolHandler::new(
-            ZakuraSupervisorHandle::new(1),
+            ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
             Network::Mainnet,
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
@@ -15588,49 +15577,44 @@ mod tests {
         let inbound = timeout(Duration::from_secs(10), connection_rx.recv())
             .await?
             .expect("the capture acceptor sends the accepted connection");
-        let ip = inbound.admitted_ip();
+        tokio::time::pause();
         let validated = inbound.source_validated();
-        let max_hosts = limits
-            .max_connections
-            .saturating_add(limits.max_pending_handshakes);
-        let charge = |handler: &ZakuraProtocolHandler| {
-            handler.supervisor.ip_slots.counts().admit_cadence(
-                ip,
-                validated,
-                handler.supervisor.max_connections_per_ip,
-                max_hosts,
-                Instant::now(),
-            )
+        let incoming = IncomingInfo {
+            remote: inbound.admitted_addr(),
+            validated,
+            pending_total: 0,
+            pending_from_ip: 0,
         };
 
-        // `admit` reserved the transport and took the address's one token.
-        assert!(handler
-            .supervisor
-            .ip_slots
-            .counts()
-            .claim_transport(limits.max_pending_handshakes));
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Admit
-        );
-        // Dials then took the inbound share.
-        assert_eq!(limits.max_inbound_connections(), 3);
+        assert_eq!(handler.admit(&incoming), Admit::Accept);
+        handler.cancel_admission(&incoming);
+        assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
+        // Account for the captured TLS start as the real acceptor would.
+        assert_eq!(handler.admit(&incoming), Admit::Accept);
         let dials = handler
             .inbound_admission
             .clone()
-            .try_acquire_many_owned(3)
+            .try_acquire_many_owned(u32::try_from(limits.max_inbound_connections())?)
             .expect("the test holds free permits");
-
-        timeout(Duration::from_secs(10), handler.handle(inbound)).await?;
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Admit
-        );
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Exhausted
-        );
+        let refusal = handler.handle(inbound);
+        assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
         drop(dials);
+
+        for _ in 1..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+            assert_eq!(handler.admit(&incoming), Admit::Accept);
+            handler.finish_admission(false);
+        }
+        assert_ne!(handler.admit(&incoming), Admit::Accept);
+        let other_host = IncomingInfo {
+            remote: "198.51.100.42:8234".parse()?,
+            ..incoming
+        };
+        for _ in DEFAULT_ZAKURA_MAX_CONNS_PER_IP..24 {
+            assert_eq!(handler.admit(&other_host), Admit::Accept);
+            handler.finish_admission(false);
+        }
+        assert_ne!(handler.admit(&other_host), Admit::Accept);
+        timeout(Duration::from_secs(10), refusal).await?;
         Ok(())
     }
 

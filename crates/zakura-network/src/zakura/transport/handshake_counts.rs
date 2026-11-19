@@ -151,17 +151,16 @@ impl HandshakeCounts {
         admission
     }
 
-    /// Refunds an attempt QUIC never started, or an attempt the node refused
-    /// for its own capacity after TLS, to the ledger [`Self::admit_cadence`]
-    /// charged for `validated`.
+    /// Refunds an attempt QUIC cancelled before TLS to the ledger
+    /// [`Self::admit_cadence`] charged for `validated`.
     pub fn refund_cadence(&mut self, ip: IpAddr, validated: bool, now: Instant) {
         let ledger = self.cadence_mut(validated);
         if let Some(node) = ledger.node.as_mut() {
-            node.refill(now);
+            node.refill_capped(now);
             node.refund();
         }
         if let Some(bucket) = ledger.hosts.get_mut(&admission_host(ip)) {
-            bucket.refill(now);
+            bucket.refill_capped(now);
             bucket.refund();
         }
     }

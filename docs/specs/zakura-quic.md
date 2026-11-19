@@ -46,8 +46,8 @@ per-address handshake cadence with one ledger per source validation state,
 returns admission charges through two new acceptor hooks, reports a
 connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
-each change. Version 0.22 adds a node-wide handshake cadence, stops refunding
-a registered connection's token, and reports when the endpoint admitted a
+each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
+charges once TLS starts, and reports when the endpoint admitted a
 connection; it changes ADM-3 and API-4, and §17t lists each change.
 
 ## 0. Conventions
@@ -469,10 +469,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   source and `Refuse` for a validated one. One address's rate stays below
   the node's, so one busy address can't refuse every other address.
   The acceptor refunds both tokens, to the ledger it charged, when the
-  attempt never starts TLS (`cancel_admission`), and when Zakura refuses it
-  after TLS for its own capacity. A failed handshake and a registered
-  connection keep their charge, so a peer that reconnects pays for each TLS
-  handshake.
+  attempt never starts TLS (`cancel_admission`). Every TLS start keeps its
+  charge, including a failed handshake or a local refusal after TLS.
 
   Zakura's responder measures `control_timeout` (10 s) from the endpoint's
   `Accept` (`Conn::admitted_at`). The control exchange gets what TLS and the
@@ -1629,8 +1627,8 @@ handshake slot for the TLS deadline plus `control_timeout`.
 
 Changed:
 
-- **ADM-3.** Adds a node-wide bucket to each cadence ledger, stops refunding
-  a registered connection's token, and measures the responder's
+- **ADM-3.** Adds a node-wide bucket to each cadence ledger, keeps both charges
+  once TLS starts, and measures the responder's
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
   whole-handshake deadline from admission.

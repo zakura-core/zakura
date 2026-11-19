@@ -431,6 +431,21 @@ fn classify_table() {
             vec![(KNOWN.to_owned(), Bucket::Known)],
         ),
         (
+            // The step loop ends a run at its own livelock violation whatever
+            // the property's status, as `ZAKURA_SIM_KNOWN` can make it.
+            "Known property ended the run",
+            run_of(Ok(synthetic(
+                Outcome::Violation,
+                Some(KNOWN),
+                None,
+                vec![],
+                0,
+            ))),
+            ExploreOutcome::Clean,
+            None,
+            vec![(KNOWN.to_owned(), Bucket::Known)],
+        ),
+        (
             "Draft property violated",
             run_of(Ok(synthetic(idle, None, None, vec![violated(DRAFT)], 0))),
             ExploreOutcome::Clean,

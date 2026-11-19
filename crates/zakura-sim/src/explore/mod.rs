@@ -348,16 +348,27 @@ fn classify_parts(
     leaked: usize,
 ) -> Classified {
     let status = |property: &str| entry.status(property).unwrap_or(Status::Active);
+    // A violation of a property that isn't `Active` is a note in its
+    // status's bucket.
+    let note = |property: &str| match status(property) {
+        Status::Active => None,
+        Status::Known { .. } => Some((property.to_owned(), Bucket::Known)),
+        Status::Draft => Some((property.to_owned(), Bucket::Draft)),
+    };
     let mut notes: Vec<(String, Bucket)> = properties
         .iter()
         .filter(|report| violated(report))
-        .filter_map(|report| match status(&report.property) {
-            Status::Active => None,
-            Status::Known { .. } => Some((report.property.clone(), Bucket::Known)),
-            Status::Draft => Some((report.property.clone(), Bucket::Draft)),
-        })
+        .filter_map(|report| note(&report.property))
         .collect();
-    let failed = violation.map(str::to_owned).or_else(|| {
+    // The step loop ends a run at its own violation, a livelock, whatever
+    // that property's status, so one that isn't `Active` is a note too.
+    if let Some(noted) = violation.and_then(note) {
+        if !notes.contains(&noted) {
+            notes.push(noted);
+        }
+    }
+    let ended = violation.filter(|property| status(property) == Status::Active);
+    let failed = ended.map(str::to_owned).or_else(|| {
         properties
             .iter()
             .find(|report| violated(report) && status(&report.property) == Status::Active)

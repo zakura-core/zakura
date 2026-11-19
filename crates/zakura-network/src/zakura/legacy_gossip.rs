@@ -47,7 +47,7 @@ use super::trace::BlockBodySource;
 use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
 use super::TxRelaySessions;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    spawn_supervised_peer_task, BoxRunFuture, CloseRow, Frame, FramedSend, OrderedSendError, Peer,
     ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
     SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId,
     ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
@@ -2989,7 +2989,8 @@ impl LegacyGossipSink {
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
-        let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+        let frame = LegacyGossipFrame::decode_frame(frame)
+            .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_24, error))?;
         let message_type = frame.message_type();
         if message_type == MSG_ADVERTISE_TX_IDS {
             count_received_tx_messages(message_type, 1);
@@ -3048,10 +3049,12 @@ impl LegacyGossipSink {
     fn decode_request(stream_kind: u16, frame: &Frame) -> Result<LegacyRequestFrame, SinkReject> {
         if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "unsupported legacy request stream kind",
             ));
         }
-        LegacyRequestFrame::decode_borrowed(frame).map_err(SinkReject::protocol)
+        LegacyRequestFrame::decode_borrowed(frame)
+            .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_23, error))
     }
 
     fn request<'a>(
@@ -3276,7 +3279,7 @@ impl ZakuraService for LegacyGossipSink {
                         frame,
                     ) {
                         Ok(()) => {}
-                        Err(SinkReject::Protocol(error)) => {
+                        Err(SinkReject::Protocol(_, error)) => {
                             debug!(
                                 ?error,
                                 ?peer_id,
@@ -3876,7 +3879,7 @@ mod tests {
         assert!(check(ZAKURA_STREAM_LEGACY_REQUESTS, &valid).is_ok());
         assert!(matches!(
             check(ZAKURA_STREAM_GOSSIP, &valid),
-            Err(SinkReject::Protocol(_))
+            Err(SinkReject::Protocol(..))
         ));
         for invalid in [
             frame(MSG_REQUEST_BLOCKS_BY_HASH, 1, one_block),
@@ -3888,7 +3891,7 @@ mod tests {
             assert!(
                 matches!(
                     check(ZAKURA_STREAM_LEGACY_REQUESTS, &invalid),
-                    Err(SinkReject::Protocol(_))
+                    Err(SinkReject::Protocol(..))
                 ),
                 "{invalid:?}"
             );

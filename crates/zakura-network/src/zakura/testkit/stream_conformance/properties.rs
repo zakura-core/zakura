@@ -688,7 +688,7 @@ async fn closes_unfinished<A: StreamConformance>(
     raw.reset(member)?;
     raw.closed().await?;
     ensure(
-        session.close_cause.get_or("unset") == UNFINISHED_EXCHANGE,
+        session.close_cause.get() == Some(UNFINISHED_EXCHANGE),
         || format!("closed for {}", session.close_cause.get_or("unset")),
     )?;
     raw.shutdown().await;

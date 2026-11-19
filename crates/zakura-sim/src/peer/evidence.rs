@@ -83,7 +83,7 @@ use super::{
 };
 use crate::{
     evidence::LiveEvidence,
-    model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
+    model::{FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
         PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
         TransportFact,
@@ -718,7 +718,7 @@ impl WireEvidence {
                 TransportFact::CloseDecided { cause: Some(cause) } => {
                     let closed = Observation::ConnectionClosed {
                         connection: *connection,
-                        cause: cause.clone(),
+                        cause: *cause,
                     };
                     let read: Vec<FrameKey> = self
                         .unsettled
@@ -730,7 +730,7 @@ impl WireEvidence {
                         .into_iter()
                         .map(|key| (key, self.unsettled.remove(&key).expect("just listed")))
                         .collect();
-                    if !is_fault_cause(cause) {
+                    if !cause.is_fault() {
                         self.late
                             .extend(read.into_iter().map(|(_, unsettled)| unsettled.frame));
                         return Ok(Some(closed));
@@ -1163,8 +1163,20 @@ fn rules(stream: StreamId) -> Option<&'static [MessageRule]> {
 
 #[cfg(test)]
 mod tests {
+    use zakura_network::zakura::{
+        CloseOutcome, CloseRow, NeutralCause, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_STREAM_DISCOVERY,
+    };
+
     use super::*;
     use crate::peer::peer_addr;
+
+    /// A discovery serving's over-commit close: a fault.
+    const FAULT: CloseOutcome = CloseOutcome::fault(
+        ZAKURA_STREAM_DISCOVERY,
+        ZAKURA_DISCOVERY_STREAM_VERSION,
+        CloseRow::REG_CLOSE_5,
+    );
 
     /// A transport event on `connection` from peer 0's first address.
     fn transport(seq: u64, connection: Option<u64>, event: TransportFact) -> Observation {
@@ -1674,7 +1686,7 @@ mod tests {
         /// The serving releases one commitment.
         Release,
         /// The node closes the connection with this cause.
-        Close(&'static str),
+        Close(CloseOutcome),
     }
 
     /// The log a node leaves when a peer sends three `GetPeers` the node
@@ -1757,9 +1769,7 @@ mod tests {
                 Then::Release => regulated(TransitionFact::CommitmentReleased {
                     message_type: get_peers.message_type,
                 }),
-                Then::Close(cause) => TransportFact::CloseDecided {
-                    cause: Some(cause.to_owned()),
-                },
+                Then::Close(cause) => TransportFact::CloseDecided { cause: Some(cause) },
             };
             log.push(transport(next(), Some(1), event));
         }
@@ -1895,8 +1905,10 @@ mod tests {
     #[test]
     fn an_over_margin_request_settles_at_the_nodes_count() {
         use Then::{Close, Count, Release};
-        const FAULT: &str = "service_protocol_reject";
-        const CLEAN: &str = "discovery_exchange_complete";
+        const CLEAN: CloseOutcome = CloseOutcome::neutral(
+            NeutralCause::LocalCancellation,
+            "discovery_exchange_complete",
+        );
         let cases: [(&[Then], &[&str]); 7] = [
             // Released one: the third request is the node's second open.
             (
@@ -1943,13 +1955,7 @@ mod tests {
     #[test]
     fn a_close_within_the_nodes_margin_violates_conformant_never_closes() {
         use Then::{Close, Count, Release};
-        let log = over_margin_log(&[
-            Count(0),
-            Release,
-            Count(1),
-            Count(2),
-            Close("service_protocol_reject"),
-        ]);
+        let log = over_margin_log(&[Count(0), Release, Count(1), Count(2), Close(FAULT)]);
         let outcomes = outcomes(log);
         assert!(
             matches!(
@@ -1975,10 +1981,7 @@ mod tests {
     #[test]
     fn a_close_before_the_nodes_count_violates_conformant_never_closes() {
         use Then::{Close, Count};
-        let outcomes = outcomes(over_margin_log(&[
-            Count(0),
-            Close("service_protocol_reject"),
-        ]));
+        let outcomes = outcomes(over_margin_log(&[Count(0), Close(FAULT)]));
         assert!(
             matches!(
                 outcomes["discovery/s4v2/conformant-never-closes"],
@@ -2001,12 +2004,7 @@ mod tests {
     #[test]
     fn a_close_past_the_nodes_margin_holds_over_margin_closes() {
         use Then::{Close, Count};
-        let log = over_margin_log(&[
-            Count(0),
-            Count(1),
-            Count(2),
-            Close("service_protocol_reject"),
-        ]);
+        let log = over_margin_log(&[Count(0), Count(1), Count(2), Close(FAULT)]);
         let outcomes = outcomes(log);
         assert!(
             matches!(

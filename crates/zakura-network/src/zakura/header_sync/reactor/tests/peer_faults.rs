@@ -3,7 +3,8 @@ use std::sync::Mutex as StdMutex;
 use super::*;
 use crate::zakura::{
     header_sync::observe::{HeaderSyncObserver, ReactorEvent},
-    CloseCause, FramedRecv, SinkReject,
+    CloseCause, CloseOutcome, CloseRow, FramedRecv, SinkReject, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_HEADER_SYNC,
 };
 
 #[test]
@@ -266,7 +267,14 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
                 continue;
             }
             assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
-            assert_eq!(close_cause.get_or("missing"), "header_peer_fault");
+            assert_eq!(
+                close_cause.get(),
+                Some(CloseOutcome::fault(
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                    CloseRow::HSYNC_CLOSE_33,
+                ))
+            );
             let start = v9::Cursor {
                 height: anchor.height,
                 hash: anchor.hash,
@@ -612,9 +620,10 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
     )
     .await
     .expect_err("an unlinked page ends the session");
-    let SinkReject::Protocol(error) = rejected else {
+    let SinkReject::Protocol(row, error) = rejected else {
         panic!("an unlinked page is a protocol violation, got {rejected:?}");
     };
+    assert_eq!(row, CloseRow::HSYNC_CLOSE_15);
     assert_eq!(
         error.to_string(),
         "the headers do not link from the page parent",

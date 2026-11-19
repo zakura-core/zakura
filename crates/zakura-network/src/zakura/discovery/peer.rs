@@ -44,7 +44,7 @@ use super::{
 };
 use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender},
-    CloseCause, Service, ZakuraConnId, ZakuraPeerId,
+    CloseCause, CloseOutcome, NeutralCause, Service, ZakuraConnId, ZakuraPeerId,
 };
 
 /// One session's [`PeerState`], shared by its reader and its writer.
@@ -253,8 +253,13 @@ impl PeerIO {
         if let Some(Close { reason }) = close {
             self.charge(SessionCharge::Retire);
             self.close_cause.record(match reason {
-                CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
-                CloseReason::ExchangeComplete => "discovery_exchange_complete",
+                CloseReason::ExchangeTimedOut => {
+                    CloseOutcome::neutral(NeutralCause::Timeout, "discovery_exchange_timed_out")
+                }
+                CloseReason::ExchangeComplete => CloseOutcome::neutral(
+                    NeutralCause::LocalCancellation,
+                    "discovery_exchange_complete",
+                ),
             });
             self.connection_cancel.cancel();
         }

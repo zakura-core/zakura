@@ -35,7 +35,8 @@ use crate::{
             Subscriptions, Update, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
-        CloseCause, Credit, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, Peer, Service,
+        CloseCause, CloseOutcome, CloseRow, Credit, Frame, FramedRecv, FramedSend, MessageRole,
+        MessageRule, Peer, Service,
         ServicePeerDirection, ServicePeerLimits, SessionDemand, SessionFull, SessionOpening,
         SessionPolicy, SessionResources, Stream, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
     },
@@ -894,7 +895,18 @@ async fn run_session<A: StreamConformance>(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(violation);
-            session.close_cause.record("service_protocol_reject");
+            // The layout's first member names the session, as a service's
+            // protocol exit does.
+            let (kind, version) = shared
+                .plan
+                .layout
+                .first()
+                .map_or((0, 0), |stream| (stream.kind, stream.version));
+            session.close_cause.record(CloseOutcome::fault(
+                kind,
+                version,
+                CloseRow::CONN_CLOSE_24,
+            ));
             session.connection.cancel();
             break;
         }

@@ -18,8 +18,8 @@ use zakura_rt::{
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, LocalRole, Peer,
-    PeerStreamSession, Pipe, ReactorBudget, Service, ServiceAdmissionDecision,
+    CloseCause, CloseOutcome, CloseRow, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle,
+    LocalRole, Peer, PeerStreamSession, Pipe, ReactorBudget, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
     ZakuraConnId, ZakuraPeerId, ZakuraTrace, DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES,
     ZAKURA_CAP_DISCOVERY,
@@ -487,7 +487,7 @@ impl Service for DiscoveryService {
             admit_peer_id,
             || {},
             move || {
-                panic_close_cause.record("service_panic");
+                panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
                 panic_service_cancel.cancel();
                 panic_connection_cancel.cancel();
             },
@@ -634,13 +634,14 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         let mut pipe = discovery_pipe(sink_peer_id);
         handle_pipe_exit(
             "discovery",
+            (ZAKURA_STREAM_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION),
             &reject_connection_cancel,
             &reject_close_cause,
             run_discovery_pipe(&mut pipe, recv, sink).await,
         );
     };
     let on_panic = move || {
-        panic_close_cause.record("service_panic");
+        panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
         panic_connection_cancel.cancel();
     };
     // Let the returned handle drop to detach the supervised reader task; the
@@ -678,7 +679,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         peer_id,
         || {},
         move || {
-            close_cause.record("service_panic");
+            close_cause.record(CloseOutcome::SERVICE_PANIC);
             service_cancel.cancel();
             connection_cancel.cancel();
         },
@@ -732,7 +733,7 @@ async fn read_discovery_messages(
     while let Some(frame) = recv.recv().await {
         let message_type = frame.message_type;
         if let Err((stage, reject)) = read_frame(pipe, frame, sink).await {
-            if let SinkReject::Protocol(error) = &reject {
+            if let SinkReject::Protocol(_, error) = &reject {
                 sink.trace_violation(message_type, stage, error);
             }
             return Err(reject);
@@ -752,7 +753,12 @@ async fn read_frame(
     let answer = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
-        .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?
+        .map_err(|error| {
+            (
+                ViolationStage::Claim,
+                SinkReject::protocol(error.close_row(), error),
+            )
+        })?
         .map(|claimed| TracedAnswer::claimed(claimed, sink));
     if let Flow::Reject(reject) = pipe.run_one(frame) {
         return Err((ViolationStage::Decode, reject));
@@ -761,11 +767,13 @@ async fn read_frame(
         return Ok(());
     };
     if let Some(answer) = &answer {
-        answer
-            .claimed
-            .admitted()
-            .check(&message)
-            .map_err(|error| (ViolationStage::Answer, SinkReject::protocol(error)))?;
+        answer.claimed.admitted().check(&message).map_err(|error| {
+            let row = match message {
+                DiscoveryMessage::Peers { .. } => CloseRow::DISCO_CLOSE_13,
+                _ => CloseRow::DISCO_CLOSE_15,
+            };
+            (ViolationStage::Answer, SinkReject::protocol(row, error))
+        })?;
     }
     sink.handle_message(message, answer)
         .await
@@ -855,18 +863,18 @@ impl DiscoverySink {
                 .serving
                 .get_peers
                 .admit(query)
-                .map_err(SinkReject::protocol)?,
+                .map_err(|error| SinkReject::protocol(error.close_row(), error))?,
             DiscoveryMessage::Peers { records } => {
                 self.handle
                     .import_session_peer_records(&self.key, records, self.peer_node_id)
                     .await
-                    .map_err(SinkReject::protocol)?;
+                    .map_err(|error| SinkReject::protocol(CloseRow::DISCO_CLOSE_17, error))?;
             }
             DiscoveryMessage::GetServices(query) => self
                 .serving
                 .get_services
                 .admit(query)
-                .map_err(SinkReject::protocol)?,
+                .map_err(|error| SinkReject::protocol(error.close_row(), error))?,
             DiscoveryMessage::Services(services) => self.handle_services(services).await?,
         }
         if let Some(mut answer) = answer {
@@ -879,13 +887,14 @@ impl DiscoverySink {
     async fn handle_services(&self, services: Services) -> Result<(), SinkReject> {
         if services.node_id != self.peer_node_id {
             return Err(SinkReject::protocol(
+                CloseRow::DISCO_CLOSE_16,
                 "Zakura discovery SERVICES authored by a different node id",
             ));
         }
         self.handle
             .import_session_services(&self.key, services, self.peer_node_id)
             .await
-            .map_err(SinkReject::protocol)?;
+            .map_err(|error| SinkReject::protocol(CloseRow::DISCO_CLOSE_16, error))?;
         Ok(())
     }
 
@@ -902,7 +911,9 @@ impl DiscoverySink {
                 RecordVerdict::Drop => {
                     tracing::debug!(?error, "dropped Zakura discovery hello");
                 }
-                RecordVerdict::Disconnect => return Err(SinkReject::protocol(error)),
+                RecordVerdict::Disconnect => {
+                    return Err(SinkReject::protocol(error.close_row(), error))
+                }
             }
         }
         self.state.record_hello();
@@ -1856,7 +1867,7 @@ mod tests {
 
         assert!(matches!(
             sink.handle_hello(forged).await,
-            Err(SinkReject::Protocol(_))
+            Err(SinkReject::Protocol(..))
         ));
         assert!(!sink.state.progress().hello);
 
@@ -2132,7 +2143,7 @@ mod tests {
         });
         to_sink.send(empty_peers()?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // The answer to a `GetPeers` with limit 1 carries two records.
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -2159,7 +2170,7 @@ mod tests {
             .send(discovery_frame(DiscoveryMessage::Peers { records })?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
         for seed in [58u8, 59] {
             let node_id = NodeSecretKey::from_bytes(&[seed; 32]).public();
             assert_eq!(handle.record_for(node_id).await, None, "nothing imports");
@@ -2220,7 +2231,7 @@ mod tests {
             })?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         capture.flush().await;
         let reader = capture.reader()?;
@@ -2300,7 +2311,7 @@ mod tests {
         let (to_sink, reader) = spawn_reader(sink);
         to_sink.send(discovery_frame(services(Vec::new()))?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // Answered once, then a second answer.
         let (sink, mut sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
@@ -2317,7 +2328,7 @@ mod tests {
             .await?;
         to_sink.send(discovery_frame(services(Vec::new()))?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // A summary the wanted list does not name.
         let (sink, mut sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
@@ -2333,7 +2344,7 @@ mod tests {
             .send(discovery_frame(services(vec![discovery_summary]))?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
         Ok(())
     }
 

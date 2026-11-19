@@ -1346,7 +1346,7 @@ fn retirement_with_a_live_subscription_closes_the_connection() {
         assert_eq!(fence.retire(), ended);
         assert_eq!(connection.is_cancelled(), !ended);
         if !ended {
-            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+            assert_eq!(cause.get(), Some(UNFINISHED_EXCHANGE));
         }
         assert_eq!(
             subscriptions.grant(&1, credit(1, 1)).is_ok(),

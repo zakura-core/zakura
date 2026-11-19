@@ -1,4 +1,4 @@
-//! Frame-read errors record a close cause that tells peer faults from
+//! Frame-read errors record a close outcome that tells peer faults from
 //! timeouts and transport loss, without changing resets or metrics.
 
 use std::{
@@ -21,6 +21,21 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL: Duration = Duration::from_millis(300);
 /// A message type no row of [`RULES`] declares.
 const UNKNOWN_TYPE: u16 = 99;
+
+/// A fault of `row` on the test stream, kind 900 at version 1.
+fn fault(row: CloseRow) -> CloseOutcome {
+    CloseOutcome::fault(900, 1, row)
+}
+
+/// A neutral timeout at `detail`.
+fn timed_out(detail: &'static str) -> CloseOutcome {
+    CloseOutcome::neutral(NeutralCause::Timeout, detail)
+}
+
+/// A neutral transport failure at `detail`.
+fn transport(detail: &'static str) -> CloseOutcome {
+    CloseOutcome::neutral(NeutralCause::IoFailure, detail)
+}
 
 /// How a peer breaks a frame read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,14 +67,15 @@ impl Case {
         Self::RateLimited,
     ];
 
-    /// The cause the node must record for this case on an ordered stream.
-    fn ordered_cause(self) -> &'static str {
+    /// The outcome the node must record for this case on an ordered stream.
+    fn ordered_cause(self) -> CloseOutcome {
         match self {
-            Self::Rejected | Self::OversizeFrame | Self::FinishedEarly => "ordered_read_rejected",
-            Self::Timeout => "ordered_read_timeout",
-            Self::Transport => "ordered_read_transport",
-            Self::AdmissionOversize => "ordered_oversize",
-            Self::RateLimited => "ordered_rate_limited",
+            Self::Rejected => fault(CloseRow::REG_CLOSE_2),
+            Self::OversizeFrame => fault(CloseRow::REG_CLOSE_1),
+            Self::FinishedEarly | Self::AdmissionOversize => fault(CloseRow::CONN_CLOSE_18),
+            Self::Timeout => timed_out("ordered_read_timeout"),
+            Self::Transport => transport("ordered_read_transport"),
+            Self::RateLimited => CloseOutcome::ORDERED_RATE_LIMITED,
         }
     }
 }
@@ -67,7 +83,7 @@ impl Case {
 /// What the node did after a read error.
 #[derive(Debug)]
 struct Outcome {
-    cause: &'static str,
+    cause: Option<CloseOutcome>,
     /// The reset code the peer read, or `None` when the connection was gone.
     reset: Option<u32>,
     cancelled: bool,
@@ -216,7 +232,7 @@ async fn run_ordered(case: Case) -> Result<Outcome, BoxError> {
     drop(inbound_rx);
     link.close().await;
     Ok(Outcome {
-        cause: close_cause.get_or("unset"),
+        cause: close_cause.get(),
         reset,
         cancelled: cancel.is_cancelled(),
     })
@@ -272,25 +288,38 @@ async fn run_request(case: RequestCase) -> Result<Outcome, BoxError> {
     let reset = read_reset(&mut peer_recv).await?;
     link.close().await;
     Ok(Outcome {
-        cause: close_cause.get_or("unset"),
+        cause: close_cause.get(),
         reset: Some(reset),
         cancelled: cancel.is_cancelled(),
     })
 }
 
 #[test]
-fn read_close_cause_maps_each_error() {
+fn read_close_outcome_maps_each_error() {
     use zakura_quic::{ConnectionError, ReadError, ReadExactError};
 
     let lost = || ReadExactError::ReadError(ReadError::ConnectionLost(ConnectionError::TimedOut));
-    let cases: Vec<(ZakuraHandlerError, &str, &str)> = vec![
+    let ordered_transport = transport("ordered_read_transport");
+    let request_transport = transport("request_read_transport");
+    let cases: Vec<(ZakuraHandlerError, CloseOutcome, CloseOutcome)> = vec![
         (
             ZakuraHandlerError::RejectedFrame {
                 message_type: UNKNOWN_TYPE,
                 rejection: FrameRejection::UnknownMessageType,
             },
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::REG_CLOSE_2),
+            fault(CloseRow::REG_CLOSE_2),
+        ),
+        (
+            ZakuraHandlerError::RejectedFrame {
+                message_type: message_type::PART,
+                rejection: FrameRejection::AboveOwed {
+                    frames: 0,
+                    bytes: 0,
+                },
+            },
+            fault(CloseRow::REG_CLOSE_8),
+            fault(CloseRow::REG_CLOSE_8),
         ),
         (
             ZakuraHandlerError::OversizeFrame {
@@ -298,54 +327,69 @@ fn read_close_cause_maps_each_error() {
                 frame_len: 2056,
                 max_frame_bytes: 1024,
             },
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::REG_CLOSE_1),
+            fault(CloseRow::REG_CLOSE_1),
         ),
         (
             ZakuraHandlerError::QuicRead(ReadExactError::FinishedEarly(2)),
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::CONN_CLOSE_18),
+            fault(CloseRow::CONN_CLOSE_18),
+        ),
+        (
+            ZakuraHandlerError::Oversize,
+            fault(CloseRow::CONN_CLOSE_18),
+            request_transport,
+        ),
+        (
+            ZakuraHandlerError::ByteRateOverrun,
+            fault(CloseRow::CONN_CLOSE_18),
+            request_transport,
+        ),
+        (
+            ZakuraHandlerError::RateLimited,
+            CloseOutcome::ORDERED_RATE_LIMITED,
+            request_transport,
         ),
         (
             ZakuraHandlerError::Timeout("frame header"),
-            "ordered_read_timeout",
-            "request_read_timeout",
+            timed_out("ordered_read_timeout"),
+            timed_out("request_read_timeout"),
         ),
         (
             ZakuraHandlerError::Timeout("frame payload"),
-            "ordered_read_timeout",
-            "request_read_timeout",
+            timed_out("ordered_read_timeout"),
+            timed_out("request_read_timeout"),
         ),
         (
             ZakuraHandlerError::QuicRead(lost()),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
         (
             ZakuraHandlerError::QuicRead(ReadExactError::ReadError(ReadError::ClosedStream)),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
         (
             ZakuraHandlerError::Io(std::io::Error::other("local buffer")),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
-        // The ordered path never records `Closed`; see `read_close_cause`.
+        // The ordered path never records `Closed`; see `read_close_outcome`.
         (
             ZakuraHandlerError::Closed,
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
     ];
     for (error, ordered, request) in &cases {
         assert_eq!(
-            read_close_cause(ReadPath::Ordered, error),
+            read_close_outcome(ReadPath::Ordered, (900, 1), error),
             *ordered,
             "{error:?}"
         );
         assert_eq!(
-            read_close_cause(ReadPath::Request, error),
+            read_close_outcome(ReadPath::Request, (900, 1), error),
             *request,
             "{error:?}"
         );
@@ -356,11 +400,9 @@ fn read_close_cause_maps_each_error() {
 async fn ordered_reader_records_rejection_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for case in [Case::Rejected, Case::OversizeFrame, Case::FinishedEarly] {
-        assert_eq!(
-            run_ordered(case).await?.cause,
-            "ordered_read_rejected",
-            "{case:?}"
-        );
+        let cause = run_ordered(case).await?.cause;
+        assert_eq!(cause, Some(case.ordered_cause()), "{case:?}");
+        assert!(cause.is_some_and(CloseOutcome::is_fault), "{case:?}");
     }
     Ok(())
 }
@@ -370,7 +412,7 @@ async fn ordered_reader_records_timeout_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     assert_eq!(
         run_ordered(Case::Timeout).await?.cause,
-        "ordered_read_timeout"
+        Some(timed_out("ordered_read_timeout"))
     );
     Ok(())
 }
@@ -380,7 +422,7 @@ async fn ordered_reader_records_transport_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     assert_eq!(
         run_ordered(Case::Transport).await?.cause,
-        "ordered_read_transport"
+        Some(transport("ordered_read_transport"))
     );
     Ok(())
 }
@@ -389,11 +431,11 @@ async fn ordered_reader_records_transport_cause() -> Result<(), BoxError> {
 async fn request_reader_records_each_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for (case, cause) in [
-        (RequestCase::Rejected, "request_read_rejected"),
-        (RequestCase::Silent, "request_read_timeout"),
-        (RequestCase::Reset, "request_read_transport"),
+        (RequestCase::Rejected, fault(CloseRow::REG_CLOSE_2)),
+        (RequestCase::Silent, timed_out("request_read_timeout")),
+        (RequestCase::Reset, transport("request_read_transport")),
     ] {
-        assert_eq!(run_request(case).await?.cause, cause, "{case:?}");
+        assert_eq!(run_request(case).await?.cause, Some(cause), "{case:?}");
     }
     Ok(())
 }
@@ -414,7 +456,7 @@ fn reader_and_worker_record_one_cause() -> Result<(), BoxError> {
     for runtime in [&current, &multi] {
         for case in Case::ORDERED {
             let outcome = runtime.block_on(run_ordered(case))?;
-            assert_eq!(outcome.cause, case.ordered_cause(), "{case:?}");
+            assert_eq!(outcome.cause, Some(case.ordered_cause()), "{case:?}");
         }
     }
     Ok(())
@@ -431,31 +473,34 @@ fn ordered_worker_closes_each_forwarded_error() {
     let cases = [
         (
             ZakuraHandlerError::Oversize,
-            Some((ZAKURA_CLOSE_OVERSIZE, "ordered_oversize")),
+            Some((ZAKURA_CLOSE_OVERSIZE, fault(CloseRow::CONN_CLOSE_18))),
         ),
         (
             ZakuraHandlerError::RateLimited,
-            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_rate_limited")),
+            Some((ZAKURA_CLOSE_RATE_LIMIT, CloseOutcome::ORDERED_RATE_LIMITED)),
         ),
         (
             ZakuraHandlerError::RejectedFrame {
                 message_type: UNKNOWN_TYPE,
                 rejection: FrameRejection::UnknownMessageType,
             },
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_rejected")),
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, fault(CloseRow::REG_CLOSE_2))),
         ),
         (
             ZakuraHandlerError::Timeout("frame header"),
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_timeout")),
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, timed_out("ordered_read_timeout"))),
         ),
         (
             ZakuraHandlerError::QuicRead(lost()),
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_transport")),
+            Some((
+                ZAKURA_CLOSE_BAD_PRELUDE,
+                transport("ordered_read_transport"),
+            )),
         ),
         (ZakuraHandlerError::Closed, None),
     ];
     for (error, close) in &cases {
-        assert_eq!(ordered_read_close(error), *close, "{error:?}");
+        assert_eq!(ordered_read_close((900, 1), error), *close, "{error:?}");
     }
 }
 
@@ -555,27 +600,30 @@ impl metrics::Recorder for CounterRecorder {
 #[test]
 fn read_close_causes_stay_trace_compatible() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    // Each new cause keeps the old prefix and lands in the same row field.
+    // A neutral read close keeps its old label, and a fault traces its row,
+    // in the same row field.
     let mut causes: Vec<_> = Case::ORDERED
         .iter()
         .filter(|case| !matches!(case, Case::AdmissionOversize | Case::RateLimited))
         .map(|case| case.ordered_cause())
         .collect();
     causes.extend([
-        "request_read_rejected",
-        "request_read_timeout",
-        "request_read_transport",
+        timed_out("request_read_timeout"),
+        transport("request_read_transport"),
     ]);
     for cause in causes {
-        assert!(
-            cause.starts_with("ordered_read_") || cause.starts_with("request_read_"),
-            "{cause}"
-        );
+        match cause {
+            CloseOutcome::Fault { row, .. } => assert_eq!(cause.label(), row.id()),
+            CloseOutcome::Neutral { detail, .. } => assert!(
+                detail.starts_with("ordered_read_") || detail.starts_with("request_read_"),
+                "{cause}"
+            ),
+        }
         let row = serde_json::to_value(
-            ConnectionTraceEvent::new("closed.neutral", 1, None).reason(cause),
+            ConnectionTraceEvent::new("closed.neutral", 1, None).reason(cause.label()),
         )?;
         assert_eq!(row["event"], "closed.neutral");
-        assert_eq!(row["reason"], cause);
+        assert_eq!(row["reason"], cause.label());
     }
 
     // The read paths emit the same counters, under the same labels.

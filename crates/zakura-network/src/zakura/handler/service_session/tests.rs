@@ -1385,6 +1385,7 @@ fn raw_worker_context(client: &QuicEndpoint, slots: Arc<Semaphore>) -> StreamWor
         stream_token: cancel.child_token(),
         close_cause: CloseCause::new(),
         freshness_tx,
+        kind_version: (0, 0),
     }
 }
 
@@ -1957,7 +1958,15 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             "cap {cap}"
         );
         if !admitted {
-            assert_eq!(close_cause.get(), Some("undersized_frame_cap"), "cap {cap}");
+            assert_eq!(
+                close_cause.get(),
+                Some(CloseOutcome::fault(
+                    SIBLING.kind,
+                    SIBLING.version,
+                    CloseRow::CONN_CLOSE_16
+                )),
+                "cap {cap}"
+            );
             let mut byte = [0; 1];
             let read = timeout(TEST_TIMEOUT, recv.read_exact(&mut byte)).await?;
             assert!(

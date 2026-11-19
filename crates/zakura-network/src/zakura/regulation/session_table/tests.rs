@@ -251,7 +251,7 @@ async fn replacement_closes_a_started_exchange_even_after_its_write_finished() {
         Replacement::Refused
     ));
     assert!(connection.cancel.is_cancelled());
-    assert_eq!(connection.cause.get_or("unset"), UNFINISHED_EXCHANGE);
+    assert_eq!(connection.cause.get(), Some(UNFINISHED_EXCHANGE));
     assert!(
         new_cancel.is_cancelled(),
         "the refused session is cancelled"

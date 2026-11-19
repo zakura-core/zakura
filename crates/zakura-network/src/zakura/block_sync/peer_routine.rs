@@ -43,7 +43,9 @@ use super::{
     ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::transport::OrderedStreamFailure;
-use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
+use crate::zakura::{
+    trace::BlockBodySource, Admit, CloseRow, FramedRecv, SinkReject, ZakuraConnId,
+};
 use std::{sync::Arc, time::Duration};
 use zakura_chain::block;
 
@@ -548,11 +550,8 @@ impl PeerRoutine {
                     "block-sync guard unexpectedly throttled an inbound frame",
                 ));
             }
-            Admit::Reject(reason) => {
-                return Err(SinkReject::protocol(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    reason,
-                )));
+            Admit::Reject(row) => {
+                return Err(SinkReject::protocol(row, row.id()));
             }
         }
 
@@ -653,7 +652,10 @@ impl PeerRoutine {
                         peer: self.io.peer.clone(),
                         reason: BlockSyncMisbehavior::MalformedMessage,
                     });
-                return Err(SinkReject::protocol(protocol_error));
+                return Err(SinkReject::protocol(
+                    CloseRow::BSYNC_CLOSE_15,
+                    protocol_error,
+                ));
             }
         };
         self.trace_message_received("block");
@@ -661,6 +663,7 @@ impl PeerRoutine {
             Ok(()) => {}
             Err(FrameBodyReject::CoinbaseHeight) => {
                 return Err(SinkReject::protocol(
+                    CloseRow::BSYNC_CLOSE_16,
                     "authorized block has a different coinbase height",
                 ));
             }
@@ -673,6 +676,7 @@ impl PeerRoutine {
                         reason: BlockSyncMisbehavior::InvalidBlock,
                     });
                 return Err(SinkReject::protocol(
+                    CloseRow::BSYNC_CLOSE_17,
                     "authorized block's transactions do not match its header",
                 ));
             }
@@ -3689,7 +3693,10 @@ mod tests {
                 | BufferedResponse::MalformedBlockBackpressured
                 | BufferedResponse::MalformedBlockAlreadyProcessing
         ) {
-            assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+            assert!(
+                matches!(result, Err(SinkReject::Protocol(..))),
+                "{result:?}"
+            );
             assert!(!registry.is_peer_parked(&peer, Instant::now()));
         } else if failure.is_some()
             && unanswered

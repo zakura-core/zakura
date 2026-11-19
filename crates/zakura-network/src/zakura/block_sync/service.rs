@@ -8,10 +8,11 @@ use super::{
     wire::*, *,
 };
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BudgetError, FramedRecv, FramedSend, LocalRole,
-    OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service, ServicePeerSnapshot,
-    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamQueueDepths,
-    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, BudgetError, CloseOutcome, FramedRecv, FramedSend,
+    LocalRole, NeutralCause, OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service,
+    ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
+    StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -735,7 +736,10 @@ impl Service for BlockSyncService {
                 && (peer.negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED == 0
                     || send.max_capacity() < 2))
         {
-            peer.close_cause().record("block_sync_regulation_contract");
+            peer.close_cause().record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "block_sync_regulation_contract",
+            ));
             peer.cancel_token().cancel();
             return;
         }
@@ -942,7 +946,7 @@ impl Service for BlockSyncService {
             let connection_cancel_token = connection_cancel_token.clone();
             let close_cause = close_cause.clone();
             move || {
-                close_cause.record("service_panic");
+                close_cause.record(CloseOutcome::SERVICE_PANIC);
                 connection_cancel_token.cancel();
             }
         };
@@ -1012,7 +1016,16 @@ impl Service for BlockSyncService {
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
-                handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
+                handle_pipe_exit(
+                    "block-sync",
+                    (
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                    ),
+                    &connection_cancel_token,
+                    &close_cause,
+                    result,
+                );
             }
         };
         // Let the returned handle drop to detach the supervised task (like

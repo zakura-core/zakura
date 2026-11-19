@@ -13,16 +13,23 @@ use support::{
 };
 use zakura_network::zakura::{
     testkit::regulation::{production_tables, TEST_FAMILY},
-    MessageRole, MessageRule, Stream,
+    CloseOutcome, CloseRow, MessageRole, MessageRule, NeutralCause, Stream,
 };
 use zakura_sim::NaReason;
 use zakura_sim::{
-    model::{consequence, is_fault_cause, Consequence, Label},
+    model::{consequence, Consequence, Label},
     observe::StreamId,
     property::{Property, Source},
     table::{rule_row, table_properties, GeneratedId, Template},
     Observation, Outcome, PropertyOutcome, RunReport, Violation,
 };
+
+/// A fault close. The checks read only its fault bit.
+const FAULT: CloseOutcome =
+    CloseOutcome::fault(TEST_STREAM.kind, TEST_STREAM.version, CloseRow::REG_CLOSE_2);
+
+/// A neutral idle-timeout close.
+const IDLE: CloseOutcome = CloseOutcome::neutral(NeutralCause::Timeout, "idle_timeout");
 
 /// The `feed` stream: a subscription with its page and terminal outcome.
 const FEED_STREAM: Stream = Stream {
@@ -87,10 +94,10 @@ fn judged(stream: Stream, seq: u64) -> Observation {
 }
 
 /// The node closing connection 1 with `cause`.
-fn closed(cause: &str) -> Observation {
+fn closed(cause: CloseOutcome) -> Observation {
     Observation::ConnectionClosed {
         connection: 1,
-        cause: cause.to_owned(),
+        cause,
     }
 }
 
@@ -183,16 +190,15 @@ fn consequences_follow_the_table() {
         };
         assert_eq!(consequence(label), expected, "{label}");
     }
-    assert!(is_fault_cause("service_protocol_reject"));
-    assert!(is_fault_cause("ordered_read_rejected"));
-    assert!(is_fault_cause("undersized_frame_cap"));
+    assert!(FAULT.is_fault());
+    assert!(CloseOutcome::fault(1, 1, CloseRow::CONN_CLOSE_16).is_fault());
     for neutral in [
-        "idle_timeout",
-        "ordered_read_timeout",
-        "ordered_read_transport",
-        "unfinished_exchange",
+        IDLE,
+        CloseOutcome::ORDERED_RATE_LIMITED,
+        CloseOutcome::neutral(NeutralCause::IoFailure, "ordered_read_transport"),
+        CloseOutcome::stall_policy("repeat_stall"),
     ] {
-        assert!(!is_fault_cause(neutral), "{neutral}");
+        assert!(!neutral.is_fault(), "{neutral}");
     }
 }
 
@@ -223,7 +229,7 @@ fn sibling_stream_fault_closes_without_violation() {
             frame(TEST_STREAM, 0, Some("ping"), Label::ReservedFlags),
             judged(TEST_STREAM, 0),
         ],
-        vec![closed("service_protocol_reject")],
+        vec![closed(FAULT)],
     ]);
     assert_eq!(report.end.violation, None);
     assert!(held(outcome(&report, "feed/s64v1/conformant-never-closes")));
@@ -245,7 +251,7 @@ fn close_cause_recorded_before_quiescence() {
             frame(FEED_STREAM, 1, Some("item"), Label::Unsolicited),
         ],
         vec![],
-        vec![closed("service_protocol_reject")],
+        vec![closed(FAULT)],
     ]);
     assert_eq!(report.end.violation, None);
     assert!(held(outcome(&report, "feed/s64v1/watch/over-live-closes")));
@@ -263,7 +269,7 @@ fn a_fault_without_a_fault_close_is_a_violation() {
             frame(FEED_STREAM, 0, None, Label::UndeclaredType),
             judged(FEED_STREAM, 0),
         ],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
     ]);
     let violation = report.end.violation.expect("the fault went unpunished");
     assert_eq!(violation.property, "feed/s64v1/undeclared-type-closes");
@@ -294,7 +300,7 @@ fn a_fault_without_a_fault_close_is_a_violation() {
         ],
         vec![Observation::ConnectionClosed {
             connection: 2,
-            cause: "service_protocol_reject".to_owned(),
+            cause: FAULT,
         }],
     ]);
     let violation = report.end.violation.expect("the fault went unpunished");
@@ -312,15 +318,12 @@ fn bad_content_gets_its_family_consequence() {
             judged(FEED_STREAM, 0),
         ]
     };
-    for consequence in [
-        Observation::Misbehavior { connection: 1 },
-        closed("header_peer_fault"),
-    ] {
+    for consequence in [Observation::Misbehavior { connection: 1 }, closed(FAULT)] {
         let report = run_script(vec![bad(), vec![consequence.clone()]]);
         assert_eq!(report.end.violation, None, "{consequence:?}");
         assert!(held(outcome(&report, ID)), "{consequence:?}");
     }
-    let report = run_script(vec![bad(), vec![closed("idle_timeout")]]);
+    let report = run_script(vec![bad(), vec![closed(IDLE)]]);
     let violation = report
         .end
         .violation
@@ -335,7 +338,7 @@ fn punishing_a_conformant_peer_is_a_violation() {
             frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
             judged(FEED_STREAM, 0),
         ],
-        vec![closed("header_peer_fault")],
+        vec![closed(FAULT)],
     ]);
     let violation = report.end.violation.expect("the close is unjustified");
     assert_eq!(violation.property, "feed/s64v1/conformant-never-closes");
@@ -359,7 +362,7 @@ fn punishing_a_conformant_peer_is_a_violation() {
             frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
             judged(FEED_STREAM, 0),
         ],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
     ]);
     assert_eq!(report.end.violation, None);
     assert!(held(outcome(&report, "feed/s64v1/conformant-never-closes")));
@@ -373,7 +376,7 @@ fn a_later_fault_does_not_justify_an_earlier_close() {
         frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
         judged(FEED_STREAM, 0),
         frame(TEST_STREAM, 0, Some("ping"), Label::ReservedFlags),
-        closed("service_protocol_reject"),
+        closed(FAULT),
         judged(TEST_STREAM, 0),
     ]]);
     let violation = report.end.violation.expect("the close came first");
@@ -396,7 +399,7 @@ fn emptying_a_cadence_bucket_is_never_punished() {
     };
     let report = run_script(vec![
         vec![exhausting, judged(TEST_STREAM, 0)],
-        vec![closed("request_protocol_reject")],
+        vec![closed(FAULT)],
     ]);
     let violation = report
         .end
@@ -436,7 +439,7 @@ fn a_rate_limit_close_after_an_exhausting_frame_breaks_cadence() {
     let script = |exhausted| {
         vec![
             vec![sent(exhausted), judged(TEST_STREAM, 0)],
-            vec![closed("ordered_rate_limited")],
+            vec![closed(CloseOutcome::ORDERED_RATE_LIMITED)],
         ]
     };
     let throttled = run_script(script(true));
@@ -521,11 +524,11 @@ fn every_unjustified_punishment_is_a_violation() {
         judged(FEED_STREAM, 0),
         on(2, frame(FEED_STREAM, 0, Some("watch"), Label::Conformant)),
         on(2, judged(FEED_STREAM, 0)),
-        closed("header_peer_fault"),
-        on(2, closed("header_peer_fault")),
+        closed(FAULT),
+        on(2, closed(FAULT)),
     ]]);
     let id = "feed/s64v1/conformant-never-closes";
-    let close = "a close with cause header_peer_fault";
+    let close = &format!("a close with cause {FAULT}");
     assert_eq!(
         violations(&report, id),
         [
@@ -649,10 +652,7 @@ fn every_cadence_punishment_at_a_boundary_is_reported() {
     frames.extend(judged_on(2, TEST_STREAM, 0, exhausting));
     let report = run_script(vec![
         frames,
-        vec![
-            closed("request_protocol_reject"),
-            Observation::Misbehavior { connection: 2 },
-        ],
+        vec![closed(FAULT), Observation::Misbehavior { connection: 2 }],
     ]);
     let id = "test/s65v2/status/cadence-never-closes";
     assert_eq!(
@@ -662,7 +662,7 @@ fn every_cadence_punishment_at_a_boundary_is_reported() {
                 id,
                 (2, &[2]),
                 "connection 1's judged frames are all conformant, so no punishment",
-                "a close with cause request_protocol_reject"
+                &format!("a close with cause {FAULT}")
             ),
             violation(
                 id,
@@ -679,7 +679,7 @@ fn every_cadence_punishment_at_a_boundary_is_reported() {
 #[test]
 fn punishment_before_any_judgement_is_a_violation() {
     let report = run_script(vec![
-        vec![closed("header_peer_fault")],
+        vec![closed(FAULT)],
         vec![
             frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
             judged(FEED_STREAM, 0),
@@ -743,7 +743,7 @@ fn an_undeclared_type_with_a_row_must_close() {
             frame(FEED_STREAM, 0, Some("item"), Label::UndeclaredType),
             judged(FEED_STREAM, 0),
         ],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
     ]);
     let violation = report.end.violation.expect("the fault went unpunished");
     assert_eq!(violation.property, "feed/s64v1/undeclared-type-closes");
@@ -808,7 +808,7 @@ fn an_over_credit_page_on_another_stream_belongs_to_its_subscription() {
     let report = run_under(
         table_properties("split", &layout),
         OBSERVED,
-        vec![vec![page, judged(pages, 0)], vec![closed("idle_timeout")]],
+        vec![vec![page, judged(pages, 0)], vec![closed(IDLE)]],
     );
     let violation = report.end.violation.expect("the page went unpunished");
     assert_eq!(violation.property, "split/s64v1/watch/over-credit-closes");

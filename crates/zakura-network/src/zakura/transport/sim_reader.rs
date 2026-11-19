@@ -21,17 +21,14 @@ use std::{
 use zakura_rt::sync::CancellationToken;
 
 use super::{
-    framed_channel, CloseCause, Frame, FrameFilter, FramedRecv, FramedSend, InboundReader,
-    MessageRule, Stream,
+    framed_channel, CloseCause, CloseOutcome, CloseRow, Frame, FrameFilter, FramedRecv, FramedSend,
+    InboundReader, MessageRule, Stream,
 };
 use crate::zakura::{
     handler::admit_tabled_message,
     regulation::{CadenceBuckets, PrecheckSlot},
     FRAME_HEADER_BYTES,
 };
-
-/// The close cause a QUIC stream reader records for a refused header.
-const READ_REJECTED: &str = "ordered_read_rejected";
 
 /// The reader of a [`read_framed_channel`]'s receiving end.
 #[derive(Clone, Debug)]
@@ -63,28 +60,46 @@ impl StreamReader {
     /// flags, minimum length and frame cap, then the attached response
     /// precheck. [`StreamReader::refuse`] a frame it doesn't admit.
     pub fn admits(&self, frame: &Frame) -> bool {
+        self.refusal(frame).is_none()
+    }
+
+    /// The row a QUIC stream reader refuses `frame`'s header for, or `None`
+    /// if it admits the header.
+    fn refusal(&self, frame: &Frame) -> Option<CloseRow> {
         let frame_cap =
             usize::try_from(self.stream.frame_cap).expect("a u32 frame cap fits in usize");
-        FrameFilter::new(self.stream.messages, InboundReader::Persistent)
+        match FrameFilter::new(self.stream.messages, InboundReader::Persistent)
             .with_precheck(self.precheck.get())
             .check_header(
                 frame.message_type,
                 frame.flags,
                 frame.payload.len(),
                 frame_cap,
-            )
-            .is_ok_and(|cap| FRAME_HEADER_BYTES.saturating_add(frame.payload.len()) <= cap)
+            ) {
+            Err(rejection) => Some(rejection.close_row()),
+            Ok(cap) if FRAME_HEADER_BYTES.saturating_add(frame.payload.len()) > cap => {
+                Some(CloseRow::REG_CLOSE_1)
+            }
+            Ok(_) => None,
+        }
     }
 
-    /// Closes the connection for a refused header, with the cause a QUIC
-    /// stream reader records: `ordered_read_rejected`.
+    /// Closes the connection for `frame`'s refused header, with the outcome a
+    /// QUIC stream reader records.
     ///
     /// # Panics
     ///
     /// If no [`Peer::read_through`](super::Peer::read_through) bound this
-    /// reader to its connection.
-    pub fn refuse(&self) {
-        self.close(READ_REJECTED);
+    /// reader to its connection, or the reader admits the header.
+    pub fn refuse(&self, frame: &Frame) {
+        let row = self
+            .refusal(frame)
+            .expect("a relay refuses only a header the reader refuses");
+        self.close(CloseOutcome::fault(
+            self.stream.kind,
+            self.stream.version,
+            row,
+        ));
     }
 
     /// Closes the connection with `cause`.
@@ -93,7 +108,7 @@ impl StreamReader {
     ///
     /// If no [`Peer::read_through`](super::Peer::read_through) bound this
     /// reader to its connection.
-    pub fn close(&self, cause: &'static str) {
+    pub fn close(&self, cause: CloseOutcome) {
         let (close_cause, token) = self.connection();
         close_cause.record(cause);
         token.cancel();
@@ -112,6 +127,7 @@ impl StreamReader {
                 .messages
                 .expect("an admission step reads a stream with a message table"),
             layout: self.stream.kind,
+            version: self.stream.version,
             buckets: CadenceBuckets::default(),
         }
     }
@@ -147,18 +163,20 @@ impl StreamReader {
 pub struct StreamAdmission {
     rules: &'static [MessageRule],
     layout: u16,
+    /// The stream's version, which a fault names.
+    version: u16,
     buckets: CadenceBuckets,
 }
 
 impl StreamAdmission {
     /// Admits `frame`, which the stream's [`StreamReader`] admitted. Returns
-    /// the close cause the worker records if it refuses the frame.
+    /// the close outcome the worker records if it refuses the frame.
     ///
     /// # Panics
     ///
     /// If the stream's table has no row for the frame's type, as the worker
     /// does.
-    pub fn admit(&mut self, frame: &Frame) -> Result<(), &'static str> {
+    pub fn admit(&mut self, frame: &Frame) -> Result<(), CloseOutcome> {
         let buckets = &mut self.buckets;
         let layout = self.layout;
         let admission = admit_tabled_message(
@@ -168,7 +186,9 @@ impl StreamAdmission {
             || {},
             || {},
         );
-        admission.ordered_close_cause().map_or(Ok(()), Err)
+        admission
+            .ordered_close_outcome((layout, self.version))
+            .map_or(Ok(()), Err)
     }
 
     /// Credits a pause in which the relay waited for the stream's receiver,
@@ -235,21 +255,26 @@ mod tests {
         );
     }
 
-    /// Each refusal maps to the cause the worker records for it.
+    /// Each refusal maps to the outcome the worker records for it.
     #[test]
     fn refusals_carry_the_workers_close_causes() {
-        assert_eq!(InboundMessageAdmission::Admit.ordered_close_cause(), None);
+        let stream = (900, 1);
+        let overrun = Some(CloseOutcome::fault(900, 1, CloseRow::CONN_CLOSE_18));
         assert_eq!(
-            InboundMessageAdmission::Oversize.ordered_close_cause(),
-            Some("ordered_oversize")
+            InboundMessageAdmission::Admit.ordered_close_outcome(stream),
+            None
         );
         assert_eq!(
-            InboundMessageAdmission::Throttled.ordered_close_cause(),
-            Some("ordered_rate_limited")
+            InboundMessageAdmission::Oversize.ordered_close_outcome(stream),
+            overrun
         );
         assert_eq!(
-            InboundMessageAdmission::ByteRateOverrun.ordered_close_cause(),
-            Some("ordered_byte_rate_overrun")
+            InboundMessageAdmission::Throttled.ordered_close_outcome(stream),
+            Some(CloseOutcome::ORDERED_RATE_LIMITED)
+        );
+        assert_eq!(
+            InboundMessageAdmission::ByteRateOverrun.ordered_close_outcome(stream),
+            overrun
         );
     }
 }

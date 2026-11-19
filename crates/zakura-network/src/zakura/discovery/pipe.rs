@@ -25,7 +25,7 @@ use super::{
     wire::PEERS_MAX_BYTES,
 };
 use crate::zakura::{
-    wire_codec::decode_frame, Edge, Flow, Frame, Node, NodeKind, Pipe, PipeCx, PipeShape,
+    wire_codec::decode_frame, CloseRow, Edge, Flow, Frame, Node, NodeKind, Pipe, PipeCx, PipeShape,
     SessionGuard, SinkReject, ZakuraPeerId,
 };
 
@@ -165,7 +165,18 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, DsLocal, DsEnv>, frame: Frame) -> 
 fn decode(frame: Frame) -> Flow<DiscoveryMessage> {
     match decode_frame::<DiscoveryMessage>(&frame) {
         Ok(msg) => Flow::Continue(msg),
-        Err(error) => Flow::Reject(SinkReject::protocol(error)),
+        Err(error) => Flow::Reject(SinkReject::protocol(decode_row(frame.message_type), error)),
+    }
+}
+
+/// The row a frame of `message_type` breaks when its body fails decode.
+fn decode_row(message_type: u16) -> CloseRow {
+    match u8::try_from(message_type) {
+        Ok(MSG_DISCOVERY_HELLO) => CloseRow::DISCO_CLOSE_5,
+        Ok(MSG_DISCOVERY_GET_PEERS) => CloseRow::DISCO_CLOSE_8,
+        Ok(MSG_DISCOVERY_PEERS) => CloseRow::DISCO_CLOSE_12,
+        // The guard admits only the five discovery types.
+        _ => CloseRow::DISCO_CLOSE_14,
     }
 }
 
@@ -221,7 +232,9 @@ mod tests {
             payload,
         });
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(
+            matches!(flow, Flow::Reject(SinkReject::Protocol(row, _)) if row == CloseRow::DISCO_CLOSE_12)
+        );
         assert!(pipe.local_mut().take_decoded().is_none());
     }
 
@@ -237,7 +250,9 @@ mod tests {
             payload: Vec::new(),
         });
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(
+            matches!(flow, Flow::Reject(SinkReject::Protocol(row, _)) if row == CloseRow::REG_CLOSE_2)
+        );
         assert!(pipe.local_mut().take_decoded().is_none());
     }
 
@@ -253,7 +268,9 @@ mod tests {
             payload: Vec::new(),
         });
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(
+            matches!(flow, Flow::Reject(SinkReject::Protocol(row, _)) if row == CloseRow::DISCO_CLOSE_5)
+        );
         assert!(pipe.local_mut().take_decoded().is_none());
     }
 

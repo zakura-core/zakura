@@ -6,6 +6,8 @@ use std::{
 };
 
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 use zakura_chain::block::{Hash, Height};
 use zakura_rt::{collections::HashMap, time::Instant};
 
@@ -41,6 +43,19 @@ pub(super) enum ResponseError {
     BodyBytes,
     #[error("the ending does not match the consumed prefix")]
     Ending,
+}
+
+impl ResponseError {
+    /// The close-spec row this error breaks. `Identity` names its row, but
+    /// the requester retires the session for it instead of closing.
+    pub(super) fn close_row(&self) -> CloseRow {
+        match self {
+            Self::Claim(refused) => refused.close_row(),
+            Self::Identity => CloseRow::BSYNC_CLOSE_19,
+            Self::BodyBytes => CloseRow::BSYNC_CLOSE_14,
+            Self::Ending => CloseRow::BSYNC_CLOSE_12,
+        }
+    }
 }
 
 /// A consumed ending. It names the original request, not the reported count,

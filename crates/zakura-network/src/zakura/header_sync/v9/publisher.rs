@@ -55,6 +55,8 @@ use std::{
 
 use futures::FutureExt;
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 use zakura_chain::block;
 use zakura_header_chain::{
     BranchId, EngineSnapshot, Frontier, HeaderGeneration, HeaderWorkAuthority, SourceId,
@@ -149,6 +151,17 @@ pub(crate) enum PublisherFault {
     /// An `Open` that asks for a schema this node does not advertise.
     #[error("the Open asks for an unadvertised auxiliary schema")]
     UnadvertisedSchema,
+}
+
+impl PublisherFault {
+    /// The close-spec row this fault breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Subscription(fault) => fault.close_row(),
+            Self::ChangedFields => CloseRow::HSYNC_CLOSE_31,
+            Self::UnadvertisedSchema => CloseRow::HSYNC_CLOSE_32,
+        }
+    }
 }
 
 /// One session's publisher: the handle the session reader applies updates

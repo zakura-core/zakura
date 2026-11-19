@@ -59,6 +59,8 @@ use std::{
 };
 
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 use zakura_rt::{
     collections::HashMap,
     sync::{
@@ -188,6 +190,16 @@ pub(crate) enum ClaimRefused {
 }
 
 impl ClaimRefused {
+    /// The regulation close-spec row this refusal breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Unsolicited { .. } => CloseRow::REG_CLOSE_6,
+            Self::OverFrames { .. } | Self::OverBytes { .. } => CloseRow::REG_CLOSE_7,
+            Self::OverOwed { .. } => CloseRow::REG_CLOSE_8,
+            Self::WrongRequest { .. } | Self::WrongRole { .. } => CloseRow::REG_CLOSE_9,
+        }
+    }
+
     /// The transport reader's rejection for a refused header.
     pub(crate) fn frame_rejection(self) -> FrameRejection {
         match self {

@@ -90,17 +90,38 @@ class SecondRequestTest(unittest.TestCase):
     def test_a_second_request_wins_when_it_arrives_before_the_first(self):
         sources = sources_at(100, [
             request(10, "a", elapsed=400),
-            request(10.3, "a", second=True, elapsed=30, hedge_reason="predicted", first_request_waited_ms=250),
+            request(9.88, "a", second=True, elapsed=30, hedge_reason="predicted"),
             request(20, "b", elapsed=100),
-            request(20.2, "b", second=True, elapsed=90, hedge_reason="predicted", first_request_waited_ms=60),
+            request(20.05, "b", second=True, elapsed=90, hedge_reason="predicted"),
             request(30, "c", delivered=False, elapsed=2000),
-            request(31, "c", second=True, elapsed=900, hedge_reason="stalled", first_request_waited_ms=1000),
+            request(29.9, "c", second=True, elapsed=900, hedge_reason="stalled"),
         ])  # fmt: skip
         outcomes = {o["reason"]: o for o in sources.summary(1)["second_requests"]}
         self.assertEqual(outcomes["predicted"]["sent"], 2)
-        self.assertEqual(outcomes["predicted"]["won"], 1, "250 + 30 beats 400; 60 + 90 does not beat 100")
+        self.assertEqual(outcomes["predicted"]["won"], 1)
         self.assertEqual(outcomes["predicted"]["saved_p50_ms"], 120)
         self.assertEqual(outcomes["stalled"]["won"], 1, "the first request never delivered")
+
+    def test_fixed_delay_request_that_finishes_later_does_not_win(self):
+        sources = sources_at(100, [
+            request(10, "a", elapsed=400),
+            request(10.05, "a", second=True, elapsed=200),
+        ])
+        outcome, = sources.summary(1)["second_requests"]
+        self.assertEqual(outcome["reason"], "fixed delay")
+        self.assertEqual(outcome["sent"], 1)
+        self.assertEqual(outcome["delivered"], 1)
+        self.assertEqual(outcome["won"], 0)
+        self.assertIsNone(outcome["saved_p50_ms"])
+
+    def test_second_request_is_paired_with_the_retry_it_belongs_to(self):
+        sources = sources_at(100, [
+            request(10, "a", elapsed=400, delivered=False),
+            request(20.1, "a", second=True, elapsed=100),
+            request(20.08, "a", elapsed=200),
+        ])
+        outcome, = sources.summary(1)["second_requests"]
+        self.assertEqual(outcome["won"], 0)
 
 
 def missed(seconds, connection, request):
@@ -135,13 +156,11 @@ class MissedBlockTest(unittest.TestCase):
         summary = sources.summary(1)["missed_blocks"]
         self.assertEqual(summary["second"]["count"], 1)
         self.assertEqual(summary["second"]["delivered_again"], 1)
-        self.assertEqual(summary["second"]["delivered_again_s"]["p50"], 600, "a small block sample counts")
+        self.assertEqual(summary["second"]["delivered_again_s"]["p50"], 600, "a block sample counts")
         first = summary["first"]
         self.assertEqual(first["count"], 3)
         self.assertEqual(first["delivered_again"], 1, "a delivered request counts")
         self.assertEqual(first["delivered_again_s"]["p50"], 100)
-        self.assertEqual(first["waiting"], 1, "still connected, no block yet")
-        self.assertEqual(first["closed"], 1, "nothing after the miss")
 
 
 class TraceFollowerTest(unittest.TestCase):
@@ -153,11 +172,15 @@ class TraceFollowerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as trace_dir:
             with open(os.path.join(trace_dir, "delivery_score.jsonl"), "w") as table:
-                table.write(json.dumps(sample(10, 1, "ping", None, 5), separators=(",", ":")) + "\n")
+                for row in (missed(10, 1, "first"), sample(20, 1, "block", None, 5)):
+                    table.write(json.dumps(row, separators=(",", ":")) + "\n")
             sources = block_sources.BlockSources(clock=lambda: STARTED + 100)
             follower = blocks.TraceFollower(trace_dir, 0, also_feed=(sources.feed,))
             self.assertEqual(follower.poll(), [])
-            self.assertEqual(sources.summary(1)["samples"]["counts"]["ping"], 1)
+            summary = sources.summary(1)
+            self.assertEqual(summary["samples"]["counts"]["block"], 1)
+            self.assertEqual(summary["missed_blocks"]["first"]["count"], 1)
+            self.assertEqual(summary["missed_blocks"]["first"]["delivered_again_s"]["p50"], 10)
 
 
 if __name__ == "__main__":

@@ -65,8 +65,8 @@ come from" panel):
   time, for first and second requests and by block size;
 - how many second requests were sent, for which reason, how many arrived
   before the first request's block, and the time they saved;
-- how often a peer that announced a block did not deliver it, and how long
-  block routing passed it over before it delivered a block again;
+- how often a peer that announced a block did not deliver it, and the time
+  until the next block observed on the same connection;
 - what the scores were made of: pings and blocks (older builds also counted
   transaction replies, and only blocks up to 256 KiB).
 

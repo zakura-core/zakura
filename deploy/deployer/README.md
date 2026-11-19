@@ -265,7 +265,8 @@ cd deploy/deployer
 The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 (`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`).
 Use `operation=dashboard` to refresh the status site and profiler tunnels from
-the selected workflow branch without deploying node binaries.
+the selected workflow branch. The dashboard operation ignores binary deployment
+inputs.
 
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,

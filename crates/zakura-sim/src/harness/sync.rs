@@ -1485,10 +1485,12 @@ impl SavedSync {
                 (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
                 (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
             ],
-            SavedSync::ReorgQuery
-            | SavedSync::ReorgRequest
-            | SavedSync::ReorgSubmit
-            | SavedSync::ReorgVerdict => &[
+            SavedSync::ReorgRequest => &[
+                (FRONTIER_WORK_CONSISTENT, "holds"),
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
+            ],
+            SavedSync::ReorgQuery | SavedSync::ReorgSubmit | SavedSync::ReorgVerdict => &[
                 (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
                 (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
             ],

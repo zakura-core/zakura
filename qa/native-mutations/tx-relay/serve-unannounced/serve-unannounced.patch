@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+index 962a7df728..06d030f854 100644
+--- a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
++++ b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+@@ -418,7 +418,7 @@ impl PeerMachine {
+         }
+         // Exact ids: this compares the authorizing data too. A body above the
+         // requester's limit is never sent.
+-        let announced = self.state.announced.is_sent(&id);
++        let announced = true;
+         let servable =
+             announced && pool.holds(&id) && size.is_some_and(|size| size <= hello.max_tx_bytes);
+         if !servable && announced {

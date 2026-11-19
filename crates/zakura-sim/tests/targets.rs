@@ -1,6 +1,6 @@
 //! Fuzz target readiness: every target `qa/suite.toml` declares resolves
-//! to its registered harness and has curated seeds that apply the
-//! harness's own properties, and `zakura-sim targets` gives each target
+//! to its registered harness and has curated seeds or a built corpus that
+//! apply the harness's own properties, and `zakura-sim targets` gives each target
 //! one status (explorer implementation plan, E5a, acceptance test 1).
 //!
 //! The build and the fuzzer run need the pinned nightly and cargo-fuzz, so
@@ -293,30 +293,40 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             target.name,
             loaded.rejected
         );
+        let corpus = (entry.corpus)();
+        let inputs: Vec<(String, &[u8])> = loaded
+            .admitted
+            .iter()
+            .map(|seed| (seed.name.clone(), seed.input()))
+            .chain(
+                corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| (format!("corpus {index}"), input.as_slice())),
+            )
+            .collect();
         assert!(
-            !loaded.admitted.is_empty(),
-            "{} ({}) has no curated seed",
+            !inputs.is_empty(),
+            "{} ({}) has no curated seed and no built corpus",
             target.name,
             entry.name
         );
         if let Some(max) = max_len(&target.args) {
-            for seed in &loaded.admitted {
+            for (name, input) in &inputs {
                 assert!(
-                    seed.input().len() <= max,
-                    "{}: -max_len={max} cuts {} ({} bytes)",
+                    input.len() <= max,
+                    "{}: -max_len={max} cuts {name} ({} bytes)",
                     target.name,
-                    seed.name,
-                    seed.input().len()
+                    input.len()
                 );
             }
         }
         let mut worker = Worker::new();
-        let reached: BTreeSet<String> = loaded
-            .admitted
+        let reached: BTreeSet<String> = inputs
             .iter()
-            .flat_map(|seed| {
-                let (outcome, applied) = run_seed(&mut worker, entry, seed.input());
-                assert_eq!(outcome, "clean", "{}", seed.name);
+            .flat_map(|(name, input)| {
+                let (outcome, applied) = run_seed(&mut worker, entry, input);
+                assert_eq!(outcome, "clean", "{name}");
                 applied
             })
             .collect();

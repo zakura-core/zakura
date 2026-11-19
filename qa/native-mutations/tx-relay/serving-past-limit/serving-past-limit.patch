@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+index 962a7df728..2bb0f3521d 100644
+--- a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
++++ b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+@@ -412,7 +412,7 @@ impl PeerMachine {
+             self.violation(shared, Violation::RequestedTwice);
+             return self.settle(shared, pool);
+         }
+-        if self.state.serving.len() >= MAX_SERVES {
++        if self.state.serving.len() > MAX_SERVES {
+             self.violation(shared, Violation::TooManyRequests);
+             return self.settle(shared, pool);
+         }

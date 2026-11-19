@@ -148,6 +148,13 @@ pub trait Subsystem: HasView + Sized + 'static {
         Vec::new()
     }
 
+    /// Full fuzz inputs the harness builds in code, such as its named
+    /// witnesses under the empty Plan. A fuzz campaign and the target check
+    /// start from them beside the seed registry's corpus seeds.
+    fn corpus() -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Whether this generator reads `prefix`, exactly
     /// [`Subsystem::SCENARIO_BYTES`] long, as its own rather than drawing a
     /// fallback scenario for it, as `draw` does for another generator's
@@ -597,6 +604,8 @@ pub struct HarnessEntry {
     pub families: fn() -> Vec<ScenarioFamily>,
     /// [`Subsystem::migrate`].
     pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
+    /// [`Subsystem::corpus`]. A machine has none.
+    pub corpus: fn() -> Vec<Vec<u8>>,
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
@@ -672,6 +681,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         accepts: S::accepts,
         families: S::families,
         migrate: S::migrate,
+        corpus: S::corpus,
     }
 }
 

@@ -23,7 +23,13 @@ const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
 /// The ID prefixes whose `Active` properties the loop must cover. Header
 /// sync's are Adam's side, and the step loop's own (`sim/…`) guard no
 /// production code.
-const IN_SCOPE: &[&str] = &["block-sync/", "block/", "discovery/", "handshake/"];
+const IN_SCOPE: &[&str] = &[
+    "block-sync/",
+    "block/",
+    "discovery/",
+    "handshake/",
+    "tx-relay/",
+];
 const HANDSHAKE_SESSIONS: &[&str] = &[
     "session/honest-never-punished",
     "session/stream-opens-bounded",

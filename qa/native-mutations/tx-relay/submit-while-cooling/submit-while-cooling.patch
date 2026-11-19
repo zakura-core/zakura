@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+index 962a7df728..03d33922c8 100644
+--- a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
++++ b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+@@ -277,7 +277,7 @@ impl PeerMachine {
+             self.state.reannounced.remove(&id);
+             return false;
+         };
+-        if shared.reactor.is_cooling(peer, self.now) {
++        if false {
+             // The peer started cooling while the body was in flight. Dropped
+             // unread, as the legacy adapter drops it.
+             self.state.requests.shift_remove(&id);

@@ -32,6 +32,7 @@ discovery_wire = "discovery/wire"
 discovery_composed = "discovery/composed"
 discovery_spam = "discovery/spam"
 header_sync_wire = "header-sync/wire"
+tx_relay_wire = "tx-relay/wire"
 
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
@@ -211,6 +212,13 @@ bench = false
 [[bin]]
 name = "header_sync_wire"
 path = "fuzz_targets/header_sync_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_relay_wire"
+path = "fuzz_targets/tx_relay_wire.rs"
 test = false
 doc = false
 bench = false

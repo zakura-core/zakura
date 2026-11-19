@@ -101,6 +101,7 @@ macro_rules! machine_entry {
             run_steered_bytes: None,
             accepts: |_| true,
             families: Vec::new,
+            corpus: Vec::new,
             migrate: |_, generator| {
                 Err(format!(
                     "{} migrates no generator-{generator} input",

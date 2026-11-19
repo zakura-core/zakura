@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+index 962a7df728..28bf2967e4 100644
+--- a/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
++++ b/crates/zakura-network/src/zakura/tx_relay/machine/session.rs
+@@ -1511,7 +1511,7 @@ impl PeerMachine {
+             .in_flight()
+             .saturating_add(shared.reactor.unsettled_count(peer));
+         let asking = state.requests.len().saturating_add(state.reserving.len());
+-        if in_flight >= MAX_REQUESTS_PER_PEER || asking >= hello.serves {
++        if in_flight > MAX_REQUESTS_PER_PEER || asking >= hello.serves {
+             return None;
+         }
+         // The id ready longest goes first: since its first announcement, or

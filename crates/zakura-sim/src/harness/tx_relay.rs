@@ -1025,6 +1025,33 @@ impl Subsystem for TxRelayWire {
         vec![ScenarioFamily::new("composed", [COMPOSED_VERSION])]
     }
 
+    /// The named witnesses whose runs take well under a second of the
+    /// target's time: each fault row's witness and honest twin, the
+    /// neutral closes but the stall, and the domain witnesses but the
+    /// stall and the pending and skip-set fills.
+    fn corpus() -> Vec<Vec<u8>> {
+        let slow = [
+            properties::STALLED_PEERS_PARKED,
+            properties::PENDING_WITHIN_BOUND,
+            properties::SKIP_SET_WITHIN_BOUND,
+        ];
+        let rows = ROW_WITNESSES
+            .iter()
+            .flat_map(|witness| [witness.witness, witness.twin]);
+        let neutral = NEUTRAL_WITNESSES
+            .iter()
+            .filter(|(detail, _)| !detail.contains("unanswered"))
+            .map(|(_, witness)| *witness);
+        let domain = DOMAIN_WITNESSES
+            .iter()
+            .filter(|(id, _)| !slow.contains(id))
+            .map(|(_, witness)| *witness);
+        rows.chain(neutral)
+            .chain(domain)
+            .map(|witness| witness().to_vec())
+            .collect()
+    }
+
     /// Whether `prefix` starts with [`COMPOSED_VERSION`].
     fn accepts(prefix: &[u8]) -> bool {
         prefix.first() == Some(&COMPOSED_VERSION)

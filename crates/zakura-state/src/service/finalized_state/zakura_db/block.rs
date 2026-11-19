@@ -398,18 +398,19 @@ impl ZakuraDb {
     fn raw_block(&self, hash_or_height: HashOrHeight) -> Option<(RawBytes, Vec<RawBytes>)> {
         // Block
         let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
-        if !self.contains_body_at_height(height) {
-            return None;
-        }
-
         let header = self.raw_block_header(height.into())?;
 
         // Transactions
 
-        let transactions: Vec<RawBytes> = self
-            .raw_transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .collect();
+        // The body is serveable only when its first transaction is stored, the same marker
+        // `contains_body_at_height` reads. Checking it on the scan that returns the
+        // transactions saves a separate read of the coinbase transaction.
+        let mut transactions = self.raw_transactions_by_height(height).peekable();
+        let (first_location, _) = transactions.peek()?;
+        if *first_location != TransactionLocation::min_for_height(height) {
+            return None;
+        }
+        let transactions: Vec<RawBytes> = transactions.map(|(_, tx)| tx).collect();
 
         if self.raw_block_transactions_may_be_pruned(height) {
             let transaction_hashes = self.transaction_hashes_for_block(height.into())?;

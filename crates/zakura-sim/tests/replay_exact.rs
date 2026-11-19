@@ -1192,7 +1192,17 @@ fn a_foreign_storage_failure_replays_exactly() {
     assert!(report.verified(), "{report:?}");
 }
 
-const WORK_INPUT: &[u8] = include_bytes!("fixtures/block-work-ownership.bin");
+/// Block seed `name`'s op tape.
+fn block_seed(name: &str) -> Vec<u8> {
+    zakura_sim::seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is a registered seed"))
+        .input
+}
+
+/// `block/work-ownership`'s seed.
+fn work_input() -> Vec<u8> {
+    block_seed("block-work-ownership")
+}
 
 #[test]
 fn work_machine_replay_child() {
@@ -1205,7 +1215,7 @@ fn work_machine_replay_child() {
 
 #[test]
 fn work_machine_records_and_replays_without_transport() {
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     let trace = open(dir.path());
     let entry = harness::find("block/work-ownership").unwrap();
     (entry.witness)(
@@ -1218,7 +1228,7 @@ fn work_machine_records_and_replays_without_transport() {
     )
     .unwrap();
     assert_eq!(trace.steps.len(), 10);
-    assert_eq!(trace.meta.scenario["input"], json!(WORK_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(work_input()));
     assert!(trace
         .steps
         .iter()
@@ -1261,7 +1271,7 @@ fn work_machine_records_and_replays_without_transport() {
 
 #[test]
 fn work_machine_preserves_empty_and_short_inputs() {
-    for input in [&[][..], &[0, 0][..], WORK_INPUT] {
+    for input in [&[][..], &[0, 0][..], &work_input()[..]] {
         let entry = harness::find("block/work-ownership").unwrap();
         let dir = record(entry, input);
         let trace = open(dir.path());
@@ -1281,7 +1291,7 @@ fn work_machine_preserves_empty_and_short_inputs() {
 
 #[test]
 fn work_machine_prefix_and_missing_evidence_never_verify() {
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     edit(dir.path(), |lines| {
         lines.truncate(5);
     });
@@ -1299,7 +1309,7 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
     assert!(!report.complete);
     assert!(report.end.is_none());
 
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     edit(dir.path(), |lines| {
         step(lines, 2).as_object_mut().unwrap().remove("machine");
     });
@@ -1312,9 +1322,15 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
     ));
 }
 
-const FUNDING_INPUT: &[u8] = include_bytes!("fixtures/block-work-funding.bin");
+/// `block/work-funding`'s seed.
+fn funding_input() -> Vec<u8> {
+    block_seed("block-work-funding")
+}
 
-const RETENTION_INPUT: &[u8] = include_bytes!("fixtures/block-decoded-retention.bin");
+/// `block/decoded-retention`'s seed.
+fn retention_input() -> Vec<u8> {
+    block_seed("block-decoded-retention")
+}
 
 #[test]
 fn decoded_retention_replay_child() {
@@ -1323,7 +1339,7 @@ fn decoded_retention_replay_child() {
         assert!(report.verified(), "{report:?}");
         assert_eq!(
             report.end.unwrap().steps,
-            RETENTION_INPUT.len() as u64 / 4 + 1
+            retention_input().len() as u64 / 4 + 1
         );
     }
 }
@@ -1332,7 +1348,7 @@ fn decoded_retention_replay_child() {
 fn decoded_retention_replays_final_holders_in_a_fresh_process() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("block/decoded-retention").unwrap();
-    let dir = record(entry, RETENTION_INPUT);
+    let dir = record(entry, &retention_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1343,9 +1359,9 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.meta.scenario["input"], json!(RETENTION_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(retention_input()));
     assert_eq!(trace.meta.generator, 1);
-    assert_eq!(trace.steps.len(), RETENTION_INPUT.len() / 4 + 1);
+    assert_eq!(trace.steps.len(), retention_input().len() / 4 + 1);
     let Some(MachineStep::DecodedRetention(parts)) = trace.steps[5].machine.as_deref() else {
         panic!("missing allocation reads")
     };
@@ -1402,7 +1418,7 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
 #[test]
 fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
     let entry = harness::find("block/decoded-retention").unwrap();
-    for input in [&[][..], &[0, 0][..], RETENTION_INPUT] {
+    for input in [&[][..], &[0, 0][..], &retention_input()[..]] {
         let dir = record(entry, input);
         let trace = open(dir.path());
         assert_eq!(trace.steps.len(), input.len().div_ceil(4) + 1);
@@ -1433,7 +1449,7 @@ fn work_funding_replay_child() {
         assert!(report.verified(), "{report:?}");
         assert_eq!(
             report.end.unwrap().steps,
-            (FUNDING_INPUT.len() / 4 + 1) as u64
+            (funding_input().len() / 4 + 1) as u64
         );
     }
 }
@@ -1442,7 +1458,7 @@ fn work_funding_replay_child() {
 fn work_funding_records_and_replays_retained_runtime_owners() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("block/work-funding").unwrap();
-    let dir = record(entry, FUNDING_INPUT);
+    let dir = record(entry, &funding_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1453,8 +1469,8 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
-    assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
+    assert_eq!(trace.steps.len(), funding_input().len() / 4 + 1);
+    assert_eq!(trace.meta.scenario["input"], json!(funding_input()));
     assert_eq!(trace.meta.generator, 2);
     assert!(trace
         .steps
@@ -1506,7 +1522,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
 #[test]
 fn work_funding_preserves_short_inputs_and_observes_drain() {
     let entry = harness::find("block/work-funding").unwrap();
-    for input in [&[][..], &[0, 0][..], FUNDING_INPUT, &[0; 512][..]] {
+    for input in [&[][..], &[0, 0][..], &funding_input()[..], &[0; 512][..]] {
         let dir = record(entry, input);
         let trace = open(dir.path());
         let mut sink = zakura_sim::MemorySink::default();
@@ -1538,7 +1554,7 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
 
 #[test]
 fn work_funding_missing_evidence_and_drain_cannot_verify() {
-    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    let dir = record_named("block/work-funding", &funding_input());
     edit(dir.path(), |lines| {
         step(lines, 2).as_object_mut().unwrap().remove("machine");
     });
@@ -1549,7 +1565,7 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
             field: "machine"
         })
     ));
-    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    let dir = record_named("block/work-funding", &funding_input());
     edit(dir.path(), |lines| {
         lines.truncate(lines.len() - 2);
     });
@@ -1677,7 +1693,10 @@ fn reactor_machine_preserves_empty_and_short_inputs() {
     }
 }
 
-const BLOCK_REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
+/// `block/reactor-policy`'s seed.
+fn block_reactor_input() -> Vec<u8> {
+    block_seed("block-reactor-policy")
+}
 
 #[test]
 fn block_reactor_machine_replay_child() {
@@ -1692,7 +1711,7 @@ fn block_reactor_machine_replay_child() {
 fn reactor_machine_records_and_replays_query_identities() {
     use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
     let entry = harness::find("block/reactor-policy").unwrap();
-    let dir = record(entry, BLOCK_REACTOR_INPUT);
+    let dir = record(entry, &block_reactor_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1704,7 +1723,7 @@ fn reactor_machine_records_and_replays_query_identities() {
     )
     .unwrap();
     assert_eq!(trace.steps.len(), 15);
-    assert_eq!(trace.meta.scenario["input"], json!(BLOCK_REACTOR_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(block_reactor_input()));
     assert!(trace
         .steps
         .iter()

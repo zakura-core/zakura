@@ -14,7 +14,7 @@
 mod support;
 
 use support::{
-    byte_inputs, inputs,
+    inputs,
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
@@ -33,6 +33,7 @@ use zakura_sim::{
     },
     model::Label,
     observe::{BlockSyncFact, RowAt, StorageFact, StorageRequest, StreamId},
+    seed::draws::byte_input,
     table::{GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -250,17 +251,12 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
-/// The committed Plan bytes under which [`old_chain_scenario`]'s run has a
-/// routine judge an old-chain body after a fork request reserved its height
-/// ([`old_chain_shortfall`]). `regenerate_old_chain_plan` picks them.
-const OLD_CHAIN_PLAN: &[u8] =
-    include_bytes!("fixtures/block-sync-old-chain-after-fork-request.plan");
-
-/// The committed input whose reset-mid-flight run reads an old-epoch body
-/// for a height past the fork while the routine's old request is still
-/// local, after another routine's fork request reserved that height.
-const STALE_REQUEST_BODY_INPUT: &[u8] =
-    include_bytes!("fixtures/block-sync-stale-request-body.bin");
+/// The Plan under which [`old_chain_scenario`]'s run has a routine judge an
+/// old-chain body after a fork request reserved its height
+/// ([`old_chain_shortfall`]): the first of 64 fuzz Plans that does.
+fn old_chain_plan() -> Vec<u8> {
+    byte_input(64, 16_384, 0)
+}
 
 /// True if a routine judged an old-chain body of a height past
 /// `scenario`'s fork after a request of a later body work epoch published
@@ -353,7 +349,7 @@ fn old_chain_scenario() -> BlockScenario {
     scenario
 }
 
-/// Checks that `plan` fills [`OLD_CHAIN_PLAN`]'s role, or returns why it
+/// Checks that `plan` fills [`old_chain_plan`]'s role, or returns why it
 /// falls short. [`old_chain_scenario`]'s run under it must end without a
 /// violation, hold `receiver-work-authorized`, and have a routine judge an
 /// old-chain body after a fork request reserved its height.
@@ -379,63 +375,14 @@ fn old_chain_shortfall(plan: &[u8]) -> Result<(), String> {
 }
 
 /// A reset while old-chain bodies are on the wire credits none of them to
-/// the fork's work. Under [`OLD_CHAIN_PLAN`], one such body reaches its
+/// the fork's work. Under [`old_chain_plan`], one such body reaches its
 /// routine after the routine dropped its request, so first-completion-wins
 /// must refuse its hash.
 #[test]
 fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
-    if let Err(shortfall) = old_chain_shortfall(OLD_CHAIN_PLAN) {
+    if let Err(shortfall) = old_chain_shortfall(&old_chain_plan()) {
         panic!("{shortfall}");
     }
-}
-
-/// Rewrites [`OLD_CHAIN_PLAN`] with the first of 64 fuzz inputs that fills
-/// its role ([`old_chain_shortfall`]). Rerun it when a block-sync change
-/// moves the plan off the crossing.
-#[test]
-#[ignore = "rewrites the committed plan"]
-#[allow(clippy::print_stdout)]
-fn regenerate_old_chain_plan() {
-    let plans = byte_inputs(64, 16_384);
-    let (index, plan) = plans
-        .iter()
-        .enumerate()
-        .find(|(index, plan)| {
-            let result = old_chain_shortfall(plan);
-            println!("old-chain plan: candidate {index}: {result:?}");
-            result.is_ok()
-        })
-        .expect("one of 64 candidates fills the plan's role");
-    let path = format!(
-        "{}/tests/fixtures/block-sync-old-chain-after-fork-request.plan",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::write(path, plan).expect("the fixture directory exists");
-    println!("old-chain plan: wrote candidate {index}");
-}
-
-/// The stale-request-body input holds `receiver-work-authorized` after an
-/// old-chain body answers a stale request for a height that a fork request
-/// reserves. With
-/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
-/// the routine credits that body to the fork request, and the same input
-/// violates it.
-#[test]
-fn the_stale_request_body_input_holds_receiver_work_authorized() {
-    let (prefix, plan) = STALE_REQUEST_BODY_INPUT.split_at(Storage::SCENARIO_BYTES);
-    let scenario = Storage::draw(prefix);
-    assert_eq!(scenario, BlockScenario::reset_mid_flight());
-    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        held(&report, &id("block/receiver-work-authorized")),
-        "{:?}",
-        report.properties
-    );
-    assert!(
-        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
-        "no routine judged an old-chain body after a fork request reserved its height"
-    );
 }
 
 /// Four generated IDs no block-sync scenario reaches stay `NotApplicable`

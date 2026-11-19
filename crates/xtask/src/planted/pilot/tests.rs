@@ -596,7 +596,7 @@ fn paired_campaigns_share_their_budget() {
     let catalogue = committed_catalogue();
     let bounds = &catalogue.discovery;
     let case = &catalogue.cases[0];
-    let corpus = Path::new("qa/mutation-pilot/discovery-empty");
+    let corpus = lane::StartCorpus::EmptyFixtures(Path::new("qa/mutation-pilot/discovery-empty"));
     let lane = Lane {
         seed: 11,
         arm: Arm::On,
@@ -633,6 +633,39 @@ fn paired_campaigns_share_their_budget() {
     assert_eq!(flag("--max-restarts"), "0");
     assert_eq!(flag("--fixtures"), "qa/mutation-pilot/discovery-empty");
     assert!(!text.iter().any(|a| a == "--parent" || a == "--corpus"));
+}
+
+/// A tree with the seed registry starts its lanes with `--seeds none`, and a
+/// pinned tree without it passes the frozen empty corpus as `--fixtures`.
+#[test]
+fn a_lane_starts_from_no_input_on_either_tree() {
+    let catalogue = committed_catalogue();
+    let bounds = &catalogue.discovery;
+    let case = &catalogue.cases[0];
+    let lane = Lane {
+        seed: 11,
+        arm: Arm::On,
+    };
+    let empty = Path::new("qa/mutation-pilot/discovery-empty");
+    let tree = tempfile::TempDir::new().expect("a temporary directory is creatable");
+    let args = || {
+        let corpus = lane::StartCorpus::of_tree(tree.path(), empty);
+        start_args(
+            &bounds.campaign,
+            &lane_spec(case, lane, bounds, "t-on-11", corpus),
+            "aa",
+            Path::new("s"),
+        )
+    };
+    let tail = |args: Vec<OsString>| args[args.len() - 2..].to_vec();
+    assert_eq!(
+        tail(args()),
+        ["--fixtures", "qa/mutation-pilot/discovery-empty"]
+    );
+    let registry = tree.path().join("crates/zakura-sim/src/seed");
+    fs::create_dir_all(&registry).expect("the registry directory is creatable");
+    fs::write(registry.join("mod.rs"), "").expect("the registry file is writable");
+    assert_eq!(tail(args()), ["--seeds", "none"]);
 }
 
 /// An original must match the catalogue's build and be clean; a mutant
@@ -1731,7 +1764,7 @@ fn a_campaign_build_is_rejected_only_for_a_compile_error() {
             },
             &catalogue.discovery,
             &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
-            dir.path(),
+            lane::StartCorpus::EmptyFixtures(dir.path()),
             true,
         )
         .expect("the lane's build failure doesn't stop the experiment");
@@ -1813,7 +1846,7 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
             },
             &catalogue.discovery,
             &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
-            dir.path(),
+            lane::StartCorpus::EmptyFixtures(dir.path()),
             false,
         )
         .expect("the lane's death doesn't stop the experiment");
@@ -2213,7 +2246,7 @@ fn each_case_reads_the_original_campaign_for_its_own_property() {
 fn each_arm_runs_with_its_own_feedback_mode() {
     let list = committed_list();
     let case = &list.cases[0];
-    let corpus = Path::new("qa/mutation-pilot/discovery-empty");
+    let corpus = lane::StartCorpus::EmptyFixtures(Path::new("qa/mutation-pilot/discovery-empty"));
     let args = |arm: Arm| {
         let name = format!("c-{arm}-11");
         start_args(
@@ -2349,7 +2382,7 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
             Lane { seed: 11, arm },
             &catalogue.discovery,
             &Pairing::of(&Pin::Catalogue(&catalogue), dir.path()),
-            dir.path(),
+            lane::StartCorpus::EmptyFixtures(dir.path()),
             true,
         )
         .expect("the lane runs")
@@ -3030,7 +3063,7 @@ fn a_campaign_builds_with_its_own_command() {
         seed: 11,
         feedback: "on",
         libfuzzer_args: &[],
-        corpus: dir.path(),
+        corpus: lane::StartCorpus::EmptyFixtures(dir.path()),
     };
     let bounds = &catalogue.discovery.campaign;
     let campaign = lane::campaign_lane(

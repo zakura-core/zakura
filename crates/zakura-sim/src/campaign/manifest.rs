@@ -329,6 +329,10 @@ pub struct StartOptions {
     pub workers: Vec<WorkerPlan>,
     /// Each worker's budget.
     pub budget: Budget,
+    /// Whether the initial snapshot holds the harness's corpus seeds.
+    /// `false` starts from no input, as cold-start discovery measurements
+    /// do.
+    pub seeds: bool,
     /// The full-suite manifest the run belongs to, if any.
     pub suite: Option<PathBuf>,
     /// Where the operator copies the store.
@@ -467,8 +471,8 @@ impl Store {
 /// run locked for [`Prepared::run`].
 ///
 /// The run's initial snapshot holds `options.harness`'s corpus seeds, which
-/// must all validate, and with
-/// [`Migration::Carry`] the previous segment's last snapshot too, which
+/// must all validate, or no seed if `options.seeds` is `false`. With
+/// [`Migration::Carry`] it holds the previous segment's last snapshot too, which
 /// needs clean fuzzer builds in both segments. A store with a run must name
 /// it as `options.parent`, since a store holds one campaign.
 pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, CampaignError> {
@@ -519,7 +523,11 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
             )
         }
     };
-    let report = seed::load(SeedSet::Corpus, Some(options.harness.name));
+    let report = if options.seeds {
+        seed::load(SeedSet::Corpus, Some(options.harness.name))
+    } else {
+        seed::SeedReport::default()
+    };
     if !report.rejected.is_empty() {
         let reasons: Vec<String> = report
             .rejected

@@ -28,7 +28,7 @@ pub const USAGE: &str = "\
   zakura-sim campaign start --store <dir> --campaign <name> --sim <name> --build <sha256>
       --seconds <n> [--workers <n>] [--seed <n>] [--cpus <list>]... [--max-len <n>]
       [--timeout <s>] [--rss-limit-mb <n>] [--max-restarts <n>] [--abandon-limit <n>]
-      [--feedback on|off] [--compact-secs <s>] [--suite <file>]
+      [--feedback on|off] [--compact-secs <s>] [--seeds corpus|none] [--suite <file>]
       [--artifacts <uri>] [--libfuzzer-arg <flag>]... [--parent <sha256> --corpus carry|seeds]
   zakura-sim campaign resume --store <dir> [--run <sha256>] [--build <sha256>] [--seconds <n>]
       [--workers <n>]
@@ -46,7 +46,7 @@ pub const HELP: &str = "\
 `build` builds a fuzz target of qa/fuzz/sim with the pinned nightly and saves
 the binary in the store with its build record, named by its SHA-256.
 `start` writes a run manifest whose initial snapshot holds the harness's
-curated seeds, then runs --workers fuzzer processes for --seconds each and
+corpus seeds, or nothing with --seeds none, then runs --workers fuzzer processes for --seconds each and
 restarts one that ends early up to --max-restarts times. When they stop, it
 saves the union of the initial snapshot and every worker's corpus as a new
 snapshot, compacts it with libFuzzer's merge if --compact-secs is set, and
@@ -207,6 +207,7 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
         "--abandon-limit",
         "--feedback",
         "--compact-secs",
+        "--seeds",
         "--suite",
         "--artifacts",
         "--libfuzzer-arg",
@@ -274,6 +275,15 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+        },
+        seeds: match flags.one("--seeds")? {
+            None | Some("corpus") => true,
+            Some("none") => false,
+            Some(other) => {
+                return Err(Error::Usage(format!(
+                    "--seeds is `corpus` or `none`, not `{other}`"
+                )))
+            }
         },
         suite: flags.one("--suite")?.map(PathBuf::from),
         artifacts: flags.one("--artifacts")?.map(str::to_owned),

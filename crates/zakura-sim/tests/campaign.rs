@@ -39,10 +39,11 @@ use zakura_sim::{
     },
     harness,
     property::Status as PropertyStatus,
+    seed::SeedSet,
     trace::BuildInfo,
 };
 
-/// The harness the tests fuzz. It has one committed seed.
+/// The harness the tests fuzz. It has one corpus seed.
 const SIM: &str = "discovery/wait-complete";
 
 /// The stand-in fuzzer. `@CONTROL@` and `@ABANDON@` are replaced.
@@ -215,7 +216,7 @@ impl Fixture {
     }
 
     /// `start`'s options: `workers` workers of `seconds` each, two
-    /// restarts, the committed fixtures.
+    /// restarts, the corpus seeds.
     fn options(&self, workers: usize, seconds: u64) -> StartOptions {
         StartOptions {
             campaign: "test".to_owned(),
@@ -240,7 +241,7 @@ impl Fixture {
                 compact_secs: None,
                 libfuzzer_args: Vec::new(),
             },
-            fixtures: vec![fixtures()],
+            seeds: true,
             suite: None,
             artifacts: None,
             parent: None,
@@ -268,8 +269,6 @@ impl Fixture {
             seconds,
             "--timeout",
             "1",
-            "--fixtures",
-            FIXTURES,
         ]
     }
 }
@@ -314,14 +313,6 @@ fn identity() -> BuildIdentity {
         rustflags: "--cfg zakura_sim".to_owned(),
         cargo_args: Vec::new(),
     }
-}
-
-/// The committed fixture directory.
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-
-/// [`FIXTURES`] as a path.
-fn fixtures() -> PathBuf {
-    PathBuf::from(FIXTURES)
 }
 
 /// Waits up to 30 s for `ready`.
@@ -918,8 +909,6 @@ fn fuzzers_run_without_the_supervisors_expected_property() {
         build,
         "--seconds",
         "1",
-        "--fixtures",
-        FIXTURES,
     ];
     let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
         .arg("campaign")
@@ -1093,12 +1082,10 @@ fn a_changed_generator_starts_a_new_segment() {
         generator: real.generator + 1,
         ..*real
     }));
-    // The committed seed fits only the real generator.
-    let no_seeds = fixture.dir.path().join("no-seeds");
-    fs::create_dir(&no_seeds).unwrap();
+    // The corpus seeds fit only the real generator.
     let mut options = fixture.options(1, 1);
     options.harness = bumped;
-    options.fixtures = vec![no_seeds];
+    options.seeds = false;
     let prepared = campaign::prepare_start(&fixture.store, options).unwrap();
     let run = prepared.manifest().clone();
     let end = prepared.run(&fixture.store).unwrap();
@@ -1155,8 +1142,7 @@ fn a_changed_generator_starts_a_new_segment() {
         manifest.harness,
         fixture.store.read_manifest(&run).unwrap().harness
     );
-    let seeds: BTreeSet<Digest> = zakura_sim::seed::load(&[fixtures()], Some(SIM))
-        .unwrap()
+    let seeds: BTreeSet<Digest> = zakura_sim::seed::load(SeedSet::Corpus, Some(SIM))
         .admitted
         .iter()
         .map(|seed| Digest::of(&seed.input))

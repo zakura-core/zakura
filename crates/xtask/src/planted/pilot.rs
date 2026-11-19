@@ -95,7 +95,7 @@ mod tests;
 
 use super::lane::{
     self, confirm_and_replay, run_lane_child, sim_build_failure, BuildFailure, CampaignBounds,
-    CampaignFacts, Confirm, LaneError, LaneSpec,
+    CampaignFacts, Confirm, LaneError, LaneSpec, StartCorpus,
 };
 #[cfg(test)]
 use super::lane::{
@@ -1109,8 +1109,9 @@ fn discovery(
         check_pins(&tree, plan.revision, cases)?;
         meta.sim_rustc = sim_rustc(&tree, plan.toolchain);
         let pairing = Pairing::of(&plan.pin, &tree);
-        let corpus = tree.join(&plan.bounds.corpus);
-        check_empty_corpus(&corpus)?;
+        let empty = tree.join(&plan.bounds.corpus);
+        check_empty_corpus(&empty)?;
+        let corpus = StartCorpus::of_tree(&tree, &empty);
         let built = build_sim(
             &tree,
             &work.join("baseline").join("sim-target"),
@@ -1130,7 +1131,7 @@ fn discovery(
                     lane,
                     plan.bounds,
                     &pairing,
-                    &corpus,
+                    corpus,
                     false,
                 )?
                 .map_err(|error| match error {
@@ -1145,7 +1146,7 @@ fn discovery(
         let mut rows = Vec::new();
         for case in cases {
             let row = discovery_case(
-                repo_root, plan, &pairing, case, lanes, &baselines, &corpus, out, work,
+                repo_root, plan, &pairing, case, lanes, &baselines, corpus, out, work,
             )?;
             for seed in &row.seeds {
                 println!(
@@ -1177,7 +1178,7 @@ fn discovery_case(
     case: &Case,
     lanes: &[Lane],
     baselines: &BTreeMap<(String, Lane), Result<Campaign, LaneError>>,
-    corpus: &Path,
+    corpus: StartCorpus<'_>,
     out: &Path,
     work: &Path,
 ) -> Result<DiscoveryCase, BoxError> {
@@ -1364,7 +1365,7 @@ fn campaign_lane(
     lane: Lane,
     bounds: &Bounds,
     pairing: &Pairing,
-    corpus: &Path,
+    corpus: StartCorpus<'_>,
     mutated: bool,
 ) -> Result<Result<Campaign, LaneError>, BoxError> {
     let name = lane_name(case, lane, mutated);
@@ -1421,7 +1422,7 @@ fn lane_spec<'a>(
     lane: Lane,
     bounds: &'a Bounds,
     name: &'a str,
-    corpus: &'a Path,
+    corpus: StartCorpus<'a>,
 ) -> LaneSpec<'a> {
     LaneSpec {
         target: &case.target,

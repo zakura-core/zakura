@@ -1590,7 +1590,6 @@ fn fake_kill(
             },
         )]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim,
     };
@@ -1862,7 +1861,6 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
             ),
         ]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: out.path().join("zakura-sim"),
     };
@@ -2794,7 +2792,6 @@ fn the_unpatched_build_reruns_a_kills_input() {
         plans: Vec::new(),
         baselines: BTreeMap::new(),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: sim,
     };
@@ -2871,7 +2868,6 @@ fn a_generator_lane_the_cap_killed_reruns_alone() {
             ((harness.to_owned(), 8), baseline(true)),
         ]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: out.path().join("zakura-sim"),
     };

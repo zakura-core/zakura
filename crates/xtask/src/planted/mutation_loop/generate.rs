@@ -87,7 +87,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     super::lane::{
         self, campaign_failure, confirm_and_replay, left_failures, run_lane_child, BuildFailure,
-        CampaignBounds, CampaignFacts, Confirm, LaneError, LaneSpec, EXPECT_VAR,
+        CampaignBounds, CampaignFacts, Confirm, LaneError, LaneSpec, StartCorpus, EXPECT_VAR,
     },
     super::seeds::{self, Registry},
     classify::{self, kill_violations, Class, Classified, GenerateFacts, GenerateStop, Reason},
@@ -133,9 +133,6 @@ pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {
 /// The file every `inproc` search reads its exclusions from, under
 /// `--out`.
 const EXCLUDE_FILE: &str = "generate/exclude.txt";
-
-/// The empty corpus every `libfuzzer` campaign starts from, under `--out`.
-const EMPTY_CORPUS: &str = "generate/empty-corpus";
 
 /// The directory, under a search's, where `zakura-sim generate` writes.
 pub(super) const SEARCH_DIR: &str = "search";
@@ -799,8 +796,6 @@ pub(super) struct Lanes {
     pub(super) baselines: BTreeMap<Pair, GenBaseline>,
     /// The digests every `inproc` search excludes.
     pub(super) exclude: PathBuf,
-    /// The empty corpus every `libfuzzer` campaign starts from.
-    pub(super) corpus: PathBuf,
     /// Each harness's fuzz target, for `libfuzzer` lanes.
     pub(super) targets: BTreeMap<String, String>,
     /// The unpatched build's `zakura-sim`, copied out of slot 0's target.
@@ -1329,8 +1324,6 @@ impl Runner {
             .ok_or("the unpatched build made no zakura-sim binary")?;
         let exclude = self.out.join(EXCLUDE_FILE);
         let excluded_inputs = write_exclusions(registry, &exclude)?;
-        let corpus = self.out.join(EMPTY_CORPUS);
-        fs::create_dir_all(&corpus)?;
         let unpatched_sim = self.out.join(UNPATCHED_SIM);
         fs::create_dir_all(unpatched_sim.parent().expect("the copy lies under --out"))?;
         fs::copy(sim, &unpatched_sim)?;
@@ -1367,7 +1360,6 @@ impl Runner {
             plans,
             baselines: BTreeMap::new(),
             exclude,
-            corpus,
             targets,
             unpatched_sim,
         };
@@ -1432,7 +1424,7 @@ impl Runner {
                         .map_err(|_| format!("a libfuzzer seed fits a u32, and {seed} doesn't"))?,
                     feedback: "on",
                     libfuzzer_args: &[],
-                    corpus: &lanes.corpus,
+                    corpus: StartCorpus::NoSeeds,
                 };
                 // One worker per campaign, so a lane's memory is one
                 // process's, as an `inproc` search's is.

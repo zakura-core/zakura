@@ -22,8 +22,8 @@
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
 //! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
-//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix] [--schedule plan|pct]
-//!     [--family <name>[,<name>]...]
+//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix]
+//!     [--schedule plan|pct|enumerate] [--family <name>[,<name>]...]
 //! zakura-sim generators
 //! ```
 //!
@@ -130,7 +130,7 @@ mod cli {
              zakura-sim verify-archive <dir>\n  \
              zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
              [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix]\n      \
-             [--schedule plan|pct] [--family <name>[,<name>]...]\n  \
+             [--schedule plan|pct|enumerate] [--family <name>[,<name>]...]\n  \
              zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
@@ -211,7 +211,10 @@ mod cli {
              under PCT or the Plan; it sets each run's schedule itself. --schedule pct\n\
              makes each run's live picks with a PCT steer the input seeds, and saves a\n\
              stopping run's input as the bytes that replay it with no steer. The report\n\
-             counts each property's outcomes over the free runs apart. --family draws\n\
+             counts each property's outcomes over the free runs apart. --schedule\n\
+             enumerate runs every schedule of each drawn input with at most two delays\n\
+             from the first enabled action, breadth first, one run each, and counts\n\
+             the inputs whose every schedule ran. --family draws\n\
              only the named families, and passes over every other draw.\n\
              ZAKURA_SIM_KNOWN=<id>[=<issue>],... makes every command treat each named\n\
              Active property as Known, so a search records its violations and goes on\n\
@@ -1195,15 +1198,16 @@ mod cli {
             schedule: match schedule.as_deref() {
                 None | Some("plan") => Schedule::Plan,
                 Some("pct") if entry.run_steered_bytes.is_some() => Schedule::Pct,
-                Some("pct") => {
+                Some("enumerate") if entry.run_steered_bytes.is_some() => Schedule::Enumerate,
+                Some(steered @ ("pct" | "enumerate")) => {
                     return Err(Error::Usage(format!(
-                        "--schedule pct: {} makes no picks to steer",
+                        "--schedule {steered}: {} makes no picks to steer",
                         entry.name
                     )))
                 }
                 Some(other) => {
                     return Err(Error::Usage(format!(
-                        "--schedule: `{other}` isn't plan or pct"
+                        "--schedule: `{other}` isn't plan, pct or enumerate"
                     )))
                 }
             },

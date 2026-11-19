@@ -520,6 +520,45 @@ fn a_mixed_search_counts_its_modes() {
     assert!(report.random_properties.is_empty());
 }
 
+/// An enumerating search on the planted race finds the lost update within
+/// its depth-2 schedules of one drawn input, and the input it saves replays
+/// the violation with no steer. On the fixed fixtures it runs every
+/// schedule of each input and moves on.
+#[test]
+fn an_enumerating_search_finds_the_race_and_exhausts_clean_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = entry(PLANTED);
+    let report = generate(
+        entry,
+        &GenerateOptions {
+            schedule: Schedule::Enumerate,
+            ..options(root.path(), None)
+        },
+    )
+    .unwrap();
+    let Stop::Violation { property } = &report.stop else {
+        panic!("the enumeration missed the planted race: {report:?}");
+    };
+    let saved = fs::read(report.input.as_ref().unwrap()).unwrap();
+    let run = (entry.run_bytes)(&saved, &mut zakura_sim::NullSink, None);
+    assert_eq!(
+        zakura_sim::explore::classify(entry, &run).outcome,
+        zakura_sim::explore::ExploreOutcome::Fail {
+            property: property.clone()
+        }
+    );
+    let clean = generate(
+        self::entry(CLEAN),
+        &GenerateOptions {
+            schedule: Schedule::Enumerate,
+            ..options(&root.path().join("clean"), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(clean.stop, Stop::Clean, "{clean:?}");
+    assert!(clean.exhausted > 0, "{clean:?}");
+}
+
 /// A search restricted to one family draws only that family, and a family
 /// the harness doesn't list is an error before any run.
 #[test]

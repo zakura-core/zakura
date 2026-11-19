@@ -53,13 +53,18 @@ use std::{
     fs, io,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{pct::Pct, Bucket, Classified, ExploreOutcome, ExploreRun, Worker};
+use super::{
+    enumerate::{self, Delays, Enumeration},
+    pct::Pct,
+    Bucket, Classified, ExploreOutcome, ExploreRun, Worker,
+};
 use crate::{
     check::PropertyOutcome,
     harness::{HarnessEntry, ScenarioFamily, HARNESSES},
@@ -117,6 +122,12 @@ pub enum Schedule {
     /// input that replays a stopping run with no steer, so every later
     /// command reads it as a plain input.
     Pct,
+    /// Every schedule of the drawn input with at most
+    /// [`enumerate::DEPTH`] delays, breadth first, one run each
+    /// ([`super::enumerate`]). A search moves to the next drawn input once
+    /// it has run every schedule of the current one. It saves a stopping
+    /// run's input as [`Schedule::Pct`] does.
+    Enumerate,
 }
 
 impl Schedule {
@@ -183,6 +194,7 @@ impl Draw {
         let schedule = match schedule {
             Schedule::Plan => "plan",
             Schedule::Pct => "pct",
+            Schedule::Enumerate => "enumerate",
         };
         format!("{draw}/{schedule}")
     }
@@ -318,6 +330,10 @@ pub struct GenerateReport {
     /// Inputs run whose scenario was free ([`Draw::free`]).
     #[serde(default)]
     pub random_runs: u64,
+    /// Drawn inputs whose every schedule ran, under
+    /// [`Schedule::Enumerate`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub exhausted: u64,
     /// True if the stopping run's end record went to the record directory.
     pub record: bool,
     /// Runs that violated each `Known` or `Draft` property, by bucket and
@@ -652,6 +668,7 @@ pub fn generate(
         mode: None,
         modes: BTreeMap::new(),
         random_runs: 0,
+        exhausted: 0,
         record: false,
         notes: BTreeMap::new(),
         abandoned: 0,
@@ -687,7 +704,34 @@ pub fn generate(
                 .family
                 .is_some_and(|family| options.families.contains(family))
     });
-    for (index, draw) in (0..options.runs).zip(drawn) {
+    let mut drawn = drawn;
+    // Under `Schedule::Enumerate`, the input whose schedules are running.
+    let mut current: Option<(Draw, Enumeration)> = None;
+    let enumerating = options.schedule == Schedule::Enumerate && entry.run_steered_bytes.is_some();
+    for index in 0..options.runs {
+        let (draw, delays) = if enumerating {
+            let next = loop {
+                if let Some((draw, enumeration)) = &mut current {
+                    if let Some(delays) = enumeration.next_schedule() {
+                        break Some((draw.clone(), delays));
+                    }
+                    report.exhausted += 1;
+                }
+                match drawn.next() {
+                    Some(draw) => current = Some((draw, Enumeration::new(enumerate::DEPTH))),
+                    None => break None,
+                }
+            };
+            match next {
+                Some((draw, delays)) => (draw, Some(delays)),
+                None => break,
+            }
+        } else {
+            match drawn.next() {
+                Some(draw) => (draw, None),
+                None => break,
+            }
+        };
         let family = draw.family;
         let digest = hex(&Sha256::digest(&draw.input));
         if options.exclude.contains(&digest) {
@@ -701,7 +745,9 @@ pub fn generate(
         // A harness the scheduler doesn't run has no picks to steer, so a
         // mixed search's PCT turns take the Plan there.
         let schedule = match draw.schedule.unwrap_or(options.schedule) {
-            Schedule::Pct if entry.run_steered_bytes.is_none() => Schedule::Plan,
+            Schedule::Pct | Schedule::Enumerate if entry.run_steered_bytes.is_none() => {
+                Schedule::Plan
+            }
             schedule => schedule,
         };
         let mode = (options.draw_policy == DrawPolicy::Mix).then(|| draw.mode(schedule));
@@ -709,11 +755,25 @@ pub fn generate(
             *report.modes.entry(mode.clone()).or_default() += 1;
         }
         report.random_runs += u64::from(draw.free);
-        let input = draw.input;
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| match schedule {
-            Schedule::Plan => worker.explore(entry, &input, summarize),
-            Schedule::Pct => worker.explore_steered(entry, &input, Pct::for_input, summarize),
+        let input = draw.input.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| match (schedule, &delays) {
+            (Schedule::Pct, _) => worker.explore_steered(entry, &input, Pct::for_input, summarize),
+            (Schedule::Enumerate, Some(delays)) => {
+                let (delays, seen) = (delays.clone(), Arc::clone(&seen));
+                worker.explore_steered(
+                    entry,
+                    &input,
+                    move |_| -> Box<dyn crate::Steer> { Box::new(Delays::new(&delays, seen)) },
+                    summarize,
+                )
+            }
+            _ => worker.explore(entry, &input, summarize),
         }));
+        if let (Some((_, enumeration)), Some(delays)) = (&mut current, &delays) {
+            let counts = seen.lock().unwrap_or_else(PoisonError::into_inner);
+            enumeration.expand(delays, &counts);
+        }
         let ran = match ran {
             Ok(ran) => ran,
             Err(payload) => {
@@ -777,6 +837,12 @@ pub fn generate(
             break;
         }
     }
+    if current
+        .as_ref()
+        .is_some_and(|(_, enumeration)| enumeration.is_done())
+    {
+        report.exhausted += 1;
+    }
     if let Some((index, family, mode, input, digest, draw, stop, end)) = stopped {
         // The input goes to disk before anything else, as a fuzz target
         // saves its failures.
@@ -804,6 +870,11 @@ pub fn generate(
         format!("{text}\n").as_bytes(),
     )?;
     Ok(report)
+}
+
+/// True for zero, which a report leaves out.
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it to

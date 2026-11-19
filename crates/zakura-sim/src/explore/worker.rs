@@ -140,7 +140,7 @@ impl Worker {
         &mut self,
         entry: &'static HarnessEntry,
         input: &[u8],
-        make: fn(&[u8]) -> Box<dyn Steer>,
+        make: impl FnOnce(&[u8]) -> Box<dyn Steer> + Send + 'static,
         then: impl FnOnce(&[u8], &ExploreRun, &Classified) -> R + Send + 'static,
     ) -> R {
         let run_steered = entry

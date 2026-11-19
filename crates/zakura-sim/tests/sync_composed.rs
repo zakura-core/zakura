@@ -102,6 +102,34 @@ fn each_slot_decodes_to_its_step() {
     assert!(!SyncComposed::accepts(&other));
 }
 
+/// A mirror takes only as many closes as its dialer makes connections. A
+/// fifth close of mirror 0 would wait forever for a fifth link and hold
+/// back the growth after it, so it is skipped.
+#[test]
+fn closes_past_the_dialers_connections_are_skipped() {
+    let close = [1, 0, 0];
+    let scenario = SyncComposed::draw(&prefix(&[close, close, close, close, close, [3, 0, 0]]));
+    let steps: Vec<_> = scenario
+        .sync
+        .control
+        .iter()
+        .map(|step| step.action.clone())
+        .collect();
+    let close = SyncAction::CloseIfLinked {
+        peer: "mirror-0".to_owned(),
+    };
+    assert_eq!(
+        steps,
+        [
+            close.clone(),
+            close.clone(),
+            close.clone(),
+            close,
+            SyncAction::Grow { len: 1 }
+        ]
+    );
+}
+
 /// Mirror 0's connection closes after the second admission, the chain
 /// grows by one block, and each mirror range read stalls for 3 s. Both
 /// steps run, in order, and the run violates nothing and reaches no

@@ -80,7 +80,7 @@ use crate::{
 pub const REDIAL_SETTLE: Duration = Duration::from_secs(10);
 
 /// The most connections one dialer makes over a run.
-const MAX_INCARNATIONS: usize = 4;
+const MAX_INCARNATIONS: u32 = 4;
 
 /// The `sync/wire` scenario: a `sync/storage` scenario on a simulated
 /// network.
@@ -1048,10 +1048,11 @@ const HOLD_UNTIL_MS: [u64; 8] = [1_000, 3_000, 6_000, 9_000, 10_000, 12_000, 16_
 ///   ([`composed_trigger`]), and control steps run in order.
 ///
 /// A close waits until its mirror has one more link than it has had
-/// composed closes, since no relink runs on the wire tier and a dialer
-/// makes at most [`MAX_INCARNATIONS`] connections. It is a
-/// [`SyncAction::CloseIfLinked`], since the node may have closed the
-/// connection itself first.
+/// composed closes, since no relink runs on the wire tier. A dialer makes
+/// at most [`MAX_INCARNATIONS`] connections, so a mirror's closes past that
+/// many are skipped: each would wait forever and hold back every later
+/// step. A close is a [`SyncAction::CloseIfLinked`], since the node may
+/// have closed the connection itself first.
 pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
     let byte = |index: usize| grammar.get(index).copied().unwrap_or(0);
     let (topology, chain) = (byte(0), byte(1));
@@ -1089,6 +1090,9 @@ pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
             0 => break,
             1 | 2 => {
                 let mirror = usize::from(a) % mirrors;
+                if closes[mirror] == MAX_INCARNATIONS {
+                    continue;
+                }
                 closes[mirror] += 1;
                 let peer = format!("mirror-{mirror}");
                 let live = Trigger::Count(closes[mirror], Box::new(Trigger::Linked(peer.clone())));

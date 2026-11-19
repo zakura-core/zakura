@@ -108,48 +108,6 @@ run = true
 timeout-secs = 1800
 
 [[ignored]]
-file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
-test = "regenerate_saved_plans"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved Plans"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_authority.rs"
-test = "regenerate_authority_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed authority witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
-test = "regenerate_reset_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_hold_release.rs"
-test = "regenerate_hold_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed hold fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_peer_retirement.rs"
-test = "regenerate_retirement_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_recovery_progress.rs"
-test = "regenerate_recovery_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_stale_chain.rs"
-test = "regenerate_chain_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false
@@ -160,54 +118,6 @@ file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
 test = "regenerate_planted_guard_scenarios"
 run = false
 reason = "a tool, not a test: it rewrites the planted cases' scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_chain_selected.rs"
-test = "regenerate_selection_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication_liveness.rs"
-test = "regenerate_liveness_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed liveness witnesses from their fixtures"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication.rs"
-test = "regenerate_publication_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed publication witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_storage_seeds.rs"
-test = "regenerate_storage_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed seeds"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
-test = "regenerate_witness_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed witness seeds"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_flood_watch.rs"
-test = "regenerate_flood_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_release_wake.rs"
-test = "regenerate_release_wake_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_repair.rs"
-test = "regenerate_repair_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's

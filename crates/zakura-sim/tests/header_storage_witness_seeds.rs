@@ -1,15 +1,10 @@
 //! fuzz-12 item 7: each action and overlap the fuzz-12 controls added, as a
-//! committed generator-3 seed, `tests/fixtures/header-storage-w-*.bin`, so
-//! the fuzzer can draw it. Each seed is a witness scenario's canonical
-//! prefix and 1,024 Plan bytes, and its run shows the overlap it's named
-//! for in the facts it logs, not only that the run ended.
+//! generator-3 seed, `header-storage-w-*` in `zakura_sim::seed`, so the
+//! fuzzer can draw it. Each seed is a witness scenario's canonical prefix
+//! and 1,024 Plan bytes, and its run shows the overlap it's named for in the
+//! facts it logs, not only that the run ended.
 #![cfg(zakura_sim)]
 
-mod support;
-
-use std::{fs, path::PathBuf};
-
-use support::{byte_inputs, storage_witnesses};
 use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -18,15 +13,12 @@ use zakura_sim::{
     harness::{
         self,
         header_node::policy::OpKind,
-        header_sync::{grammar, Storage, StorageScenario},
+        header_sync::{storage_witnesses, Storage},
         Subsystem,
     },
     observe::{StorageFact, StoragePoint, StorageRequest, StorageResult},
     seed, NullSink, Observation, RunReport,
 };
-
-/// The Plan bytes after each seed's prefix.
-const PLAN_BYTES: usize = 1_024;
 
 /// The overlap a witness seed's run shows.
 #[derive(Clone, Copy, Debug)]
@@ -342,11 +334,8 @@ impl Shows {
     }
 }
 
-/// What each witness seed's run shows, by stem, and which [`PLAN_BYTES`]
-/// slice of the [`byte_inputs`] stream is its Plan. Most use slice 16.
-/// The hold, the reconsider, the release and two forks use a slice whose
-/// run orders their overlap that way.
-fn shows(stem: &str) -> (Shows, usize) {
+/// What each witness seed's run shows, by name.
+fn shows(stem: &str) -> Shows {
     use std::cmp::Ordering;
     let witness = stem
         .strip_prefix("header-storage-w-")
@@ -365,112 +354,72 @@ fn shows(stem: &str) -> (Shows, usize) {
         .unwrap_or_else(|| panic!("{stem} names no prefix class"))
     };
     if let Some(named) = witness.strip_prefix("recover-") {
-        return (Shows::Recovered(class(named)), 16);
+        return Shows::Recovered(class(named));
     }
     if let Some(named) = witness.strip_prefix("owed-") {
-        return (Shows::Owed(class(named)), 16);
+        return Shows::Owed(class(named));
     }
-    if let Some((kind, allow, outcome, _)) = storage_witnesses::fault_witnesses()
+    if let Some((kind, _, outcome, _)) = storage_witnesses::fault_witnesses()
         .into_iter()
         .find(|(kind, _, outcome, _)| storage_witnesses::fault_stem(*kind, outcome) == stem)
     {
-        let _ = allow;
-        return (Shows::Failed(kind, outcome), 16);
+        return Shows::Failed(kind, outcome);
     }
     match witness {
-        "reset-locator" => (Shows::HeldAcrossReset(OpKind::Locator), 16),
-        "reset-prepare" => (Shows::HeldAcrossReset(OpKind::Prepare), 16),
-        "reset-apply" => (Shows::HeldAcrossReset(OpKind::Apply), 16),
-        "reset-reply" => (Shows::ResetBetweenCommitAndDelivery, 16),
-        "hold-succeeds" => (Shows::SucceededAfterHold, 2),
-        "reconsider" => (Shows::ReconsiderMidRound, 20),
-        "release" => (Shows::ReleasedRead, 17),
-        "reply-hold" => (Shows::ReplyOutlasted, 16),
-        "reply-after-shutdown" => (
-            Shows::DeliveredAfter {
-                action: "shutdown",
-                delivered: false,
-            },
-            16,
-        ),
-        "reply-after-close" => (
-            Shows::DeliveredAfter {
-                action: "close",
-                delivered: true,
-            },
-            16,
-        ),
-        "stop-storage" => (Shows::StopDroppedApply, 16),
-        "peer-lease-denied" => (Shows::PeerLeaseDenied, 16),
+        "reset-locator" => Shows::HeldAcrossReset(OpKind::Locator),
+        "reset-prepare" => Shows::HeldAcrossReset(OpKind::Prepare),
+        "reset-apply" => Shows::HeldAcrossReset(OpKind::Apply),
+        "reset-reply" => Shows::ResetBetweenCommitAndDelivery,
+        "hold-succeeds" => Shows::SucceededAfterHold,
+        "reconsider" => Shows::ReconsiderMidRound,
+        "release" => Shows::ReleasedRead,
+        "reply-hold" => Shows::ReplyOutlasted,
+        "reply-after-shutdown" => Shows::DeliveredAfter {
+            action: "shutdown",
+            delivered: false,
+        },
+        "reply-after-close" => Shows::DeliveredAfter {
+            action: "close",
+            delivered: true,
+        },
+        "stop-storage" => Shows::StopDroppedApply,
+        "peer-lease-denied" => Shows::PeerLeaseDenied,
         // The node prepares mirror-0's branch-1 fork first.
-        "equal-forks" => (
-            Shows::ForkWork {
-                earlier: 4,
-                later: 4,
-                work: Ordering::Equal,
-            },
-            16,
-        ),
-        "longer-fork" => (
-            Shows::ForkWork {
-                earlier: 5,
-                later: 3,
-                work: Ordering::Less,
-            },
-            17,
-        ),
-        "weighted-fork" => (
-            Shows::ForkWork {
-                earlier: 5,
-                later: 3,
-                work: Ordering::Greater,
-            },
-            17,
-        ),
+        "equal-forks" => Shows::ForkWork {
+            earlier: 4,
+            later: 4,
+            work: Ordering::Equal,
+        },
+        "longer-fork" => Shows::ForkWork {
+            earlier: 5,
+            later: 3,
+            work: Ordering::Less,
+        },
+        "weighted-fork" => Shows::ForkWork {
+            earlier: 5,
+            later: 3,
+            work: Ordering::Greater,
+        },
         _ => panic!("{stem} has no overlap to show"),
     }
 }
 
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// A full fuzz input: `scenario`'s canonical prefix, then slice `index` of
-/// [`byte_inputs`].
-fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
-    let stream = byte_inputs(64, 1_024).concat();
-    let plan = stream
-        .get(index * PLAN_BYTES..(index + 1) * PLAN_BYTES)
-        .expect("64 inputs of up to 1,024 bytes hold every seed's Plan");
-    grammar::input(scenario, plan).unwrap_or_else(|error| panic!("{scenario:?}: {error}"))
-}
-
-/// Each committed witness seed is its scenario's input. Its run through
-/// the registered harness ends clean, and shows the overlap it's named
-/// for. Every witness has a seed.
+/// Each witness seed's run through the registered harness ends clean, and
+/// shows the overlap it's named for. Every witness has a seed.
 #[test]
-fn committed_witness_seeds_show_their_overlaps() {
+fn witness_seeds_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
-    let seeds = storage_witnesses::witness_seeds();
+    let seeds: Vec<_> = seed::all()
+        .into_iter()
+        .filter(|seed| seed.name.starts_with("header-storage-w-"))
+        .collect();
     // 15 named witnesses, 10 faults, 5 recovery classes and hdr-13's two
     // owed recoveries.
     assert_eq!(seeds.len(), 32);
-    for (stem, scenario) in seeds {
-        let (shows, slice) = shows(&stem);
-        let committed = fs::read(fixtures().join(format!("{stem}.bin")))
-            .unwrap_or_else(|error| panic!("{stem}: {error}"));
-        assert_eq!(
-            committed,
-            input(slice, &scenario),
-            "{stem}: the committed seed changed; regenerate the seeds if that's intended"
-        );
-        assert_eq!(
-            Storage::draw(&committed[..Storage::SCENARIO_BYTES]),
-            scenario,
-            "{stem}"
-        );
-        let run = (entry.run_bytes)(&committed, &mut NullSink, None);
+    for seed in seeds {
+        let stem = &seed.name;
+        let shows = shows(stem);
+        let run = (entry.run_bytes)(&seed.input, &mut NullSink, None);
         let report = run
             .report()
             .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));
@@ -481,36 +430,5 @@ fn committed_witness_seeds_show_their_overlaps() {
         );
         assert_eq!(run.leaked(), 0, "{stem}");
         assert!(shows.in_run(report), "{stem} doesn't show {shows:?}");
-    }
-}
-
-/// Rewrites every witness seed and its sidecar. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_storage_witness_seeds -- --ignored regenerate_witness_seeds`.
-#[test]
-#[ignore = "rewrites the committed seeds"]
-fn regenerate_witness_seeds() {
-    for (stem, scenario) in storage_witnesses::witness_seeds() {
-        let (shows, slice) = shows(&stem);
-        let input = input(slice, &scenario);
-        let base = fixtures().join(&stem);
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
-            "# The committed fuzz input `{stem}.bin`, a fuzz-12 item 7 witness whose run\n\
-             # shows {shows:?}. Its 344-byte prefix is the scenario's canonical\n\
-             # encoding, then 1,024 Plan bytes.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_storage_witness_seeds.rs\"\n",
-            harness = Storage::NAME,
-            generator = Storage::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(
-                &serde_json::to_value(&scenario).expect("scenarios serialize")
-            ),
-        );
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

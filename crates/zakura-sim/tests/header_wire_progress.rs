@@ -13,14 +13,7 @@
 
 mod support;
 
-use std::{
-    cell::RefCell,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{cell::RefCell, io::Write, path::Path, process::Command, time::Duration};
 
 use serde_json::Value;
 use support::inputs;
@@ -49,6 +42,7 @@ use zakura_sim::{
         PeerAction, PeerSpec, NODE_ADDR,
     },
     record::RecordSink,
+    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::{check_witness, Expect, WitnessScenario},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
@@ -58,25 +52,22 @@ use zakura_sim::{
 /// runs as the child, and where the recorded trace is.
 const CHILD: &str = "HEADER_WIRE_PROGRESS_REPLAY_CHILD";
 
-/// The committed progress input, `tests/fixtures/header-wire-honest-progress.bin`:
-/// the saved Plan's tag, then its Plan bytes.
+/// The progress seed's input, `header-wire-honest-progress`: the saved
+/// Plan's tag, then its Plan bytes.
 fn committed() -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!(
-            "header-wire-{}.bin",
-            SavedPlan::HonestProgress.name()
-        ));
-    fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    let name = format!("header-wire-{}", SavedPlan::HonestProgress.name());
+    seed::find(&name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .input
 }
 
-/// The committed input's Plan, after its two-byte scenario tag.
+/// The progress seed's Plan, after its two-byte scenario tag.
 fn committed_plan() -> PlanInput {
     let input = committed();
     assert_eq!(
         HeaderWire::draw(&input[..HeaderWire::SCENARIO_BYTES]),
         progress_scenario(),
-        "the committed input picks the progress fixture"
+        "the seed picks the progress fixture"
     );
     Plan::from_fuzz(&input[HeaderWire::SCENARIO_BYTES..])
 }

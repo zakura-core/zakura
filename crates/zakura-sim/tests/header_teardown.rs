@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::{cell::RefCell, io::Write, path::Path, process::Command};
+use std::{cell::RefCell, io::Write, path::Path, process::Command, sync::LazyLock};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -28,9 +28,13 @@ use zakura_sim::{
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
+/// The close-and-relink seed's input, `header-storage-close-relink`,
 /// whose node releases rounds as its mirrors close and finish.
-const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-relink.bin");
+static CLOSE_RELINK_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    zakura_sim::seed::find("header-storage-close-relink")
+        .expect("the seed is registered")
+        .input
+});
 
 /// `header-sync/teardown-returns-baseline` holds on the committed
 /// close-and-relink seed, and the run reaches its trigger history: the
@@ -159,7 +163,7 @@ fn the_teardown_witness_replays_in_a_fresh_process() {
     };
     for witness in 0..2 {
         let what = match witness {
-            0 => RecordInput::Input(CLOSE_RELINK_INPUT),
+            0 => RecordInput::Input(&CLOSE_RELINK_INPUT),
             _ => RecordInput::Plan {
                 scenario: &held_lease,
                 plan: &plan,

@@ -17,11 +17,10 @@ mod support;
 
 use std::{
     cell::RefCell,
-    fs,
     future::Future,
     io::Write,
     num::NonZeroU64,
-    path::{Path, PathBuf},
+    path::Path,
     pin::pin,
     process::Command,
     task::{Context, Poll, Waker},
@@ -34,9 +33,7 @@ use zakura_header_chain::BodyWorkAuthority;
 use zakura_node_services::header_chain::{Port, VctRepairContextReply};
 use zakura_sim::NaReason;
 use zakura_sim::{
-    domain::header_sync::{
-        COMMIT_ONLY_AUTHORIZED, OUTSTANDING_WORK_BOUNDED, STALE_COMPLETION_INERT,
-    },
+    domain::header_sync::{OUTSTANDING_WORK_BOUNDED, STALE_COMPLETION_INERT},
     explore::{classify, ExploreOutcome},
     harness::{
         self,
@@ -54,71 +51,43 @@ use zakura_sim::{
 };
 use zakura_storage::header::controlled::ControlledPort;
 
-/// The committed inputs, `tests/fixtures/header-repair-*.bin`: a fixture's
-/// scenario byte, then Plan bytes.
-const APPLIED_INPUT: &[u8] = include_bytes!("fixtures/header-repair-applied.bin");
-/// See [`APPLIED_INPUT`].
-const PREPARE_DEPARTS_INPUT: &[u8] = include_bytes!("fixtures/header-repair-prepare-departs.bin");
-/// See [`APPLIED_INPUT`].
-const APPLY_DEPARTS_INPUT: &[u8] = include_bytes!("fixtures/header-repair-apply-departs.bin");
-/// See [`APPLIED_INPUT`].
-const SUPPLIER_PRUNED_INPUT: &[u8] = include_bytes!("fixtures/header-repair-supplier-pruned.bin");
-
-/// A committed input's file stem, its fixture, and how
-/// [`regenerate_repair_seeds`] picks its Plan from [`support::byte_inputs`]:
-/// the stream's count and longest input, then the index.
-type Seed = (&'static str, RepairScenario, usize, usize, usize);
-
-/// Every committed input, in the order of [`committed`]. The first three
-/// repair, and [`SUPPLIER_PRUNED`] doesn't. Each fixture's history waits on
-/// control steps with no deadline, such as the stale peer's close, so a
-/// Plan that keeps one waiting until the step budget never reaches the
-/// rest of it. The committed Plans and the generated ones reach every
-/// fixture's history.
-const SEEDS: [Seed; 4] = [
-    ("header-repair-applied", RepairScenario::Applied, 4, 256, 0),
+/// The seeds, `header-repair-*` in `zakura_sim::seed`, with their
+/// fixtures. Each input is the fixture's scenario byte, then Plan bytes.
+/// The first three repair, and the supplier-pruned one doesn't. Each
+/// fixture's history waits on control steps with no deadline, such as the
+/// stale peer's close, so a Plan that keeps one waiting until the step
+/// budget never reaches the rest of it. The seeds' Plans and the generated
+/// ones reach every fixture's history.
+const SEEDS: [(&str, RepairScenario); 4] = [
+    ("header-repair-applied", RepairScenario::Applied),
     (
         "header-repair-prepare-departs",
         RepairScenario::PrepareDeparts,
-        4,
-        256,
-        0,
     ),
+    ("header-repair-apply-departs", RepairScenario::ApplyDeparts),
     (
-        "header-repair-apply-departs",
-        RepairScenario::ApplyDeparts,
-        4,
-        256,
-        0,
+        "header-repair-supplier-pruned",
+        RepairScenario::SupplierPruned,
     ),
-    SUPPLIER_PRUNED,
 ];
 
-/// The committed input whose supplier lacks the tree records.
-const SUPPLIER_PRUNED: Seed = (
-    "header-repair-supplier-pruned",
-    RepairScenario::SupplierPruned,
-    4,
-    256,
-    0,
-);
-
-/// The committed inputs, in the order of [`SEEDS`].
-fn committed() -> [&'static [u8]; 4] {
-    [
-        APPLIED_INPUT,
-        PREPARE_DEPARTS_INPUT,
-        APPLY_DEPARTS_INPUT,
-        SUPPLIER_PRUNED_INPUT,
-    ]
+/// The input of the seed named `name`.
+fn seed_input(name: &str) -> Vec<u8> {
+    seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .input
 }
 
-/// The committed inputs whose repair applies, with their seeds.
-fn repairing() -> impl Iterator<Item = (Seed, &'static [u8])> {
+/// Each seed's name, fixture and input, in the order of [`SEEDS`].
+fn seeds() -> impl Iterator<Item = (&'static str, RepairScenario, Vec<u8>)> {
     SEEDS
         .into_iter()
-        .zip(committed())
-        .filter(|((_, scenario, ..), _)| *scenario != RepairScenario::SupplierPruned)
+        .map(|(name, scenario)| (name, scenario, seed_input(name)))
+}
+
+/// The seeds whose repair applies.
+fn repairing() -> impl Iterator<Item = (&'static str, RepairScenario, Vec<u8>)> {
+    seeds().filter(|(_, scenario, _)| *scenario != RepairScenario::SupplierPruned)
 }
 
 /// Polls `future` once. An engine port's operation outside a run finishes
@@ -134,11 +103,6 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
 /// `scenario`'s scenario byte.
 fn byte(scenario: RepairScenario) -> u8 {
     match scenario {
@@ -147,14 +111,6 @@ fn byte(scenario: RepairScenario) -> u8 {
         RepairScenario::ApplyDeparts => 2,
         RepairScenario::SupplierPruned => 3,
     }
-}
-
-/// The input [`regenerate_repair_seeds`] builds for `seed`: the fixture's
-/// scenario byte, then its Plan.
-fn generated((_, scenario, count, max_len, index): Seed) -> Vec<u8> {
-    let mut input = vec![byte(scenario)];
-    input.extend(support::byte_inputs(count, max_len).swap_remove(index));
-    input
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -320,58 +276,58 @@ fn repaired(run: &Run) {
     assert_eq!(context.selected_header_count(), 1);
 }
 
-/// `header-sync/stale-completion-inert` holds on each committed repairing
-/// input through the registered harness, and each run repairs as
+/// `header-sync/stale-completion-inert` holds on each repairing seed
+/// through the registered harness, and each run repairs as
 /// [`repaired`] checks.
 #[test]
-fn the_committed_repair_inputs_hold_stale_completion_inert() {
+fn the_repair_seeds_hold_stale_completion_inert() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
-    for ((stem, scenario, ..), input) in repairing() {
+    for (stem, scenario, input) in repairing() {
         let result = (entry.witness)(
             &entry.scenario(&input[..RepairHarness::SCENARIO_BYTES]),
-            plan(input),
+            plan(&input),
             STALE_COMPLETION_INERT,
             Expect::Holds,
             &[],
             &mut MemorySink::default(),
         );
         assert_eq!(result, Ok(()), "{stem}");
-        repaired(&run(scenario, plan(input)));
+        repaired(&run(scenario, plan(&input)));
     }
 }
 
 /// Each repairing fixture repairs and holds under generated plans, not only
-/// the committed ones, and the supplier-pruned one makes its charged
+/// the seeds' ones, and the supplier-pruned one makes its charged
 /// history under them as [`charged`] checks.
 #[test]
 fn the_repair_fixtures_hold_under_every_plan() {
     for input in support::inputs(8, 256) {
-        for ((_, scenario, ..), _) in repairing() {
+        for (_, scenario, _) in repairing() {
             repaired(&run(scenario, input.clone()));
         }
         charged(&run(RepairScenario::SupplierPruned, input));
     }
 }
 
-/// `header-sync/outstanding-work-bounded` holds on every committed input
-/// through the registered harness.
+/// `header-sync/outstanding-work-bounded` holds on every seed through the
+/// registered harness.
 #[test]
-fn the_committed_repair_inputs_hold_outstanding_work_bounded() {
+fn the_repair_seeds_hold_outstanding_work_bounded() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
-    for ((stem, ..), input) in SEEDS.into_iter().zip(committed()) {
+    for (stem, _, input) in seeds() {
         let result = (entry.witness)(
             &entry.scenario(&input[..RepairHarness::SCENARIO_BYTES]),
-            plan(input),
+            plan(&input),
             OUTSTANDING_WORK_BOUNDED,
             Expect::Holds,
             &[],
             &mut MemorySink::default(),
         );
-        assert_eq!(result, Ok(()), "committed {stem} input");
+        assert_eq!(result, Ok(()), "{stem}");
     }
     charged(&run(
         RepairScenario::SupplierPruned,
-        plan(SUPPLIER_PRUNED_INPUT),
+        plan(&seed_input("header-repair-supplier-pruned")),
     ));
 }
 
@@ -430,14 +386,12 @@ fn the_scenario_byte_picks_the_fixture() {
 }
 
 /// The stale calls, the property's report and the full log depend only on
-/// the plan: the committed prepare-departs plan A twice, then B, then A
+/// the plan: the prepare-departs seed's plan A twice, then B, then A
 /// again, gives A's every time, and B's log differs.
 #[test]
 fn repair_evidence_repeats_a_a_and_a_b_a() {
-    let plans: [&[u8]; 2] = [
-        &PREPARE_DEPARTS_INPUT[RepairHarness::SCENARIO_BYTES..],
-        &[7; 256],
-    ];
+    let prepare_departs = seed_input("header-repair-prepare-departs");
+    let plans: [&[u8]; 2] = [&prepare_departs[RepairHarness::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()
         .map(|plan| {
@@ -492,7 +446,7 @@ fn captured() -> String {
     format!("{:?}\n", stale.windows())
 }
 
-/// Each committed input, recorded in this process and replayed exactly in
+/// Each seed, recorded in this process and replayed exactly in
 /// a fresh process of the same test binary, finds the same stale calls at
 /// the same drains.
 #[test]
@@ -512,9 +466,9 @@ fn the_repair_witnesses_replay_in_a_fresh_process() {
             .expect("the test harness captures stdout");
         return;
     }
-    for input in committed() {
+    for (_, _, input) in seeds() {
         let dir = TempDir::new().expect("a temporary directory");
-        record(&entry, RecordInput::Input(input), dir.path()).expect("the witness records");
+        record(&entry, RecordInput::Input(&input), dir.path()).expect("the witness records");
         let recorded = captured();
         let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
             .args([
@@ -537,20 +491,14 @@ fn the_repair_witnesses_replay_in_a_fresh_process() {
     }
 }
 
-/// Each committed input is its [`generated`] input, and runs through the
-/// registered harness to a defined end that the explorer classifies clean.
+/// Each seed draws its fixture, and runs through the registered harness to
+/// a defined end that the explorer classifies clean.
 #[test]
-fn the_committed_inputs_are_their_plans_and_run_clean() {
+fn the_seeds_draw_their_fixtures_and_run_clean() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
-    for (seed, committed) in SEEDS.into_iter().zip(committed()) {
-        let stem = seed.0;
-        assert_eq!(
-            committed,
-            generated(seed),
-            "{stem}: the committed input changed; regenerate it if that's intended"
-        );
-        assert_eq!(RepairHarness::draw(committed), seed.1, "{stem}");
-        let run = (entry.run_bytes)(committed, &mut NullSink, None);
+    for (stem, scenario, input) in seeds() {
+        assert_eq!(RepairHarness::draw(&input), scenario, "{stem}");
+        let run = (entry.run_bytes)(&input, &mut NullSink, None);
         let report = run
             .report()
             .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));
@@ -565,52 +513,5 @@ fn the_committed_inputs_are_their_plans_and_run_clean() {
             ExploreOutcome::Clean,
             "{stem}"
         );
-    }
-}
-
-/// Rewrites the committed inputs and their sidecars. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_repair -- --ignored regenerate_repair_seeds`.
-#[test]
-#[ignore = "rewrites the committed inputs"]
-fn regenerate_repair_seeds() {
-    for seed in SEEDS {
-        let (stem, scenario, ..) = seed;
-        let input = generated(seed);
-        let base = fixtures().join(stem);
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        // The repairing inputs witness the repair's own properties too. The
-        // supplier-pruned input witnesses only the repair source rows.
-        let witnesses: &[&str] = if scenario == RepairScenario::SupplierPruned {
-            &[OUTSTANDING_WORK_BOUNDED]
-        } else {
-            &[
-                STALE_COMPLETION_INERT,
-                COMMIT_ONLY_AUTHORIZED,
-                OUTSTANDING_WORK_BOUNDED,
-            ]
-        };
-        let mut sidecar = format!(
-            "# The committed fuzz input `{stem}.bin`: the harness that runs it, the\n\
-             # generator version it was built for, and its SHA-256. Its first byte\n\
-             # picks the repair fixture, then come the Plan bytes.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_repair.rs\"\n",
-            harness = RepairHarness::NAME,
-            generator = RepairHarness::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(
-                &serde_json::to_value(scenario).expect("scenarios serialize")
-            ),
-        );
-        for property in witnesses {
-            sidecar.push_str(&format!(
-                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
-            ));
-        }
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

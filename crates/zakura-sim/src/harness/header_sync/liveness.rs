@@ -352,6 +352,9 @@ impl RecoveryFixture {
             },
             controls,
             weights: Default::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 }
@@ -399,6 +402,9 @@ fn departure_recovery() -> StorageScenario {
             step(TAKER, ControlAction::Recover, None),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -844,6 +850,9 @@ fn level() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -884,6 +893,9 @@ fn serving(then: Allow, mirror: u32) -> StorageScenario {
             when: Some(Trigger::Submitted(Select::nth(OpKind::Read, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1010,6 +1022,9 @@ fn departure(stage: Stage, by: Departs) -> StorageScenario {
         },
         controls,
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1037,6 +1052,9 @@ fn held(kind: OpKind) -> StorageScenario {
             when: Some(Trigger::Submitted(Select::nth(kind, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1504,15 +1522,18 @@ impl Subsystem for Liveness {
         let retirement = scenario
             .roles()
             .map_or_else(RetirementEvidence::default, RetirementEvidence::armed);
-        let delayed_page = (*scenario == LivenessScenario::LatePage).then(|| DelayedPage {
-            mirror: OWNER.to_owned(),
-            by: LATE_PAGE_DELAY,
-        });
+        let delayed_pages = (*scenario == LivenessScenario::LatePage)
+            .then(|| DelayedPage {
+                mirror: OWNER.to_owned(),
+                by: LATE_PAGE_DELAY,
+            })
+            .into_iter()
+            .collect();
         let ports = Ports {
             hold_wake: HoldWakeEvidence::armed(),
             publication: PublicationEvidence::armed(scenario.arming()),
             retirement,
-            delayed_page,
+            delayed_pages,
             finishes: false,
             ..Storage::prepare(&scenario.storage())
         };

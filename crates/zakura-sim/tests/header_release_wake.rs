@@ -12,11 +12,9 @@ mod support;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::Write,
     path::Path,
-    path::PathBuf,
     process::Command,
     time::Duration,
 };
@@ -49,57 +47,30 @@ use zakura_sim::{
     PropertyOutcome, PropertyReport, RunConfig, RunEnd, RunReport, Sim, StepCtx, Violation,
 };
 
-/// The committed release input, `tests/fixtures/header-release-wake.bin`:
+/// The release seed's input, `header-release-wake`:
 /// [`WakeScenario::Release`]'s scenario byte, then Plan bytes. Its run's
 /// release comes from a completion drained at the top of the reactor's
 /// loop, so only the budget's release wake gets the reactor back to the
 /// waiting offer. `cargo xtask planted header-sync/capacity-release-wakes`
 /// checks that removing that wake violates the property on it.
-const RELEASE_INPUT: &[u8] = include_bytes!("fixtures/header-release-wake.bin");
+fn release_input() -> Vec<u8> {
+    seed_input("header-release-wake")
+}
 
-/// The committed deferred input,
-/// `tests/fixtures/header-release-wake-deferred.bin`:
+/// The deferred seed's input, `header-release-wake-deferred`:
 /// [`WakeScenario::Deferred`]'s scenario byte, then Plan bytes. The
 /// release's cached pass is deferred to the refill, and the planted cases
 /// that drop the refill deadline or the refill itself violate the property
 /// on it.
-const DEFERRED_INPUT: &[u8] = include_bytes!("fixtures/header-release-wake-deferred.bin");
-
-/// A committed input's file stem, its fixture, and how
-/// [`regenerate_release_wake_seeds`] picks its Plan from
-/// [`support::byte_inputs`]: the stream's count and longest input, then
-/// the index.
-type Seed = (&'static str, WakeScenario, usize, usize, usize);
-
-/// Every committed input. The release Plan is the first tested one whose
-/// release is drained at the top of the loop. Any Plan defers in the
-/// deferred fixture.
-const SEEDS: [Seed; 2] = [
-    ("header-release-wake", WakeScenario::Release, 400, 512, 155),
-    (
-        "header-release-wake-deferred",
-        WakeScenario::Deferred,
-        16,
-        256,
-        0,
-    ),
-];
-
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+fn deferred_input() -> Vec<u8> {
+    seed_input("header-release-wake-deferred")
 }
 
-/// The input [`regenerate_release_wake_seeds`] builds for `seed`: the
-/// fixture's scenario byte, then its Plan.
-fn generated((_, scenario, count, max_len, index): Seed) -> Vec<u8> {
-    let byte = match scenario {
-        WakeScenario::Release => 0,
-        WakeScenario::Deferred => 1,
-    };
-    let mut input = vec![byte];
-    input.extend(support::byte_inputs(count, max_len).swap_remove(index));
-    input
+/// The input of the seed named `name`.
+fn seed_input(name: &str) -> Vec<u8> {
+    seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .input
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -176,7 +147,7 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
 /// waiting offer's read.
 #[test]
 fn the_release_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Release, RELEASE_INPUT);
+    let between = committed_input_holds(WakeScenario::Release, &release_input());
     assert!(!deferred(&between), "{between:?}");
 }
 
@@ -184,7 +155,7 @@ fn the_release_wake_input_holds_capacity_release_wakes() {
 /// deferred to the refill before the waiting offer's read.
 #[test]
 fn the_deferred_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Deferred, DEFERRED_INPUT);
+    let between = committed_input_holds(WakeScenario::Deferred, &deferred_input());
     assert!(deferred(&between), "{between:?}");
 }
 
@@ -543,8 +514,8 @@ where
 #[test]
 fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
     let committed = [
-        (WakeScenario::Release, plan(RELEASE_INPUT)),
-        (WakeScenario::Deferred, plan(DEFERRED_INPUT)),
+        (WakeScenario::Release, plan(&release_input())),
+        (WakeScenario::Deferred, plan(&deferred_input())),
     ];
     let plans = support::inputs(3, 256).into_iter().flat_map(|input| {
         [
@@ -659,7 +630,7 @@ fn an_undeclared_fixture_opens_no_wake() {
     let report = run_prepared::<ReleaseWake>(
         &scenario,
         ports,
-        plan(RELEASE_INPUT),
+        plan(&release_input()),
         &mut MemorySink::default(),
         None,
     )
@@ -846,12 +817,12 @@ fn first_prepare_outcome(report: &RunReport) -> Option<String> {
 #[test]
 fn a_budget_cut_between_a_wake_and_its_refill_holds_the_wake() {
     for (scenario, input) in [
-        (WakeScenario::Release, RELEASE_INPUT),
-        (WakeScenario::Deferred, DEFERRED_INPUT),
+        (WakeScenario::Release, release_input()),
+        (WakeScenario::Deferred, deferred_input()),
     ] {
-        let (report, full) = measured::<ReleaseWake>(scenario, plan(input));
+        let (report, full) = measured::<ReleaseWake>(scenario, plan(&input));
         let opened = wake_after(&full, picked(&report, "peer:node:release"));
-        let (report, measured) = cut(scenario, opened, plan(input));
+        let (report, measured) = cut(scenario, opened, plan(&input));
         assert_eq!(
             report.end.outcome,
             Outcome::Budget,
@@ -909,14 +880,14 @@ fn a_budget_cut_between_a_wake_and_its_refill_holds_the_wake() {
 /// the run as source evidence rather than leave the prepare held.
 #[test]
 fn the_planned_prepare_keeps_its_local_fault_whatever_the_cut() {
-    let (full, _) = measured::<ReleaseWake>(WakeScenario::Release, plan(RELEASE_INPUT));
+    let (full, _) = measured::<ReleaseWake>(WakeScenario::Release, plan(&release_input()));
     assert_eq!(
         first_prepare_outcome(&full).as_deref(),
         Some("local-resource")
     );
     let release = picked(&full, "peer:node:release");
     for budget in [release - 1, release, release + 1] {
-        let (report, _) = cut(WakeScenario::Release, budget, plan(RELEASE_INPUT));
+        let (report, _) = cut(WakeScenario::Release, budget, plan(&release_input()));
         assert_eq!(
             report.end.harness, None,
             "cut at {budget}: {:?}",
@@ -933,7 +904,7 @@ fn the_planned_prepare_keeps_its_local_fault_whatever_the_cut() {
     let error = run_prepared::<CutWake>(
         &scenario,
         CutWake::prepare(&scenario),
-        plan(RELEASE_INPUT),
+        plan(&release_input()),
         &mut MemorySink::default(),
         None,
     )
@@ -969,7 +940,8 @@ fn the_scenario_byte_picks_the_fixture() {
 /// gives A's every time, and B's log differs.
 #[test]
 fn wake_evidence_repeats_a_a_and_a_b_a() {
-    let plans: [&[u8]; 2] = [&RELEASE_INPUT[ReleaseWake::SCENARIO_BYTES..], &[7; 256]];
+    let release = release_input();
+    let plans: [&[u8]; 2] = [&release[ReleaseWake::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()
         .map(|plan| {
@@ -1044,9 +1016,9 @@ fn the_wake_witnesses_replay_in_a_fresh_process() {
             .expect("the test harness captures stdout");
         return;
     }
-    for input in [RELEASE_INPUT, DEFERRED_INPUT] {
+    for input in [release_input(), deferred_input()] {
         let dir = TempDir::new().expect("a temporary directory");
-        record(&entry, RecordInput::Input(input), dir.path()).expect("the witness records");
+        record(&entry, RecordInput::Input(&input), dir.path()).expect("the witness records");
         let recorded = captured();
         let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
             .args([
@@ -1069,68 +1041,30 @@ fn the_wake_witnesses_replay_in_a_fresh_process() {
     }
 }
 
-/// Each committed input is its [`generated`] input, and runs through the
-/// registered harness to a defined end that the explorer classifies clean.
+/// Each seed draws its fixture, and runs through the registered harness to
+/// a defined end that the explorer classifies clean.
 #[test]
-fn the_committed_inputs_are_their_plans_and_run_clean() {
+fn the_seeds_draw_their_fixtures_and_run_clean() {
     let entry = harness::find(ReleaseWake::NAME).expect("the harness is registered");
-    for (seed, committed) in SEEDS.into_iter().zip([RELEASE_INPUT, DEFERRED_INPUT]) {
-        let stem = seed.0;
-        assert_eq!(
-            committed,
-            generated(seed),
-            "{stem}: the committed input changed; regenerate it if that's intended"
-        );
-        assert_eq!(ReleaseWake::draw(committed), seed.1, "{stem}");
-        let run = (entry.run_bytes)(committed, &mut NullSink, None);
+    for (scenario, input) in [
+        (WakeScenario::Release, release_input()),
+        (WakeScenario::Deferred, deferred_input()),
+    ] {
+        assert_eq!(ReleaseWake::draw(&input), scenario);
+        let run = (entry.run_bytes)(&input, &mut NullSink, None);
         let report = run
             .report()
-            .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));
+            .unwrap_or_else(|| panic!("{scenario:?}: {:?}", run.result));
         assert!(
             matches!(report.end.outcome, Outcome::Budget | Outcome::Idle { .. }),
-            "{stem}: {:?}",
+            "{scenario:?}: {:?}",
             report.end
         );
-        assert_eq!(run.leaked(), 0, "{stem}");
+        assert_eq!(run.leaked(), 0, "{scenario:?}");
         assert_eq!(
             classify(entry, &run).outcome,
             ExploreOutcome::Clean,
-            "{stem}"
+            "{scenario:?}"
         );
-    }
-}
-
-/// Rewrites the committed inputs and their sidecars. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_release_wake -- --ignored regenerate_release_wake_seeds`.
-#[test]
-#[ignore = "rewrites the committed inputs"]
-fn regenerate_release_wake_seeds() {
-    for seed in SEEDS {
-        let (stem, scenario, ..) = seed;
-        let input = generated(seed);
-        let base = fixtures().join(stem);
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
-            "# The committed fuzz input `{stem}.bin`: the harness that runs it, the\n\
-             # generator version it was built for, and its SHA-256. Its first byte\n\
-             # picks the wake fixture, then come the Plan bytes.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_release_wake.rs\"\n\
-             \n\
-             [[witness]]\n\
-             property = \"{CAPACITY_RELEASE_WAKES}\"\n\
-             expect = \"holds\"\n",
-            harness = ReleaseWake::NAME,
-            generator = ReleaseWake::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(
-                &serde_json::to_value(scenario).expect("scenarios serialize")
-            ),
-        );
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::{cell::RefCell, io::Write, path::Path, process::Command};
+use std::{cell::RefCell, io::Write, path::Path, process::Command, sync::LazyLock};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -25,10 +25,14 @@ use zakura_sim::{
     MemorySink, Plan, PlanInput, RunReport,
 };
 
-/// The committed stale-prepare seed (`tests/header_storage_seeds.rs`),
+/// The stale-prepare seed's input, `header-storage-stale-prepare`,
 /// whose node ends a prepare after its round retired while the same peer's
 /// next round is active.
-const STALE_PREPARE_INPUT: &[u8] = include_bytes!("fixtures/header-storage-stale-prepare.bin");
+static STALE_PREPARE_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    zakura_sim::seed::find("header-storage-stale-prepare")
+        .expect("the seed is registered")
+        .input
+});
 
 /// `header-sync/stale-completion-inert` holds on the committed stale-prepare
 /// seed, and the run reaches its trigger history: a call ends stale.
@@ -146,7 +150,7 @@ fn the_stale_witness_replays_in_a_fresh_process() {
         return;
     }
     let dir = TempDir::new().expect("a temporary directory");
-    record(&entry, RecordInput::Input(STALE_PREPARE_INPUT), dir.path())
+    record(&entry, RecordInput::Input(&STALE_PREPARE_INPUT), dir.path())
         .expect("the witness records");
     let recorded = captured();
     let child = Command::new(std::env::current_exe().expect("the test binary has a path"))

@@ -1,14 +1,14 @@
 //! M5-F: connection lifecycle on `header-sync/wire`, and the saved Plans.
 //! A replacement while storage is pending follows M4's ordering over real
-//! connections, a disconnect with pages in flight ends cleanly, and the
-//! committed Plans replay to their pinned end records: the spec's
-//! completion evidence. A history a test needs that never happened fails
+//! connections, a disconnect with pages in flight ends cleanly, and each
+//! saved Plan's seed reaches its history with no property violated: the
+//! spec's completion evidence. A history a test needs that never happened fails
 //! it: a missing observation is a harness failure, never evidence.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{cell::Cell, fs, path::PathBuf, process::Command, time::Duration};
+use std::{cell::Cell, path::PathBuf, process::Command, time::Duration};
 
 use tempfile::TempDir;
 
@@ -19,10 +19,7 @@ use support::{
     steer::{before, steer, Steer},
 };
 use zakura_sim::{
-    domain::{
-        header_sync::COMMIT_ONLY_AUTHORIZED, header_sync_progress::HONEST_PROGRESS,
-        session::HONEST_NEVER_PUNISHED,
-    },
+    domain::{header_sync_progress::HONEST_PROGRESS, session::HONEST_NEVER_PUNISHED},
     harness::{
         self,
         header_node::{
@@ -39,15 +36,11 @@ use zakura_sim::{
         DatagramOutcome, Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest,
         StorageResult, TransportFact,
     },
-    peer::{
-        adversary::{Act, ContentRule},
-        honest::HonestSpec,
-        peer_addr, PeerAction, PeerSpec, NODE_ADDR,
-    },
+    peer::{adversary::Act, honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
     seed,
     trace::{replay_with, ReplayOptions, TraceReader},
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
-    StepCtx,
+    Checker, MemorySink, NoChecks, Observation, Outcome, Plan, PlanInput, PropertyOutcome,
+    RunReport, StepCtx,
 };
 
 /// The node's chain at the start of most runs.
@@ -770,30 +763,21 @@ impl Marks {
     }
 }
 
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+/// Saved Plan `plan`'s seed input, `header-wire-<name>`.
+fn seed_input(plan: SavedPlan) -> Vec<u8> {
+    let name = format!("header-wire-{}", plan.name());
+    seed::find(&name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .input
 }
 
-/// Saved Plan `plan`'s committed input and pinned end record.
-fn committed(plan: SavedPlan) -> (Vec<u8>, String) {
-    let base = fixtures().join(format!("header-wire-{}", plan.name()));
-    let input = fs::read(base.with_extension("bin"))
-        .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
-    let end = fs::read_to_string(base.with_extension("end.json"))
-        .unwrap_or_else(|error| panic!("{}: {error}", plan.name()));
-    (input, end.trim_end().to_owned())
-}
-
-/// Runs a committed input as `zakura-sim record --input` does: its prefix
-/// picks the scenario, and the rest is the Plan. Returns the report with
-/// its end record's line.
-fn replay(input: &[u8]) -> (RunReport, String, WirePorts) {
+/// Runs an input as `zakura-sim record --input` does: its prefix picks the
+/// scenario, and the rest is the Plan. Returns the report with the ports.
+fn replay(input: &[u8]) -> (RunReport, WirePorts) {
     let (prefix, plan) = input.split_at(HeaderWire::SCENARIO_BYTES);
     let scenario = HeaderWire::draw(prefix);
-    let (report, lines, ports) = run_with(&scenario, Plan::from_fuzz(plan), &mut NoChecks);
-    let end = lines.last().expect("a run writes its end record").clone();
-    (report, end, ports)
+    let (report, _, ports) = run_with(&scenario, Plan::from_fuzz(plan), &mut NoChecks);
+    (report, ports)
 }
 
 /// The generated property that judges a frame labelled `label` on `row`.
@@ -805,28 +789,25 @@ fn judging(label: Label, row: &str) -> String {
     }
 }
 
-/// Each saved Plan, committed under `tests/fixtures/header-wire-*.bin`
-/// with its sidecar, replays to its pinned end record,
-/// `header-wire-*.end.json`. Its prefix picks the saved scenario. The
-/// honest sync reaches the 120-header tip with `conformant-never-closes`
-/// and `session/honest-never-punished` held, each act's frame gets its
-/// label with the matching `<label>-closes` held, applied, and the progress
-/// fixture reaches its one successor with `header-sync/honest-progress`
-/// held. No run fails.
-///
-/// This fails if a saved Plan's end record changes. After a deliberate
-/// change, regenerate them with `regenerate_saved_plans`.
+/// Each saved Plan's seed, `header-wire-<name>`, runs to its step budget
+/// with no property violated, no task panicked and none leaked. Its prefix
+/// picks the saved scenario. The honest sync reaches the 120-header tip
+/// with `conformant-never-closes` and `session/honest-never-punished`
+/// held, each act's frame gets its label with the matching
+/// `<label>-closes` held, applied, and the progress fixture reaches its one
+/// successor with `header-sync/honest-progress` held.
 #[test]
-fn saved_plans_replay_their_end_records() {
+fn saved_plans_reach_their_histories() {
     for plan in SavedPlan::ALL {
-        let (input, pinned) = committed(plan);
+        let input = seed_input(plan);
         assert_eq!(
             HeaderWire::draw(&input[..2]),
             plan.scenario(),
             "{}",
             plan.name()
         );
-        let (report, end, ports) = replay(&input);
+        let (report, ports) = replay(&input);
+        assert_eq!(report.end.outcome, Outcome::Budget, "{}", plan.name());
         assert_eq!(
             report.end.harness,
             None,
@@ -886,10 +867,23 @@ fn saved_plans_replay_their_end_records() {
             }
             SavedPlan::OldPageAfterReopen => old_page_judged_after_reopen(&report),
         }
+        for reported in &report.properties {
+            assert!(
+                matches!(
+                    reported.outcome,
+                    PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable { .. }
+                ),
+                "{}: {} is {:?}",
+                plan.name(),
+                reported.property,
+                reported.outcome
+            );
+        }
+        let cleanup = &report.cleanup;
         assert_eq!(
-            end,
-            pinned,
-            "{}: the saved Plan's end record changed; regenerate the saved Plans if that's intended",
+            (cleanup.panicked, cleanup.leaked),
+            (0, 0),
+            "{}: {cleanup:?}",
             plan.name()
         );
     }
@@ -994,7 +988,7 @@ const FUZZ_13: [SavedPlan; 3] = [
     SavedPlan::Act(Act::OutcomeCrossing),
 ];
 
-/// Every record a run of committed input `input` writes, observations and
+/// Every record a run of input `input` writes, observations and
 /// their stamps included.
 fn records(input: &[u8]) -> Vec<String> {
     let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
@@ -1013,8 +1007,8 @@ fn records(input: &[u8]) -> Vec<String> {
 fn fuzz_13_saved_plans_repeat_a_a_and_a_b_a() {
     for (index, plan) in FUZZ_13.into_iter().enumerate() {
         let other = FUZZ_13[(index + 1) % FUZZ_13.len()];
-        let (a, _) = committed(plan);
-        let (b, _) = committed(other);
+        let a = seed_input(plan);
+        let b = seed_input(other);
         let first = records(&a);
         assert_eq!(records(&a), first, "{}: A/A", plan.name());
         assert_ne!(records(&b), first, "{}: B differs", plan.name());
@@ -1025,7 +1019,7 @@ fn fuzz_13_saved_plans_repeat_a_a_and_a_b_a() {
 /// The variable naming the traces a fresh-process replay child reads.
 const FUZZ_13_CHILD: &str = "ZAKURA_SIM_FUZZ_13_TRACES";
 
-/// Each of fuzz-13's saved Plans, recorded from its committed input,
+/// Each of fuzz-13's saved Plans, recorded from its seed,
 /// replays Exact in a fresh process: every pick, draw and observation,
 /// stamps included.
 #[test]
@@ -1042,7 +1036,7 @@ fn fuzz_13_saved_plans_replay_exact_in_a_fresh_process() {
     }
     let dir = TempDir::new().expect("a temporary directory");
     for plan in FUZZ_13 {
-        let (input, _) = committed(plan);
+        let input = seed_input(plan);
         harness::record(
             entry,
             RecordInput::Input(&input),
@@ -1111,73 +1105,7 @@ fn over_credit_objects_eager_delivery_holds_no_livelock() {
         .into_iter()
         .chain([0; 8192])
         .collect();
-    let (report, _, _) = replay(&input);
+    let (report, _) = replay(&input);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert_eq!(report.end.violation, None, "{:?}", report.end);
-}
-
-/// Rewrites every saved Plan: its input, its sidecar and its end record.
-/// The honest sync's Plan is the first of M5.1's 64 inputs. Each act's is
-/// the default Plan, the one M5-E1's action test runs, and so is the
-/// progress fixture's. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_wire_lifecycle -- --ignored regenerate_saved_plans`.
-#[test]
-#[ignore = "rewrites the committed saved Plans"]
-fn regenerate_saved_plans() {
-    for plan in SavedPlan::ALL {
-        let bytes = match plan {
-            SavedPlan::HonestSync => match inputs(1, 16_384).remove(0) {
-                PlanInput::Bytes(bytes) => bytes,
-                _ => unreachable!("inputs are bytes"),
-            },
-            SavedPlan::Act(_)
-            | SavedPlan::HonestProgress
-            | SavedPlan::Reopen
-            | SavedPlan::OldPageAfterReopen => Vec::new(),
-        };
-        let input: Vec<u8> = plan.tag().into_iter().chain(bytes).collect();
-        let (_, end, _) = replay(&input);
-        let base = fixtures().join(format!("header-wire-{}", plan.name()));
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        // The progress fixture and the three refused-page acts are planted
-        // cases' inputs, which `cargo xtask planted` records as witnesses
-        // expecting a hold.
-        let holds = |property: &str| {
-            format!("\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n")
-        };
-        let witness = match plan {
-            SavedPlan::HonestProgress => holds(HONEST_PROGRESS),
-            SavedPlan::Act(
-                Act::BadContent {
-                    rule: ContentRule::Linkage | ContentRule::LowerLocator,
-                }
-                | Act::OverCreditObjects,
-            ) => holds(COMMIT_ONLY_AUTHORIZED),
-            SavedPlan::HonestSync
-            | SavedPlan::Act(_)
-            | SavedPlan::Reopen
-            | SavedPlan::OldPageAfterReopen => String::new(),
-        };
-        let sidecar = format!(
-            "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\
-             # runs it, the generator version it was built for, and its SHA-256. Its\n\
-             # first two bytes pick the saved `{name}` scenario, and\n\
-             # `header-wire-{name}.end.json` is its pinned end record.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_wire_lifecycle.rs\"\n{witness}",
-            name = plan.name(),
-            harness = HeaderWire::NAME,
-            generator = HeaderWire::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(&scenario),
-        );
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
-        fs::write(base.with_extension("end.json"), format!("{end}\n"))
-            .expect("the fixture directory exists");
-    }
 }

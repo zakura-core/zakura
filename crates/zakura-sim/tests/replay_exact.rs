@@ -1568,7 +1568,12 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
     assert!(report.end.is_none());
 }
 
-const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/header-reactor-policy.bin");
+/// The `header-reactor-policy` seed's op tape.
+fn reactor_input() -> Vec<u8> {
+    zakura_sim::seed::find("header-reactor-policy")
+        .expect("the header reactor's seed is registered")
+        .input
+}
 
 #[test]
 fn reactor_machine_replay_child() {
@@ -1580,7 +1585,8 @@ fn reactor_machine_replay_child() {
 
 #[test]
 fn reactor_machine_records_and_replays_without_transport() {
-    let dir = record_named("header/reactor-policy", REACTOR_INPUT);
+    let input = reactor_input();
+    let dir = record_named("header/reactor-policy", &input);
     let trace = open(dir.path());
     let entry = harness::find("header/reactor-policy").unwrap();
     (entry.witness)(
@@ -1592,7 +1598,7 @@ fn reactor_machine_records_and_replays_without_transport() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), REACTOR_INPUT.len().div_ceil(4));
+    assert_eq!(trace.steps.len(), input.len().div_ceil(4));
     assert!(trace
         .steps
         .iter()
@@ -1622,12 +1628,18 @@ fn reactor_machine_records_and_replays_without_transport() {
     ));
 }
 
-const PUBLISHER_INPUT: &[u8] = include_bytes!("fixtures/header-publisher-policy.bin");
+/// The `header-publisher-policy` seed's op tape.
+fn publisher_input() -> Vec<u8> {
+    zakura_sim::seed::find("header-publisher-policy")
+        .expect("the header publisher's seed is registered")
+        .input
+}
 
 #[test]
 fn publisher_machine_records_and_replays_without_transport() {
     let name = "header/publisher-policy";
-    let dir = record_named(name, PUBLISHER_INPUT);
+    let input = publisher_input();
+    let dir = record_named(name, &input);
     let trace = open(dir.path());
     (harness::find(name).unwrap().witness)(
         &trace.meta.scenario,
@@ -1638,7 +1650,7 @@ fn publisher_machine_records_and_replays_without_transport() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), PUBLISHER_INPUT.len().div_ceil(4));
+    assert_eq!(trace.steps.len(), input.len().div_ceil(4));
     assert!(trace
         .steps
         .iter()
@@ -1660,7 +1672,8 @@ fn publisher_machine_records_and_replays_without_transport() {
 
 #[test]
 fn reactor_machine_preserves_empty_and_short_inputs() {
-    for input in [&[][..], &[0, 0][..], REACTOR_INPUT] {
+    let reactor = reactor_input();
+    for input in [&[][..], &[0, 0][..], &reactor[..]] {
         let entry = harness::find("header/reactor-policy").unwrap();
         let dir = record(entry, input);
         let trace = open(dir.path());

@@ -5,7 +5,9 @@
 
 mod support;
 
-use support::storage_witnesses::{competing_mirrors, header_apply, reply_hold};
+use zakura_sim::harness::header_sync::storage_witnesses::{
+    competing_mirrors, header_apply, reply_hold,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -509,13 +511,12 @@ where
     }
 }
 
-/// The committed seed `stem`, a full fuzz input the harness draws its
-/// scenario from.
+/// The input of the seed named `stem`, a full fuzz input the harness draws
+/// its scenario from.
 fn seed(stem: &str) -> Vec<u8> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("{stem}.bin"));
-    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    zakura_sim::seed::find(stem)
+        .unwrap_or_else(|| panic!("{stem} is registered"))
+        .input
 }
 
 /// Plan bytes after a scenario prefix, the same on every call.
@@ -600,10 +601,12 @@ fn witnesses() -> Vec<Witness> {
         grow_to_drain_plan(),
     ));
     // fuzz-12 item 7's witness seeds.
-    for (stem, _) in support::storage_witnesses::witness_seeds() {
-        all.push(drawn("header-sync/storage", &stem, seed(&stem)));
+    for witness in zakura_sim::seed::all() {
+        if witness.name.starts_with("header-storage-w-") {
+            all.push(drawn("header-sync/storage", &witness.name, witness.input));
+        }
     }
-    // fuzz-13's saved Plans, each run from its committed seed.
+    // fuzz-13's saved Plans, each run from its seed.
     for stem in FUZZ_13_SEEDS {
         all.push(drawn("header-sync/wire", stem, seed(stem)));
     }
@@ -618,7 +621,7 @@ fn witnesses() -> Vec<Witness> {
     all
 }
 
-/// fuzz-13's committed `header-sync/wire` seeds.
+/// fuzz-13's `header-sync/wire` seeds.
 const FUZZ_13_SEEDS: [&str; 3] = [
     "header-wire-reopen",
     "header-wire-old-page-after-reopen",

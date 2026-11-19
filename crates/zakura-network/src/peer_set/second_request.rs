@@ -8,7 +8,7 @@
 //!
 //! The downloader shares the first dispatch with the peer set for each individual attempt, and
 //! asks for a second request once. The peer set holds that request (see
-//! [`ParkedSecondRequest`]) and decides again only when an input to the decision changes:
+//! [`HeldSecondRequest`]) and decides again only when an input to the decision changes:
 //!
 //! - another peer announces the block;
 //! - an announcer becomes a better source: its connection is free again, an unanswered or
@@ -122,7 +122,7 @@ pub(super) type SecondResponse = BoxFuture<'static, Result<Response, BoxError>>;
 
 /// A download's request for a second copy of its block, held by the peer set until an announcer
 /// qualifies or the download stops accepting a second request.
-pub(super) struct ParkedSecondRequest {
+pub(super) struct HeldSecondRequest {
     hash: block::Hash,
     attempt: BlockHedge,
     /// Receives the response of the second request, once one is sent. Dropping it tells the
@@ -132,7 +132,7 @@ pub(super) struct ParkedSecondRequest {
     timer: Pin<Box<Sleep>>,
 }
 
-impl ParkedSecondRequest {
+impl HeldSecondRequest {
     /// Holds a second request for `hash`, and returns it with the receiver of its response.
     pub(super) fn new(
         hash: block::Hash,
@@ -140,13 +140,13 @@ impl ParkedSecondRequest {
     ) -> (Self, oneshot::Receiver<SecondResponse>) {
         let (reply, response) = oneshot::channel();
         let timer = Box::pin(sleep_until(attempt.window_end()));
-        let parked = Self {
+        let held = Self {
             hash,
             attempt,
             reply,
             timer,
         };
-        (parked, response)
+        (held, response)
     }
 
     /// The block to request.
@@ -176,18 +176,23 @@ impl ParkedSecondRequest {
 
     /// Registers the task polling with `cx` to be woken at the next time waiting alone changes
     /// the decision (see [`decision_times`]), or when the window ends.
-    pub(super) fn poll_next_decision(&mut self, cx: &mut Context<'_>) {
-        self.timer.as_mut().reset(next_decision_at(&self.attempt));
+    ///
+    /// `considered_at` is a time no later than the decision that just left this request held.
+    /// The next time is counted from it, not from now, so a decision time that arrives between
+    /// that decision and this call is not skipped: the task is woken at once instead.
+    pub(super) fn poll_next_decision(&mut self, considered_at: Instant, cx: &mut Context<'_>) {
+        let next = next_decision_after(&self.attempt, considered_at);
+        self.timer.as_mut().reset(next);
         if self.timer.as_mut().poll(cx).is_ready() {
-            // That time arrived while the request was being considered, so consider it again.
             cx.waker().wake_by_ref();
         }
     }
 }
 
-/// The next time waiting alone changes the decision for `attempt`, or the end of its window
-/// when no such time is left, or the first request has not been sent yet.
-fn next_decision_at(attempt: &BlockHedge) -> Instant {
+/// The first time after `considered_at` at which waiting alone changes the decision for
+/// `attempt`, or the end of its window when no such time is left, or the first request has not
+/// been sent yet.
+fn next_decision_after(attempt: &BlockHedge, considered_at: Instant) -> Instant {
     let window_end = attempt.window_end();
     let Some(first) = attempt.first_dispatch() else {
         return window_end;
@@ -195,11 +200,10 @@ fn next_decision_at(attempt: &BlockHedge) -> Instant {
     let Some(first_score) = first.score else {
         return window_end;
     };
-    let now = Instant::now();
     decision_times(first_score)
         .into_iter()
         .map(|after| first.at + after)
-        .find(|at| *at > now)
+        .find(|at| *at > considered_at)
         .map_or(window_end, |at| at.min(window_end))
 }
 
@@ -281,6 +285,34 @@ mod tests {
                 previous = decision;
             }
         }
+    }
+
+    /// The timer is armed after the decision, so it must count from the time of the decision.
+    /// Counted from the time of arming, a first request that became overdue in between would
+    /// not be considered again until it stalled.
+    #[tokio::test(start_paused = true)]
+    async fn a_decision_time_that_arrives_while_deciding_is_not_skipped() {
+        let attempt = BlockHedge::new(Instant::now());
+        let sent_at = Instant::now();
+        attempt
+            .dispatch_if_needed(None, Some(ms(242)), || ())
+            .expect("an open download accepts its first request");
+
+        let considered_at = sent_at + ms(241);
+        tokio::time::advance(ms(243)).await;
+        assert_eq!(
+            next_decision_after(&attempt, considered_at),
+            sent_at + ms(242),
+            "the overdue time passed after the decision, so it is still due"
+        );
+        assert_eq!(
+            next_decision_after(&attempt, sent_at + ms(242)),
+            sent_at + ms(742)
+        );
+        assert_eq!(
+            next_decision_after(&attempt, sent_at + ms(742)),
+            attempt.window_end()
+        );
     }
 
     #[test]

@@ -137,7 +137,7 @@ use crate::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
             SecondRequestChoice,
         },
-        second_request::{second_request_reason, ParkedSecondRequest, SecondResponse},
+        second_request::{second_request_reason, HeldSecondRequest, SecondResponse},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -319,7 +319,7 @@ where
     /// Each is considered again whenever maintenance runs, and leaves once it is sent or its
     /// download stops accepting one. Only the local block downloader adds to this, one request
     /// per gossiped block download, so its concurrency limit bounds the length.
-    parked_second_requests: Vec<ParkedSecondRequest>,
+    held_second_requests: Vec<HeldSecondRequest>,
 
     /// The network of this peer set.
     network: Network,
@@ -423,7 +423,7 @@ where
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
             block_download_score_and_hedge: config.block_download_score_and_hedge.enabled,
-            parked_second_requests: Vec::new(),
+            held_second_requests: Vec::new(),
 
             network: config.network.clone(),
         }
@@ -1621,7 +1621,7 @@ where
     /// Holds a download's request for a second copy of a gossiped block until another announcer
     /// should deliver it sooner than the first request, then sends it.
     ///
-    /// Nothing is sent here. [`Self::retry_parked_second_requests`] decides, first on the
+    /// Nothing is sent here. [`Self::retry_held_second_requests`] decides, first on the
     /// maintenance pass that follows this call and then whenever an input to the decision
     /// changes.
     ///
@@ -1637,8 +1637,8 @@ where
             return async { Err(NoFasterBlockSource.into()) }.boxed();
         }
 
-        let (parked, response) = ParkedSecondRequest::new(hash, attempt);
-        self.parked_second_requests.push(parked);
+        let (held, response) = HeldSecondRequest::new(hash, attempt);
+        self.held_second_requests.push(held);
         async move {
             match response.await {
                 Ok(response) => response.await,
@@ -1663,8 +1663,8 @@ where
     ///   request's timer.
     ///
     /// Does nothing when no request is held.
-    fn retry_parked_second_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
-        if self.parked_second_requests.is_empty() {
+    fn retry_held_second_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        if self.held_second_requests.is_empty() {
             return Ok(());
         }
 
@@ -1672,32 +1672,37 @@ where
         // A held request needs the announcements that arrive in between.
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
-        for mut parked in std::mem::take(&mut self.parked_second_requests) {
-            if !parked.poll_open(cx) {
+        // Read before deciding, so each timer counts from a time its decision had reached.
+        let considered_at = tokio::time::Instant::now();
+        for mut held in std::mem::take(&mut self.held_second_requests) {
+            if !held.poll_open(cx) {
                 continue;
             }
-            match self.choose_second_request(parked.hash(), parked.attempt(), cx) {
+            let chosen = self
+                .choose_second_request(held.hash(), held.attempt(), cx)
+                // A download gets one second request, and none once it stops accepting one.
+                .filter(|_| held.attempt().claim_dispatch());
+            match chosen {
                 Some((peer, choice)) => {
-                    let response = self.send_second_request(parked.hash(), peer, choice);
-                    parked.send(response);
+                    let response = self.send_second_request(held.hash(), peer, choice);
+                    held.send(response);
                 }
                 None => {
-                    parked.poll_next_decision(cx);
-                    self.parked_second_requests.push(parked);
+                    held.poll_next_decision(considered_at, cx);
+                    self.held_second_requests.push(held);
                 }
             }
         }
         // The length is bounded by the block downloader's concurrency limit, far below the
         // integers an `f64` holds exactly.
-        metrics::gauge!("pool.route_inv.hedge.parked")
-            .set(self.parked_second_requests.len() as f64);
+        metrics::gauge!("pool.route_inv.hedge.held").set(self.held_second_requests.len() as f64);
 
         Ok(())
     }
 
     /// Chooses the peer to send a second request for a gossiped block to, if another announcer
-    /// should deliver it sooner than the first request and the download has not had a second
-    /// request yet.
+    /// should deliver it sooner than the first request. Changes nothing: the caller claims the
+    /// download's one second request before sending.
     ///
     /// The candidates are the idle peers that announced the block, other than the one the first
     /// request went to, and the best is the one expected to answer soonest. It is chosen when it
@@ -1705,9 +1710,8 @@ where
     /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
     /// this node, so a peer cannot claim a faster one.
     ///
-    /// Returns the chosen peer, which is in the ready set, after claiming the download's one
-    /// second request for it. Otherwise returns `None`, having registered `cx` to be woken when
-    /// a connected announcer becomes a better source.
+    /// Returns the chosen peer, which is in the ready set. Otherwise returns `None`. Either
+    /// way, registers `cx` to be woken when a connected announcer becomes a better source.
     fn choose_second_request(
         &self,
         hash: block::Hash,
@@ -1742,10 +1746,6 @@ where
             metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
             return None;
         };
-        if !attempt.claim_dispatch() {
-            return None;
-        }
-
         let choice = SecondRequestChoice {
             first_request_waited,
             reason,
@@ -1916,7 +1916,7 @@ where
 
         // After the peer statuses above are current: a peer that just became ready can take a
         // held second request.
-        self.retry_parked_second_requests(cx)?;
+        self.retry_held_second_requests(cx)?;
 
         // Peers leave the set through many paths. Pruning here, instead of at each
         // path, keeps stall counts bounded by the live peers.

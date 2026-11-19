@@ -1,10 +1,9 @@
 //! sched-4 S4.4 and S4.5: each race fixture's saved violating schedule.
 //!
-//! `tests/fixtures/race-schedules/` holds one seed per fixture: the planted
-//! race on 2 workers, then Plan bytes that reach the race's trigger
-//! history. They sit outside `tests/fixtures/` itself, where the seed
-//! corpus lives, because they fail by design: a fuzz campaign seeded with
-//! one would find its race at once.
+//! Each fixture has one seed, `race-schedule-<name>`: the planted race on 2
+//! workers, then Plan bytes that reach the race's trigger history. They sit
+//! in the known failures, outside the seed corpus, because they fail by
+//! design: a fuzz campaign seeded with one would find its race at once.
 //!
 //! - S4.4: each saved schedule reproduces its race's violation with the
 //!   race's trigger history, and the fix holds on the same Plan bytes. This
@@ -17,11 +16,7 @@
 #![cfg(zakura_sim)]
 
 use std::{
-    collections::BTreeMap,
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    collections::BTreeMap, marker::PhantomData, path::Path, process::Command, time::Duration,
 };
 
 use tempfile::TempDir;
@@ -37,48 +32,46 @@ use zakura_sim::{
     },
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, TriggerHistory},
     property::{Status as PropertyStatus, Verdict},
-    seed::{self, Seed},
+    seed::{self, Seed, SeedSet},
     trace::{replay, replay_with, ReplayError, ReplayOptions, Trace, TraceReader},
     Divergence, RunConfig, Sim,
 };
 
-/// The saved schedules' directory.
-fn schedules() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/race-schedules")
-}
-
 /// Every saved schedule, by its fixture's property. Each must validate as a
-/// required seed of its fixture's own harness, at that harness's current
-/// generator, and decode to the planted race on 2 workers.
+/// known-failure seed of its fixture's own harness and decode to the
+/// planted race on 2 workers.
 fn saved() -> BTreeMap<&'static str, Seed> {
-    let report = seed::load(&[schedules()], None).expect("the schedule directory lists");
-    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-    assert!(report.quarantined.is_empty(), "{:?}", report.quarantined);
+    let report = seed::load(SeedSet::KnownFailure, None);
+    let ours = |seed: &Seed| seed.name.starts_with("race-schedule-");
+    let rejected: Vec<_> = report
+        .rejected
+        .iter()
+        .filter(|failed| ours(&failed.seed))
+        .collect();
+    assert!(rejected.is_empty(), "{rejected:?}");
     let race = serde_json::to_value(Scenario {
         variant: Variant::Base,
         workers: 2,
     })
     .unwrap();
     let mut saved = BTreeMap::new();
-    for seed in report.admitted {
+    for seed in report.admitted.into_iter().filter(ours) {
         let fixture = Which::ALL
             .into_iter()
-            .find(|which| which.property() == seed.sidecar.harness)
-            .unwrap_or_else(|| panic!("{}: not a race fixture", seed.path.display()));
+            .find(|which| which.property() == seed.harness)
+            .unwrap_or_else(|| panic!("{}: not a race fixture", seed.name));
         assert_eq!(
-            seed.path.file_stem().and_then(|stem| stem.to_str()),
+            seed.name.strip_prefix("race-schedule-"),
             fixture.property().strip_prefix("race/"),
-            "`race_fixtures.rs` finds each schedule by its fixture's name"
+            "each schedule is named for its fixture"
         );
-        assert!(seed.sidecar.required, "{}", seed.path.display());
         assert_eq!(
-            seed.sidecar.scenario_sha256,
-            seed::scenario_sha256(&race),
+            seed::decode(harness::find(&seed.harness).unwrap(), &seed.input),
+            Ok(seed::scenario_sha256(&race)),
             "{}: the planted race on 2 workers",
-            seed.path.display()
+            seed.name
         );
         let witnesses: Vec<(&str, &str)> = seed
-            .sidecar
             .witness
             .iter()
             .map(|w| (w.property.as_str(), w.expect.as_str()))
@@ -98,7 +91,7 @@ fn saved() -> BTreeMap<&'static str, Seed> {
 #[test]
 fn each_race_has_a_saved_schedule() {
     for (name, seed) in saved() {
-        let witness = &seed.sidecar.witness[0];
+        let witness = &seed.witness[0];
         let dir = TempDir::new().unwrap();
         let (_, result) = record_witness(
             harness::find(name).unwrap(),

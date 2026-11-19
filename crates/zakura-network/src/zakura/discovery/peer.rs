@@ -11,6 +11,7 @@
 //! A local timeout never revokes a query's authority. A close first waits, up
 //! to its deadline, for this session's unwritten answers and for the peer's
 //! delivered answers and `Hello`, which can be waiting for a verification slot.
+//! It also waits for the reader to judge every frame it already received.
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod replay;
@@ -227,9 +228,9 @@ impl PeerIO {
         }
     }
 
-    /// Resolves once this session wrote every answer it admitted and processed
-    /// every answer and `Hello` it read. The reader keeps admitting requests
-    /// during the wait, so the written check repeats.
+    /// Resolves once this session wrote every answer it admitted and judged
+    /// every frame it received. The reader keeps admitting requests during the
+    /// wait, so the written check repeats.
     async fn answers_settled(&self) {
         loop {
             self.answers.wait().await;

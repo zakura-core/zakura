@@ -32,7 +32,7 @@ use super::protocol::{
     DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
-use super::requester::{reservation_pool, ClaimedAnswer, Queries};
+use super::requester::{reservation_pool, ClaimedAnswer, Queries, SettlingHold};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity, OUTPUT_BYTES};
 use super::state::DiscoverySessionKey;
 use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, ViolationStage};
@@ -729,7 +729,8 @@ async fn read_discovery_messages(
     mut recv: FramedRecv,
     sink: &DiscoverySink,
 ) -> Result<(), SinkReject> {
-    while let Some(frame) = recv.recv().await {
+    let mut reading = None;
+    while let Some(frame) = next_frame(&mut recv, &mut reading, &sink.queries).await {
         let message_type = frame.message_type;
         if let Err((stage, reject)) = read_frame(pipe, frame, sink).await {
             if let SinkReject::Protocol(error) = &reject {
@@ -739,6 +740,29 @@ async fn read_discovery_messages(
         }
     }
     Ok(())
+}
+
+/// Takes the next frame from `recv`, waiting only when none is queued.
+///
+/// `reading` holds a closing session's answer wait from the first frame the
+/// reader takes until it finds `recv` empty. A graceful close therefore judges
+/// every frame the reader already received, and answers each request among
+/// them. The queue holds at most the session's receive credit, and the close's
+/// answer deadline still bounds the wait.
+async fn next_frame(
+    recv: &mut FramedRecv,
+    reading: &mut Option<SettlingHold>,
+    queries: &Queries,
+) -> Option<Frame> {
+    let frame = match recv.try_recv() {
+        Ok(frame) => frame,
+        Err(_) => {
+            *reading = None;
+            recv.recv().await?
+        }
+    };
+    reading.get_or_insert_with(|| queries.reading());
+    Some(frame)
 }
 
 /// Runs one frame through the pipe and handles its decoded message. An error
@@ -4098,6 +4122,165 @@ mod tests {
             .await??
             .expect("a replaced session's answer rejects nothing");
         assert_eq!(handle.record_for(relayed.public()).await, None);
+        Ok(())
+    }
+
+    /// The reader of `io`'s session: it shares the session's queries and
+    /// progress, and its serving writes the answers `io` waits for.
+    fn test_sink(io: &mut PeerIO) -> DiscoverySink {
+        let serving = ServingCapacity::new(DEFAULT_ZAKURA_MAX_CONNECTIONS).session(
+            PeerSampler {
+                handle: io.handle.clone(),
+                requester: io.peer_node_id,
+            },
+            ServiceReporter {
+                handle: io.handle.clone(),
+                header_sync: None,
+                block_sync: None,
+            },
+            io.session.peer_id(),
+            io.session.send.clone(),
+            io.session.cancel_token(),
+            io.connection_cancel.clone(),
+            io.close_cause.clone(),
+        );
+        io.answers = serving.answers_written();
+        DiscoverySink {
+            handle: io.handle.clone(),
+            serving,
+            queries: io.queries.clone(),
+            peer_node_id: io.peer_node_id,
+            remote_ip: None,
+            session: io.session.clone(),
+            key: io.slot.key.clone(),
+            state: io.state.clone(),
+            trace: ZakuraTrace::default(),
+        }
+    }
+
+    /// The `Hello`s the peer queues after its exchange's answers.
+    const HELLO_BURST: usize = 8;
+
+    /// A discovery-only session whose peer completes the exchange, then
+    /// queues a `GetServices`, a burst of `Hello`s, and `last`. The reader
+    /// stalls on the discovery lock at the `GetServices` while the close
+    /// waits, so the close finds every queued frame unread.
+    ///
+    /// Returns the reader's result, and whether the connection had closed when
+    /// the reader returned. Also returns the writer, the frames the node wrote
+    /// to the peer, and the connection's token.
+    async fn burst_at_exchange_end(
+        seed: u8,
+        last: Frame,
+    ) -> Result<
+        (
+            JoinHandle<(Result<(), SinkReject>, bool)>,
+            JoinHandle<()>,
+            FramedRecv,
+            CancellationToken,
+        ),
+        crate::BoxError,
+    > {
+        let (handle, peer_id, peer_secret) = handle_with_session(seed, 2).await?;
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let (send, mut peer_recv) = framed_channel(64);
+        let (mut io, _states) = test_peer_io(handle.clone(), peer_id.clone(), send);
+        let sink = test_sink(&mut io);
+        let progress = io.state.clone();
+        let connection = io.connection_cancel.clone();
+        // Keeps the close waiting until the queued frames are in place.
+        let held = io.queries.verifying_hello();
+
+        let (to_reader, recv) = framed_channel(64);
+        let writer = tokio::spawn(io.run());
+        let reader = tokio::spawn({
+            let connection = connection.clone();
+            async move {
+                let mut pipe = discovery_pipe(peer_id);
+                let read = run_discovery_pipe(&mut pipe, recv, sink).await;
+                (read, connection.is_cancelled())
+            }
+        });
+        complete_peer_side_discovery_exchange(&to_reader, &mut peer_recv, &peer_secret, &handshake)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let exchange = progress.progress();
+        assert!(exchange.hello && exchange.peers && exchange.services);
+
+        let lock = handle.lock_for_test().await;
+        to_reader
+            .send(discovery_frame(DiscoveryMessage::GetServices(
+                GetServices {
+                    wanted_services: Vec::new(),
+                },
+            ))?)
+            .await?;
+        let record = signed_discovery_record(&peer_secret, &handshake)?;
+        for _ in 0..HELLO_BURST {
+            to_reader
+                .send(discovery_frame(DiscoveryMessage::Hello {
+                    record: record.clone(),
+                })?)
+                .await?;
+        }
+        to_reader.send(last).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(lock);
+        Ok((reader, writer, peer_recv, connection))
+    }
+
+    fn get_peers_frame() -> Result<Frame, crate::BoxError> {
+        discovery_frame(DiscoveryMessage::GetPeers(GetPeers {
+            limit: 1,
+            wanted_services: Vec::new(),
+            exclude_node_ids: Vec::new(),
+        }))
+    }
+
+    /// A bad `GetPeers` queued behind a `Hello` burst at the exchange's end
+    /// gets its protocol reject before the exchange's graceful close.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_close_rejects_a_bad_frame_it_already_received(
+    ) -> Result<(), crate::BoxError> {
+        let mut bad = get_peers_frame()?;
+        // The limit is the payload's first field, and 0 fails its decode.
+        bad.payload[..2].copy_from_slice(&0u16.to_le_bytes());
+        let (reader, writer, _peer_recv, _connection) = burst_at_exchange_end(78, bad).await?;
+
+        let (read, closed) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
+        assert!(
+            matches!(read, Err(SinkReject::Protocol(..))),
+            "the reader judges the bad frame: {read:?}"
+        );
+        assert!(!closed, "the graceful close waits for the reject");
+        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        Ok(())
+    }
+
+    /// An honest `GetPeers` queued behind a `Hello` burst at the exchange's end
+    /// gets its answer before the exchange's graceful close.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_close_answers_a_request_it_already_received() -> Result<(), crate::BoxError>
+    {
+        let (reader, writer, mut peer_recv, connection) =
+            burst_at_exchange_end(80, get_peers_frame()?).await?;
+
+        tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
+            .await
+            .expect("the exchange closes its discovery-only connection");
+        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        let (read, _) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
+        assert!(read.is_ok(), "an honest peer rejects nothing: {read:?}");
+        let mut answered = false;
+        while let Ok(frame) = peer_recv.try_recv() {
+            answered |= matches!(
+                decode_frame::<DiscoveryMessage>(&frame)?,
+                DiscoveryMessage::Peers { .. }
+            );
+        }
+        assert!(answered, "the node answers the GetPeers before it closes");
         Ok(())
     }
 }

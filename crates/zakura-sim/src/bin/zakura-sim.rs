@@ -22,7 +22,8 @@
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
 //! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
-//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle] [--schedule plan|pct]
+//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix] [--schedule plan|pct]
+//!     [--family <name>[,<name>]...]
 //! zakura-sim generators
 //! ```
 //!
@@ -128,8 +129,8 @@ mod cli {
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n  \
              zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
-             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle]\n      \
-             [--schedule plan|pct]\n  \
+             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix]\n      \
+             [--schedule plan|pct] [--family <name>[,<name>]...]\n  \
              zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
@@ -204,9 +205,14 @@ mod cli {
              there. It exits 0 once the report is written, whatever the search found.\n\
              --draws picks each run's scenario family: uniform (the default) from the\n\
              seed and the run alone, or cycle, which visits every family, each of its\n\
-             variants and one untagged run once per block of runs. --schedule pct makes\n\
-             each run's live picks with a PCT steer the input seeds, and saves a stopping\n\
-             run's input as the bytes that replay it with no steer.\n\
+             variants and one untagged run once per block of runs. free draws only the\n\
+             families that compose a scenario from their bytes. mix takes turns: a\n\
+             cycled family under the Plan, a cycled family under PCT, then a free draw\n\
+             under PCT or the Plan; it sets each run's schedule itself. --schedule pct\n\
+             makes each run's live picks with a PCT steer the input seeds, and saves a\n\
+             stopping run's input as the bytes that replay it with no steer. The report\n\
+             counts each property's outcomes over the free runs apart. --family draws\n\
+             only the named families, and passes over every other draw.\n\
              ZAKURA_SIM_KNOWN=<id>[=<issue>],... makes every command treat each named\n\
              Active property as Known, so a search records its violations and goes on\n\
              past an open bug. Replaying such a trace needs the same value.\n\
@@ -1119,8 +1125,9 @@ mod cli {
             "--exclude",
             "--draws",
             "--schedule",
+            "--family",
         ];
-        let mut flags: [Option<String>; 8] = Default::default();
+        let mut flags: [Option<String>; 9] = Default::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = names
@@ -1134,7 +1141,7 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        let [sim, seed, runs, out, max_bytes, exclude, draws, schedule] = flags;
+        let [sim, seed, runs, out, max_bytes, exclude, draws, schedule, family] = flags;
         let need = |value: Option<String>, flag: &str| {
             value.ok_or_else(|| Error::Usage(format!("`generate` needs {flag}")))
         };
@@ -1171,9 +1178,17 @@ mod cli {
             draw_policy: match draws.as_deref() {
                 None | Some("uniform") => DrawPolicy::Uniform,
                 Some("cycle") => DrawPolicy::Cycle,
+                Some("free") => DrawPolicy::Free,
+                Some("mix") if schedule.is_some() => {
+                    return Err(Error::Usage(
+                        "--draws mix sets each run's schedule, so it takes no --schedule"
+                            .to_owned(),
+                    ))
+                }
+                Some("mix") => DrawPolicy::Mix,
                 Some(other) => {
                     return Err(Error::Usage(format!(
-                        "--draws: `{other}` isn't uniform or cycle"
+                        "--draws: `{other}` isn't uniform, cycle, free or mix"
                     )))
                 }
             },
@@ -1192,7 +1207,22 @@ mod cli {
                     )))
                 }
             },
+            families: family
+                .iter()
+                .flat_map(|names| names.split(','))
+                .map(str::to_owned)
+                .collect(),
         };
+        if let Some(unknown) = options.families.iter().find(|name| {
+            !(entry.families)()
+                .iter()
+                .any(|family| family.name == name.as_str())
+        }) {
+            return Err(Error::Usage(format!(
+                "--family: {} has no family `{unknown}`",
+                entry.name
+            )));
+        }
         let report = generate::generate(entry, &options).map_err(|error| {
             Error::Failed(format!(
                 "writing {} in {}: {error}",

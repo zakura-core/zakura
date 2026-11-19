@@ -1513,7 +1513,7 @@ impl Subsystem for Storage {
     /// The grammar's version byte: a prefix without it draws the default
     /// scenario.
     fn families() -> Vec<ScenarioFamily> {
-        vec![ScenarioFamily::new("grammar", [grammar::LAYOUT.version])]
+        vec![ScenarioFamily::free("grammar", [grammar::LAYOUT.version])]
     }
 
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its

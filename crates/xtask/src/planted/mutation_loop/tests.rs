@@ -1101,9 +1101,12 @@ fn search(stop: GenerateStop, named: Option<Applicability>) -> GenerateFacts {
         millis: 900,
         input: stopped.then(|| "/out/search/ab.bin".into()),
         family: stopped.then(|| "stuck-floor".to_owned()),
+        mode: None,
         properties: named
             .map(|counts| BTreeMap::from([(NAMED.to_owned(), counts)]))
             .unwrap_or_default(),
+        random_runs: 0,
+        random_properties: BTreeMap::new(),
     }
 }
 
@@ -2220,6 +2223,7 @@ fn generate_flags_parse_and_refuse_bad_values() {
                 ("block-sync/storage".to_owned(), 20),
                 ("discovery/wire".to_owned(), 1000),
             ]),
+            draws: "mix".to_owned(),
         }
     );
     assert!(flags.generate.on());
@@ -2348,6 +2352,7 @@ fn the_report_keeps_generator_lanes_and_findings_apart() {
             seeds: vec![11],
             harness: "auto".to_owned(),
             seconds: None,
+            draws: Some("mix".to_owned()),
             excluded_inputs: 120,
         }),
         property_findings: vec![PropertyFinding {

@@ -147,6 +147,7 @@ fn scratch_suite(tests: Option<&[&str]>, ignored: &[&str]) -> SuiteFile {
             .collect(),
         excluded_target: Vec::new(),
         missing_target: Vec::new(),
+        excluded_harness: Vec::new(),
         pending: Vec::new(),
     }
 }

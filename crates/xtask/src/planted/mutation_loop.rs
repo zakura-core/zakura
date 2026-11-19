@@ -211,12 +211,14 @@ enum Runnable {
     /// One test in one test binary.
     Test { target: String, test: String },
     /// `zakura-sim generate`'s search on a harness: `runs` inputs drawn
-    /// from `seed`, skipping the digests in `exclude`.
+    /// from `seed` under the draw policy `draws`, skipping the digests in
+    /// `exclude`.
     Generate {
         harness: String,
         seed: u64,
         runs: u64,
         exclude: PathBuf,
+        draws: String,
     },
 }
 
@@ -1522,6 +1524,7 @@ impl Runner {
                 seed,
                 runs,
                 exclude,
+                draws,
             } => {
                 let sim = built
                     .sim
@@ -1531,6 +1534,7 @@ impl Runner {
                 command
                     .args(["generate", "--sim", harness])
                     .args(["--seed", &seed.to_string(), "--runs", &runs.to_string()])
+                    .args(["--draws", draws])
                     .arg("--exclude")
                     .arg(exclude)
                     .arg("--out")

@@ -15,8 +15,8 @@ use std::{
 use sha2::{Digest, Sha256};
 use zakura_sim::{
     explore::generate::{
-        draws, draws_with, generate, generator_harnesses, inputs, read_exclusions, DrawPolicy,
-        GenerateOptions, GenerateReport, Schedule, Stop, REPORT_FILE, UNTAGGED,
+        draws, draws_with, generate, generator_harnesses, inputs, planned_draws, read_exclusions,
+        Draw, DrawPolicy, GenerateOptions, GenerateReport, Schedule, Stop, REPORT_FILE, UNTAGGED,
     },
     harness::{self, HarnessEntry, HARNESSES},
     trace::end_records::END_RECORDS_VAR,
@@ -49,6 +49,7 @@ fn options(out: &Path, records: Option<&Path>) -> GenerateOptions {
         abandon_limit: 1,
         draw_policy: DrawPolicy::Uniform,
         schedule: Schedule::Plan,
+        families: BTreeSet::new(),
     }
 }
 
@@ -408,6 +409,188 @@ fn a_pct_search_saves_an_input_that_replays_unsteered() {
     .unwrap();
     assert_eq!(again.skipped, 1, "{again:?}");
     assert_ne!(again.kill_run, report.kill_run, "{again:?}");
+}
+
+/// A mixed search takes turns of three: a cycled draw under the Plan, a
+/// cycled draw under PCT, and a free draw, under PCT on odd turns. On
+/// `discovery/wire` the free draws visit each free family once per block,
+/// and every draw past its tag keeps [`inputs`]' bytes.
+#[test]
+fn the_mixed_draws_take_turns_and_reach_every_free_family() {
+    let entry = entry("discovery/wire");
+    let families = (entry.families)();
+    let free: BTreeSet<&str> = families
+        .iter()
+        .filter(|family| family.free)
+        .map(|family| family.name)
+        .collect();
+    assert_eq!(free, BTreeSet::from(["composed", "spam"]));
+    let drawn: Vec<Draw> = planned_draws(
+        SEED,
+        512,
+        families.clone(),
+        entry.untagged_free,
+        DrawPolicy::Mix,
+    )
+    .take(3 * 8)
+    .collect();
+    let mut reached = BTreeSet::new();
+    for (index, draw) in drawn.iter().enumerate() {
+        let round = index / 3;
+        let expected = match (index % 3, round % 2) {
+            (1, _) | (2, 1) => Schedule::Pct,
+            _ => Schedule::Plan,
+        };
+        assert_eq!(draw.schedule, Some(expected), "run {index}");
+        if index % 3 == 2 {
+            assert!(draw.free, "run {index}: {:?}", draw.family);
+            reached.insert(draw.family.unwrap());
+        }
+        let family = families
+            .iter()
+            .find(|listed| Some(listed.name) == draw.family);
+        if let Some(family) = family {
+            assert!(draw.input.starts_with(&family.tag), "run {index}");
+            assert_eq!(draw.free, family.free, "run {index}");
+        }
+    }
+    assert_eq!(reached, free);
+    // The free policy draws only free families.
+    assert!(
+        planned_draws(SEED, 512, families, entry.untagged_free, DrawPolicy::Free)
+            .take(16)
+            .all(|draw| draw.free && draw.schedule.is_none())
+    );
+}
+
+/// A machine harness's untagged op tape is free, so every draw of a free
+/// search on it is, and a harness with neither free families nor a free
+/// tape draws no free input.
+#[test]
+fn a_free_search_is_free_only_where_the_prefix_is() {
+    let machine = HARNESSES
+        .iter()
+        .find(|entry| entry.machine)
+        .expect("a machine harness");
+    assert!(machine.untagged_free);
+    assert!(
+        planned_draws(SEED, 512, (machine.families)(), true, DrawPolicy::Free)
+            .take(8)
+            .all(|draw| draw.free)
+    );
+    let fixed = entry(CLEAN);
+    assert!(!fixed.untagged_free);
+    assert!(
+        planned_draws(SEED, 64, (fixed.families)(), false, DrawPolicy::Free)
+            .take(8)
+            .all(|draw| !draw.free)
+    );
+}
+
+/// A mixed search counts its runs per mode, and runs each PCT turn under
+/// PCT on a harness the scheduler runs. The race fixtures draw no free
+/// scenario, so no run counts as random and no property has random reach.
+#[test]
+fn a_mixed_search_counts_its_modes() {
+    let root = tempfile::tempdir().unwrap();
+    let report = generate(
+        entry(CLEAN),
+        &GenerateOptions {
+            runs: 12,
+            draw_policy: DrawPolicy::Mix,
+            ..options(root.path(), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report.stop, Stop::Clean, "{report:?}");
+    assert_eq!(report.modes.values().sum::<u64>(), 12, "{:?}", report.modes);
+    assert_eq!(
+        report.modes.get("cycle/pct"),
+        Some(&6),
+        "{:?}",
+        report.modes
+    );
+    assert_eq!(
+        report.modes.get("cycle/plan"),
+        Some(&6),
+        "{:?}",
+        report.modes
+    );
+    assert_eq!(report.random_runs, 0);
+    assert!(report.random_properties.is_empty());
+}
+
+/// A search restricted to one family draws only that family, and a family
+/// the harness doesn't list is an error before any run.
+#[test]
+fn a_family_filter_draws_only_the_named_family() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = entry("discovery/wire");
+    let family = (entry.families)()[0].name;
+    let report = generate(
+        entry,
+        &GenerateOptions {
+            runs: 2,
+            families: BTreeSet::from([family.to_owned()]),
+            draw_policy: DrawPolicy::Cycle,
+            ..options(root.path(), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report.executed, 2, "{report:?}");
+    assert_eq!(
+        report.families.keys().collect::<Vec<_>>(),
+        [family],
+        "{report:?}"
+    );
+    let unknown = generate(
+        entry,
+        &GenerateOptions {
+            families: BTreeSet::from(["no-such-family".to_owned()]),
+            ..options(&root.path().join("unknown"), None)
+        },
+    );
+    assert!(unknown.is_err());
+}
+
+/// A wire harness's older input keeps its scenario: the migration widens
+/// the two-byte prefix to the new one and keeps the Plan bytes, and a
+/// first byte that is now a free family's tag becomes the default
+/// scenario's.
+#[test]
+fn the_wire_harnesses_migrate_their_two_byte_prefixes() {
+    for (name, old, free_tags) in [
+        ("discovery/wire", 2, &[0xFD_u8, 0xFC][..]),
+        ("sync/wire", 5, &[0xFA][..]),
+    ] {
+        let entry = entry(name);
+        let plan = [9_u8, 8, 7];
+        let source = [&[0x11_u8, 0x22][..], &plan].concat();
+        let migrated = (entry.migrate)(&source, old).unwrap();
+        assert_eq!(migrated.len(), entry.scenario_bytes + plan.len(), "{name}");
+        assert_eq!(migrated[..2], [0x11, 0x22], "{name}");
+        assert!(
+            migrated[2..entry.scenario_bytes]
+                .iter()
+                .all(|byte| *byte == 0),
+            "{name}"
+        );
+        assert_eq!(migrated[entry.scenario_bytes..], plan, "{name}");
+        assert_eq!(
+            entry.scenario(&migrated[..entry.scenario_bytes]),
+            entry.scenario(&[0x11, 0x22]),
+            "{name}"
+        );
+        for tag in free_tags {
+            let source = [&[*tag, 0][..], &plan].concat();
+            let migrated = (entry.migrate)(&source, old).unwrap();
+            assert_ne!(migrated[0], *tag, "{name}");
+            assert_eq!(migrated[entry.scenario_bytes..], plan, "{name}");
+        }
+        // A prefix with no Plan bytes stays as it was.
+        assert_eq!((entry.migrate)(&[0x11], old).unwrap(), vec![0x11], "{name}");
+        assert!((entry.migrate)(&source, old + 1).is_err(), "{name}");
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -89,7 +89,10 @@ fn reset_mid_write() -> &'static [u8] {
         let steer = Box::new(WriterLast::default());
         let (_, plan) = run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
             .unwrap_or_else(|error| panic!("the steered zakura#2378 run fails: {error}"));
-        [&RESET_MID_WRITE_PREFIX[..], &plan].concat()
+        let mut input = RESET_MID_WRITE_PREFIX.to_vec();
+        input.resize(SyncWire::SCENARIO_BYTES, 0);
+        input.extend_from_slice(&plan);
+        input
     })
 }
 

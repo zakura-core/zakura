@@ -36,7 +36,9 @@ run-4). In order, it:
    `cargo xtask sim-suite --frozen`;
 3. `suite`: runs the full planted sim suite;
 4. `loop`: runs the loop with generator lanes on what changed since the
-   last pin, or on every case on its first run;
+   last pin, or on every case on its first run. Each lane's search takes
+   turns between cycled families under the Plan, cycled families under PCT,
+   and free draws (`--generate-draws`, `mix` by default);
 5. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on what
    changed since its own pin, `<state>/latest-libfuzzer.json`, which
    advances only when the step succeeds, so a failed step's changes run
@@ -58,9 +60,17 @@ run-4). In order, it:
    triage. The routine then diffs the new report against the previous
    cumulative one, lists the cumulative report's untriaged lanes, and
    writes every lane's diff to `findings.json`;
-9. `completeness`: writes `completeness.json`, which lists the manifest rows
-   the routine ran, the rows it didn't run and why, and the unimplemented
-   rows. It reports coverage only, apart from `findings.json`.
+9. `reach`: with `--reach-runs` above 0, the default, runs one mixed
+   generator search on every generator harness with
+   `scripts/suite_fuzz_run.py reach`, seeded by the UTC day, and counts for
+   each property the runs and the free runs that applied it;
+10. `completeness`: writes `completeness.json`, which lists the manifest rows
+   the routine ran, the rows it didn't run and why, the unimplemented rows,
+   and each property's reach. It reports coverage only, apart from
+   `findings.json`. A property no free run applied is a reach finding:
+   `findings.json` lists every one under `reach`, and the routine fails on
+   one that `<state>/latest-reach.json`, the previous run's list, doesn't
+   hold.
 
 Each run writes under `<state>/runs/<UTC time>-<commit>/`, with each step's
 exit status in `routine.json`, and `<state>/latest.json` names the last
@@ -81,6 +91,8 @@ LATEST_FILE = "latest.json"
 LIBFUZZER_LATEST_FILE = "latest-libfuzzer.json"
 CUMULATIVE_FILES = {"loop": "cumulative.json", "libfuzzer": "cumulative-libfuzzer.json"}
 ROUTINE_FILE = "routine.json"
+REACH_FILE = "reach.json"
+LATEST_REACH_FILE = "latest-reach.json"
 FINDINGS_FILE = "findings.json"
 SUITE_MANIFEST_FILE = "suite-manifest.json"
 SUITE_FUZZ_SCRIPT = Path(__file__).resolve().parent / "suite_fuzz_run.py"
@@ -232,16 +244,30 @@ def report_diff(previous_path, new_path):
     return 1 if has_news(changes) else 0
 
 
-def loop_command(previous, out, generate_runs, extra):
+def loop_command(previous, out, generate_runs, extra, draws=None):
     """Return the loop's command line: the cases a change since `previous`'s pin affects, or every case without one."""
     since = ["--changed-since", previous["pinned"]] if previous else []
+    policy = ["--generate-draws", draws] if draws else []
     return [
         "cargo", "xtask", "planted", "loop",
         "--out", str(out),
         "--generate-runs", str(generate_runs),
+        *policy,
         *since,
         *extra,
     ]
+
+
+def reach_seed(now):
+    """Return the reach searches' seed for a run at `now`: the UTC day's number, so each day searches new inputs."""
+    return int(now.timestamp()) // 86400
+
+
+def reach_findings(record, previous):
+    """Return the reach findings: every unreached property, and those the previous run's list didn't hold."""
+    unreached = record.get("unreached", [])
+    before = set((previous or {}).get("unreached", []))
+    return {"unreached": unreached, "new_unreached": [prop for prop in unreached if prop not in before]}
 
 
 def read_latest(state, name=LATEST_FILE):
@@ -285,7 +311,8 @@ def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None)
     extra = [arg for arg in args.loop_args if arg != "--"]
     steps.append({
         "name": "loop",
-        "argv": loop_command(previous, Path(run_dir) / "loop", args.generate_runs, budget + extra),
+        "argv": loop_command(previous, Path(run_dir) / "loop", args.generate_runs, budget + extra,
+                             args.generate_draws),
         "env": {},
         "cwd": checkout,
     })
@@ -297,6 +324,16 @@ def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None)
         steps.append({
             "name": "libfuzzer",
             "argv": loop_command({"pinned": since}, Path(run_dir) / "libfuzzer", args.generate_runs, libfuzzer + extra),
+            "env": {},
+            "cwd": checkout,
+        })
+    if args.reach_runs:
+        reach = [flag for harness in args.harness_runs for flag in ("--harness-runs", harness)]
+        steps.append({
+            "name": "reach",
+            "argv": [sys.executable, str(SUITE_FUZZ_SCRIPT), "reach", "--checkout", checkout,
+                     "--out", str(run_dir), "--seed", str(args.reach_seed), "--runs", str(args.reach_runs),
+                     "--jobs", str(args.reach_jobs), *reach],
             "env": {},
             "cwd": checkout,
         })
@@ -331,6 +368,8 @@ def completeness_step(checkout, run_dir, steps):
         inputs += ["--suite-fuzz", str(run_dir / "suite-fuzz.json")]
     if "loop" in names:
         inputs += ["--loop-report", str(run_dir / "loop" / REPORT_FILE)]
+    if "reach" in names:
+        inputs += ["--reach", str(run_dir / REACH_FILE)]
     return {
         "name": "completeness",
         "argv": [sys.executable, str(SUITE_FUZZ_SCRIPT), "completeness",
@@ -401,6 +440,7 @@ def routine(args):
     """Run the droplet timer's routine once, and return its exit status."""
     state = Path(args.state).resolve()
     checkout = Path(args.checkout).resolve()
+    args.reach_seed = reach_seed(datetime.now(timezone.utc))
     latest = read_latest(state)
     libfuzzer_latest = read_latest(state, LIBFUZZER_LATEST_FILE)
     if args.dry_run:
@@ -459,6 +499,17 @@ def routine(args):
         findings[lane] = changes
         record["news"][lane] = has_news(changes)
         status = status or int(record["news"][lane])
+    # A property no free run applied is a reach finding, and one the
+    # previous run didn't list is news.
+    if (run_dir / REACH_FILE).exists():
+        record_reach = read_json(run_dir / REACH_FILE)
+        found = reach_findings(record_reach, read_json(state / LATEST_REACH_FILE))
+        findings["reach"] = found
+        record["news"]["reach"] = bool(found["new_unreached"])
+        status = status or int(record["news"]["reach"])
+        if "error" not in record_reach:
+            (state / LATEST_REACH_FILE).write_text(json.dumps(
+                {"pinned": pinned, "unreached": found["unreached"]}, indent=2) + "\n")
     (run_dir / FINDINGS_FILE).write_text(json.dumps(findings, indent=2) + "\n")
     if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
         (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
@@ -505,6 +556,11 @@ def main(argv=None):
                        help="fuzz each target for this long per worker instead; nonzero also turns the suite fuzz on")
     timer.add_argument("--fuzz-workers", type=int, default=1, help="each suite-fuzz campaign run's workers")
     timer.add_argument("--fuzz-jobs", type=int, default=1, help="how many suite-fuzz campaigns run at once")
+    timer.add_argument("--generate-draws", default="mix",
+                       help="each inproc search's draw policy: uniform, cycle, free or mix")
+    timer.add_argument("--reach-runs", type=int, default=30,
+                       help="each harness's mixed search for the reach report; 0 turns it off")
+    timer.add_argument("--reach-jobs", type=int, default=4, help="how many reach searches run at once")
     timer.add_argument("--dry-run", action="store_true", help="print the steps without running any")
     timer.add_argument("loop_args", nargs=argparse.REMAINDER, help="more `planted loop` flags, after `--`")
     args = parser.parse_args(argv)

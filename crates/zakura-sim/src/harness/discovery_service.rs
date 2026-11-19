@@ -39,7 +39,8 @@ use zakura_network::zakura::{
     DiscoveryMessage, DiscoveryService, Service, Stream, TransportObserver, ZakuraDiscoveryConfig,
     ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraServiceId,
     DEFAULT_DISCOVERY_CONNECTION_HEADROOM, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
-    ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
+    MAX_DISCOVERY_RECORDS_PER_RESPONSE, ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION,
+    ZAKURA_STREAM_DISCOVERY,
 };
 use zakura_quic::sim::{SeededInputs, SimNet};
 
@@ -261,7 +262,7 @@ fn spawn_with(
         let (readiness, commands) = control.add(
             &name,
             peer.script.clone(),
-            peer.adversary.is_some() || peer.discovers_adversarially(),
+            is_adversary(peer) && !peer.spams,
         );
         let (listening, _) = zakura_rt::sync::watch::channel(false);
         let task = PeerTask {
@@ -1048,6 +1049,515 @@ fn sent_row<const ROW: usize>(log: &ObservationLog) -> bool {
     })
 }
 
+/// Whether `peer` is an adversary: it acts, here or on header sync.
+fn is_adversary(peer: &PeerSpec) -> bool {
+    peer.adversary.is_some() || peer.discovers_adversarially()
+}
+
+/// For a scenario where a peer takes a discovery act and none spams,
+/// `BoundedAdversary` at [`ADVERSARY_RATE`] actions per virtual second, the
+/// budget [`PeerControl`] holds an adversary to. Nothing otherwise, so a
+/// spammer's run judges no property that assumes the bound.
+fn wire_assumptions<S>(scenario: &WireScenario) -> Assumptions<S> {
+    let adversaries: Vec<&PeerSpec> = scenario.peers.iter().filter(|p| is_adversary(p)).collect();
+    if adversaries.is_empty() || adversaries.iter().any(|peer| peer.spams) {
+        return Assumptions::none();
+    }
+    Assumptions::declare(vec![AssumeRecord {
+        assume: Assume::BoundedAdversary,
+        params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
+    }])
+}
+
+/// The step loop's task observations, the network's datagrams, the peers'
+/// frames and the node's closes.
+fn wire_sources() -> Sources {
+    Sources::observed(&[
+        Source::Schedule,
+        Source::Datagrams,
+        Source::Frames,
+        Source::Closes,
+    ])
+}
+
+/// The action slots of a `discovery/composed` prefix, after its version
+/// byte and its three bytes of node, script and hold choices.
+pub const COMPOSED_SLOTS: usize = 13;
+
+/// The first byte of every `discovery/composed` prefix that
+/// [`composed_scenario`] reads: [`DiscoveryComposed`]'s generator. Any
+/// other first byte draws the default scenario, as `header-sync/storage`'s
+/// grammar does.
+pub const COMPOSED_VERSION: u8 = 1;
+
+/// The actions that keep a composed script's peer conformant: each request,
+/// then the cadence runs of [`HOSTILE_ACTS`], whose exhausted frame the
+/// node must not close for, then [`CONFORMANT_ACTS`]. A new action goes at
+/// the end of its list, with a bump of [`DiscoveryComposed`]'s `GENERATOR`.
+fn conformant_actions() -> Vec<PeerAction> {
+    let requests = [
+        Request::GetPeers,
+        Request::GetServices,
+        Request::GetOnePeer,
+        Request::GetHeaderSyncService,
+    ]
+    .map(|request| PeerAction::Ask { request });
+    let runs = HOSTILE_ACTS
+        .iter()
+        .filter(|(_, act)| is_cadence_run(*act))
+        .chain(&CONFORMANT_ACTS)
+        .map(|(_, act)| PeerAction::Discover { act: *act });
+    requests.into_iter().chain(runs).collect()
+}
+
+/// Every action a composed script may take: [`conformant_actions`], then
+/// each act of [`HOSTILE_ACTS`] that breaks a rule.
+fn composed_actions() -> Vec<PeerAction> {
+    let faults = HOSTILE_ACTS
+        .iter()
+        .filter(|(_, act)| !is_cadence_run(*act))
+        .map(|(_, act)| PeerAction::Discover { act: *act });
+    conformant_actions().into_iter().chain(faults).collect()
+}
+
+/// Whether `act` is a cadence run, whose frames stay conformant.
+fn is_cadence_run(act: DiscoveryAct) -> bool {
+    matches!(
+        act,
+        DiscoveryAct::HelloBurst | DiscoveryAct::RequestRun { .. }
+    )
+}
+
+/// The scenario the bytes after a `discovery/composed` prefix's version
+/// byte encode, in fixed slots so a change to one byte changes one choice
+/// (fuzz-11). Counting from the byte after the version:
+///
+/// - Byte 0: the node's verification slots (bits 0 and 1, 1 to 4), its
+///   `GetPeers` limit (bits 2 and 3: production's, 1, 2 or 8), whether it
+///   dials a listening peer it holds as a static candidate (bit 4), and the
+///   links' delays (bits 5 and 6: 1 to 100 ms, 1 to 5 ms, 50 to 400 ms, or
+///   1 to 1,000 ms).
+/// - Byte 1: the records each `Peers` relays (bits 0 and 1, 0 to 3, at
+///   most the node's limit), and whether the script may break rules
+///   (bit 7).
+/// - Byte 2: which answers the peer holds (bits 0 to 2: `Hello`, `Peers`,
+///   `Services`) and until when (bits 3 and 4: 500, 1,500, 2,500 or 4,000
+///   ms past the run's start).
+/// - Each later byte: an action slot. 0 ends the script. Any other value
+///   picks an action of [`conformant_actions`], or of [`composed_actions`]
+///   once byte 1 lets the script break rules.
+///
+/// The peer skips an act that isn't ready within [`STALE_ACT_WAIT`] of
+/// becoming its next action ([`PeerSpec::skip_stale_acts`]), so one act
+/// can't stall the rest.
+///
+/// [`STALE_ACT_WAIT`]: crate::peer::STALE_ACT_WAIT
+pub fn composed_scenario(prefix: &[u8]) -> WireScenario {
+    let byte = |index: usize| prefix.get(index).copied().unwrap_or(0);
+    let (node, script, holds) = (byte(0), byte(1), byte(2));
+    let base = WireScenario::default();
+    let mut net = base.net.clone();
+    // At least a millisecond, so each round trip moves the clock, as
+    // `act_scenario`'s links do: a request run's exchanges would otherwise
+    // all land at one instant.
+    (net.default_link.min_delay_ms, net.default_link.max_delay_ms) = match (node >> 5) & 3 {
+        0 => (1, 100),
+        1 => (1, 5),
+        2 => (50, 400),
+        _ => (1, 1_000),
+    };
+    let peer_sample_limit = [None, Some(1), Some(2), Some(8)][usize::from((node >> 2) & 3)];
+    let limit = peer_sample_limit.unwrap_or(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+    let until_ms = [500, 1_500, 2_500, 4_000][usize::from((holds >> 3) & 3)];
+    let held = [Answer::Hello, Answer::Peers, Answer::Services]
+        .into_iter()
+        .zip(0..)
+        .filter(|(_, bit)| holds & (1 << bit) != 0)
+        .map(|(answer, _)| Hold { answer, until_ms })
+        .collect();
+    let actions = if script & 0x80 != 0 {
+        composed_actions()
+    } else {
+        conformant_actions()
+    };
+    let steps = (3..3 + COMPOSED_SLOTS)
+        .map(byte)
+        .take_while(|slot| *slot != 0)
+        // The remainder is below the actions' count.
+        .map(|slot| actions[usize::from(slot - 1) % actions.len()])
+        .collect();
+    let dials = node & 0x10 != 0;
+    let peer = if dials {
+        PeerSpec::listening()
+    } else {
+        PeerSpec::dialing()
+    };
+    let relays =
+        u8::try_from(usize::from(script & 3).min(limit)).expect("at most three relayed records");
+    WireScenario {
+        net,
+        node: NodeSpec {
+            verification_slots: 1 + usize::from(node & 3),
+            static_candidates: if dials { vec![0] } else { Vec::new() },
+            peer_sample_limit,
+        },
+        peers: vec![PeerSpec {
+            script: steps,
+            skip_stale_acts: true,
+            ..discovering(
+                peer,
+                DiscoveryScript {
+                    relays,
+                    holds: held,
+                },
+            )
+        }],
+    }
+}
+
+/// The full `discovery/composed` prefix, [`COMPOSED_VERSION`] first, whose
+/// scenario runs `steps` under bytes `node`, `script` and `holds`
+/// ([`composed_scenario`]), with each step's slot its first value. Fails if
+/// `steps` holds more than [`COMPOSED_SLOTS`] actions, or an action that
+/// `script` doesn't allow.
+pub fn composed_prefix(
+    node: u8,
+    script: u8,
+    holds: u8,
+    steps: &[PeerAction],
+) -> Result<[u8; COMPOSED_BYTES], String> {
+    if steps.len() > COMPOSED_SLOTS {
+        return Err(format!("{} steps, past {COMPOSED_SLOTS}", steps.len()));
+    }
+    let actions = if script & 0x80 != 0 {
+        composed_actions()
+    } else {
+        conformant_actions()
+    };
+    let mut prefix = [0; COMPOSED_BYTES];
+    prefix[..4].copy_from_slice(&[COMPOSED_VERSION, node, script, holds]);
+    for (slot, step) in prefix[4..].iter_mut().zip(steps) {
+        let index = actions
+            .iter()
+            .position(|action| action == step)
+            .ok_or_else(|| format!("byte 1 {script:#04x} allows no {}", step.name()))?;
+        *slot = u8::try_from(index + 1)
+            .map_err(|_| format!("{} actions, past a byte's slots", actions.len()))?;
+    }
+    Ok(prefix)
+}
+
+/// `discovery/wire`'s node and properties with one peer whose script,
+/// holds, links and node limits a prefix composes ([`composed_scenario`]).
+/// The fuzzer then chooses the order, count and mix of the peer's
+/// exchanges, where `discovery/wire` picks one saved conversation.
+pub struct DiscoveryComposed;
+
+impl HasView for DiscoveryComposed {
+    type View = ();
+
+    /// Nothing. The registry's checks read the observations.
+    fn view(&self) {}
+}
+
+/// The length of a `discovery/composed` prefix: its version byte, three
+/// bytes of choices and [`COMPOSED_SLOTS`] action slots.
+pub const COMPOSED_BYTES: usize = 4 + COMPOSED_SLOTS;
+
+/// `discovery/composed`'s step budget: room for a script of
+/// [`COMPOSED_SLOTS`] acts, past [`wire_config`]'s 30,000 for one act. Its
+/// livelock limit, a tenth of the budget, leaves room for the two bursts of
+/// up to 64 frames the adversary's rate lets land at one instant, at about
+/// 40 steps a frame.
+pub const COMPOSED_BUDGET: u64 = 80_000;
+
+impl Subsystem for DiscoveryComposed {
+    const NAME: &'static str = "discovery/composed";
+    // A u8 always fits in a u32.
+    const GENERATOR: u32 = COMPOSED_VERSION as u32;
+    const SCENARIO_BYTES: usize = COMPOSED_BYTES;
+    type Scenario = WireScenario;
+    type Prepared = NodeHandle;
+
+    /// [`wire_config`] with [`COMPOSED_BUDGET`] steps.
+    fn config(_: &WireScenario) -> RunConfig {
+        RunConfig {
+            budget: COMPOSED_BUDGET,
+            ..wire_config()
+        }
+    }
+
+    /// [`wire_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        wire_properties()
+    }
+
+    /// [`wire_assumptions`].
+    fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
+        wire_assumptions(scenario)
+    }
+
+    /// An empty slot for the node's handle.
+    fn prepare(_: &WireScenario) -> NodeHandle {
+        NodeHandle::default()
+    }
+
+    /// [`spawn`]'s network, node and peers, with the node's handle kept in
+    /// `node`.
+    fn build(sim: &mut Sim, scenario: &WireScenario, node: NodeHandle) -> Self {
+        spawn_with(sim, &scenario.net, &scenario.node, &scenario.peers, node);
+        DiscoveryComposed
+    }
+
+    /// [`wire_sources`].
+    fn sources() -> Sources {
+        wire_sources()
+    }
+
+    /// One family, the grammar, whose tag is [`COMPOSED_VERSION`].
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("composed", [COMPOSED_VERSION])]
+    }
+
+    /// Whether `prefix` starts with [`COMPOSED_VERSION`], so `draw` reads
+    /// it rather than drawing the default scenario.
+    fn accepts(prefix: &[u8]) -> bool {
+        prefix.first() == Some(&COMPOSED_VERSION)
+    }
+
+    /// [`composed_scenario`] of the bytes after [`COMPOSED_VERSION`], or the
+    /// default scenario for a prefix with another first byte.
+    fn draw(prefix: &[u8]) -> WireScenario {
+        match prefix.split_first() {
+            Some((&COMPOSED_VERSION, grammar)) => composed_scenario(grammar),
+            _ => WireScenario::default(),
+        }
+    }
+}
+
+/// The first byte of every `discovery/spam` prefix that [`spam_scenario`]
+/// reads: [`DiscoverySpam`]'s generator. Any other first byte draws the
+/// default scenario.
+pub const SPAM_VERSION: u8 = 1;
+
+/// The request slots of a `discovery/spam` prefix's honest peer.
+pub const SPAM_HONEST_SLOTS: usize = 4;
+
+/// The action slots a `discovery/spam` prefix's spammers share.
+pub const SPAM_SLOTS: usize = 24;
+
+/// The length of a `discovery/spam` prefix: its version byte, two bytes of
+/// choices, [`SPAM_HONEST_SLOTS`] and [`SPAM_SLOTS`].
+pub const SPAM_BYTES: usize = 3 + SPAM_HONEST_SLOTS + SPAM_SLOTS;
+
+/// `discovery/spam`'s step budget: room for three spammers' scripts of
+/// [`SPAM_SLOTS`] acts beside the honest peer. Its runs declare no
+/// `BoundedAdversary`, so no livelock limit applies.
+pub const SPAM_BUDGET: u64 = 150_000;
+
+/// The requests a `discovery/spam` honest peer may ask. A new one goes at
+/// the end, with a bump of [`DiscoverySpam`]'s `GENERATOR`.
+const HONEST_REQUESTS: [Request; 4] = [
+    Request::GetPeers,
+    Request::GetServices,
+    Request::GetOnePeer,
+    Request::GetHeaderSyncService,
+];
+
+/// The answer a `discovery/spam` honest peer holds. The node closes a
+/// discovery connection once its own exchange completes, so the held
+/// `Services` keeps the honest connection open while the peer asks.
+const HONEST_HOLD: Hold = Hold {
+    answer: Answer::Services,
+    until_ms: 1_500,
+};
+
+/// Every action a spammer may take: [`composed_actions`], then a
+/// `Disconnect`, after which it dials again.
+fn spam_actions() -> Vec<PeerAction> {
+    composed_actions()
+        .into_iter()
+        .chain([PeerAction::Disconnect])
+        .collect()
+}
+
+/// The scenario the bytes after a `discovery/spam` prefix's version byte
+/// encode, in fixed slots (fuzz-11). Counting from the byte after the
+/// version:
+///
+/// - Byte 0: the node's verification slots, `GetPeers` limit and links, as
+///   [`composed_scenario`]'s byte 0 sets them. The node dials no one.
+/// - Byte 1: the records each spammer's `Peers` relays (bits 0 and 1, at
+///   most the node's limit), and how many spammers run (bits 4 and 5: 1, 2,
+///   3 or 3).
+/// - Bytes 2 to 5: the honest peer's requests, of [`HONEST_REQUESTS`]. 0
+///   ends its script.
+/// - Each later byte: an action slot of [`spam_actions`], which every
+///   spammer runs. 0 ends the script.
+///
+/// Each spammer [spams](PeerSpec::spams), and skips stale acts as a
+/// composed peer does. The honest peer dials last, holds
+/// [`HONEST_HOLD`] and only asks, so `conformant-never-closes` judges every
+/// frame it sends.
+pub fn spam_scenario(prefix: &[u8]) -> WireScenario {
+    let byte = |index: usize| prefix.get(index).copied().unwrap_or(0);
+    let mut scenario = composed_scenario(&[byte(0) & !0x10, byte(1) & 3, 0]);
+    let peer = scenario
+        .peers
+        .pop()
+        .expect("a composed scenario has one peer");
+    let actions = spam_actions();
+    let script: Vec<PeerAction> = (2 + SPAM_HONEST_SLOTS..2 + SPAM_HONEST_SLOTS + SPAM_SLOTS)
+        .map(byte)
+        .take_while(|slot| *slot != 0)
+        // The remainder is below the actions' count.
+        .map(|slot| actions[usize::from(slot - 1) % actions.len()])
+        .collect();
+    let asks = (2..2 + SPAM_HONEST_SLOTS)
+        .map(byte)
+        .take_while(|slot| *slot != 0)
+        .map(|slot| PeerAction::Ask {
+            request: HONEST_REQUESTS[usize::from(slot - 1) % HONEST_REQUESTS.len()],
+        })
+        .collect();
+    let spammers = [1, 2, 3, 3][usize::from((byte(1) >> 4) & 3)];
+    let spammer = PeerSpec {
+        script,
+        spams: true,
+        ..peer.clone()
+    };
+    let discovery = peer.discovery.clone().map(|script| DiscoveryScript {
+        holds: vec![HONEST_HOLD],
+        ..script
+    });
+    scenario.peers = vec![spammer; spammers];
+    scenario.peers.push(PeerSpec {
+        script: asks,
+        discovery,
+        ..peer
+    });
+    scenario
+}
+
+/// The full `discovery/spam` prefix, [`SPAM_VERSION`] first, whose scenario
+/// runs `spammers` spammers on `steps` beside an honest peer that asks
+/// `asks`, under node byte `node` ([`spam_scenario`]). Fails if `spammers`
+/// isn't 1 to 3, a list is longer than its slots, or a step isn't one of
+/// [`spam_actions`].
+pub fn spam_prefix(
+    node: u8,
+    spammers: u8,
+    asks: &[Request],
+    steps: &[PeerAction],
+) -> Result<[u8; SPAM_BYTES], String> {
+    if !(1..=3).contains(&spammers) {
+        return Err(format!("{spammers} spammers, not 1 to 3"));
+    }
+    if asks.len() > SPAM_HONEST_SLOTS || steps.len() > SPAM_SLOTS {
+        return Err(format!("{} asks and {} steps", asks.len(), steps.len()));
+    }
+    let mut prefix = [0; SPAM_BYTES];
+    prefix[..3].copy_from_slice(&[SPAM_VERSION, node, (spammers - 1) << 4]);
+    let slot = |index: Option<usize>, what: &str| {
+        let index = index.ok_or_else(|| format!("a spam prefix holds no {what}"))?;
+        u8::try_from(index + 1).map_err(|_| format!("{what} is past a byte's slots"))
+    };
+    for (byte, ask) in prefix[3..].iter_mut().zip(asks) {
+        *byte = slot(
+            HONEST_REQUESTS.iter().position(|request| request == ask),
+            ask.name(),
+        )?;
+    }
+    let actions = spam_actions();
+    for (byte, step) in prefix[3 + SPAM_HONEST_SLOTS..].iter_mut().zip(steps) {
+        *byte = slot(
+            actions.iter().position(|action| action == step),
+            step.name(),
+        )?;
+    }
+    Ok(prefix)
+}
+
+/// `discovery/wire`'s node and properties with one to three spammers and
+/// an honest peer beside them ([`spam_scenario`]). A spammer takes its acts
+/// as fast as the schedule allows and dials again after every close, so
+/// the node's refusals, cadence and per-connection state face a flood that
+/// keeps going after the first refusal. Its runs declare no
+/// `BoundedAdversary`, so they judge the bounds, panics and the honest
+/// peer's `conformant-never-closes`, not liveness.
+pub struct DiscoverySpam;
+
+impl HasView for DiscoverySpam {
+    type View = ();
+
+    /// Nothing. The registry's checks read the observations.
+    fn view(&self) {}
+}
+
+impl Subsystem for DiscoverySpam {
+    const NAME: &'static str = "discovery/spam";
+    // A u8 always fits in a u32.
+    const GENERATOR: u32 = SPAM_VERSION as u32;
+    const SCENARIO_BYTES: usize = SPAM_BYTES;
+    type Scenario = WireScenario;
+    type Prepared = NodeHandle;
+
+    /// [`wire_config`] with [`SPAM_BUDGET`] steps.
+    fn config(_: &WireScenario) -> RunConfig {
+        RunConfig {
+            budget: SPAM_BUDGET,
+            ..wire_config()
+        }
+    }
+
+    /// [`wire_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        wire_properties()
+    }
+
+    /// [`wire_assumptions`], which declares nothing for a spammer's run.
+    fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
+        wire_assumptions(scenario)
+    }
+
+    /// An empty slot for the node's handle.
+    fn prepare(_: &WireScenario) -> NodeHandle {
+        NodeHandle::default()
+    }
+
+    /// [`spawn`]'s network, node and peers, with the node's handle kept in
+    /// `node`.
+    fn build(sim: &mut Sim, scenario: &WireScenario, node: NodeHandle) -> Self {
+        spawn_with(sim, &scenario.net, &scenario.node, &scenario.peers, node);
+        DiscoverySpam
+    }
+
+    /// [`wire_sources`].
+    fn sources() -> Sources {
+        wire_sources()
+    }
+
+    /// One family, the grammar, whose tag is [`SPAM_VERSION`].
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("spam", [SPAM_VERSION])]
+    }
+
+    /// Whether `prefix` starts with [`SPAM_VERSION`], so `draw` reads it
+    /// rather than drawing the default scenario.
+    fn accepts(prefix: &[u8]) -> bool {
+        prefix.first() == Some(&SPAM_VERSION)
+    }
+
+    /// [`spam_scenario`] of the bytes after [`SPAM_VERSION`], or the default
+    /// scenario for a prefix with another first byte.
+    fn draw(prefix: &[u8]) -> WireScenario {
+        match prefix.split_first() {
+            Some((&SPAM_VERSION, grammar)) => spam_scenario(grammar),
+            _ => WireScenario::default(),
+        }
+    }
+}
+
 /// The discovery node behind its real transport on simulated QUIC, named
 /// `node`, with scripted peers.
 pub struct DiscoveryWire;
@@ -1076,21 +1586,9 @@ impl Subsystem for DiscoveryWire {
         wire_properties()
     }
 
-    /// For a scenario where a peer takes a discovery act, `BoundedAdversary`
-    /// at [`ADVERSARY_RATE`] actions per virtual second, the budget
-    /// [`PeerControl`] holds an adversary to.
+    /// [`wire_assumptions`].
     fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
-        if !scenario
-            .peers
-            .iter()
-            .any(|peer| peer.adversary.is_some() || peer.discovers_adversarially())
-        {
-            return Assumptions::none();
-        }
-        Assumptions::declare(vec![AssumeRecord {
-            assume: Assume::BoundedAdversary,
-            params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
-        }])
+        wire_assumptions(scenario)
     }
 
     /// An empty slot for the node's handle.
@@ -1105,15 +1603,9 @@ impl Subsystem for DiscoveryWire {
         DiscoveryWire
     }
 
-    /// The step loop's task observations, the network's datagrams, the
-    /// peers' frames and the node's closes.
+    /// [`wire_sources`].
     fn sources() -> Sources {
-        Sources::observed(&[
-            Source::Schedule,
-            Source::Datagrams,
-            Source::Frames,
-            Source::Closes,
-        ])
+        wire_sources()
     }
 
     /// Each saved Plan's tag ([`SavedPlan::tag`]), then each hostile

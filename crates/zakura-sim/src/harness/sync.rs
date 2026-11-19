@@ -122,6 +122,13 @@ pub enum SyncAction {
         /// A mirror's name.
         peer: String,
     },
+    /// [`SyncAction::Close`], or nothing if the node holds no connection to
+    /// `peer`: a composed scenario's close, which can come after the node
+    /// closed that connection itself and before the dialer redials it.
+    CloseIfLinked {
+        /// A mirror's name.
+        peer: String,
+    },
     /// Link `peer` again, with a new connection and sessions, in its newest
     /// link's direction.
     Relink {
@@ -152,7 +159,9 @@ impl SyncAction {
     /// every mirror's chain, or `node`.
     fn actor(&self) -> &str {
         match self {
-            SyncAction::Close { peer } | SyncAction::Relink { peer } => peer,
+            SyncAction::Close { peer }
+            | SyncAction::CloseIfLinked { peer }
+            | SyncAction::Relink { peer } => peer,
             SyncAction::Grow { .. } | SyncAction::Reset { .. } => "chain",
             SyncAction::Teardown => "node",
         }
@@ -162,6 +171,7 @@ impl SyncAction {
     fn name(&self) -> &'static str {
         match self {
             SyncAction::Close { .. } => "close",
+            SyncAction::CloseIfLinked { .. } => "close-if-linked",
             SyncAction::Relink { .. } => "relink",
             SyncAction::Grow { .. } => "grow",
             SyncAction::Reset { .. } => "reset",
@@ -402,12 +412,15 @@ impl SyncTopology {
     }
 
     /// Closes the node's newest connection to the mirror named `peer`. A
-    /// QUIC connection's dialer redials it.
-    async fn close(&self, peer: &str) {
+    /// QUIC connection's dialer redials it. If the node holds no connection
+    /// to `peer`, that fails the run, unless `if_linked`, which makes the
+    /// close a no-op ([`SyncAction::CloseIfLinked`]).
+    async fn close(&self, peer: &str, if_linked: bool) {
         let quic = match &self.transport {
             Transport::Memory => {
                 match self.link_to(peer) {
                     Some(link) => link.close(),
+                    None if if_linked => {}
                     None => self.fail(format!("the scenario never links `{peer}`")),
                 }
                 return;
@@ -424,7 +437,12 @@ impl SyncTopology {
         };
         quic.closed.borrow_mut().push(id.clone());
         if !supervisor.disconnect_peer(id).await {
-            self.fail(format!("the node has no connection to `{peer}`"));
+            if if_linked {
+                // No connection closed, so none was superseded.
+                quic.closed.borrow_mut().pop();
+            } else {
+                self.fail(format!("the node has no connection to `{peer}`"));
+            }
         }
     }
 
@@ -712,7 +730,8 @@ impl Control {
         sim.scheduler().spawn_root("control", async move {
             while let Some(action) = links.recv().await {
                 match action {
-                    SyncAction::Close { peer } => task_topology.close(&peer).await,
+                    SyncAction::Close { peer } => task_topology.close(&peer, false).await,
+                    SyncAction::CloseIfLinked { peer } => task_topology.close(&peer, true).await,
                     SyncAction::Relink { peer } => task_topology.relink(&peer),
                     SyncAction::Teardown => task_topology.teardown().await,
                     action => unreachable!("the link task gets only links, not {action:?}"),

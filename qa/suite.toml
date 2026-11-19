@@ -114,6 +114,18 @@ run = true
 timeout-secs = 1800
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_wire_witness.rs"
+test = "regenerate_planted_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
+test = "regenerate_late_fault_fixture"
+run = false
+reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false
@@ -145,6 +157,22 @@ timeout-secs = 2700
 id = "sim-asan/zakura-rt-zakura-scheduler"
 build = "sim-asan"
 args = "test --locked -p zakura-rt -p zakura-scheduler --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests"
+timeout-secs = 2700
+
+# zakura-sim's own release and AddressSanitizer runs (sim-7.2): the
+# library's unit tests and the scheduler, race and replay test targets.
+# `cli` spawns the `zakura-sim` binary, which Cargo builds with the same
+# flags.
+[[lane]]
+id = "sim-release/zakura-sim"
+build = "sim-release"
+args = "test --locked -p zakura-sim --release --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test replay_exact --test idle --test time --test race_schedules"
+timeout-secs = 2700
+
+[[lane]]
+id = "sim-asan/zakura-sim"
+build = "sim-asan"
+args = "test --locked -p zakura-sim --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --lib --test draws --test race_fixtures --test discovery --test witness --test cli --test race_schedules"
 timeout-secs = 2700
 
 # Fuzz targets. A `sim` target runs the one harness that
@@ -191,6 +219,17 @@ smoke-secs = 60
 args = ["-len_control=0"]
 timeout-secs = 1800
 
+# `sync/composed` runs `sync/wire`'s node and mirrors with the topology,
+# chain, closes, growths, reorgs, block holds and teardown its 27-byte
+# prefix composes, so the target fuzzes how many of each a run takes and in
+# what order.
+[[target]]
+package = "sim"
+name = "sync_composed"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
 # `block-sync/storage`'s two-byte prefix picks a saved scenario or the
 # default one. A generated run takes about 96 s and needs about 7 GB, so the
 # row raises the RSS limit to 8 GiB, and its smoke and scheduled campaign run
@@ -215,6 +254,26 @@ package = "sim"
 name = "discovery_wire"
 smoke-secs = 60
 args = ["-len_control=0"]
+timeout-secs = 1800
+
+# `discovery/composed` runs `discovery/wire`'s node with one peer whose
+# script, holds, links and node limits its 17-byte prefix composes, so the
+# target fuzzes the order, count and mix of the peer's exchanges.
+[[target]]
+package = "sim"
+name = "discovery_composed"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
+# `discovery/spam` runs `discovery/wire`'s node with one to three
+# spammers, which act without a rate limit and dial again after every
+# close, beside an honest peer whose requests must never close it.
+[[target]]
+package = "sim"
+name = "discovery_spam"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
 # `header-sync/wire` runs the header-sync node behind its real transport on

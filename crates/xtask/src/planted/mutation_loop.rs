@@ -85,7 +85,7 @@ use super::{
     pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
     planted_layout, provenance, remove_worktree,
     seeds::{self, Registry},
-    CaseFile, TypedFile, PLANTED_DIR, PROFILE, SHARED,
+    CaseFile, PLANTED_DIR, PROFILE, SHARED,
 };
 use crate::{
     run_command,
@@ -731,9 +731,10 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
             if file.seed.is_some() {
                 watched.push(PathBuf::from(seeds::REGISTRY));
             }
-            if let Some(TypedFile { scenario, plan, .. }) = file.typed {
-                watched.push(scenario);
-                watched.extend(plan);
+            if let Some(typed) = file.typed {
+                let plan = typed.plan_file()?;
+                watched.push(typed.scenario);
+                watched.extend(plan.map(|plan| plan.path().to_path_buf()));
             }
             watched.extend(file.checks);
         }
@@ -1606,26 +1607,22 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
             .map_err(|error| format!("{}: {error}", path.display()))?;
             match (file.seed, file.typed) {
                 (Some(name), None) => Ok(seed(&name)),
-                (
-                    None,
-                    Some(TypedFile {
-                        harness,
-                        scenario,
-                        plan,
-                    }),
-                ) => {
+                (None, Some(typed)) => {
+                    let plan = typed
+                        .plan_file()
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
                     let mut args = vec![
                         "--scenario".to_owned(),
-                        fs::read_to_string(tree.join(&scenario))?,
+                        fs::read_to_string(tree.join(&typed.scenario))?,
                     ];
                     if let Some(plan) = plan {
                         args.extend([
-                            "--plan".to_owned(),
-                            tree.join(plan).to_string_lossy().into_owned(),
+                            plan.flag().to_owned(),
+                            tree.join(plan.path()).to_string_lossy().into_owned(),
                         ]);
                     }
                     Ok(Runnable::Record {
-                        harness,
+                        harness: typed.harness,
                         args,
                         property: property.to_owned(),
                     })

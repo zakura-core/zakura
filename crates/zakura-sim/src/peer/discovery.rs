@@ -234,6 +234,7 @@ impl Request {
 const SESSION: u64 = 0;
 
 /// An answer waiting for its hold.
+#[derive(Clone)]
 struct Held {
     due: Instant,
     answer: Answer,
@@ -424,6 +425,10 @@ pub(crate) struct DiscoveryPeer {
     relays: Vec<NodeSecretKey>,
     content: DiscoveryContent,
     models: Option<Models>,
+    /// Whether an act whose frame the models label otherwise than its own
+    /// label still sends, with the models' labels, rather than failing.
+    /// A composed script's peer sets it ([`super::PeerSpec::skip_stale_acts`]).
+    pub(crate) lenient: bool,
 }
 
 impl DiscoveryPeer {
@@ -457,6 +462,7 @@ impl DiscoveryPeer {
             relays,
             content,
             models: None,
+            lenient: false,
         })
     }
 
@@ -649,7 +655,19 @@ impl DiscoveryPeer {
                     .get_mut(&header.message_type)
                     .expect("every request row has a model");
                 if faults.is_conformant() {
-                    model.request_frame(SESSION)
+                    let labels = model.request_frame(SESSION);
+                    // The evidence settles an `OverMargin` request by the
+                    // node's count, which can admit it, so it counts toward
+                    // the requests after it either way.
+                    if labels.first() == Label::OverMargin {
+                        model.open_crossed(SESSION);
+                    }
+                    labels
+                } else if faults.contains(Label::BadContent) {
+                    // The node decodes a request before its serving counts
+                    // it, so a request whose content fails is refused
+                    // before any margin applies.
+                    Labels::NONE
                 } else {
                     model.clone().request_frame(SESSION)
                 }

@@ -1,7 +1,8 @@
 //! The `sync` seeds: `sync/wire`'s and `sync/storage`'s saved scenarios and
 //! curated combinations, each its tag and the empty Plan, the
-//! `sync/storage` seeds whose Plan is a fixed draw a search picked, and
-//! zakura#2378's known failure, whose Plan a steered run records.
+//! `sync/storage` seeds whose Plan is a fixed draw a search picked,
+//! zakura#2378's known failure, whose Plan a steered run records, and the
+//! `sync/composed` prefixes, each under the empty Plan.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
@@ -14,7 +15,10 @@ use crate::{
     harness::{
         run_steered,
         sync::{SavedSync, SyncStorage},
-        sync_wire::{SavedWire, SyncWire, COMBINED_TAG, CURATED},
+        sync_wire::{
+            SavedWire, SyncComposed, SyncWire, COMBINED_TAG, CURATED, SYNC_COMPOSED_BYTES,
+            SYNC_COMPOSED_VERSION,
+        },
         Subsystem,
     },
     observe::BlockSyncFact,
@@ -178,6 +182,56 @@ impl Steer for WriterLast {
     }
 }
 
+/// A `sync/composed` prefix: two mirrors, the second dialed by the node,
+/// on the default chain, then `events`, three bytes each, then zeros.
+fn composed(events: &[[u8; 3]]) -> Vec<u8> {
+    let mut prefix = vec![SYNC_COMPOSED_VERSION, 0b0000_1001, 0];
+    prefix.extend(events.iter().flatten());
+    prefix.resize(SYNC_COMPOSED_BYTES, 0);
+    prefix
+}
+
+/// The `sync/composed` seeds, `sync-composed-<name>`:
+///
+/// - `honest`: two mirrors serve one chain with no control step.
+/// - `close-growth-stall`: mirror 0's connection closes after the second
+///   admission, the chain grows, and each mirror range read stalls for
+///   3 s.
+/// - `reset`: the mirrors reset to a fork at height 3 that ends one above
+///   the tip.
+/// - `every-step`: every control kind once: two closes, growth, a reset, a
+///   held range read and a teardown.
+fn composed_seeds() -> Vec<Seed> {
+    let targets = "crates/zakura-sim/tests/targets.rs";
+    let source = "crates/zakura-sim/tests/sync_composed.rs";
+    let every_step = [
+        [1, 1, 0b0000_0100],
+        [2, 1, 0],
+        [3, 1, 0],
+        [4, 9, 0],
+        [5, 0b0000_0100, 2],
+        [7, 0, 0],
+        [3, 3, 0],
+    ];
+    let close_growth_stall = [[1, 0, 0b0000_0101], [3, 0, 0], [5, 0b0000_0100, 1]];
+    [
+        ("honest", targets, composed(&[])),
+        ("close-growth-stall", source, composed(&close_growth_stall)),
+        ("reset", targets, composed(&[[4, 9, 0]])),
+        ("every-step", targets, composed(&every_step)),
+    ]
+    .into_iter()
+    .map(|(name, source, prefix)| {
+        Seed::new(
+            format!("sync-composed-{name}"),
+            SyncComposed::NAME,
+            source,
+            prefix,
+        )
+    })
+    .collect()
+}
+
 /// `seed` with each of `witnesses`.
 fn witnessed(seed: Seed, witnesses: &[(&str, Expect)]) -> Seed {
     witnesses.iter().fold(seed, |seed, (property, expect)| {
@@ -242,5 +296,6 @@ pub(super) fn seeds() -> Vec<Seed> {
         .chain(storage)
         .chain(searched)
         .chain([known_failure])
+        .chain(composed_seeds())
         .collect()
 }

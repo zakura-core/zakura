@@ -12,11 +12,12 @@ use crate::{
             WATCH_OBSERVED_UNDER_FLOOD, WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
         },
         header_sync_progress::HONEST_PROGRESS,
+        session::HONEST_NEVER_PUNISHED,
     },
     harness::{
         header_sync::{
             grammar, storage_witnesses as witnesses, Flood, FloodScenario, HeaderWire, ReleaseWake,
-            RepairHarness, RepairScenario, Storage, StorageScenario, WakeScenario,
+            RepairHarness, RepairScenario, Storage, StorageScenario, WakeScenario, DIRECT_DISPATCH,
         },
         wire_plans::SavedPlan,
         Subsystem,
@@ -98,9 +99,11 @@ fn storage_seeds() -> Vec<Seed> {
         .map(|(name, scenario, slice)| {
             let seed = storage(name, STORAGE_SOURCE, &scenario, &storage_plan(slice));
             match name {
+                "header-storage-default" => seed.witness(DIRECT_DISPATCH, Expect::Holds),
                 "header-storage-close-relink" => seed
                     .witness(CHUNK_BUDGET_BOUND, Expect::Holds)
-                    .witness(TEARDOWN_RETURNS_BASELINE, Expect::Holds),
+                    .witness(TEARDOWN_RETURNS_BASELINE, Expect::Holds)
+                    .witness(OUTSTANDING_WORK_BOUNDED, Expect::Holds),
                 "header-storage-stale-prepare" => {
                     seed.witness(STALE_COMPLETION_INERT, Expect::Holds)
                 }
@@ -163,14 +166,42 @@ fn witness_seeds() -> Vec<Seed> {
     let source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs";
     scenarios
         .into_iter()
-        .map(|(name, scenario, slice)| storage(&name, source, &scenario, &storage_plan(slice)))
+        .map(|(name, scenario, slice)| {
+            let seed = storage(&name, source, &scenario, &storage_plan(slice));
+            match name.as_str() {
+                "header-storage-w-stop-storage" => {
+                    seed.witness(TEARDOWN_RETURNS_BASELINE, Expect::Holds)
+                }
+                _ => seed,
+            }
+        })
         .collect()
+}
+
+/// The S5v9 row of `header-sync/wire`'s saved Plan `name` that its planted
+/// case expects to hold, if any.
+fn s5v9_witness(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "honest-sync" => "header-sync/s5v9/subscribe-headers/sender-within-live",
+        "after-close" => "header-sync/s5v9/subscribe-headers/after-close-closes",
+        "bad-content" => "header-sync/s5v9/headers/bad-content-closes",
+        "bad-cursor" => "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
+        "long-payload" => "header-sync/s5v9/status/long-payload-closes",
+        "over-credit-header" => "header-sync/s5v9/subscribe-headers/over-credit-closes",
+        "over-live" => "header-sync/s5v9/subscribe-headers/over-live-closes",
+        "reserved-flags" => "header-sync/s5v9/status/reserved-flags-closes",
+        "short-payload" => "header-sync/s5v9/status/short-payload-closes",
+        "undeclared-type" => "header-sync/s5v9/undeclared-type-closes",
+        "unsolicited" => "header-sync/s5v9/headers/unsolicited-closes",
+        _ => return None,
+    })
 }
 
 /// `header-sync/wire`'s saved Plans, `header-wire-<name>`: each Plan's tag,
 /// then the honest sync's 16 KiB draw, or no bytes for the rest, which runs
-/// the default Plan. The progress fixture and the three refused-page acts
-/// are planted cases' inputs, so each carries a witness expecting a hold.
+/// the default Plan. The progress fixture, the reopen, the three
+/// refused-page acts, the honest sync and the S5v9 rows' acts are planted
+/// cases' inputs, so each carries a witness expecting a hold.
 fn wire_seeds() -> Vec<Seed> {
     SavedPlan::ALL
         .into_iter()
@@ -185,15 +216,21 @@ fn wire_seeds() -> Vec<Seed> {
                 "crates/zakura-sim/tests/header_wire_lifecycle.rs",
                 input,
             );
-            match plan {
+            let seed = match plan {
                 SavedPlan::HonestProgress => seed.witness(HONEST_PROGRESS, Expect::Holds),
-                SavedPlan::Act(
+                SavedPlan::HonestSync => seed.witness(HONEST_NEVER_PUNISHED, Expect::Holds),
+                SavedPlan::Reopen
+                | SavedPlan::Act(
                     Act::BadContent {
                         rule: ContentRule::Linkage | ContentRule::LowerLocator,
                     }
                     | Act::OverCreditObjects,
                 ) => seed.witness(COMMIT_ONLY_AUTHORIZED, Expect::Holds),
                 _ => seed,
+            };
+            match s5v9_witness(plan.name()) {
+                Some(property) => seed.witness(property, Expect::Holds),
+                None => seed,
             }
         })
         .collect()

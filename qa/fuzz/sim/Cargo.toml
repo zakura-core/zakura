@@ -24,10 +24,13 @@ block_reactor_policy = "block/reactor-policy"
 header_publisher_policy = "header/publisher-policy"
 sync_storage = "sync/storage"
 sync_wire = "sync/wire"
+sync_composed = "sync/composed"
 handshake_wire = "handshake/wire"
 handshake_counts = "handshake/counts"
 block_sync_storage = "block-sync/storage"
 discovery_wire = "discovery/wire"
+discovery_composed = "discovery/composed"
+discovery_spam = "discovery/spam"
 header_sync_wire = "header-sync/wire"
 
 [features]
@@ -42,6 +45,9 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 zakura-scheduler = { path = "../../../crates/zakura-scheduler" }
 zakura-sim = { path = "../../../crates/zakura-sim" }
+
+[dev-dependencies]
+zakura-rt = { path = "../../../crates/zakura-rt" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(zakura_sim)"] }
@@ -168,6 +174,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sync_composed"
+path = "fuzz_targets/sync_composed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_sync_storage"
 path = "fuzz_targets/block_sync_storage.rs"
 test = false
@@ -177,6 +190,20 @@ bench = false
 [[bin]]
 name = "discovery_wire"
 path = "fuzz_targets/discovery_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_composed"
+path = "fuzz_targets/discovery_composed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_spam"
+path = "fuzz_targets/discovery_spam.rs"
 test = false
 doc = false
 bench = false

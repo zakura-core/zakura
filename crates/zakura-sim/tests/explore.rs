@@ -431,6 +431,21 @@ fn classify_table() {
             vec![(KNOWN.to_owned(), Bucket::Known)],
         ),
         (
+            // The step loop ends a run at its own livelock violation whatever
+            // the property's status, as `ZAKURA_SIM_KNOWN` can make it.
+            "Known property ended the run",
+            run_of(Ok(synthetic(
+                Outcome::Violation,
+                Some(KNOWN),
+                None,
+                vec![],
+                0,
+            ))),
+            ExploreOutcome::Clean,
+            None,
+            vec![(KNOWN.to_owned(), Bucket::Known)],
+        ),
+        (
             "Draft property violated",
             run_of(Ok(synthetic(idle, None, None, vec![violated(DRAFT)], 0))),
             ExploreOutcome::Clean,
@@ -715,4 +730,29 @@ fn a_panicking_job_retires_the_worker_and_resumes() {
     assert_eq!(worker.retired(), 1);
     let outcome = worker.explore(&PENDING, &[], |_, _, classified| classified.outcome.clone());
     assert_eq!(outcome, ExploreOutcome::Clean);
+}
+
+/// A steered run that a harness failure ends still returns the Plan bytes
+/// its steer recorded, not the input it started from, so a PCT search saves
+/// a reproducer of the run that failed.
+#[test]
+fn a_steered_harness_failure_keeps_its_recorded_bytes() {
+    let input = [7u8; 8];
+    let (run, replay) = zakura_sim::explore::run_steered_bytes::<Colon>(
+        &input,
+        &mut NullSink,
+        zakura_sim::explore::pct::Pct::for_input(&input),
+    );
+    assert!(
+        matches!(
+            &run.result,
+            Err(HarnessError::Run {
+                failure: HarnessFailure::TaskNameHasColon { .. },
+                ..
+            })
+        ),
+        "{:?}",
+        run.result
+    );
+    assert_ne!(replay, input, "the replay is the steer's recording");
 }

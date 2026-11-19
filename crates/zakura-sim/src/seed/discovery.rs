@@ -1,6 +1,7 @@
 //! The `discovery` seeds: the record-book and session-installation op
-//! tapes `zakura-network` encodes, the `discovery/wire` saved Plans, and the
-//! Plans that hold a discovery source back until a race shows.
+//! tapes `zakura-network` encodes, the `discovery/wire` saved Plans, the
+//! Plans that hold a discovery source back until a race shows, and the
+//! `discovery/composed` and `discovery/spam` prefixes.
 //!
 //! [`wait_complete_input`] and [`late_response_plan`] build their Plans by
 //! rerunning the simulator, once per step their Plan holds the source back.
@@ -15,10 +16,18 @@ use super::Seed;
 use crate::{
     check::{after_step, Violation},
     domain::discovery::{is_source, late_answer, WaitState},
+    explore::generate::draws,
     harness::{
         discovery::{run_config, spawn},
-        discovery_service::{DiscoveryWire, SavedPlan},
+        discovery_service::{
+            composed_prefix, spam_prefix, DiscoveryComposed, DiscoverySpam, DiscoveryWire,
+            SavedPlan,
+        },
         run_prepared, HarnessError, Subsystem,
+    },
+    peer::{
+        discovery::{DiscoveryAct, Request},
+        PeerAction,
     },
     plan::width,
     record::{DrawRecord, Record},
@@ -77,7 +86,124 @@ pub(super) fn seeds() -> Vec<Seed> {
             _ => Seed::new(name, DiscoveryWire::NAME, source, plan.tag().to_vec()),
         });
     }
+    seeds.extend(composed_seeds());
+    seeds.extend(spam_seeds());
     seeds
+}
+
+/// `request` as a peer's step.
+fn ask(request: Request) -> PeerAction {
+    PeerAction::Ask { request }
+}
+
+/// An undeclared message type, as a peer's step.
+const UNDECLARED: PeerAction = PeerAction::Discover {
+    act: DiscoveryAct::UndeclaredType { message_type: 0 },
+};
+
+/// The `discovery/composed` seeds, each a prefix under the empty Plan:
+///
+/// - `two-requests`: a peer that holds its `Services` and asks for one
+///   record and for the header-sync service.
+/// - `undeclared`: a peer that asks for peers, then sends an undeclared
+///   message type, which the node refuses.
+fn composed_seeds() -> Vec<Seed> {
+    let source = "crates/zakura-sim/tests/targets.rs";
+    let two_requests = [ask(Request::GetOnePeer), ask(Request::GetHeaderSyncService)];
+    let undeclared = [ask(Request::GetPeers), UNDECLARED];
+    [
+        (
+            "two-requests",
+            composed_prefix(0, 1, 0b0000_1100, &two_requests),
+        ),
+        ("undeclared", composed_prefix(0, 0x81, 0, &undeclared)),
+    ]
+    .into_iter()
+    .map(|(name, prefix)| {
+        let prefix = prefix.unwrap_or_else(|error| panic!("discovery-composed-{name}: {error}"));
+        Seed::new(
+            format!("discovery-composed-{name}"),
+            DiscoveryComposed::NAME,
+            source,
+            prefix.to_vec(),
+        )
+    })
+    .collect()
+}
+
+/// The search that found `discovery-spam-content-before-margin`: generator
+/// seed 4106, inputs of up to 512 bytes, run 302.
+const CONTENT_BEFORE_MARGIN: (u64, usize, usize) = (4106, 512, 302);
+
+/// The `discovery/spam` seeds:
+///
+/// - `bursts`: three spammers send `Hello` bursts and repeated requests past
+///   the margin, beside an honest peer that asks for services and peers.
+/// - `reconnect`: one spammer sends undeclared types back to back,
+///   disconnects and dials again, beside an honest peer that asks for
+///   peers.
+/// - `content-before-margin`: the generator's input
+///   [`CONTENT_BEFORE_MARGIN`], whose spammer sends a `GetServices` with bad
+///   wanted services past the margin, which the node refuses at decode.
+fn spam_seeds() -> Vec<Seed> {
+    let hello_burst = PeerAction::Discover {
+        act: DiscoveryAct::HelloBurst,
+    };
+    let bursts = [
+        hello_burst,
+        hello_burst,
+        ask(Request::GetPeers),
+        ask(Request::GetPeers),
+        ask(Request::GetServices),
+        ask(Request::GetServices),
+        ask(Request::GetPeers),
+    ];
+    let reconnect = [
+        UNDECLARED,
+        UNDECLARED,
+        PeerAction::Disconnect,
+        UNDECLARED,
+        UNDECLARED,
+    ];
+    let prefix = |name: &str, spammers, asks: &[Request], steps: &[PeerAction]| {
+        spam_prefix(0, spammers, asks, steps)
+            .unwrap_or_else(|error| panic!("discovery-spam-{name}: {error}"))
+            .to_vec()
+    };
+    let (seed, max_bytes, run) = CONTENT_BEFORE_MARGIN;
+    let (_, content_before_margin) = draws(seed, max_bytes, DiscoverySpam::families())
+        .nth(run)
+        .expect("the generator's draws never end");
+    let targets = "crates/zakura-sim/tests/targets.rs";
+    let source = "crates/zakura-sim/tests/discovery_spam.rs";
+    [
+        (
+            "bursts",
+            targets,
+            prefix(
+                "bursts",
+                3,
+                &[Request::GetServices, Request::GetPeers],
+                &bursts,
+            ),
+        ),
+        (
+            "reconnect",
+            source,
+            prefix("reconnect", 1, &[Request::GetPeers], &reconnect),
+        ),
+        ("content-before-margin", source, content_before_margin),
+    ]
+    .into_iter()
+    .map(|(name, source, input)| {
+        Seed::new(
+            format!("discovery-spam-{name}"),
+            DiscoverySpam::NAME,
+            source,
+            input,
+        )
+    })
+    .collect()
 }
 
 /// A step's option count, the index it picked, and the index of the option

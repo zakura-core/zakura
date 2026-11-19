@@ -121,6 +121,74 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "discovery_composed",
+        &[
+            "discovery/late-response-admitted",
+            "discovery/s4v2/get-peers/bad-content-closes",
+            "discovery/s4v2/get-peers/cadence-never-closes",
+            "discovery/s4v2/get-peers/long-payload-closes",
+            "discovery/s4v2/get-peers/over-margin-closes",
+            "discovery/s4v2/get-peers/reserved-flags-closes",
+            "discovery/s4v2/get-peers/short-payload-closes",
+            "discovery/s4v2/get-services/bad-content-closes",
+            "discovery/s4v2/get-services/cadence-never-closes",
+            "discovery/s4v2/get-services/long-payload-closes",
+            "discovery/s4v2/get-services/over-margin-closes",
+            "discovery/s4v2/get-services/reserved-flags-closes",
+            "discovery/s4v2/get-services/short-payload-closes",
+            "discovery/s4v2/hello/bad-content-closes",
+            "discovery/s4v2/hello/cadence-never-closes",
+            "discovery/s4v2/hello/long-payload-closes",
+            "discovery/s4v2/hello/reserved-flags-closes",
+            "discovery/s4v2/hello/short-payload-closes",
+            "discovery/s4v2/peers/bad-content-closes",
+            "discovery/s4v2/peers/long-payload-closes",
+            "discovery/s4v2/peers/over-owed-closes",
+            "discovery/s4v2/peers/reserved-flags-closes",
+            "discovery/s4v2/peers/short-payload-closes",
+            "discovery/s4v2/peers/unsolicited-closes",
+            "discovery/s4v2/services/bad-content-closes",
+            "discovery/s4v2/services/long-payload-closes",
+            "discovery/s4v2/services/over-owed-closes",
+            "discovery/s4v2/services/reserved-flags-closes",
+            "discovery/s4v2/services/short-payload-closes",
+            "discovery/s4v2/services/unsolicited-closes",
+        ],
+    ),
+    (
+        "discovery_spam",
+        &[
+            "discovery/late-response-admitted",
+            "discovery/s4v2/get-peers/bad-content-closes",
+            "discovery/s4v2/get-peers/cadence-never-closes",
+            "discovery/s4v2/get-peers/long-payload-closes",
+            "discovery/s4v2/get-peers/reserved-flags-closes",
+            "discovery/s4v2/get-peers/short-payload-closes",
+            "discovery/s4v2/get-services/cadence-never-closes",
+            "discovery/s4v2/get-services/long-payload-closes",
+            "discovery/s4v2/get-services/over-margin-closes",
+            "discovery/s4v2/get-services/reserved-flags-closes",
+            "discovery/s4v2/get-services/short-payload-closes",
+            "discovery/s4v2/hello/bad-content-closes",
+            "discovery/s4v2/hello/cadence-never-closes",
+            "discovery/s4v2/hello/long-payload-closes",
+            "discovery/s4v2/hello/reserved-flags-closes",
+            "discovery/s4v2/hello/short-payload-closes",
+            "discovery/s4v2/peers/bad-content-closes",
+            "discovery/s4v2/peers/long-payload-closes",
+            "discovery/s4v2/peers/over-owed-closes",
+            "discovery/s4v2/peers/reserved-flags-closes",
+            "discovery/s4v2/peers/short-payload-closes",
+            "discovery/s4v2/peers/unsolicited-closes",
+            "discovery/s4v2/services/bad-content-closes",
+            "discovery/s4v2/services/long-payload-closes",
+            "discovery/s4v2/services/over-owed-closes",
+            "discovery/s4v2/services/reserved-flags-closes",
+            "discovery/s4v2/services/short-payload-closes",
+            "discovery/s4v2/services/unsolicited-closes",
+        ],
+    ),
+    (
         "discovery_wire",
         &[
             "discovery/s4v2/get-peers/bad-content-closes",
@@ -179,6 +247,15 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
             "header-sync/s5v9/subscribe-headers/short-payload-closes",
             "header-sync/state-publication-consistent",
+        ],
+    ),
+    (
+        "sync_composed",
+        &[
+            "block-sync/frontier-work-consistent",
+            "session/connection-shares-bound",
+            "session/credit-isolated",
+            "session/send-isolated",
         ],
     ),
 ];
@@ -312,8 +389,7 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name the close-and-relink and
-/// stale-prepare seeds.
+/// storage seeds carry the planted cases that name one of them as input.
 #[test]
 fn bypasses_follow_their_seed() {
     let load = |harness| seed::load(SeedSet::Corpus, Some(harness)).admitted;
@@ -332,17 +408,22 @@ fn bypasses_follow_their_seed() {
     assert_eq!(
         patches,
         [
+            "qa/planted/harness/direct-dispatch/locator-to-action-channel.patch",
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/outstanding-work-bounded/secondary-reservation.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/consumed-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-locator-permit.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/shutdown-kept-queue.patch",
             "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
         ]
         .map(Path::new),

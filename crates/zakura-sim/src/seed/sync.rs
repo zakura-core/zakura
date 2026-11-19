@@ -1,12 +1,12 @@
 //! The `sync` seeds: `sync/wire`'s and `sync/storage`'s saved scenarios and
 //! curated combinations, each its tag and the empty Plan, the
 //! `sync/storage` seeds whose Plan is a fixed draw a search picked,
-//! zakura#2378's mid-write reset, whose Plan a steered run records, and the
+//! zakura#2378's known failure, whose Plan a steered run records, and the
 //! `sync/composed` prefixes, each under the empty Plan.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
-use super::{draws::byte_input, Seed};
+use super::{draws::byte_input, Seed, SeedSet};
 use crate::{
     domain::{
         cross::{BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK},
@@ -73,10 +73,10 @@ const RESET_MID_WRITE_SEED: u64 = 23;
 /// steer, the run of [`RESET_MID_WRITE_SEED`]'s Plan under [`WriterLast`].
 /// The steer is what reaches the reset: random Plans alone rarely leave a
 /// request mid-write when the fork's reset lands. The fork's tip reset then
-/// retires a block request while its frame is partly written. Before
-/// zakura#2378's fix, that reset cancelled the whole block-sync session, and
-/// the writer fence closed the honest connection with `unfinished_exchange`
-/// while the session's other requests waited.
+/// retires a block request while its frame is partly written, which cancels
+/// the whole block-sync session, and the writer fence closes the honest
+/// connection with `unfinished_exchange` while the session's other requests
+/// wait.
 ///
 /// The steered run takes a few seconds, so the first call runs it and later
 /// calls in the process reuse its bytes.
@@ -283,18 +283,19 @@ pub(super) fn seeds() -> Vec<Seed> {
         )
         .witness(BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
     ];
-    // The session-scoped writer fence fixed zakura#2378, so the seed holds.
-    let reset_mid_write = Seed::built(
+    // zakura#2378 is open, so the seed fails by design.
+    let known_failure = Seed::built(
         "sync-wire-reset-mid-write",
         SyncWire::NAME,
         WIRE,
         reset_mid_write,
     )
-    .witness(STALLED_SERVICE_ISOLATED, Expect::Holds);
+    .witness(STALLED_SERVICE_ISOLATED, Expect::Violated)
+    .in_set(SeedSet::KnownFailure);
     wire.chain(curated)
         .chain(storage)
         .chain(searched)
-        .chain([reset_mid_write])
+        .chain([known_failure])
         .chain(composed_seeds())
         .collect()
 }

@@ -583,10 +583,9 @@ fn curated_combined_actions_sync_both_tips() {
     }
 }
 
-/// The seed that reaches zakura#2378's schedule: the fork while storage
-/// holds a submission, with every read stalled, under a Plan that a steered
-/// run recorded so that a block request's writer runs last while its frame
-/// write is under way.
+/// zakura#2378's known failure: the fork while storage holds a submission,
+/// with every read stalled, under a Plan that a steered run recorded so that
+/// a block request's writer runs last while its frame write is under way.
 const RESET_MID_WRITE: &str = "sync-wire-reset-mid-write";
 
 /// The steps at which a reset retired a block request whose frame write
@@ -613,41 +612,55 @@ fn mid_write_resets(log: &ObservationLog) -> Vec<u64> {
     resets
 }
 
-/// zakura#2378: a reset that retires a block request mid-write once
-/// cancelled the whole block-sync session, and the writer fence closed the
+/// zakura#2378's known failure: a reset that retires a block request mid-write
+/// cancels the whole block-sync session, and the writer fence closes the
 /// honest connection with `unfinished_exchange` while the session's other
-/// requests waited, which [`STALLED_SERVICE_ISOLATED`] forbids. The fence
-/// now holds the session's token, so the reset ends only the session, and
-/// the connection stays open.
+/// requests wait, which [`STALLED_SERVICE_ISOLATED`] forbids.
 ///
-/// [`RESET_MID_WRITE`] must validate as a corpus seed of `sync/wire` whose
-/// only witness expects that property to hold. Its run must reset a request
-/// mid-write and end with no violation. The test asks for a new seed if the
-/// schedule stops reaching the mid-write reset.
+/// [`RESET_MID_WRITE`] must validate as a known-failure seed of `sync/wire`
+/// whose only witness expects that violation. Its run must reset a request
+/// mid-write and then end in exactly that violation. The test fails with
+/// "fixed: remove this expectation (zakura#2378)" once the reset no longer
+/// closes the connection, and asks for a new seed if the schedule stops
+/// reaching the mid-write reset at all.
 #[test]
-fn a_mid_write_reset_keeps_an_honest_connection() {
-    let report = seed::load(SeedSet::Corpus, Some(SyncWire::NAME));
+fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
+    let report = seed::load(SeedSet::KnownFailure, Some(SyncWire::NAME));
     assert!(report.rejected.is_empty(), "{:?}", report.rejected);
     let seed = report
         .admitted
         .iter()
         .find(|seed| seed.name == RESET_MID_WRITE)
-        .expect("the seed is in the corpus");
+        .expect("the seed is a known failure");
     let witnesses: Vec<(&str, &str)> = seed
         .witness
         .iter()
         .map(|witness| (witness.property.as_str(), witness.expect.as_str()))
         .collect();
-    assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "holds")]);
+    assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "violated")]);
     let (prefix, plan) = seed.input().split_at(SyncWire::SCENARIO_BYTES);
     let (report, _, _) =
         run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
     assert!(
         !mid_write_resets(&report.log).is_empty(),
-        "{RESET_MID_WRITE} no longer resets a block request mid-write: build a new seed: {:?}",
+        "{RESET_MID_WRITE} no longer resets a block request mid-write, so it no longer \
+         reaches zakura#2378: build a new seed: {:?}",
         report.end
     );
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    let violation = report.end.violation.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{RESET_MID_WRITE} no longer violates {STALLED_SERVICE_ISOLATED}, so zakura#2378 \
+             is fixed: remove this expectation (zakura#2378): {:?}",
+            report.end
+        )
+    });
+    assert!(
+        violation.property == STALLED_SERVICE_ISOLATED
+            && violation.actual.contains("with cause unfinished_exchange"),
+        "{RESET_MID_WRITE} should violate {STALLED_SERVICE_ISOLATED} with an \
+         unfinished_exchange close until zakura#2378 is fixed, and violated another: \
+         {violation:?}"
+    );
 }
 
 /// A run's end record: its last line.

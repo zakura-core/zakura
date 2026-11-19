@@ -24,7 +24,8 @@ mod sim_reader;
 pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 pub use handshake_counts::{
-    handshake_cadence, inbound_share, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission,
+    handshake_cadence, inbound_share, node_handshake_cadence, HandshakeCadenceAdmission,
+    HandshakeCounts, IpAdmission,
 };
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are

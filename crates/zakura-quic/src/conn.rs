@@ -10,7 +10,10 @@ use std::{
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, ConnectionStats, StreamId, VarInt};
-use zakura_rt::sync::{oneshot, Mutex, PoisonError};
+use zakura_rt::{
+    sync::{oneshot, Mutex, PoisonError},
+    time::Instant,
+};
 
 use crate::{
     driver::{ConnCmd, ConnRef},
@@ -257,6 +260,7 @@ pub struct Conn {
     inner: ConnRef,
     remote_id: NodeId,
     admitted_addr: SocketAddr,
+    admitted_at: Instant,
     source_validated: bool,
     alpn: Arc<[u8]>,
 }
@@ -266,6 +270,7 @@ impl fmt::Debug for Conn {
         f.debug_struct("Conn")
             .field("remote_id", &self.remote_id)
             .field("admitted_addr", &self.admitted_addr)
+            .field("admitted_at", &self.admitted_at)
             .field("source_validated", &self.source_validated)
             .field("alpn", &String::from_utf8_lossy(&self.alpn))
             .finish()
@@ -277,6 +282,7 @@ impl Conn {
         inner: ConnRef,
         remote_id: NodeId,
         admitted_addr: SocketAddr,
+        admitted_at: Instant,
         source_validated: bool,
         alpn: Vec<u8>,
     ) -> Self {
@@ -284,6 +290,7 @@ impl Conn {
             inner,
             remote_id,
             admitted_addr,
+            admitted_at,
             source_validated,
             alpn: alpn.into(),
         }
@@ -302,6 +309,13 @@ impl Conn {
     /// The socket address admitted at accept or dial time.
     pub fn admitted_addr(&self) -> SocketAddr {
         self.admitted_addr
+    }
+
+    /// When the endpoint admitted the attempt: its `Accept` for an inbound
+    /// connection, and the start of the winning attempt for an outbound one.
+    /// An acceptor measures a whole-handshake deadline from here.
+    pub fn admitted_at(&self) -> Instant {
+        self.admitted_at
     }
 
     /// Whether the source address was validated before TLS started: by a

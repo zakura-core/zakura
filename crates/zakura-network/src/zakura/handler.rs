@@ -669,7 +669,8 @@ pub struct ZakuraLocalLimits {
     /// Stream prelude read timeout.
     pub prelude_timeout: Duration,
     /// Control handshake deadline: it bounds each read and write, and the
-    /// whole exchange in both directions.
+    /// whole exchange in both directions. A responder measures it from the
+    /// QUIC admission, so TLS and the control exchange share it.
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
@@ -3639,9 +3640,15 @@ impl ZakuraProtocolHandler {
         };
         let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
-        // The overall deadline bounds peers that pace each control step.
+        // One deadline from admission bounds the whole handshake: the control
+        // exchange gets what TLS left of `control_timeout`, so a peer that
+        // paces each stage holds the slot for `control_timeout` at most.
+        let remaining = self
+            .limits
+            .control_timeout
+            .saturating_sub(connection.admitted_at().elapsed());
         let result = match timeout(
-            self.limits.control_timeout,
+            remaining,
             self.run_native_responder_handshake(connection, remote_peer_id, conn),
         )
         .await
@@ -4899,18 +4906,8 @@ impl ZakuraProtocolHandler {
                 .await;
         }
         // A registered connection now counts as registered in `ip_slots`.
+        // It keeps its cadence token, so reconnecting costs a token.
         drop(context.control_handshake);
-        // Registration refunds the attempt's cadence token, even when a local
-        // capability change closes the connection below.
-        if matches!(registration, ZakuraRegistration::Registered { .. })
-            && context.direction == ServicePeerDirection::Inbound
-        {
-            self.refund_cadence(
-                connection.admitted_addr(),
-                connection.source_validated(),
-                "registered",
-            );
-        }
         if let ZakuraRegistration::Registered {
             conn_id,
             peer_id,
@@ -5146,6 +5143,7 @@ impl Acceptor for ZakuraProtocolHandler {
                 super::HandshakeCadenceAdmission::Admit => "admitted",
                 super::HandshakeCadenceAdmission::Exhausted => "exhausted",
                 super::HandshakeCadenceAdmission::Capacity => "capacity",
+                super::HandshakeCadenceAdmission::NodeExhausted => "node-exhausted",
             },
             hosts,
         );
@@ -5156,6 +5154,11 @@ impl Acceptor for ZakuraProtocolHandler {
                 incoming,
                 "zakura.p2p.conn.retried.cadence",
                 "zakura.p2p.conn.rejected.cadence",
+            ),
+            super::HandshakeCadenceAdmission::NodeExhausted => retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.node_cadence",
+                "zakura.p2p.conn.rejected.node_cadence",
             ),
         }
     }
@@ -8625,6 +8628,7 @@ impl ZakuraHandlerError {
 
 #[cfg(all(test, not(zakura_sim)))]
 mod tests {
+    mod admission_rate;
     mod bounded_decoding;
     pub(super) mod connection;
     mod frame_lifetime;
@@ -14709,8 +14713,8 @@ mod tests {
     /// addresses, earns the spoofed sources a stateless Retry, never a
     /// refusal, and leaves a validated Initial from the victim its own
     /// cadence (zakura#2337 review).
-    #[test]
-    fn spoofed_initials_never_lock_out_a_validated_source() {
+    #[tokio::test(start_paused = true)]
+    async fn spoofed_initials_never_lock_out_a_validated_source() {
         let victim: IpAddr = "203.0.113.9".parse().expect("test ip parses");
         let limits = ZakuraLocalLimits::from_config(&Config::default());
         let handler = ZakuraProtocolHandler::new(
@@ -14753,7 +14757,11 @@ mod tests {
             }
         }
         let fresh: IpAddr = "198.51.100.3".parse().expect("test ip parses");
-        assert_eq!(spoof(fresh), Admit::Retry, "the unvalidated ledger is full");
+        assert_eq!(
+            spoof(fresh),
+            Admit::Retry,
+            "the unvalidated node bucket and ledger are spent"
+        );
         assert_eq!(handler.admit(&attempt(fresh, true)), Admit::Accept);
         handler.finish_admission(false);
     }

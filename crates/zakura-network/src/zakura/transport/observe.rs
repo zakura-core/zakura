@@ -121,7 +121,8 @@ pub enum TransportEvent {
         /// Whether the source address was validated before TLS, which picks
         /// the ledger charged or refunded.
         validated: bool,
-        /// Admitted, exhausted, capacity, registered, or cancelled.
+        /// Admitted, exhausted, node-exhausted, capacity, refused, or
+        /// cancelled.
         action: &'static str,
         /// Tokens in a full bucket.
         capacity: u32,

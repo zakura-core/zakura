@@ -731,9 +731,10 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     );
                 }
             }
-            // Registration, a local refusal after TLS, and a cancelled
-            // admission refund the attempt.
-            "registered" | "refused" | "cancelled" => window.refund(now),
+            // A local refusal after TLS and a cancelled admission refund the
+            // attempt. The node's bucket refuses as "node-exhausted", which
+            // no address's charges need to earn.
+            "refused" | "cancelled" => window.refund(now),
             "exhausted" if !rate && !window.refusal_earned(now) => {
                 return cx.violated(
                     "an address with a token is never exhausted",

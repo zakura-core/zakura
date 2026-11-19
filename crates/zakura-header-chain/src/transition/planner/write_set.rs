@@ -349,9 +349,9 @@ pub(super) fn body_work_effect(
         return BodyWorkEffect::Preserved;
     }
 
-    // A rival commit leaves every outstanding selected hash above the same shared parent.
-    if new_selected == old_selected
-        && new_verified.len() > old_verified.len()
+    // Both paths retained their history. Compare tips because finalization can trim
+    // their common prefix in the same transaction as a rival commit.
+    if new_selected.last() == old_selected.last()
         && common_body_frontier(old_selected, old_verified)
             == common_body_frontier(new_selected, new_verified)
     {
@@ -521,6 +521,18 @@ mod body_work_epoch_tests {
                 replaces(),
             ),
             BodyWorkEffect::Preserved
+        );
+        // The same commit may also finalize the common parent.
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected[1..],
+                &before_commit,
+                &late_commit[1..],
+                Some(finality(selected[1])),
+                continues(),
+            ),
+            BodyWorkEffect::Preserved,
         );
         // Later transitions that leave the verified tip in place keep the epoch, even
         // when finality trims both projections.

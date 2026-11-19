@@ -205,9 +205,8 @@ impl ReactorState {
     fn verified_tip_diverged(&self) -> bool {
         self.committed_view.as_ref().is_some_and(|view| {
             let frontiers = view.frontiers;
-            frontiers.verified_best.height > frontiers.header_best.height
-                || (frontiers.verified_best.height == frontiers.header_best.height
-                    && frontiers.verified_best.hash != frontiers.header_best.hash)
+            view.body_download_anchor.height < frontiers.header_best.height
+                && frontiers.verified_best.height >= frontiers.header_best.height
         })
     }
 

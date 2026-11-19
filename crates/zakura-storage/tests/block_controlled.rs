@@ -734,14 +734,15 @@ fn an_earlier_admission_wins_an_equal_work_tie() {
     harness.complete(first, BlockOutcome::Admit);
     harness.complete(second, BlockOutcome::Admit);
 
-    // The selected chain ends at A1, so B1's commit moves the verified tip
-    // off it and starts an epoch too.
+    // B commits first while A remains the selected header.
+    let epoch = harness.engine.view().body_work_epoch;
     harness.complete(second, COMMITTED);
     assert_eq!(
         harness.engine.snapshot().frontiers.verified_best,
         b.frontier()
     );
-    let epoch = harness.engine.view().body_work_epoch;
+    assert_eq!(harness.engine.view().body_work_epoch, epoch);
+    assert_eq!(harness.engine.view().body_download_anchor, anchor);
     harness
         .service
         .complete(first, COMMITTED)

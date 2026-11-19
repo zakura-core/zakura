@@ -34,7 +34,7 @@ pub struct FrontierSet {
     pub finalized: Frontier,
     /// Best locally header-valid frontier.
     pub header_best: Frontier,
-    /// Best body-verified frontier on the selected path.
+    /// Tip of the verified chain, which can diverge from the selected headers.
     pub verified_best: Frontier,
 }
 

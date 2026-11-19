@@ -70,6 +70,7 @@ struct Seen {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ViewShape {
     frontiers: zakura_header_chain::FrontierSet,
+    body_download_anchor: Frontier,
     header_best_score: zakura_header_chain::ChainScore,
     alarms: zakura_header_chain::AlarmSet,
     /// Whether the body-work epoch moved since the previous step.
@@ -298,6 +299,7 @@ fn served(blocks: &[(block::Height, Vec<u8>)]) -> Vec<(block::Height, block::Has
 fn shape(view: &CommittedHeaderChainView, reset: bool) -> ViewShape {
     ViewShape {
         frontiers: view.snapshot.frontiers,
+        body_download_anchor: view.body_download_anchor,
         header_best_score: view.snapshot.header_best_score,
         alarms: view.snapshot.alarms.clone(),
         reset,
@@ -359,6 +361,10 @@ async fn committed_bodies_select_query_and_serve_alike() {
     }
     for (step, real, controlled) in &steps {
         assert_eq!(real, controlled, "after {step}");
+        assert_eq!(
+            real.view.body_download_anchor, real.needed.0,
+            "after {step}"
+        );
     }
 
     // The scenario reaches the tie and the reset it claims.

@@ -128,6 +128,14 @@ async fn receive_across_rival_commit(waiting_for_decode: bool) {
     assert_eq!(wiring.view.borrow().download_floor, parent.height);
     assert_eq!(wiring.view.borrow().verified_hash, parent.hash);
     assert_eq!(wiring.view.borrow().reset_epoch, reset_epoch);
+    assert!(
+        events.0.lock().unwrap().iter().all(|event| match event {
+            BlockEvent::Reactor { state, .. } =>
+                state.request_floor == parent.height && state.verified_block_tip == parent.height,
+            _ => true,
+        }),
+        "no reactor transition retired the selected height before its response"
+    );
     assert_eq!(handle.accounting.reserved(), charge);
     let current = wiring.registry.outstanding_claims_at(height).pop().unwrap();
     assert_eq!(current.peer, peer);

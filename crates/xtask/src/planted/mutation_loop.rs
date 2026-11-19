@@ -644,8 +644,18 @@ pub(super) fn planted_cases(
         }
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
-        let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
+        let CaseFile {
+            also_violates,
+            search,
+            ..
+        } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
+        // A search case commits no input for a witness lane to run. The
+        // loop's generator lanes search each mutant instead.
+        if search.is_some() {
+            println!("{path}: skipped: a search case has no committed witness");
+            continue;
+        }
         cases.push(LoopCase {
             label: relative_label(repo_root, &patch),
             listed_in: case_file.clone(),
@@ -1628,7 +1638,7 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
                     })
                 }
                 _ => Err(format!(
-                    "{}: names neither or both of seed and typed",
+                    "{}: names no seed or typed case, or more than one",
                     path.display()
                 )
                 .into()),

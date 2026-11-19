@@ -1,0 +1,23 @@
+# The header publisher's stop asserts that every subscription already
+# ended. That doesn't hold when a subscriber leaves mid-subscription, so
+# the session's publisher task panics as its session ends. The reactor
+# isn't the task that panics: a reactor that unwinds fails the run as the
+# tap's `ReactorGone`, never as this ID. The required failure is
+# `sim/no-task-panic`'s.
+#
+# `sim/no-task-panic` registers no trigger-history check, so the runner
+# judges both runs by their outcome alone (#2590).
+#
+# The input comes from a search on `header-sync/storage` whose cycled
+# draws give every third run the `serving-churn` family: the node serves
+# four mirrors, and each closes its connection once the node completes a
+# read for it, then relinks. The panic comes as the closed session's
+# publisher stops, and its unwind drops what the publisher held, so
+# nothing else the node owes changes.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[search]
+harness = "header-sync/storage"
+seed = 1
+runs = 60
+draws = "cycle"

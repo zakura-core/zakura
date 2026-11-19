@@ -753,6 +753,7 @@ impl StartCmd {
                 state.clone(),
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
+                zakura_block_sync_handoff.announced_blocks().clone(),
             )
             .boxed()
             .await;

@@ -451,6 +451,9 @@ pub struct SemanticallyVerifiedBlock {
     pub auth_data_root: Option<AuthDataRoot>,
     /// Original verifier receipt order, also forwarded by trusted mirrors.
     ///
+    /// The verifier draws it when the complete block arrives, or reuses the order reserved when
+    /// the block's header was admitted if the body followed within its deadline.
+    ///
     /// This is process-local metadata, not serialized block data. Restored
     /// blocks have no order. Orders from different primary sessions cannot be compared.
     pub receipt_order: Option<u64>,

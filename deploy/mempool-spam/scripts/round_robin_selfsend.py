@@ -130,7 +130,9 @@ def wait_next_block(
 def transaction_state(node: dict, txid: str, timeout: float) -> str | None:
     """Where `node` holds `txid`: "mempool", "block", or None.
 
-    None also covers a node that did not answer within `timeout`.
+    "block" covers side-chain blocks too, which come back with a block hash
+    and zero confirmations. None also covers a node that did not answer
+    within `timeout`.
     """
     try:
         if txid in rpc_call(node["rpc_url"], "getrawmempool", timeout=timeout):
@@ -141,7 +143,7 @@ def transaction_state(node: dict, txid: str, timeout: float) -> str | None:
         tx = rpc_call(node["rpc_url"], "getrawtransaction", [txid, 1], timeout=timeout)
     except Exception:  # noqa: BLE001
         return None
-    if isinstance(tx, dict) and int(tx.get("confirmations") or 0) > 0:
+    if isinstance(tx, dict) and (tx.get("blockhash") or int(tx.get("confirmations") or 0) > 0):
         return "block"
     return "mempool"
 

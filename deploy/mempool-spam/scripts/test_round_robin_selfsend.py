@@ -11,8 +11,9 @@ TXID = "ab" * 32
 
 
 def fake_rpc(nodes: dict):
-    """An `rpc_call` stand-in. `nodes` maps an RPC URL to its behaviour:
-    "mempool" or "block" answers for TXID, and "dead" waits out the timeout."""
+    """An `rpc_call` stand-in. `nodes` maps an RPC URL to where it holds TXID:
+    "mempool", "block" (best chain), "side" (only a side-chain block), or
+    "dead" (never answers, so every call waits out its timeout)."""
 
     def call(url, method, params=None, timeout=30, auth=None):
         behaviour = nodes[url]
@@ -22,7 +23,9 @@ def fake_rpc(nodes: dict):
         if method == "getrawmempool":
             return [TXID] if behaviour == "mempool" else []
         if behaviour == "block":
-            return {"txid": TXID, "confirmations": 1}
+            return {"txid": TXID, "confirmations": 1, "blockhash": "11" * 32}
+        if behaviour == "side":
+            return {"txid": TXID, "confirmations": 0, "height": -1, "blockhash": "22" * 32}
         raise RuntimeError("No such mempool or main chain transaction")
 
     return call
@@ -50,15 +53,16 @@ class FirstSeenMatrix(unittest.TestCase):
         self.assertEqual(in_block, {})
 
     def test_a_node_that_first_finds_it_mined_is_kept_apart(self):
-        nodes = [node("a"), node("late")]
-        rpc = fake_rpc({"http://a": "mempool", "http://late": "block"})
+        # A side-chain block also counts: it isn't in the mempool either.
+        nodes = [node("a"), node("late"), node("side")]
+        rpc = fake_rpc({"http://a": "mempool", "http://late": "block", "http://side": "side"})
         with mock.patch.object(harness, "rpc_call", rpc):
             in_mempool, in_block = harness.first_seen_matrix(
                 nodes, TXID, duration=1.0, interval=0.05
             )
 
         self.assertEqual(set(in_mempool), {"a"})
-        self.assertEqual(set(in_block), {"late"})
+        self.assertEqual(set(in_block), {"late", "side"})
 
 
 class Report(unittest.TestCase):

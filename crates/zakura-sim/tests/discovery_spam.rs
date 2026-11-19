@@ -123,3 +123,17 @@ fn a_spammer_keeps_going_after_its_connection_ends() {
         "{answers:?}"
     );
 }
+
+/// A spammer's `GetServices` with bad wanted services, sent past the margin,
+/// found by the generator (seed 4106, run 302). The node decodes a request
+/// before its serving counts it, so it refuses this one at decode, with no
+/// count. The peer's model labels it `BadContent`, which justifies the
+/// close. Before, it labelled it `OverMargin`, which the evidence settles
+/// only by the node's count, so the justified close failed
+/// `conformant-never-closes`.
+#[test]
+fn a_request_with_bad_content_is_refused_before_its_margin() {
+    run_clean(include_bytes!(
+        "fixtures/discovery-spam-content-before-margin.bin"
+    ));
+}

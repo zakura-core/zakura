@@ -44,7 +44,7 @@ pub(super) enum SequencerEvidence {
         invalid: zakura_header_chain::ConsensusBodyInvalid,
     },
     Misbehavior {
-        peer: ZakuraPeerId,
+        supplier: BlockSupplier,
         reason: BlockSyncMisbehavior,
     },
 }
@@ -128,7 +128,7 @@ pub(super) struct ReceivedBody {
     pub(super) body: super::super::reorder::BodyFacts,
     pub(super) bytes: u64,
     pub(super) admitted_estimate_bytes: Option<u64>,
-    pub(super) peer: ZakuraPeerId,
+    pub(super) supplier: BlockSupplier,
 }
 
 /// How a chain-tip reset was classified.
@@ -465,7 +465,7 @@ impl SequencerState {
             body.body,
             body.bytes,
             body.admitted_estimate_bytes,
-            body.peer,
+            body.supplier,
         ) {
             AcceptOutcome::Buffered { .. } => BodyAcceptance::Buffered,
             AcceptOutcome::Redundant { .. } => BodyAcceptance::Redundant,
@@ -982,7 +982,7 @@ impl SequencerState {
                     };
                     let disconnects = reason.proves_tampered_body();
                     let action = SequencerEvidence::Misbehavior {
-                        peer: applying.source_peer.clone(),
+                        supplier: applying.supplier.clone(),
                         reason,
                     };
                     // The driver disconnects a proven tampering supplier, so that

@@ -2074,38 +2074,37 @@ impl ZakuraSupervisorHandle {
     pub async fn enforce_block_sync_misbehavior(
         &self,
         peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
         reason: &crate::zakura::BlockSyncMisbehavior,
     ) -> bool {
         if !reason.proves_tampered_body() {
             return false;
         }
-        let token = {
+        let disconnected = {
             let state = self.inner.lock().await;
             state
                 .active_by_peer
                 .get(peer_id)
-                .map(|entry| (entry.disconnect_token.clone(), entry.close_cause.clone()))
+                .filter(|entry| entry.conn_id == conn_id && !entry.disconnect_token.is_cancelled())
+                .is_some_and(|entry| {
+                    entry.close_cause.record(CloseOutcome::fault(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        CloseRow::BSYNC_CLOSE_18,
+                    ));
+                    entry.disconnect_token.cancel();
+                    true
+                })
         };
-        // Count only connections this call closes, not a peer that already left
-        // or a connection that is already shutting down.
-        let disconnected = token.is_some_and(|(token, close_cause)| {
-            let already_closing = token.is_cancelled();
-            close_cause.record(CloseOutcome::fault(
-                ZAKURA_STREAM_BLOCK_SYNC,
-                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-                CloseRow::BSYNC_CLOSE_18,
-            ));
-            token.cancel();
-            !already_closing
-        });
         if disconnected {
             metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
         }
         info!(
             ?peer_id,
+            conn_id,
             ?reason,
             disconnected,
-            "disconnecting Zakura peer that served a tampered block body"
+            "recorded tampered block body verdict for Zakura connection"
         );
         disconnected
     }
@@ -10106,7 +10105,7 @@ mod tests {
         supervisor: &ZakuraSupervisorHandle,
         peer: ZakuraPeerId,
         disconnect_token: CancellationToken,
-    ) {
+    ) -> ZakuraConnId {
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
         let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
         let registration = supervisor
@@ -10122,10 +10121,7 @@ mod tests {
             )
             .await;
 
-        assert!(
-            matches!(registration, ZakuraRegistration::Registered { .. }),
-            "test peer should register once"
-        );
+        registered_conn_id(registration)
     }
 
     async fn register_test_peer_with_hash_and_ip(
@@ -11547,11 +11543,12 @@ mod tests {
         for (index, (reason, disconnects)) in cases.into_iter().enumerate() {
             let peer = test_peer(u8::try_from(index + 20).expect("the case count fits in u8"));
             let disconnect_token = CancellationToken::new();
-            register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
+            let conn_id =
+                register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
 
             assert_eq!(
                 supervisor
-                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .enforce_block_sync_misbehavior(&peer, conn_id, &reason)
                     .await,
                 disconnects,
                 "{reason:?}"
@@ -11560,7 +11557,7 @@ mod tests {
             if disconnects {
                 assert!(
                     !supervisor
-                        .enforce_block_sync_misbehavior(&peer, &reason)
+                        .enforce_block_sync_misbehavior(&peer, conn_id, &reason)
                         .await,
                     "a connection already closing is not closed again: {reason:?}"
                 );
@@ -11570,10 +11567,81 @@ mod tests {
             !supervisor
                 .enforce_block_sync_misbehavior(
                     &test_peer(250),
+                    0,
                     &mismatch(BodyCommitmentKind::AuthDataRoot)
                 )
                 .await,
             "a peer that already left has nothing to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_block_verdict_matches_the_supplying_registration() {
+        use crate::zakura::BlockSyncMisbehavior;
+        use zakura_header_chain::{BodyCommitmentKind, BodyPayloadMismatch, EvidenceId, SourceId};
+
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let peer = test_peer(26);
+        let reason = BlockSyncMisbehavior::BodyPayloadMismatch(BodyPayloadMismatch {
+            evidence: EvidenceId::from_digest([1; 32]),
+            requested: block::Hash([2; 32]),
+            delivered: block::Hash([2; 32]),
+            kind: BodyCommitmentKind::AuthDataRoot,
+            source: SourceId::from_digest([3; 32]),
+        });
+        let supplier_cancel = CancellationToken::new();
+        let supplier = register_test_peer(&supervisor, peer.clone(), supplier_cancel.clone()).await;
+
+        let replacement_cancel = CancellationToken::new();
+        let replacement_cause = CloseCause::new();
+        let (outbound, _outbound_recv) = mpsc::channel(1);
+        let replacement = registered_conn_id(
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    None,
+                    [0; TRANSCRIPT_HASH_BYTES],
+                    ZakuraPeerHandle::new_for_tests(peer.clone(), outbound),
+                    replacement_cancel.clone(),
+                    replacement_cause.clone(),
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                )
+                .await,
+        );
+        assert!(supplier_cancel.is_cancelled());
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, supplier, &reason)
+                .await
+        );
+        assert!(!replacement_cancel.is_cancelled());
+        assert_eq!(replacement_cause.get(), None);
+        assert_eq!(supervisor.outbound_peer_handles().await.len(), 1);
+
+        assert!(
+            supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
+        );
+        assert_eq!(
+            replacement_cause.get(),
+            Some(CloseOutcome::fault(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                CloseRow::BSYNC_CLOSE_18,
+            ))
+        );
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
+        );
+        supervisor.deregister(&peer, replacement).await;
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
         );
     }
 

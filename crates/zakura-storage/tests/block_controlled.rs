@@ -283,6 +283,7 @@ fn ids_are_unique_and_enumeration_is_deterministic() {
         let mut harness = Harness::new();
         let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900); 3], 0);
         let misbehavior = BlockSyncAction::Misbehavior {
+            conn_id: None,
             peer: ZakuraPeerId::new([3; 32]).expect("a 32-byte node ID is in bounds"),
             reason: BlockSyncMisbehavior::StatusSpam,
         };

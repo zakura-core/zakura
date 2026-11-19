@@ -111,6 +111,7 @@ fn one_action_of_each() -> Vec<BlockSyncAction> {
             },
         },
         BlockSyncAction::Misbehavior {
+            conn_id: None,
             peer: ZakuraPeerId::new([3; 32]).expect("a 32-byte node ID is in bounds"),
             reason: BlockSyncMisbehavior::StatusSpam,
         },

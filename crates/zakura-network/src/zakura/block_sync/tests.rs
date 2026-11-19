@@ -4990,7 +4990,15 @@ impl TestSequencer {
     ) -> AcceptOutcome {
         let facts = self.payloads.insert(body);
         let result = self.policy.accept_buffered_body(
-            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+            owner,
+            source,
+            height,
+            hash,
+            previous,
+            facts,
+            bytes,
+            estimate,
+            super::events::BlockSupplier { peer, conn_id: 0 },
         );
         if matches!(result, AcceptOutcome::Redundant { .. }) {
             self.payloads.release(facts.id);
@@ -10729,6 +10737,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         if let BlockSyncAction::Misbehavior {
             peer: action_peer,
             reason,
+            ..
         } = action
         {
             assert_ne!(
@@ -12511,8 +12520,16 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
     // fails the test (the peer was not scored).
     let scored = loop {
-        if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+        if let BlockSyncAction::Misbehavior {
+            peer,
+            conn_id,
+            reason,
+        } = next_action(&mut actions).await
+        {
             assert_eq!(peer, bad_peer);
+            // The verdict names the supplying registration, which the helper
+            // gives connection ID 0.
+            assert_eq!(conn_id, Some(0));
             assert_eq!(
                 reason,
                 BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
@@ -13983,6 +14000,7 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     while action_sender.capacity() > 0 {
         action_sender
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14435,6 +14453,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14564,6 +14583,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14927,7 +14947,9 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     // The violation is still recorded as a best-effort `Misbehavior` action.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+            if let BlockSyncAction::Misbehavior { peer, reason, .. } =
+                next_action(&mut actions).await
+            {
                 if peer == probe && reason == BlockSyncMisbehavior::InvalidBlock {
                     break;
                 }

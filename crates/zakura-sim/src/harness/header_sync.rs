@@ -13,6 +13,7 @@
 mod flood;
 pub mod grammar;
 pub mod liveness;
+pub mod progress;
 mod release_wake;
 mod repair;
 pub mod storage_witnesses;
@@ -22,16 +23,18 @@ pub use liveness::Liveness;
 pub use release_wake::{ReleaseWake, WakeScenario};
 pub use repair::{RepairHarness, RepairScenario, REPAIR_HEIGHT, STALE_PEER, SUPPLIER, TIP};
 
-use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
+    header_progress_deadline, header_progress_turn,
     observe::{HeaderSyncObserver, ReactorEvent},
     spawn_header_sync_reactor,
     v9::RegtestMessage,
-    FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
+    FullStateFrontiers, HeaderProgressUnbounded, HeaderSyncStartup, ZakuraHeaderSyncConfig,
+    LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_rt::sync::watch;
@@ -87,7 +90,7 @@ use crate::{
             BudgetView, ChainView, ForkView, HoldWakeView, OutstandingView, PublicationView,
             ResetView, RetirementView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
-        header_sync_progress::{bounded_adversary_progress, recovery_deadline},
+        header_sync_progress::{bounded_adversary_progress, recovery_deadline, PROGRESS_BOUND},
         session::{honest_never_punished, HonestPeers},
     },
     observe::{ReactorFact, StorageFact},
@@ -872,6 +875,11 @@ pub struct StorageView {
     /// still owes. A harness that doesn't run the check leaves it never
     /// applied.
     pub publication: PublicationEvidence,
+    /// `header-sync/honest-progress`'s deadline in this run: its 30 s alone,
+    /// or with adversaries, the deadline production's constants give
+    /// ([`progress_bound`]). Only `header-sync/wire`'s progress fixture
+    /// applies it.
+    pub progress_bound: Result<Duration, HeaderProgressUnbounded>,
 }
 
 impl PublicationView for StorageView {
@@ -1066,6 +1074,7 @@ impl HasView for Storage {
             recovery: self.recovery.clone(),
             fork_choice: self.fork_choice.clone(),
             publication: self.publication.clone(),
+            progress_bound: Ok(PROGRESS_BOUND),
         }
     }
 
@@ -1712,6 +1721,11 @@ pub struct HeaderWire {
     sessions: SessionEvidence,
     /// The peers that closed their own connection.
     closed: PeerCloses,
+    /// The adversaries beside the progress fixture's honest peer, or `None`
+    /// outside the fixture ([`progress_adversaries`]).
+    progress_adversaries: Option<usize>,
+    /// [`StorageView::progress_bound`].
+    progress_bound: Result<Duration, HeaderProgressUnbounded>,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -1749,6 +1763,7 @@ impl HasView for HeaderWire {
             // The wire harness doesn't judge fork choice or publication.
             fork_choice: ForkChoiceEvidence::default(),
             publication: PublicationEvidence::default(),
+            progress_bound: self.progress_bound,
         }
     }
 
@@ -1941,6 +1956,8 @@ impl Subsystem for HeaderWire {
         );
         *ports.startup.borrow_mut() = Some(header.startup.clone());
         *ports.adoption.borrow_mut() = Some(adoption.clone());
+        let progress_adversaries = progress_adversaries(scenario);
+        let progress_bound = progress_bound(&header.startup, progress_adversaries.unwrap_or(0));
         let faults = FaultEvidence::new(
             attributions,
             cooldowns,
@@ -2024,6 +2041,8 @@ impl Subsystem for HeaderWire {
             faults,
             sessions: ports.sessions,
             closed: ports.closed,
+            progress_adversaries,
+            progress_bound,
             _keep: Box::new(node),
         }
     }
@@ -2053,45 +2072,9 @@ impl Subsystem for HeaderWire {
     /// scenario with honest peers, `HonestPeer` with their names
     /// ([`WireScenario::honest_peers`]). For the [`progress_fixture`],
     /// also `BoundedDelivery` and `BoundedStorage`, which its link and
-    /// storage policy enforce, and `StableMembership`, which holds while
-    /// `peer-0`'s header session is the node's only membership
-    /// ([`wire_holds`]).
+    /// storage policy enforce, and `StableMembership` ([`wire_holds`]).
     fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
-        let mut declared = Vec::new();
-        if scenario.peers.iter().any(|peer| peer.adversary.is_some()) {
-            declared.push(AssumeRecord {
-                assume: Assume::BoundedAdversary,
-                params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
-            });
-        }
-        let honest = scenario.honest_peers();
-        if !honest.is_empty() {
-            let names: Vec<String> = honest.iter().map(|index| format!("peer-{index}")).collect();
-            declared.push(AssumeRecord {
-                assume: Assume::HonestPeer,
-                params: serde_json::json!({ "peers": names }),
-            });
-        }
-        if progress_fixture(scenario) {
-            declared.extend([
-                AssumeRecord {
-                    assume: Assume::BoundedDelivery,
-                    params: serde_json::json!({
-                        "max_delay_ms": PROGRESS_LINK.max_delay_ms,
-                        "loss_budget": PROGRESS_LINK.loss_budget,
-                    }),
-                },
-                AssumeRecord {
-                    assume: Assume::BoundedStorage,
-                    params: serde_json::json!({ "bound_ms": PROGRESS_STORAGE_BOUND_MS }),
-                },
-                AssumeRecord {
-                    assume: Assume::StableMembership,
-                    params: serde_json::json!({ "peer": "peer-0" }),
-                },
-            ]);
-        }
-        Assumptions::declare(declared).holds_when(wire_holds)
+        Assumptions::declare(wire_assumptions(scenario)).holds_when(wire_holds)
     }
 
     /// Each saved Plan's tag ([`SavedPlan::tag`]).
@@ -2109,6 +2092,45 @@ impl Subsystem for HeaderWire {
     }
 }
 
+/// The assumptions [`HeaderWire`] declares for `scenario`.
+fn wire_assumptions(scenario: &WireScenario) -> Vec<AssumeRecord> {
+    let mut declared = Vec::new();
+    if scenario.peers.iter().any(|peer| peer.adversary.is_some()) {
+        declared.push(AssumeRecord {
+            assume: Assume::BoundedAdversary,
+            params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
+        });
+    }
+    let honest = scenario.honest_peers();
+    if !honest.is_empty() {
+        let names: Vec<String> = honest.iter().map(|index| format!("peer-{index}")).collect();
+        declared.push(AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::json!({ "peers": names }),
+        });
+    }
+    if let Some(adversaries) = progress_adversaries(scenario) {
+        declared.extend([
+            AssumeRecord {
+                assume: Assume::BoundedDelivery,
+                params: serde_json::json!({
+                    "max_delay_ms": PROGRESS_LINK.max_delay_ms,
+                    "loss_budget": PROGRESS_LINK.loss_budget,
+                }),
+            },
+            AssumeRecord {
+                assume: Assume::BoundedStorage,
+                params: serde_json::json!({ "bound_ms": PROGRESS_STORAGE_BOUND_MS }),
+            },
+            AssumeRecord {
+                assume: Assume::StableMembership,
+                params: serde_json::json!({ "peer": "peer-0", "adversaries": adversaries }),
+            },
+        ]);
+    }
+    declared
+}
+
 /// The progress fixture's link, in both directions: 0 to 10 ms, in order,
 /// with no loss (properties.md, `honest-progress`).
 pub const PROGRESS_LINK: super::LinkSpec = super::LinkSpec {
@@ -2121,19 +2143,26 @@ pub const PROGRESS_LINK: super::LinkSpec = super::LinkSpec {
 /// How long the progress fixture's storage may take over each operation.
 pub const PROGRESS_STORAGE_BOUND_MS: u64 = 10;
 
-/// Whether `scenario` is `header-sync/honest-progress`'s fixed fixture, the
-/// only scenario that declares its assumptions. The node holds one chain
-/// with no fork. One honest peer dials it and holds the same chain plus one
-/// header, so it serves exactly that successor, with no subscription of its
-/// own and no script beyond closing its connection. Every link is
-/// [`PROGRESS_LINK`], and storage succeeds within
-/// [`PROGRESS_STORAGE_BOUND_MS`] with no holds.
+/// Whether `scenario` is `header-sync/honest-progress`'s fixture, the only
+/// scenario that declares its assumptions ([`progress_adversaries`]).
 pub fn progress_fixture(scenario: &WireScenario) -> bool {
-    let [peer] = &scenario.peers[..] else {
-        return false;
-    };
+    progress_adversaries(scenario).is_some()
+}
+
+/// How many adversaries `scenario`'s progress fixture holds beside its
+/// honest peer, or `None` if `scenario` isn't the fixture.
+///
+/// The node holds one chain with no fork. The honest peer, `peer-0`, dials
+/// it and holds the same chain plus one header, so it serves exactly that
+/// successor, with no subscription of its own and no script beyond closing
+/// its connection. Each later peer is an adversary that dials the node
+/// ([`progress_adversary`]). Every link is [`PROGRESS_LINK`], and storage
+/// succeeds within [`PROGRESS_STORAGE_BOUND_MS`] with no holds.
+pub fn progress_adversaries(scenario: &WireScenario) -> Option<usize> {
+    let (peer, adversaries) = scenario.peers.split_first()?;
     let successor = scenario.node.main.checked_add(1);
-    scenario.node.fork.is_none()
+    let fixture = scenario.node.fork.is_none()
+        && adversaries.iter().all(progress_adversary)
         && peer.is_honest()
         && peer.dialer == PeerDialer::Peer
         && peer
@@ -2157,20 +2186,80 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
                 disruptions: Vec::new(),
-            }
+            };
+    fixture.then_some(adversaries.len())
+}
+
+/// Whether `peer` is one of the progress fixture's adversaries: it dials
+/// the node, offers header sync alone, holds an honest chain it may refuse
+/// to serve, lie about or serve with an invalid tip, has no subscription
+/// of its own and no script, and runs no handshake fault.
+fn progress_adversary(peer: &PeerSpec) -> bool {
+    (peer.adversary.is_some() || peer.invalid_tip)
+        && peer.dialer == PeerDialer::Peer
+        && peer.capabilities == PeerSpec::dialing().capabilities
+        && !peer.bad_nonce_echo
+        && peer.discovery.is_none()
+        && !peer.spams
+        && peer.script.is_empty()
+        && peer
+            .honest
+            .as_ref()
+            .is_some_and(|honest| honest.subscribe.is_none())
+        && peer.handshake.as_ref().is_none_or(|spec| {
+            spec.control == crate::peer::handshake::options::ControlFault::None
+                && spec.prelude == crate::peer::handshake::options::PreludeFault::None
+                && spec.abandon_after.is_none()
+        })
+}
+
+/// How much one turn of the progress deadline allows beyond production's
+/// figure ([`header_progress_turn`]): the turn's link delays, at most
+/// [`PROGRESS_LINK`]'s 10 ms each way, and its storage operations, at most
+/// [`PROGRESS_STORAGE_BOUND_MS`] each, with room to spare.
+pub const PROGRESS_TURN_SLACK: Duration = Duration::from_secs(1);
+
+/// `header-sync/honest-progress`'s deadline for a node on `startup` with
+/// `adversaries` beside the honest peer: properties.md's 30 s alone, or
+/// else production's figure ([`header_progress_deadline`]) plus
+/// [`PROGRESS_TURN_SLACK`] for each turn it counts. An error if production's
+/// constants give no figure.
+pub fn progress_bound(
+    startup: &StartupFacts,
+    adversaries: usize,
+) -> Result<Duration, HeaderProgressUnbounded> {
+    if adversaries == 0 {
+        return Ok(PROGRESS_BOUND);
+    }
+    let adversaries = u32::try_from(adversaries).unwrap_or(u32::MAX);
+    let deadline = header_progress_deadline(
+        &startup.config,
+        startup.request_timeout,
+        startup.max_connections,
+        adversaries,
+    )?;
+    let turn = header_progress_turn(&startup.config, startup.request_timeout)?;
+    let turns = deadline.as_nanos() / turn.as_nanos().max(1);
+    Ok(deadline + PROGRESS_TURN_SLACK * u32::try_from(turns).unwrap_or(u32::MAX))
 }
 
 /// Whether `assume` holds after a step of `wire`: `StableMembership` while
-/// `peer-0` is the node's only membership
-/// ([`SessionEvidence::stable_membership`]) and hasn't closed its own
-/// connection, and every other assumption always, since the scenario
-/// enforces what it declares. Only the environment breaks it
-/// ([`EndedBy`](crate::property::EndedBy)): `peer-0`'s scripted close, or
-/// another peer. A node that drops `peer-0` leaves it holding.
+/// `peer-0` hasn't closed its own connection and is the node's only
+/// membership ([`SessionEvidence::stable_membership`]), or, beside
+/// adversaries, has joined it ([`SessionEvidence::joined`]). Every other
+/// assumption always holds, since the scenario enforces what it declares.
+/// Only the environment breaks it ([`EndedBy`](crate::property::EndedBy)):
+/// `peer-0`'s scripted close, or, without adversaries, another peer. A
+/// node that drops `peer-0` leaves it holding. Adversaries join and leave
+/// as they like, which the deadline already counts.
 fn wire_holds(wire: &HeaderWire, assume: Assume) -> bool {
     match assume {
         Assume::StableMembership => {
-            wire.sessions.stable_membership("peer-0") && !wire.closed.borrow().contains(&0)
+            let member = match wire.progress_adversaries {
+                Some(adversaries) if adversaries > 0 => wire.sessions.joined("peer-0"),
+                _ => wire.sessions.stable_membership("peer-0"),
+            };
+            member && !wire.closed.borrow().contains(&0)
         }
         _ => true,
     }
@@ -3277,6 +3366,7 @@ mod tests {
                 recovery: RecoveryEvidence::default(),
                 fork_choice: ForkChoiceEvidence::default(),
                 publication: PublicationEvidence::default(),
+                progress_bound: Ok(PROGRESS_BOUND),
             }
         }
     }

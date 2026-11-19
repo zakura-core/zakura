@@ -280,6 +280,12 @@ pub(crate) struct Honest {
     pub(super) node_status: Option<Status>,
     /// The last ending it sent for a subscription the node opened.
     pub(super) last_ending: Option<HeadersOutcome>,
+    /// If set, it serves intermittently: one header per page, this long
+    /// after the subscription opened or after its last page, and never the
+    /// header that reaches the target.
+    drip: Option<Duration>,
+    /// When the next intermittent page is due, while one is owed.
+    drip_due: Option<Instant>,
 }
 
 impl Honest {
@@ -306,7 +312,16 @@ impl Honest {
             serve,
             node_status: None,
             last_ending: None,
+            drip: None,
+            drip_due: None,
         }
+    }
+
+    /// This script, serving intermittently every `drip` if it's set
+    /// ([`Honest::drip`]).
+    pub(crate) fn dripping(mut self, drip: Option<Duration>) -> Self {
+        self.drip = drip;
+        self
     }
 
     /// A header stream started: fresh models, no subscriptions the node
@@ -316,6 +331,7 @@ impl Honest {
         self.models = StreamModels::new(now, self.chain.clone());
         self.serving.clear();
         self.paged = None;
+        self.drip_due = None;
         self.node_status = None;
         self.status_due = now + self.refresh;
         if !self.announce {
@@ -324,22 +340,28 @@ impl Honest {
         vec![self.send(RegtestMessage::Status(self.chain.status.clone()))]
     }
 
-    /// The next time [`Honest::tick`] has work: the next `Status` refresh.
+    /// The next time [`Honest::tick`] has work: the next `Status` refresh,
+    /// or an owed intermittent page.
     pub(crate) fn deadline(&self) -> Instant {
-        self.status_due
+        self.drip_due
+            .map_or(self.status_due, |due| due.min(self.status_due))
     }
 
-    /// Sends the refresh `Status` once it's due.
+    /// Sends the refresh `Status` once it's due, and an owed intermittent
+    /// page once it's due.
     pub(crate) fn tick(&mut self) -> Vec<Outgoing> {
         let now = Instant::now();
-        if now < self.status_due {
-            return Vec::new();
+        let mut out = Vec::new();
+        if now >= self.status_due {
+            self.status_due = now + self.refresh;
+            if self.announce {
+                out.push(self.send(RegtestMessage::Status(self.chain.status.clone())));
+            }
         }
-        self.status_due = now + self.refresh;
-        if !self.announce {
-            return Vec::new();
+        if self.drip_due.is_some_and(|due| now >= due) {
+            out.extend(self.pump());
         }
-        vec![self.send(RegtestMessage::Status(self.chain.status.clone()))]
+        out
     }
 
     /// When a held grant may next be offered, if one is waiting: never once
@@ -636,6 +658,7 @@ impl Honest {
         self.served += 1;
         if self.serving.is_empty() {
             self.paged = None;
+            self.drip_due = None;
         }
         vec![self.send(RegtestMessage::HeadersOutcome(HeadersOutcome {
             subscription_id: id,
@@ -651,6 +674,13 @@ impl Honest {
         if !self.serve {
             return out;
         }
+        if let Some(drip) = self.drip {
+            out.extend(self.drip_page(drip));
+            if !out.is_empty() {
+                self.paged = Some(Instant::now());
+            }
+            return out;
+        }
         let ids: Vec<u64> = self.serving.keys().copied().collect();
         for id in ids {
             while let Some(page) = self.next_page(id) {
@@ -661,6 +691,34 @@ impl Honest {
             self.paged = Some(Instant::now());
         }
         out
+    }
+
+    /// The intermittent page owed now, if any: one header of the first live
+    /// subscription with credit and at least two headers left, `drip` after
+    /// the wait for it started or after the last such page. A call that
+    /// finds such a subscription with no wait running only starts one, and
+    /// a call that finds none ends the wait, so no timer fires for nothing.
+    fn drip_page(&mut self, drip: Duration) -> Option<Outgoing> {
+        let now = Instant::now();
+        let Some(id) = self.serving.keys().copied().find(|id| {
+            self.page_room(*id).is_some_and(|room| room > 0)
+                && self.left(*id).is_some_and(|left| left > 1)
+        }) else {
+            self.drip_due = None;
+            return None;
+        };
+        match self.drip_due {
+            Some(due) if now >= due => {
+                self.drip_due = Some(now + drip);
+                let page = self.page_at(id, 1)?;
+                Some(self.send(page))
+            }
+            Some(_) => None,
+            None => {
+                self.drip_due = Some(now + drip);
+                None
+            }
+        }
     }
 
     /// Subscription `id`'s next page, sized as production's publisher sizes

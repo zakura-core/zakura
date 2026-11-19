@@ -299,6 +299,7 @@ pub fn act_scenario(act: Act) -> WireScenario {
         announce: true,
         serve: false,
         withhold: false,
+        drip_ms: None,
     };
     let held = SubscribeSpec {
         start: PRELOAD,

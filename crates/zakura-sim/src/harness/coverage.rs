@@ -1409,6 +1409,16 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("skipped-apply"),
     },
+    // The role mixes' nightly test, and the case whose block sync keeps
+    // stalled heights with their stalled owner.
+    Coverage {
+        property: crate::harness::block_progress::ADVERSARY_PROGRESS,
+        passing: passes(
+            "tests/block_progress.rs",
+            "the_role_mixes_hold_adversary_progress",
+        ),
+        bypass: Bypass::Planted("stall-never-reassigned"),
+    },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its seed unpatched as a
     // witness test that expects a hold, before it runs the patch.

@@ -14,6 +14,7 @@ use crate::{
         },
     },
     harness::{
+        block_progress::{BlockProgress, Mix, ADVERSARY_PROGRESS},
         block_semantic::{
             CAPACITY_RELEASE_TAG, DECODED_INPUT_STALL_TAG, RESET_MID_FLIGHT_TAG, STALLED_RESET_TAG,
         },
@@ -351,7 +352,7 @@ fn short_plan() -> Vec<u8> {
 /// Every `block` seed.
 pub(super) fn seeds() -> Vec<Seed> {
     let storage = Storage::NAME;
-    vec![
+    let mut seeds = vec![
         Seed::new(
             "block-work-ownership",
             ENTRY.name,
@@ -489,5 +490,27 @@ pub(super) fn seeds() -> Vec<Seed> {
             "crates/zakura-sim/tests/block_table.rs",
             STALE_REQUEST_BODY.to_vec(),
         ),
-    ]
+    ];
+    seeds.extend(progress_seeds());
+    seeds
+}
+
+/// `block-sync/progress`'s fixed role mixes, `block-progress-<name>`: each
+/// mix's prefix under the empty Plan, built from its typed adversaries
+/// ([`Mix::prefix`]). Each carries a witness expecting
+/// `block-sync/adversary-progress` to hold, and the silent mix is the input
+/// of the planted case that never takes stalled work back.
+fn progress_seeds() -> Vec<Seed> {
+    Mix::ALL
+        .into_iter()
+        .map(|mix| {
+            Seed::new(
+                format!("block-progress-{}", mix.name()),
+                BlockProgress::NAME,
+                "crates/zakura-sim/tests/block_progress.rs",
+                mix.prefix(),
+            )
+            .witness(ADVERSARY_PROGRESS, Expect::Holds)
+        })
+        .collect()
 }

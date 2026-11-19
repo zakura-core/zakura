@@ -1416,7 +1416,10 @@ impl PeerTask {
             (adversary.announces(), adversary.serves())
         });
         let honest = match (self.spec.honest.clone(), self.chain.clone()) {
-            (Some(spec), Some(chain)) => Some(Honest::with(spec, chain, announce, serve)),
+            (Some(spec), Some(chain)) => Some(
+                Honest::with(spec, chain, announce, serve)
+                    .dripping(adversary.as_ref().and_then(Adversary::drip)),
+            ),
             (None, None) => None,
             _ => unreachable!("the harness gives a chain to exactly the honest peers"),
         };

@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index fed1671c54..9acca8f855 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2962,7 +2962,16 @@ impl HeaderSyncReactor {
+             .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(60))
+     }
+ 
++    // Planted: a request past its deadline only loses the deadline, so its
++    // peer keeps the stalled target and nobody else gets it.
+     fn retire_timed_out_requests(&mut self, now: Instant) {
++        for peer in self.state.timed_out_requests(now) {
++            self.state.clear_request_deadline(&peer);
++        }
++    }
++
++    #[allow(dead_code)]
++    fn retire_timed_out_requests_unplanted(&mut self, now: Instant) {
+         for peer in self.state.timed_out_requests(now) {
+             let repair = self.peer_work_queue.active(&peer).and_then(|active| {
+                 matches!(

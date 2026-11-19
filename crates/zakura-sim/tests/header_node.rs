@@ -328,6 +328,7 @@ impl HasView for Planted {
             recovery: Default::default(),
             fork_choice: Default::default(),
             publication: Default::default(),
+            progress_bound: Ok(zakura_sim::domain::header_sync_progress::PROGRESS_BOUND),
         }
     }
 }

@@ -3,7 +3,7 @@
 //! `header-sync/release-wake`, `header-sync/repair` and `header-sync/flood`,
 //! and the two header machines' op tapes.
 
-use super::{draws, Seed};
+use super::{draws, Seed, SeedSet};
 use crate::{
     domain::{
         header_sync::{
@@ -16,7 +16,9 @@ use crate::{
     },
     harness::{
         header_sync::{
-            grammar, storage_witnesses as witnesses, Flood, HeaderWire, ReleaseWake, RepairHarness,
+            grammar,
+            progress::{HeaderProgress, Mix},
+            storage_witnesses as witnesses, Flood, HeaderWire, ReleaseWake, RepairHarness,
             RepairScenario, Storage, StorageScenario, WakeScenario, DIRECT_DISPATCH,
         },
         wire_plans::SavedPlan,
@@ -31,6 +33,7 @@ pub(super) fn seeds() -> Vec<Seed> {
     let mut seeds = storage_seeds();
     seeds.extend(witness_seeds());
     seeds.extend(wire_seeds());
+    seeds.extend(progress_seeds());
     seeds.extend(one_byte_seeds());
     seeds.extend(machine_seeds());
     seeds
@@ -232,6 +235,27 @@ fn wire_seeds() -> Vec<Seed> {
                 Some(property) => seed.witness(property, Expect::Holds),
                 None => seed,
             }
+        })
+        .collect()
+}
+
+/// `header-sync/progress`'s fixed role mixes, `header-progress-<name>`: each
+/// mix's prefix under the empty Plan, built from its typed adversaries
+/// ([`Mix::prefix`]). Each carries a witness expecting
+/// `header-sync/honest-progress` to hold, and the silent mix is the input of
+/// the planted case that never takes a stalled target back.
+fn progress_seeds() -> Vec<Seed> {
+    Mix::ALL
+        .into_iter()
+        .map(|mix| {
+            Seed::new(
+                format!("header-progress-{}", mix.name()),
+                HeaderProgress::NAME,
+                "crates/zakura-sim/tests/header_progress.rs",
+                mix.prefix(),
+            )
+            .in_set(SeedSet::Slow)
+            .witness(HONEST_PROGRESS, Expect::Holds)
         })
         .collect()
 }

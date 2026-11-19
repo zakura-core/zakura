@@ -1699,6 +1699,7 @@ pub(crate) mod tests {
                 recovery: self.recovery.clone(),
                 fork_choice: Default::default(),
                 publication: Default::default(),
+                progress_bound: Ok(crate::domain::header_sync_progress::PROGRESS_BOUND),
             }
         }
     }

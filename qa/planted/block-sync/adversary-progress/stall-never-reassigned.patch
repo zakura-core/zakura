@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
+index bba8596c5d..34f9bd5e60 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs
+@@ -141,11 +141,13 @@ impl PeerIO {
+         reason: &'static str,
+     ) -> Vec<block::Height> {
+         let unreceived: Vec<_> = unreceived_heights(outstanding).collect();
++        // Planted: the stalled heights stay with their stalled owner, so no
++        // other peer is ever asked for them.
+         let outcome = self
+             .work
+             .release_reserved_and_return_items_detailed_for_owner(
+                 outstanding.request.owner,
+-                unreceived.iter().copied(),
++                std::iter::empty(),
+             );
+         self.trace_work_returned(reason, outstanding, unreceived.len(), outcome);
+         unreceived

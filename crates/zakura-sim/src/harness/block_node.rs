@@ -502,9 +502,13 @@ struct PendingRead {
     engine: Arc<EnginePort>,
     /// The read.
     request: BlockRangeRead,
-    /// Whether the mirror withholds the read's first height, so the run
-    /// never serves it.
+    /// Whether the mirror withholds the read's first height, or its fault
+    /// withholds the read, so the run never serves it.
     withheld: bool,
+    /// Whether the mirror's fault answers the read with no blocks.
+    empty: bool,
+    /// How long after its submission the run may serve the read.
+    delay: Duration,
     /// Whether the run has served it, which lets its caller read full state.
     served: bool,
     /// The caller's waker.
@@ -584,9 +588,15 @@ impl Future for MirrorRead {
                 .remove(&self.id)
                 .expect("the read was just found served")
         };
+        let request = read.request;
+        if read.empty {
+            return Poll::Ready(Ok(BlockRangeReadResult {
+                blocks: Vec::new(),
+                lease: request.lease,
+            }));
+        }
         // The caller reads full state itself: the engine's lock may be held
         // across a scheduling point, so only a task can wait for it.
-        let request = read.request;
         let blocks = read.engine.read_block_range(
             request.start_height,
             request.count,
@@ -613,6 +623,28 @@ impl Drop for MirrorRead {
     }
 }
 
+/// How a hostile mirror serves its range reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "fault", deny_unknown_fields)]
+pub enum MirrorFault {
+    /// After its first `served` reads, it never serves one.
+    Silent {
+        /// The reads it serves first.
+        served: u32,
+    },
+    /// After its first `served` reads, it answers each with no blocks, so
+    /// its serving ends the range as unavailable.
+    Unavailable {
+        /// The reads it serves first.
+        served: u32,
+    },
+    /// It serves each read `delay_ms` after the read arrives.
+    Slow {
+        /// The delay.
+        delay_ms: u64,
+    },
+}
+
 /// A mirror's storage: full state holding the whole fixture chain, which
 /// answers each query at once. Its range reads wait for the run.
 #[derive(Clone, Debug)]
@@ -622,6 +654,10 @@ pub struct MirrorStorage {
     reads: MirrorReads,
     /// Heights whose range reads the run never serves.
     withheld: Vec<u32>,
+    /// How it misbehaves, if it does.
+    fault: Option<MirrorFault>,
+    /// The range reads it has had.
+    count: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl MirrorStorage {
@@ -633,7 +669,15 @@ impl MirrorStorage {
             engine,
             reads,
             withheld: Vec::new(),
+            fault: None,
+            count: Arc::default(),
         }
+    }
+
+    /// The same storage, serving its range reads as `fault` says.
+    pub fn with_fault(mut self, fault: Option<MirrorFault>) -> Self {
+        self.fault = fault;
+        self
     }
 
     /// The same storage, except that the run never serves a range read that
@@ -700,6 +744,15 @@ impl BlockRangeSource for MirrorStorage {
         &self,
         request: BlockRangeRead,
     ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
+        let nth = self
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (faulty_withheld, empty, delay) = match self.fault {
+            Some(MirrorFault::Silent { served }) => (nth >= served, false, Duration::ZERO),
+            Some(MirrorFault::Unavailable { served }) => (false, nth >= served, Duration::ZERO),
+            Some(MirrorFault::Slow { delay_ms }) => (false, false, Duration::from_millis(delay_ms)),
+            None => (false, false, Duration::ZERO),
+        };
         let mut queue = self.reads.queue();
         queue.last_id += 1;
         let id = queue.last_id;
@@ -708,7 +761,9 @@ impl BlockRangeSource for MirrorStorage {
             PendingRead {
                 mirror: self.name.clone(),
                 engine: self.engine.clone(),
-                withheld: self.withheld.contains(&request.start_height.0),
+                withheld: faulty_withheld || self.withheld.contains(&request.start_height.0),
+                empty,
+                delay,
                 request,
                 served: false,
                 waker: None,
@@ -748,7 +803,11 @@ impl ActionSource for MirrorReadSource {
         let predicates = self.predicates.borrow();
         for (id, read) in &queue.pending {
             let since = self.stages.since(BlockKey::Mirror(*id), now);
-            if !read.served && !read.withheld && predicates.serves(*id, since) {
+            if !read.served
+                && !read.withheld
+                && since >= read.delay
+                && predicates.serves(*id, since)
+            {
                 out.push((Identity::storage(&read.mirror, *id, "serve"), *id));
             }
         }
@@ -760,7 +819,11 @@ impl ActionSource for MirrorReadSource {
         for (id, read) in &queue.pending {
             if !read.served {
                 let key = BlockKey::Mirror(*id);
-                predicates.boundaries(None, key, self.stages.since(key, now), now, out);
+                let since = self.stages.since(key, now);
+                if let Some(wait) = read.delay.checked_sub(since).filter(|wait| !wait.is_zero()) {
+                    out.extend(now.checked_add(wait).map(Boundary::Opens));
+                }
+                predicates.boundaries(None, key, since, now, out);
             }
         }
     }
@@ -791,13 +854,20 @@ impl ActionSource for MirrorReadSource {
     }
 
     /// `serve` for each queued read the mirror doesn't withhold, which no
-    /// hold filters.
-    fn recovery(&self, _: SimInstant, out: &mut RecoveryOffer) {
+    /// hold filters, once its delay has passed, and the instant each
+    /// delayed read's delay ends.
+    fn recovery(&self, now: SimInstant, out: &mut RecoveryOffer) {
         let queue = self.reads.queue();
         for (id, read) in &queue.pending {
-            if !read.served && !read.withheld {
-                out.actions
-                    .push((Identity::storage(&read.mirror, *id, "serve"), *id));
+            if read.served || read.withheld {
+                continue;
+            }
+            let since = self.stages.since(BlockKey::Mirror(*id), now);
+            match read.delay.checked_sub(since).filter(|wait| !wait.is_zero()) {
+                Some(wait) => out.boundaries.extend(now.checked_add(wait)),
+                None => out
+                    .actions
+                    .push((Identity::storage(&read.mirror, *id, "serve"), *id)),
             }
         }
     }

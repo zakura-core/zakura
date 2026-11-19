@@ -45,8 +45,8 @@ use super::{
         relay::Wire,
         tap::{BlockTap, TapHandoffs},
         view::BlockSyncView,
-        BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
-        NodeStorage, Policy, PolicySource, Topology, PROBE,
+        BlockNode, Effects, LateHandle, LiveChain, MirrorFault, MirrorReadSource, MirrorReads,
+        MirrorStorage, NodeStorage, Policy, PolicySource, Topology, PROBE,
     },
     header_sync::{check_service_operation_ids, Dialer},
     ScenarioFamily, Subsystem,
@@ -84,6 +84,10 @@ pub struct MirrorSpec {
     /// never gets those reads' bodies from this mirror.
     #[serde(default)]
     pub withheld: Vec<u32>,
+    /// How the mirror misbehaves, if it does. Left out of the scenario's
+    /// JSON when unset, so earlier scenarios keep their digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<MirrorFault>,
 }
 
 impl MirrorSpec {
@@ -92,6 +96,7 @@ impl MirrorSpec {
         MirrorSpec {
             dialer,
             withheld: Vec::new(),
+            fault: None,
         }
     }
 }
@@ -269,6 +274,7 @@ impl BlockScenario {
             mirrors: vec![MirrorSpec {
                 dialer: Dialer::Mirror,
                 withheld: vec![3],
+                fault: None,
             }],
             max_reorder_lookahead_bytes: Some(4_000),
             steps: Some(1_500_000),
@@ -311,6 +317,7 @@ impl BlockScenario {
                 .map(|dialer| MirrorSpec {
                     dialer,
                     withheld: [3].into_iter().chain(404..=420).collect(),
+                    fault: None,
                 })
                 .collect(),
             max_inflight_block_bytes: Some(20_000_000),
@@ -398,6 +405,7 @@ impl BlockScenario {
                 .map(|dialer| MirrorSpec {
                     dialer,
                     withheld: (9..=16).collect(),
+                    fault: None,
                 })
                 .collect(),
             control: ["mirror-0", "mirror-1"]
@@ -454,6 +462,7 @@ impl BlockScenario {
                 .map(|dialer| MirrorSpec {
                     dialer,
                     withheld: (11..=18).collect(),
+                    fault: None,
                 })
                 .collect(),
             probe: true,
@@ -784,7 +793,8 @@ impl Subsystem for Storage {
                 engine,
                 NodeStorage::Mirror(
                     MirrorStorage::new(&name, engine.clone(), ports.reads.clone())
-                        .withholding(&scenario.mirrors[index].withheld),
+                        .withholding(&scenario.mirrors[index].withheld)
+                        .with_fault(scenario.mirrors[index].fault),
                 ),
                 ZakuraBlockSyncConfig::default(),
                 None,

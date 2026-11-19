@@ -188,6 +188,7 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
         announce: true,
         serve: false,
         withhold,
+        drip_ms: None,
     };
     let (node, peer) = match act {
         Act::Unsolicited { .. } => (

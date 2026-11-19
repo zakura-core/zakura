@@ -12,6 +12,7 @@
 
 pub mod block_hostile;
 pub mod block_node;
+pub mod block_progress;
 pub mod block_semantic;
 pub mod block_sync;
 pub mod block_work;
@@ -703,7 +704,9 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<header_sync::Flood>(),
     entry::<header_sync::RepairHarness>(),
     entry::<block_sync::Storage>(),
+    entry::<block_progress::BlockProgress>(),
     entry::<header_sync::HeaderWire>(),
+    entry::<header_sync::progress::HeaderProgress>(),
     entry::<discovery_service::DiscoveryWire>(),
     entry::<discovery_service::DiscoveryComposed>(),
     entry::<discovery_service::DiscoverySpam>(),

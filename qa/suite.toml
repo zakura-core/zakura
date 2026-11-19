@@ -431,6 +431,16 @@ harness = "header-sync/liveness"
 owner = "E5a"
 reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
 
+[[missing-target]]
+harness = "header-sync/progress"
+owner = "E5a"
+reason = "no target: a run waits out one 30 s stall-rule turn per adversary, which takes seconds of wall time, and its one property, header-sync/honest-progress, is Draft, so a fuzz target fails on nothing; the nightly sim runs the role mixes in tests/header_progress.rs"
+
+[[missing-target]]
+harness = "block-sync/progress"
+owner = "E5a"
+reason = "no target: its one property, block-sync/adversary-progress, is Draft, so a fuzz target fails on nothing; the nightly sim runs the role mixes in tests/block_progress.rs"
+
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and
 # then the check fails until its row here goes.

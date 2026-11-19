@@ -1,0 +1,14 @@
+# Never reassigns stalled work: a request past its timeout, or a peer that
+# stalls, returns none of its unreceived heights to the queue, so they stay
+# with their stalled owner and no other peer is asked for them. In the
+# silent mix, two adversaries take ranges and never answer them. The node
+# never submits the last height, and its obligation runs past the deadline
+# production's constants give for two adversaries. Unpatched, each
+# adversary's ranges return to the queue after its request timeout, and the
+# honest mirror serves them within three liveness turns.
+seed = "block-progress-silent"
+# Besides io.rs, which the patch changes, the rest of block sync decides
+# when requests time out, when a peer parks, and which peer takes returned
+# work, and the progress module derives the deadline.
+checks = ["crates/zakura-network/src/zakura/block_sync"]
+no_target = "block-sync/progress has no fuzz target, and block-sync/adversary-progress is Draft, so a fuzz target would run the patched input clean"

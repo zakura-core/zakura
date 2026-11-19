@@ -499,6 +499,18 @@ impl SessionEvidence {
         self.ledger().facts.clone()
     }
 
+    /// Whether `peer` has joined the node's membership: own-9 has a
+    /// `Session` row for `peer`'s header session. Other peers may come and
+    /// go. Nothing the node does ends it, so the caller checks `peer`'s own
+    /// close. `false` without own-9's facts.
+    pub fn joined(&self, peer: &str) -> bool {
+        self.ledger().own9.as_ref().is_some_and(|own9| {
+            own9.rows.iter().any(|row| {
+                row.peer.as_deref() == Some(peer) && row.kind == ZAKURA_STREAM_HEADER_SYNC
+            })
+        })
+    }
+
     /// Whether the node's membership is `peer` alone: own-9 has a `Session`
     /// row for `peer`'s header session, every row is `peer`'s, and the
     /// reactor admitted only `peer`'s sessions. A row comes before the

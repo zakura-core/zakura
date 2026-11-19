@@ -1,0 +1,15 @@
+# Never reassigns stalled work: a header request past its deadline only
+# loses the deadline, so the stall rule charges no strike and its peer keeps
+# the target. In the silent mix, three adversaries announce the honest
+# successor before the honest peer dials and never serve it. The first one
+# keeps the target, the honest offer waits behind it, and the successor's
+# obligation runs past the deadline production's constants give for three
+# adversaries, with the node's tip at 50. Unpatched, each adversary loses
+# the target after one request timeout, and the honest peer serves it
+# within three turns.
+seed = "header-progress-silent"
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides how offers wait and take turns, and the progress module derives
+# the deadline.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+no_target = "header-sync/progress has no fuzz target, and header-sync/honest-progress is Draft, so a fuzz target would run the patched input clean"

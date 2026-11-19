@@ -36,7 +36,9 @@ use crate::{
 
 /// Once the node reads the honest peer's first `Status`, whose tip is the
 /// one header past the node's own, the node adopts that header as its
-/// selected tip within [`PROGRESS_BOUND`] of virtual time.
+/// selected tip within [`PROGRESS_BOUND`] of virtual time, or, beside k
+/// adversaries, within the deadline production's constants give for k
+/// (step 10; [`StorageView::progress_bound`]).
 pub const HONEST_PROGRESS: &str = "header-sync/honest-progress";
 
 /// [`HONEST_PROGRESS`]'s bound: properties.md's 30 virtual seconds.
@@ -57,8 +59,11 @@ pub fn honest_progress<S: HasView<View = StorageView>>() -> Property<S> {
         id: PropertyId::new(HONEST_PROGRESS),
         claim: "once the node reads an honest peer's first Status advertising the one header \
                 past its own tip, it applies that header and adopts it as its selected tip \
-                within 30 virtual seconds, while delivery and storage stay bounded and the \
-                peer is the node's only membership until it closes its own connection",
+                within 30 virtual seconds, or beside k adversaries within the deadline \
+                production's constants give for k (one stall-rule turn per adversary and one \
+                for the honest peer, at most one per header-sync slot), while delivery and \
+                storage stay bounded and the peer stays a member until it closes its own \
+                connection",
         kind: Kind::Liveness {
             bound: LivenessBound::VirtualTime(PROGRESS_BOUND),
         },
@@ -167,11 +172,21 @@ fn check_honest_progress<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
         .0
         .checked_add(1)
         .expect("fixture heights stay small");
-    let obligation = cx.fact_obligation(
+    let bound = match view.progress_bound {
+        Ok(bound) => bound,
+        Err(why) => {
+            cx.missing_evidence(format!(
+                "production's constants give no progress deadline: {why:?}"
+            ));
+            return Verdict::NotApplicable;
+        }
+    };
+    let mut obligation = cx.fact_obligation(
         None,
         Subject::Owner(format!("height {successor}")),
         adopted_successor,
     );
+    obligation.bound = LivenessBound::VirtualTime(bound);
     cx.oblige(obligation);
     Verdict::Holds
 }

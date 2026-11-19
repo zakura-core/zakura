@@ -54,6 +54,12 @@ pub struct AdversarySpec {
     /// without its payload.
     #[serde(default)]
     pub withhold: bool,
+    /// If set, it serves intermittently: one header per page, each this many
+    /// milliseconds after the subscription opened or after its last page,
+    /// and never the header that reaches the target. Left out of a
+    /// serialized scenario when unset, so saved ones keep their form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drip_ms: Option<u64>,
 }
 
 /// A row of header sync's table.
@@ -506,6 +512,11 @@ impl Adversary {
     /// Whether it serves the node's subscriptions with pages.
     pub(crate) fn serves(&self) -> bool {
         self.spec.serve
+    }
+
+    /// How long it waits before each page, if it serves intermittently.
+    pub(crate) fn drip(&self) -> Option<Duration> {
+        self.spec.drip_ms.map(Duration::from_millis)
     }
 
     /// When `act`'s setup history is done, so the `Plan` may pick it:
@@ -1215,6 +1226,7 @@ mod tests {
             announce: true,
             serve: true,
             withhold: false,
+            drip_ms: None,
         });
         (honest, adversary)
     }

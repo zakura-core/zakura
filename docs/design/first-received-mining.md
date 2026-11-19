@@ -69,10 +69,10 @@ and the most a withholder can gain.
 
 The deadline is the same for every block size, because scaling it with size
 does not lower that bound. Under a deadline that grows with size up to a cap,
-a withholder pads its block until it gets the cap. A size term only shortens
-the deadline for small blocks, which are 99.8% of Mainnet blocks. A deadline
-of 500 ms plus the body's size at 1 MiB per second, capped at 2 seconds, gave
-them about 0.6 seconds. That is too short over several relay hops, where a
+a withholder pads its block until it gets the cap. In the year of Mainnet
+blocks sampled, 96.2% were at most 100 kB. The old deadline of 500 ms plus
+the body's size at 1 MiB per second gave those blocks at most 596 ms.
+That is too short over several relay hops, where a
 small block's delivery time is mostly round trips rather than transfer. In a
 lab at a 300 ms round trip, the Mainnet 95th percentile peer round trip, a
 100 kB block's claim expired by the second relay hop in all 10 trials, while a

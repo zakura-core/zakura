@@ -13,7 +13,7 @@ name: Deploy Zakura mainnet fleet
 # each node's iroh identity, custom peers, and mempool/sync tuning) and their
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
 # this deploy sets manage_config = false and keeps the existing unit and cache.
-# Only asia-scored opts into the scoring config upgrade with its binary.
+# The fleet enables legacy block scoring and hedging with compatible binaries.
 # The archive publisher also installs its matching exporter and
 # verifies publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
@@ -398,6 +398,7 @@ jobs:
           # Keep the hand-written configs and restart the existing services.
           deploy_kind     = "systemd"
           manage_config   = false
+          upgrade_block_source_score = true
           service_name    = "zakurad"
           bin_path        = "/usr/local/bin/zakurad"
           network         = "Mainnet"
@@ -518,22 +519,20 @@ jobs:
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # asia-hedged uses [network.block_hedge] from #2548.
+          # The former experiment nodes now run the selected fleet build.
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
           monitor    = { profiler_url = "http://127.0.0.1:8107" }
-          commit     = "120535dbbb74e65f4a8c57ae3f19f9a10d77afc3"
+          commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # Upgrade the scoring config with the first build pinned here that uses #2595.
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "5193815225a1d57fc4c7c5519386cbaf45a8979c"
-          upgrade_block_source_score = true
+          commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF
@@ -695,6 +694,7 @@ jobs:
               raise SystemExit(f"unknown node: {node_name}")
 
           values = {
+              "EXPECTED_COMMIT": node["commit"],
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
               "BIN_PATH": node.get("bin_path", defaults["bin_path"]),
@@ -713,11 +713,10 @@ jobs:
           PY
           )"
 
-          expected_commit="$DEPLOY_COMMIT"
           ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
             "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
              RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
-             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
+             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$EXPECTED_COMMIT' bash -s" <<'EOF'
           set -euo pipefail
 
           # How long the node may take to answer RPC after the restart, and the
@@ -750,6 +749,10 @@ jobs:
               return
             fi
             echo "Rolling ${SERVICE_NAME} back to ${BIN_PATH}.bak" >&2
+            backup="${BIN_PATH}.scoring-backup"
+            if [ -f "$backup/scoring.path" ]; then
+              python3 "$backup/upgrade_block_source_score.py" restore "$backup" || return 1
+            fi
             install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"
             if restart_service; then
               echo "Rolled back to $("$BIN_PATH" --version)." >&2

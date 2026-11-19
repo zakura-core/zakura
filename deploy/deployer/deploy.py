@@ -52,6 +52,7 @@ DEFAULTS = {
     # to the scoring config upgrade alongside its binary.
     # For fleets provisioned outside the deployer with hand-tuned configs.
     "manage_config": True,
+    "upgrade_block_source_score": False,
     "service_name": "zakurad",
     "bin_path": "/usr/local/bin/zakurad",
     "config_path": "/etc/zakura/zakura.toml",
@@ -235,7 +236,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     # silently dropped by an older deploy.py — that once turned a preserve-config
     # deploy into a destructive one. `name`/`ssh_string`/`commit` are per-node only.
     known_default_keys = set(DEFAULTS)
-    known_node_keys = known_default_keys | {"name", "ssh_string", "commit", "upgrade_block_source_score"}
+    known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
     defaults_raw = data.get("defaults", {})
     unknown_defaults = set(defaults_raw) - known_default_keys
     if unknown_defaults:
@@ -283,9 +284,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             zakura = dict(merged["zakura"] or {})
             zakura["tx_relay"] = {**zakura.get("tx_relay", {}), "enabled": setup["tx_relay"]}
             merged["zakura"] = zakura
-        upgrade_score = raw.get("upgrade_block_source_score", False)
+        upgrade_score = merged["upgrade_block_source_score"]
         if not isinstance(upgrade_score, bool) or (upgrade_score and (
-            merged["manage_config"] or merged["deploy_kind"] != "systemd" or merged["release_state_publisher"]
+            merged["manage_config"] or merged["deploy_kind"] != "systemd"
         )):
             raise DeployError(f"{name}: upgrade_block_source_score requires a binary-only systemd node")
         publisher = merged["release_state_publisher"]
@@ -893,33 +894,31 @@ BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
 
-# The scoring config changes format with this binary. Prepare it before
-# installing either file so an unexpected host config leaves both in place.
-config=""
-if [ -f "$STAGE/upgrade_block_source_score.py" ]; then
-    config=$(python3 "$STAGE/upgrade_block_source_score.py" "$SERVICE" "$STAGE")
-fi
-if [ -n "$config" ]; then
-    [ -x "$BIN_PATH" ] || {{ echo "missing binary for config rollback" >&2; exit 1; }}
-    [ "$NO_RESTART" = 0 ] || {{ echo "the first scoring config upgrade requires a restart" >&2; exit 1; }}
+helper="$STAGE/upgrade_block_source_score.py"
+backup="${{BIN_PATH}}.scoring-backup"
+if [ -f "$helper" ]; then
+    python3 "$helper" prepare --service "$SERVICE" --binary "$STAGE/zakurad.new" "$STAGE" >/dev/null
+    if [ -f "$STAGE/scoring.path" ]; then
+        [ -x "$BIN_PATH" ] || {{ echo "missing binary for config rollback" >&2; exit 1; }}
+        [ "$NO_RESTART" = 0 ] || {{ echo "changing scoring config requires a restart" >&2; exit 1; }}
+    fi
 fi
 
 mkdir -p "$(dirname "$BIN_PATH")"
-
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-if [ -n "$config" ]; then
-    # Rename within the config directory so readers see one complete version.
-    tmp=$(mktemp -d "${{config}}.XXXXXX")
-    trap 'rm -f -- "$tmp/original" "$tmp/next"; rmdir "$tmp"' EXIT
-    cp -p -- "$config" "$tmp/original"
-    cp -p -- "$tmp/original" "$tmp/next"
-    cat "$STAGE/scoring.new" > "$tmp/next"
-    cmp -s -- "$tmp/original" "$STAGE/scoring.old" || {{ echo "node config changed during staging" >&2; exit 1; }}
+# Keep the config paired with this .bak through the outer RPC startup canary.
+# Rotate the pair even when this deployment no longer changes the config.
+if [ -f "$helper" ] || [ -d "$backup" ]; then
+    install -d -m 700 "$backup"
+    rm -f -- "$backup/scoring.path" "$backup/scoring.old" "$backup/scoring.new"
+    if [ -f "$STAGE/scoring.path" ]; then
+        cp -p "$STAGE"/scoring.* "$helper" "$backup/"
+    fi
 fi
 install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
-if [ -n "$config" ] && ! mv -f -- "$tmp/next" "$config"; then
+if [ -f "$STAGE/scoring.path" ] && ! python3 "$helper" apply "$STAGE"; then
     install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
     exit 1
 fi
@@ -943,8 +942,8 @@ restart_service() {{
 
 if ! restart_service; then
     echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
-    if [ -n "$config" ]; then
-        mv -f -- "$tmp/original" "$config"
+    if [ -f "$backup/scoring.path" ]; then
+        python3 "$backup/upgrade_block_source_score.py" restore "$backup"
     fi
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
@@ -1089,6 +1088,9 @@ def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
     try:
         run(node.scp_to(str(binary), f"{stage}/zakurad"), capture=True)
         run(node.scp_to(str(exporter), f"{stage}/zakura-checkpoints"), capture=True)
+        if node.upgrade_block_source_score:
+            helper = SCRIPT_DIR / "mainnet" / "upgrade_block_source_score.py"
+            run(node.scp_to(str(helper), f"{stage}/{helper.name}"), capture=True)
         command = " ".join(shlex.quote(value) for value in (
             "bash", "-s", "--", stage, node.bin_path, node.service_name, node.sha,
         ))

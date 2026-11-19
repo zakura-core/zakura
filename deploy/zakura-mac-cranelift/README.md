@@ -162,9 +162,12 @@ matching the requested source and lockfile. Fresh builds support
 unsupported.
 
 Installation pauses the watchdog while changing the binary and expected
-receipts, then checks block progress and healthy comparison. It preserves
-configuration, database, original bootstrap evidence, cursor and incident
-evidence. A binary rollback does not undo database migrations. Historical
+receipts, then checks block progress and healthy comparison. It verifies the
+installed config against its receipt, enables
+`[network.block_download_score_and_hedge] enabled = true`, and records the new
+digest on both hosts. A failed comparison restores the old config with its
+binary and receipts. The database, bootstrap history and comparison cursor
+carry forward. A binary rollback does not undo database migrations. Historical
 comparisons are not proof that a new version reverified old blocks.
 
 Use `mac_operation=status` for a strict health check; unhealthy or stale results

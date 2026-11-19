@@ -229,19 +229,25 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-The two Singapore experiment nodes have hand-written configs. `asia-hedged`
-uses `[network.block_hedge]` from PR 2548. On the first `asia-scored` deploy
-with the build pinned for PR 2595, the installer replaces the enabled
-`[network.block_source_score]` and `second_request` flags with:
+The Mainnet fleet enables scoring and hedging for legacy block downloads:
 
 ```toml
 [network.block_download_score_and_hedge]
 enabled = true
 ```
 
-That first upgrade requires a restart. If startup fails, the installer restores
-the original config and binary together. Later deploys accept the new setting
-as-is. A dashboard refresh does not run the node installer.
+All Linux Zakura nodes use the selected deployment ref, including the former
+Singapore experiments. The installer checks that the candidate supports the
+setting, then adds or enables it and removes superseded scoring and fixed-delay
+hedging tables. The first config change requires a restart. On ordinary systemd
+nodes, both the initial startup check and the optional RPC canary can restore
+the previous binary and config together. The archive publisher applies
+the config during its paired node/exporter install and retains its existing
+failure and publication policy.
+
+The separately deployed Mac verifier enables the same setting with its accepted
+candidate and records the new config digest in both deployment receipts.
+Dashboard refreshes and status checks do not apply node settings.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
@@ -279,8 +285,8 @@ Zakura identity (the node ids hardcoded as bootstrap peers in
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
-the existing `zakurad` service. Only `asia-scored` opts into the scoring config
-upgrade described above. The
+the existing `zakurad` service. The fleet applies the scoring setting
+described above while preserving unrelated node settings. The
 `rpc_listen_addr` / `log_file` / `p2p_stack` /
 `[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
 dashboard's SSH probe, not deployed to nodes. On-node configs should use

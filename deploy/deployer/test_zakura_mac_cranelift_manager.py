@@ -135,6 +135,8 @@ class CandidateTests(unittest.TestCase):
             def run(host, script, **kwargs):
                 host.scripts.append(script)
                 subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
+                if ' prepare --config ' in script:
+                    return 'd' * 64
                 if script.startswith('mktemp'):
                     return '/var/tmp/zakura-verifier-ci.fixture'
                 if script.startswith('sudo -n cat') and 'status.json' not in script:
@@ -153,22 +155,25 @@ class CandidateTests(unittest.TestCase):
         with patch.object(deploy.time, 'sleep'):
             deploy.deploy_candidate(mac, linux, self.path, self.receipt)
         self.assertEqual(linux.samples, 2)
+        self.assertEqual(json.loads(linux.files['/etc/zakura-mac-verifier/receipt.json'])['config_sha256'], 'd' * 64)
+        self.assertIn(' apply /var/tmp/', '\n'.join(mac.scripts))
         commands = '\n'.join(linux.scripts)
         self.assertEqual(commands.count("state['receipt_digest']"), 1)
         self.assertNotIn('state["cursor"]', commands)
         self.assertIn('systemctl stop zakura-fleet-watchdog', commands)
         self.assertIn('systemctl start zakura-fleet-watchdog', commands)
-        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
+        self.assertTrue(mac.scripts[-1].startswith('sudo -n rm -rf -- '))
 
     def test_binary_deploy_failure_restores_both_receipts_and_rebinds_cursor(self):
         mac, linux = self.deployment_hosts(fail_receipt=True)
         with self.assertRaises(RuntimeError):
             deploy.deploy_candidate(mac, linux, self.path, self.receipt)
         self.assertIn('receipt.json.previous', '\n'.join(mac.scripts))
+        self.assertIn(' restore /var/tmp/', '\n'.join(mac.scripts))
         commands = '\n'.join(linux.scripts)
         self.assertIn('receipt.json.previous /etc/zakura-mac-verifier/receipt.json', commands)
         self.assertEqual(commands.count("state['receipt_digest']"), 1)
-        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
+        self.assertTrue(mac.scripts[-1].startswith('sudo -n rm -rf -- '))
 
 
 

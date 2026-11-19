@@ -88,6 +88,12 @@ for ((attempt = 0; attempt < 30; attempt++)); do
 done
 case "$state" in inactive|failed) ;; *) exit 1 ;; esac
 
+# Check the scoring config before stopping publication or replacing the pair.
+score_helper="$STAGE/upgrade_block_source_score.py"
+if [ -f "$score_helper" ]; then
+    python3 "$score_helper" prepare --service "$NODE_SERVICE" --binary "$STAGE/zakurad" "$STAGE" >/dev/null
+fi
+
 # Stage on the destination filesystems before stopping the node. Rename avoids
 # overwriting an executing binary. Once restart begins, do not automatically
 # roll back: startup may already have migrated the database to a newer format.
@@ -104,6 +110,9 @@ systemctl daemon-reload
 touch "$PAUSE_MARKER"
 RESTORE_TIMER=false
 systemctl stop "$NODE_SERVICE"
+if [ -f "$score_helper" ]; then
+    python3 "$score_helper" apply "$STAGE"
+fi
 mv -f "$INSTALL_ROOT/bin/zakura-checkpoints.new" "$INSTALL_ROOT/bin/zakura-checkpoints"
 mv -f "$INSTALL_ROOT/EXPORTER_REVISION.new" "$INSTALL_ROOT/EXPORTER_REVISION"
 mv -f "${BIN_PATH}.new" "$BIN_PATH"

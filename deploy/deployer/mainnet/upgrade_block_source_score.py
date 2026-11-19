@@ -1,67 +1,116 @@
-"""Stage the PR 2595 scoring config for the binary-only systemd installer."""
+"""Prepare, install, or restore the fleet's legacy block-download settings."""
 
 import argparse
+import hashlib
+import os
 import re
 import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 
-OLD = "block_source_score"
-NEW = "block_download_score_and_hedge"
+SETTING = "block_download_score_and_hedge"
+# Settings superseded by the merged implementation, including the fixed-delay experiment.
+TABLES = {"block_source_score": {"enabled", "second_request"},
+          "block_hedge": {"enabled", "delay"}, SETTING: {"enabled"}}
 
 
 def upgraded_config(text):
-    """Return an equivalent config with the two enabled flags merged, or None if current."""
+    """Enable the merged setting while preserving every unrelated TOML value."""
     expected = tomllib.loads(text)
-    network = expected.get("network", {})
-    current = network.get(NEW)
-    if (OLD not in network and isinstance(current, dict)
-            and set(current) == {"enabled"} and current["enabled"] is True):
-        return None
-    old = network.get(OLD)
-    if (not isinstance(old, dict) or set(old) != {"enabled", "second_request"}
-            or not all(value is True for value in old.values()) or NEW in network):
-        raise ValueError("expected both legacy scoring flags enabled or the merged setting enabled")
+    network = expected.setdefault("network", {})
+    present = [name for name in TABLES if name in network]
+    if present == [SETTING] and network[SETTING] == {"enabled": True} and network[SETTING]["enabled"] is True:
+        return text
 
-    # Keep comments and formatting elsewhere in the operator's config. Parse the
-    # result again so a match inside a multiline string can never change its value.
-    header = re.search(r"(?m)^[ \t]*\[network\.block_source_score\][ \t]*(?:#[^\n]*)?$", text)
-    if header is None:
-        raise ValueError("expected a [network.block_source_score] table")
-    tail = text[header.end():]
-    next_header = re.search(r"(?m)^[ \t]*\[", tail)
-    end = next_header.start() if next_header else len(tail)
-    body = re.sub(r"(?m)^[ \t]*second_request[ \t]*=[ \t]*true[ \t]*(?:#[^\n]*)?(?:\n|$)", "", tail[:end])
-    result = text[:header.start()] + header.group().replace(OLD, NEW, 1) + body + tail[end:]
-    del network[OLD]
-    network[NEW] = {"enabled": True}
+    edited = text
+    for name in present:
+        table = network.pop(name)
+        if not isinstance(table, dict) or table.keys() - TABLES[name]:
+            raise ValueError(f"unrecognized fields in network.{name}")
+        header = re.search(rf"(?m)^[ \t]*\[network\.{name}\][ \t]*(?:#[^\n]*)?$", edited)
+        if header is None:
+            raise ValueError(f"expected a [network.{name}] table")
+        tail = edited[header.end():]
+        following = re.search(r"(?m)^[ \t]*\[", tail)
+        edited = edited[:header.start()] + (tail[following.start():] if following else "")
+
+    result = edited + f"\n[network.{SETTING}]\nenabled = true\n"
+    network[SETTING] = {"enabled": True}
     if tomllib.loads(result) != expected:
-        raise ValueError("could not update only the legacy scoring settings")
+        raise ValueError("could not update only the block-download settings")
     return result
+
+
+def service_config(service):
+    """Read the explicit config path used by this systemd service."""
+    shown = subprocess.check_output(
+        ["systemctl", "show", "-p", "ExecStart", "--value", service], text=True, timeout=10
+    )
+    match = re.search(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](/[^\s;]+)", shown)
+    if match is None:
+        raise ValueError("could not locate the explicit node config in systemd ExecStart")
+    return Path(match[1])
+
+
+def prepare(config, binary, stage, expected_digest):
+    """Verify the candidate schema and save the two config versions in private staging."""
+    generated = subprocess.check_output([str(binary), "-c", os.devnull, "generate"], timeout=30)
+    if SETTING not in tomllib.loads(generated.decode()).get("network", {}):
+        raise ValueError("candidate binary does not support the fleet block-download setting")
+    config = config.resolve(strict=True)
+    original = config.read_bytes()
+    if expected_digest and hashlib.sha256(original).hexdigest() != expected_digest:
+        raise ValueError("installed config differs from its deployment receipt")
+    updated = upgraded_config(original.decode()).encode()
+    if updated != original:
+        (stage / "scoring.path").write_text(str(config))
+        (stage / "scoring.old").write_bytes(original)
+        (stage / "scoring.new").write_bytes(updated)
+    return hashlib.sha256(updated).hexdigest()
+
+
+def replace_config(stage, restore):
+    """Replace only the staged version, preserving ownership and permissions on the host."""
+    location = stage / "scoring.path"
+    if not location.exists():
+        return
+    path = Path(location.read_text())
+    before, after = (stage / "scoring.old").read_bytes(), (stage / "scoring.new").read_bytes()
+    if restore:
+        before, after = after, before
+    current = path.read_bytes()
+    if current == after:
+        return
+    if current != before:
+        raise ValueError("node config changed after staging")
+    with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
+        candidate = Path(tmp) / "config"
+        subprocess.run(["cp", "-p", str(path), str(candidate)], check=True)
+        candidate.write_bytes(after)
+        candidate.replace(path)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("service")
-    parser.add_argument("stage", type=Path)
+    commands = parser.add_subparsers(dest="action", required=True)
+    stage = commands.add_parser("prepare")
+    source = stage.add_mutually_exclusive_group(required=True)
+    source.add_argument("--service")
+    source.add_argument("--config", type=Path)
+    stage.add_argument("--binary", type=Path, required=True)
+    stage.add_argument("--expected-digest")
+    for command in (stage, commands.add_parser("apply"), commands.add_parser("restore")):
+        command.add_argument("stage", type=Path)
     args = parser.parse_args(argv)
-    shown = subprocess.check_output(
-        ["systemctl", "show", "-p", "ExecStart", "--value", args.service], text=True, timeout=10
-    )
-    match = re.search(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](/[^\s;]+)", shown)
-    if match is None:
-        parser.exit(1, "could not locate the node config in systemd ExecStart\n")
-    config = Path(match[1]).resolve(strict=True)
-    original = config.read_bytes()
+    os.umask(0o077)
     try:
-        updated = upgraded_config(original.decode())
-    except ValueError as error:
-        parser.exit(1, f"scoring config upgrade: {error}\n")
-    if updated is not None:
-        # The deployer created this private staging directory on the node.
-        (args.stage / "scoring.old").write_bytes(original)
-        (args.stage / "scoring.new").write_bytes(updated.encode())
-        print(config)
+        if args.action == "prepare":
+            print(prepare(args.config or service_config(args.service), args.binary, args.stage, args.expected_digest))
+        else:
+            replace_config(args.stage, args.action == "restore")
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"fleet scoring config: {error}\n")
 
 
 if __name__ == "__main__":

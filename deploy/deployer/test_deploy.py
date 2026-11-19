@@ -678,7 +678,11 @@ class ScoringUpgradeTests(unittest.TestCase):
         self.bin = self.root / "zakurad"
         self.bin.write_text("#!/bin/sh\necho old\n")
         self.bin.chmod(0o755)
-        (self.stage / "zakurad.new").write_text("#!/bin/sh\necho new\n")
+        candidate = self.stage / "zakurad.new"
+        candidate.write_text("#!/bin/sh\nif [ \"$3\" = generate ]; then\n"
+                             + "echo '[network.block_download_score_and_hedge]'\necho 'enabled = false'\n"
+                             + "else echo new; fi\n")
+        candidate.chmod(0o755)
         shutil.copy(SCRIPT_DIR / "mainnet/upgrade_block_source_score.py", self.stage)
         (self.root / "sleep").write_text("#!/bin/sh\nexit 0\n")
         (self.root / "sleep").chmod(0o755)
@@ -710,32 +714,68 @@ esac
         return subprocess.run(["bash", "-s"], input=script, env=env,
                               capture_output=True, text=True, timeout=10)
 
-    def test_only_asia_scored_stages_the_upgrade_from_the_mainnet_inventory(self):
+    def test_all_mainnet_entries_request_scoring_and_use_the_deployment_ref(self):
         workflow = SCRIPT_DIR.parents[1] / ".github/workflows/zakura-mainnet-deploy.yml"
         inventory = workflow.read_text().split("cat > nodes.ci.toml <<EOF\n", 1)[1].split("\n          EOF", 1)[0]
         path = self.root / "nodes.toml"
         path.write_text(inventory)
         nodes = deploy.load_nodes(path, None)
-        self.assertEqual([n.name for n in nodes if n.upgrade_block_source_score], ["asia-scored"])
+        self.assertIn("archive-vct-off", [n.name for n in nodes])
         for node in nodes:
-            with mock.patch.object(deploy, "run") as upload, mock.patch.object(
-                deploy, "ssh_with_stdin", return_value=mock.Mock(returncode=0)
-            ):
-                deploy.install_node(node, self.bin, "/tmp/node-stage", no_restart=False)
-            files = [call.args[0][-2] for call in upload.call_args_list]
-            self.assertEqual(str(SCRIPT_DIR / "mainnet/upgrade_block_source_score.py") in files,
-                             node.name == "asia-scored")
+            with self.subTest(node=node.name):
+                self.assertTrue(node.upgrade_block_source_score)
+                self.assertEqual(node.commit, "${REF}")
+                if node.release_state_publisher:
+                    continue
+                with mock.patch.object(deploy, "run") as upload, mock.patch.object(
+                    deploy, "ssh_with_stdin", return_value=mock.Mock(returncode=0)
+                ):
+                    deploy.install_node(node, self.bin, "/tmp/node-stage", no_restart=False)
+                files = [call.args[0][-2] for call in upload.call_args_list]
+                self.assertIn(str(SCRIPT_DIR / "mainnet/upgrade_block_source_score.py"), files)
 
     def test_upgrades_only_scoring_and_accepts_repeated_deploy(self):
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.config.read_text(), self.NEW + self.OTHER)
+        self.assertEqual(tomllib.loads(self.config.read_text()), tomllib.loads(self.NEW + self.OTHER))
+        self.assertIn(self.OTHER, self.config.read_text())
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
         self.assertTrue((self.root / "active").exists())
         inode = self.config.stat().st_ino
+        # The production deployer creates a fresh stage for each run.
+        for staged in self.stage.glob("scoring.*"):
+            staged.unlink()
         second = self.install(no_restart=True)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.config.stat().st_ino, inode)
+
+    def test_enables_absent_disabled_and_fixed_delay_configs(self):
+        for section in ("", "[network.block_hedge]\ndelay = '50ms'\nenabled = true\n",
+                        self.NEW.replace("true", "false"), self.OLD.replace("true", "false")):
+            with self.subTest(section=section):
+                self.config.write_text(section + self.OTHER)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tomllib.loads(self.config.read_text()), tomllib.loads(self.OTHER + self.NEW))
+
+    def test_incompatible_candidate_is_refused_before_install(self):
+        (self.stage / "zakurad.new").write_text("#!/bin/sh\necho '[network]'\n")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support", result.stderr)
+        self.assertEqual(self.config.read_text(), self.OLD + self.OTHER)
+        self.assertEqual(self.bin.read_text(), "#!/bin/sh\necho old\n")
+
+    def test_rpc_canary_rollback_uses_the_config_paired_with_the_binary_backup(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        workflow = (SCRIPT_DIR.parents[1] / ".github/workflows/zakura-mainnet-deploy.yml").read_text()
+        body = workflow.split("          rollback() {", 1)[1].split("\n          }", 1)[0]
+        script = "set -eu\nrestart_service() { true; }\nrollback() {" + body + "\n}\nrollback"
+        subprocess.run(["bash", "-s"], input=script, text=True, check=True, capture_output=True,
+                       env=dict(os.environ, BIN_PATH=str(self.bin), SERVICE_NAME="zakurad"))
+        self.assertEqual(self.config.read_text(), self.OLD + self.OTHER)
+        self.assertEqual(self.bin.read_text(), "#!/bin/sh\necho old\n")
 
     def test_start_failure_restores_the_pair_and_restarts_the_old_service(self):
         self.assertNotEqual(self.install(fail_new=True).returncode, 0)
@@ -745,8 +785,7 @@ esac
         self.assertTrue((self.root / "active").exists())
 
     def test_uncertain_config_and_deferred_restart_leave_both_files_intact(self):
-        for text, no_restart in [(self.OLD, True), (self.OLD.replace("true", "false"), False),
-                                 (self.OLD + self.NEW, False)]:
+        for text, no_restart in [(self.OLD, True), (self.OLD + "unknown = true\n", False)]:
             with self.subTest(text=text, no_restart=no_restart):
                 self.config.write_text(text)
                 self.assertNotEqual(self.install(no_restart=no_restart).returncode, 0)

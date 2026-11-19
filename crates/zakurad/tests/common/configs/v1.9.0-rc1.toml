@@ -102,14 +102,14 @@ peerset_initial_target_size = 100
 push_relayed_blocks = false
 unconditional_peers = []
 
-# Warm each new legacy TCP connection with a few padded pings, so that its first
+# Warm each new legacy TCP connection with two padded pings, so that its first
 # full block does not wait for TCP slow start. Needs
 # net.ipv4.tcp_slow_start_after_idle = 0.
 [network.tcp_warmup]
 chunk_timeout = "5s"
 enabled = false
-first_chunk_bytes = 14000
-max_chunk_bytes = 2097144
+first_chunk_bytes = 800000
+max_chunk_bytes = 1600000
 max_concurrent = 16
 peer_cooldown = "1day"
 tip_quiet = "2s"

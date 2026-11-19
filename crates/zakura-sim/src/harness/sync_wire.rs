@@ -950,9 +950,9 @@ pub const SYNC_COMPOSED_VERSION: u8 = 1;
 /// byte, a chain byte, then three bytes per event slot.
 pub const SYNC_COMPOSED_BYTES: usize = 3 + 3 * SYNC_COMPOSED_SLOTS;
 
-/// When a composed hold opens, in milliseconds from the run's start
-/// ([`Trigger::VirtualTime`]): from a short stall to past block sync's
-/// 8-second request timeout for an operation taken early in the run.
+/// How long a composed hold keeps each operation it holds, in milliseconds
+/// after that operation's submission, as [`Trigger::VirtualTime`] counts in
+/// a hold: from a short stall to past block sync's 8-second request timeout.
 const HOLD_UNTIL_MS: [u64; 8] = [1_000, 3_000, 6_000, 9_000, 10_000, 12_000, 16_000, 24_000];
 
 /// The scenario the bytes after a `sync/composed` prefix's version byte
@@ -1084,9 +1084,9 @@ fn composed_trigger(b: u8) -> Option<Trigger> {
 
 /// A block hold from its slot's `a` and `b`: it holds mirror range reads,
 /// needed-block queries, admissions or applies (`a` bits 0 and 1), each
-/// one or only the first to fourth (bit 2 clear, then bits 3 and 4), until
-/// [`HOLD_UNTIL_MS`] at `b` modulo 8, then offers the operation's ordinary
-/// outcome.
+/// one or only the first to fourth (bit 2 clear, then bits 3 and 4), each
+/// for [`HOLD_UNTIL_MS`] at `b` modulo 8 after its submission, then offers
+/// the operation's ordinary outcome.
 fn composed_hold(a: u8, b: u8) -> block_policy::Hold {
     use block_policy::{BlockAllow, BlockKind, Select};
     let (kind, then) = match a & 3 {

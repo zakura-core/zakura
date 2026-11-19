@@ -52,9 +52,8 @@ impl DeliveredBlock {
     }
 
     /// Credits a legacy delivery once its exact body has passed verification: clears the miss
-    /// the connection had when the reply arrived, and records the reply's answer time, which
-    /// moves the peer's expected answer time only if the reply was small enough to arrive in
-    /// one round trip.
+    /// the connection had when the reply arrived, and records the reply's time and size for
+    /// the peer's round-trip or large-block estimate.
     /// Clones share the same observation. Other transports carry no observation.
     pub fn record_verified(&self) {
         if let Some(observation) = &self.observation {

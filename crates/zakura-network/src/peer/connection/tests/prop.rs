@@ -199,7 +199,7 @@ async fn send_block_request(
 
     let request = Request::BlocksByHash(IndexSet::from_iter([block]));
     let client_request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request,
         tx: response_sender,
         // we skip inventory collection in these tests

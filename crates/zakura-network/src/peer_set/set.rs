@@ -131,7 +131,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
-        AdvertisedBlockRequest, LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
+        BlockRequestKind, LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
     },
     peer_set::{
         legacy_peer_trace::{
@@ -1281,19 +1281,20 @@ where
         mut svc: LoadTrackedClient,
         req: Request,
         attempt: Option<&crate::BlockHedge>,
-        advertised: Option<AdvertisedBlockRequest>,
+        advertised: bool,
     ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
         let response = match attempt {
             Some(attempt) => {
-                let reply = crate::protocol::internal::FirstReply {
-                    estimate: svc.block_gossip.delivery_estimate(),
-                    block_size: svc.inbound_block_size(),
+                let estimate = svc.block_gossip.delivery_estimate();
+                let route = BlockRequestKind::TrackedPrimary {
+                    attempt: attempt.clone(),
+                    advertised,
                 };
-                attempt.dispatch_if_needed(Some(peer), Some(reply), || {
-                    svc.call_routed(req, advertised)
+                attempt.dispatch_if_needed(Some(peer), Some(estimate), || {
+                    svc.call_routed(req, Some(route))
                 })
             }
-            None => Ok(svc.call_routed(req, advertised)),
+            None => Ok(svc.call_routed(req, advertised.then_some(BlockRequestKind::Primary))),
         };
         self.push_unready(peer, svc);
         response
@@ -1490,10 +1491,7 @@ where
                 svc,
                 req,
                 attempt.as_ref(),
-                matches!(hash, InventoryHash::Block(_)).then(|| match &attempt {
-                    Some(attempt) => AdvertisedBlockRequest::TimedPrimary(attempt.clone()),
-                    None => AdvertisedBlockRequest::Primary,
-                }),
+                matches!(hash, InventoryHash::Block(_)),
             ) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
@@ -1570,7 +1568,7 @@ where
                 )),
                 _ => None,
             };
-            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
+            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), false) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
             };
@@ -1739,8 +1737,8 @@ where
     ) -> Option<(D::Key, SecondRequestChoice)> {
         let first = attempt.first_dispatch()?;
         let first_peer = first.legacy_peer;
-        let block_bytes = first.reply_bytes();
-        let first_score = first.expected(block_bytes)?;
+        let block_bytes = first.block_size.get().copied();
+        let first_score = first.estimate.expected(block_bytes)?;
         let candidates: Vec<_> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
@@ -1789,7 +1787,7 @@ where
         let started = Instant::now();
         let fut = svc.call_routed(
             Request::BlocksByHash(std::iter::once(hash).collect()),
-            Some(AdvertisedBlockRequest::Hedge),
+            Some(BlockRequestKind::Hedge),
         );
         self.push_unready(peer, svc);
 

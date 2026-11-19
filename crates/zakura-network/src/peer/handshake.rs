@@ -2306,7 +2306,7 @@ async fn send_one_heartbeat(
     let request = Request::Ping(Nonce::default());
     tracing::trace!(?request, "queueing heartbeat request");
     match server_tx.try_send(ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request,
         tx,
         // we're not requesting inventory, so we don't need to update the registry

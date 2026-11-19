@@ -186,51 +186,64 @@ fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     assert!(bytes.is_empty(), "all complete messages should be consumed");
 }
 
-/// A `block` message's header states the block's size, so the codec reports it before the body
-/// has arrived. The header of any other message leaves it alone.
+/// The declared length becomes visible only after the block header identifies the request.
 #[test]
-fn a_block_message_s_size_is_known_before_its_body_arrives() {
+fn a_partial_frame_reports_only_the_requested_block_size() {
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+    let body = BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    for (command, requested_hash, matches) in [
+        (*BLOCK_COMMAND, hash, true),
+        (*BLOCK_COMMAND, block::Hash([0; 32]), false),
+        (*b"tx\0\0\0\0\0\0\0\0\0\0", hash, false),
+    ] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(OnceLock::new());
+        codec
+            .inbound_block_size()
+            .watch(requested_hash, size.clone());
+        let message = wire_message(command, body);
+        let prefix = HEADER_LEN + block::MAX_SERIALIZED_HEADER_BYTES;
+        let mut received = BytesMut::from(&message[..prefix - 1]);
+        assert!(codec.decode(&mut received).unwrap().is_none());
+        assert_eq!(size.get(), None);
+        received.extend_from_slice(&message[prefix - 1..prefix]);
+        assert!(codec.decode(&mut received).unwrap().is_none());
+        assert_eq!(
+            size.get().copied(),
+            matches.then_some(u64::try_from(body.len()).unwrap())
+        );
+    }
+}
+
+/// Cancelling and re-requesting even the same hash cannot redirect a partially read frame.
+#[test]
+fn a_frame_keeps_the_size_destination_it_started_with() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
     let mut codec = Codec::builder()
         .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
         .finish();
-    let size = codec.inbound_block_size();
-    let partial = |command: [u8; 12]| {
-        let message = wire_message(command, &[0; 2_000]);
-        BytesMut::from(&message[..HEADER_LEN + 100])
-    };
+    let observation = codec.inbound_block_size();
+    let original = Arc::new(OnceLock::new());
+    observation.watch(hash, original.clone());
+    let message = wire_message(*BLOCK_COMMAND, body);
+    let mut received = BytesMut::from(&message[..HEADER_LEN]);
+    assert!(codec.decode(&mut received).unwrap().is_none());
 
-    let mut other_codec = Codec::builder()
-        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
-        .finish();
-    let other_size = other_codec.inbound_block_size();
+    observation.clear();
+    let retry = Arc::new(OnceLock::new());
+    observation.watch(hash, retry.clone());
+    received.extend_from_slice(&message[HEADER_LEN..message.len() - 1]);
+    assert!(codec.decode(&mut received).unwrap().is_none());
     assert_eq!(
-        other_codec
-            .decode(&mut partial(*b"tx\0\0\0\0\0\0\0\0\0\0"))
-            .expect("a partial message is not an error"),
-        None
+        original.get().copied(),
+        Some(u64::try_from(body.len()).unwrap())
     );
-    assert_eq!(
-        other_size.get(),
-        None,
-        "a transaction's header says nothing about a block"
-    );
-
-    assert_eq!(size.get(), None, "nothing has arrived yet");
-    assert_eq!(
-        codec
-            .decode(&mut partial(*BLOCK_COMMAND))
-            .expect("a partial message is not an error"),
-        None,
-        "the block is not complete"
-    );
-    assert_eq!(
-        size.get(),
-        Some(2_000),
-        "the header gave the size with 100 of 2,000 body bytes received"
-    );
-
-    size.clear();
-    assert_eq!(size.get(), None, "a cleared size is unknown again");
+    assert_eq!(retry.get(), None);
 }
 
 fn wire_message(command: [u8; 12], body: &[u8]) -> Vec<u8> {

@@ -86,15 +86,6 @@ impl TestPeer {
         (self.addr, client)
     }
 
-    /// Where this peer's connection reports the size of a block that has started to arrive.
-    /// Setting it stands in for the connection's decoder reading a `block` message's header.
-    fn inbound_block_size(&self) -> crate::protocol::external::InboundBlockSize {
-        self.client
-            .as_ref()
-            .expect("peer is not yet in the peer set")
-            .inbound_block_size()
-    }
-
     /// Returns the next message the connection has already written to the peer, if any.
     async fn written_now(&mut self) -> Option<Message> {
         // Let the connection task run without advancing the paused clock.
@@ -1999,7 +1990,6 @@ async fn request_large_block_from(
     peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
     guard: &mut PeerSetGuard,
     first: &mut TestPeer,
-    first_reply_size: &crate::protocol::external::InboundBlockSize,
 ) -> (
     crate::BlockHedge,
     impl std::future::Future<Output = Result<Response, BoxError>>,
@@ -2011,7 +2001,12 @@ async fn request_large_block_from(
         first.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()]))
     );
-    first_reply_size.set(LARGE_BLOCK_BYTES);
+    attempt
+        .first_dispatch()
+        .expect("first request was routed")
+        .block_size
+        .set(LARGE_BLOCK_BYTES)
+        .expect("first size report");
     (attempt, first_request)
 }
 
@@ -2030,11 +2025,10 @@ async fn for_a_large_block_a_nearby_announcer_is_asked_and_a_far_one_is_not() {
         measured_peer(&mut far, &registry, Some(240)),
         measured_peer(&mut near, &registry, Some(5)),
     ];
-    let first_reply_size = first.inbound_block_size();
     let (mut peer_set, mut guard) =
         peer_set_with_second_requests(&mut [&mut first, &mut far, &mut near]);
     let (attempt, _first_request) =
-        request_large_block_from(&mut peer_set, &mut guard, &mut first, &first_reply_size).await;
+        request_large_block_from(&mut peer_set, &mut guard, &mut first).await;
     announce_block(&mut peer_set, &mut guard, &far).await;
 
     // 1.5 MB is expected to take the first peer about 1,670 ms and the far peer about 1,610 ms.
@@ -2069,7 +2063,6 @@ async fn a_first_peer_slow_on_large_blocks_gives_way_to_a_far_peer_once_the_size
     let _far_measured = measured_peer(&mut far, &registry, Some(240));
     // About five times what a new connection with a 100 ms round trip would need.
     record_large_block(&first_samples, 3_350);
-    let first_reply_size = first.inbound_block_size();
     let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut far]);
 
     announce_block(&mut peer_set, &mut guard, &first).await;
@@ -2088,7 +2081,12 @@ async fn a_first_peer_slow_on_large_blocks_gives_way_to_a_far_peer_once_the_size
         "with the size unknown, the first peer's 100 ms round trip beats the far peer's 240 ms"
     );
 
-    first_reply_size.set(LARGE_BLOCK_BYTES);
+    attempt
+        .first_dispatch()
+        .expect("first request was routed")
+        .block_size
+        .set(LARGE_BLOCK_BYTES)
+        .expect("first size report");
     let _second = request_block_again(&mut peer_set, &attempt, 40).await;
     assert_eq!(
         far.written_now().await,
@@ -2112,11 +2110,10 @@ async fn of_two_far_announcers_the_one_faster_on_large_blocks_is_asked() {
     // One took about as long as a new connection needs for 1.5 MB, the other a third of that.
     record_large_block(&cold_samples, 1_600);
     record_large_block(&warm_samples, 560);
-    let first_reply_size = first.inbound_block_size();
     let (mut peer_set, mut guard) =
         peer_set_with_second_requests(&mut [&mut first, &mut cold, &mut warm]);
     let (attempt, _first_request) =
-        request_large_block_from(&mut peer_set, &mut guard, &mut first, &first_reply_size).await;
+        request_large_block_from(&mut peer_set, &mut guard, &mut first).await;
     announce_block(&mut peer_set, &mut guard, &cold).await;
     announce_block(&mut peer_set, &mut guard, &warm).await;
 

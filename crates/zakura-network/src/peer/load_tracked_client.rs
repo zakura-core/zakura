@@ -14,11 +14,9 @@ use tower::{
 
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
-    peer::{AdvertisedBlockRequest, Client, ConnectedAddr, ConnectionInfo},
+    peer::{BlockRequestKind, Client, ConnectedAddr, ConnectionInfo},
     peer_registry::trace_user_agent,
-    protocol::external::{
-        canonical_socket_addr, types::PeerServices, types::Version, InboundBlockSize,
-    },
+    protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
     Request,
 };
 
@@ -26,7 +24,7 @@ use crate::{
 #[derive(Debug)]
 struct RoutedClient(Client);
 
-impl Service<(Request, Option<AdvertisedBlockRequest>)> for RoutedClient {
+impl Service<(Request, Option<BlockRequestKind>)> for RoutedClient {
     type Response = <Client as Service<Request>>::Response;
     type Error = <Client as Service<Request>>::Error;
     type Future = <Client as Service<Request>>::Future;
@@ -35,10 +33,7 @@ impl Service<(Request, Option<AdvertisedBlockRequest>)> for RoutedClient {
         self.0.poll_ready(cx)
     }
 
-    fn call(
-        &mut self,
-        (request, advertised): (Request, Option<AdvertisedBlockRequest>),
-    ) -> Self::Future {
+    fn call(&mut self, (request, advertised): (Request, Option<BlockRequestKind>)) -> Self::Future {
         self.0.send_request(request, advertised)
     }
 }
@@ -145,12 +140,6 @@ impl LoadTrackedClient {
         self.request_slot.is_free()
     }
 
-    /// A handle to the size of the block this connection has started to receive since its
-    /// current request began, known once the reply's header has arrived.
-    pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
-        self.request_slot.inbound_block_size()
-    }
-
     /// Returns true if a block request timed out or was cancelled after at least half its timeout,
     /// and the peer has not completed a successful block response since then.
     pub(crate) fn has_unanswered_block_request(&self) -> bool {
@@ -197,7 +186,7 @@ impl LoadTrackedClient {
     pub(crate) fn call_routed(
         &mut self,
         request: Request,
-        advertised: Option<AdvertisedBlockRequest>,
+        advertised: Option<BlockRequestKind>,
     ) -> <Self as Service<Request>>::Future {
         self.service.call((request, advertised))
     }

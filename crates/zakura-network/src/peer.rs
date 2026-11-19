@@ -29,7 +29,7 @@ pub(crate) use announced_blocks::AnnouncedBlocks;
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 
-pub(crate) use client::{AdvertisedBlockRequest, CancelHeartbeatTask, ClientRequest, RequestSlot};
+pub(crate) use client::{BlockRequestKind, CancelHeartbeatTask, ClientRequest, RequestSlot};
 
 pub use client::Client;
 pub use connection::Connection;

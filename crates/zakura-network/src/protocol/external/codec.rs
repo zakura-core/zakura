@@ -4,10 +4,7 @@ use std::{
     fmt,
     io::{BufWriter, Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[cfg(test)]
@@ -263,35 +260,30 @@ fn serialized_block_checksum(block: &BlockHandle) -> sha256d::Checksum {
 /// The command of a `block` message, as it appears in a message header.
 const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
 
-/// The size of the `block` message a connection last started to receive, shared between the
-/// connection's decoder and whoever is waiting for the block.
-///
-/// A message's header states its body length before the body arrives, and a `block` message's
-/// body is the serialized block. So the size of a requested block is known one round trip after
-/// the request, well before a large block has finished downloading.
-///
-/// The decoder sets the size, and the connection clears it when it starts a new request.
+/// A request's destination for the size declared by its matching block message.
+#[derive(Clone, Debug)]
+struct RequestedBlockSize {
+    hash: block::Hash,
+    bytes: Arc<OnceLock<u64>>,
+}
+
+/// Shares the active primary request between the connection and its decoder.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct InboundBlockSize(Arc<AtomicU64>);
+pub(crate) struct InboundBlockSize(Arc<Mutex<Option<RequestedBlockSize>>>);
 
 impl InboundBlockSize {
-    /// Zero stands for "unknown": a block is never empty.
-    const UNKNOWN: u64 = 0;
-
-    /// Records that a `block` message of `serialized_bytes` has started to arrive.
-    pub(crate) fn set(&self, serialized_bytes: u64) {
-        self.0.store(serialized_bytes, Ordering::Release);
+    /// Called after the connection writes a single-block request.
+    pub(crate) fn watch(&self, hash: block::Hash, bytes: Arc<OnceLock<u64>>) {
+        *self.0.lock().expect("block size lock is never poisoned") =
+            Some(RequestedBlockSize { hash, bytes });
     }
 
-    /// The serialized size of the block that has started to arrive, or `None` if no `block`
-    /// message has since the last [`clear`](Self::clear).
-    pub(crate) fn get(&self) -> Option<u64> {
-        Some(self.0.load(Ordering::Acquire)).filter(|bytes| *bytes != Self::UNKNOWN)
-    }
-
-    /// Forgets the size, because the block it described is no longer the one awaited.
+    /// Stop observing this request when the connection becomes idle.
     pub(crate) fn clear(&self) {
-        self.set(Self::UNKNOWN);
+        self.0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .take();
     }
 }
 
@@ -299,7 +291,7 @@ impl InboundBlockSize {
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
-    /// Set from each `block` message's header, before its body arrives.
+    /// The request to observe when the next block message starts.
     inbound_block_size: InboundBlockSize,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
@@ -328,8 +320,7 @@ impl Codec {
         }
     }
 
-    /// A handle to the size of the `block` message this codec last started to decode. The codec
-    /// sets it when the message's header arrives.
+    /// Connect the request handler to this decoder before splitting the framed transport.
     pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
         self.inbound_block_size.clone()
     }
@@ -676,6 +667,7 @@ enum DecodeState {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
+        requested_size: Option<RequestedBlockSize>,
     },
 }
 
@@ -687,6 +679,7 @@ impl fmt::Debug for DecodeState {
                 body_len,
                 command,
                 checksum,
+                ..
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
@@ -753,11 +746,6 @@ impl Decoder for Codec {
                     metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
-                    if command == *BLOCK_COMMAND {
-                        // The length came from a u32, so widening it to u64 is lossless.
-                        self.inbound_block_size.set(body_len as u64);
-                    }
-
                     // Reserve buffer space for the next arriving bytes, not the claimed body.
                     src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
@@ -765,6 +753,15 @@ impl Decoder for Codec {
                         body_len,
                         command,
                         checksum,
+                        requested_size: if command == *BLOCK_COMMAND {
+                            self.inbound_block_size
+                                .0
+                                .lock()
+                                .expect("block size lock is never poisoned")
+                                .clone()
+                        } else {
+                            None
+                        },
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -774,7 +771,21 @@ impl Decoder for Codec {
                     body_len,
                     command,
                     checksum,
+                    ref mut requested_size,
                 } => {
+                    // Inspect at most one bounded header per observed frame, even if it arrives
+                    // one byte at a time. The full decoder still checks the checksum and body.
+                    let prefix_len = body_len.min(block::MAX_SERIALIZED_HEADER_BYTES);
+                    if src.len() >= prefix_len {
+                        if let Some(requested) = requested_size.take() {
+                            if block::Header::zcash_deserialize(&src[..prefix_len])
+                                .is_ok_and(|header| header.hash() == requested.hash)
+                            {
+                                // The transport length was read from a u32.
+                                let _ = requested.bytes.set(body_len as u64);
+                            }
+                        }
+                    }
                     if src.len() < body_len {
                         // Need to wait for the full body
                         trace!(?self.state, len = src.len(), "src buffer does not have an entire body, waiting");

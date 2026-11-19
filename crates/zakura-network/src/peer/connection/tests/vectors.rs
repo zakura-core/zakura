@@ -241,7 +241,7 @@ async fn connection_run_loop_message_ok() {
     // Simulate a message send and receive
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -308,7 +308,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -327,7 +327,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (block_tx, block_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::BlocksByHash(IndexSet::from([hash])),
             tx: block_tx,
             inv_collector: None,
@@ -369,7 +369,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -388,7 +388,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (find_tx, mut find_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::FindBlocks {
                 known_blocks: Vec::new(),
                 stop: None,
@@ -749,7 +749,7 @@ async fn connection_run_loop_send_timeout_nil_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::AdvertiseTransactionIds(HashSet::new(), None),
         tx: request_tx,
         inv_collector: None,
@@ -824,7 +824,7 @@ async fn connection_run_loop_send_timeout_expect_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -899,7 +899,7 @@ async fn connection_run_loop_receive_timeout() {
     // Simulate a message receive timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -1297,7 +1297,7 @@ async fn connection_ping_pong_round_trip() {
 
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::Ping(nonce),
             tx: response_tx,
             inv_collector: None,
@@ -1757,7 +1757,7 @@ impl BudgetedConnection {
         let (tx, response) = oneshot::channel();
         self.client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::BlocksByHash(blocks.iter().map(|block| block.hash()).collect()),
                 tx,
                 inv_collector: None,
@@ -2038,7 +2038,7 @@ fn client_request(
 ) {
     let (tx, rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request,
         tx,
         inv_collector: None,
@@ -2169,57 +2169,112 @@ async fn request_slot_tracks_responses_and_notfound() {
     connection_task.abort();
 }
 
-/// The size of an arriving block belongs to the request it answers: it lasts while that request
-/// is outstanding, and is forgotten when the connection takes its next request.
-#[tokio::test(start_paused = true)]
-async fn the_arriving_block_size_is_forgotten_when_the_next_request_starts() {
+/// A queued primary stays unknown while an earlier block arrives on its connection. After
+/// its getdata is written, only a matching partial block frame can publish its size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_and_active_primaries_observe_only_their_own_block() {
+    use crate::{
+        peer::BlockRequestKind,
+        peer_registry::{DeliveryEstimate, DeliverySampleKind},
+        protocol::external::Codec,
+        BlockHedge,
+    };
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{Encoder, FramedRead};
+    use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
+    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
     let _init_guard = zakura_test::init();
+    let codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    let (connection, mut client, _inbound, mut outbound, _error) = new_test_connection();
+    let connection = connection.with_inbound_block_size(codec.inbound_block_size());
+    let (mut wire, reader) = tokio::io::duplex(16 * 1024);
+    let conn_task = tokio::spawn(connection.run(FramedRead::new(reader, codec)));
 
-    let (mut peer_tx, peer_rx) = mpsc::channel(4);
-    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
-    let slot = connection.request_slot.clone();
-    let size = slot.inbound_block_size();
-    let connection_task = tokio::spawn(connection.run(peer_rx));
-    let (_tx, block) = response_vectors();
-
-    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    client_tx.send(request).await.expect("connection is open");
+    let primary = |mut body: &[u8], advertised| {
+        let block = block::Block::zcash_deserialize_bounded(&mut body).unwrap();
+        let hash = block.hash();
+        let attempt = BlockHedge::new(tokio::time::Instant::now());
+        let mut estimate = DeliveryEstimate::default();
+        estimate.record(
+            DeliverySampleKind::Ping,
+            Duration::from_millis(250),
+            Instant::now(),
+        );
+        let (mut request, response) = client_request(Request::block_by_hash(hash, None));
+        request.block_request = Some(BlockRequestKind::TrackedPrimary {
+            attempt: attempt.clone(),
+            advertised,
+        });
+        attempt
+            .dispatch_if_needed(
+                Some("127.0.0.1:8233".parse().unwrap()),
+                Some(estimate),
+                || (),
+            )
+            .unwrap();
+        let size = attempt.first_dispatch().unwrap().block_size;
+        let mut frame = BytesMut::new();
+        Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish()
+            .encode(Message::Block(Arc::new(block).into()), &mut frame)
+            .unwrap();
+        (request, response, size, frame, hash)
+    };
+    let (a, a_response, a_size, a_frame, a_hash) = primary(&BLOCK_MAINNET_1_BYTES, true);
+    let (b, b_response, b_size, b_frame, b_hash) = primary(&BLOCK_MAINNET_2_BYTES, false);
+    client.send(a).await.unwrap();
     assert_eq!(
         outbound.next().await,
-        Some(Message::GetData(vec![block.hash().into()]))
+        Some(Message::GetData(vec![a_hash.into()]))
     );
-    // The connection's decoder reads the header of the peer's `block` message.
-    size.set(1_500_000);
-    settle().await;
+    client.try_send(b).expect("B fits in the queue behind A");
+
+    // Leave a single byte outstanding so the connection cannot take B yet.
+    let last = a_frame.len() - 1;
+    wire.write_all(&a_frame[..last]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while a_size.get().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the decoder observed A");
     assert_eq!(
-        size.get(),
-        Some(1_500_000),
-        "the size stays known while the block is downloading"
+        a_size.get().copied(),
+        Some(u64::try_from(BLOCK_MAINNET_1_BYTES.len()).unwrap())
     );
-
-    peer_tx
-        .send(Ok(Message::Block(block.clone().into())))
-        .await
-        .expect("connection is open");
-    response
-        .await
-        .expect("connection responds")
-        .expect("peer sent the block");
-
-    let (request, _response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(b_size.get(), None);
+    wire.write_all(&a_frame[last..]).await.unwrap();
+    a_response.await.unwrap().unwrap();
     assert_eq!(
         outbound.next().await,
-        Some(Message::GetData(vec![block.hash().into()]))
-    );
-    settle().await;
-    assert_eq!(
-        size.get(),
-        None,
-        "the next request's block has not started to arrive"
+        Some(Message::GetData(vec![b_hash.into()]))
     );
 
-    connection_task.abort();
+    // A late copy of A arrives while B is active. A valid B frame must still fill B's cell.
+    wire.write_all(&a_frame).await.unwrap();
+    // The pong confirms the connection has processed the late frame.
+    let nonce = Nonce::default();
+    let mut ping = BytesMut::new();
+    Codec::builder()
+        .finish()
+        .encode(Message::Ping(nonce), &mut ping)
+        .unwrap();
+    wire.write_all(&ping).await.unwrap();
+    assert_eq!(outbound.next().await, Some(Message::Pong(nonce)));
+    assert_eq!(b_size.get(), None);
+    wire.write_all(&b_frame).await.unwrap();
+    b_response.await.unwrap().unwrap();
+    assert_eq!(
+        b_size.get().copied(),
+        Some(u64::try_from(BLOCK_MAINNET_2_BYTES.len()).unwrap())
+    );
+    conn_task.abort();
 }
 
 /// Cancellation and timeouts free the request slot, and a disconnect leaves it busy.
@@ -2265,7 +2320,7 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
 
     // A disconnect fails the outstanding request and leaves the slot busy.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     assert_eq!(
         outbound.next().await,
@@ -2313,7 +2368,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // An early cancellation says nothing about the peer.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2329,7 +2384,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // A downloader's own timeout usually cancels just before the connection's timer fires.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2361,7 +2416,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // The connection's own timeout also records the request.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Hedge);
+    request.block_request = Some(crate::peer::BlockRequestKind::Hedge);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2389,9 +2444,10 @@ async fn legacy_deadline_charges_only_a_written_advertised_request() {
         let (tx, block) = response_vectors();
         let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
         let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-        request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::TimedPrimary(
-            attempt.clone(),
-        ));
+        request.block_request = Some(crate::peer::BlockRequestKind::TrackedPrimary {
+            attempt: attempt.clone(),
+            advertised: true,
+        });
         if written {
             client_tx.send(request).await.unwrap();
             outbound.next().await.unwrap();
@@ -2630,7 +2686,7 @@ async fn block_advert_while_awaiting_response() {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![idle_hash],
                     stop: None,
@@ -2707,7 +2763,7 @@ async fn block_advert_as_ordinary_request_is_an_error() {
         let (request_tx, request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::AdvertiseBlock(block::Hash([5; 32]).into(), None),
                 tx: request_tx,
                 inv_collector: None,
@@ -2971,7 +3027,7 @@ async fn send_find_blocks(
     let (request_tx, request_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::FindBlocks {
                 known_blocks: vec![block::Hash([1; 32])],
                 stop: None,
@@ -3212,7 +3268,7 @@ async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
             let (request_tx, request_rx) = oneshot::channel();
             client_tx
                 .try_send(ClientRequest {
-                    advertised_block: None,
+                    block_request: None,
                     request: Request::TransactionsById(HashSet::from([requested.id(), missing])),
                     tx: request_tx,
                     inv_collector: None,
@@ -3341,7 +3397,7 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![block::Hash([1; 32])],
                     stop: None,

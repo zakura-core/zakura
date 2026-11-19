@@ -7,11 +7,9 @@
 //! would only cost bandwidth, because a legacy block request cannot be cancelled.
 //!
 //! A legacy `inv` carries no block size, so when the first request is sent every expected answer
-//! time is a peer's round trip. The size is learned from the first peer's reply: the header of
-//! its `block` message states the length, one round trip after the request and before the body
-//! has arrived. From then on the expected answer times compared here are the ones for a block
-//! of that size, from each peer's round trip and its record on large blocks. The decision
-//! itself does not change.
+//! time is a peer's round trip. The message header states the body length. Once enough of the
+//! body arrives to identify the requested block by its header hash, routing uses that length
+//! to compare peers using their round trips and their records on large blocks.
 //!
 //! The downloader shares the first dispatch with the peer set for each individual attempt, and
 //! asks for a second request once. The peer set holds that request (see

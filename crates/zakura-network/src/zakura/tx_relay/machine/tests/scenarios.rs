@@ -16,7 +16,7 @@ use crate::zakura::tx_relay::machine::{
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, INITIAL_WINDOW, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
     MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP, PENDING_PER_PEER,
-    PENDING_SHARE, RETRY_FIRST, TRIED_PER_ENTRY,
+    PENDING_SHARE, RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -1248,6 +1248,34 @@ fn a_zero_advert_delay_announces_to_everyone_at_once() {
     bench.now = Duration::from_secs(2);
     bench.resync();
     assert_eq!(advertised(&bench, resynced), sessions);
+}
+
+/// The fan-out ranks sessions by the round-trip times their routines
+/// report, lowest first, from the next ranking on: with a window of one, an
+/// admission goes at once only to the session placed first.
+#[test]
+fn the_lowest_round_trip_time_hears_first_once_the_ranking_refreshes() {
+    let mut bench = Bench::with(one_at_once(ADVERT_DELAY), true, &[]);
+    let sessions = [bench.join(1), bench.join(2), bench.join(3)];
+    for (session, ms) in sessions.iter().zip([90, 60, 30]) {
+        bench.rtt(*session, Duration::from_millis(ms));
+    }
+    let before = bench.id(0);
+    bench.add(&[before]);
+    assert_eq!(
+        advertised(&bench, before),
+        vec![sessions[0]],
+        "sticky until then"
+    );
+
+    bench.tick(RANK_INTERVAL);
+    let after = bench.id(1);
+    bench.add(&[after]);
+    assert_eq!(
+        advertised(&bench, after),
+        vec![sessions[2]],
+        "the fastest first"
+    );
 }
 
 /// Sessions that open before the pool attaches announce the whole pool once

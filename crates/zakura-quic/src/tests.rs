@@ -2226,6 +2226,27 @@ async fn a_header_read_takes_only_the_header_from_quinn() {
     .unwrap();
 }
 
+/// An RTT reader reports the smoothed round-trip time in the connection's
+/// load snapshot.
+#[tokio::test]
+async fn an_rtt_reader_reports_the_smoothed_rtt() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(8).await;
+        let reader = inbound.rtt_reader();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[5; 10_000]).await.unwrap();
+        send.finish().unwrap();
+        let (_send, mut recv) = inbound.accept_bi().await.unwrap();
+        while recv.read_chunk(usize::MAX).await.unwrap().is_some() {}
+        tokio::time::sleep(crate::LOAD_INTERVAL * 4).await;
+        let rtt = reader.rtt().expect("the connection is open");
+        assert!(!rtt.is_zero(), "the snapshot carries the smoothed RTT");
+        assert_eq!(rtt, inbound.load().rtt);
+    })
+    .await
+    .unwrap();
+}
+
 /// Takes the first stream's data and then rejects the connection, the way
 /// Zakura closes a peer that fails its control handshake.
 struct ChurnAcceptor;

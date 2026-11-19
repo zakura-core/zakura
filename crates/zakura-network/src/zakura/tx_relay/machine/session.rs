@@ -609,8 +609,6 @@ impl PeerMachine {
 
     /// This session's routine reports its connection's smoothed round-trip
     /// time. It counts at the next ranking.
-    // Unused until the IO reports round-trip times, which a later change wires in.
-    #[allow(dead_code)]
     pub(crate) fn observe_rtt(
         &mut self,
         shared: &mut Shared,

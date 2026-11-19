@@ -38,7 +38,7 @@ use super::{
     machine::{
         peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
         PeerMachine, PoolView, RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved,
-        Verdict, Violation, WaiterId, MAX_SERVES,
+        Verdict, Violation, WaiterId, MAX_SERVES, RANK_INTERVAL,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
@@ -307,6 +307,7 @@ impl Service for TxRelayService {
             ownership.gap_until = None;
         }
         let peer_key = self.peer_key(&peer.id);
+        let rtt = peer.rtt_reader();
         let conn_cancel = peer.cancel_token();
         let session_cancel = peer.service_cancel_token();
         let close_cause = peer.close_cause();
@@ -329,6 +330,7 @@ impl Service for TxRelayService {
             peer.remote_ip,
             SessionIo::new(data, state, close, reports_rx, inv, connection),
             session_cancel,
+            rtt,
         );
         task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
     }
@@ -637,6 +639,10 @@ struct Routine {
     io: SessionIo,
     /// The session's cancellation, which stops its writers too.
     cancel: CancellationToken,
+    /// Reads the connection's smoothed round-trip time, which the routine
+    /// reports to the ranking once a [`RANK_INTERVAL`], from `rtt_due` on.
+    rtt: Option<zakura_quic::RttReader>,
+    rtt_due: Instant,
     /// The pool as this routine last read it, and its place in the log, or
     /// `None` before the first snapshot.
     view: SnapshotView,
@@ -652,13 +658,15 @@ struct Routine {
 
 impl Routine {
     /// Opens a session of `peer` on `io`, sends our `Hello`, and returns its
-    /// routine, which reads the pool before its first step.
+    /// routine, which reads the pool before its first step and reports the
+    /// round-trip time `rtt` reads on its first tick.
     fn open(
         wiring: Wiring,
         peer: PeerKey,
         remote_ip: Option<IpAddr>,
         io: SessionIo,
         cancel: CancellationToken,
+        rtt: Option<zakura_quic::RttReader>,
     ) -> Self {
         let wake = Arc::new(Notify::new());
         let view = SnapshotView::empty();
@@ -700,6 +708,8 @@ impl Routine {
             wake,
             io,
             cancel,
+            rtt,
+            rtt_due: Instant::now(),
             view,
             cursor: None,
             pool_open: true,
@@ -836,9 +846,27 @@ impl Routine {
         }
     }
 
-    /// Time passed, or another step woke this one.
+    /// Time passed, or another step woke this one. A round-trip time due
+    /// for the ranking goes in this step.
     fn tick(&mut self) {
-        self.step(|machine, shared, pool, now| machine.tick(shared, pool, now));
+        match self.due_rtt() {
+            Some(rtt) => self.step(|machine, shared, pool, now| {
+                machine.observe_rtt(shared, pool, rtt, now);
+            }),
+            None => self.step(|machine, shared, pool, now| machine.tick(shared, pool, now)),
+        }
+    }
+
+    /// The connection's round-trip time, if a report is due, and when the
+    /// next one is. A connection with no sample yet reports nothing.
+    fn due_rtt(&mut self) -> Option<Duration> {
+        let reader = self.rtt.as_ref()?;
+        let now = Instant::now();
+        if now < self.rtt_due {
+            return None;
+        }
+        self.rtt_due = now + RANK_INTERVAL;
+        reader.rtt().filter(|rtt| !rtt.is_zero())
     }
 
     /// What this routine does after each input: sends announcements and
@@ -857,14 +885,18 @@ impl Routine {
     }
 
     /// When this routine next has something due: the machine's deadline,
-    /// which covers its next `Inv` try.
+    /// which covers its next `Inv` try, or its next round-trip time report.
     fn next_wake(&self) -> Instant {
         let far = Instant::now() + Duration::from_secs(3600);
         let machine = {
             let node = self.wiring.node.lock().expect("the node is never poisoned");
             self.machine.next_deadline(&node.shared)
         };
-        machine.map_or(far, |at| self.wiring.base + at)
+        let machine = machine.map_or(far, |at| self.wiring.base + at);
+        match self.rtt {
+            Some(_) => machine.min(self.rtt_due),
+            None => machine,
+        }
     }
 
     /// Handles one frame from the peer. Returns `false` for a frame that

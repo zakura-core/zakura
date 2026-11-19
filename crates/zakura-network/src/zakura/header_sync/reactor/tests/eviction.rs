@@ -211,8 +211,10 @@ fn a_timeout_during_our_own_apply_charges_no_strike() {
     assert!(fixture.is_admitted() && !fixture.cancel.is_cancelled());
 }
 
+/// A page that reaches the target only stages its headers. Its preparation
+/// clears the strikes, not its arrival (#2248).
 #[test]
-fn a_productive_response_resets_the_unproductive_counter() {
+fn a_staged_page_does_not_reset_the_unproductive_counter() {
     let mut fixture = eviction_fixture(3, 7);
 
     for _ in 0..2 {
@@ -223,20 +225,13 @@ fn a_productive_response_resets_the_unproductive_counter() {
     fixture.answer_with_one_header(7);
     assert_eq!(
         fixture.unproductive_requests(),
-        Some(0),
-        "one usable header clears the peer's accumulated strikes"
+        Some(2),
+        "staged headers are not progress until they are prepared"
     );
-    let _ = fixture.drain_actions();
-
-    for _ in 0..2 {
-        fixture.time_out_one_request(7);
-    }
-
-    assert!(
-        fixture.is_admitted() && !fixture.cancel.is_cancelled(),
-        "strikes that straddle a productive response must not accumulate across it"
-    );
-    assert_eq!(fixture.unproductive_requests(), Some(2));
+    assert!(fixture
+        .drain_actions()
+        .iter()
+        .any(|action| matches!(action, HeaderPortOperation::PrepareHeaderTarget { .. })));
 }
 
 #[test]
@@ -578,28 +573,45 @@ async fn a_delayed_first_request_still_gets_the_carried_time() {
     );
 }
 
-/// The carried time binds only the replacement's first deadline. A staged
-/// page re-arms it in full, so a peer that answers pays nothing for the
-/// replacement.
+/// #2248's drip: a peer sends one linked header just inside each request
+/// timeout (29 s of 30 s). A page that neither fills the reservation nor
+/// reaches the target is not progress, so the request's first deadline
+/// stands, and the drip ends in a stall. The same holds for a replacement's
+/// carried deadline.
 #[tokio::test(start_paused = true)]
-async fn an_answered_replacement_request_gets_a_full_timeout() {
-    let mut fixture = eviction_fixture(1, 7);
-    let timeout = fixture.reactor.startup.request_timeout;
-    fixture.start_request(7);
-    time::advance(timeout - std::time::Duration::from_secs(1)).await;
-    let replacement = fixture.replace_session(8);
-    fixture.start_request(8);
+async fn a_one_header_drip_ends_in_a_stall() {
+    for replaced in [false, true] {
+        let mut fixture = eviction_fixture(1, 7);
+        let timeout = fixture.reactor.startup.request_timeout;
+        let session = if replaced {
+            fixture.start_request(7);
+            time::advance(timeout - std::time::Duration::from_secs(1)).await;
+            let replacement = fixture.replace_session(8);
+            fixture.start_request(8);
+            (8, replacement)
+        } else {
+            fixture.start_request(7);
+            (7, fixture.cancel.clone())
+        };
+        let deadline = *fixture
+            .reactor
+            .state
+            .request_deadlines
+            .get(&fixture.peer)
+            .expect("the request has a deadline");
 
-    let answered = Instant::now();
-    fixture.answer_started_request(8);
-    assert_eq!(
-        fixture.reactor.state.request_deadlines.get(&fixture.peer),
-        Some(&(answered + timeout)),
-        "the staged page re-arms a full timeout"
-    );
-    time::advance(std::time::Duration::from_secs(1)).await;
-    fixture.reactor.retire_timed_out_requests(Instant::now());
-    assert!(!replacement.is_cancelled());
+        time::advance(deadline - Instant::now() - std::time::Duration::from_secs(1)).await;
+        fixture.answer_started_request(session.0);
+        assert_eq!(
+            fixture.reactor.state.request_deadlines.get(&fixture.peer),
+            Some(&deadline),
+            "a dripped header does not extend the deadline"
+        );
+        time::advance(std::time::Duration::from_secs(1)).await;
+        fixture.reactor.retire_timed_out_requests(Instant::now());
+        assert!(session.1.is_cancelled(), "the drip ends in a stall");
+        assert!(!fixture.is_admitted());
+    }
 }
 
 /// A replacement that retires no unanswered request gives the replacement's

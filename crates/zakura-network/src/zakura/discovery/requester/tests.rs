@@ -363,6 +363,21 @@ async fn a_retired_session_refuses_the_next_query() {
     assert_eq!(pool.held(), 0);
 }
 
+/// disco-14: silent sessions cannot starve the query pool. A session holds
+/// at most one reservation per query kind, so 92 sessions (the default
+/// connection limit) hold at most 184 entries. The derived pool covers twice
+/// that, 368 entries, so an honest session always reserves at once.
+#[test]
+fn the_query_pool_covers_twice_every_sessions_queries() {
+    let pool = reservation_pool();
+    let needed = 2 * crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS * QUERY_KINDS.len();
+    assert_eq!(needed, 368);
+    let entries: Vec<_> = std::iter::from_fn(|| pool.try_entry())
+        .take(needed)
+        .collect();
+    assert_eq!(entries.len(), needed);
+}
+
 /// A full node-wide pool defers the query to the next exchange.
 #[tokio::test]
 async fn a_full_pool_defers_the_query() {

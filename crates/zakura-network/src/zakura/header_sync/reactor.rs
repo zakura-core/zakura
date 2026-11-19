@@ -1674,10 +1674,9 @@ impl HeaderSyncReactor {
             self.reject_page(peer, session_id);
             return;
         }
-        self.reset_unproductive_requests(&peer, session_id);
-        self.state
-            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
-
+        // A staged page is not progress yet (#2248): a peer could drip one
+        // header per deadline and hold its reservation. Progress is a
+        // prepared target, or a filled reservation that continues the round.
         let active = self
             .peer_work_queue
             .active(&peer)
@@ -1701,8 +1700,19 @@ impl HeaderSyncReactor {
                 }
                 self.prepare_staged_work(&peer, bounded_prefix);
             }
-            PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+            PageNext::Continue { staged_tip } => {
+                self.note_request_progress(&peer, session_id);
+                self.continue_round(&peer, staged_tip);
+            }
         }
+    }
+
+    /// Count progress on `peer`'s request from `session_id`: clear its
+    /// strikes and give the request a full timeout.
+    fn note_request_progress(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        self.reset_unproductive_requests(peer, session_id);
+        self.state
+            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
     }
 
     /// Judge a page for `peer`'s selected-range repair, and retry the repair
@@ -2296,11 +2306,7 @@ impl HeaderSyncReactor {
                         return;
                     }
                 }
-                self.state.arm_request_deadline(
-                    peer.clone(),
-                    Instant::now(),
-                    self.startup.request_timeout,
-                );
+                self.note_request_progress(&peer, active.owner.session_id());
                 assert!(
                     self.peer_work_queue.begin_apply(&peer),
                     "the exact preparing request passed the completion gate"

@@ -34,12 +34,12 @@ The reservation is called a claim. Four rules define it:
   blocks above the verified tip are claimed, so catch-up creates none.
 - **A block has one claim, and it is permanent.** A claim, once made, is never
   replaced or renewed by delivering the header again, and reading it does not
-  use it up, so an invalid
-  body under the same header cannot take it. The table holds 64 claims. When
-  it is full it refuses new claims and never drops old ones. A claim is
-  removed only when its height falls below the verified tip, where no new
-  claim can be made. That floor never goes down, so after a rollback claims
-  resume once the tip passes it again.
+  use it up, so an invalid body under the same header cannot take it. The
+  table holds 64 claims. When it is full it refuses new claims and never
+  drops old ones. A claim is removed when no apply covering it succeeds, or
+  at the first header apply after the verified tip passes its height, where
+  no new claim can be made. That floor never goes down, so after a rollback
+  claims resume once the tip passes it again.
 - **The body has a deadline.** It is 500 ms plus the body's serialized size at
   1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
   body that arrives later draws a fresh order, as if its header had never been
@@ -89,7 +89,7 @@ Some blocks have no claim and are ranked by body arrival:
   headers before bodies.
 - A block whose header arrived before a restart. Claims are not persisted.
 - A block refused by a full table. On Testnet, minimum-difficulty headers can
-  fill the table at every height.
+  fill the table, which then refuses claims until the verified tip moves.
 
 [Fork retention](../specs/fork-aware-header-chain-engine.md#lc-retain-01)
 keeps newly accepted parents available for extension and evicted bodies eligible

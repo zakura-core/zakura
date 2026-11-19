@@ -10,7 +10,7 @@ use zakura_chain::{block, serialization::ZcashSerialize};
 use zakura_node_services::block_memory::BlockHandle;
 
 use super::{
-    claims::{AnnouncementClaims, MinedGuard},
+    claims::{AnnouncementClaims, ClaimOutcome, MinedGuard},
     order,
 };
 
@@ -88,10 +88,28 @@ impl ReceiptRegistry {
         block: &BlockHandle,
         now: Instant,
     ) -> ReceiptGuard {
+        let (receipt, counted) = self.draw(hash, block, now);
+        if let Some(claim) = counted {
+            claim.record(hash, receipt.order);
+        }
+        receipt
+    }
+
+    /// Gives `block` its receipt, and returns the claim outcome to count for it.
+    ///
+    /// Only a newly tracked receipt is counted. A body that shares a receipt was counted when
+    /// that receipt was drawn, and an untracked body is not counted, so junk bodies under a real
+    /// header cannot skew the claim metrics.
+    pub(super) fn draw(
+        &self,
+        hash: block::Hash,
+        block: &BlockHandle,
+        now: Instant,
+    ) -> (ReceiptGuard, Option<ClaimOutcome>) {
         let claim = self
             .claims
             .resolve(hash, now, || block.zcash_serialized_size());
-        let (order, registered, drawn) = {
+        let (order, registered, counted) = {
             let mut active = self
                 .active
                 .lock()
@@ -104,7 +122,7 @@ impl ReceiptRegistry {
                     .callers
                     .checked_add(1)
                     .expect("each active caller owns memory, so its count fits in usize");
-                (entry.order, Some((hash, entry.block.clone())), false)
+                (entry.order, Some((hash, entry.block.clone())), None)
             } else if bodies.len() < MAX_BODIES_PER_HASH {
                 let order = new_order();
                 bodies.push(Entry {
@@ -112,21 +130,17 @@ impl ReceiptRegistry {
                     order,
                     callers: 1,
                 });
-                (order, Some((hash, block.clone())), true)
+                (order, Some((hash, block.clone())), Some(claim))
             } else {
-                (new_order(), None, true)
+                (new_order(), None, None)
             }
         };
-        // A body that shares a receipt was counted when that receipt was drawn. An untracked body
-        // is not counted, so junk bodies under a real header cannot skew the claim metrics.
-        if drawn && registered.is_some() {
-            claim.record(hash, order);
-        }
-        ReceiptGuard {
+        let receipt = ReceiptGuard {
             active: self.active.clone(),
             registered,
             order,
-        }
+        };
+        (receipt, counted)
     }
 
     /// Records that the locally mined block `hash` at `height` took `order`. See

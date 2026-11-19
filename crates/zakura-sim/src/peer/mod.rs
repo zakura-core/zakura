@@ -42,6 +42,7 @@ pub mod handshake;
 pub mod honest;
 pub mod limit;
 mod stage;
+pub mod tx_relay;
 
 use std::{
     cell::{Cell, RefCell},
@@ -386,7 +387,7 @@ pub struct PeerFailure(Arc<Mutex<Option<String>>>);
 impl PeerFailure {
     /// Records `why`, unless a failure is already recorded. The lock is
     /// never held across another call.
-    fn record(&self, why: String) {
+    pub(crate) fn record(&self, why: String) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -540,6 +541,22 @@ impl PeerControl {
             kind: stream.kind,
             version: stream.version,
         });
+        self
+    }
+
+    /// Also logs the peers' frames on tx-relay's `streams`, which the
+    /// evidence judges at their label's stage.
+    pub(crate) fn with_tx_relay(mut self, streams: &[Stream]) -> Self {
+        let evidence = std::mem::take(&mut self.evidence);
+        self.evidence = evidence.with_tx_relay(
+            streams
+                .iter()
+                .map(|stream| StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                })
+                .collect(),
+        );
         self
     }
 
@@ -839,7 +856,7 @@ impl Crafted {
 }
 
 /// `header`'s 8 bytes, then `payload`, as a peer writes them.
-fn frame_bytes(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn frame_bytes(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     // Written lengths stay far below 4 GiB.
     let len = u32::try_from(header.payload_len).expect("a written payload fits u32");
     let mut bytes = Vec::with_capacity(8 + payload.len());
@@ -1186,7 +1203,7 @@ struct HeaderStream {
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
-fn bind_config(addr: SocketAddr) -> QuicBindConfig {
+pub(crate) fn bind_config(addr: SocketAddr) -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![addr],
         max_bidi_streams: 16,

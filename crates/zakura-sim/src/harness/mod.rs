@@ -31,6 +31,7 @@ mod record;
 pub mod scenario;
 pub mod sync;
 pub mod sync_wire;
+pub mod tx_relay;
 pub mod wire_node;
 pub mod wire_plans;
 
@@ -710,6 +711,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
     entry::<sync_wire::SyncComposed>(),
+    entry::<tx_relay::TxRelayWire>(),
 ];
 
 /// The harness named `name`.

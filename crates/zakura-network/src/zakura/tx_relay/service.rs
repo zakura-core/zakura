@@ -34,6 +34,8 @@ use zakura_rt::{
     time::{self, Instant},
 };
 
+#[cfg(zakura_sim)]
+use super::sim::{Received, SimEffect, SimState, TxRelayEvent, TxRelayObserver};
 use super::{
     machine::{
         peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
@@ -203,6 +205,33 @@ impl TxRelayService {
         unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
+        Arc::new(Self::start(pool, may_cool, config, unconditional, sessions))
+    }
+
+    /// [`Self::spawn`], with every session reporting its steps to
+    /// `observer`.
+    #[cfg(zakura_sim)]
+    pub(crate) fn spawn_observed(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+        observer: TxRelayObserver,
+    ) -> Arc<Self> {
+        let mut service = Self::start(pool, may_cool, config, unconditional, sessions);
+        service.wiring.observer = Some(observer);
+        Arc::new(service)
+    }
+
+    /// Starts the reactor task and returns the service. See [`Self::spawn`].
+    fn start(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+    ) -> Self {
         let mut key = [0; 8];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let node = Node {
@@ -223,6 +252,8 @@ impl TxRelayService {
             inv_buckets: InvBuckets::default(),
             base: Instant::now(),
             unconditional,
+            #[cfg(zakura_sim)]
+            observer: None,
         };
         // The reactor task holds a reader, not a handle, so it does not keep
         // the core running, and it stops once the service, every routine
@@ -244,7 +275,7 @@ impl TxRelayService {
             .hash_length(8)
             .key(&key)
             .personal(b"Zakura_TxPeerKey");
-        Arc::new(Self { wiring, peer_key })
+        Self { wiring, peer_key }
     }
 
     /// The machine's name for `peer`, the same for every connection to it: a
@@ -623,6 +654,9 @@ struct Wiring {
     /// Bodies from these addresses are never charged. See
     /// [`Routine::exempt`].
     unconditional: UnconditionalPeers,
+    /// Hears each session's steps, in the simulator.
+    #[cfg(zakura_sim)]
+    observer: Option<TxRelayObserver>,
 }
 
 /// One session's routine. See the module docs.
@@ -668,6 +702,15 @@ impl Routine {
             let node = &mut *node;
             let marks = Marks::of(&node.shared);
             let machine = PeerMachine::connect(&mut node.shared, &view, peer, now);
+            #[cfg(zakura_sim)]
+            if let Some(observer) = &wiring.observer {
+                observer(TxRelayEvent::Opened {
+                    session: machine.session().0,
+                    peer: io.connection.0.clone(),
+                    readmitted: machine.readmitted(),
+                    parked: machine.is_ended(),
+                });
+            }
             node.sessions.insert(
                 machine.session(),
                 Handle {
@@ -811,6 +854,8 @@ impl Routine {
             }
             let result = input(&mut self.machine, &mut node.shared, &view, now);
             let effects = std::mem::take(&mut node.shared.effects);
+            #[cfg(zakura_sim)]
+            self.report_step(&node.shared, &effects);
             let closes = closers(node, &effects, Some(session));
             let wakes = route(node, marks, Some(session));
             (result, effects, closes, wakes)
@@ -886,6 +931,8 @@ impl Routine {
     /// decode on the blocking pool first.
     async fn message(&mut self, message: TxRelayMessage) {
         count(&message, "received");
+        #[cfg(zakura_sim)]
+        self.report_received(&message);
         match message {
             TxRelayMessage::Hello {
                 serves,
@@ -1065,6 +1112,12 @@ impl Routine {
     /// task.
     fn finish(mut self) {
         self.step(|machine, shared, pool, now| machine.end(shared, pool, now));
+        #[cfg(zakura_sim)]
+        if let Some(observer) = &self.wiring.observer {
+            observer(TxRelayEvent::Ended {
+                session: self.machine.session().0,
+            });
+        }
         {
             let mut node = self.wiring.node.lock().expect("the node is never poisoned");
             node.sessions.remove(&self.machine.session());
@@ -1089,6 +1142,91 @@ impl Routine {
             inv.sessions = inv.sessions.saturating_sub(1);
         }
         self.io.live = None;
+    }
+
+    /// Reports a decoded message from the peer, before its step.
+    #[cfg(zakura_sim)]
+    fn report_received(&self, message: &TxRelayMessage) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let message = match message {
+            TxRelayMessage::Hello {
+                serves,
+                max_tx_bytes,
+            } => Received::Hello {
+                serves: *serves,
+                max_tx_bytes: *max_tx_bytes,
+            },
+            TxRelayMessage::Inv(entries) => Received::Inv(entries.clone()),
+            TxRelayMessage::GetTxs(id) => Received::GetTxs(*id),
+            TxRelayMessage::Tx { id, body } => Received::Tx {
+                id: *id,
+                size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+            },
+            TxRelayMessage::NotFound(id) => Received::NotFound(*id),
+        };
+        observer(TxRelayEvent::Received {
+            session: self.machine.session().0,
+            message,
+        });
+    }
+
+    /// Reports the step that produced `effects`, under the node's lock, so
+    /// every session's steps reach the observer in order.
+    #[cfg(zakura_sim)]
+    fn report_step(&self, shared: &Shared, effects: &[RelayEffect]) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let session = self.machine.session();
+        let peer = self.machine.state.peer;
+        let cooling = shared.reactor.is_cooling(peer, self.machine.clock());
+        let effects = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RelayEffect::Ask { id, .. } => Some(SimEffect::Ask(*id)),
+                RelayEffect::Serve { id, .. } => Some(SimEffect::Serve(*id)),
+                RelayEffect::NotFound { id, .. } => Some(SimEffect::NotFound(*id)),
+                RelayEffect::Submit {
+                    reservation, body, ..
+                } => Some(SimEffect::Submit {
+                    requested: self.reservations.get(reservation).map(Reservation::tx_id),
+                    body: body.id(),
+                    size: transaction_size(body.size()),
+                    cooling,
+                }),
+                RelayEffect::Park { session: parked } if *parked == session => {
+                    Some(SimEffect::Park)
+                }
+                RelayEffect::Close {
+                    session: closed,
+                    reason,
+                } => Some(SimEffect::Close {
+                    session: closed.0,
+                    outcome: close_outcome(*reason),
+                }),
+                _ => None,
+            })
+            .collect();
+        let state = &self.machine.state;
+        observer(TxRelayEvent::Stepped {
+            session: session.0,
+            peer: self.io.connection.0.clone(),
+            effects,
+            state: SimState {
+                hello_serves: state.hello.map(|hello| hello.serves),
+                asking: state.requests.len().saturating_add(state.reserving.len()),
+                in_flight: state.in_flight(),
+                unsettled: shared.reactor.unsettled_count(peer),
+                serving: state.serving.len(),
+                pending: state.pending.len(),
+                waiting: state.waiting.len(),
+                known: state.known.len(),
+                cooling,
+                ended: self.machine.is_ended(),
+            },
+        });
     }
 
     /// Performs one of this session's effects.
@@ -1254,6 +1392,15 @@ impl Routine {
                 .is_ok()
             {
                 count(&message, "sent");
+                #[cfg(zakura_sim)]
+                if let (Some(observer), TxRelayMessage::Inv(entries)) =
+                    (&self.wiring.observer, &message)
+                {
+                    observer(TxRelayEvent::InvSent {
+                        session: self.machine.session().0,
+                        entries: entries.clone(),
+                    });
+                }
             }
         }
     }

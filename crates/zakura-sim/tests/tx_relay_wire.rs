@@ -1,0 +1,428 @@
+//! `tx-relay/wire` (#2577): each `tx-relay` property applies and holds in
+//! its named witness, a composed prefix. Each fault row of `tx-relay`'s
+//! close table closes the connection in its witness, and its honest twin,
+//! which keeps the rule the witness breaks, runs without a fault close.
+//! Each reachable neutral close of the table closes in its own witness.
+//! Every generated ID fails on a scripted history that bypasses its rule.
+#![cfg(zakura_sim)]
+
+mod support;
+
+use std::{collections::BTreeSet, sync::Arc};
+
+use support::script::{run_under, Node, OBSERVED};
+use zakura_network::zakura::tx_relay_sim::TX_RELAY_STREAMS;
+use zakura_network::zakura::{CloseOutcome, CloseRow};
+use zakura_sim::{
+    domain::tx_relay::{
+        lock, SharedRelay, ANNOUNCE_AFTER_ADMISSION, COOLING_BODIES_DROPPED,
+        FAULT_CLOSE_NAMES_A_BROKEN_ROW, HELLO_FIRST, IDS, NO_PROBE, PENDING_WITHIN_BOUND,
+        REQUESTED_BODIES_ONLY, REQUESTS_WITHIN_LIMIT, SERVING_WITHIN_LIMIT, SKIP_SET_WITHIN_BOUND,
+        STALLED_PEERS_PARKED,
+    },
+    harness::{
+        run_prepared,
+        tx_relay::{
+            composed_prefix, read_log, wire_properties, RelayScenario, TxRelayWire, COMPOSED_BYTES,
+            NEUTRAL_WITNESSES, ROW_WITNESSES, STALL_WITNESS,
+        },
+        Subsystem,
+    },
+    model::Label,
+    peer::tx_relay::{header_fault, Answer, HeaderFault, HelloMode, RelayRow, RelayStep},
+    table::{generated_trigger, GeneratedId, Template},
+    NullSink, Observation, Outcome, PlanInput, PropertyOutcome, RunReport,
+};
+
+/// Runs `prefix` under the all-defaults Plan, and returns its report and
+/// evidence. No run may end at a harness failure.
+fn run(prefix: &[u8]) -> (RunReport, SharedRelay) {
+    let scenario = TxRelayWire::draw(prefix);
+    let evidence = SharedRelay::default();
+    let report = run_prepared::<TxRelayWire>(
+        &scenario,
+        Arc::clone(&evidence),
+        PlanInput::Bytes(Vec::new()),
+        &mut NullSink,
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{prefix:02x?}: {error:?}"));
+    assert_ne!(
+        report.end.outcome,
+        Outcome::Harness,
+        "{prefix:02x?}: {:?}",
+        report.end
+    );
+    read_log(&evidence, &report.log);
+    (report, evidence)
+}
+
+/// The properties `report` shows violated.
+fn violated(report: &RunReport) -> Vec<String> {
+    report
+        .properties
+        .iter()
+        .filter(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }))
+        .map(|r| format!("{}: {:?}", r.property, r.outcome))
+        .collect()
+}
+
+/// `id`'s outcome in `report`.
+fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
+    &report
+        .properties
+        .iter()
+        .find(|r| r.property == id)
+        .unwrap_or_else(|| panic!("the run reports {id}: {:?}", report.properties))
+        .outcome
+}
+
+/// True if `id` applied in `report` and held.
+fn held(report: &RunReport, id: &str) -> bool {
+    matches!(outcome(report, id), PropertyOutcome::Held { applicable } if *applicable > 0)
+}
+
+/// The closes the node decided, in log order.
+fn closes(report: &RunReport) -> Vec<CloseOutcome> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::ConnectionClosed { cause, .. } => Some(*cause),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Peer 0's `steps`, under node byte `node`, peers byte `peers` and answer
+/// byte `answer`.
+fn prefix(node: u8, peers: u8, answer: u8, steps: &[RelayStep]) -> [u8; COMPOSED_BYTES] {
+    let steps: Vec<(usize, RelayStep)> = steps.iter().map(|step| (0, *step)).collect();
+    composed_prefix(node, peers, answer, &steps).expect("a witness fits the grammar")
+}
+
+/// Waits ten seconds.
+const WAIT: RelayStep = RelayStep::Wait { secs: 10 };
+
+/// The bits of answer byte `answer` that pick `chosen`, among the
+/// conformant answers or all of them as `faults` says.
+fn answer(chosen: Answer, faults: bool) -> u8 {
+    let index = Answer::ALL
+        .into_iter()
+        .filter(|answer| faults || answer.conformant())
+        .position(|answer| answer == chosen)
+        .expect("the answer is listed");
+    u8::try_from(index).expect("a few answers")
+}
+
+/// Each domain property's named witness.
+fn domain_witnesses() -> Vec<(&'static str, [u8; COMPOSED_BYTES])> {
+    vec![
+        // A pool that takes 2 s to decide holds five bodies at once.
+        (
+            REQUESTS_WITHIN_LIMIT,
+            prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT]),
+        ),
+        // Twenty bodies of the node's, announced, then asked for at once.
+        (
+            SERVING_WITHIN_LIMIT,
+            prefix(0x30, 0, 0, &[WAIT, RelayStep::FetchBurst, WAIT]),
+        ),
+        (
+            PENDING_WITHIN_BOUND,
+            prefix(0, 0x80, 0, &[RelayStep::FillPending, WAIT]),
+        ),
+        (
+            SKIP_SET_WITHIN_BOUND,
+            prefix(0, 0x80, 0, &[RelayStep::FillKnown, WAIT]),
+        ),
+        (
+            REQUESTED_BODIES_ONLY,
+            prefix(0, 0x80, 0, &[RelayStep::UnrequestedTx { tx: 0 }, WAIT]),
+        ),
+        // Bad bodies first, each earning a cooldown, answered a second
+        // apart: the second arrives while its peer cools.
+        (
+            COOLING_BODIES_DROPPED,
+            prefix(0x08, 0x08, 0x10, &[RelayStep::AnnounceAll, WAIT]),
+        ),
+        (STALLED_PEERS_PARKED, STALL_WITNESS()),
+        (
+            HELLO_FIRST,
+            prefix(
+                0,
+                0,
+                0x20,
+                &[
+                    RelayStep::Announce,
+                    RelayStep::Wait { secs: 1 },
+                    RelayStep::Hello,
+                    WAIT,
+                ],
+            ),
+        ),
+        // The peer asks for a body it supplied, which the node never
+        // announces back to it.
+        (
+            NO_PROBE,
+            prefix(
+                0,
+                0,
+                0,
+                &[
+                    RelayStep::AnnounceAll,
+                    WAIT,
+                    RelayStep::Probe { tx: 0 },
+                    WAIT,
+                ],
+            ),
+        ),
+        // Peer 0's bodies, admitted, go to peer 1.
+        (
+            ANNOUNCE_AFTER_ADMISSION,
+            composed_prefix(
+                0,
+                1,
+                0,
+                &[(0, RelayStep::AnnounceAll), (1, WAIT), (1, WAIT)],
+            )
+            .expect("a witness fits the grammar"),
+        ),
+        (FAULT_CLOSE_NAMES_A_BROKEN_ROW, (ROW_WITNESSES[4].witness)()),
+    ]
+}
+
+/// A prefix decodes to the steps it encodes, the encoder refuses a step
+/// that breaks a rule unless byte 1 allows one, a prefix with another
+/// version byte draws the default scenario, and every domain property has
+/// a witness.
+#[test]
+fn a_prefix_round_trips_its_steps() {
+    let steps = [
+        (0, RelayStep::AnnounceAll),
+        (1, RelayStep::Fetch),
+        (0, RelayStep::Probe { tx: 8 }),
+    ];
+    let mut prefix = composed_prefix(0, 1, 0, &steps).unwrap();
+    let scenario = TxRelayWire::draw(&prefix);
+    assert_eq!(
+        scenario.peers[0].steps,
+        [RelayStep::AnnounceAll, RelayStep::Probe { tx: 8 }]
+    );
+    assert_eq!(scenario.peers[1].steps, [RelayStep::Fetch]);
+    assert!(TxRelayWire::accepts(&prefix));
+    prefix[0] ^= 0xff;
+    assert!(!TxRelayWire::accepts(&prefix));
+    assert_eq!(TxRelayWire::draw(&prefix), RelayScenario::default());
+    assert!(composed_prefix(0, 0, 0, &[(0, RelayStep::BadHello)]).is_err());
+    let hostile = composed_prefix(0, 0x80, 0, &[(0, RelayStep::BadHello)]).unwrap();
+    assert_eq!(
+        TxRelayWire::draw(&hostile).peers[0].steps,
+        [RelayStep::BadHello]
+    );
+    let witnessed: BTreeSet<&str> = domain_witnesses().iter().map(|(id, _)| *id).collect();
+    assert_eq!(witnessed, IDS.into_iter().collect());
+    assert_eq!(answer(Answer::Never, false), 2);
+}
+
+/// Each domain property applies in its witness, reaches its trigger and
+/// holds, and the run violates nothing.
+#[test]
+fn each_domain_property_holds_in_its_witness() {
+    for (id, prefix) in domain_witnesses() {
+        let (report, evidence) = run(&prefix);
+        assert!(held(&report, id), "{id}: {:?}", outcome(&report, id));
+        let triggered = lock(&evidence)
+            .facts
+            .get(id)
+            .is_some_and(|fact| fact.triggered);
+        assert!(triggered, "{id}: its witness never reached its trigger");
+        assert_eq!(violated(&report), Vec::<String>::new(), "{id}");
+    }
+}
+
+/// Each fault row's witness closes the connection naming that row, and
+/// its honest twin closes nothing for a fault. Neither run violates a
+/// property.
+#[test]
+fn each_close_row_closes_in_its_witness_and_not_in_its_twin() {
+    for witness in ROW_WITNESSES {
+        let row = witness.row;
+        let (report, _) = run(&(witness.witness)());
+        let closed = closes(&report);
+        assert!(
+            closed.iter().any(|close| close.row() == Some(row)),
+            "{row}: closes {closed:?}"
+        );
+        assert_eq!(violated(&report), Vec::<String>::new(), "{row}");
+        let (twin, _) = run(&(witness.twin)());
+        let faults: Vec<CloseOutcome> = closes(&twin)
+            .into_iter()
+            .filter(|close| close.is_fault())
+            .collect();
+        assert_eq!(faults, Vec::new(), "{row}'s twin");
+        assert_eq!(violated(&twin), Vec::<String>::new(), "{row}'s twin");
+    }
+}
+
+/// Each reachable neutral close of `tx-relay`'s table closes the
+/// connection with its recorded detail in its witness, which violates
+/// nothing.
+#[test]
+fn each_neutral_close_closes_in_its_witness() {
+    for (detail, witness) in NEUTRAL_WITNESSES {
+        let (report, _) = run(&witness());
+        let closes = closes(&report);
+        assert!(
+            closes.iter().any(|close| close.label() == detail),
+            "{detail}: closes {closes:?}"
+        );
+        assert_eq!(violated(&report), Vec::<String>::new(), "{detail}");
+    }
+}
+
+/// The generated IDs no `tx-relay` scenario reaches, each with why.
+const UNREACHED: [(&str, &str); 0] = [];
+
+/// The witnesses of the generated IDs: the row witnesses, a header fault
+/// of each row, an undeclared type on each stream, an `Inv` flood, and an
+/// honest exchange.
+fn generated_witnesses() -> Vec<[u8; COMPOSED_BYTES]> {
+    let mut witnesses: Vec<[u8; COMPOSED_BYTES]> = ROW_WITNESSES
+        .iter()
+        .map(|witness| (witness.witness)())
+        .collect();
+    for row in RelayRow::ALL {
+        for fault in [
+            HeaderFault::ReservedFlags,
+            HeaderFault::ShortPayload,
+            HeaderFault::LongPayload,
+        ] {
+            witnesses.push(prefix(0, 0x80, 0, &[header_fault(row, fault), WAIT]));
+        }
+    }
+    for data in [true, false] {
+        witnesses.push(prefix(
+            0,
+            0x80,
+            0,
+            &[RelayStep::UndeclaredType { data }, WAIT],
+        ));
+    }
+    witnesses.push(prefix(0, 0x80, 0, &[RelayStep::InvFlood, WAIT]));
+    witnesses.push(prefix(0, 0x80, 0, &[RelayStep::UnrequestedNotFound, WAIT]));
+    witnesses.push(prefix(
+        0,
+        0x01,
+        0,
+        &[RelayStep::AnnounceAll, WAIT, RelayStep::FetchBurst, WAIT],
+    ));
+    witnesses
+}
+
+/// Every generated ID reaches its trigger and holds in one of its
+/// witnesses, which violate nothing, unless [`UNREACHED`] names it.
+#[test]
+fn every_generated_property_holds_in_a_witness() {
+    let mut reached = BTreeSet::new();
+    for prefix in generated_witnesses() {
+        let (report, _) = run(&prefix);
+        assert_eq!(violated(&report), Vec::<String>::new(), "{prefix:02x?}");
+        for property in wire_properties::<TxRelayWire>() {
+            let name = property.id.to_string();
+            if generated_trigger(&TX_RELAY_STREAMS, &property.id, &report.log)
+                && held(&report, &name)
+            {
+                reached.insert(name);
+            }
+        }
+    }
+    let unreached: BTreeSet<String> = UNREACHED.iter().map(|(id, _)| (*id).to_owned()).collect();
+    let all: BTreeSet<String> = wire_properties::<TxRelayWire>()
+        .iter()
+        .map(|property| property.id.to_string())
+        .collect();
+    let missing: Vec<&String> = all
+        .iter()
+        .filter(|id| !reached.contains(*id) && !unreached.contains(*id))
+        .collect();
+    assert_eq!(missing, Vec::<&String>::new());
+    let stale: Vec<&String> = unreached.intersection(&reached).collect();
+    assert_eq!(
+        stale,
+        Vec::<&String>::new(),
+        "reached, yet listed unreached"
+    );
+}
+
+/// The scripted history that bypasses generated ID `id`'s rule: a fault
+/// the node never punishes, or a punishment of a conformant peer.
+fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
+    let row = id.row.map(str::to_owned);
+    let peer = |label: Label, exhausted: bool| Observation::PeerFrame {
+        connection: 1,
+        stream: id.stream,
+        quic_stream: None,
+        seq: 0,
+        row: if label == Label::UndeclaredType {
+            None
+        } else {
+            row.clone().or(Some("hello".to_owned()))
+        },
+        rule_stream: id.stream,
+        label,
+        exhausted,
+        exchange: None,
+        payload: 9,
+    };
+    let judged = Observation::FrameJudged {
+        connection: 1,
+        stream: id.stream,
+        quic_stream: None,
+        seq: 0,
+    };
+    let fault_close = Observation::ConnectionClosed {
+        connection: 1,
+        cause: CloseOutcome::fault(id.stream.kind, id.stream.version, CloseRow::RELAY_CLOSE_3),
+    };
+    match id.template {
+        Template::Closes(label) => vec![vec![peer(label, false)], vec![judged]],
+        Template::ConformantNeverCloses => vec![
+            vec![peer(Label::Conformant, false)],
+            vec![judged, fault_close],
+        ],
+        Template::CadenceNeverCloses => vec![
+            vec![peer(Label::Conformant, true)],
+            vec![judged, fault_close],
+        ],
+        other => panic!("tx-relay registers no {other:?} template"),
+    }
+}
+
+/// Every generated `tx-relay` ID fails on a scripted history that bypasses
+/// its rule.
+#[test]
+fn scripted_bypasses_violate_every_generated_id() {
+    for property in wire_properties::<Node>() {
+        let name = property.id.to_string();
+        let parsed = GeneratedId::parse(&name).expect("a generated ID parses back");
+        let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+        assert!(
+            matches!(outcome(&report, &name), PropertyOutcome::Violated { .. }),
+            "{name}: {:?}",
+            report.properties
+        );
+    }
+}
+
+/// The answer byte of the stall witness picks `Never` among the
+/// conformant answers, and its peer announces fresh ids as each session
+/// opens.
+#[test]
+fn the_stall_witness_never_answers() {
+    let scenario = TxRelayWire::draw(&STALL_WITNESS());
+    assert_eq!(scenario.peers[0].answer, Answer::Never);
+    assert_eq!(scenario.peers[0].hello, HelloMode::First);
+    assert!(scenario.peers[0].announce_on_open > 0);
+}

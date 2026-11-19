@@ -646,7 +646,7 @@ impl Known {
     }
 
     /// How many short ids are known.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(crate) fn len(&self) -> usize {
         self.by_short.len()
     }

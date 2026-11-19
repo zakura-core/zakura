@@ -10,3 +10,4 @@ pub mod header_sync;
 pub mod header_sync_progress;
 pub mod session;
 pub mod shared;
+pub mod tx_relay;

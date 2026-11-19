@@ -213,9 +213,6 @@ and deploys it to:
 - `archive-vct-off` — `root@104.131.174.28`
 - `asia-hedged` — `root@68.183.178.89`
 - `asia-scored` — `root@206.189.45.15`
-- `asia-hedged-simple` (Singapore) — `root@143.198.222.9`
-- `us-scored` (New York) — `root@165.227.220.111`
-- `europe-central-scored` (Amsterdam) — `root@188.166.118.152`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
@@ -232,11 +229,10 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-These five experiment nodes use the legacy P2P stack. `asia-hedged` measures
-`[network.block_hedge]` from PR 2548. `asia-scored`, `us-scored`, and
-`europe-central-scored` measure `[network.block_source_score]` with
-`second_request` from PR 2572. `asia-hedged-simple` measures
-`first_two_announcers` from PR 2581. Each entry pins a build that understands the
+Both experiment nodes use the legacy P2P stack. `asia-hedged` measures
+`[network.block_hedge]` from PR 2548. `asia-scored` measures
+`[network.block_source_score]` with `second_request` from PR 2572.
+Each entry pins a build that understands the
 settings in its node's config. Unpin an entry when its PR merges, or remove
 it when the experiment ends.
 

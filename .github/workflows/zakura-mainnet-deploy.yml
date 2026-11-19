@@ -381,10 +381,7 @@ jobs:
             159.203.113.196 \
             104.131.174.28 \
             68.183.178.89 \
-            206.189.45.15 \
-            165.227.220.111 \
-            188.166.118.152 \
-            143.198.222.9; do
+            206.189.45.15; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -548,32 +545,6 @@ jobs:
           commit     = "4e5d4c3d66d70c9a126bf16c0a2b7084e58d3749"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
-
-          # Run the #2572 second-request experiment in New York and Amsterdam.
-          [[nodes]]
-          name       = "us-scored"
-          ssh_string = "root@165.227.220.111"
-          monitor    = { profiler_url = "http://127.0.0.1:8109" }
-          commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
-          rpc_listen_addr = "127.0.0.1:8232"
-          p2p_stack  = "legacy"
-
-          [[nodes]]
-          name       = "europe-central-scored"
-          ssh_string = "root@188.166.118.152"
-          monitor    = { profiler_url = "http://127.0.0.1:8110" }
-          commit     = "d85f876dd98e66d1b6c485d10bf7fb1e705a6f40"
-          rpc_listen_addr = "127.0.0.1:8232"
-          p2p_stack  = "legacy"
-
-          # Singapore comparison against the score-based experiment in #2572.
-          [[nodes]]
-          name       = "asia-hedged-simple"
-          ssh_string = "root@143.198.222.9"
-          monitor    = { profiler_url = "http://127.0.0.1:8111" }
-          commit     = "6885fa105c0c30501135ee17a5a3f03c8a3b7639"
-          rpc_listen_addr = "127.0.0.1:8232"
-          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary
@@ -732,7 +703,7 @@ jobs:
           if node is None:
               raise SystemExit(f"unknown node: {node_name}")
 
-          uses_rpc_cookie = node_name in {"zakura-compat", "asia-hedged-simple"}
+          uses_rpc_cookie = node_name == "zakura-compat"
           values = {
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
@@ -935,7 +906,7 @@ jobs:
           # auth for nodes that require it into the dashboard copy.
           awk '
             { print }
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"(zakura-compat|asia-hedged-simple)"$/ { uses_cookie = 1 }
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"$/ { uses_cookie = 1 }
             uses_cookie && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""

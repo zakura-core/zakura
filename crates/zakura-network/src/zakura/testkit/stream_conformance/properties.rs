@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     zakura::{
-        regulation::{ServeCapacity, Update, STALL_POLICY},
+        regulation::{ServeCapacity, SessionKey, Update, STALL_POLICY},
         testkit::await_until,
         wire_codec::{decode_frame, encode_frame},
         Credit, Frame, MessageRole, MessageRule, Stream, DEFAULT_ZAKURA_RECEIVE_WINDOW,
@@ -208,7 +208,7 @@ async fn raw_peer<A: StreamConformance>(
     victim: &LayoutNode<A>,
     layout: &'static [Stream],
     seed: u64,
-) -> Result<(RawLayoutPeer, u64), BoxError> {
+) -> Result<(RawLayoutPeer, SessionKey), BoxError> {
     let mut raw = RawLayoutPeer::connect(
         victim.addr().await,
         &victim.limits,
@@ -218,7 +218,24 @@ async fn raw_peer<A: StreamConformance>(
     .await?;
     raw.open_layout(layout).await?;
     let session = victim.wait_session(&raw.id()).await?;
-    Ok((raw, session.key.session_id))
+    Ok((raw, session.key))
+}
+
+/// Reopen `layout` from `raw` after its session `old` retired, and wait for
+/// `victim` to hold the new session.
+///
+/// The offer waits for `victim`'s transport to release `old`. Until then the
+/// transport drops the offer, and unlike a node, `raw` never offers again.
+async fn reopen<A: StreamConformance>(
+    raw: &mut RawLayoutPeer,
+    victim: &LayoutNode<A>,
+    layout: &'static [Stream],
+    old: SessionKey,
+) -> Result<(), BoxError> {
+    victim.wait_released(old).await?;
+    raw.open_layout(layout).await?;
+    victim.wait_session_after(&raw.id(), Some(old.session_id)).await?;
+    Ok(())
 }
 
 fn ensure(condition: bool, failure: impl FnOnce() -> String) -> Result<(), BoxError> {
@@ -647,8 +664,7 @@ pub(crate) async fn member_retirement<A: StreamConformance>(
             raw.ended(other).await?;
         }
         raw.probe_sibling(&SIBLINGS[0]).await?;
-        raw.open_layout(layout).await?;
-        victim.wait_session_after(&raw.id(), Some(old)).await?;
+        reopen(&mut raw, &victim, layout, old).await?;
         raw_exchanges::<A>(&mut raw, &plan, 1).await?;
         ensure(!raw.is_closed(), || {
             "retiring a member closed the connection".into()
@@ -705,10 +721,7 @@ async fn resets_unfinished<A: StreamConformance>(
         raw.ended(other).await?;
     }
     raw.probe_sibling(&SIBLINGS[0]).await?;
-    raw.open_layout(layout).await?;
-    victim
-        .wait_session_after(&raw.id(), Some(session.key.session_id))
-        .await?;
+    reopen(&mut raw, victim, layout, session.key).await?;
     raw_exchanges::<A>(&mut raw, plan, 1).await?;
     ensure(!raw.is_closed(), || {
         "resetting a started exchange closed the connection".into()
@@ -740,9 +753,9 @@ pub(crate) async fn repeated_stall<A: StreamConformance>(
     for stall in 0..2 {
         // Keep only the session's ID and cause: holding the session would
         // hold its reservations.
-        let (session_id, close_cause) = {
+        let (key, close_cause) = {
             let session = victim.wait_session(&raw.id()).await?;
-            (session.key.session_id, session.close_cause.clone())
+            (session.key, session.close_cause.clone())
         };
         let reserved = hold_started_exchange(&mut raw, &victim, &plan).await?;
         ensure(!reserved || victim.shared().pool.held() > held, || {
@@ -766,8 +779,7 @@ pub(crate) async fn repeated_stall<A: StreamConformance>(
         )
         .await?;
         raw.probe_sibling(&SIBLINGS[0]).await?;
-        raw.open_layout(layout).await?;
-        victim.wait_session_after(&raw.id(), Some(session_id)).await?;
+        reopen(&mut raw, &victim, layout, key).await?;
         raw_exchanges::<A>(&mut raw, &plan, 1).await?;
         ensure(!raw.is_closed(), || {
             "a first stall closed the connection".into()
@@ -1015,7 +1027,7 @@ pub(crate) async fn partial_frames<A: StreamConformance>(
                             .shared()
                             .table
                             .get(&raw.id())
-                            .is_none_or(|(key, _)| key.session_id != old)
+                            .is_none_or(|(key, _)| key != old)
                     })
                     .await?;
                     raw.probe_sibling(&SIBLINGS[0]).await?;

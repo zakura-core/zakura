@@ -221,6 +221,15 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "header-sync/state-publication-consistent",
         ],
     ),
+    (
+        "sync_composed",
+        &[
+            "block-sync/frontier-work-consistent",
+            "session/connection-shares-bound",
+            "session/credit-isolated",
+            "session/send-isolated",
+        ],
+    ),
 ];
 
 /// The target's own properties that [`UNAPPLIED`] lists, sorted.

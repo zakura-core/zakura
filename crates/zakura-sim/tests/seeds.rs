@@ -374,10 +374,11 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The intended scenario of a `discovery/composed` seed: the one its steps'
-/// encoding draws.
+/// The intended scenario of a `discovery/composed` or `sync/composed` seed:
+/// the one its steps' encoding draws.
 fn composed(stem: &str) -> Option<serde_json::Value> {
     use discovery_service::{composed_prefix, DiscoveryComposed};
+    use sync_wire::{SyncComposed, SYNC_COMPOSED_BYTES, SYNC_COMPOSED_VERSION};
     use zakura_sim::{
         harness::Subsystem,
         peer::{
@@ -388,6 +389,13 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
     let ask = |request| PeerAction::Ask { request };
     let undeclared = PeerAction::Discover {
         act: DiscoveryAct::UndeclaredType { message_type: 0 },
+    };
+    // Two mirrors, one each way, on the default chain, then the events.
+    let sync = |events: &[[u8; 3]]| {
+        let mut prefix = vec![SYNC_COMPOSED_VERSION, 0b0000_1001, 0];
+        prefix.extend(events.iter().flatten());
+        prefix.resize(SYNC_COMPOSED_BYTES, 0);
+        SyncComposed::draw(&prefix)
     };
     let scenario = match stem {
         "discovery-composed-two-requests" => {
@@ -400,6 +408,20 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
                 composed_prefix(0, 0x81, 0, &[ask(Request::GetPeers), undeclared]).unwrap();
             serde_json::to_value(DiscoveryComposed::draw(&prefix))
         }
+        "sync-composed-honest" => serde_json::to_value(sync(&[])),
+        "sync-composed-close-growth-stall" => {
+            serde_json::to_value(sync(&[[1, 0, 0b0000_0101], [3, 0, 0], [5, 0b0000_0100, 1]]))
+        }
+        "sync-composed-reset" => serde_json::to_value(sync(&[[4, 9, 0]])),
+        "sync-composed-every-step" => serde_json::to_value(sync(&[
+            [1, 1, 0b0000_0100],
+            [2, 1, 0],
+            [3, 1, 0],
+            [4, 9, 0],
+            [5, 0b0000_0100, 2],
+            [7, 0, 0],
+            [3, 3, 0],
+        ])),
         _ => return None,
     };
     Some(scenario.expect("scenarios serialize"))

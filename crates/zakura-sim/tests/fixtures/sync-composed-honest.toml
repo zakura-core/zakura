@@ -1,0 +1,7 @@
+# The committed fuzz input `sync-composed-honest.bin` for `sync/composed`.
+# Two mirrors serve one chain with no control step.
+harness = "sync/composed"
+generator = 1
+sha256 = "8b0c3e31aecfeb3921c4f17f5955c33b583a333275f9d2cda6183f0967c5ba5a"
+scenario_sha256 = "b0a0d7ca2470e75d9a24002413510a2b9dcd251f0e94f807158b61c7fc1a4951"
+source = "crates/zakura-sim/tests/targets.rs"

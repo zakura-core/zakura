@@ -204,6 +204,18 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved scenarios"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_reorg_stale_body_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reorg stale-body input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_reorg_verdict_republish_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reorg verdict-republish input under a planted patch"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -367,6 +379,17 @@ package = "sim"
 name = "sync_wire"
 smoke-secs = 60
 args = ["-len_control=0"]
+timeout-secs = 1800
+
+# `sync/composed` runs `sync/wire`'s node and mirrors with the topology,
+# chain, closes, growths, reorgs, block holds and teardown its 27-byte
+# prefix composes, so the target fuzzes how many of each a run takes and in
+# what order.
+[[target]]
+package = "sim"
+name = "sync_composed"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
 # `block-sync/storage`'s two-byte prefix picks a saved scenario or the

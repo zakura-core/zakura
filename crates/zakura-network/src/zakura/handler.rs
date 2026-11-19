@@ -6498,7 +6498,7 @@ async fn persistent_stream_worker_with_policy(
     // Reading and forwarding may both block. Keep them independent of writes
     // so waiting for inbound channel space cannot stall an outgoing response.
     // A dedicated reader also preserves partial frame reads across outbound writes.
-    let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
+    let (close_tx, mut close_rx) = mpsc::channel::<(u32, CloseOutcome)>(1);
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
@@ -6612,24 +6612,21 @@ async fn persistent_stream_worker_with_policy(
                     error
                 }
             };
-            // Any error is terminal. `Closed` is a clean peer-initiated close;
-            // every other error must disconnect the peer, under the cause
-            // `read_close_cause` gives it. Forward the error first so the main
-            // loop can map it to a reset code, then cancel the connection
-            // ourselves so the disconnect is guaranteed even if the main loop
-            // tore the worker down for a stopped outbound write before
-            // processing it.
-            let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
-            if !must_disconnect && !reader_context.stream_token.is_cancelled() {
-                if let Some(cause) = &reader_failure_cause {
-                    // Publish the cause before waking either the service EOF or
-                    // the sibling worker's cancellation path.
-                    cause.record(OrderedStreamFailure::RemoteClose);
+            let close = ordered_read_close(reader_context.stream(), &error);
+            let session_failure = match error {
+                ZakuraHandlerError::Closed => Some(OrderedStreamFailure::RemoteClose),
+                ZakuraHandlerError::Timeout(_) => Some(OrderedStreamFailure::ReadTimeout),
+                _ => None,
+            };
+            // Publish before the drop guard cancels the session or the service sees EOF.
+            if !reader_context.stream_token.is_cancelled() {
+                if let (Some(cause), Some(failure)) = (&reader_failure_cause, session_failure) {
+                    cause.record(failure);
                 }
             }
-            let cause = read_close_outcome(ReadPath::Ordered, reader_context.stream(), &error);
-            let _ = error_tx.send(error).await;
-            if must_disconnect {
+            if let Some((code, cause)) = close {
+                // The reader also closes the connection if the writer is blocked.
+                let _ = close_tx.send((code, cause)).await;
                 reader_context.close_cause.record(cause);
                 reader_context.connection_token.cancel();
             }
@@ -6735,17 +6732,15 @@ async fn persistent_stream_worker_with_policy(
                     }
                 }
             }
-            error = error_rx.recv() => {
-                if let Some(error) = error {
-                    if let Some((code, cause)) = ordered_read_close(context.stream(), &error) {
-                        // The reader already emitted any oversize-desync diagnostic.
-                        if code == ZAKURA_CLOSE_BAD_PRELUDE {
-                            debug!(?error, "closing Zakura stream worker");
-                        }
-                        let _ = send.reset(VarInt::from_u32(code));
-                        context.close_cause.record(cause);
-                        context.connection_token.cancel();
+            close = close_rx.recv() => {
+                if let Some((code, cause)) = close {
+                    // The reader already emitted any oversize-desync diagnostic.
+                    if code == ZAKURA_CLOSE_BAD_PRELUDE {
+                        debug!(?cause, "closing Zakura stream worker");
                     }
+                    let _ = send.reset(VarInt::from_u32(code));
+                    context.close_cause.record(cause);
+                    context.connection_token.cancel();
                 }
                 break;
             }
@@ -6767,14 +6762,14 @@ async fn persistent_stream_worker_with_policy(
 }
 
 /// How the ordered worker closes on an error its reader forwarded: the
-/// stream's reset code and the close cause to record. `None` is a clean
-/// close, which resets and records nothing.
+/// stream's reset code and the connection close cause to record. A clean
+/// close or a frame timeout ends only the session.
 fn ordered_read_close(
     stream: (u16, u16),
     error: &ZakuraHandlerError,
 ) -> Option<(u32, CloseOutcome)> {
     let code = match error {
-        ZakuraHandlerError::Closed => return None,
+        ZakuraHandlerError::Closed | ZakuraHandlerError::Timeout(_) => return None,
         ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
         ZakuraHandlerError::RateLimited | ZakuraHandlerError::ByteRateOverrun => {
             ZAKURA_CLOSE_RATE_LIMIT
@@ -6796,16 +6791,9 @@ enum ReadPath {
 /// The close outcome for a frame-read error on `path`, on the `(kind,
 /// version)` stream.
 ///
-/// A frame that breaks its stream's table, frame cap, message cap or byte rate,
-/// or ends before its declared length, is a peer fault. A rate limit, a
-/// timeout and a transport error are neutral, and so is every unlisted error
-/// (such as `Io`). A request stream that closes before its request frame ends
-/// is transport too. The ordered path never records `Closed`, which is a clean
-/// close.
-///
-/// The ordered reader and its worker race to record one error, and
-/// [`CloseCause`] keeps the first writer, so both record through this. That
-/// includes the reader's admission failures.
+/// A broken frame rule or truncated payload assigns a fault. A rate limit
+/// or transport failure assigns a neutral cause. The ordered reader handles
+/// an orderly end and both readers handle frame timeouts before this mapping.
 fn read_close_outcome(
     path: ReadPath,
     (kind, version): (u16, u16),
@@ -6822,12 +6810,6 @@ fn read_close_outcome(
         | (ReadPath::Ordered, Oversize)
         | (ReadPath::Ordered, ByteRateOverrun) => fault(CloseRow::CONN_CLOSE_18),
         (ReadPath::Ordered, RateLimited) => CloseOutcome::ORDERED_RATE_LIMITED,
-        (ReadPath::Ordered, Timeout(_)) => {
-            CloseOutcome::neutral(NeutralCause::Timeout, "ordered_read_timeout")
-        }
-        (ReadPath::Request, Timeout(_)) => {
-            CloseOutcome::neutral(NeutralCause::Timeout, "request_read_timeout")
-        }
         (ReadPath::Ordered, _) => {
             CloseOutcome::neutral(NeutralCause::IoFailure, "ordered_read_transport")
         }
@@ -6901,6 +6883,11 @@ async fn request_stream_worker(
     // The raw frame stays funded until its service's call ends.
     let (frame, raw_grant) = match frame {
         Ok(AdmittedFrame { frame, grant }) => (frame, grant),
+        Err(ZakuraHandlerError::Timeout(_)) => {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+            return;
+        }
         Err(error) => {
             debug!(
                 ?error,
@@ -11039,6 +11026,108 @@ mod tests {
             crate::zakura::header_sync::v9::Message::Status(_)
         ));
         assert!(!connection_cancel.is_cancelled());
+
+        shutdown.cancel();
+        reactor_task.await?;
+        Ok(())
+    }
+
+    /// A header-sync frame read that times out ends the session as a stall,
+    /// not a disconnect. The first stall leaves the connection up. A second
+    /// read timeout on the same connection closes it under the stall policy.
+    #[tokio::test(start_paused = true)]
+    async fn header_sync_read_timeouts_follow_the_stall_rule() -> Result<(), BoxError> {
+        use crate::zakura::regulation::STALL_POLICY;
+
+        let shutdown = CancellationToken::new();
+        let mut startup = header_sync_startup(shutdown.clone());
+        let cooldown = startup.config.unproductive_peer_cooldown;
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let snapshot = zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized: anchor,
+                header_best: anchor,
+                verified_best: anchor,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                anchor.hash,
+            ),
+            oldest_retained_height: anchor.height,
+            alarms: Default::default(),
+        };
+        let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+        startup.committed_snapshots = Some(snapshot_rx);
+        let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
+        let service = HeaderSyncService::new(header_sync);
+        let peer = test_peer(19);
+        let conn_id = test_conn_id();
+        let connection_cancel = CancellationToken::new();
+        let close_cause = CloseCause::new();
+
+        for session_id in [7, 8] {
+            let (inbound_tx, inbound_rx) = crate::zakura::framed_channel(8);
+            let failure = OrderedStreamFailureCause::default();
+            let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(8);
+            let streams = HashMap::from([(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ServiceStream::new(
+                    session_id,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                    inbound_rx.with_failure_cause(failure.clone()),
+                    outbound_tx,
+                    connection_cancel.child_token(),
+                ),
+            )]);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_HEADER_SYNC,
+                ServicePeerDirection::Inbound,
+                streams,
+                connection_cancel.clone(),
+                close_cause.clone(),
+            ));
+            tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+                .await?
+                .ok_or("the admitted session sends its status")?;
+
+            let open_now = || {
+                matches!(
+                    service.session_demand(
+                        conn_id,
+                        &peer,
+                        ZAKURA_CAP_HEADER_SYNC,
+                        ServicePeerDirection::Inbound,
+                    ),
+                    SessionDemand::OpenNow
+                )
+            };
+            assert!(open_now());
+            // The transport reader records the timeout, then ends the stream.
+            failure.record(OrderedStreamFailure::ReadTimeout);
+            drop(inbound_tx);
+            // The stall starts the readmission cooldown, which a plain
+            // disconnect would not.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while open_now() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            if session_id == 7 {
+                assert!(!connection_cancel.is_cancelled());
+                assert_eq!(close_cause.get(), None);
+                tokio::time::advance(cooldown).await;
+            }
+        }
+        assert!(connection_cancel.is_cancelled());
+        assert_eq!(close_cause.get(), Some(STALL_POLICY));
 
         shutdown.cancel();
         reactor_task.await?;

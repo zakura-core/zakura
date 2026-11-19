@@ -3362,6 +3362,7 @@ mod tests {
     async fn cancelled_session_settles_peer_failures_before_reopening() {
         for failure in [
             super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::ReadTimeout,
             super::OrderedStreamFailure::WriteTimeout,
         ] {
             check_cancelled_session_policy(Some(failure), true, false, false).await;

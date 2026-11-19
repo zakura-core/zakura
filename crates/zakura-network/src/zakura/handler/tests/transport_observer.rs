@@ -233,12 +233,10 @@ fn decided(events: &[TransportEvent]) -> Vec<Option<CloseOutcome>> {
         .collect()
 }
 
-/// A legal crossing and a slow link reach the final connection observer as
-/// neutral closes. The crossing is a full page within credit after the node
-/// sent `Close`, which the reader admits. Each peer then stalls partway
-/// through a header, so the reader's timeout closes the connection.
+/// A slow link retires its session without a connection close decision.
+/// The reader can still admit a full page within credit after the node sent `Close`.
 #[tokio::test]
-async fn a_crossing_and_a_slow_link_close_neutral() -> Result<(), BoxError> {
+async fn a_crossing_and_a_slow_link_retire_only_the_session() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let len = largest_page();
     let page = [header(v9::message_type::HEADERS, len), vec![0; len]].concat();
@@ -268,16 +266,7 @@ async fn a_crossing_and_a_slow_link_close_neutral() -> Result<(), BoxError> {
             )
         });
         assert_eq!(reserved, crossing, "{:?}", run.events);
-        let decided = decided(&run.events);
-        assert_eq!(
-            decided,
-            [Some(CloseOutcome::neutral(
-                NeutralCause::Timeout,
-                "ordered_read_timeout"
-            ))],
-            "crossing {crossing}"
-        );
-        assert!(decided.iter().flatten().all(|cause| !cause.is_fault()));
+        assert!(decided(&run.events).is_empty(), "crossing {crossing}");
     }
     Ok(())
 }

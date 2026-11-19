@@ -1041,20 +1041,18 @@ pub(crate) async fn partial_frames<A: StreamConformance>(
     )
     .await?;
     raw.open_layout(layout).await?;
-    victim.wait_session(&raw.id()).await?;
+    let session = victim.wait_session(&raw.id()).await?.key.session_id;
     let started = Instant::now();
     raw.write(member, &bytes[..bytes.len() - 1]).await?;
-    while !raw.is_closed() {
+    while victim.shared().table.get(&raw.id()).is_some_and(|(key, _)| key.session_id == session) {
         ensure(started.elapsed() < CONFORMANCE_DEADLINE, || {
             "a stalled frame never ended".into()
         })?;
-        // A failed probe means the connection is closing.
-        if raw.probe_sibling(&SIBLINGS[0]).await.is_err() {
-            break;
-        }
+        raw.probe_sibling(&SIBLINGS[0]).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    raw.closed().await?;
+    raw.probe_sibling(&SIBLINGS[0]).await?;
+    ensure(!raw.is_closed(), || "the first frame stall closed the connection".into())?;
     ensure(started.elapsed() >= limits.quic_idle_timeout / 2, || {
         "the stalled frame ended before its read deadline".into()
     })?;

@@ -96,6 +96,7 @@ impl PeerState {
             OrderedStreamFailure::RemoteClose => {
                 "block-sync peer closed the stream with its requests unanswered"
             }
+            OrderedStreamFailure::ReadTimeout => "block-sync frame read stalled",
             OrderedStreamFailure::WriteTimeout => {
                 "block-sync stream write stalled with download requests unanswered"
             }

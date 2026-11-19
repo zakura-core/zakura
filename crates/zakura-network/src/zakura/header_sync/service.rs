@@ -885,6 +885,7 @@ impl Service for HeaderSyncService {
         let pipe_cancel = service_cancel_token.clone();
         let protocol_connection_cancel = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
+        let stream_failure = recv.failure_cause();
         let pipe: BoxRunFuture<'static, ()> = Box::pin(async move {
             let Ok(admitted) = admitted else {
                 return;
@@ -928,14 +929,26 @@ impl Service for HeaderSyncService {
         let teardown_sessions = self.sessions.clone();
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
+        let teardown_connection = connection_cancel_token.clone();
         let on_teardown = move || {
             teardown_sessions.remove(&teardown_peer, key);
             // Replaced sessions still own a reserved teardown slot. The reactor checks generations.
-            let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
-                peer: teardown_peer,
-                session_id,
-                reason: teardown_close_cause.get_or("stream_closed"),
-            });
+            let event = if !teardown_connection.is_cancelled()
+                && stream_failure.and_then(|cause| cause.get())
+                    == Some(crate::zakura::transport::OrderedStreamFailure::ReadTimeout)
+            {
+                Event::PeerReadTimedOut {
+                    peer: teardown_peer,
+                    session_id,
+                }
+            } else {
+                Event::PeerDisconnected {
+                    peer: teardown_peer,
+                    session_id,
+                    reason: teardown_close_cause.get_or("stream_closed"),
+                }
+            };
+            let _ = teardown_handle.send_lifecycle(event);
         };
         let panic_connection_cancel = connection_cancel_token.clone();
         let panic_close_cause = close_cause.clone();

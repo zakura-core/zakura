@@ -871,6 +871,9 @@ impl HeaderSyncReactor {
                 session_id,
                 reason,
             } => self.handle_peer_disconnected(&peer, session_id, reason),
+            Event::PeerReadTimedOut { peer, session_id } => {
+                self.stall_session(&peer, session_id, "frame_read_timeout");
+            }
             Event::AdvisorySummary { .. } => {}
             Event::Status {
                 peer,

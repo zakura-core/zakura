@@ -2141,6 +2141,9 @@ async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(),
         match expected {
             Some(OrderedStreamFailure::RemoteClose) => peer_recv.stop(0u32.into())?,
             Some(OrderedStreamFailure::WriteTimeout) => {}
+            Some(OrderedStreamFailure::ReadTimeout) => {
+                unreachable!("this fixture drives writes and resets")
+            }
             None => cancel.cancel(),
         }
         timeout(TEST_TIMEOUT, cancel.cancelled()).await?;

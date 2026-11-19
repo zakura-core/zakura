@@ -2425,6 +2425,56 @@ async fn a_held_second_request_is_sent_when_the_first_request_is_overdue_or_stal
     }
 }
 
+/// An announcer's earlier miss can expire after the first request stalls, with no new peer event.
+#[tokio::test(start_paused = true)]
+async fn a_held_second_request_is_sent_when_an_announcers_miss_expires() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut far = TestPeer::spawn(1);
+    let mut near = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut far, &registry, Some(100)),
+        measured_peer(&mut near, &registry, Some(5)),
+    ];
+
+    let missed = near
+        .client
+        .as_mut()
+        .unwrap()
+        .ready()
+        .await
+        .unwrap()
+        .call_routed(
+            Request::BlocksByHash([OTHER_BLOCK_HASH].into()),
+            Some(crate::peer::AdvertisedBlockRequest::Primary),
+        );
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![OTHER_BLOCK_HASH.into()]))
+    );
+    near.peer_inbound
+        .send(Ok(Message::NotFound(vec![OTHER_BLOCK_HASH.into()])))
+        .await
+        .unwrap();
+    assert!(missed.await.is_err());
+
+    // Start a new download with one second left on the ten-minute miss.
+    tokio::time::advance(Duration::from_secs(599)).await;
+    let mut peers = OwnedPeerSet::spawn(&mut [&mut far, &mut near]);
+    peers.announce(&far);
+    let (_attempt, _first, _second) = peers.download(&mut far).await;
+    peers.announce(&near);
+    assert_eq!(near.written_now().await, None);
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_eq!(near.written_now().await, None, "the miss still applies");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "expiry alone makes the idle announcer eligible again"
+    );
+}
+
 /// A held second request ends with no peer asked when its window closes.
 #[tokio::test(start_paused = true)]
 async fn a_held_second_request_ends_when_its_window_closes() {

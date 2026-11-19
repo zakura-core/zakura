@@ -137,7 +137,9 @@ use crate::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
             SecondRequestChoice,
         },
-        second_request::{second_request_reason, HeldSecondRequest, SecondResponse},
+        second_request::{
+            next_decision_after, second_request_reason, HeldSecondRequest, SecondResponse,
+        },
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -1659,8 +1661,8 @@ where
     /// - an announcer becoming a better source, through its connection (see
     ///   [`Self::choose_second_request`]). A busy announcer the peer set itself is waiting on
     ///   wakes this task when it becomes ready, as any unready peer does;
-    /// - the first request becoming overdue or stalled, and the window ending, through the
-    ///   request's timer.
+    /// - the first request becoming overdue or stalled, an announcer's missed-block mark
+    ///   expiring, or the window ending, through the request's timer.
     ///
     /// Does nothing when no request is held.
     fn retry_held_second_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
@@ -1678,8 +1680,9 @@ where
             if !held.poll_open(cx) {
                 continue;
             }
+            let mut next_decision = next_decision_after(held.attempt(), considered_at);
             let chosen = self
-                .choose_second_request(held.hash(), held.attempt(), cx)
+                .choose_second_request(held.hash(), held.attempt(), cx, &mut next_decision)
                 // A download gets one second request, and none once it stops accepting one.
                 .filter(|_| held.attempt().claim_dispatch());
             match chosen {
@@ -1688,7 +1691,7 @@ where
                     held.send(response);
                 }
                 None => {
-                    held.poll_next_decision(considered_at, cx);
+                    held.poll_next_decision(next_decision, cx);
                     self.held_second_requests.push(held);
                 }
             }
@@ -1701,8 +1704,8 @@ where
     }
 
     /// Chooses the peer to send a second request for a gossiped block to, if another announcer
-    /// should deliver it sooner than the first request. Changes nothing: the caller claims the
-    /// download's one second request before sending.
+    /// should deliver it sooner than the first request. The caller claims the download's one
+    /// second request before sending.
     ///
     /// The candidates are the idle peers that announced the block, other than the one the first
     /// request went to, and the best is the one expected to answer soonest. It is chosen when it
@@ -1711,12 +1714,13 @@ where
     /// this node, so a peer cannot claim a faster one.
     ///
     /// Returns the chosen peer, which is in the ready set. Otherwise returns `None`. Either
-    /// way, registers `cx` to be woken when a connected announcer becomes a better source.
+    /// way, registers `cx` for announcer changes and shortens `next_decision` for expiring misses.
     fn choose_second_request(
         &self,
         hash: block::Hash,
         attempt: &crate::BlockHedge,
         cx: &Context<'_>,
+        next_decision: &mut tokio::time::Instant,
     ) -> Option<(D::Key, SecondRequestChoice)> {
         let first = attempt.first_dispatch()?;
         let first_peer = first.legacy_peer;
@@ -1727,14 +1731,7 @@ where
             .filter(|addr| Some(**addr) != first_peer)
             .filter_map(|addr| {
                 let svc = self.ready_services.get(addr)?;
-                // Registered before the peer's state is read, so a change after the read
-                // still wakes this task.
-                svc.notify_when_block_source_changes(cx);
-                // Second requests run only with block source scoring on.
-                if !svc.is_preferred_block_source(true) {
-                    return None;
-                }
-                Some((*addr, svc.block_gossip.delivery_score()?))
+                Some((*addr, svc.second_request_score(cx, next_decision)?))
             })
             .collect();
         let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {

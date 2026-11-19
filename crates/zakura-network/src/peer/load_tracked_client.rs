@@ -162,17 +162,27 @@ impl LoadTrackedClient {
             && !(skip_missed_announcers && self.request_slot.announced_block_missed())
     }
 
-    /// Registers the task polling with `cx` to be woken when this peer becomes a better block
-    /// source: its connection is free again, an unanswered or missed block mark clears, or
-    /// its expected answer time is measured again.
-    ///
-    /// Register before reading [`Self::is_preferred_block_source`] or the peer's delivery score,
-    /// so that a change between the read and the task going to sleep still wakes it.
-    pub(crate) fn notify_when_block_source_changes(&self, cx: &std::task::Context<'_>) {
+    /// Returns this announcer's score if it can serve a second request. Registers for changes
+    /// before reading its state and brings the next decision forward if only a timed miss
+    /// keeps it from serving the block.
+    pub(crate) fn second_request_score(
+        &self,
+        cx: &Context<'_>,
+        next_decision: &mut tokio::time::Instant,
+    ) -> Option<std::time::Duration> {
         self.request_slot.notify_when_usable(cx);
         if let Some(registry) = &self.block_gossip.registry {
             registry.notify_when_score_changes(cx);
         }
+        if !self.is_preferred_block_source(false) {
+            return None;
+        }
+        let score = self.block_gossip.delivery_score()?;
+        if let Some(expiry) = self.request_slot.announced_block_miss_expiry() {
+            *next_decision = (*next_decision).min(expiry);
+            return None;
+        }
+        Some(score)
     }
 
     /// Sends the request with the reason this particular peer was chosen.

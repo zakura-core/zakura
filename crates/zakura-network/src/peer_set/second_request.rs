@@ -12,7 +12,7 @@
 //!
 //! - another peer announces the block;
 //! - an announcer becomes a better source: its connection is free again, an unanswered or
-//!   missed block mark clears, or its expected answer time is measured again;
+//!   missed block mark clears, a miss expires, or its expected answer time is measured again;
 //! - the first request becomes overdue, and later stalls (see [`decision_times`]).
 //!
 //! Between those events a candidate can only look worse, because the time left on the first
@@ -174,14 +174,8 @@ impl HeldSecondRequest {
         let _ = self.reply.send(response);
     }
 
-    /// Registers the task polling with `cx` to be woken at the next time waiting alone changes
-    /// the decision (see [`decision_times`]), or when the window ends.
-    ///
-    /// `considered_at` is a time no later than the decision that just left this request held.
-    /// The next time is counted from it, not from now, so a decision time that arrives between
-    /// that decision and this call is not skipped: the task is woken at once instead.
-    pub(super) fn poll_next_decision(&mut self, considered_at: Instant, cx: &mut Context<'_>) {
-        let next = next_decision_after(&self.attempt, considered_at);
+    /// Wakes the owner at the next decision, including when it came due during evaluation.
+    pub(super) fn poll_next_decision(&mut self, next: Instant, cx: &mut Context<'_>) {
         self.timer.as_mut().reset(next);
         if self.timer.as_mut().poll(cx).is_ready() {
             cx.waker().wake_by_ref();
@@ -189,10 +183,9 @@ impl HeldSecondRequest {
     }
 }
 
-/// The first time after `considered_at` at which waiting alone changes the decision for
-/// `attempt`, or the end of its window when no such time is left, or the first request has not
-/// been sent yet.
-fn next_decision_after(attempt: &BlockHedge, considered_at: Instant) -> Instant {
+/// The first request's next overdue or stall deadline after `considered_at`, capped by the
+/// window end. An announcer's miss can bring the next decision forward.
+pub(super) fn next_decision_after(attempt: &BlockHedge, considered_at: Instant) -> Instant {
     let window_end = attempt.window_end();
     let Some(first) = attempt.first_dispatch() else {
         return window_end;

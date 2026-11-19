@@ -175,9 +175,15 @@ impl RequestSlot {
     /// Returns true if the peer announced a block and then did not deliver it within the last
     /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and no subsequent verified delivery cleared the miss.
     pub(crate) fn announced_block_missed(&self) -> bool {
+        self.announced_block_miss_expiry().is_some()
+    }
+
+    /// When the current miss expires, if it still excludes this peer from scored routing.
+    pub(super) fn announced_block_miss_expiry(&self) -> Option<tokio::time::Instant> {
         self.missed_at()
             .as_ref()
-            .is_some_and(|missed_at| missed_at.elapsed() < ANNOUNCED_BLOCK_MISS_LIFETIME)
+            .map(|missed_at| **missed_at + ANNOUNCED_BLOCK_MISS_LIFETIME)
+            .filter(|expiry| *expiry > tokio::time::Instant::now())
     }
 
     /// Identifies the miss preceding this reply, including two misses within the same clock tick.

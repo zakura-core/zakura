@@ -2250,7 +2250,10 @@ fn a_reopened_session_shares_its_connections_walk_meter() {
         assert!(walk(&mut first).is_some());
     }
     let mut reopened = session();
-    assert!(walk(&mut reopened).is_none(), "the reopen gets no fresh burst");
+    assert!(
+        walk(&mut reopened).is_none(),
+        "the reopen gets no fresh burst"
+    );
     assert_eq!(
         reopened.state.walk_due(),
         Some(start + OPEN_WALKS.refill_interval)

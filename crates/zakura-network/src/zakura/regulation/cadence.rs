@@ -362,7 +362,7 @@ impl Bucket {
 #[derive(Clone, Debug)]
 pub(crate) struct SharedBucket {
     cadence: Cadence,
-    bucket: Arc<std::sync::Mutex<Option<Bucket>>>,
+    bucket: Arc<zakura_rt::sync::Mutex<Option<Bucket>>>,
 }
 
 impl SharedBucket {
@@ -379,7 +379,7 @@ impl SharedBucket {
         let mut bucket = self
             .bucket
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner);
         let bucket = bucket.get_or_insert_with(|| Bucket::new(self.cadence, now));
         bucket.refill(now);
         if bucket.take() {
@@ -394,7 +394,7 @@ impl SharedBucket {
     pub(crate) fn next_token_at(&self) -> Option<Instant> {
         self.bucket
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner)
             .as_ref()
             .map(Bucket::next_token_at)
     }

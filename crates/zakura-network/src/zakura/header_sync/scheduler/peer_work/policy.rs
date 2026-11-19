@@ -1128,7 +1128,12 @@ impl WorkPolicy {
         let Some(request) = self.request_mut(peer) else {
             return false;
         };
-        if request.entries.len().saturating_sub(request.credited_entries) < share {
+        if request
+            .entries
+            .len()
+            .saturating_sub(request.credited_entries)
+            < share
+        {
             return false;
         }
         request.credited_entries = request.entries.len();

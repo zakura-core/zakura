@@ -193,8 +193,7 @@ impl HandshakeCounts {
         if node.tokens() == 0 {
             return HandshakeCadenceAdmission::NodeExhausted;
         }
-        let Some(host) =
-            ledger.host(admission_host(ip), max_connections_per_ip, max_hosts, now)
+        let Some(host) = ledger.host(admission_host(ip), max_connections_per_ip, max_hosts, now)
         else {
             return HandshakeCadenceAdmission::Capacity;
         };

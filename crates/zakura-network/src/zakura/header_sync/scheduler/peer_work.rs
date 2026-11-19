@@ -835,7 +835,10 @@ impl PeerWorkQueue {
     /// The peer picks its own page size, so one filled reservation proves
     /// little: at one header per page, a peer could hold its round with one
     /// header per request timeout (F-198).
-    pub(in crate::zakura::header_sync) fn credit_staged_share(&mut self, peer: &ZakuraPeerId) -> bool {
+    pub(in crate::zakura::header_sync) fn credit_staged_share(
+        &mut self,
+        peer: &ZakuraPeerId,
+    ) -> bool {
         self.policy
             .credit_staged(peer, MAX_HEADER_CHUNK_RESERVATION_V1)
     }

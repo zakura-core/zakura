@@ -1,0 +1,8 @@
+# The committed fuzz input `discovery-composed-crossed.bin` for `discovery/composed`.
+# A conformant script of request runs and `GetServices` asks, whose
+# crossed request the peer's model must count open (seed 3203, run 337).
+harness = "discovery/composed"
+generator = 1
+sha256 = "ab68b5aa9109ef3497dfb3a744640c8c988e49bf62dddc786816f25ea51e075d"
+scenario_sha256 = "2748b5496efd3370fa5c43eada79f4dafc71122138eff4187a08f381cdcf2753"
+source = "crates/zakura-sim/tests/discovery_composed.rs"

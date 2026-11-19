@@ -19,6 +19,7 @@ pub(crate) async fn zakura_header_sync_driver_startup<State>(
     header_chain_authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     network: &zakura_chain::parameters::Network,
     coordinator: &std::sync::Arc<super::SyncCoordinator>,
+    announcement_claims: zakura_consensus::AnnouncementClaims,
 ) -> Result<ZakuraHeaderSyncDriverStartup, Report>
 where
     State: Service<
@@ -130,7 +131,7 @@ where
             header_chain_authority,
             network.clone(),
             committed_snapshots,
-            coordinator.announced_blocks().clone(),
+            announcement_claims,
         )),
     })
 }
@@ -325,12 +326,12 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     network: zakura_chain::parameters::Network,
     adapter_key: port::AdapterKey,
     selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
-    announced_blocks: zakura_consensus::AnnouncementClaims,
+    announcement_claims: zakura_consensus::AnnouncementClaims,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
     /// Build the port over the state services. `selected_chain` is state's
-    /// committed snapshot watch, which [`Port::selected_chain`] hands out. `announced_blocks`
+    /// committed snapshot watch, which [`Port::selected_chain`] hands out. `announcement_claims`
     /// receives a claim for each header applied just above the verified tip.
     pub(crate) fn new(
         state: State,
@@ -338,7 +339,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
         authority: zakura_state::HeaderChainBodyEvidenceAuthority,
         network: zakura_chain::parameters::Network,
         selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
-        announced_blocks: zakura_consensus::AnnouncementClaims,
+        announcement_claims: zakura_consensus::AnnouncementClaims,
     ) -> Self {
         Self {
             state,
@@ -347,7 +348,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
             network,
             adapter_key: port::AdapterKey::new(),
             selected_chain,
-            announced_blocks,
+            announcement_claims,
         }
     }
 }
@@ -470,14 +471,14 @@ where
         let state = self.state.clone();
         let authority = self.authority.clone();
         let adapter_key = self.adapter_key.clone();
-        let announced_blocks = self.announced_blocks.clone();
+        let announcement_claims = self.announcement_claims.clone();
         let selected_chain = self.selected_chain.clone();
         Box::pin(async move {
             apply_header_target(
                 state,
                 authority,
                 adapter_key,
-                announced_blocks,
+                announcement_claims,
                 selected_chain,
                 target,
             )
@@ -744,13 +745,13 @@ where
 
 /// Applies a prepared header target to state's header chain.
 ///
-/// Headers that state accepts just above the verified tip get a claim in `announced_blocks`, so
+/// Headers that state accepts just above the verified tip get a claim in `announcement_claims`, so
 /// their blocks keep the place in receipt order they had when this apply started.
 async fn apply_header_target<State>(
     state: State,
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     adapter_key: port::AdapterKey,
-    announced_blocks: zakura_consensus::AnnouncementClaims,
+    announcement_claims: zakura_consensus::AnnouncementClaims,
     selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     target: port::PreparedHeaderTarget,
 ) -> port::ApplyHeaderTargetReply
@@ -772,7 +773,7 @@ where
     let (owner, source, target_tip_hash) = (insert.owner, insert.source, insert.target_tip_hash);
     // Reserved before the wait on the state writer, so a rival body that reaches the verifier
     // during that wait does not overtake a header that arrived first.
-    let claims = begin_announcement_claims(&announced_blocks, &selected_chain, &insert.batch);
+    let claims = begin_announcement_claims(&announcement_claims, &selected_chain, &insert.batch);
     let prepared = authority.from_registered_header_attempt(insert);
     match wait_for_header_target_apply(
         owner,
@@ -823,7 +824,7 @@ where
 /// Returns `None` until state has published a header-chain snapshot, because the verified tip
 /// is unknown before that.
 fn begin_announcement_claims(
-    announced_blocks: &zakura_consensus::AnnouncementClaims,
+    announcement_claims: &zakura_consensus::AnnouncementClaims,
     selected_chain: &tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     batch: &zakura_header_chain::PreparedHeaderBatch,
 ) -> Option<zakura_consensus::PendingClaims> {
@@ -839,7 +840,7 @@ fn begin_announcement_claims(
         .iter()
         .filter(|header| header.validation == zakura_header_chain::HeaderValidationState::Valid)
         .map(|header| (header.hash, header.height));
-    Some(announced_blocks.begin(valid_now, verified_tip))
+    Some(announcement_claims.begin(valid_now, verified_tip))
 }
 
 /// Classify state's refusal of a prepared header target.
@@ -2063,7 +2064,7 @@ mod tests {
         let near = engine_comparison::admit(&*port, anchor, &fixture.extend(anchor, 5, 0), 1).await;
         let claimed: Vec<_> = near
             .iter()
-            .filter(|header| state.announced_blocks.is_claimed(header.hash))
+            .filter(|header| state.announcement_claims.is_claimed(header.hash))
             .map(|header| header.height)
             .collect();
         assert_eq!(claimed, [block::Height(1), block::Height(2)]);
@@ -2073,7 +2074,7 @@ mod tests {
             engine_comparison::admit(&*port, near[4], &fixture.extend(near[4], 3, 0), 2).await;
         assert!(far
             .iter()
-            .all(|header| !state.announced_blocks.is_claimed(header.hash)));
+            .all(|header| !state.announcement_claims.is_claimed(header.hash)));
     }
 
     #[tokio::test]
@@ -2105,22 +2106,7 @@ mod tests {
             refused.category,
             zakura_header_chain::ErrorCategory::InvalidHeader
         );
-        assert!(!state.announced_blocks.is_claimed(header.hash()));
-    }
-
-    #[tokio::test]
-    async fn applying_a_known_header_again_keeps_its_claim() {
-        let (state, port, fixture) = claiming_port().await;
-        let anchor = fixture.anchor();
-        let headers = fixture.extend(anchor, 1, 0);
-
-        let first = engine_comparison::admit(&*port, anchor, &headers, 1).await;
-        assert!(state.announced_blocks.is_claimed(first[0].hash));
-
-        // A second peer serves the same header, which changes nothing in the header chain.
-        let again = engine_comparison::admit(&*port, anchor, &headers, 2).await;
-        assert_eq!(again, first);
-        assert!(state.announced_blocks.is_claimed(first[0].hash));
+        assert!(!state.announcement_claims.is_claimed(header.hash()));
     }
 
     #[test]

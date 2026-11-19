@@ -40,7 +40,7 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
-pub use receipt::{AnnouncementClaims, PendingClaims, ANNOUNCEMENT_PRIORITY_WINDOW};
+pub use receipt::{AnnouncementClaims, PendingClaims};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -64,8 +64,6 @@ pub struct SemanticBlockVerifier<S, V> {
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
     receipt_orders: receipt::ReceiptRegistry,
-    /// Claims made by header sync, read when a body is given its receipt order.
-    announcement_claims: AnnouncementClaims,
 }
 
 /// Block verification errors.
@@ -415,13 +413,12 @@ where
             transaction_verifier,
             prepared_candidates: Default::default(),
             receipt_orders: Default::default(),
-            announcement_claims: Default::default(),
         }
     }
 
     /// Ranks blocks by the claims in `claims`, which header sync creates as it admits headers.
     pub fn with_announcement_claims(mut self, claims: AnnouncementClaims) -> Self {
-        self.announcement_claims = claims;
+        self.receipt_orders = receipt::ReceiptRegistry::new(claims);
         self
     }
 }
@@ -451,20 +448,14 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| {
-            self.receipt_orders
-                .register(hash, &block, &self.announcement_claims)
-        });
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         // Marked before this call returns, so a rival body that arrives next already finds it.
-        let mined_watermark = request
-            .is_mined_commit()
-            .then(|| block.coinbase_height())
-            .flatten()
-            .zip(receipt.as_ref())
-            .map(|(height, receipt)| {
-                self.announcement_claims
-                    .mark_mined(hash, height, receipt.order)
-            });
+        let mined_watermark = match (&receipt, block.coinbase_height()) {
+            (Some(receipt), Some(height)) if request.is_mined_commit() => {
+                Some(self.receipt_orders.mark_mined(hash, height, receipt.order))
+            }
+            _ => None,
+        };
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();

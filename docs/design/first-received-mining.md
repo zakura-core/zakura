@@ -35,7 +35,7 @@ The reservation is called a claim. Four rules define it:
   removed only when its height falls below the verified tip, where no new
   claim can be made.
 - **The body has a deadline.** It is 500 ms plus the body's serialized size at
-  1 MiB per second, capped at `ANNOUNCEMENT_PRIORITY_WINDOW` (2 seconds). A
+  1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
   body that arrives later draws a fresh order, as if its header had never been
   seen.
 - **A node keeps the block it mined.** A locally submitted block has no claim

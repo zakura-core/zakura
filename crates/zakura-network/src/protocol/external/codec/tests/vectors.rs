@@ -186,6 +186,53 @@ fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     assert!(bytes.is_empty(), "all complete messages should be consumed");
 }
 
+/// A `block` message's header states the block's size, so the codec reports it before the body
+/// has arrived. The header of any other message leaves it alone.
+#[test]
+fn a_block_message_s_size_is_known_before_its_body_arrives() {
+    let mut codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    let size = codec.inbound_block_size();
+    let partial = |command: [u8; 12]| {
+        let message = wire_message(command, &[0; 2_000]);
+        BytesMut::from(&message[..HEADER_LEN + 100])
+    };
+
+    let mut other_codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    let other_size = other_codec.inbound_block_size();
+    assert_eq!(
+        other_codec
+            .decode(&mut partial(*b"tx\0\0\0\0\0\0\0\0\0\0"))
+            .expect("a partial message is not an error"),
+        None
+    );
+    assert_eq!(
+        other_size.get(),
+        None,
+        "a transaction's header says nothing about a block"
+    );
+
+    assert_eq!(size.get(), None, "nothing has arrived yet");
+    assert_eq!(
+        codec
+            .decode(&mut partial(*BLOCK_COMMAND))
+            .expect("a partial message is not an error"),
+        None,
+        "the block is not complete"
+    );
+    assert_eq!(
+        size.get(),
+        Some(2_000),
+        "the header gave the size with 100 of 2,000 body bytes received"
+    );
+
+    size.clear();
+    assert_eq!(size.get(), None, "a cleared size is unknown again");
+}
+
 fn wire_message(command: [u8; 12], body: &[u8]) -> Vec<u8> {
     let body_len = u32::try_from(body.len()).expect("test message body fits in a u32");
     let mut bytes = Vec::with_capacity(HEADER_LEN + body.len());

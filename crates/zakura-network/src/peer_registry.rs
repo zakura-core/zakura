@@ -13,8 +13,7 @@ use zakura_chain::block;
 mod delivery;
 mod delivery_trace;
 
-use delivery::DeliveryEstimate;
-pub(crate) use delivery::DeliverySampleKind;
+pub(crate) use delivery::{DeliveryEstimate, DeliverySampleKind};
 pub(crate) use delivery_trace::DeliveryTrace;
 
 use crate::{
@@ -334,14 +333,13 @@ impl PeerRegistryUpdater {
 
     /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
     ///
-    /// Only a round trip moves the expected answer time: a ping, or a block reply small enough
-    /// to arrive in one ([`DeliverySampleKind::is_round_trip`]). A larger block reply leaves it
-    /// as it was.
+    /// [`DeliveryEstimate::record`] decides what the sample updates: the peer's round trip, or
+    /// its record on large blocks.
     ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.
     ///
-    /// Every sample, counted or not, is written to the connection's delivery trace.
+    /// Every sample is written to the connection's delivery trace.
     pub(crate) fn record_delivery_sample(
         &self,
         kind: DeliverySampleKind,
@@ -359,31 +357,16 @@ impl PeerRegistryUpdater {
         if !state.active_connections.contains_key(&self.key) {
             return;
         }
-        let (score_before, estimate) = if kind.is_round_trip() {
-            let estimate = state
-                .delivery_estimates
-                .entry(self.key.clone())
-                .or_default();
-            let score_before = estimate.score();
-            estimate.record(sample, now);
-            (score_before, *estimate)
-        } else {
-            let estimate = state
-                .delivery_estimates
-                .get(&self.key)
-                .copied()
-                .unwrap_or_default();
-            (estimate.score(), estimate)
-        };
+        let estimate = state
+            .delivery_estimates
+            .entry(self.key.clone())
+            .or_default();
+        let before = *estimate;
+        estimate.record(kind, sample, now);
+        let after = *estimate;
         drop(state);
 
-        self.delivery_trace.sample(
-            kind,
-            sample,
-            score_before,
-            estimate.score(),
-            estimate.weight(),
-        );
+        self.delivery_trace.sample(kind, sample, &before, &after);
         self.score_waker.wake();
     }
 
@@ -405,13 +388,20 @@ impl PeerRegistryUpdater {
     /// The expected time for this peer to answer a block request, from its recent answers, or
     /// `None` before its first measured answer.
     pub(crate) fn delivery_score(&self) -> Option<Duration> {
+        self.delivery_estimate().score()
+    }
+
+    /// What is known about how long this peer takes to deliver a block: its round trip and its
+    /// record on large blocks. Empty before its first measured answer.
+    pub(crate) fn delivery_estimate(&self) -> DeliveryEstimate {
         self.registry
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned")
             .delivery_estimates
             .get(&self.key)
-            .and_then(DeliveryEstimate::score)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -650,8 +640,16 @@ mod tests {
             "an unmeasured peer still has no score after a large block"
         );
         assert_eq!(rows[0]["weight"], 0.0);
+        assert!(
+            rows[0].get("expected_ms").is_none() && rows[0].get("slowdown").is_none(),
+            "without a round trip there is nothing to expect or to compare the reply with"
+        );
 
         assert_eq!(rows[2]["kind"], "block");
+        assert!(
+            rows[2].get("expected_ms").is_none() && rows[2].get("slowdown").is_none(),
+            "only large blocks carry the large-block expectation"
+        );
         assert_eq!(rows[2]["wire_bytes"], ROUND_TRIP_REPLY_BYTES);
         assert_eq!(rows[2]["score_ms"], 20);
         assert_eq!(rows[2]["weight"], 2.0);
@@ -664,6 +662,15 @@ mod tests {
         assert_eq!(
             rows[3]["weight"], 2.0,
             "the score rests on the same samples as before"
+        );
+        assert_eq!(
+            rows[3]["expected_ms"], 20,
+            "one byte over the limit was expected in barely more than one round trip"
+        );
+        let slowdown = rows[3]["slowdown"].as_f64().expect("slowdown is traced");
+        assert!(
+            (slowdown - 250.0).abs() < 0.1,
+            "five seconds is 250 times the 20 ms expected: {slowdown}"
         );
     }
 

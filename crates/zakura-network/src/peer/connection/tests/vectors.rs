@@ -2169,6 +2169,59 @@ async fn request_slot_tracks_responses_and_notfound() {
     connection_task.abort();
 }
 
+/// The size of an arriving block belongs to the request it answers: it lasts while that request
+/// is outstanding, and is forgotten when the connection takes its next request.
+#[tokio::test(start_paused = true)]
+async fn the_arriving_block_size_is_forgotten_when_the_next_request_starts() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let size = slot.inbound_block_size();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (_tx, block) = response_vectors();
+
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    // The connection's decoder reads the header of the peer's `block` message.
+    size.set(1_500_000);
+    settle().await;
+    assert_eq!(
+        size.get(),
+        Some(1_500_000),
+        "the size stays known while the block is downloading"
+    );
+
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+
+    let (request, _response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    settle().await;
+    assert_eq!(
+        size.get(),
+        None,
+        "the next request's block has not started to arrive"
+    );
+
+    connection_task.abort();
+}
+
 /// Cancellation and timeouts free the request slot, and a disconnect leaves it busy.
 #[tokio::test(start_paused = true)]
 async fn request_slot_tracks_cancellation_timeout_and_disconnect() {

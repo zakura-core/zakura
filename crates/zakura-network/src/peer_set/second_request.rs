@@ -6,10 +6,18 @@
 //! now, is clearly shorter than what is left of the first request's. Otherwise the second copy
 //! would only cost bandwidth, because a legacy block request cannot be cancelled.
 //!
+//! A legacy `inv` carries no block size, so when the first request is sent every expected answer
+//! time is a peer's round trip. The size is learned from the first peer's reply: the header of
+//! its `block` message states the length, one round trip after the request and before the body
+//! has arrived. From then on the expected answer times compared here are the ones for a block
+//! of that size, from each peer's round trip and its record on large blocks. The decision
+//! itself does not change.
+//!
 //! The downloader shares the first dispatch with the peer set for each individual attempt, and
 //! asks for a second request once. The peer set holds that request (see
 //! [`HeldSecondRequest`]) and decides again only when an input to the decision changes:
 //!
+//! - the first reply reveals the requested block's size;
 //! - another peer announces the block;
 //! - an announcer becomes a better source: its connection is free again, which is also when
 //!   an unanswered block mark clears, a missed block mark clears or expires, or its expected
@@ -74,11 +82,12 @@ fn decision_times(first_score: Duration) -> [Duration; 2] {
 
 /// Decides whether to send a second request for a block.
 ///
-/// - `first_score` is the first peer's expected answer time when it was asked. A first peer
-///   with no measured answers gets no second request, because there is nothing to compare a
-///   candidate with;
+/// - `first_score` is the first peer's expected answer time for the block, from its measurements
+///   when it was asked. A first peer with no measured answers gets no second request, because
+///   there is nothing to compare a candidate with;
 /// - `waited` is how long the first request has been outstanding;
-/// - `best_candidate_score` is the expected answer time of the fastest eligible, measured second announcer.
+/// - `best_candidate_score` is the expected answer time, for the same block, of the fastest
+///   eligible, measured second announcer.
 ///
 /// A candidate is compared with what is left of the first peer's expected time, or, once the first
 /// request is overdue, with all of it (see the comment in the body for why).
@@ -96,9 +105,10 @@ pub(super) fn second_request_reason(
     }
 
     // An overdue first request is probably fetching a block larger than the ones its score was
-    // measured on. A legacy `inv` carries no block size, and the first peer's score comes mostly
-    // from pings, so it covers the peer's distance but not the time to transfer a large block.
-    // Counting down to zero would then refuse every candidate until the stall point.
+    // measured on. A legacy `inv` carries no block size, and until the reply's header arrives
+    // the first peer's score is its round trip, so it covers the peer's distance but not the
+    // time to transfer a large block. Counting down to zero would then refuse every candidate
+    // until the stall point.
     //
     // This came from a load test on the asia-scored mainnet node (Singapore), with blocks of
     // about 1.5 MB. At heights 3,586,323, 3,586,329 and 3,586,330 the first peer was expected

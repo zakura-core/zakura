@@ -13,7 +13,10 @@
 //! `predicted` when another announcer was expected to deliver clearly sooner, `stalled` when the
 //! first request ran well past its expected time. `first_request_waited_ms` is how long the first
 //! request had been outstanding since dispatch to a peer, excluding local routing queue time, and
-//! `first_score_ms` is the first peer's expected answer time.
+//! `first_score_ms` is the first peer's expected answer time. `decision_block_bytes` is the
+//! block's serialized size, if the first peer's reply had started to arrive when the second
+//! request was decided. With it, `first_score_ms` and `score_ms` are the times expected for a
+//! block of that size from each peer; without it, they are the peers' round trips.
 //! A delivered block's row has `block_bytes`, its decoded size, so answer times can be compared
 //! with expected ones by block size.
 //! `peer_start_height` is the peer's untrusted, point-in-time handshake claim and is not used as an
@@ -73,10 +76,14 @@ pub(super) struct SecondRequestChoice {
     pub(super) reason: SecondRequestReason,
     /// The number of idle peers, other than the first one, that had announced the block.
     pub(super) candidates: usize,
-    /// The chosen peer's expected answer time, if it has been measured.
+    /// The chosen peer's expected answer time for the block, if it has been measured.
     pub(super) score: Option<Duration>,
-    /// The first peer's expected answer time when it was asked.
+    /// The first peer's expected answer time for the block, from its measurements when it was
+    /// asked.
     pub(super) first_score: Duration,
+    /// The block's serialized size the two expected times are for, or `None` if the first
+    /// peer's reply had not started to arrive, in which case they are round trips.
+    pub(super) block_bytes: Option<u64>,
 }
 
 /// The idle announcers a block request chose among, and their expected answer times.
@@ -144,6 +151,8 @@ enum LegacyPeerEvent<'a> {
         first_request_waited_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_score_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decision_block_bytes: Option<u64>,
         #[serde(flatten)]
         result: BlockRequestResult<'a>,
     },
@@ -362,6 +371,7 @@ impl LegacyPeerTrace {
                 first_request_waited_ms: hedge
                     .map(|choice| saturating_millis(choice.first_request_waited)),
                 first_score_ms: hedge.map(|choice| saturating_millis(choice.first_score)),
+                decision_block_bytes: hedge.and_then(|choice| choice.block_bytes),
                 result,
             }
         });
@@ -621,6 +631,7 @@ mod tests {
                 candidates: 2,
                 score: Some(Duration::from_millis(50)),
                 first_score: Duration::from_millis(230),
+                block_bytes: Some(1_500_000),
             }),
             Duration::from_millis(48),
             &Err(SharedPeerError::from(PeerError::NotFoundResponse(vec![
@@ -639,6 +650,7 @@ mod tests {
         assert_eq!(event["hedge_reason"], "predicted");
         assert_eq!(event["first_request_waited_ms"], 70);
         assert_eq!(event["first_score_ms"], 230);
+        assert_eq!(event["decision_block_bytes"], 1_500_000);
         assert_eq!(event["candidates"], 2);
         assert_eq!(event["score_ms"], 50);
         assert!(event.get("best_score_ms").is_none());

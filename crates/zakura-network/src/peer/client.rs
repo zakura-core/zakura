@@ -32,7 +32,7 @@ use crate::{
     },
     peer_set::InventoryChange,
     protocol::{
-        external::InventoryHash,
+        external::{InboundBlockSize, InventoryHash},
         internal::{Request, Response},
     },
     BoxError, PeerSocketAddr,
@@ -113,6 +113,10 @@ pub(crate) struct RequestSlot {
     /// The task to wake when this connection becomes usable as a block source again. Empty
     /// unless the peer set is holding a second block request that this peer could serve.
     usable_waker: Arc<AtomicWaker>,
+
+    /// The size of the block that has started to arrive since the current request began, which
+    /// the connection's decoder sets. Never set for a connection built without a decoder's cell.
+    inbound_block_size: InboundBlockSize,
 }
 
 /// How long scored routing passes over a peer that failed to deliver an announced block,
@@ -125,6 +129,28 @@ pub(crate) struct RequestSlot {
 pub(crate) const ANNOUNCED_BLOCK_MISS_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 impl RequestSlot {
+    /// A slot for a connection whose decoder reports arriving block sizes in `inbound_block_size`.
+    pub(crate) fn with_inbound_block_size(inbound_block_size: InboundBlockSize) -> Self {
+        Self {
+            inbound_block_size,
+            ..Self::default()
+        }
+    }
+
+    /// Records that the connection has taken a client request: it is busy, and no block of the
+    /// new request's reply has started to arrive.
+    pub(crate) fn begin_request(&self) {
+        self.inbound_block_size.clear();
+        self.set_busy(true);
+    }
+
+    /// A handle to the size of the block that has started to arrive since the current request
+    /// began. For a block request this is the requested block's size, known as soon as the
+    /// reply's header arrives.
+    pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
+        self.inbound_block_size.clone()
+    }
+
     /// Records whether the connection is handling a client request (or can no longer take one).
     pub(crate) fn set_busy(&self, busy: bool) {
         let was_busy = self.busy.swap(busy, Ordering::AcqRel);

@@ -16,7 +16,9 @@ use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{AdvertisedBlockRequest, Client, ConnectedAddr, ConnectionInfo},
     peer_registry::trace_user_agent,
-    protocol::external::{canonical_socket_addr, types::PeerServices, types::Version},
+    protocol::external::{
+        canonical_socket_addr, types::PeerServices, types::Version, InboundBlockSize,
+    },
     Request,
 };
 
@@ -141,6 +143,12 @@ impl LoadTrackedClient {
     /// request can briefly report free after it takes that request.
     pub(crate) fn can_send_request_now(&self) -> bool {
         self.request_slot.is_free()
+    }
+
+    /// A handle to the size of the block this connection has started to receive since its
+    /// current request began, known once the reply's header has arrived.
+    pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
+        self.request_slot.inbound_block_size()
     }
 
     /// Returns true if a block request timed out or was cancelled after at least half its timeout,

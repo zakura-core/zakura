@@ -1285,7 +1285,11 @@ where
     ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
         let response = match attempt {
             Some(attempt) => {
-                attempt.dispatch_if_needed(Some(peer), svc.block_gossip.delivery_score(), || {
+                let reply = crate::protocol::internal::FirstReply {
+                    estimate: svc.block_gossip.delivery_estimate(),
+                    block_size: svc.inbound_block_size(),
+                };
+                attempt.dispatch_if_needed(Some(peer), Some(reply), || {
                     svc.call_routed(req, advertised)
                 })
             }
@@ -1735,7 +1739,8 @@ where
     ) -> Option<(D::Key, SecondRequestChoice)> {
         let first = attempt.first_dispatch()?;
         let first_peer = first.legacy_peer;
-        let first_score = first.score?;
+        let block_bytes = first.reply_bytes();
+        let first_score = first.expected(block_bytes)?;
         let candidates: Vec<_> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
@@ -1760,6 +1765,7 @@ where
             candidates: candidates.len(),
             score: Some(score),
             first_score,
+            block_bytes,
         };
         Some((peer, choice))
     }

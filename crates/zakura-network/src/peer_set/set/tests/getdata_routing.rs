@@ -86,6 +86,15 @@ impl TestPeer {
         (self.addr, client)
     }
 
+    /// Where this peer's connection reports the size of a block that has started to arrive.
+    /// Setting it stands in for the connection's decoder reading a `block` message's header.
+    fn inbound_block_size(&self) -> crate::protocol::external::InboundBlockSize {
+        self.client
+            .as_ref()
+            .expect("peer is not yet in the peer set")
+            .inbound_block_size()
+    }
+
     /// Returns the next message the connection has already written to the peer, if any.
     async fn written_now(&mut self) -> Option<Message> {
         // Let the connection task run without advancing the paused clock.
@@ -1967,6 +1976,160 @@ async fn a_slow_large_block_does_not_rush_the_next_second_request_to_a_far_peer(
         far.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
         "the second request is still available once the first request stalls"
+    );
+}
+
+/// A 1.5 MB block, which a new connection needs about 6.7 round trips to deliver.
+const LARGE_BLOCK_BYTES: u64 = 1_500_000;
+
+/// Records that the peer behind `samples` took `answer_ms` to deliver a 1.5 MB block.
+fn record_large_block(samples: &crate::peer_registry::PeerRegistryUpdater, answer_ms: u64) {
+    samples.record_delivery_sample(
+        crate::peer_registry::DeliverySampleKind::Block {
+            wire_bytes: LARGE_BLOCK_BYTES,
+        },
+        Duration::from_millis(answer_ms),
+        std::time::Instant::now(),
+    );
+}
+
+/// Requests `BLOCK_HASH` from `first`, its only announcer so far, and then has the header of
+/// `first`'s reply arrive, which says the block is 1.5 MB.
+async fn request_large_block_from(
+    peer_set: &mut PeerSet<TestDiscover, MockChainTip>,
+    guard: &mut PeerSetGuard,
+    first: &mut TestPeer,
+    first_reply_size: &crate::protocol::external::InboundBlockSize,
+) -> (
+    crate::BlockHedge,
+    impl std::future::Future<Output = Result<Response, BoxError>>,
+) {
+    announce_block(peer_set, guard, first).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let first_request = request_primary(peer_set, &attempt).await;
+    assert_eq!(
+        first.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    first_reply_size.set(LARGE_BLOCK_BYTES);
+    (attempt, first_request)
+}
+
+/// Once the first reply's header says the block is large, every peer is expected to need the
+/// round trips that size takes. A far announcer no faster than the first peer is then not asked,
+/// even long after the first peer's own round trip has passed, while a nearby announcer is.
+#[tokio::test(start_paused = true)]
+async fn for_a_large_block_a_nearby_announcer_is_asked_and_a_far_one_is_not() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut far = TestPeer::spawn(2);
+    let mut near = TestPeer::spawn(3);
+    let _measured = [
+        measured_peer(&mut first, &registry, Some(250)),
+        measured_peer(&mut far, &registry, Some(240)),
+        measured_peer(&mut near, &registry, Some(5)),
+    ];
+    let first_reply_size = first.inbound_block_size();
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut first, &mut far, &mut near]);
+    let (attempt, _first_request) =
+        request_large_block_from(&mut peer_set, &mut guard, &mut first, &first_reply_size).await;
+    announce_block(&mut peer_set, &mut guard, &far).await;
+
+    // 1.5 MB is expected to take the first peer about 1,670 ms and the far peer about 1,610 ms.
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 70).await).await;
+    // For a block that fits one round trip, 750 ms would be a stall.
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 730).await).await;
+    assert_eq!(
+        far.written_now().await,
+        None,
+        "800 ms into a 1.5 MB download, a peer just as far away is not asked"
+    );
+
+    announce_block(&mut peer_set, &mut guard, &near).await;
+    let _second = request_block_again(&mut peer_set, &attempt, 10).await;
+    assert_eq!(
+        near.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "a nearby peer, expected to deliver 1.5 MB in about 35 ms, is asked"
+    );
+    assert_eq!(far.written_now().await, None);
+}
+
+/// A first peer that is near but has been slow to deliver large blocks gives way to a far
+/// announcer, once the reply's header shows the block is large.
+#[tokio::test(start_paused = true)]
+async fn a_first_peer_slow_on_large_blocks_gives_way_to_a_far_peer_once_the_size_is_known() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut far = TestPeer::spawn(2);
+    let (_first_guard, first_samples) = measured_peer(&mut first, &registry, Some(100));
+    let _far_measured = measured_peer(&mut far, &registry, Some(240));
+    // About five times what a new connection with a 100 ms round trip would need.
+    record_large_block(&first_samples, 3_350);
+    let first_reply_size = first.inbound_block_size();
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut far]);
+
+    announce_block(&mut peer_set, &mut guard, &first).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first_request = request_primary(&mut peer_set, &attempt).await;
+    assert_eq!(
+        first.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    announce_block(&mut peer_set, &mut guard, &far).await;
+
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 30).await).await;
+    assert_eq!(
+        far.written_now().await,
+        None,
+        "with the size unknown, the first peer's 100 ms round trip beats the far peer's 240 ms"
+    );
+
+    first_reply_size.set(LARGE_BLOCK_BYTES);
+    let _second = request_block_again(&mut peer_set, &attempt, 40).await;
+    assert_eq!(
+        far.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the first peer is expected to take about 3,350 ms for 1.5 MB, the far peer 1,610 ms"
+    );
+}
+
+/// Of two far announcers, the one that has delivered large blocks faster is asked, even though
+/// the other has the slightly shorter round trip.
+#[tokio::test(start_paused = true)]
+async fn of_two_far_announcers_the_one_faster_on_large_blocks_is_asked() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut cold = TestPeer::spawn(2);
+    let mut warm = TestPeer::spawn(3);
+    let _first_measured = measured_peer(&mut first, &registry, Some(250));
+    let (_cold_guard, cold_samples) = measured_peer(&mut cold, &registry, Some(240));
+    let (_warm_guard, warm_samples) = measured_peer(&mut warm, &registry, Some(245));
+    // One took about as long as a new connection needs for 1.5 MB, the other a third of that.
+    record_large_block(&cold_samples, 1_600);
+    record_large_block(&warm_samples, 560);
+    let first_reply_size = first.inbound_block_size();
+    let (mut peer_set, mut guard) =
+        peer_set_with_second_requests(&mut [&mut first, &mut cold, &mut warm]);
+    let (attempt, _first_request) =
+        request_large_block_from(&mut peer_set, &mut guard, &mut first, &first_reply_size).await;
+    announce_block(&mut peer_set, &mut guard, &cold).await;
+    announce_block(&mut peer_set, &mut guard, &warm).await;
+
+    let _second = request_block_again(&mut peer_set, &attempt, 70).await;
+    assert_eq!(
+        warm.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the peer expected to deliver 1.5 MB in about 560 ms beats the first peer's 1,670 ms"
+    );
+    assert_eq!(
+        cold.written_now().await,
+        None,
+        "the peer expected to take about 1,600 ms is not asked"
     );
 }
 

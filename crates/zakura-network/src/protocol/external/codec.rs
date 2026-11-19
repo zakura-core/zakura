@@ -4,7 +4,10 @@ use std::{
     fmt,
     io::{BufWriter, Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 #[cfg(test)]
@@ -257,10 +260,47 @@ fn serialized_block_checksum(block: &BlockHandle) -> sha256d::Checksum {
     sha256d_checksum_of_digest(first)
 }
 
+/// The command of a `block` message, as it appears in a message header.
+const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
+
+/// The size of the `block` message a connection last started to receive, shared between the
+/// connection's decoder and whoever is waiting for the block.
+///
+/// A message's header states its body length before the body arrives, and a `block` message's
+/// body is the serialized block. So the size of a requested block is known one round trip after
+/// the request, well before a large block has finished downloading.
+///
+/// The decoder sets the size, and the connection clears it when it starts a new request.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InboundBlockSize(Arc<AtomicU64>);
+
+impl InboundBlockSize {
+    /// Zero stands for "unknown": a block is never empty.
+    const UNKNOWN: u64 = 0;
+
+    /// Records that a `block` message of `serialized_bytes` has started to arrive.
+    pub(crate) fn set(&self, serialized_bytes: u64) {
+        self.0.store(serialized_bytes, Ordering::Release);
+    }
+
+    /// The serialized size of the block that has started to arrive, or `None` if no `block`
+    /// message has since the last [`clear`](Self::clear).
+    pub(crate) fn get(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Acquire)).filter(|bytes| *bytes != Self::UNKNOWN)
+    }
+
+    /// Forgets the size, because the block it described is no longer the one awaited.
+    pub(crate) fn clear(&self) {
+        self.set(Self::UNKNOWN);
+    }
+}
+
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
+    /// Set from each `block` message's header, before its body arrives.
+    inbound_block_size: InboundBlockSize,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
 }
@@ -288,6 +328,12 @@ impl Codec {
         }
     }
 
+    /// A handle to the size of the `block` message this codec last started to decode. The codec
+    /// sets it when the message's header arrives.
+    pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
+        self.inbound_block_size.clone()
+    }
+
     /// Reconfigure the version used by the codec, e.g., after completing a handshake.
     pub fn reconfigure_version(&mut self, version: Version) {
         self.builder.version = version;
@@ -308,6 +354,7 @@ impl Builder {
         Codec {
             builder: self,
             state: DecodeState::Head,
+            inbound_block_size: InboundBlockSize::default(),
             #[cfg(test)]
             body_decode_panic: Cell::new(None),
         }
@@ -376,7 +423,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } => b"block\0\0\0\0\0\0\0",
+            Block { .. } => BLOCK_COMMAND,
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -706,6 +753,11 @@ impl Decoder for Codec {
                     metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
+                    if command == *BLOCK_COMMAND {
+                        // The length came from a u32, so widening it to u64 is lossless.
+                        self.inbound_block_size.set(body_len as u64);
+                    }
+
                     // Reserve buffer space for the next arriving bytes, not the claimed body.
                     src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
@@ -774,7 +826,7 @@ impl Decoder for Codec {
                             b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
                             b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                             b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                            b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                            BLOCK_COMMAND => self.read_block(&mut body_reader),
                             b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
                             b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
                             b"getheaders\0\0" => self.read_getheaders(&mut body_reader),

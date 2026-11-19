@@ -15,7 +15,10 @@ use zakura_chain::{
 use zakura_node_services::block_memory::BlockHandle;
 
 use super::super::types::Nonce;
-use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
+use crate::{
+    peer_registry::DeliveryEstimate, protocol::external::InboundBlockSize, zakura::ZakuraPeerId,
+    PeerSocketAddr,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest::{arbitrary::any, collection::vec, strategy::Strategy};
@@ -51,12 +54,37 @@ enum HedgeDispatch {
     Dispatched,
 }
 
-/// The first handoff of this download to a peer. Native peers have no legacy address or score.
-#[derive(Clone, Copy, Debug)]
+/// The first handoff of this download to a peer. Native peers have no legacy address and no
+/// expected answer time.
+#[derive(Clone, Debug)]
 pub(crate) struct FirstDispatch {
     pub(crate) at: Instant,
     pub(crate) legacy_peer: Option<PeerSocketAddr>,
-    pub(crate) score: Option<Duration>,
+    reply: FirstReply,
+}
+
+impl FirstDispatch {
+    /// The serialized size of the block the first peer has started to send, or `None` until
+    /// its reply's header arrives. Read it once per decision, so that the first peer and every
+    /// other announcer are judged on the same size.
+    pub(crate) fn reply_bytes(&self) -> Option<u64> {
+        self.reply.block_size.get()
+    }
+
+    /// How long the first request is expected to take in all, for a block of `reply_bytes`, or
+    /// `None` if the first peer had no measured answers when it was asked.
+    pub(crate) fn expected(&self, reply_bytes: Option<u64>) -> Option<Duration> {
+        self.reply.estimate.expected(reply_bytes)
+    }
+}
+
+/// What a first request's expected answer time is worked out from.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FirstReply {
+    /// What was known, at dispatch, about how long the peer takes to deliver a block.
+    pub(crate) estimate: DeliveryEstimate,
+    /// The size of the block the peer's connection is receiving, once its header has arrived.
+    pub(crate) block_size: InboundBlockSize,
 }
 
 impl BlockHedge {
@@ -118,7 +146,7 @@ impl BlockHedge {
     }
 
     pub(crate) fn first_dispatch(&self) -> Option<FirstDispatch> {
-        self.state().first
+        self.state().first.clone()
     }
 
     /// When the window for dispatching a second request ends, unless it is closed sooner.
@@ -143,10 +171,13 @@ impl BlockHedge {
 
     /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
     /// The closure only enqueues work in a ready service or reserved channel slot.
+    ///
+    /// `reply` is what a legacy `peer`'s expected answer time is worked out from. Without it,
+    /// or if the peer has no measured answers, the download gets no second request.
     pub(crate) fn dispatch_if_needed<T>(
         &self,
         peer: Option<PeerSocketAddr>,
-        score: Option<Duration>,
+        reply: Option<FirstReply>,
         dispatch: impl FnOnce() -> T,
     ) -> Result<T, crate::BoxError> {
         let mut state = self.state();
@@ -156,15 +187,19 @@ impl BlockHedge {
         if state.satisfied {
             return Err("block already delivered".into());
         }
-        if state.first.is_none() && score.is_none() && state.hedge == HedgeDispatch::Open {
+        let reply = reply.unwrap_or_default();
+        if state.first.is_none()
+            && reply.estimate.score().is_none()
+            && state.hedge == HedgeDispatch::Open
+        {
             metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
-            // The first dispatch fixes the score used by every later comparison.
+            // The first dispatch fixes the estimate used by every later comparison.
             state.hedge = HedgeDispatch::Closed;
         }
         state.first.get_or_insert_with(|| FirstDispatch {
             at: Instant::now(),
             legacy_peer: peer,
-            score,
+            reply,
         });
         Ok(dispatch())
     }

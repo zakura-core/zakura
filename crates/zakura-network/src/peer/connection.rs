@@ -874,6 +874,16 @@ where
         self
     }
 
+    /// Makes this connection's request slot report the block sizes its decoder reads into
+    /// `inbound_block_size`. Call before sharing the slot.
+    pub(super) fn with_inbound_block_size(
+        mut self,
+        inbound_block_size: crate::protocol::external::InboundBlockSize,
+    ) -> Self {
+        self.request_slot = super::client::RequestSlot::with_inbound_block_size(inbound_block_size);
+        self
+    }
+
     /// Makes this connection write its block gossip to `gossip_trace`.
     pub(super) fn with_gossip_trace(
         mut self,
@@ -1030,7 +1040,7 @@ where
                         }
                         Either::Right(Some(req)) => {
                             // The request may wait for the peer writer before the state changes.
-                            self.request_slot.set_busy(true);
+                            self.request_slot.begin_request();
                             self.request_started_at = Some(tokio::time::Instant::now());
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await

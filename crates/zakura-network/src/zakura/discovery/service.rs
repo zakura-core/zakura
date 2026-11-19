@@ -2659,7 +2659,7 @@ mod tests {
                     )
                     .await
                     .expect("the writer panics at its owner check after the initial timeout");
-                    assert_eq!(close_cause.get(), Some("service_panic"));
+                    assert_eq!(close_cause.get(), Some(CloseOutcome::SERVICE_PANIC));
                     drop((peer_send, peer_recv));
                 }
                 SessionExit::LocalCancel => {

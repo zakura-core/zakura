@@ -1,11 +1,11 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
-index 23d8fafeec..495d0820e2 100644
+index 8c5d7ea630..43df89de0f 100644
 --- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
-@@ -543,15 +543,19 @@ impl PublisherState {
+@@ -577,15 +577,19 @@ impl PublisherState {
+                         continue;
+                     }
                  }
-                 let target = subscription.fixed.target;
-                 let last = subscription.position.last();
 +                let locators = match last {
 +                    Some(last) => vec![last.hash],
 +                    None => subscription.locators.clone(),

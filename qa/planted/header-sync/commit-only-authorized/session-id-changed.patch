@@ -1,11 +1,11 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/service.rs b/crates/zakura-network/src/zakura/header_sync/service.rs
-index d6b2fd0d02..28007ff26f 100644
+index 0ce8b6bccf..05d1fb61fe 100644
 --- a/crates/zakura-network/src/zakura/header_sync/service.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/service.rs
-@@ -765,7 +765,7 @@ impl Service for HeaderSyncService {
-         let subscriber = subscriber.observed_by(self.header_sync.credit_tap(&peer_id, session_id));
+@@ -827,7 +827,7 @@ impl Service for HeaderSyncService {
          let session = PeerSession::new(
              peer_id.clone(),
+             conn_id,
 -            session_id,
 +            session_id + 1,
              peer.direction,

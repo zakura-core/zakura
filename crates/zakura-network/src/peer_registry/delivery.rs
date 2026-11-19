@@ -10,6 +10,7 @@
 //!   with that model. It absorbs what the size cannot say: how warm the connection usually is,
 //!   and how fast the peer and the path to it are.
 //!
+//! Even a warmed-up connection still needs one round trip for the request and reply.
 //! For a block that fits one round trip, or whose size is not known, the expected time is the
 //! round trip alone.
 //!
@@ -179,16 +180,16 @@ impl DeliveryEstimate {
     ///
     /// This is the round trip when the size is unknown or fits one round trip. For a larger
     /// block it is the cold-connection time for that size, times the peer's large-block
-    /// slowdown factor. A peer with no large-block record is taken at the model's word.
+    /// slowdown factor, with the round trip as a lower bound. A peer with no large-block
+    /// record is taken at the model's word.
     pub(crate) fn expected(&self, wire_bytes: Option<u64>) -> Option<Duration> {
         let large = wire_bytes.filter(|wire_bytes| *wire_bytes > ROUND_TRIP_REPLY_BYTES);
         let Some(wire_bytes) = large else {
             return self.score();
         };
         let slowdown = self.large_block_slowdown().unwrap_or(1.0);
-        Some(duration_from_secs(
-            self.cold_transfer_secs(wire_bytes)? * slowdown,
-        ))
+        let trips = (round_trips(wire_bytes) * slowdown).max(1.0);
+        Some(duration_from_secs(self.round_trip.value()? * trips))
     }
 }
 
@@ -308,6 +309,18 @@ mod tests {
         estimate.record(block(LARGE), cold(&estimate) / 3, now);
         let expected = estimate.expected(Some(LARGE)).expect("measured");
         assert!(expected < cold(&estimate) / 2, "expected {expected:?}");
+    }
+
+    #[test]
+    fn a_warm_peer_still_needs_one_round_trip_above_the_size_cutoff() {
+        let mut estimate = DeliveryEstimate::default();
+        let now = Instant::now();
+        estimate.record(PING, ms(220), now);
+        estimate.record(block(LARGE), ms(500), now);
+        for size in [ROUND_TRIP_REPLY_BYTES, ROUND_TRIP_REPLY_BYTES + 1] {
+            assert_eq!(estimate.expected(Some(size)), Some(ms(220)));
+        }
+        assert_eq!(estimate.expected(Some(LARGE)), Some(ms(500)));
     }
 
     #[test]

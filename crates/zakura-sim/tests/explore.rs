@@ -717,3 +717,28 @@ fn a_panicking_job_retires_the_worker_and_resumes() {
     let outcome = worker.explore(&PENDING, &[], |_, _, classified| classified.outcome.clone());
     assert_eq!(outcome, ExploreOutcome::Clean);
 }
+
+/// A steered run that a harness failure ends still returns the Plan bytes
+/// its steer recorded, not the input it started from, so a PCT search saves
+/// a reproducer of the run that failed.
+#[test]
+fn a_steered_harness_failure_keeps_its_recorded_bytes() {
+    let input = [7u8; 8];
+    let (run, replay) = zakura_sim::explore::run_steered_bytes::<Colon>(
+        &input,
+        &mut NullSink,
+        zakura_sim::explore::pct::Pct::for_input(&input),
+    );
+    assert!(
+        matches!(
+            &run.result,
+            Err(HarnessError::Run {
+                failure: HarnessFailure::TaskNameHasColon { .. },
+                ..
+            })
+        ),
+        "{:?}",
+        run.result
+    );
+    assert_ne!(replay, input, "the replay is the steer's recording");
+}

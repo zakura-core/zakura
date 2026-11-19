@@ -230,10 +230,18 @@ node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
 The two Singapore experiment nodes have hand-written configs. `asia-hedged`
-uses `[network.block_hedge]` from PR 2548. `asia-scored` uses
-`[network.block_source_score]` with `second_request`. Its deployment pin
-must support that config until the host switches to
-`[network.block_download_score_and_hedge]`, the setting introduced in PR 2595.
+uses `[network.block_hedge]` from PR 2548. On the first `asia-scored` deploy
+with the build pinned for PR 2595, the installer replaces the enabled
+`[network.block_source_score]` and `second_request` flags with:
+
+```toml
+[network.block_download_score_and_hedge]
+enabled = true
+```
+
+That first upgrade requires a restart. If startup fails, the installer restores
+the original config and binary together. Later deploys accept the new setting
+as-is. A dashboard refresh does not run the node installer.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
@@ -271,7 +279,8 @@ Zakura identity (the node ids hardcoded as bootstrap peers in
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
-the existing `zakurad` service, leaving the config, unit, and cache untouched. The
+the existing `zakurad` service. Only `asia-scored` opts into the scoring config
+upgrade described above. The
 `rpc_listen_addr` / `log_file` / `p2p_stack` /
 `[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
 dashboard's SSH probe, not deployed to nodes. On-node configs should use

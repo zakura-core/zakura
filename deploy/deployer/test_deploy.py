@@ -1,6 +1,9 @@
 import importlib.util
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import tempfile
@@ -656,6 +659,99 @@ class ConfigKeyTests(unittest.TestCase):
                 deploy.load_nodes(path, None)
 
 
+
+
+class ScoringUpgradeTests(unittest.TestCase):
+    OLD = "[network.block_source_score]\nsecond_request = true\nenabled = true\n"
+    NEW = "[network.block_download_score_and_hedge]\nenabled = true\n"
+    OTHER = "[state]\ncache_dir = '/mnt/data/zakura'  # operator setting\n"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.stage = self.root / "stage"
+        self.stage.mkdir(mode=0o700)
+        self.config = self.root / "node.toml"
+        self.config.write_text(self.OLD + self.OTHER)
+        self.config.chmod(0o640)
+        self.bin = self.root / "zakurad"
+        self.bin.write_text("#!/bin/sh\necho old\n")
+        self.bin.chmod(0o755)
+        (self.stage / "zakurad.new").write_text("#!/bin/sh\necho new\n")
+        shutil.copy(SCRIPT_DIR / "mainnet/upgrade_block_source_score.py", self.stage)
+        (self.root / "sleep").write_text("#!/bin/sh\nexit 0\n")
+        (self.root / "sleep").chmod(0o755)
+        (self.root / "systemctl").write_text("""#!/bin/sh
+case "$1" in
+    show) echo "{ argv[]=$BINARY --config=$CONFIG start ; }" ;;
+    stop) rm -f "$ACTIVE" ;;
+    start)
+        version=$("$BINARY")
+        if [ "$version" = old ]; then
+            grep -Fqx '[network.block_source_score]' "$CONFIG" || exit 1
+        else
+            grep -Fqx '[network.block_download_score_and_hedge]' "$CONFIG" || exit 1
+            [ "$FAIL_NEW" = 0 ] || exit 1
+        fi
+        touch "$ACTIVE" ;;
+    is-active) test -f "$ACTIVE" ;;
+esac
+""")
+        (self.root / "systemctl").chmod(0o755)
+
+    def install(self, *, no_restart=False, fail_new=False):
+        script = deploy.BINARY_ONLY_INSTALL_SCRIPT.format(
+            stage=shlex.quote(str(self.stage)), bin_path=shlex.quote(str(self.bin)),
+            service="zakurad", no_restart=int(no_restart),
+        )
+        env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", CONFIG=str(self.config),
+                   BINARY=str(self.bin), ACTIVE=str(self.root / "active"), FAIL_NEW=str(int(fail_new)))
+        return subprocess.run(["bash", "-s"], input=script, env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    def test_only_asia_scored_stages_the_upgrade_from_the_mainnet_inventory(self):
+        workflow = SCRIPT_DIR.parents[1] / ".github/workflows/zakura-mainnet-deploy.yml"
+        inventory = workflow.read_text().split("cat > nodes.ci.toml <<EOF\n", 1)[1].split("\n          EOF", 1)[0]
+        path = self.root / "nodes.toml"
+        path.write_text(inventory)
+        nodes = deploy.load_nodes(path, None)
+        self.assertEqual([n.name for n in nodes if n.upgrade_block_source_score], ["asia-scored"])
+        for node in nodes:
+            with mock.patch.object(deploy, "run") as upload, mock.patch.object(
+                deploy, "ssh_with_stdin", return_value=mock.Mock(returncode=0)
+            ):
+                deploy.install_node(node, self.bin, "/tmp/node-stage", no_restart=False)
+            files = [call.args[0][-2] for call in upload.call_args_list]
+            self.assertEqual(str(SCRIPT_DIR / "mainnet/upgrade_block_source_score.py") in files,
+                             node.name == "asia-scored")
+
+    def test_upgrades_only_scoring_and_accepts_repeated_deploy(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.config.read_text(), self.NEW + self.OTHER)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+        self.assertTrue((self.root / "active").exists())
+        inode = self.config.stat().st_ino
+        second = self.install(no_restart=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.config.stat().st_ino, inode)
+
+    def test_start_failure_restores_the_pair_and_restarts_the_old_service(self):
+        self.assertNotEqual(self.install(fail_new=True).returncode, 0)
+        self.assertEqual(self.config.read_text(), self.OLD + self.OTHER)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.bin.read_text(), "#!/bin/sh\necho old\n")
+        self.assertTrue((self.root / "active").exists())
+
+    def test_uncertain_config_and_deferred_restart_leave_both_files_intact(self):
+        for text, no_restart in [(self.OLD, True), (self.OLD.replace("true", "false"), False),
+                                 (self.OLD + self.NEW, False)]:
+            with self.subTest(text=text, no_restart=no_restart):
+                self.config.write_text(text)
+                self.assertNotEqual(self.install(no_restart=no_restart).returncode, 0)
+                self.assertEqual(self.config.read_text(), text)
+                self.assertEqual(self.bin.read_text(), "#!/bin/sh\necho old\n")
 
 
 class SharedHostStagingTests(unittest.TestCase):

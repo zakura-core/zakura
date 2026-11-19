@@ -12,15 +12,15 @@ name: Deploy Zakura mainnet fleet
 # per-node configs (external_addr, an inline zakura_node_secret_key that pins
 # each node's iroh identity, custom peers, and mempool/sync tuning) and their
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
-# this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
-# restarts the existing `zakurad` service, leaving the config, unit, and cache
-# untouched. The archive publisher also installs its matching exporter and
+# this deploy sets manage_config = false and keeps the existing unit and cache.
+# Only asia-scored opts into the scoring config upgrade with its binary.
+# The archive publisher also installs its matching exporter and
 # verifies publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
-# default) rather than the deprecated v2_p2p/legacy_p2p bools. This workflow does
-# not rewrite node configs; p2p_stack below is dashboard/metadata only.
+# default) rather than the deprecated v2_p2p/legacy_p2p bools. The p2p_stack fields
+# below are dashboard metadata.
 
 on:
   workflow_dispatch:
@@ -395,8 +395,7 @@ jobs:
           REF="${DEPLOY_COMMIT:-$GITHUB_SHA}"
           cat > nodes.ci.toml <<EOF
           [defaults]
-          # Binary-only: swap the binary and restart the existing service; leave
-          # the hand-tuned config, unit, and /root/.cache/zebra state untouched.
+          # Keep the hand-written configs and restart the existing services.
           deploy_kind     = "systemd"
           manage_config   = false
           service_name    = "zakurad"
@@ -519,7 +518,6 @@ jobs:
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # This binary-only deployment preserves each node's on-disk config.
           # asia-hedged uses [network.block_hedge] from #2548.
           [[nodes]]
           name       = "asia-hedged"
@@ -529,13 +527,13 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored still uses [network.block_source_score] with second_request.
-          # Keep a compatible pin until the host config is updated for #2595.
+          # Upgrade the scoring config with the first build pinned here that uses #2595.
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "4e5d4c3d66d70c9a126bf16c0a2b7084e58d3749"
+          commit     = "5193815225a1d57fc4c7c5519386cbaf45a8979c"
+          upgrade_block_source_score = true
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

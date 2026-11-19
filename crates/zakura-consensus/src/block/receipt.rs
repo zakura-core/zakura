@@ -2,8 +2,8 @@
 //!
 //! A block's receipt order is normally drawn when its complete body reaches the verifier. A block
 //! whose header was admitted first can instead keep the order reserved for that header, provided
-//! its body follows within its deadline. That stops a small body from overtaking a larger one
-//! whose header arrived earlier.
+//! its body follows within a deadline that is the same for every block size. That stops a small
+//! body from overtaking a larger one whose header arrived earlier.
 //!
 //! Priority belongs to the block, not to a delivery attempt. [`AnnouncementClaims`] holds at most
 //! one claim per block hash, never replaces or renews it, and does not consume it when a body

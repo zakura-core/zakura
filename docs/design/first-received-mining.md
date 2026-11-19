@@ -13,8 +13,8 @@ A greater-work chain still replaces an earlier equal-work winner.
 
 A block's receipt order is drawn when its complete body reaches the full-block
 verifier. A block whose header was admitted first keeps the order reserved for
-that header instead, provided its body reaches the verifier before a deadline
-that grows with its size.
+that header instead, provided its body reaches the verifier within a fixed
+deadline.
 
 Without this, a block full of transactions can lose an equal-work race to an
 empty block announced later, because the larger body takes longer to transfer.
@@ -41,10 +41,9 @@ The reservation is called a claim. Four rules define it:
   no new claim can be made. That floor is the highest verified tip seen and
   never goes down, so after a rollback blocks at or below it get no claim and
   are ranked by arrival until the tip passes it again.
-- **The body has a deadline.** It is 500 ms plus the body's serialized size at
-  1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
-  body that arrives later draws a fresh order, as if its header had never been
-  seen.
+- **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
+  for every block, whatever its size. A body that arrives later draws a fresh
+  order, as if its header had never been seen.
 - **A node keeps the block it mined.** A locally submitted block takes its
   receipt order at submission, like any other body. A rival's earlier claim at
   the same height is ignored from that moment, for every mined block that is
@@ -65,12 +64,23 @@ tie against blocks found while it withheld, which makes withholding profitable
 at any hashrate. Because a claim belongs to the block and not to a delivery
 attempt, a failed download or a repeated announcement does not restart the
 deadline. Inside the deadline, withholding is indistinguishable from slow
-honest delivery, so the deadline is both the transfer delay forgiven for large
-blocks and the most a withholder can gain. A miner who pads a block to about
-1.5 MiB gets the full 2 seconds. The cap is therefore the real bound, and the
-size term only shortens the deadline for small blocks.
+honest delivery, so the deadline is both the delay forgiven for honest blocks
+and the most a withholder can gain.
 
-The constants are estimates of honest delivery, not measurements. The
+The deadline is the same for every block size, because scaling it with size
+does not lower that bound. Under a deadline that grows with size up to a cap,
+a withholder pads its block until it gets the cap. A size term only shortens
+the deadline for small blocks, which are 99.8% of Mainnet blocks. A deadline
+of 500 ms plus the body's size at 1 MiB per second, capped at 2 seconds, gave
+them about 0.6 seconds. That is too short over several relay hops, where a
+small block's delivery time is mostly round trips rather than transfer. In a
+lab at a 300 ms round trip, the Mainnet 95th percentile peer round trip, a
+100 kB block's claim expired by the second relay hop in all 10 trials, while a
+flat 2 seconds kept it for all 4 hops measured. The cost is that a withholder
+gets the full 2 seconds without padding its block, which padding already
+gave it.
+
+The 2 seconds is an estimate of honest delivery, not a measurement. The
 `sync.block.announcement_claim` counter records how each body resolved
 (`used`, `expired`, `voided` by a mined block, or `none`), and the
 `sync.block.announcement_claim.age.seconds` histogram records the age of the

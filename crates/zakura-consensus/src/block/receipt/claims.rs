@@ -11,21 +11,17 @@ use zakura_chain::block::{self, HeightDiff};
 
 use super::order;
 
-/// The longest any block keeps its claim while its body is in transit, whatever its size.
+/// How long after its claim a block's body still takes the claimed order, whatever its size.
 ///
-/// Inside its deadline a withheld body looks the same as a slow honest delivery, so this cap is
-/// the most a miner can gain by sitting on an announced block and still winning an equal-work
-/// tie. A block padded to about 1.5 MiB gets all of it. The value is an estimate of honest
-/// full-block delivery, to be revisited against the `sync.block.announcement_claim.age.seconds`
+/// Inside the deadline a withheld body looks the same as a slow honest delivery, so this is the
+/// most a miner can gain by sitting on an announced block and still winning an equal-work tie.
+/// The deadline is the same for every size because scaling it with size would not lower that
+/// bound: a withholder pads its block until it gets the largest deadline. A size term would only
+/// shorten the deadline for small blocks, which are nearly all blocks, and over several relay
+/// hops their delivery time is mostly round trips, not transfer. The value is an estimate of
+/// honest delivery, to be revisited against the `sync.block.announcement_claim.age.seconds`
 /// histogram.
-pub(super) const MAX_CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
-
-/// The part of [`body_deadline`] that does not depend on body size: scheduling, the round trip
-/// of the body request, and the wait for the verifier.
-pub(super) const CLAIM_BASE_GRACE: Duration = Duration::from_millis(500);
-
-/// The slowest honest body transfer that still keeps a claim, in bytes per second.
-const MIN_HONEST_BODY_BYTES_PER_SEC: u64 = 1024 * 1024;
+pub(super) const CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How far above the verified tip a header can be and still get a claim.
 ///
@@ -38,19 +34,6 @@ const MAX_CLAIM_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 /// A full table refuses new claims instead of dropping old ones, so flooding it cannot remove a
 /// claim that is already in force. A refused block is ranked by body arrival.
 pub(super) const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
-
-/// How long after its claim a body of `bytes` serialized bytes still takes the claimed order.
-///
-/// Transfer time grows with size, so a small block gets less than a full one. Every block gets
-/// at most [`MAX_CLAIM_BODY_DEADLINE`].
-pub(super) fn body_deadline(bytes: usize) -> Duration {
-    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-    let transfer =
-        Duration::from_micros(bytes.saturating_mul(1_000_000) / MIN_HONEST_BODY_BYTES_PER_SEC);
-    CLAIM_BASE_GRACE
-        .saturating_add(transfer)
-        .min(MAX_CLAIM_BODY_DEADLINE)
-}
 
 /// A place in receipt order reserved for a block when its header arrived.
 #[derive(Copy, Clone, Debug)]
@@ -267,7 +250,7 @@ impl AnnouncementClaims {
     }
 
     /// Resolves the claim held for `hash` against a body arriving at `now`, whose serialized
-    /// size `bytes` gives.
+    /// size `bytes` gives for the claim metrics.
     ///
     /// Resolving does not use the claim up, so an invalid body under the same header cannot take
     /// it from the real one. `bytes` is called only for a claimed block, after the table lock is
@@ -289,7 +272,7 @@ impl AnnouncementClaims {
         let bytes = bytes();
         if voided {
             ClaimOutcome::Voided { age, bytes }
-        } else if age <= body_deadline(bytes) {
+        } else if age <= CLAIM_BODY_DEADLINE {
             ClaimOutcome::Used {
                 order: claim.order,
                 age,

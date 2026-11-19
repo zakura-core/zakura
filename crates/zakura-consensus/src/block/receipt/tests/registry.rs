@@ -35,9 +35,9 @@ fn a_claim_is_shared_by_every_body_delivered_under_its_header() {
 
     // A delivery after every earlier one finished is still inside the deadline.
     drop(receipts);
-    let again = registry.register_at(block.hash(), &variant(0), now + body_deadline(0));
+    let again = registry.register_at(block.hash(), &variant(0), now + CLAIM_BODY_DEADLINE);
     assert_eq!(again.order, claimed);
-    let late = now + MAX_CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    let late = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
     drop(again);
     assert!(registry.register_at(block.hash(), &variant(0), late).order > claimed);
 }
@@ -58,7 +58,7 @@ fn a_claimed_body_shares_its_order_with_overlapping_deliveries() {
     assert_eq!(Some(first.order), claims.claimed_order(block.hash()));
 
     // An overlapping delivery shares the receipt even after the claim's deadline.
-    let late = now + MAX_CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    let late = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
     let duplicate = BlockHandle::from(Arc::new(block.as_ref().clone()));
     assert_eq!(
         registry.register_at(block.hash(), &duplicate, late).order,

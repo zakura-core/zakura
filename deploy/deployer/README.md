@@ -99,12 +99,18 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `setup` — optionally put the selected node on `legacy` (legacy P2P and the
+  classic pool) or `v2` (dual P2P, the pool core and tx-relay), for comparing
+  pools on real peers. The default `auto` keeps the fleet's setup, and
+  deploying a node with `auto` again restores it. It can't be combined with
+  `p2p_stack`.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
-Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
-explicit `node`, preventing canary settings from being applied fleet-wide.
+Explicit `p2p_stack` or `setup` overrides and `header_sync_trace = true`
+require an explicit `node`, preventing canary settings from being applied
+fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available

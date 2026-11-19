@@ -889,7 +889,14 @@ jobs:
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
           # The block propagation page and the module that joins the nodes' reports for it.
           sudo install -m 644 deploy/runner/propagation.py deploy/runner/propagation.html \
-            deploy/profiler/peer_addresses.py "$dashboard_dir/"
+            deploy/runner/peer_location.py deploy/profiler/peer_addresses.py "$dashboard_dir/"
+          # Where outside peers are, looked up on this host: DB-IP's free City Lite
+          # database, refreshed until the installed copy is this month's. Locations
+          # are optional, so a failure here only warns and the page shows none.
+          dpkg -s python3-maxminddb >/dev/null 2>&1 \
+            || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-maxminddb; } \
+            || echo "::warning::python3-maxminddb could not be installed; peers will have no location" >&2
+          sudo python3 deploy/runner/refresh_peer_location_db.py /var/lib/zakura-mainnet-dashboard/geo
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
           # auth for the compatibility node into this copy (not the deploy config).
@@ -935,7 +942,7 @@ jobs:
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
           EnvironmentFile=/etc/zakura-mainnet-dashboard/dashboard.env
-          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 127.0.0.1 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 127.0.0.1 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json --geo-db /var/lib/zakura-mainnet-dashboard/geo/dbip-city-lite.mmdb
           Restart=always
           RestartSec=5
 

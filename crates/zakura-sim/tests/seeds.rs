@@ -298,6 +298,8 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         }
 
         "header-sync-storage-default" => value(StorageScenario::default()),
+        "sync-storage-reorg-stale-body" => value(SavedSync::Reorg.scenario()),
+        "sync-storage-reorg-verdict-republish" => value(SavedSync::ReorgVerdict.scenario()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],
         }),

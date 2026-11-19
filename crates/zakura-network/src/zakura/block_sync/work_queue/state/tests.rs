@@ -232,6 +232,36 @@ fn an_old_hash_receipt_keeps_the_reissued_reservation() {
     );
 }
 
+/// A reset whose floor passes queued work drops that work and its charges,
+/// as a floor advance would, so a retired provisional claim can't publish.
+#[test]
+fn a_forward_reset_drops_work_at_or_below_its_floor() {
+    let mut state = new_state();
+    let heights: Vec<(u32, u64)> = (1..=7).map(|raw| (raw, 100)).collect();
+    extend(&mut state, authority(0), &heights);
+    // 1..=3 are published, 4..=6 pending, and 7 a provisional claim.
+    let published = take(&mut state, 1, 3, 1, 1);
+    assert_eq!(publish(&mut state, &published), 300);
+    let provisional = take(&mut state, 7, 7, 2, 1);
+    assert!(state.is_unpublished_claim(owner_of(&provisional), &provisional));
+
+    let delta = state.reset_above(height(8));
+
+    assert!(
+        (1..=8).all(|raw| state.item_for_height(height(raw)).is_none()),
+        "nothing at or below the new floor remains"
+    );
+    assert_eq!(delta.released_bytes, 300, "the published charge settles");
+    assert!(delta.wake.revocation, "dropping published work revokes it");
+    assert_eq!(state.reserved_bytes(), 0);
+    assert_eq!(state.ledger_fault(), None);
+    state.assert_invariants();
+    assert!(
+        !state.is_unpublished_claim(owner_of(&provisional), &provisional),
+        "the retired provisional claim can't publish"
+    );
+}
+
 #[test]
 fn duplicate_settlement_releases_each_charge_once() {
     let mut state = new_state();
@@ -444,8 +474,8 @@ fn a_floor_advance_revokes_only_reserved_work() {
     assert!(!delta.wake.revocation);
 }
 
-/// A forward reset leaves a received height at or below the new floor in
-/// flight. Its owner cannot defer it: the height is committed.
+/// A forward reset drops a received height at or below the new floor. Its
+/// owner cannot defer it back into the queue: the height is committed.
 #[test]
 fn a_committed_received_height_cannot_be_deferred() {
     let mut state = new_state();
@@ -458,12 +488,12 @@ fn a_committed_received_height_cannot_be_deferred() {
         Some(100)
     );
     let _ = state.reset_above(height(2));
-    assert!(state.in_flight_contains(height(1)));
+    assert!(!state.in_flight_contains(height(1)));
     assert_eq!(
         state.defer_received(owner, height(1), hash(1), 100, height(0)),
         None
     );
-    assert!(state.in_flight_contains(height(1)));
+    assert!(!state.pending_contains(height(1)));
 }
 
 // ---- machine target ----
@@ -784,7 +814,9 @@ fn apply(state: &mut WorkQueueState, book: &mut Bookkeeping, op: Op) -> (u64, u6
         Op::Reset(floor) => {
             book.generation += 1;
             let delta = state.reset_above(height(floor));
-            check_removal(&before, state, delta, |raw| raw > floor);
+            // Every height is above the old floor, so a reset drops them all:
+            // those above `floor`, and those at or below a raised floor.
+            check_removal(&before, state, delta, |_| true);
             (0, delta.released_bytes)
         }
         Op::RefreshAuthority => {

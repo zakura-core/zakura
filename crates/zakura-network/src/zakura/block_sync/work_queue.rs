@@ -553,7 +553,7 @@ impl WorkQueue {
 
     /// Frontier reset: pin the floor and drop every `pending`/`in_flight` entry
     /// `> floor` (their buffers were dropped; the producer re-fills via the next
-    /// query).
+    /// query), plus the entries at or below a raised floor.
     ///
     /// Settle request estimates for removed heights after unlocking.
     pub(super) fn reset_above(&self, floor: block::Height) {
@@ -566,6 +566,8 @@ impl WorkQueue {
             .values()
             .filter_map(|registration| registration.claim.upgrade())
             .collect();
+        // A claim wholly at or below the floor is left as `advance_floor` leaves
+        // it. Its heights leave the queue, so `try_start` skips an unwritten frame.
         for claim in claims.iter().filter(|claim| claim.has_height_above(floor)) {
             claim.reset();
             inner.request_writes.remove(&claim.owner());

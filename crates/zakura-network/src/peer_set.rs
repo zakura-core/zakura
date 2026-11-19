@@ -4,6 +4,7 @@ mod initialize;
 mod inventory_registry;
 mod legacy_peer_trace;
 mod limit;
+mod second_request;
 mod set;
 mod stall_tracker;
 mod unready_service;

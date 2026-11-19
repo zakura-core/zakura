@@ -32,6 +32,10 @@ use crate::zakura::{
     MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
+mod eviction;
+
+use eviction::EvictionIndex;
+
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;
 /// Native discovery stream version.
@@ -1263,6 +1267,9 @@ pub struct ZakuraDiscoveryBook {
     /// Third-party entries attributed to each relay. A relay with no entries
     /// has no key.
     relayed: HashMap<NodeId, usize>,
+    /// The non-static entries in eviction order. Every change to an entry
+    /// updates it.
+    eviction: EvictionIndex,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -2250,6 +2257,7 @@ impl ZakuraDiscoveryBook {
             sample_snapshot: None,
             generation: 0,
             relayed: HashMap::new(),
+            eviction: EvictionIndex::default(),
         }
     }
 
@@ -2274,8 +2282,10 @@ impl ZakuraDiscoveryBook {
     pub(super) fn assert_invariants(&self) {
         const PROPERTY: &str = "discovery/record-book";
         let mut relayed: HashMap<NodeId, usize> = HashMap::new();
+        let mut eviction = EvictionIndex::default();
         let mut statics = 0;
         for (node_id, entry) in &self.entries {
+            eviction.insert(*node_id, entry);
             assert_eq!(
                 entry.record.body.node_id, *node_id,
                 "{PROPERTY}: an entry under another node id"
@@ -2304,6 +2314,10 @@ impl ZakuraDiscoveryBook {
         assert!(
             self.relayed == relayed,
             "{PROPERTY}: relay attribution disagrees with the entries"
+        );
+        assert!(
+            self.eviction == eviction,
+            "{PROPERTY}: the eviction index disagrees with the entries"
         );
         let busiest = relayed.values().copied().max().unwrap_or(0);
         assert!(
@@ -2361,10 +2375,7 @@ impl ZakuraDiscoveryBook {
 
     /// Returns the number of non-static records learned from peers.
     pub fn discovered_len(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| !entry.is_static)
-            .count()
+        self.eviction.len()
     }
 
     /// Returns the entry for `node_id`, if present.
@@ -2806,12 +2817,13 @@ impl ZakuraDiscoveryBook {
         authenticated_addr: Option<SocketAddr>,
         now: u64,
     ) {
-        if let Some(entry) = self.entries.get_mut(node_id) {
+        let newly_confirmed = self.update_entry(node_id, |entry| {
             entry.last_success = Some(now);
-            if entry.confirm(&[], authenticated_addr.as_slice()) {
-                self.generation += 1;
-            }
             entry.failure_count = 0;
+            entry.confirm(&[], authenticated_addr.as_slice())
+        });
+        if newly_confirmed == Some(true) {
+            self.generation += 1;
         }
         if let Some(candidate) = self.static_candidates.get_mut(node_id) {
             candidate.last_success = Some(now);
@@ -2821,9 +2833,9 @@ impl ZakuraDiscoveryBook {
 
     /// Marks a failed dial for `node_id` without blacklisting it.
     pub fn mark_dial_failure(&mut self, node_id: &NodeId, _now: u64) {
-        if let Some(entry) = self.entries.get_mut(node_id) {
+        self.update_entry(node_id, |entry| {
             entry.failure_count = entry.failure_count.saturating_add(1);
-        }
+        });
         if let Some(candidate) = self.static_candidates.get_mut(node_id) {
             candidate.failure_count = candidate.failure_count.saturating_add(1);
         }
@@ -3010,7 +3022,9 @@ impl ZakuraDiscoveryBook {
             }
             let old_relay = relay_of(entry.source, node_id);
             let previous_sequence = entry.record.body.sequence;
+            self.eviction.remove(node_id, entry);
             let (outcome, newly_confirmed) = update_existing_entry(entry, record, metadata, now);
+            self.eviction.insert(node_id, entry);
             if outcome == ImportOutcome::Updated {
                 changes.push(BookChange::Replaced {
                     node_id,
@@ -3061,6 +3075,7 @@ impl ZakuraDiscoveryBook {
         if entry.confirm(&metadata.confirmed_addrs, &metadata.dialed_addrs) {
             self.generation += 1;
         }
+        self.eviction.insert(node_id, &entry);
         self.entries.insert(node_id, entry);
         self.evict_to_limits(now, changes);
         if !self.entries.contains_key(&node_id) {
@@ -3107,7 +3122,7 @@ impl ZakuraDiscoveryBook {
 
     fn evict_to_limits(&mut self, now: u64, changes: &mut Vec<BookChange>) {
         while self.discovered_len() > self.limits.max_records {
-            let Some(node_id) = self.next_eviction_candidate(now) else {
+            let Some(node_id) = self.eviction.candidate(now) else {
                 break;
             };
             self.remove_entry(&node_id, EvictionCause::BookLimit, changes);
@@ -3122,6 +3137,7 @@ impl ZakuraDiscoveryBook {
         changes: &mut Vec<BookChange>,
     ) {
         if let Some(entry) = self.entries.remove(node_id) {
+            self.eviction.remove(*node_id, &entry);
             self.unattribute(relay_of(entry.source, *node_id));
             changes.push(BookChange::Evicted {
                 node_id: *node_id,
@@ -3177,50 +3193,18 @@ impl ZakuraDiscoveryBook {
         }
     }
 
-    fn next_eviction_candidate(&self, now: u64) -> Option<NodeId> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| !entry.is_static && entry_is_expired(entry, now))
-            .min_by_key(|(node_id, entry)| {
-                (
-                    entry.record.body.expires_at_unix_secs,
-                    node_id_sort_key(node_id),
-                )
-            })
-            .map(|(node_id, _)| *node_id)
-            .or_else(|| {
-                self.entries
-                    .iter()
-                    .filter(|(_, entry)| {
-                        !entry.is_static
-                            && entry.last_success.is_none()
-                            && entry.failure_count >= HIGH_DIAL_FAILURE_COUNT
-                    })
-                    .max_by_key(|(node_id, entry)| {
-                        (
-                            entry.failure_count,
-                            Reverse(entry.last_seen),
-                            Reverse(node_id_sort_key(node_id)),
-                        )
-                    })
-                    .map(|(node_id, _)| *node_id)
-            })
-            .or_else(|| {
-                // Unconfirmed relayed records go first, so relays cannot
-                // evict the confirmed entries that peer samples disclose.
-                self.entries
-                    .iter()
-                    .filter(|(_, entry)| !entry.is_static)
-                    .min_by_key(|(node_id, entry)| {
-                        (
-                            entry.is_confirmed(),
-                            entry.last_success.unwrap_or(0),
-                            entry.last_seen,
-                            node_id_sort_key(node_id),
-                        )
-                    })
-                    .map(|(node_id, _)| *node_id)
-            })
+    /// Applies `update` to `node_id`'s entry, if the book has one, and keeps
+    /// the eviction index in step. Returns what `update` returned.
+    fn update_entry<R>(
+        &mut self,
+        node_id: &NodeId,
+        update: impl FnOnce(&mut ZakuraDiscoveryEntry) -> R,
+    ) -> Option<R> {
+        let entry = self.entries.get_mut(node_id)?;
+        self.eviction.remove(*node_id, entry);
+        let result = update(entry);
+        self.eviction.insert(*node_id, entry);
+        Some(result)
     }
 }
 
@@ -6619,6 +6603,95 @@ mod tests {
         assert!(book
             .get(&id(10))
             .is_some_and(ZakuraDiscoveryEntry::is_static));
+    }
+
+    /// disco-24 `book-work-per-answer`: the record count and the next
+    /// eviction victim read a number of index keys that doesn't grow with the
+    /// book. Each eviction group reads one key, so an answer reads at most
+    /// three, at 1,000 records and at 10,000 alike.
+    ///
+    /// The book keeps its index equal to one built from its entries (see
+    /// `assert_invariants`), so this builds the index from entries directly.
+    /// Each entry clones one of two verified records: record verification
+    /// dominates the cost of a 10,000-record book in a debug build.
+    #[test]
+    fn book_answers_read_no_more_keys_as_the_book_grows() {
+        /// Returns how many group heads the eviction answer at `now` read, and
+        /// the answer.
+        fn answer(index: &EvictionIndex, now: u64) -> (usize, Option<NodeId>) {
+            let heads: Vec<_> = index.group_heads(now).collect();
+            let read = heads
+                .iter()
+                .position(Option::is_some)
+                .map_or(heads.len(), |head| head + 1);
+            let candidate = index.candidate(now);
+            assert_eq!(candidate, heads.into_iter().flatten().next());
+            (read, candidate)
+        }
+
+        let template = |expires_at| {
+            let secret = secret_key();
+            let mut body = body(&secret);
+            body.expires_at_unix_secs = expires_at;
+            let record = ZakuraNodeRecord::sign(body, &secret).expect("test record signs");
+            let node_id = record.body.node_id;
+            let mut book = ZakuraDiscoveryBook::default();
+            book.import_record(record, None, NOW, &context())
+                .expect("the template record imports");
+            book.entries
+                .remove(&node_id)
+                .expect("the book holds the template entry")
+        };
+        let early = template(NOW + 10);
+        let late = template(NOW + 3_600);
+
+        let mut reads = Vec::new();
+        for size in [1_000_u32, 10_000] {
+            let ids: Vec<NodeId> = (0..size)
+                .map(|index| {
+                    let mut seed = [0x5a; 32];
+                    seed[..4].copy_from_slice(&index.to_le_bytes());
+                    NodeSecretKey::from_bytes(&seed).public()
+                })
+                .collect();
+            let last = ids.len() - 1;
+            // Entry 0 expires early, entry 1 fails, and the last entry is
+            // the least recently seen.
+            let entry = |index: usize, failure_count: u32| {
+                let mut entry = if index == 0 {
+                    early.clone()
+                } else {
+                    late.clone()
+                };
+                entry.last_seen = NOW - u64::try_from(index).expect("the index fits u64");
+                entry.failure_count = failure_count;
+                entry
+            };
+            let mut eviction = EvictionIndex::default();
+            for (index, node_id) in ids.iter().enumerate() {
+                let failures = if index == 1 {
+                    HIGH_DIAL_FAILURE_COUNT
+                } else {
+                    0
+                };
+                eviction.insert(*node_id, &entry(index, failures));
+            }
+            assert_eq!(eviction.len(), ids.len());
+
+            let expired = answer(&eviction, NOW + 100);
+            let failing = answer(&eviction, NOW + 5);
+            eviction.remove(ids[1], &entry(1, HIGH_DIAL_FAILURE_COUNT));
+            eviction.insert(ids[1], &entry(1, 0));
+            let ranked = answer(&eviction, NOW + 5);
+            assert_eq!(expired, (1, Some(ids[0])));
+            assert_eq!(failing, (2, Some(ids[1])));
+            assert_eq!(ranked, (3, Some(ids[last])));
+            reads.push([expired.0, failing.0, ranked.0]);
+        }
+        assert_eq!(
+            reads[0], reads[1],
+            "the reads per answer grew with the book"
+        );
     }
 
     /// A full book evicts unconfirmed relayed records before confirmed ones,

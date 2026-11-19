@@ -2583,3 +2583,148 @@ async fn production_ingress_status_flood_observes_snapshots() -> Result<(), crat
     }
     Ok(())
 }
+
+/// Counts the wire events the run loop takes, and notes the count when the
+/// ready peer's `Status` turns out handled: its locator query is on the
+/// action queue by the next take.
+#[derive(Debug)]
+struct ReadyServed {
+    ready: ZakuraPeerId,
+    actions: std::sync::Mutex<mpsc::Receiver<HeaderPortOperation>>,
+    /// Wire events taken so far, and the take that showed the ready peer's
+    /// query, if any.
+    taken: std::sync::Mutex<(usize, Option<usize>)>,
+}
+
+impl observe::HeaderSyncObserver for ReadyServed {
+    fn observe(&self, event: observe::ReactorEvent) {
+        if !matches!(
+            event,
+            observe::ReactorEvent::EventTaken {
+                queue: observe::EventQueue::Wire,
+                ..
+            }
+        ) {
+            return;
+        }
+        let mut taken = self.taken.lock().expect("no test panics holding it");
+        let mut actions = self.actions.lock().expect("no test panics holding it");
+        while let Ok(action) = actions.try_recv() {
+            if matches!(
+                &action,
+                HeaderPortOperation::QueryHeaderLocator { peer, .. } if *peer == self.ready
+            ) && taken.1.is_none()
+            {
+                // The take that handled the ready peer's event was the last one.
+                taken.1 = Some(taken.0);
+            }
+        }
+        taken.0 += 1;
+    }
+}
+
+/// hsync-29 `ready-peer-served`: each peer routine awaits one send at a time
+/// on the reactor's event queue, which grants queue slots to waiting senders
+/// in FIFO order. So a ready peer's routine gets its slot within the queue's
+/// capacity plus one take per other peer and per worker completion. It
+/// pushes its event only when the scheduler next polls it, and until then
+/// other routines can fill the slots the reactor frees: a scheduler term R.
+/// On this single-threaded runtime R stays within one capacity, so at most
+/// two capacities plus one event per other peer go first. Seven peers flood
+/// the queue, and the ready peer sends one `Status` once they wait on it.
+/// Nothing in this reactor sends worker completions on the queue, so the
+/// worker term is zero.
+#[tokio::test]
+async fn a_ready_peer_waits_behind_at_most_two_queues_and_one_event_per_peer() {
+    const FLOODERS: u8 = 7;
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (_snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let capacity = handle.events.max_capacity();
+    let (ready, _outbound) = connect(&mut reactor, 1);
+    let recorder = Arc::new(ReadyServed {
+        ready: ready.clone(),
+        actions: std::sync::Mutex::new(actions),
+        taken: std::sync::Mutex::new((0, None)),
+    });
+    reactor.startup.observer.0 = Some(recorder.clone());
+
+    let flooders: Vec<_> = (0..FLOODERS)
+        .map(|index| {
+            let handle = handle.clone();
+            let byte = 0x80 + index;
+            let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID is valid");
+            let status = status_for(&snapshot, block::Hash([byte; 32]));
+            tokio::spawn(async move {
+                loop {
+                    let event = Event::Status {
+                        peer: peer.clone(),
+                        session_id: 0,
+                        status: status.clone(),
+                    };
+                    if handle.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+    // The flooders fill the queue, and then each waits on it.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(handle.events.capacity(), 0, "the flooders fill the queue");
+    let ready_send = tokio::spawn({
+        let handle = handle.clone();
+        let status = status_for(&snapshot, block::Hash([0x42; 32]));
+        async move {
+            handle
+                .send(Event::Status {
+                    peer: ready,
+                    session_id: 0,
+                    status,
+                })
+                .await
+        }
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    let task = tokio::spawn(reactor.run());
+    let mut served = None;
+    for _ in 0..100_000 {
+        served = recorder.taken.lock().expect("no test panics holding it").1;
+        if served.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    for flooder in flooders {
+        flooder.abort();
+    }
+    ready_send
+        .await
+        .expect("the ready peer's send task ends")
+        .expect("the reactor took the ready peer's event");
+
+    let served = served.expect("the reactor handled the ready peer's status");
+    let before = served - 1;
+    let bound = 2 * capacity + usize::from(FLOODERS);
+    assert!(
+        before <= bound,
+        "{before} events went before the ready peer's, above 2 × {capacity} + {FLOODERS}"
+    );
+    // The flood keeps the queue full, so the bound is nearly tight.
+    assert!(before >= capacity, "only {before} events went first");
+}

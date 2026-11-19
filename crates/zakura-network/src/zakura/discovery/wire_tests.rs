@@ -889,9 +889,10 @@ fn services_cap_fits_the_largest_answer_exactly() {
 }
 
 /// Hello, GetPeers, and GetServices share one cadence: a 15 s sender floor,
-/// and a bucket of 42 that regains one message every 7 s.
+/// and a bucket of 42 that regains one message every 7 s. Every row is paced,
+/// so the stream's reader waits for a token when a bucket is empty.
 #[test]
-fn rows_with_a_cadence_record_bursts_and_forward() {
+fn rows_with_a_cadence_park_their_reader_when_exhausted() {
     for row in [HELLO, GET_PEERS, GET_SERVICES] {
         let cadence = match row.role {
             MessageRole::Announcement { cadence } => cadence,
@@ -915,6 +916,9 @@ fn rows_with_a_cadence_record_bursts_and_forward() {
             }
         );
     }
+    assert!(crate::zakura::regulation::parks_on_exhaustion(
+        super::wire::RULES
+    ));
 }
 
 /// Each fixture writes a row's longest payload by hand. Decoding it and

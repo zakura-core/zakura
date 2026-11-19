@@ -15,6 +15,10 @@
 //! keeps settling. Cancellation, a closed stream, or a refused terminal write
 //! stops the publisher: state records the [`Exit`] and starts nothing more.
 //!
+//! A job that leases from an `Open`'s locators walks the target's ancestry
+//! in storage, and output bytes don't pay for that walk. [`OPEN_WALKS`]
+//! meters those jobs, and the task waits until [`PublisherState::walk_due`].
+//!
 //! State holds values only. The runtime owner holds each permit, frame, and
 //! capacity signal, and tells state about them by identity: a [`SlotOffer`]
 //! for an `Open`, a [`CapacityWait`] for a capacity refusal, and a [`Page`]'s
@@ -25,11 +29,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::{Bound, ControlFlow},
+    time::Duration,
 };
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
 use zakura_node_services::header_chain::SelectedChainMembership;
+use zakura_rt::time::Instant;
 
 use super::{
     super::{
@@ -41,9 +47,28 @@ use super::{
 use crate::zakura::{
     header_sync::wire::{AuxSchema, MAX_HS_RANGE},
     regulation::{
-        Applied, PublicationLedger, PublicationOpened, SlotId, SlotOffer, SubscriptionLimits,
-        Totals,
+        Applied, Bucket, PublicationLedger, PublicationOpened, SlotId, SlotOffer,
+        SubscriptionLimits, Totals,
     },
+    Cadence,
+};
+
+/// The meter on jobs that lease from an `Open`'s locators: four back to back,
+/// then one every five seconds per session.
+///
+/// Such a lease walks the target's retained ancestry down to the nearest
+/// locator. At a locator below the retained headers (at most 65,536), that
+/// walk took 143 ms in release, against 13 ms to read a full 4,000-header
+/// page and 27 µs for a one-header page. Pages pay for themselves in output
+/// bytes, and the walk doesn't, so a peer could repeat `Open`s for walks.
+///
+/// A session holds one live subscription, so at most one `Open` waits, for
+/// at most one refill interval: far below a subscriber's 30 s request
+/// timeout. A subscriber that opens once per refill interval never waits.
+pub(super) const OPEN_WALKS: Cadence = Cadence {
+    capacity: 4,
+    refill_interval: Duration::from_secs(5),
+    send_interval: Duration::from_secs(5),
 };
 
 /// The fields an update must repeat from its `Open`.
@@ -236,6 +261,10 @@ pub(super) struct PublisherState {
     in_progress: Option<InProgress>,
     /// Jobs started, which numbers the next [`JobKey`].
     jobs_started: u64,
+    /// The [`OPEN_WALKS`] meter, made full at its first job.
+    open_walks: Option<Bucket>,
+    /// When the meter next lets a job that [`Self::next_job`] held back start.
+    walk_due: Option<Instant>,
     /// Terminal outcomes to write, in order.
     terminals: VecDeque<Terminal>,
     /// The slot of the terminal outcome the task is writing.
@@ -254,6 +283,8 @@ impl PublisherState {
             last_served: None,
             in_progress: None,
             jobs_started: 0,
+            open_walks: None,
+            walk_due: None,
             terminals: VecDeque::new(),
             writing: None,
             exit: None,
@@ -450,10 +481,16 @@ impl PublisherState {
     /// it ends here, without a state read and even while it is stalled, when
     /// the selected tip is no higher than its last header and differs from
     /// it.
+    ///
+    /// A job that leases from the `Open`'s locators spends an [`OPEN_WALKS`]
+    /// token at `now`. Without one, its subscription waits until
+    /// [`Self::walk_due`], and another subscription may go first.
     pub(super) fn next_job<const HEADER_BYTES: usize>(
         &mut self,
         selected: Option<&EngineSnapshot>,
+        now: Instant,
     ) -> Option<Job> {
+        self.walk_due = None;
         if self.in_progress.is_some()
             || self.writing.is_some()
             || !self.terminals.is_empty()
@@ -530,6 +567,16 @@ impl PublisherState {
                 }
                 let target = subscription.fixed.target;
                 let last = subscription.position.last();
+                if last.is_none() {
+                    let meter = self
+                        .open_walks
+                        .get_or_insert_with(|| Bucket::new(OPEN_WALKS, now));
+                    meter.refill(now);
+                    if !meter.take() {
+                        self.walk_due = Some(meter.next_token_at());
+                        continue;
+                    }
+                }
                 Job {
                     key,
                     id,
@@ -562,6 +609,12 @@ impl PublisherState {
             return Some(job);
         }
         None
+    }
+
+    /// When a job that the [`OPEN_WALKS`] meter held back at the last
+    /// [`Self::next_job`] may start, if one was.
+    pub(super) fn walk_due(&self) -> Option<Instant> {
+        self.walk_due
     }
 
     /// Whether job `key` is the job in progress. After [`Self::end_due`], a job

@@ -476,7 +476,7 @@ fn a_check_on_a_moved_chain_records_no_tip() {
     let again = machine
         .owner
         .state
-        .next_job::<HB>(Some(&moved))
+        .next_job::<HB>(Some(&moved), zakura_rt::time::Instant::now())
         .expect("the tip is checked again");
     assert_eq!((again.id, again.count), (1, 0));
 }
@@ -850,7 +850,8 @@ fn publisher_witness_rejects_a_lost_subscription() {
 fn publisher_witness_rejects_lost_job() {
     run(decode(WITNESS), |machine, step| {
         if matches!(step, Step::Open { .. }) {
-            machine.owner.state.next_job::<HB>(None);
+            let now = machine.tick();
+            machine.owner.state.next_job::<HB>(None, now);
         }
     });
 }

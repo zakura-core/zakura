@@ -27,7 +27,8 @@
 //! the selected chain still contains a header comes from
 //! [`Port::selected_chain_contains`], which walks nothing and takes no lease.
 //! Local failures wait for an update, a selected-chain change, or a capacity
-//! release, never for a timer.
+//! release, never for a timer. The one timer is the walk meter's: a job that
+//! would lease from an `Open`'s locators waits for its token.
 //!
 //! [`PublisherState`] holds the subscription policy, which runs without a
 //! runtime and holds only values. This module holds the resources: the lock,
@@ -69,6 +70,7 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_rt::{
     sync::{mpsc, watch, CancellationToken, Mutex, MutexGuard, Notify, PoisonError},
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -698,6 +700,8 @@ async fn publish<const HEADER_BYTES: usize>(
     // The page in progress, under the key state recorded for its job.
     let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
+        // When the walk meter lets a job it held back start, if it did.
+        let mut walk_due = None;
         let (outcomes, abandoned) = {
             let mut shared = lock(&task.shared);
             let outcomes = shared.end_due();
@@ -738,7 +742,10 @@ async fn publish<const HEADER_BYTES: usize>(
         if work.is_none() {
             let snapshot = selected.borrow().clone();
             let mut shared = lock(&task.shared);
-            let job = shared.state.next_job::<HEADER_BYTES>(snapshot.as_ref());
+            let job = shared
+                .state
+                .next_job::<HEADER_BYTES>(snapshot.as_ref(), Instant::now());
+            walk_due = shared.state.walk_due();
             let ending = shared.state.end_queued();
             drop(shared);
             if let Some(job) = job {
@@ -782,6 +789,8 @@ async fn publish<const HEADER_BYTES: usize>(
                 }
             }
             () = task.wake.notified() => {}
+            () = zakura_rt::time::sleep_until(walk_due.unwrap_or_else(Instant::now)),
+                if walk_due.is_some() => {}
             changed = selected.changed(), if selected_open => {
                 if changed.is_ok() {
                     lock(&task.shared).state.selected_changed();

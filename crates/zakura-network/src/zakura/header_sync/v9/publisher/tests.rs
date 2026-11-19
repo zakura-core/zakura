@@ -2181,6 +2181,82 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
     harness.check_quiet().await;
 }
 
+/// hsync-30: each job that leases from the `Open`'s locators walks the
+/// ancestry, so it spends an `OPEN_WALKS` token. With the clock at exact token
+/// boundaries, walks never exceed `capacity + elapsed / refill_interval`.
+#[test]
+fn walks_from_open_locators_spend_the_meter_at_exact_boundaries() {
+    use super::state::OPEN_WALKS;
+
+    let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
+    let mut owner = PublisherOwner::new(limits());
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
+    assert_eq!(owner.apply(&open), Ok(Applied::Live));
+    let start = zakura_rt::time::Instant::now();
+    // A retry leases from the `Open`'s locators again, as a peer that keeps
+    // the first page from going would make it.
+    let walk = |owner: &mut PublisherOwner, now| {
+        let job = owner.state.next_job::<HB>(None, now)?;
+        assert_eq!(job.locators, [genesis.hash], "the job walks from the Open");
+        owner.state.finish(job.key, Output::Retry, None);
+        Some(())
+    };
+    for _ in 0..OPEN_WALKS.capacity {
+        assert!(walk(&mut owner, start).is_some());
+    }
+    assert!(walk(&mut owner, start).is_none());
+    let mut due = start + OPEN_WALKS.refill_interval;
+    assert_eq!(owner.state.walk_due(), Some(due));
+    let mut walks = OPEN_WALKS.capacity;
+    for _ in 0..10 {
+        assert!(walk(&mut owner, due - Duration::from_nanos(1)).is_none());
+        assert!(walk(&mut owner, due).is_some(), "the token returns on time");
+        walks += 1;
+        let elapsed = (due - start).as_nanos() / OPEN_WALKS.refill_interval.as_nanos();
+        assert!(u128::from(walks) <= u128::from(OPEN_WALKS.capacity) + elapsed);
+        assert!(walk(&mut owner, due).is_none());
+        due += OPEN_WALKS.refill_interval;
+        assert_eq!(owner.state.walk_due(), Some(due));
+    }
+}
+
+/// A peer that reopens for walks soon meets the meter, and each `Open` the
+/// meter holds back still ends once its token returns: within one refill
+/// interval, far below a subscriber's 30 s request timeout.
+#[tokio::test(start_paused = true)]
+async fn a_held_open_is_served_when_its_walk_token_returns() {
+    use super::state::OPEN_WALKS;
+
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let elsewhere = Frontier::new(block::Height(1), block::Hash([6; 32]));
+    let mut held = 0;
+    for walks in 1..=10 {
+        harness
+            .open(chain[1].hash, vec![elsewhere], credit(), AuxSchema::None)
+            .await;
+        let opened = tokio::time::Instant::now();
+        let mut received = harness.deliver_all().await;
+        if received.is_empty() {
+            held += 1;
+        }
+        while received.is_empty() {
+            received = harness.deliver_all().await;
+        }
+        assert!(tokio::time::Instant::now() - opened <= OPEN_WALKS.refill_interval + QUIET * 2);
+        assert_eq!(
+            received,
+            [Received::Ended(HeadersOutcomeCode::NoLocatorIntersection)]
+        );
+        assert_eq!(port.store().walks, walks);
+    }
+    assert!(held > 0, "the meter held back some Open");
+    harness.check_quiet().await;
+}
+
 /// An outcome a job finds after `Close` arrived gives way to
 /// `SubscriptionClosed`.
 #[test]
@@ -2193,7 +2269,7 @@ fn close_wins_over_an_outcome_found_after_it() {
     assert_eq!(owner.apply(&open), Ok(Applied::Live));
     let job = owner
         .state
-        .next_job::<HB>(None)
+        .next_job::<HB>(None, zakura_rt::time::Instant::now())
         .expect("the path has a page to read");
     let close = subscriber.close().expect("the subscription is live");
     assert_eq!(owner.apply(&close), Ok(Applied::Live));

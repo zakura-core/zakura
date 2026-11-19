@@ -680,3 +680,60 @@ fn a_charge_reports_a_low_bucket_below_a_quarter_of_capacity() {
     }
     assert_eq!(ledger.charge(key, cadence, now), Charged::Exhausted);
 }
+
+#[test]
+fn a_parked_frame_takes_the_next_token_at_its_exact_instant() {
+    let (mut buckets, clock) = buckets();
+    for _ in 0..EVERY_30_SECONDS.capacity {
+        buckets.charge(LAYOUT, &STATUS);
+    }
+    assert_eq!(buckets.charge(LAYOUT, &STATUS), CadenceCharge::Exhausted);
+    // The exhausted charge took nothing.
+    assert_eq!(buckets.tokens(LAYOUT, STATUS.message_type), Some(0));
+    let due = clock.now() + EVERY_30_SECONDS.refill_interval;
+    assert_eq!(buckets.take_parked(LAYOUT, &STATUS), Err(due));
+    clock.advance(EVERY_30_SECONDS.refill_interval - Duration::from_nanos(1));
+    assert_eq!(buckets.take_parked(LAYOUT, &STATUS), Err(due));
+    clock.advance(Duration::from_nanos(1));
+    assert_eq!(buckets.take_parked(LAYOUT, &STATUS), Ok(()));
+    assert_eq!(buckets.tokens(LAYOUT, STATUS.message_type), Some(0));
+    // The next parked frame waits a whole interval more.
+    assert_eq!(
+        buckets.take_parked(LAYOUT, &STATUS),
+        Err(due + EVERY_30_SECONDS.refill_interval)
+    );
+    // A row without a cadence never waits.
+    assert_eq!(buckets.take_parked(LAYOUT, &GET), Ok(()));
+}
+
+/// The production layouts: discovery parks; header sync, block sync and
+/// transaction relay carry unpaced traffic beside their cadence rows.
+#[test]
+fn only_streams_whose_every_row_is_paced_park() {
+    use crate::zakura::{
+        block_sync::BLOCK_SYNC_SERVICE_STREAMS,
+        discovery::wire::RULES as DISCOVERY,
+        header_sync::v9::{CommonMessage, RegtestMessage},
+        regulation::test_family::RULES as TEST_FAMILY,
+        tx_relay::wire::TX_RELAY_STREAMS,
+    };
+
+    assert!(parks_on_exhaustion(DISCOVERY));
+    // Header sync's Status shares its stream with subscription updates and
+    // pages.
+    assert!(!parks_on_exhaustion(&CommonMessage::ROWS));
+    assert!(!parks_on_exhaustion(&RegtestMessage::ROWS));
+    // Block sync's Status shares its stream with GetBlocks and bodies, and
+    // transaction relay's Hello shares its stream with GetTxs.
+    for stream in BLOCK_SYNC_SERVICE_STREAMS.iter().chain(&TX_RELAY_STREAMS) {
+        let rules = stream
+            .messages
+            .expect("every production stream has a table");
+        assert!(!parks_on_exhaustion(rules), "stream {}", stream.kind);
+    }
+    assert!(!parks_on_exhaustion(TEST_FAMILY));
+    assert!(parks_on_exhaustion(&[STATUS, PING, PONG]));
+    // A response whose request is not on the same stream isn't paced there.
+    assert!(!parks_on_exhaustion(&[STATUS, PONG]));
+    assert!(!parks_on_exhaustion(&[STATUS, GET, PART, DONE]));
+}

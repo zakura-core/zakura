@@ -98,7 +98,11 @@ pub(crate) enum Authorization {
     Block(block::Height),
     /// The ending already consumed its reservation.
     Ended(CompletedRange),
-    /// A local incompatibility, not a protocol fault.
+    /// A body that answers a live exchange from another chain, such as a
+    /// peer's answer after a fork (#2303). It is a local incompatibility, not
+    /// a protocol fault: the fence has already reset the session, and the
+    /// connection stays. A body with no live exchange fails the precheck as
+    /// unsolicited instead.
     IncompatibleHeader,
 }
 

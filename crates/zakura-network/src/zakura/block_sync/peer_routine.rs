@@ -587,6 +587,8 @@ impl PeerRoutine {
                 // Height-only requests cannot identify which live range the
                 // unexpected header belongs to. Defer each still-wanted
                 // body for this supplier without delaying other suppliers.
+                // The session ends without a fault, and its heights return
+                // to scheduling when the routine drops.
                 let bodies = self
                     .io
                     .requester

@@ -273,6 +273,57 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
     ));
 }
 
+/// zakura-core/zakura#2303: the chain forks below a written request, so the
+/// routine abandons it, and the peer honestly answers it from its new best
+/// chain. The answer is neutral: the body never reaches the sequencer, the
+/// peer is charged nothing, only the session resets, and the height returns
+/// to scheduling under the new branch.
+#[tokio::test]
+async fn a_fork_answer_to_an_abandoned_request_resets_only_the_session() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, pool, connection, mut events) =
+        requester_routine(block::Hash([1; 32]));
+    let (bodies, mut received) = mpsc::channel(1);
+    routine.io.sequencer_input = bodies;
+    routine.try_fill();
+    next_sent(&mut outbound).await;
+    routine.io.work.reset_above(block::Height(0));
+    routine.gc_obsolete_outstanding();
+    assert!(routine.state.window.outstanding.is_empty());
+    routine.io.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(1),
+            block.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    while events.try_recv().is_ok() {}
+
+    let error = try_deliver(&mut routine, BlockSyncMessage::Block(block.clone()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, SinkReject::Local(_)));
+    assert!(
+        received.try_recv().is_err(),
+        "the mismatched body never reaches verification"
+    );
+    assert!(routine.io.session.cancel_token().is_cancelled());
+    assert!(!connection.is_cancelled(), "the connection stays");
+    assert!(!std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. })));
+    let work = routine.io.work.clone();
+    drop(routine);
+    assert_eq!(pool.held(), 0);
+    assert_eq!(
+        work.item_for_height(block::Height(1)).map(|item| item.hash),
+        Some(block.hash()),
+        "the new branch's height waits for scheduling"
+    );
+    assert!(work.pending_contains(block::Height(1)));
+}
+
 #[tokio::test]
 async fn invalid_ending_keeps_the_written_exchange_fenced() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));

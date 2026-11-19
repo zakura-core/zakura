@@ -1931,6 +1931,62 @@ mod tests {
         Ok(())
     }
 
+    /// Gossip carries no receipt priority of its own. The verifier ranks the block by the claim
+    /// header sync made for its hash, if there is one.
+    #[tokio::test]
+    async fn an_advertised_block_reaches_the_verifier_as_a_plain_commit() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let network = BoxCloneService::new(service_fn(move |_request: zn::Request| {
+            let block = block.clone();
+            async move { Ok(zn::Response::Blocks(vec![Available((block.into(), None))])) }
+        }));
+        let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let requests_tx = requests_tx.clone();
+                async move {
+                    let hash = request.block().hash();
+                    requests_tx.send(request)?;
+                    Ok(hash)
+                }
+            }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        let committed = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("download completes")
+            .expect("downloads stream is open")
+            .expect("download succeeds");
+        assert_eq!(committed, hash);
+        assert!(matches!(
+            requests_rx.try_recv(),
+            Ok(zakura_consensus::Request::Commit(block)) if block.hash() == hash
+        ));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn zakura_advertiser_source_is_sent_to_network_download_request() {
         let hash = hash(9);

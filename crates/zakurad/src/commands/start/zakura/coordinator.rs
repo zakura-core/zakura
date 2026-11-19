@@ -41,6 +41,9 @@ pub(crate) struct SyncCoordinator {
     operations: Mutex<BTreeMap<BlockApplyOperationId, BlockApplyOperationRecord>>,
     drained: Notify,
     phase_changed: Notify,
+    /// Receipt-order claims for headers applied just above the verified tip. Header sync
+    /// creates them and the block verifier reads them when a body arrives.
+    announced_blocks: zakura_consensus::AnnouncementClaims,
 }
 
 /// Tracks one in-flight native block apply.
@@ -122,6 +125,11 @@ impl SyncCoordinator {
         })
     }
 
+    /// The claim table shared by header sync, which writes it, and the block verifier.
+    pub(crate) fn announced_blocks(&self) -> &zakura_consensus::AnnouncementClaims {
+        &self.announced_blocks
+    }
+
     fn new_with_phase(phase: ApplyPhase) -> Arc<Self> {
         let header_status = HeaderRuntimeStatus::Detached {
             epoch: LifecycleEpoch::INITIAL,
@@ -140,6 +148,7 @@ impl SyncCoordinator {
             operations: Mutex::new(BTreeMap::new()),
             drained: Notify::new(),
             phase_changed: Notify::new(),
+            announced_blocks: Default::default(),
         });
         coordinator.publish_phase(phase);
         coordinator

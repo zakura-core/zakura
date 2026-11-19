@@ -4322,3 +4322,216 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .await
     .expect("duplicate receipt regression must finish");
 }
+
+/// Two equal-work blocks on genesis, and a verifier over real state that ranks them by the
+/// claims in `claims`.
+struct EqualWorkTips {
+    a: Arc<Block>,
+    b: Arc<Block>,
+    tip: zs::LatestChainTip,
+    claims: AnnouncementClaims,
+    verifier: SemanticBlockVerifier<
+        crate::transaction::TestStateService,
+        tower::util::BoxCloneService<tx::Request, tx::Response, BoxError>,
+    >,
+}
+
+impl EqualWorkTips {
+    async fn new() -> Self {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let zakura_state::InitializedState {
+            state,
+            latest_chain_tip: tip,
+            ..
+        } = zs::init_test_services(&network).await;
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        state
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            ))
+            .await
+            .unwrap();
+        let mut a = nu5_prepared_test_block(&network, None);
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &a.auth_data_root(),
+        );
+        let header = Arc::make_mut(&mut a.header);
+        header.previous_block_hash = genesis.hash();
+        header.time = genesis.header.time + chrono::Duration::seconds(150);
+        header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+        let a = Arc::new(a);
+        let mut b = a.as_ref().clone();
+        Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+        let b = Arc::new(b);
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let claims = AnnouncementClaims::default();
+        let verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .with_announcement_claims(claims.clone());
+
+        Self {
+            a,
+            b,
+            tip,
+            claims,
+            verifier,
+        }
+    }
+
+    /// Claims `block` the way header sync does when it applies the block's header on genesis.
+    fn admit_header(&self, block: &Block) {
+        let height = block
+            .coinbase_height()
+            .expect("the test blocks have a coinbase height");
+        self.claims
+            .begin([(block.hash(), height)], block::Height(0))
+            .commit();
+    }
+
+    fn tip_hash(&self) -> Option<block::Hash> {
+        use zakura_chain::chain_tip::ChainTip;
+
+        self.tip.best_tip_hash()
+    }
+}
+
+/// Longer than any body deadline, so a body delivered after this wait has lost its claim.
+const PAST_EVERY_BODY_DEADLINE: std::time::Duration =
+    ANNOUNCEMENT_PRIORITY_WINDOW.saturating_add(std::time::Duration::from_millis(50));
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_whose_header_came_first_wins_the_tie_only_inside_its_deadline() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for body_is_prompt in [true, false] {
+            let mut tips = EqualWorkTips::new().await;
+            let (a, b) = (tips.a.clone(), tips.b.clone());
+
+            // A's header is admitted first, but B's body reaches the verifier before A's does.
+            tips.admit_header(&a);
+            let b_commit = tips.verifier.call(Request::Commit(b.clone().into()));
+            if !body_is_prompt {
+                tokio::time::sleep(PAST_EVERY_BODY_DEADLINE).await;
+            }
+            let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
+
+            b_commit.await.unwrap();
+            assert_eq!(tips.tip_hash(), Some(b.hash()));
+            a_commit.await.unwrap();
+            let expected = if body_is_prompt { &a } else { &b };
+            assert_eq!(
+                tips.tip_hash(),
+                Some(expected.hash()),
+                "body_is_prompt: {body_is_prompt}",
+            );
+        }
+    })
+    .await
+    .expect("announcement priority test must finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_block_does_not_renew_its_claim_by_being_announced_again() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let (a, b) = (tips.a.clone(), tips.b.clone());
+
+        // A's body is withheld past its deadline while its header keeps being delivered.
+        tips.admit_header(&a);
+        for _ in 0..3 {
+            tokio::time::sleep(PAST_EVERY_BODY_DEADLINE / 3).await;
+            tips.admit_header(&a);
+        }
+
+        // A competitor appears, and A's body is released right after its latest announcement.
+        let b_commit = tips.verifier.call(Request::Commit(b.clone().into()));
+        let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
+        b_commit.await.unwrap();
+        a_commit.await.unwrap();
+        assert_eq!(
+            tips.tip_hash(),
+            Some(b.hash()),
+            "a withheld block is ranked by the arrival of its body",
+        );
+    })
+    .await
+    .expect("withholding test must finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mined_block_keeps_the_tip_from_a_rival_whose_header_came_first() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let (a, b) = (tips.a.clone(), tips.b.clone());
+
+        // A rival's header is admitted, then this node mines B before A's body arrives.
+        tips.admit_header(&a);
+        let b_commit = tips.verifier.call(Request::CommitMined {
+            size: b.zcash_serialized_size(),
+            block: b.clone().into(),
+            admission: zs::BlockAdmission::pending(),
+        });
+        let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
+
+        b_commit.await.unwrap();
+        assert_eq!(tips.tip_hash(), Some(b.hash()));
+        a_commit.await.unwrap();
+        assert_eq!(
+            tips.tip_hash(),
+            Some(b.hash()),
+            "a node does not abandon the block it mined",
+        );
+    })
+    .await
+    .expect("mined block priority test must finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_mined_block_leaves_a_rival_claim_in_force() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let (a, b) = (tips.a.clone(), tips.b.clone());
+
+        // A submitted block at A's height is rejected, because its parent is unknown.
+        tips.admit_header(&a);
+        let mut orphan = b.as_ref().clone();
+        Arc::make_mut(&mut orphan.header).previous_block_hash = block::Hash([0xff; 32]);
+        let rejected = tips
+            .verifier
+            .call(Request::CommitMined {
+                size: orphan.zcash_serialized_size(),
+                block: Arc::new(orphan).into(),
+                admission: zs::BlockAdmission::pending(),
+            })
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(VerifyBlockError::Commit(
+                zs::CommitBlockError::MissingMinedParent
+            ))
+        ));
+
+        // The rejected block no longer outranks A, so A still wins the tie against B.
+        let b_commit = tips.verifier.call(Request::Commit(b.clone().into()));
+        let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
+        b_commit.await.unwrap();
+        assert_eq!(tips.tip_hash(), Some(b.hash()));
+        a_commit.await.unwrap();
+        assert_eq!(tips.tip_hash(), Some(a.hash()));
+    })
+    .await
+    .expect("invalid mined block test must finish");
+}

@@ -54,6 +54,8 @@ pub(crate) struct ProductionState {
     pub(crate) authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     /// Regtest.
     pub(crate) network: zakura_chain::parameters::Network,
+    /// The claim table every port over this state writes to.
+    pub(crate) announced_blocks: zakura_consensus::AnnouncementClaims,
 }
 
 impl ProductionState {
@@ -104,6 +106,7 @@ impl ProductionState {
             read_state,
             authority,
             network,
+            announced_blocks: Default::default(),
         }
     }
 
@@ -137,6 +140,7 @@ impl ProductionState {
             self.authority.clone(),
             self.network.clone(),
             snapshots,
+            self.announced_blocks.clone(),
         ))
     }
 }
@@ -171,7 +175,7 @@ async fn both() -> [Arc<dyn Port>; 2] {
 }
 
 /// `port`'s latest committed snapshot.
-fn snapshot(port: &dyn Port) -> zakura_header_chain::EngineSnapshot {
+pub(crate) fn snapshot(port: &dyn Port) -> zakura_header_chain::EngineSnapshot {
     port.selected_chain()
         .borrow()
         .clone()
@@ -180,7 +184,7 @@ fn snapshot(port: &dyn Port) -> zakura_header_chain::EngineSnapshot {
 
 /// Prepares and applies `headers` on `parent` through `port`. Returns their
 /// frontiers.
-async fn admit(
+pub(crate) async fn admit(
     port: &dyn Port,
     parent: Frontier,
     headers: &[Arc<block::Header>],
@@ -756,6 +760,7 @@ async fn adapter_deadlines_match_the_contract() {
         network: HeaderFixture::regtest().network().clone(),
         adapter_key: key.clone(),
         selected_chain: tokio::sync::watch::channel(None).1,
+        announced_blocks: Default::default(),
     };
     let anchor = HeaderFixture::regtest().anchor();
     let scope = HeaderWorkAuthority {

@@ -40,6 +40,7 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
+pub use receipt::{AnnouncementClaims, PendingClaims, ANNOUNCEMENT_PRIORITY_WINDOW};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -63,6 +64,8 @@ pub struct SemanticBlockVerifier<S, V> {
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
     receipt_orders: receipt::ReceiptRegistry,
+    /// Claims made by header sync, read when a body is given its receipt order.
+    announcement_claims: AnnouncementClaims,
 }
 
 /// Block verification errors.
@@ -401,7 +404,10 @@ where
     V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     V::Future: Send + 'static,
 {
-    /// Creates a new SemanticBlockVerifier
+    /// Creates a new SemanticBlockVerifier.
+    ///
+    /// It holds no announcement claims, so every block is ranked by the arrival of its body
+    /// until [`Self::with_announcement_claims`] supplies the table header sync writes to.
     pub fn new(network: &Network, state_service: S, transaction_verifier: V) -> Self {
         Self {
             network: network.clone(),
@@ -409,7 +415,14 @@ where
             transaction_verifier,
             prepared_candidates: Default::default(),
             receipt_orders: Default::default(),
+            announcement_claims: Default::default(),
         }
+    }
+
+    /// Ranks blocks by the claims in `claims`, which header sync creates as it admits headers.
+    pub fn with_announcement_claims(mut self, claims: AnnouncementClaims) -> Self {
+        self.announcement_claims = claims;
+        self
     }
 }
 
@@ -438,7 +451,20 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
+        let receipt = (!request.is_proposal()).then(|| {
+            self.receipt_orders
+                .register(hash, &block, &self.announcement_claims)
+        });
+        // Marked before this call returns, so a rival body that arrives next already finds it.
+        let mined_watermark = request
+            .is_mined_commit()
+            .then(|| block.coinbase_height())
+            .flatten()
+            .zip(receipt.as_ref())
+            .map(|(height, receipt)| {
+                self.announcement_claims
+                    .mark_mined(hash, height, receipt.order)
+            });
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -890,6 +916,12 @@ where
                 commit_prepared_block(&mut state_service, prepared_block, mined).await
             }
             .await;
+
+            // A mined block that failed, or whose request was dropped, releases its watermark
+            // with this guard, which puts a rival's earlier claim back in force.
+            if let (Ok(_), Some(mined_watermark)) = (&result, mined_watermark) {
+                mined_watermark.keep();
+            }
 
             match result {
                 // Proposals never become body evidence, so they keep the first failure.

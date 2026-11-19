@@ -60,6 +60,46 @@ fn integrated_header_selection_preserves_the_first_selected_equal_work_tip() {
     );
 }
 
+/// Known limitation: the selected equal-work header keeps its place however long its body is
+/// withheld, and block sync fetches bodies only on the selected path. Full state bounds the
+/// same reservation with `zakura_consensus::ANNOUNCEMENT_PRIORITY_WINDOW`. This engine does not
+/// yet.
+#[test]
+fn an_alarmed_unavailable_body_does_not_release_the_selected_equal_work_tip() {
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let a = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x31);
+    let b = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x32);
+    // Prefer the tip the raw-hash fallback would not choose.
+    let withheld = if a.hash.0 < b.hash.0 { a } else { b };
+    let now = Utc::now();
+    store
+        .graph
+        .set_body_validation_state(
+            withheld.hash,
+            BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+                started_at: now - chrono::Duration::minutes(12),
+                attempts: 10,
+                suppliers: 2,
+                supplier_set_digest: [0x11; 32],
+                alarmed: true,
+                next_probe_at: now + chrono::Duration::minutes(8),
+            }),
+        )
+        .expect("the withheld header is in the graph");
+    store.graph.prefer_header_tip(Some(withheld));
+
+    assert_eq!(store.graph.select_best_header_chain().unwrap().0, withheld);
+    assert_eq!(
+        crate::graph::GraphOverlay::new(&store.graph)
+            .select_best_header_chain()
+            .unwrap()
+            .0,
+        withheld
+    );
+}
+
 #[test]
 fn malformed_full_state_paths_fail_with_exact_shape_errors() {
     let (store, config) = TestStore::new(EngineMode::Integrated);

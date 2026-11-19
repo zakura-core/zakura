@@ -169,6 +169,12 @@ harness that takes no steered schedule, such as a machine harness, runs
 each draw under the Plan. The search's report counts runs per mode, and
 the runs and free runs that applied each property.
 
+`--schedule enumerate` runs every schedule of each drawn input that delays
+the first enabled action at most twice, breadth first, then moves to the
+next input. A race fixture's run makes tens of picks, so its depth-2
+enumeration ends in seconds. A wire run makes tens of thousands, and its
+enumeration doesn't end within a search. A machine harness makes no picks.
+
 What each harness draws, as audited for #2536's follow-up:
 
 | Harness | Prefix | Adversary | Node limits | Network faults | PCT | Free draws |

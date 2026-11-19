@@ -26,10 +26,10 @@ The reservation is called a claim. Four rules define it:
   order and the time when it starts applying a header, so a body that arrives
   during the apply already takes them. The claim is kept once state has
   accepted the header, by which point the header has passed Equihash, its
-  target, parent linkage and contextual difficulty. Applies of the same header
-  from several peers share the first reservation. If none of them succeeds,
-  the claim is removed, and a later apply of that header claims from its own
-  start, which can only rank the block later. A header
+  target, parent linkage and the contextual difficulty and time rules. Applies
+  of the same header from several peers share the first reservation. If none
+  of them succeeds, the claim is removed, and a later apply of that header
+  claims from its own start, which can only rank the block later. A header
   deferred for a future timestamp gets no claim. Only headers one or two
   blocks above the verified tip are claimed, so catch-up creates none.
 - **A block has one claim, and it is permanent.** A claim, once made, is never
@@ -38,8 +38,9 @@ The reservation is called a claim. Four rules define it:
   table holds 64 claims. When it is full it refuses new claims and never
   drops old ones. A claim is removed when no apply covering it succeeds, or
   at the first header apply after the verified tip passes its height, where
-  no new claim can be made. That floor never goes down, so after a rollback
-  claims resume once the tip passes it again.
+  no new claim can be made. That floor is the highest verified tip seen and
+  never goes down, so after a rollback blocks at or below it get no claim and
+  are ranked by arrival until the tip passes it again.
 - **The body has a deadline.** It is 500 ms plus the body's serialized size at
   1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
   body that arrives later draws a fresh order, as if its header had never been
@@ -89,7 +90,8 @@ Some blocks have no claim and are ranked by body arrival:
   headers before bodies.
 - A block whose header arrived before a restart. Claims are not persisted.
 - A block refused by a full table. On Testnet, minimum-difficulty headers can
-  fill the table, which then refuses claims until the verified tip moves.
+  fill the table, which then refuses claims until the verified tip passes the
+  flooded heights.
 
 [Fork retention](../specs/fork-aware-header-chain-engine.md#lc-retain-01)
 keeps newly accepted parents available for extension and evicted bodies eligible

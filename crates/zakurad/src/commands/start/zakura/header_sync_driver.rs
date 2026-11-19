@@ -773,7 +773,8 @@ where
     })?;
     let (owner, source, target_tip_hash) = (insert.owner, insert.source, insert.target_tip_hash);
     // Reserved before the wait on the state writer, so a body that reaches the verifier during
-    // that wait, the block's own or a rival's, is ranked by when this header arrived.
+    // that wait, the block's own or a rival's, is ranked by when this header arrived. Only the
+    // lab checks this ordering end to end; the claim API tests cover the reservation itself.
     let claims = begin_announcement_claims(&announcement_claims, &selected_chain, &insert.batch);
     let prepared = authority.from_registered_header_attempt(insert);
     match wait_for_header_target_apply(
@@ -786,8 +787,8 @@ where
             zakura_header_chain::ApplyResult::Committed
             | zakura_header_chain::ApplyResult::NoChange(_),
         )) => {
-            // State has now checked contextual difficulty, the last header rule, so the claims
-            // are kept. Any other outcome removes them.
+            // State has now checked the contextual difficulty and time rules, the last header
+            // rules, so the claims are kept. Any other outcome removes them.
             if let Some(claims) = claims {
                 claims.commit();
             }
@@ -2107,6 +2108,31 @@ mod tests {
             refused.category,
             zakura_header_chain::ErrorCategory::InvalidHeader
         );
+        assert!(!state.announcement_claims.is_claimed(header.hash()));
+    }
+
+    #[tokio::test]
+    async fn a_header_deferred_for_its_future_timestamp_is_not_claimed() {
+        let (state, port, fixture) = claiming_port().await;
+        let anchor = fixture.anchor();
+
+        let mut header = *fixture.extend(anchor, 1, 0)[0];
+        header.time = chrono::Utc::now() + chrono::Duration::hours(3);
+        let header = Arc::new(header);
+        let request = fixture.target_request(
+            &engine_comparison::snapshot(&*port),
+            anchor,
+            std::slice::from_ref(&header),
+            1,
+        );
+        let prepared = port
+            .prepare_header_target(request)
+            .await
+            .expect("a future header passes context-free validation");
+        port.apply_header_target(prepared)
+            .await
+            .expect("state admits a future header as deferred");
+
         assert!(!state.announcement_claims.is_claimed(header.hash()));
     }
 

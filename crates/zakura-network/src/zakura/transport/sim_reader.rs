@@ -26,7 +26,7 @@ use super::{
 };
 use crate::zakura::{
     handler::admit_tabled_message,
-    regulation::{CadenceBuckets, PrecheckSlot},
+    regulation::{parks_on_exhaustion, CadenceBuckets, PrecheckSlot},
     FRAME_HEADER_BYTES,
 };
 
@@ -104,13 +104,20 @@ impl StreamReader {
     ///
     /// # Panics
     ///
-    /// If the reader's stream has no message table.
+    /// If the reader's stream has no message table, or if its reader parks
+    /// on an empty cadence bucket, as a discovery stream's does. The step never
+    /// waits, so it can't stand in for that reader.
     pub fn admission(&self) -> StreamAdmission {
+        let rules = self
+            .stream
+            .messages
+            .expect("an admission step reads a stream with a message table");
+        assert!(
+            !parks_on_exhaustion(rules),
+            "an admission step never waits for a cadence token"
+        );
         StreamAdmission {
-            rules: self
-                .stream
-                .messages
-                .expect("an admission step reads a stream with a message table"),
+            rules,
             layout: self.stream.kind,
             buckets: CadenceBuckets::default(),
         }
@@ -164,6 +171,7 @@ impl StreamAdmission {
         let admission = admit_tabled_message(
             frame,
             self.rules,
+            false,
             |rule, payload_len| buckets.charge_frame(layout, rule, payload_len),
             || {},
             || {},

@@ -8,8 +8,12 @@
 //!
 //! The layout validator sizes buckets for a connection-wide outage. A single
 //! stream can stall longer while sibling streams keep the connection alive.
-//! Exhaustion therefore measures a burst, not a protocol violation. The reader
-//! records exhaustion and forwards the frame. Local read pauses add tokens.
+//! Exhaustion therefore measures a burst, not a protocol violation, and never
+//! closes. Local read pauses add tokens. On exhaustion, the reader of a
+//! stream whose every row is paced ([`parks_on_exhaustion`]) waits for the
+//! row's next token, so QUIC flow control slows the sender. Any other reader
+//! records exhaustion and forwards the frame, and its service meters the
+//! row's work itself.
 //!
 //! A [`MessageRole::Metered`] row is charged by payload bytes instead, in a
 //! [`ByteBucket`] that belongs to the connection as the cadence buckets do.
@@ -39,6 +43,8 @@
 //! | A conformant sender that stalls and resumes is never cut off | `a_sender_that_stalls_and_resumes_never_overruns_the_receiver` |
 //! | Reopening sessions on one connection buys no bytes | `reopening_sessions_on_one_connection_buys_no_bytes` |
 //! | A charge reports a low bucket below a quarter of its capacity | `a_charge_reports_a_low_bucket_below_a_quarter_of_capacity` |
+//! | A parked frame takes the token due exactly one refill interval after the last | `a_parked_frame_takes_the_next_token_at_its_exact_instant` |
+//! | Only a stream whose every row is paced parks its reader | `only_streams_whose_every_row_is_paced_park` |
 
 use std::{sync::Arc, time::Duration};
 
@@ -301,6 +307,11 @@ impl Bucket {
         self.tokens >= self.cadence.capacity
     }
 
+    /// When the bucket earns its next token, as of its latest refill.
+    pub(crate) fn next_token_at(&self) -> Instant {
+        self.last_refill + self.cadence.refill_interval
+    }
+
     /// Check the bucket's invariants right after a refill at `now`: less than
     /// one interval of elapsed time, and less than one interval of pause
     /// credit, remains unconverted into tokens.
@@ -361,6 +372,21 @@ impl CadenceLedger {
         Charged::Admit {
             low: bucket.tokens < cadence.capacity / 4,
         }
+    }
+
+    /// Take a token of a row with `cadence` at `now` for a frame that found
+    /// the bucket empty, or return when the bucket earns its next token.
+    fn take_parked(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+    ) -> Result<(), Instant> {
+        let bucket = self.bucket(key, cadence, now);
+        if bucket.take() {
+            return Ok(());
+        }
+        Err(bucket.next_token_at())
     }
 
     /// Credit a local read pause of `paused` to a row with `cadence` at `now`.
@@ -499,6 +525,24 @@ impl<C: Clock> CadenceBuckets<C> {
         CadenceCharge::Overrun
     }
 
+    /// Take a token of `rule`'s bucket on `layout` for a parked frame: one
+    /// that [`Self::charge_frame`] found its row's bucket empty for. Returns
+    /// the instant the bucket earns its next token if it holds none now.
+    ///
+    /// A row without a cadence holds no bucket and takes nothing. The frame's
+    /// first charge took no token, so a parked frame pays exactly one token,
+    /// here.
+    pub(crate) fn take_parked(&mut self, layout: u16, rule: &MessageRule) -> Result<(), Instant> {
+        let Some(cadence) = cadence(rule) else {
+            return Ok(());
+        };
+        let key = CadenceKey {
+            layout,
+            message_type: rule.message_type,
+        };
+        self.ledger.take_parked(key, cadence, self.clock.now())
+    }
+
     /// Credit a local read pause on a stream of `layout` that carries `rules`.
     ///
     /// While this node's reader waits for its own handler, the sender keeps
@@ -531,6 +575,36 @@ impl<C: Clock> CadenceBuckets<C> {
             })
             .map(|bucket| bucket.tokens)
     }
+}
+
+/// Whether the reader of a stream that carries `rules` parks on an empty
+/// cadence bucket, instead of recording the exhaustion and forwarding the frame.
+///
+/// A parked reader holds back every later frame of its stream too. So a reader
+/// parks only if every row of its stream is paced: each announcement and
+/// request declares a cadence, and each response answers a request of the
+/// same stream that declares one. A subscription's pages and a metered row are
+/// not paced by a cadence, nor is the work an uncadenced request asks for, so
+/// a park would stall that traffic. On such a stream, the service meters an
+/// announcement's work itself.
+pub(crate) fn parks_on_exhaustion(rules: &[MessageRule]) -> bool {
+    let paced_request = |message_type| {
+        MessageRule::find(rules, message_type).is_some_and(|request| {
+            matches!(
+                request.role,
+                MessageRole::Request {
+                    cadence: Some(_),
+                    ..
+                }
+            )
+        })
+    };
+    rules.iter().all(|rule| match rule.role {
+        MessageRole::Announcement { .. } => true,
+        MessageRole::Request { cadence, .. } => cadence.is_some(),
+        MessageRole::Response { request, .. } => paced_request(request),
+        MessageRole::Subscription { .. } | MessageRole::Metered { .. } => false,
+    })
 }
 
 /// The row's cadence, if it declares one.

@@ -60,7 +60,7 @@ use super::peer_memory::{
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
-use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
+use super::regulation::{parks_on_exhaustion, CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
@@ -2448,6 +2448,38 @@ impl StreamWorkerContext {
             .expect("Zakura cadence bucket mutex is never poisoned")
             .credit_pause(cadence.layout, rules, paused);
     }
+
+    /// Wait until the cadence bucket of `frame`'s row holds a token, and take
+    /// it. Returns `false` if the stream or its connection was cancelled
+    /// first; the wait itself never closes anything.
+    ///
+    /// Call this only for a frame that [`admit_inbound_message`] parked. The
+    /// frame keeps its receive grant while it waits, and pays exactly one
+    /// token. The wait earns no pause credit, so it never refills the bucket
+    /// it waits on.
+    async fn park_for_cadence(&self, frame: &Frame) -> bool {
+        let (Some(cadence), Some(rules)) = (&self.cadence, self.messages) else {
+            return true;
+        };
+        let rule = MessageRule::find(rules, frame.message_type)
+            .expect("the frame filter admits only rows of the stream's table");
+        loop {
+            let taken = cadence
+                .buckets
+                .lock()
+                .expect("Zakura cadence bucket mutex is never poisoned")
+                .take_parked(cadence.layout, rule);
+            let Err(next_token) = taken else {
+                return true;
+            };
+            zakura_rt::select! {
+                biased;
+                _ = self.connection_token.cancelled() => return false,
+                _ = self.stream_token.cancelled() => return false,
+                () = zakura_rt::time::sleep_until(next_token) => {}
+            }
+        }
+    }
 }
 
 struct AdmittedSession {
@@ -2795,6 +2827,9 @@ pub(crate) enum InboundMessageAdmission {
     Throttled,
     /// A metered row overran its connection's byte bucket.
     ByteRateOverrun,
+    /// The row's cadence bucket is empty, and the stream's reader waits for
+    /// a token before it forwards the frame. See [`parks_on_exhaustion`].
+    Park,
 }
 
 fn admit_inbound_message(
@@ -2829,6 +2864,7 @@ fn admit_inbound_message(
         return admit_tabled_message(
             frame,
             rules,
+            cadence.parks,
             |rule, payload_len| {
                 cadence
                     .buckets
@@ -2890,7 +2926,8 @@ fn admit_inbound_message(
 /// frame's row and charges the row's bucket through `charge`, with the
 /// frame's payload length. If a metered row's frame overran its byte bucket,
 /// it calls `overrun` and refuses the frame. If the bucket was empty, it
-/// calls `exhausted`, and an empty bucket doesn't refuse the frame.
+/// calls `exhausted`. An empty bucket never refuses the frame: it parks the
+/// frame if the stream's reader `parks`, and admits it otherwise.
 ///
 /// # Panics
 ///
@@ -2899,6 +2936,7 @@ fn admit_inbound_message(
 pub(crate) fn admit_tabled_message(
     frame: &Frame,
     rules: &[MessageRule],
+    parks: bool,
     charge: impl FnOnce(&MessageRule, usize) -> CadenceCharge,
     overrun: impl FnOnce(),
     exhausted: impl FnOnce(),
@@ -2913,9 +2951,13 @@ pub(crate) fn admit_tabled_message(
         return InboundMessageAdmission::ByteRateOverrun;
     }
     // A sibling stream can keep the connection alive during an unbounded
-    // transport stall. Exhaustion cannot prove a sender violation.
+    // transport stall. Exhaustion cannot prove a sender violation, so it
+    // waits or passes, and never closes.
     if charge == CadenceCharge::Exhausted {
         exhausted();
+        if parks {
+            return InboundMessageAdmission::Park;
+        }
     }
     InboundMessageAdmission::Admit
 }
@@ -2925,7 +2967,7 @@ impl InboundMessageAdmission {
     /// `None` if it admits the frame.
     pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
         match self {
-            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Admit | InboundMessageAdmission::Park => None,
             InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
             InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
             InboundMessageAdmission::ByteRateOverrun => Some(ZakuraHandlerError::ByteRateOverrun),
@@ -6407,9 +6449,16 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
-                        .ordered_error()
+                    let admission =
+                        admit_inbound_message(&admitted.frame, &reader_context, stream_kind);
+                    // A parked frame holds back the rest of this stream, so QUIC
+                    // flow control slows the sender. Cancellation ends the wait.
+                    if admission == InboundMessageAdmission::Park
+                        && !reader_context.park_for_cadence(&admitted.frame).await
                     {
+                        break;
+                    }
+                    match admission.ordered_error() {
                         None => {
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
@@ -6751,6 +6800,12 @@ async fn request_stream_worker(
     let _ = context.freshness_tx.send(Instant::now());
     match admit_inbound_message(&frame, &context, prelude.stream_kind) {
         InboundMessageAdmission::Admit => {}
+        InboundMessageAdmission::Park => {
+            // The raw frame keeps its grant while the request waits.
+            if !context.park_for_cadence(&frame).await {
+                return;
+            }
+        }
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
             context.close_cause.record("request_oversize");
@@ -8405,6 +8460,9 @@ struct CadenceScope {
     buckets: SharedCadenceBuckets,
     /// The primary stream kind of the stream's layout, which keys its buckets.
     layout: u16,
+    /// Whether the stream's reader waits for a token when a bucket is empty.
+    /// See [`parks_on_exhaustion`].
+    parks: bool,
 }
 
 /// The cadence scope for `stream` in `layout`, if the stream has a table.
@@ -8413,9 +8471,10 @@ fn cadence_scope(
     stream: Stream,
     layout: u16,
 ) -> Option<CadenceScope> {
-    stream.messages.map(|_| CadenceScope {
+    stream.messages.map(|rules| CadenceScope {
         buckets: buckets.cadence.clone(),
         layout,
+        parks: parks_on_exhaustion(rules),
     })
 }
 
@@ -8626,6 +8685,7 @@ impl ZakuraHandlerError {
 #[cfg(all(test, not(zakura_sim)))]
 mod tests {
     mod bounded_decoding;
+    mod cadence_park;
     pub(super) mod connection;
     mod frame_lifetime;
     #[cfg(not(zakura_sim))]

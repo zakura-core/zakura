@@ -663,6 +663,17 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        // Submission waits, the mempool and getblocktemplate share one bounded trace writer.
+        let template_path_trace = JsonlEventEmitter::new(
+            config
+                .network
+                .zakura
+                .trace_dir
+                .clone()
+                .map(JsonlTracer::spawn)
+                .unwrap_or_else(JsonlTracer::noop),
+            zakura_jsonl_trace::node_id(),
+        );
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -673,7 +684,8 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
-                .with_second_block_request(config.network.block_download_score_and_hedge.enabled),
+                .with_second_block_request(config.network.block_download_score_and_hedge.enabled)
+                .with_trace(template_path_trace.clone()),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
@@ -808,19 +820,6 @@ impl StartCmd {
             state.clone(),
             latest_chain_tip.clone(),
             misbehavior.clone(),
-        );
-
-        // The mempool and `getblocktemplate` trace the path from a new tip to a mining template.
-        // They share one writer.
-        let template_path_trace = JsonlEventEmitter::new(
-            config
-                .network
-                .zakura
-                .trace_dir
-                .clone()
-                .map(JsonlTracer::spawn)
-                .unwrap_or_else(JsonlTracer::noop),
-            zakura_jsonl_trace::node_id(),
         );
 
         info!(?pool_implementation, "initializing mempool");

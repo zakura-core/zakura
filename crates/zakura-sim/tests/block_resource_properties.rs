@@ -1,9 +1,9 @@
-//! Block sync's resource bounds (P5b, gates P5.1–P5.4): each committed
-//! input reaches its property's trigger history on the real node and
+//! Block sync's resource bounds (P5b, gates P5.1–P5.4): each seed
+//! reaches its property's trigger history on the real node and
 //! holds, honest runs hold all four bounds across A/A and A/B/A and across
 //! worker counts, teardown returns every charge, and the owner model folds
 //! the observer's effects as the bounds need. `cargo xtask planted` runs
-//! the same inputs with each property's bypass patch applied.
+//! the same seeds with each property's bypass patch applied.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -30,34 +30,34 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{BlockSyncFact, StorageBranch, WorkOwner, WorkScope},
+    seed,
     witness::{check_witness, Expect, WitnessScenario},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
 };
 
-/// The committed input that picks the paused-handoffs scenario: routines
-/// pause in their handoffs, so floor requests charge past `M`.
-const PAUSED_HANDOFFS_INPUT: &[u8] = include_bytes!("fixtures/block-sync-paused-handoffs.bin");
+/// The seed that picks the paused-handoffs scenario: routines pause in
+/// their handoffs, so floor requests charge past `M`.
+const PAUSED_HANDOFFS: &str = "block-sync-paused-handoffs";
 
-/// The committed input whose paused-handoffs run races two routines for the
-/// floor's next height: one probes it, another takes it first, and the
-/// first routine's floor take starts above it.
-const FLOOR_LANE_RACE_INPUT: &[u8] = include_bytes!("fixtures/block-sync-floor-lane-race.bin");
+/// The seed that picks the above-window scenario: the node requests heights
+/// above the commit window that never arrive.
+const ABOVE_WINDOW: &str = "block-sync-above-window";
 
-/// The committed input that picks the stuck-floor scenario: the commit
-/// window fills while height 3 never arrives.
-const STUCK_FLOOR_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-stuck-floor.bin");
+/// The seed that picks the peers-leave scenario: both mirrors leave while
+/// the node owes them requests.
+const PEERS_LEAVE: &str = "block-sync-peers-leave";
 
-/// The committed input that picks the default scenario, whose routines hand
-/// charged bodies to the sequencer.
-const HANDOFF_INPUT: &[u8] = include_bytes!("fixtures/block-sync-handoff.bin");
+/// The seed that picks the stalled-reset scenario, whose routines hand
+/// charged bodies to the sequencer while storage never answers.
+const STALLED_RESET: &str = "block-sync-stalled-reset";
 
-/// The committed input that picks the above-window scenario: the node
-/// requests heights above the commit window that never arrive.
-const ABOVE_WINDOW_INPUT: &[u8] = include_bytes!("fixtures/slow-seeds/block-sync-above-window.bin");
+/// The seed that races two routines for the floor lane in the
+/// paused-handoffs scenario.
+const FLOOR_LANE_RACE: &str = "block-sync-floor-lane-race";
 
-/// The committed input that picks the peers-leave scenario: both mirrors
-/// leave while the node owes them requests.
-const PEERS_LEAVE_INPUT: &[u8] = include_bytes!("fixtures/block-sync-peers-leave.bin");
+/// The seed that picks the stuck-floor scenario: one mirror withholds
+/// height 3, so the commit window fills.
+const STUCK_FLOOR: &str = "block-sync-stuck-floor";
 
 /// The resource bounds every run that rests judges. Teardown applies only
 /// once every peer leaves.
@@ -68,8 +68,13 @@ const IDS: [&str; 4] = [
     LOOKAHEAD_OVERSHOOT_BOUND,
 ];
 
-/// The scenario and Plan that `zakura-sim record --input` runs for `input`.
-fn committed(input: &[u8]) -> WitnessScenario<Storage> {
+/// The scenario and Plan that `zakura-sim record --seed` runs for seed
+/// `name`.
+fn seeded(name: &str) -> WitnessScenario<Storage> {
+    let input = seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is a registered seed"))
+        .input()
+        .to_vec();
     let (prefix, plan) = input.split_at(Storage::SCENARIO_BYTES);
     WitnessScenario {
         scenario: Storage::draw(prefix),
@@ -77,29 +82,52 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
     }
 }
 
-/// The paused-handoffs input holds the reserved bound after a floor request
+/// The paused-handoffs seed holds the reserved bound after a floor request
 /// charges past `M`. With `above-floor-charge.patch`, above-floor requests
-/// charge past `M` too, and the same input violates it.
+/// charge past `M` too, and the same seed violates it.
 #[test]
 fn the_paused_handoffs_input_holds_reserved_byte_bound() {
-    holds(committed(PAUSED_HANDOFFS_INPUT), RESERVED_BYTE_BOUND);
+    holds(seeded(PAUSED_HANDOFFS), RESERVED_BYTE_BOUND);
 }
 
-/// The floor-lane race input holds the reserved bound. The node refuses the
+/// The floor-lane race seed holds the reserved bound. The node refuses the
 /// losing routine's take above the floor for capacity. With
 /// `qa/native-mutations/bounds/wide-floor-lane`, that take counts as a
-/// floor request and charges past `M`, and the same input violates it.
+/// floor request and charges past `M`, and the same seed violates it.
 #[test]
 fn the_floor_lane_race_input_holds_reserved_byte_bound() {
-    let witness = committed(FLOOR_LANE_RACE_INPUT);
+    let witness = seeded(FLOOR_LANE_RACE);
     assert_eq!(witness.scenario, BlockScenario::paused_handoffs());
     holds(witness, RESERVED_BYTE_BOUND);
 }
 
-/// The production node captures every runtime payload through receipt and teardown.
+/// The stuck-floor scenario fills the commit window and holds the retained
+/// bound. The seed runs 1,500,000 steps, which `wide-commit-window.patch`
+/// needs to retain 805 bodies. The window fills within 400,000, so this
+/// test stops there.
 #[test]
-fn the_handoff_input_holds_payload_inventory_agrees() {
-    holds(committed(HANDOFF_INPUT), PAYLOAD_INVENTORY_AGREES);
+#[ignore = "a debug run takes minutes; `cargo xtask planted` runs the seed unpatched"]
+fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
+    let mut witness = seeded(STUCK_FLOOR);
+    assert_eq!(witness.scenario, BlockScenario::stuck_floor());
+    witness.scenario.steps = Some(400_000);
+    holds(witness, RETAINED_BYTE_BOUND);
+}
+
+/// The production node captures every runtime payload through receipt and
+/// teardown. With `lost-payload-release.patch`, the sequencer drops a
+/// payload's release, and the same seed violates the property.
+#[test]
+fn the_stalled_reset_seed_holds_payload_inventory_agrees() {
+    holds(seeded(STALLED_RESET), PAYLOAD_INVENTORY_AGREES);
+}
+
+/// The stalled-reset seed holds the ledgers at every quiescence boundary
+/// after a charged handoff. With `handoff-keeps-charge.patch`, a routine
+/// keeps its charge after the handoff, and the same seed violates them.
+#[test]
+fn the_stalled_reset_seed_holds_budget_ledgers_agree() {
+    holds(seeded(STALLED_RESET), BUDGET_LEDGERS_AGREE);
 }
 
 /// D2's `h > 0` witness (P5.1, P5.3): with routines paused in their
@@ -108,7 +136,7 @@ fn the_handoff_input_holds_payload_inventory_agrees() {
 /// `M + 2.5·B`.
 #[test]
 fn paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance() {
-    let witness = committed(PAUSED_HANDOFFS_INPUT);
+    let witness = seeded(PAUSED_HANDOFFS);
     assert_eq!(witness.scenario, BlockScenario::paused_handoffs());
     let report = node_run(&witness.scenario, witness.input);
     let reserved = property(&report, RESERVED_BYTE_BOUND);
@@ -130,27 +158,6 @@ fn paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance() {
         reserved.peaks
     );
     assert_eq!(peak, limits.budget + 5 * B / 2, "{:?}", reserved.peaks);
-}
-
-/// The handoff input holds the ledgers at every quiescence boundary after
-/// a charged handoff. With `handoff-keeps-charge.patch`, a routine keeps
-/// its charge after the handoff, and the same input violates them.
-#[test]
-fn the_handoff_input_holds_budget_ledgers_agree() {
-    holds(committed(HANDOFF_INPUT), BUDGET_LEDGERS_AGREE);
-}
-
-/// The stuck-floor scenario fills the commit window and holds the retained
-/// bound. The committed input runs 1,500,000 steps, which
-/// `wide-commit-window.patch` needs to retain 805 bodies. The window fills
-/// within 400,000, so this test stops there.
-#[test]
-#[ignore = "a debug run takes minutes; `cargo xtask planted` runs the committed input unpatched"]
-fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
-    let mut witness = committed(STUCK_FLOOR_INPUT);
-    assert_eq!(witness.scenario, BlockScenario::stuck_floor());
-    witness.scenario.steps = Some(400_000);
-    holds(witness, RETAINED_BYTE_BOUND);
 }
 
 /// The floor witness (P5.3): routines paused in their handoffs fill the
@@ -357,7 +364,7 @@ fn every_floor_churn_plan_asks_for_the_floor_before_the_reset() {
 #[test]
 #[ignore = "a debug run takes over a minute; run it on demand with `--ignored` and `--profile planted`"]
 fn the_above_window_input_holds_lookahead_overshoot_bound() {
-    let witness = committed(ABOVE_WINDOW_INPUT);
+    let witness = seeded(ABOVE_WINDOW);
     assert_eq!(witness.scenario, BlockScenario::above_window());
     let report = node_run(&witness.scenario, witness.input);
     let lookahead = property(&report, LOOKAHEAD_OVERSHOOT_BOUND);
@@ -381,7 +388,7 @@ fn the_above_window_input_holds_lookahead_overshoot_bound() {
 /// requests, and the same input violates it.
 #[test]
 fn block_sync_teardown_returns_baseline() {
-    let witness = committed(PEERS_LEAVE_INPUT);
+    let witness = seeded(PEERS_LEAVE);
     assert_eq!(witness.scenario, BlockScenario::peers_leave());
     let report = node_run(&witness.scenario, witness.input.clone());
     for id in IDS.into_iter().chain([TEARDOWN_RETURNS_BASELINE]) {

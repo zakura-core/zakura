@@ -15,8 +15,8 @@ use std::{
 use sha2::{Digest, Sha256};
 use zakura_sim::{
     explore::generate::{
-        draws, generate, generator_harnesses, inputs, read_exclusions, GenerateOptions,
-        GenerateReport, Stop, REPORT_FILE, UNTAGGED,
+        draws, draws_with, generate, generator_harnesses, inputs, read_exclusions, DrawPolicy,
+        GenerateOptions, GenerateReport, Schedule, Stop, REPORT_FILE, UNTAGGED,
     },
     harness::{self, HarnessEntry, HARNESSES},
     trace::end_records::END_RECORDS_VAR,
@@ -47,6 +47,8 @@ fn options(out: &Path, records: Option<&Path>) -> GenerateOptions {
         out: out.to_owned(),
         records: records.map(Path::to_owned),
         abandon_limit: 1,
+        draw_policy: DrawPolicy::Uniform,
+        schedule: Schedule::Plan,
     }
 }
 
@@ -285,6 +287,127 @@ fn the_draws_reach_each_family() {
             .collect::<Vec<_>>(),
         plain
     );
+}
+
+/// The cycle draws visit every slot once per block: each family's variants
+/// and one untagged run. On `handshake/wire`, whose hello, ack and prelude
+/// families pick a fault by the byte after the tag, a block of runs draws
+/// every fault of each, which uniform draws of the same length miss. The
+/// uniform policy gives [`draws`]' inputs, and the bytes past what a slot
+/// writes are [`inputs`]' own.
+#[test]
+fn the_cycle_draws_visit_every_variant_once_per_block() {
+    use zakura_sim::harness::{handshake_wire::Wire, Subsystem};
+    let families = Wire::families();
+    let slots: usize = families
+        .iter()
+        .map(|family| usize::from(family.variants))
+        .sum::<usize>()
+        + 1;
+    assert!(
+        families.iter().any(|family| family.variants > 1),
+        "{families:?}"
+    );
+    for block in 0..2 {
+        let drawn: Vec<(Option<&str>, Vec<u8>)> =
+            draws_with(SEED, 512, families.clone(), DrawPolicy::Cycle)
+                .skip(block * slots)
+                .take(slots)
+                .collect();
+        let mut seen = BTreeSet::new();
+        for (family, input) in &drawn {
+            let family = family.unwrap();
+            let slot = match families.iter().find(|listed| listed.name == family) {
+                Some(listed) => {
+                    assert!(input.starts_with(&listed.tag), "{family}: {input:02x?}");
+                    let variant = (listed.variants > 1).then(|| input[listed.tag.len()]);
+                    if let Some(variant) = variant {
+                        assert!(u16::from(variant) < listed.variants, "{family}");
+                    }
+                    (family, variant)
+                }
+                None => {
+                    assert_eq!(family, UNTAGGED);
+                    (family, None)
+                }
+            };
+            assert!(seen.insert(slot), "block {block} draws {slot:?} twice");
+        }
+        assert_eq!(seen.len(), slots, "block {block}");
+    }
+    let uniform: Vec<_> = draws_with(SEED, 512, families.clone(), DrawPolicy::Uniform)
+        .take(64)
+        .collect();
+    assert_eq!(
+        uniform,
+        draws(SEED, 512, families).take(64).collect::<Vec<_>>()
+    );
+    let plain: Vec<Vec<u8>> = inputs(SEED, 512).take(64).collect();
+    let block = Wire::families();
+    for ((family, input), plain) in draws_with(SEED, 512, block.clone(), DrawPolicy::Cycle)
+        .take(64)
+        .zip(&plain)
+    {
+        let written = block
+            .iter()
+            .find(|listed| Some(listed.name) == family)
+            .map_or(0, |listed| {
+                listed.tag.len() + usize::from(listed.variants > 1)
+            });
+        if plain.len() > written {
+            assert_eq!(input[written..], plain[written..]);
+        }
+    }
+}
+
+/// A PCT search stops on the planted race, and the input it saves replays
+/// the same violation with no steer: the zero-padded prefix, then the Plan
+/// bytes the steered run recorded.
+#[test]
+fn a_pct_search_saves_an_input_that_replays_unsteered() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = entry(PLANTED);
+    let report = generate(
+        entry,
+        &GenerateOptions {
+            schedule: Schedule::Pct,
+            ..options(root.path(), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report.schedule, Schedule::Pct);
+    let Stop::Violation { property } = &report.stop else {
+        panic!("the PCT search missed the planted race: {report:?}");
+    };
+    let saved = fs::read(report.input.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        hex(&Sha256::digest(&saved)),
+        report.input_sha256.clone().unwrap()
+    );
+    let run = (entry.run_bytes)(&saved, &mut zakura_sim::NullSink, None);
+    assert_eq!(
+        zakura_sim::explore::classify(entry, &run).outcome,
+        zakura_sim::explore::ExploreOutcome::Fail {
+            property: property.clone()
+        }
+    );
+    // The saved replay isn't the draw, so excluding the reported draw digest
+    // skips that run on the same seed.
+    let draw = report
+        .draw_sha256
+        .clone()
+        .expect("a steered run's replay differs from its draw");
+    let again = generate(
+        entry,
+        &GenerateOptions {
+            schedule: Schedule::Pct,
+            exclude: BTreeSet::from([draw]),
+            ..options(&root.path().join("again"), None)
+        },
+    )
+    .unwrap();
+    assert_eq!(again.skipped, 1, "{again:?}");
+    assert_ne!(again.kill_run, report.kill_run, "{again:?}");
 }
 
 fn hex(bytes: &[u8]) -> String {

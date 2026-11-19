@@ -467,6 +467,17 @@ impl WireEvidence {
             }
             projected.append(&mut self.late);
         }
+        // A request placed after its connection's teardown gets no count,
+        // so it stays unjudged, as the teardown left the ones it released.
+        if !self.unsettled.is_empty() {
+            for connection in &self.torn_down {
+                projected.extend(
+                    take_connection(&mut self.unsettled, *connection)
+                        .into_values()
+                        .map(|unsettled| unsettled.frame),
+                );
+            }
+        }
         let logged: Vec<Observation> = placed.into_iter().chain(projected).collect();
         for obs in &logged {
             log.push(obs.clone());

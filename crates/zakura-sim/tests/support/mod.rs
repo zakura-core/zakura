@@ -3,11 +3,9 @@
 #![allow(dead_code)]
 
 pub mod feed;
-pub mod handshake_seeds;
 pub mod prepare_fault;
 pub mod script;
 pub mod steer;
-pub mod storage_witnesses;
 
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};
@@ -61,26 +59,7 @@ pub fn inputs(count: usize, max_len: usize) -> Vec<PlanInput> {
         .collect()
 }
 
-/// The bytes of [`inputs`].
-pub fn byte_inputs(count: usize, max_len: usize) -> Vec<Vec<u8>> {
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    let mut next = move || {
-        // SplitMix64.
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    (0..count)
-        .map(|_| {
-            // The remainder is at most max_len, which is a usize.
-            let len = (next() % (max_len as u64 + 1)) as usize;
-            // Keeping the low byte is the point.
-            (0..len).map(|_| next() as u8).collect()
-        })
-        .collect()
-}
+pub use zakura_sim::seed::draws::byte_inputs;
 
 /// The picks of `report`, as identity strings.
 pub fn picks(report: &RunReport) -> Vec<&str> {

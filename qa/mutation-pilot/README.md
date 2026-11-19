@@ -188,19 +188,21 @@ list, add a `[[case]]`.
 The cases run on `header_sync_storage`, `header_sync_wire`, `sync_storage`,
 `sync_wire` and `discovery_wire`. Each passes the protocol-state collector,
 and each harness logs the observations the collector reads. Nightly
-`cargo xtask planted --targets` confirms each case's committed input through
-its target. `discovery_wire` has one input case. `block_sync_storage` has
+`cargo xtask planted --targets` confirms each case's seed through its
+target. `discovery_wire` has one seed case. `block_sync_storage` has
 none in the list: a generated run takes about 96 seconds, so a 600-second
 campaign runs a handful of inputs.
 
-`cargo xtask planted pilot feedback` reads the list and checks each case: its
-patch must exist, its property must be the case's directory, and its target
-must run its input's harness. A case listed twice and a typed case fail. The
-runner then builds the runner tree's `HEAD`, as
+`cargo xtask planted pilot feedback` builds the runner tree's simulator to
+list the seed registry, then reads the list and checks each case: its patch
+must exist, its property must be the case's directory, its seed must be in
+the registry, and its target must run its seed's harness. A case listed
+twice and a typed case fail. The runner then builds the runner tree's
+`HEAD`, as
 `planted --targets` does: each original campaign runs `HEAD`, and each
 mutant runs `HEAD` with the case's patch. The list's cases come from the
 runner's tree. The list and each case's `.toml` must match `HEAD`, and
-`HEAD`'s checkout must hold the same patches, inputs and production files,
+`HEAD`'s checkout must hold the same patches, case files and production files,
 so commit any change to the list or a case first. The simulator builds
 with the checkout's own toolchain, and the report's `sim_rustc` records its
 `rustc --version`. Each fuzz build must name the checkout's commit,

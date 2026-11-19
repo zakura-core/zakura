@@ -55,6 +55,25 @@ peer's IP address; otherwise the address is absent. These addresses are every
 peer's, with nothing left out, which is why `/api/propagation` is not passed
 through: the dashboard drops the private ones when it joins the nodes.
 
+**How well peer scores predict block downloads.** The profiler summarises the
+last 1, 6 or 24 hours of requests to announcing Zcash peers (`block_sources.py`, served
+at `/api/sources?hours=N` and shown in the node page's "Where announced blocks
+come from" panel):
+
+- how far each download was from its peer's score, the peer's expected answer
+  time, for first and second requests and by block size;
+- how many second requests were sent, for which reason, how many arrived
+  first or delivered the only copy, and the arrival-time difference when both
+  requests delivered and the second arrived first;
+- how often a peer that announced a block did not deliver it, and the time
+  until the next block observed on the same connection;
+- what the scores were made of: pings and blocks (older builds also counted
+  transaction replies, and only blocks up to 256 KiB).
+
+The last two need a node build that writes the `delivery_score` trace table.
+The summary is kept in memory, so a restarted profiler rebuilds it from what
+it reads back of each table.
+
 ## Staying out of the node's way
 
 - Parsing, storage and serving run at idle scheduling priority and idle I/O

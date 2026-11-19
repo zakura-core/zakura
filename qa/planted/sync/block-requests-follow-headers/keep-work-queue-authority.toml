@@ -5,7 +5,7 @@
 # applies the second, a routine takes that returned work and publishes it
 # under the first. After #2321, the `reorg-submit` input's queue held only
 # in-flight work when its fork arrived, with nothing to take again.
-input = "crates/zakura-sim/tests/fixtures/sync-storage-reorg-verdict-republish.bin"
+seed = "sync-storage-reorg-verdict-republish"
 # Besides sequencer_task/state.rs, which the patch changes, header sync's
 # apply and the rest of block sync decide what work is queued at the fork.
 checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/header_sync"]

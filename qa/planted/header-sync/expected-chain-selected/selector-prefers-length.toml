@@ -11,4 +11,3 @@ checks = ["crates/zakura-header-chain/src/graph", "crates/zakura-header-chain/sr
 [typed]
 harness = "header-sync/storage"
 scenario = "crates/zakura-sim/tests/fixtures/header-selection-heavier-offered-to-longer.json"
-plan = "crates/zakura-sim/tests/fixtures/header-selection-heavier-offered-to-longer.plan"

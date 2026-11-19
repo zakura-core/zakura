@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::{fs, io::Write, path::Path, path::PathBuf, process::Command};
+use std::{io::Write, path::Path, process::Command};
 
 use tempfile::TempDir;
 use zakura_sim::{
@@ -23,10 +23,7 @@ use zakura_sim::{
     MemorySink, NullSink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// The committed input's file stem.
-const STEM: &str = "header-flood-lifecycle";
-
-/// The committed input, `tests/fixtures/header-flood-lifecycle.bin`:
+/// The seed's name, `header-flood-lifecycle` in `zakura_sim::seed`:
 /// [`FloodScenario::Lifecycle`]'s scenario byte, then Plan bytes. The
 /// lifecycle queue delivers an event after its commit and before the watch
 /// read, and the reverted reactor breaks the rule while a churn connect
@@ -34,23 +31,14 @@ const STEM: &str = "header-flood-lifecycle";
 /// `cargo xtask planted header-sync/watch-observed-under-lifecycle-flood`
 /// checks that reverting #1566's top-of-turn watch check violates the rule
 /// on it.
-const INPUT: &[u8] = include_bytes!("fixtures/header-flood-lifecycle.bin");
+const SEED: &str = "header-flood-lifecycle";
 
-/// Which of 24 [`support::byte_inputs`] of up to 256 bytes is the committed
-/// input's Plan.
-const PLAN_INDEX: usize = 2;
-
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// The input [`regenerate_flood_seed`] builds: the lifecycle fixture's
-/// scenario byte, then its Plan.
-fn generated() -> Vec<u8> {
-    let mut input = vec![1];
-    input.extend(support::byte_inputs(24, 256).swap_remove(PLAN_INDEX));
-    input
+/// The seed's input.
+fn seed_input() -> Vec<u8> {
+    seed::find(SEED)
+        .unwrap_or_else(|| panic!("{SEED} is registered"))
+        .input()
+        .to_vec()
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -73,15 +61,16 @@ fn run(scenario: FloodScenario, input: PlanInput) -> (RunReport, PropertyOutcome
     (report, outcome)
 }
 
-/// The committed input holds its property through the registered harness
-/// and reaches its trigger history: the lifecycle queue delivered an event
-/// after the commit and before the watch read.
+/// The seed holds its property through the registered harness and reaches
+/// its trigger history: the lifecycle queue delivered an event after the
+/// commit and before the watch read.
 #[test]
-fn the_committed_flood_input_holds_its_watch_rule() {
+fn the_flood_seed_holds_its_watch_rule() {
     let entry = harness::find(Flood::NAME).expect("the harness is registered");
+    let input = seed_input();
     let result = (entry.witness)(
-        &entry.scenario(&INPUT[..Flood::SCENARIO_BYTES]),
-        plan(INPUT),
+        &entry.scenario(&input[..Flood::SCENARIO_BYTES]),
+        plan(&input),
         WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
         Expect::Holds,
         &[],
@@ -92,7 +81,7 @@ fn the_committed_flood_input_holds_its_watch_rule() {
 
 /// The lifecycle watch property holds under every plan in both fixtures.
 /// Not every plan's queue competes with the commit's watch read, which is
-/// why the committed input is pinned.
+/// why the seed's Plan is fixed.
 #[test]
 fn the_flood_fixtures_hold_the_watch_rule_under_every_plan() {
     for scenario in [FloodScenario::Wire, FloodScenario::Lifecycle] {
@@ -120,12 +109,13 @@ fn the_scenario_byte_picks_the_flood_fixture() {
     }
 }
 
-/// The run's log and the watch outcome depend only on the plan: the
-/// committed lifecycle plan A twice, then B, then A again, gives A's every
-/// time, and B's log differs.
+/// The run's log and the watch outcome depend only on the plan: the seed's
+/// plan A twice, then B, then A again, gives A's every time, and B's log
+/// differs.
 #[test]
 fn flood_runs_repeat_a_a_and_a_b_a() {
-    let plans: [&[u8]; 2] = [&INPUT[Flood::SCENARIO_BYTES..], &[7; 256]];
+    let lifecycle = seed_input();
+    let plans: [&[u8]; 2] = [&lifecycle[Flood::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()
         .map(|plan| {
@@ -141,31 +131,30 @@ fn flood_runs_repeat_a_a_and_a_b_a() {
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
 }
 
-/// Set, to a directory holding the committed input's recorded trace, in the
-/// child process that [`the_flood_witness_replays_in_a_fresh_process`]
-/// starts.
+/// Set, to a directory holding the seed's recorded trace, in the child
+/// process that [`the_flood_witness_replays_in_a_fresh_process`] starts.
 const CHILD: &str = "ZAKURA_SIM_FLOOD_TRACE";
 
-/// The committed input, recorded in this process, replays exactly in a
-/// fresh process of the same test binary, where its run gives the same
-/// watch outcome.
+/// The seed, recorded in this process, replays exactly in a fresh process
+/// of the same test binary, where its run gives the same watch outcome.
 #[test]
 fn the_flood_witness_replays_in_a_fresh_process() {
     let entry = harness::find(Flood::NAME).expect("the harness is registered");
+    let input = seed_input();
     if let Some(dir) = std::env::var_os(CHILD) {
         let trace = TraceReader::open(Path::new(&dir)).expect("the trace was recorded");
         // A replay that leaves the trace's picks, draws or observations, or
         // fails where the recording didn't, errs.
         replay_with(&trace, entry, ReplayOptions::default())
             .unwrap_or_else(|error| panic!("{error}"));
-        let (_, outcome) = run(FloodScenario::Lifecycle, plan(INPUT));
+        let (_, outcome) = run(FloodScenario::Lifecycle, plan(&input));
         writeln!(std::io::stdout(), "FLOOD-BEGIN\n{outcome:?}\nFLOOD-END")
             .expect("the test harness captures stdout");
         return;
     }
     let dir = TempDir::new().expect("a temporary directory");
-    record(entry, RecordInput::Input(INPUT), dir.path()).expect("the witness records");
-    let (_, outcome) = run(FloodScenario::Lifecycle, plan(INPUT));
+    record(entry, RecordInput::Input(&input), dir.path()).expect("the witness records");
+    let (_, outcome) = run(FloodScenario::Lifecycle, plan(&input));
     let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
         .args([
             "--exact",
@@ -186,18 +175,14 @@ fn the_flood_witness_replays_in_a_fresh_process() {
     assert_eq!(replayed, format!("{outcome:?}"));
 }
 
-/// The committed input is its [`generated`] input, and runs through the
-/// registered harness to a defined end that the explorer classifies clean.
+/// The seed draws the lifecycle fixture, and runs through the registered
+/// harness to a defined end that the explorer classifies clean.
 #[test]
-fn the_committed_flood_input_is_its_plan_and_runs_clean() {
+fn the_flood_seed_draws_its_fixture_and_runs_clean() {
     let entry = harness::find(Flood::NAME).expect("the harness is registered");
-    assert_eq!(
-        INPUT,
-        generated(),
-        "the committed input changed; regenerate it if that's intended"
-    );
-    assert_eq!(Flood::draw(INPUT), FloodScenario::Lifecycle);
-    let run = (entry.run_bytes)(INPUT, &mut NullSink, None);
+    let input = seed_input();
+    assert_eq!(Flood::draw(&input), FloodScenario::Lifecycle);
+    let run = (entry.run_bytes)(&input, &mut NullSink, None);
     let report = run.report().unwrap_or_else(|| panic!("{:?}", run.result));
     assert!(
         matches!(report.end.outcome, Outcome::Budget | Outcome::Idle { .. }),
@@ -206,36 +191,4 @@ fn the_committed_flood_input_is_its_plan_and_runs_clean() {
     );
     assert_eq!(run.leaked(), 0);
     assert_eq!(classify(entry, &run).outcome, ExploreOutcome::Clean);
-}
-
-/// Rewrites the committed input and its sidecar. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_flood_watch -- --ignored regenerate_flood_seed`.
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_flood_seed() {
-    let input = generated();
-    let base = fixtures().join(STEM);
-    fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-    let sidecar = format!(
-        "# The committed fuzz input `{STEM}.bin`: the harness that runs it, the\n\
-         # generator version it was built for, and its SHA-256. Its first byte\n\
-         # picks the flood fixture, then come the Plan bytes.\n\
-         harness = \"{harness}\"\n\
-         generator = {generator}\n\
-         sha256 = \"{digest}\"\n\
-         scenario_sha256 = \"{scenario}\"\n\
-         source = \"crates/zakura-sim/tests/header_flood_watch.rs\"\n\
-         \n\
-         [[witness]]\n\
-         property = \"{WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD}\"\n\
-         expect = \"holds\"\n",
-        harness = Flood::NAME,
-        generator = Flood::GENERATOR,
-        digest = seed::sha256(&input),
-        scenario = seed::scenario_sha256(
-            &serde_json::to_value(FloodScenario::Lifecycle).expect("scenarios serialize")
-        ),
-    );
-    fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
 }

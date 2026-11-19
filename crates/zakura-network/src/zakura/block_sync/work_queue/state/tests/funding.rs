@@ -893,7 +893,7 @@ mod tests {
 
     /// One session publishes 1,000 above-floor bytes, overdraws 500 more
     /// with a floor request, and its next floor request would pass the floor
-    /// total. The same bytes are the committed `block-work-owner-cap.bin`.
+    /// total. zakura-sim's `block-work-owner-cap` seed is the same bytes.
     pub(super) const OWNER_CAP_INPUT: &[u8] = &[
         0, 0, 7, 249, 1, 2, 31, 10, 2, 0, 0, 0, 3, 0, 0, 0, 1, 6, 15, 5, 2, 1, 6, 0, 3, 1, 0, 0, 0,
         8, 1, 249, 1, 8, 7, 3, 2, 2, 8, 0,

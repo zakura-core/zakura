@@ -1,409 +1,51 @@
-//! The committed fuzz seeds and their validation against the current
-//! generators (explorer implementation plan, E3a-1).
+//! The seed registry (explorer implementation plan, E3a-1): every seed
+//! builds and validates, and every planted case and work-list entry that
+//! names a seed names one the registry builds.
 #![cfg(zakura_sim)]
 
-mod support;
+use std::{collections::BTreeSet, fs, path::Path};
 
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
-
-use serde::Serialize;
-use support::{handshake_seeds, storage_witnesses};
-use tempfile::TempDir;
 use zakura_sim::{
-    harness::{
-        block_sync::BlockScenario,
-        discovery, discovery_service,
-        fixtures::{PickScenario, Variant, Which},
-        header_sync::{FloodScenario, RepairScenario, StorageScenario, WakeScenario},
-        sync::SavedSync,
-        sync_wire::{self, SavedWire, CURATED},
-        wire_plans::SavedPlan,
-        HARNESSES,
-    },
+    harness::HARNESSES,
     planted,
-    seed::{self, SeedError, SeedKind, SeedReport},
+    seed::{self, Seed, SeedError, SeedSet},
+    witness::Expect,
 };
 
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// [`seed::load`] on `dirs`, which list.
-fn load(dirs: &[PathBuf], harness: Option<&str>) -> SeedReport {
-    seed::load(dirs, harness).expect("the directories list")
-}
-
-/// The committed seeds that fail by design, outside the seed corpus.
-fn known_failures() -> PathBuf {
-    fixtures().join("known-failures")
-}
-
-/// The committed seeds that run too long for a fuzz input, outside the
-/// seed corpus.
-fn slow_seeds() -> PathBuf {
-    fixtures().join("slow-seeds")
-}
-
-/// Every committed seed passes validation, and none is left out. No seed
-/// in the corpus expects a violation, since fuzz campaigns and target
-/// checks run each one as an input that passes.
+/// Every seed in every set validates, and no two share a name. The corpus
+/// holds seeds, since fuzz campaigns and target checks start from it.
 #[test]
-fn committed_seeds_validate() {
-    let report = load(&[fixtures()], None);
-    let failures: Vec<String> = report
-        .rejected
-        .iter()
-        .chain(&report.quarantined)
-        .map(|failed| format!("{}: {}", failed.path.display(), failed.error))
-        .collect();
-    assert!(failures.is_empty(), "{failures:#?}");
-    let inputs = fs::read_dir(fixtures())
-        .expect("the fixture directory lists")
-        .filter(|entry| {
-            entry
-                .as_ref()
-                .expect("the directory lists")
-                .path()
-                .extension()
-                .is_some_and(|e| e == seed::SEED_EXTENSION)
-        })
-        .count();
-    assert_eq!(report.admitted.len(), inputs);
-    assert!(inputs > 0, "the S4.7 input is committed");
-    assert!(report.admitted.iter().all(|seed| seed.sidecar.required));
-    let failing: Vec<&Path> = report
-        .admitted
-        .iter()
-        .filter(|seed| seed.sidecar.expects_violation())
-        .map(|seed| seed.path.as_path())
-        .collect();
-    assert!(
-        failing.is_empty(),
-        "these seeds fail by design, so they belong in {}: {failing:?}",
-        known_failures().display()
-    );
-}
-
-/// Every seed in the known-failure directory validates, and each carries a
-/// witness that expects a violation, which its own test checks. Without an
-/// open-bug repro, the directory is absent.
-#[test]
-fn known_failures_validate_and_expect_violations() {
-    if !known_failures().is_dir() {
-        return;
+fn every_seed_validates() {
+    for set in [SeedSet::Corpus, SeedSet::KnownFailure, SeedSet::Slow] {
+        let report = seed::load(set, None);
+        let failures: Vec<String> = report
+            .rejected
+            .iter()
+            .map(|failed| format!("{}: {}", failed.seed.name, failed.error))
+            .collect();
+        assert!(failures.is_empty(), "{set:?}: {failures:#?}");
     }
-    let report = load(&[known_failures()], None);
-    assert!(
-        report.rejected.is_empty() && report.quarantined.is_empty(),
-        "{:?} {:?}",
-        report.rejected,
-        report.quarantined
-    );
-    for seed in &report.admitted {
+    assert!(!seed::load(SeedSet::Corpus, None).admitted.is_empty());
+    let mut names = BTreeSet::new();
+    for seed in seed::all() {
         assert!(
-            seed.sidecar.expects_violation(),
-            "{} expects no violation, so it belongs in the seed corpus",
-            seed.path.display()
+            names.insert(seed.name.clone()),
+            "two seeds are named {}",
+            seed.name
         );
     }
 }
 
-/// Every seed in the slow-seed directory validates, and none expects a
-/// violation: each runs clean, only too long for a fuzz input.
+/// Each case under `qa/planted/` sits beside its patch and names a property
+/// a harness reports. A seed case names a seed of any set that carries a
+/// `holds` witness of the case's property, as `cargo xtask planted` checks
+/// it unpatched. A typed case names a committed scenario, and a Plan file
+/// if it gives one.
 #[test]
-fn slow_seeds_validate_and_expect_no_violation() {
-    let report = load(&[slow_seeds()], None);
-    assert!(
-        report.rejected.is_empty() && report.quarantined.is_empty(),
-        "{:?} {:?}",
-        report.rejected,
-        report.quarantined
-    );
-    assert!(
-        !report.admitted.is_empty(),
-        "the stuck-floor input is committed"
-    );
-    for seed in &report.admitted {
-        assert!(
-            !seed.sidecar.expects_violation(),
-            "{} expects a violation, so it belongs in {}",
-            seed.path.display(),
-            known_failures().display()
-        );
-    }
-}
-
-/// The scenario each committed seed is meant to run, by its file's stem,
-/// built with the scenario's own constructor rather than the generator.
-fn intended(stem: &str) -> Option<serde_json::Value> {
-    fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
-        Some(serde_json::to_value(scenario).expect("scenarios serialize"))
-    }
-    if let Some(curated) = handshake_seeds::handshake_seeds()
-        .into_iter()
-        .find(|curated| curated.stem == stem)
-    {
-        return value(curated.scenario);
-    }
-    if stem == "handshake-partial-session" {
-        use zakura_sim::{
-            harness::handshake_wire::Scenario,
-            peer::{handshake::options::HandshakeSpec, PeerAction, PeerSpec},
-        };
-        let mut peer = PeerSpec::dialing();
-        peer.capabilities |= 1 << 59;
-        peer.handshake = Some(HandshakeSpec::default());
-        peer.script = vec![
-            PeerAction::Offer {
-                kind: 902,
-                version: 1,
-                wire_id: 1,
-            },
-            PeerAction::Close,
-        ];
-        return value(Scenario {
-            peers: vec![peer; 3],
-            ..Scenario::default()
-        });
-    }
-    if stem == "handshake-stream-churn" {
-        use zakura_sim::{
-            harness::handshake_wire::Scenario,
-            peer::{handshake::options::HandshakeSpec, PeerAction},
-        };
-        let mut scenario = Scenario::default();
-        scenario.net.default_link.min_delay_ms = 0;
-        scenario.net.default_link.max_delay_ms = 0;
-        scenario.peers[0].handshake = Some(HandshakeSpec::default());
-        scenario.peers[0].script = vec![
-            PeerAction::Open {
-                kind: u16::MAX,
-                version: 1
-            };
-            64
-        ];
-        scenario.peers[0].script.push(PeerAction::Close);
-        return value(scenario);
-    }
-    if stem == "handshake-installed-services" {
-        use zakura_sim::{
-            harness::handshake_wire::Scenario,
-            peer::{handshake::options::HandshakeSpec, PeerSpec},
-        };
-        return value(Scenario {
-            peers: vec![PeerSpec {
-                handshake: Some(HandshakeSpec::default()),
-                ..PeerSpec::listening()
-            }],
-            ..Scenario::default()
-        });
-    }
-    if let Some(plan) = SavedPlan::ALL
-        .into_iter()
-        .find(|plan| stem == format!("header-wire-{}", plan.name()))
-    {
-        return value(plan.scenario());
-    }
-    if let Some(plan) = discovery_service::SavedPlan::ALL
-        .into_iter()
-        .find(|plan| stem == format!("discovery-wire-{}", plan.name()))
-    {
-        return value(plan.scenario());
-    }
-    if let Some(fixture) = Which::ALL.into_iter().find(|fixture| {
-        stem == format!(
-            "race-fixtures-{}-fixed",
-            fixture.property().trim_start_matches("race/")
-        )
-    }) {
-        return value(PickScenario {
-            fixture,
-            variant: Variant::Fixed,
-            workers: 1,
-        });
-    }
-    if let Some(saved) = SavedWire::ALL
-        .into_iter()
-        .find(|saved| stem == format!("sync-wire-{}", saved.name()))
-    {
-        return value(saved.scenario());
-    }
-    if let Some((_, prefix)) = CURATED
-        .into_iter()
-        .find(|(name, _)| stem == format!("sync-wire-{name}"))
-    {
-        return value(sync_wire::combined(&prefix));
-    }
-    if stem == "sync-wire-reset-mid-write" {
-        return value(sync_wire::combined(&[sync_wire::COMBINED_TAG, 0b0001_0100]));
-    }
-    if let Some(saved) = SavedSync::ALL
-        .into_iter()
-        .find(|saved| stem == format!("sync-storage-{}", saved.name()))
-    {
-        return value(saved.scenario());
-    }
-    if let Some((_, scenario)) = storage_witnesses::witness_seeds()
-        .into_iter()
-        .find(|(witness, _)| witness == stem)
-    {
-        return value(scenario);
-    }
-    match stem {
-        "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
-            input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
-        }),
-        "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
-            input: vec![128, 1, 128],
-        }),
-        "handshake-counts-cadence" => value(zakura_sim::record::machine::MachineScenario {
-            input: [8, 0, 0].repeat(32),
-        }),
-        "handshake-cadence-burst" | "handshake-cadence-conformant" => {
-            let conformant = stem == "handshake-cadence-conformant";
-            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
-            scenario.net.default_link.min_delay_ms = 0;
-            scenario.net.default_link.max_delay_ms = 0;
-            scenario.net.default_link.reorder = false;
-            scenario.peers = (0..if conformant { 16 } else { 1 })
-                .map(|index| {
-                    let mut peer = zakura_sim::peer::PeerSpec::dialing();
-                    peer.handshake = Some(zakura_sim::peer::handshake::options::HandshakeSpec {
-                        control: zakura_sim::peer::handshake::options::ControlFault::Network,
-                        bind_ip: Some("192.0.2.1".parse().unwrap()),
-                        retries: if conformant { 1 } else { 31 },
-                        retry_delay_ms: if conformant { 1_000 } else { 0 },
-                        dial_delay_ms: index * 60,
-                        ..Default::default()
-                    });
-                    peer
-                })
-                .collect();
-            value(scenario)
-        }
-        "handshake-slow-control" => {
-            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
-            scenario.peers[0].handshake =
-                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
-                    length_delay_ms: 9_000,
-                    payload_delay_ms: 9_000,
-                    ..Default::default()
-                });
-            value(scenario)
-        }
-
-        "header-sync-storage-default" => value(StorageScenario::default()),
-        "sync-storage-reorg-stale-body" => value(SavedSync::Reorg.scenario()),
-        "sync-storage-reorg-verdict-republish" => value(SavedSync::ReorgVerdict.scenario()),
-        "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
-            input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],
-        }),
-        "block-reactor-policy" => value(zakura_sim::record::machine::MachineScenario {
-            input: vec![
-                0, 0, 1, 200, 0, 8, 2, 200, 7, 0, 200, 0, 3, 0, 0, 0, 1, 0, 0, 1, 6, 2, 1, 0, 6, 3,
-                0, 0, 5, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 200, 2, 0, 1, 0, 7, 0, 200, 0, 3, 0, 0, 0,
-                4, 0, 30, 0, 6, 0, 3, 0,
-            ],
-        }),
-        "block-work-ownership" => value(zakura_sim::record::machine::MachineScenario {
-            input: vec![
-                0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 9, 1, 0, 0, 1, 2, 1, 0, 0,
-                5, 0, 0, 0, 4, 1, 0, 0, 5, 1, 0, 0,
-            ],
-        }),
-        "header-reactor-policy" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
-        }),
-        "header-publisher-policy" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/header-publisher-policy.bin").to_vec(),
-        }),
-        "block-work-funding" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/block-work-funding.bin").to_vec(),
-        }),
-        "block-decoded-retention" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/block-decoded-retention.bin").to_vec(),
-        }),
-        "block-work-owner-cap" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/block-work-owner-cap.bin").to_vec(),
-        }),
-        "discovery-wait-complete" => value(discovery::Scenario::default()),
-        "discovery-verification-capacity" => value(discovery::CapacityScenario::default()),
-        "discovery-record-book" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/discovery-record-book.bin").to_vec(),
-        }),
-        "discovery-session-installation" => value(zakura_sim::record::machine::MachineScenario {
-            input: include_bytes!("fixtures/discovery-session-installation.bin").to_vec(),
-        }),
-        "block-sync-handoff" => value(BlockScenario::default()),
-        "block-sync-stuck-floor" => value(BlockScenario::stuck_floor()),
-        "block-sync-paused-handoffs" | "block-sync-floor-lane-race" => {
-            value(BlockScenario::paused_handoffs())
-        }
-        "block-sync-above-window" => value(BlockScenario::above_window()),
-        "block-sync-peers-leave" => value(BlockScenario::peers_leave()),
-        "block-sync-reset-mid-flight" | "block-sync-stale-request-body" => {
-            value(BlockScenario::reset_mid_flight())
-        }
-        "block-sync-stale-beside-current" => value(BlockScenario::stale_beside_current()),
-        "block-sync-stalled-reset" => value(BlockScenario::stalled_reset()),
-        "block-sync-decoded-input-stall" => value(BlockScenario::decoded_input_stall()),
-        "block-sync-capacity-frontier-first" | "block-sync-capacity-reply-first" => {
-            value(BlockScenario::capacity_release())
-        }
-        "header-storage-default" => value(StorageScenario::default()),
-        "header-storage-close-relink" => value(StorageScenario::close_relink()),
-        "header-storage-grow" => value(StorageScenario::grow()),
-        "header-storage-holds" => value(StorageScenario::holds()),
-        "header-storage-triggers" | "header-storage-stale-prepare" => {
-            value(StorageScenario::triggers())
-        }
-        "header-storage-locator-dropped" => value(storage_witnesses::dropped_locator()),
-        "header-storage-apply-at-close" => value(storage_witnesses::apply_at_close()),
-        "header-storage-competing-mirrors" => value(storage_witnesses::competing_mirrors()),
-        "header-release-wake" => value(WakeScenario::Release),
-        "header-release-wake-deferred" => value(WakeScenario::Deferred),
-        "header-flood-lifecycle" => value(FloodScenario::Lifecycle),
-        "header-repair-applied" => value(RepairScenario::Applied),
-        "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),
-        "header-repair-apply-departs" => value(RepairScenario::ApplyDeparts),
-        "header-repair-supplier-pruned" => value(RepairScenario::SupplierPruned),
-        _ => None,
-    }
-}
-
-/// Each committed seed's sidecar records its intended scenario, so a seed
-/// that passes validation decodes to that scenario. A new seed needs a row
-/// in [`intended`].
-#[test]
-fn committed_seeds_record_their_intended_scenarios() {
-    let report = load(&[fixtures(), slow_seeds()], None);
-    for seed in &report.admitted {
-        let stem = seed.path.file_stem().and_then(|s| s.to_str()).unwrap();
-        let scenario = intended(stem).unwrap_or_else(|| panic!("{stem} has no intended scenario"));
-        assert_eq!(
-            seed.sidecar.scenario_sha256,
-            seed::scenario_sha256(&scenario),
-            "{stem}"
-        );
-    }
-}
-
-/// Each planted case's committed input is a seed whose sidecar carries a
-/// witness of the case's property expecting `holds`, as `cargo xtask
-/// planted` checks it unpatched. The test reads every case file at any
-/// depth under `qa/planted/`, and each must sit beside a patch the runner
-/// finds, so no case escapes either. Each case's property is one a
-/// harness reports.
-#[test]
-fn planted_inputs_carry_their_witnesses() {
+fn planted_cases_name_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let catalogue = root.join(planted::PLANTED_DIR);
-    let report = load(&[fixtures(), slow_seeds()], None);
+    let seeds = seed::all();
     let reported: BTreeSet<String> = HARNESSES
         .iter()
         .flat_map(|entry| (entry.properties)())
@@ -431,368 +73,106 @@ fn planted_inputs_carry_their_witnesses() {
         );
         let table: toml::Table = toml::from_str(&fs::read_to_string(case).unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
-        // A typed case runs a committed scenario, not a seed.
+        // A typed case runs a committed scenario under Plan bytes, a
+        // scripted Plan or the empty Plan, not a seed.
         if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
-            for file in ["scenario", "plan"] {
-                let path = typed[file].as_str().unwrap();
+            assert!(
+                !(typed.contains_key("plan") && typed.contains_key("script")),
+                "{}: both a plan and a script",
+                case.display()
+            );
+            for file in ["scenario", "plan", "script"] {
+                let Some(path) = typed.get(file).and_then(toml::Value::as_str) else {
+                    assert_ne!(file, "scenario", "{}: no scenario", case.display());
+                    continue;
+                };
                 assert!(root.join(path).is_file(), "{}: no {path}", case.display());
             }
             continue;
         }
-        let input = root.join(table["input"].as_str().unwrap());
-        let seed = report
-            .admitted
+        let name = table["seed"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}: `seed` isn't a name", case.display()));
+        let seed = seeds
             .iter()
-            .find(|seed| seed.path.canonicalize().ok() == input.canonicalize().ok())
-            .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
+            .find(|seed| seed.name == name)
+            .unwrap_or_else(|| panic!("{}: no seed is named {name}", case.display()));
         assert!(
-            seed.sidecar
-                .witness
+            seed.witness
                 .iter()
                 .any(|witness| witness.property == id && witness.expect == "holds"),
-            "{}: {} carries no `holds` witness of {id}",
-            case.display(),
-            seed.path.display()
+            "{}: {name} carries no `holds` witness of {id}",
+            case.display()
         );
     }
     assert!(!cases.is_empty(), "the planted cases are committed");
 }
 
-/// A directory holding one seed, `seed.bin`, built from a committed seed.
-struct Scratch {
-    dir: TempDir,
+/// A corpus seed that passes [`seed::check`], to break one field at a time.
+fn good() -> Seed {
+    let seed = seed::find("discovery-wait-complete").expect("the seed is registered");
+    assert_eq!(seed::check(&seed), Ok(()));
+    seed
 }
 
-impl Scratch {
-    /// Copies the committed seed `stem` and its sidecar, rewritten by
-    /// `edit`.
-    fn copy(stem: &str, edit: impl FnOnce(String) -> String) -> Scratch {
-        let scratch = Scratch {
-            dir: TempDir::new().unwrap(),
-        };
-        let bytes = fs::read(fixtures().join(format!("{stem}.bin"))).unwrap();
-        let sidecar = fs::read_to_string(fixtures().join(format!("{stem}.toml"))).unwrap();
-        scratch.write(&bytes, Some(&edit(sidecar)));
-        scratch
-    }
-
-    /// Writes `seed.bin`, and `seed.toml` if given.
-    fn write(&self, bytes: &[u8], sidecar: Option<&str>) {
-        fs::write(self.dir.path().join("seed.bin"), bytes).unwrap();
-        if let Some(sidecar) = sidecar {
-            fs::write(self.dir.path().join("seed.toml"), sidecar).unwrap();
-        }
-    }
-
-    /// [`load`] on the directory.
-    fn load(&self, harness: Option<&str>) -> SeedReport {
-        load(&[self.dir.path().to_owned()], harness)
-    }
-
-    /// The one seed's failure, which must be a rejection.
-    fn rejected(&self) -> SeedError {
-        let report = self.load(None);
-        assert!(report.admitted.is_empty() && report.quarantined.is_empty());
-        let [failed] = <[_; 1]>::try_from(report.rejected).expect("one seed is rejected");
-        failed.error
-    }
-}
-
-/// The sidecar of the committed seed `stem`, with `from` replaced by `to`.
-fn replace(from: &'static str, to: &'static str) -> impl FnOnce(String) -> String {
-    move |sidecar: String| {
-        assert!(sidecar.contains(from), "{from}");
-        sidecar.replacen(from, to, 1)
-    }
-}
-
-/// A seed built for another generator is rejected with both versions.
+/// A seed for an unregistered harness, or with input for another generator,
+/// is rejected.
 #[test]
-fn another_generator_is_rejected() {
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace("generator = 1", "generator = 7"),
-    );
+fn a_seed_must_fit_its_harness() {
+    let mut seed = good();
+    seed.harness = "no/such-harness".to_owned();
     assert_eq!(
-        scratch.rejected(),
-        SeedError::Generator {
-            seed: 7,
-            harness: 1
-        }
+        seed::check(&seed),
+        Err(SeedError::UnknownHarness("no/such-harness".to_owned()))
     );
+    let seed = seed::find("header-storage-default").expect("the seed is registered");
+    let mut input = seed.input().to_vec();
+    // Generator 2's prefix, which the current header-storage generator
+    // decodes as its fallback scenario.
+    input[0] = 2;
+    let seed = Seed::new(seed.name, &seed.harness, &seed.source, input);
+    assert_eq!(seed::check(&seed), Err(SeedError::OtherGenerator));
 }
 
-/// A seed whose bytes changed is rejected with both digests.
-#[test]
-fn changed_bytes_are_rejected() {
-    let scratch = Scratch::copy("discovery-wait-complete", |sidecar| sidecar);
-    let mut bytes = fs::read(fixtures().join("discovery-wait-complete.bin")).unwrap();
-    bytes.push(0);
-    scratch.write(&bytes, None);
-    assert!(
-        matches!(scratch.rejected(), SeedError::Digest { actual, .. } if actual == seed::sha256(&bytes))
-    );
-}
-
-/// A seed without a sidecar, and a sidecar without a seed, are rejected.
-#[test]
-fn missing_halves_are_rejected() {
-    let scratch = Scratch::copy("discovery-wait-complete", |sidecar| sidecar);
-    fs::remove_file(scratch.dir.path().join("seed.toml")).unwrap();
-    assert_eq!(scratch.rejected(), SeedError::NoSidecar);
-    let scratch = Scratch::copy("discovery-wait-complete", |sidecar| sidecar);
-    fs::remove_file(scratch.dir.path().join("seed.bin")).unwrap();
-    assert_eq!(scratch.rejected(), SeedError::NoInput);
-}
-
-/// A sidecar with an unknown field, or one naming no harness, is rejected
-/// even when the caller asks for another harness's seeds.
-#[test]
-fn unreadable_sidecars_are_rejected_for_every_harness() {
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace("source =", "sauce = \"x\"\nsource ="),
-    );
-    assert!(matches!(scratch.rejected(), SeedError::Sidecar(_)));
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace("\"discovery/wait-complete\"", "\"discovery/nowhere\""),
-    );
-    let report = scratch.load(Some("block-sync/storage"));
-    assert_eq!(report.other_harnesses, 0);
-    assert_eq!(
-        report.rejected[0].error,
-        SeedError::UnknownHarness("discovery/nowhere".to_owned())
-    );
-}
-
-/// A seed whose prefix decodes to another scenario than its sidecar records
-/// is rejected with the decoded scenario's digest.
-#[test]
-fn another_scenario_is_rejected() {
-    let reset = fs::read_to_string(fixtures().join("block-sync-reset-mid-flight.toml")).unwrap();
-    let reset_digest = toml::from_str::<seed::Sidecar>(&reset)
-        .unwrap()
-        .scenario_sha256;
-    let scratch = Scratch::copy("block-sync-stale-beside-current", |sidecar| {
-        let stale = toml::from_str::<seed::Sidecar>(&sidecar).unwrap();
-        sidecar.replace(&stale.scenario_sha256, &reset_digest)
-    });
-    let stale = load(&[fixtures()], Some("block-sync/storage"))
-        .admitted
-        .into_iter()
-        .find(|seed| seed.path.ends_with("block-sync-stale-beside-current.bin"))
-        .unwrap();
-    assert_eq!(
-        scratch.rejected(),
-        SeedError::Scenario {
-            recorded: reset_digest,
-            decoded: stale.sidecar.scenario_sha256,
-        }
-    );
-}
-
-/// A witness must name a registered property, once, with an expectation.
+/// A witness must name a registered property, once, and a seed must name
+/// its source.
 #[test]
 fn bad_witnesses_are_rejected() {
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace(
-            "discovery/wait-complete-wakes",
-            "discovery/no-such-property",
-        ),
-    );
+    let seed = good().witness("discovery/no-such-property", Expect::Holds);
     assert_eq!(
-        scratch.rejected(),
-        SeedError::Unregistered("discovery/no-such-property".to_owned())
+        seed::check(&seed),
+        Err(SeedError::Unregistered(
+            "discovery/no-such-property".to_owned()
+        ))
     );
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace("expect = \"holds\"", "expect = \"maybe\""),
-    );
-    assert!(matches!(scratch.rejected(), SeedError::Expect { .. }));
-    let scratch = Scratch::copy("discovery-wait-complete", |sidecar| {
-        format!(
-            "{sidecar}\n[[witness]]\nproperty = \"discovery/wait-complete-wakes\"\n\
-             expect = \"violated\"\n"
-        )
-    });
+    let property = good().witness[0].property.clone();
+    let seed = good().witness(&property, Expect::Applicable);
     assert_eq!(
-        scratch.rejected(),
-        SeedError::DuplicateWitness("discovery/wait-complete-wakes".to_owned())
+        seed::check(&seed),
+        Err(SeedError::DuplicateWitness(property))
     );
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace(
-            "source = \"crates/zakura-sim/tests/witness.rs\"",
-            "source = \" \"",
-        ),
-    );
-    assert_eq!(scratch.rejected(), SeedError::NoSource);
+    let mut seed = good();
+    seed.source = " ".to_owned();
+    assert_eq!(seed::check(&seed), Err(SeedError::NoSource));
 }
 
-/// The committed stale-beside-current seed as a `plan` seed: its Plan bytes
-/// alone, with `prefix` as the given sidecar text.
-fn plan_seed(prefix: &str) -> Scratch {
-    let scratch = Scratch {
-        dir: TempDir::new().unwrap(),
-    };
-    let input = fs::read(fixtures().join("block-sync-stale-beside-current.bin")).unwrap();
-    let plan = &input[2..];
-    let sidecar = fs::read_to_string(fixtures().join("block-sync-stale-beside-current.toml"))
-        .unwrap()
-        .replace(&seed::sha256(&input), &seed::sha256(plan))
-        .replacen("source =", &format!("kind = \"plan\"\n{prefix}source ="), 1);
-    scratch.write(plan, Some(&sidecar));
-    scratch
-}
-
-/// A `plan` seed joins its prefix to its Plan bytes. Its prefix must decode
-/// to the recorded scenario, and it can't be left out.
+/// A seed's witnesses fit its set: only a known failure expects a violation,
+/// and a known failure must.
 #[test]
-fn plan_seeds_take_their_scenario_from_the_prefix() {
-    let report = plan_seed("prefix = \"ff06\"\n").load(None);
-    let [admitted] = <[_; 1]>::try_from(report.admitted).expect("the plan seed is admitted");
-    assert_eq!(admitted.sidecar.kind, SeedKind::Plan);
-    assert_eq!(
-        admitted.input,
-        fs::read(fixtures().join("block-sync-stale-beside-current.bin")).unwrap()
-    );
-    // `ff 0c` is reset-mid-flight's tag.
-    assert!(matches!(
-        plan_seed("prefix = \"ff0c\"\n").rejected(),
-        SeedError::Scenario { .. }
-    ));
-    assert_eq!(plan_seed("").rejected(), SeedError::NoPrefix);
-    assert_eq!(
-        plan_seed("prefix = \"ff\"\n").rejected(),
-        SeedError::Prefix {
-            prefix: "ff".to_owned(),
-            scenario_bytes: 2
-        }
-    );
-    let scratch = Scratch::copy(
-        "block-sync-stale-beside-current",
-        replace("source =", "prefix = \"ff06\"\nsource ="),
-    );
-    assert_eq!(scratch.rejected(), SeedError::PrefixOnInput);
-}
-
-/// An optional seed that fails is quarantined with its reason, and a seed
-/// of another harness than the one asked for is only counted. An optional
-/// seed naming no registered harness is quarantined whichever harness is
-/// asked for.
-#[test]
-fn optional_seeds_are_quarantined_and_other_harnesses_counted() {
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace("generator = 1", "generator = 7\nrequired = false"),
-    );
-    let report = scratch.load(None);
-    assert!(report.admitted.is_empty() && report.rejected.is_empty());
-    assert_eq!(
-        report.quarantined[0].error,
-        SeedError::Generator {
-            seed: 7,
-            harness: 1
-        }
-    );
-    let report = scratch.load(Some("block-sync/storage"));
-    assert_eq!(report.other_harnesses, 1);
-    assert!(report.quarantined.is_empty());
-    let scratch = Scratch::copy(
-        "discovery-wait-complete",
-        replace(
-            "\"discovery/wait-complete\"",
-            "\"discovery/retired\"\nrequired = false",
-        ),
-    );
-    let report = scratch.load(Some("block-sync/storage"));
-    assert!(report.admitted.is_empty() && report.rejected.is_empty());
-    assert_eq!(report.other_harnesses, 0);
-    assert_eq!(
-        report.quarantined[0].error,
-        SeedError::UnknownHarness("discovery/retired".to_owned())
-    );
-}
-
-/// A sidecar edit.
-type Edit = Box<dyn Fn(String) -> String>;
-
-/// A copy of the committed `header-storage-default` seed, its sidecar with
-/// `edit` applied, its bytes with `bytes` applied, and every kept source, in
-/// a new directory, and the errors validating it gives.
-fn migrated_default(
-    edit: impl Fn(String) -> String,
-    bytes: impl Fn(&mut Vec<u8>),
-) -> Vec<SeedError> {
-    let dir = TempDir::new().unwrap();
-    let mut input = fs::read(fixtures().join("header-storage-default.bin")).unwrap();
-    let sidecar = fs::read_to_string(fixtures().join("header-storage-default.toml")).unwrap();
-    let digest = seed::sha256(&input);
-    bytes(&mut input);
-    let sidecar = edit(sidecar.replace(&digest, &seed::sha256(&input)));
-    fs::write(dir.path().join("seed.bin"), &input).unwrap();
-    fs::write(dir.path().join("seed.toml"), sidecar).unwrap();
-    let sources = dir.path().join(seed::SOURCES_DIR);
-    fs::create_dir(&sources).unwrap();
-    for source in fs::read_dir(fixtures().join(seed::SOURCES_DIR)).unwrap() {
-        let source = source.unwrap().path();
-        fs::copy(&source, sources.join(source.file_name().unwrap())).unwrap();
-    }
-    let report = load(&[dir.path().to_path_buf()], None);
-    report
-        .rejected
-        .into_iter()
-        .map(|failed| failed.error)
-        .collect()
-}
-
-/// A migrated seed's `derived_from` must name a kept source that migrates to
-/// the seed. One naming another seed's source, one naming a source that
-/// isn't kept, and one claiming the generator the seed is at are all
-/// rejected, and the unchanged copy is admitted.
-#[test]
-fn derived_seeds_must_migrate_from_their_kept_source() {
-    let keep = |sidecar: String| sidecar;
-    assert_eq!(migrated_default(keep, |_| {}), []);
-    const DEFAULT_SOURCE: &str = "251c8894a914f36210e128139a57ffbb34a6ea871511f1d91387ace64e538148";
-    const GROW_SOURCE: &str = "13a6f50ed23fbeabd2398d65f6da2ec0807869b1b64f185031c14b5ead5e7ee5";
-    let cases: [(Edit, &str); 3] = [
-        (
-            Box::new(|sidecar: String| sidecar.replace(DEFAULT_SOURCE, GROW_SOURCE)),
-            "migrates to other bytes",
-        ),
-        (
-            Box::new(|sidecar: String| sidecar.replace(DEFAULT_SOURCE, &"ab".repeat(32))),
-            "names no kept source",
-        ),
-        (
-            Box::new(|sidecar: String| sidecar.replace("generator = 2", "generator = 3")),
-            "not one older",
-        ),
-    ];
-    for (edit, reason) in cases {
-        let [error] = &migrated_default(edit, |_| {})[..] else {
-            panic!("{reason}: one rejection");
-        };
-        assert!(matches!(error, SeedError::Derived(_)), "{error:?}");
-        assert!(
-            error.to_string().contains(reason),
-            "{error} doesn't say {reason}"
+fn witnesses_fit_the_set() {
+    let mut violated = good();
+    let property = violated.witness.remove(0).property;
+    assert!(violated.witness.is_empty());
+    let violated = violated.witness(&property, Expect::Violated);
+    for set in [SeedSet::Corpus, SeedSet::Slow] {
+        assert_eq!(
+            seed::check(&violated.clone().in_set(set)),
+            Err(SeedError::WrongSet(set))
         );
     }
-}
-
-/// A seed whose prefix carries another generator's version byte is
-/// rejected, though the harness would draw the default scenario for it and
-/// the sidecar records that scenario's digest.
-#[test]
-fn a_seed_for_another_generator_is_rejected() {
-    let drop_source =
-        |sidecar: String| sidecar[..sidecar.find("[derived_from]").unwrap()].to_owned();
+    assert_eq!(seed::check(&violated.in_set(SeedSet::KnownFailure)), Ok(()));
     assert_eq!(
-        migrated_default(drop_source, |input| input[0] = 2),
-        [SeedError::OtherGenerator]
+        seed::check(&good().in_set(SeedSet::KnownFailure)),
+        Err(SeedError::WrongSet(SeedSet::KnownFailure))
     );
 }

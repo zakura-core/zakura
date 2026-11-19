@@ -1,0 +1,38 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
+index fe2b40dd43..85fcfeba26 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/status.rs
+@@ -4,7 +4,8 @@ use zakura_rt::time::Instant;
+ 
+ use super::super::Status;
+ 
+-const MIN_PUBLICATION_INTERVAL: Duration = Duration::from_secs(1);
++// Mutation: the publication floor is a millisecond, not a second.
++const MIN_PUBLICATION_INTERVAL: Duration = Duration::from_millis(1);
+ const MAX_CHANGE_DELAY: Duration = Duration::from_secs(2);
+ const PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(100);
+ 
+@@ -30,7 +31,8 @@ impl StatusPublisher {
+             last_sent: None,
+             last_sent_at: None,
+             pending_at: Some(now),
+-            refresh_interval: refresh_interval.max(MIN_PUBLICATION_INTERVAL),
++            // Mutation: an unchanged status is republished at the floor.
++            refresh_interval: MIN_PUBLICATION_INTERVAL,
+         }
+     }
+ 
+diff --git a/crates/zakura-network/src/zakura/regulation/cadence.rs b/crates/zakura-network/src/zakura/regulation/cadence.rs
+index 0c116e5ee8..885765028c 100644
+--- a/crates/zakura-network/src/zakura/regulation/cadence.rs
++++ b/crates/zakura-network/src/zakura/regulation/cadence.rs
+@@ -326,7 +326,8 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
+             .filter_map(|rule| {
+                 cadence(rule).map(|cadence| Slot {
+                     message_type: rule.message_type,
+-                    send_interval: cadence.send_interval,
++                    // Mutation: a row's frames go out a millisecond apart.
++                    send_interval: cadence.send_interval.min(Duration::from_millis(1)),
+                     latest: None,
+                     last_sent: None,
+                     unwritten: zakura_rt::sync::Weak::new(),

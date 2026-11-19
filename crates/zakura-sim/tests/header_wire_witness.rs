@@ -235,6 +235,18 @@ fn applies(report: &RunReport, id: &str, what: impl std::fmt::Debug) {
     }
 }
 
+/// Requires `session/honest-never-punished` to apply and hold in `report`.
+/// Its trigger history reads the harness's view, which a finished report
+/// doesn't carry, so this reads the property's outcome. The trigger itself
+/// is judged where the view is, as its planted case records it.
+fn honest_holds(report: &RunReport, what: impl std::fmt::Debug) {
+    let outcome = outcome(report, HONEST_NEVER_PUNISHED);
+    assert!(
+        matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+        "{what:?}: {HONEST_NEVER_PUNISHED}: {outcome:?}"
+    );
+}
+
 /// Every generated ID `header-sync/wire` registers, in order.
 fn generated() -> Vec<String> {
     HeaderWire::properties()
@@ -293,7 +305,7 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
         applies(report, covered, &witness);
     }
     applies(report, &id("conformant-never-closes"), &witness);
-    applies(report, HONEST_NEVER_PUNISHED, &witness);
+    honest_holds(report, &witness);
     for suffix in UNREACHED {
         assert_eq!(
             *outcome(report, &id(suffix)),
@@ -520,6 +532,7 @@ fn honest_peer_never_punished() {
             honest(PeerSpec::listening(), 120, None),
         ],
         policy: Policy::converging(),
+        budget: None,
     };
     let redial = WireScenario {
         peers: vec![PeerSpec {
@@ -540,7 +553,7 @@ fn honest_peer_never_punished() {
             let report = run_plan(&scenario, plan);
             assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
             assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
-            applies(&report, HONEST_NEVER_PUNISHED, name);
+            honest_holds(&report, name);
             let honest = honest_connections(&report, &scenario);
             assert!(!honest.is_empty(), "{name}: no honest peer connected");
             for entry in report.log.entries() {
@@ -892,4 +905,281 @@ fn scripted_punishments_of_an_honest_peer_violate_honest_never_punished() {
         "a punishment with no transport row is missing evidence: {:?}",
         report.end
     );
+}
+
+/// A scripted history as a harness, with peer 0 marked `HonestPeer`, so a
+/// witness test judges `session/honest-never-punished`, whose trigger reads
+/// the view, on it.
+struct HonestScript;
+
+/// [`HonestScript`]'s histories.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+enum Punished {
+    /// The node reports a `Misbehavior` against honest peer 0's connection
+    /// before it judges any frame there.
+    BeforeJudging,
+    /// The node fault-closes honest peer 0's connection before it judges any
+    /// frame there.
+    ClosedBeforeJudging,
+    /// The node judges peer 0's conformant frame, and punishes no one.
+    Judged,
+}
+
+impl Punished {
+    /// The history, one batch per step.
+    fn script(self) -> Vec<Vec<Observation>> {
+        match self {
+            Punished::BeforeJudging => vec![
+                vec![registered()],
+                vec![Observation::Misbehavior { connection: 1 }],
+            ],
+            Punished::ClosedBeforeJudging => {
+                vec![vec![registered()], vec![closed(FAULT)]]
+            }
+            Punished::Judged => {
+                let [frame, judged] = labelled(Label::Conformant);
+                vec![vec![registered()], vec![frame], vec![judged]]
+            }
+        }
+    }
+}
+
+impl HasView for HonestScript {
+    type View = MarkedView;
+
+    /// Peer 0, the one honest peer.
+    fn view(&self) -> MarkedView {
+        MarkedView([0].into())
+    }
+}
+
+impl Subsystem for HonestScript {
+    const NAME: &'static str = "test/honest-script";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Punished;
+    type Prepared = ();
+
+    fn config(_: &Punished) -> zakura_sim::RunConfig {
+        support::config(1, 1_000)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Punished) {}
+
+    fn build(sim: &mut zakura_sim::Sim, history: &Punished, (): ()) -> Self {
+        support::script::feed(sim, history.script());
+        HonestScript
+    }
+
+    fn sources() -> zakura_sim::property::Sources {
+        let mut observed = OBSERVED.to_vec();
+        observed.push(Source::View);
+        zakura_sim::property::Sources::observed(&observed)
+    }
+
+    fn assumptions(_: &Punished) -> Assumptions<Self> {
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::json!({ "peers": ["peer-0"] }),
+        }])
+    }
+
+    fn properties() -> Vec<Property<Self>> {
+        vec![honest_never_punished()]
+    }
+
+    fn draw(_: &[u8]) -> Punished {
+        Punished::Judged
+    }
+}
+
+/// The witness judge counts a punishment of an honest peer before the node
+/// judged any frame on its connection as `session/honest-never-punished`'s
+/// trigger history, so that catch isn't lost: a `Misbehavior` and a fault
+/// close, each before any `FrameJudged`. A judged frame with no punishment
+/// still reaches it on a holding history.
+#[test]
+fn a_punishment_before_any_judgement_reaches_the_honest_trigger() {
+    let judged = |history, expect| {
+        zakura_sim::witness::witness::<HonestScript>(
+            zakura_sim::witness::WitnessScenario {
+                scenario: history,
+                input: Plan::from_fuzz(&[1; 64]),
+            },
+            HONEST_NEVER_PUNISHED,
+            expect,
+        )
+    };
+    for history in [Punished::BeforeJudging, Punished::ClosedBeforeJudging] {
+        assert_eq!(judged(history, Expect::Violated), Ok(()), "{history:?}");
+    }
+    assert_eq!(judged(Punished::Judged, Expect::Holds), Ok(()));
+}
+
+/// The committed scenarios of the generated IDs' typed planted cases
+/// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
+/// focused scenario ([`act_scenario`]) for each act no saved Plan takes,
+/// the status bursts' cut at the 20th, an adversary serving the node its
+/// chain and the held subscription, both with no act, and the node serving
+/// an honest subscriber. The saved Plans' inputs serve the other cases.
+fn planted_scenarios() -> Vec<(&'static str, WireScenario)> {
+    let act = |name, act| (name, act_scenario(act));
+    let mut held = act_scenario(Act::MinPayload {
+        row: Row::SubscribeHeaders,
+    });
+    held.peers[0].script.clear();
+    let mut serving = act_scenario(Act::ExtraEnding);
+    serving.peers[0].script.clear();
+    // The 20th burst's frame is the first to find the `Status` bucket
+    // empty, so `exhausted-cadence-throttled`'s script ends there, leaving
+    // its patched close no burst to try on the closed connection.
+    let mut burst = act_scenario(Act::StatusBurst);
+    burst.peers[0].script.truncate(20);
+    vec![
+        act(
+            "status-bad-content",
+            Act::BadContent {
+                rule: ContentRule::StatusAnchor,
+            },
+        ),
+        ("status-burst", burst),
+        act(
+            "subscribe-headers-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::SubscribeHeaders,
+                bit: 0,
+            },
+        ),
+        act(
+            "subscribe-headers-short-payload",
+            Act::ShortPayload {
+                row: Row::SubscribeHeaders,
+            },
+        ),
+        act(
+            "subscribe-headers-long-payload",
+            Act::LongPayload {
+                row: Row::SubscribeHeaders,
+            },
+        ),
+        act(
+            "subscribe-headers-bad-content",
+            Act::BadContent {
+                rule: ContentRule::OpenLocators,
+            },
+        ),
+        act(
+            "headers-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::Headers,
+                bit: 0,
+            },
+        ),
+        act(
+            "headers-short-payload",
+            Act::ShortPayload { row: Row::Headers },
+        ),
+        act(
+            "headers-outcome-reserved-flags",
+            Act::ReservedFlags {
+                row: Row::HeadersOutcome,
+                bit: 0,
+            },
+        ),
+        act(
+            "headers-outcome-short-payload",
+            Act::ShortPayload {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-long-payload",
+            Act::LongPayload {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-unsolicited",
+            Act::Unsolicited {
+                row: Row::HeadersOutcome,
+            },
+        ),
+        act(
+            "headers-outcome-bad-content",
+            Act::BadContent {
+                rule: ContentRule::OutcomeWindow,
+            },
+        ),
+        ("serving-adversary", serving),
+        ("held-subscription", held),
+        ("served-subscription", served_subscription()),
+    ]
+}
+
+/// The node at 120 serving an honest peer at 50, which dials it and
+/// subscribes from genesis with its grants sent at once. The node never
+/// subscribes, so every frame of its subscription rows is its publisher's.
+fn served_subscription() -> WireScenario {
+    WireScenario {
+        node: Chain::main(120),
+        peers: vec![honest(
+            PeerSpec::dialing(),
+            PRELOAD,
+            Some(SubscribeSpec {
+                start: 0,
+                open: CreditSpec {
+                    objects: 250,
+                    bytes: 65_750,
+                },
+                grants: GrantPolicy::Immediate,
+            }),
+        )],
+        policy: Policy::converging(),
+        ..WireScenario::default()
+    }
+}
+
+/// The committed fixture file `name`.
+fn fixture_file(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// `scenario` as its committed JSON.
+fn scenario_json(scenario: &WireScenario) -> String {
+    serde_json::to_string_pretty(scenario).expect("scenarios serialize") + "\n"
+}
+
+/// The committed typed planted inputs are what their builders give.
+///
+/// This fails if a builder or the scenario format changes; after a
+/// deliberate change, run `regenerate_planted_scenarios`.
+#[test]
+fn planted_scenarios_match_their_builders() {
+    let read = |name: &str| {
+        std::fs::read_to_string(fixture_file(name))
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    for (name, scenario) in planted_scenarios() {
+        let file = format!("header-wire-planted-{name}.json");
+        assert_eq!(
+            read(&file),
+            scenario_json(&scenario),
+            "run `regenerate_planted_scenarios`"
+        );
+    }
+}
+
+/// Rewrites the typed planted inputs. Run it
+/// with `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
+/// header_wire_witness -- --ignored regenerate_planted_scenarios`.
+#[test]
+#[ignore = "rewrites the committed planted scenarios"]
+fn regenerate_planted_scenarios() {
+    for (name, scenario) in planted_scenarios() {
+        let file = fixture_file(&format!("header-wire-planted-{name}.json"));
+        std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
+    }
 }

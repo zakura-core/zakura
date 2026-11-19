@@ -20,7 +20,7 @@ it counts as floor requests.
 
 ## Witness
 
-The committed input `crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin`
+The seed `block-sync-floor-lane-race`
 (paused handoffs), which the test
 `block_resource_properties::the_floor_lane_race_input_holds_reserved_byte_bound`
 also runs. A seeded random search on the remote host found it. In its run,

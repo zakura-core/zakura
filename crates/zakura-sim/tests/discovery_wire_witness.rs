@@ -529,10 +529,6 @@ fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
     }
 }
 
-/// The `late-response` saved Plan's committed input: its tag, then its
-/// Plan.
-const LATE_RESPONSE: &[u8] = include_bytes!("fixtures/discovery-wire-late-response.bin");
-
 /// `discovery/late-response-admitted` applies and holds in the
 /// `late-response` saved Plan, where the node reads the held `Peers` after
 /// its initial wait timed out (`discovery_wire_lifecycle.rs` checks that
@@ -543,7 +539,11 @@ const LATE_RESPONSE: &[u8] = include_bytes!("fixtures/discovery-wire-late-respon
 /// delivering the `Peers` after the timeout.
 #[test]
 fn late_response_admitted_applies_in_its_saved_plan() {
-    let (prefix, plan) = LATE_RESPONSE.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let input = zakura_sim::seed::find("discovery-wire-late-response")
+        .expect("the seed is registered")
+        .input()
+        .to_vec();
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
     assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
     let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);
     witnessed(

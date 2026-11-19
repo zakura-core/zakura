@@ -788,7 +788,9 @@ where
             | zakura_header_chain::ApplyResult::NoChange(_),
         )) => {
             // State has now checked the contextual difficulty and time rules, the last header
-            // rules, so the claims are kept. Any other outcome removes them.
+            // rules, so the claims are kept. NoChange includes a header the chain evicted at
+            // once, whose claim then holds a table slot until the tip passes it. Any other
+            // outcome removes the claims.
             if let Some(claims) = claims {
                 claims.commit();
             }

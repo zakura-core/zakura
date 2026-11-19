@@ -949,6 +949,83 @@ fn an_older_time_from_a_caller_does_not_turn_the_clock_back() {
     assert!(matches!(step.verdict(waiter), Some(Verdict::Admitted)));
 }
 
+/// A parked transaction ends at its submitter's deadline, as a timeout,
+/// even though its own wait for a parent runs longer. A parent admitted
+/// after that does not bring it back. Its wait for a parent still wins a
+/// tie, with today's cached missing-input answer.
+#[test]
+fn a_submitters_deadline_ends_a_parked_admission() {
+    let mut runner = TestRunner::deterministic();
+    let (parent, child) = family(&mut runner);
+    let mut bench = Bench::new();
+
+    // The fetch took 15 s, and the adapter stops waiting at 73 s.
+    bench.now = Duration::from_secs(15);
+    let reservation = bench.reserved(&child);
+    let (waiter, step) = bench.submit_until(reservation, &child, Some(Duration::from_secs(73)));
+    let job = started(&step)[0];
+    assert!(bench.missing(job, vec![parent.outpoint(0)]).is_empty());
+
+    let step = bench.tick(Duration::from_secs(58));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert_eq!(step.changes, vec![Change::Refused(child.id())]);
+    assert_eq!(bench.machine.slots_in_use(), 0);
+
+    bench.now += Duration::from_secs(1);
+    let (_, parent_job) = bench.start(&parent);
+    let step = bench.pass(parent_job, &parent);
+    assert!(started(&step).is_empty(), "the child is not run again");
+    assert!(bench.reserve(&child).0.is_ok(), "a timeout caches nothing");
+
+    // A deadline at the same time as the end of the wait for a parent.
+    let mut bench = Bench::new();
+    let reservation = bench.reserved(&child);
+    let (waiter, step) = bench.submit_until(reservation, &child, Some(T_PARK));
+    let job = started(&step)[0];
+    bench.missing(job, vec![parent.outpoint(0)]);
+    let step = bench.tick(T_PARK);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+}
+
+/// A verification ends at its submitter's deadline when that comes before
+/// its own limit, and a body that arrives after the deadline is not
+/// verified at all.
+#[test]
+fn a_submitters_deadline_ends_a_verification_and_a_late_body() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let mut bench = Bench::new();
+    let reservation = bench.reserved(&txs[0]);
+    let (waiter, step) = bench.submit_until(reservation, &txs[0], Some(Duration::from_secs(10)));
+    let job = started(&step)[0];
+    let step = bench.tick(Duration::from_secs(10));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert!(step
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Cancel(cancelled) if *cancelled == job)));
+    assert!(
+        bench.pass(job, &txs[0]).is_empty(),
+        "the late pass is ignored"
+    );
+
+    let reservation = bench.reserved(&txs[1]);
+    bench.now = Duration::from_secs(80);
+    let (waiter, step) = bench.submit_until(reservation, &txs[1], Some(Duration::from_secs(73)));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert!(started(&step).is_empty());
+    assert_eq!(bench.machine.slots_in_use(), 0);
+}
+
 // Chain events.
 
 /// A block removes what it mined, then what it conflicts with, as today. A

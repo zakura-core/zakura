@@ -498,6 +498,48 @@ async fn a_child_woken_by_its_parent_reads_a_pool_that_holds_the_parent() {
     assert!(matches!(verdict, Verdict::Admitted), "{verdict:?}");
 }
 
+/// A parked child ends at its submitter's deadline, long before its wait
+/// for a parent would, and a parent admitted after that does not bring it
+/// back.
+#[tokio::test]
+async fn a_submitters_deadline_ends_a_parked_child_before_a_late_parent() {
+    let (parent, child) = parent_and_child();
+    let harness = Harness::start(&[parent.clone(), child.clone()]);
+
+    let reservation = harness
+        .handle
+        .reserve(child.id(), far())
+        .await
+        .expect("the test's deadline is far off")
+        .expect("the core grants a reservation")
+        .give_up_at(zakura_rt::time::Instant::now() + Duration::from_millis(100));
+    let verdict = tokio::time::timeout(
+        ANSWER,
+        harness
+            .handle
+            .submit(reservation, child.real.transaction.clone(), far()),
+    )
+    .await
+    .expect("the child is decided at its submitter's deadline")
+    .expect("the test's deadline is far off");
+    assert!(
+        matches!(verdict, Verdict::LocalFault(LocalFault::VerifyTimeout)),
+        "{verdict:?}"
+    );
+
+    assert!(matches!(harness.submit(&parent).await, Verdict::Admitted));
+    harness.round_trip().await;
+    assert_eq!(
+        harness.calls(&child),
+        1,
+        "the parent does not wake the child"
+    );
+    assert!(harness
+        .handle
+        .snapshot()
+        .is_some_and(|snapshot| snapshot.transaction(&child.id().mined_id()).is_none()));
+}
+
 #[tokio::test]
 async fn a_block_that_mines_a_pooled_transaction_removes_it() {
     let (parent, child) = parent_and_child();

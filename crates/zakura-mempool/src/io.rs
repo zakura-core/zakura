@@ -279,9 +279,10 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                     drop(reservation);
                     return;
                 }
+                let give_up = reservation.give_up();
                 let id = reservation.accept();
                 self.fetches.remove(&id);
-                let (waiter, step) = self.machine.submit(id, transaction, now);
+                let (waiter, step) = self.machine.submit(id, transaction, give_up, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
             }

@@ -110,6 +110,8 @@ pub struct Reservation {
     release: Option<mpsc::UnboundedSender<ReservationId>>,
     /// Cancelled when the core no longer needs this reservation's body.
     cancel: CancellationToken,
+    /// When the core ends the admission. See [`Self::give_up_at`].
+    give_up: Option<Instant>,
 }
 
 impl Reservation {
@@ -126,7 +128,25 @@ impl Reservation {
             tx_id,
             release: Some(release),
             cancel,
+            give_up: None,
         }
+    }
+
+    /// Has the core end this reservation's admission at `at`, as a
+    /// [`LocalFault::VerifyTimeout`], if it is still undecided then. A caller
+    /// that frees its own per-peer state at a deadline sets it here, so the
+    /// transaction is not still undecided in the core after the caller has
+    /// let go of it. Without one, the admission ends only at the core's own
+    /// limits, [`T_VERIFY`] and [`T_PARK`].
+    pub fn give_up_at(mut self, at: Instant) -> Self {
+        self.give_up = Some(at);
+        self
+    }
+
+    /// When the core ends this reservation's admission, if its caller set a
+    /// time. See [`Self::give_up_at`].
+    pub fn give_up(&self) -> Option<Instant> {
+        self.give_up
     }
 
     /// Cancelled when the core no longer needs the body this reservation
@@ -256,7 +276,8 @@ pub struct Rejection {
 /// nothing is cached. The caller can submit again.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum LocalFault {
-    /// The verification did not finish before its deadline.
+    /// The verification did not finish before its deadline, or its
+    /// submitter's deadline passed. See [`Reservation::give_up_at`].
     VerifyTimeout,
     /// The verification job panicked.
     VerifyPanicked,

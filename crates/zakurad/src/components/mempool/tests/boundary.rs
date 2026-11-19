@@ -1290,6 +1290,36 @@ async fn one_peer_holds_at_most_five_fetches(mode: Mode) {
     }
 }
 
+/// An id another peer is already fetching takes none of a peer's five
+/// slots, so a peer that advertises five such ids and one new one still has
+/// the new one fetched.
+async fn ids_another_peer_is_fetching_take_none_of_a_peers_slots(mode: Mode) {
+    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    harness.activate().await;
+    let fetching: Vec<_> = (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+        .map(unknown_id)
+        .collect();
+    let new = unknown_id(MAX_INBOUND_CONCURRENCY_PER_PEER);
+    let request = Request::QueueFromPeer {
+        transactions: fetching.iter().copied().map(Gossip::from).collect(),
+        source: legacy_peer(1),
+    };
+    harness.ask(request).await;
+
+    let mut offered: Vec<Gossip> = fetching.iter().copied().map(Gossip::from).collect();
+    offered.push(new.into());
+    let request = Request::QueueFromPeer {
+        transactions: offered,
+        source: legacy_peer(2),
+    };
+    harness.ask(request).await;
+    assert_eq!(
+        harness.queue_one(new).await.unbox_mempool_error(),
+        MempoolError::AlreadyQueued,
+        "the second peer's new id is being fetched"
+    );
+}
+
 /// The core only: a body that earns its legacy peer a cooldown silences that
 /// peer. Its next push is ignored and never verified, and another peer's push
 /// still is. The adapter keeps the cooldown, since the core knows no peers.
@@ -2025,6 +2055,7 @@ both_pools!(
     same_id_twice_is_already_queued_at_the_first_stage,
     full_queue_is_refused_at_the_first_stage,
     one_peer_holds_at_most_five_fetches,
+    ids_another_peer_is_fetching_take_none_of_a_peers_slots,
     output_waits_are_limited_to_distinct_outpoints,
     a_transaction_mined_while_it_is_brought_in_is_answered_as_cancelled,
     a_body_mined_while_it_is_verified_is_answered_as_cancelled,

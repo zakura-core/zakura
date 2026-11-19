@@ -213,6 +213,9 @@ struct Admission<E> {
     missing_error: Option<E>,
     /// Whether the one check allowed after that wait ended has been used.
     last_check_used: bool,
+    /// When its submitter stops waiting. It ends then as a timeout, whatever
+    /// its stage. See `Reservation::give_up_at`.
+    give_up: Option<Instant>,
     /// Whether the chain was reset since it was reserved. See
     /// [`Effect::Start`].
     after_reset: bool,
@@ -448,6 +451,7 @@ impl<E: VerifyError> MempoolState<E> {
                 missing_since: None,
                 missing_error: None,
                 last_check_used: false,
+                give_up: None,
                 after_reset: false,
             },
         );
@@ -477,11 +481,13 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// A body under `reservation`. Returns the waiter the verdict will name,
-    /// which can be in the returned step.
+    /// which can be in the returned step. An admission still undecided at
+    /// `give_up` ends then as a timeout.
     pub fn submit(
         &mut self,
         reservation: ReservationId,
         tx: UnminedTx,
+        give_up: Option<Instant>,
         now: Instant,
     ) -> (WaiterId, Step) {
         self.enter(now);
@@ -511,10 +517,17 @@ impl<E: VerifyError> MempoolState<E> {
             self.step.effects.push(Effect::Verdict { waiter, verdict });
             return (waiter, self.take_step());
         };
+        let now = self.now;
         let admission = self.admission_at(key);
         admission.waiter = Some(waiter);
         admission.body = Some(tx);
-        self.start_admission(key);
+        admission.give_up = give_up;
+        // The command waited past its submitter's deadline.
+        if give_up.is_some_and(|at| at <= now) {
+            self.fail_locally(key, LocalFault::VerifyTimeout);
+        } else {
+            self.start_admission(key);
+        }
         (waiter, self.take_step())
     }
 
@@ -750,7 +763,12 @@ impl<E: VerifyError> MempoolState<E> {
             .values()
             .filter_map(|admission| match &admission.stage {
                 Stage::Verifying { deadline, .. } => Some(*deadline),
-                Stage::Parked { .. } => admission.missing_since.map(|since| since + T_PARK),
+                Stage::Parked { .. } => admission
+                    .missing_since
+                    .map(|since| since + T_PARK)
+                    .into_iter()
+                    .chain(admission.give_up)
+                    .min(),
                 Stage::Reserved => None,
             })
             .min()
@@ -968,6 +986,10 @@ impl<E: VerifyError> MempoolState<E> {
                             .is_some_and(|since| since + T_PARK > self.now),
                         "pool/slot-time-within-limit: a transaction was left parked past its wait for a parent"
                     );
+                    assert!(
+                        admission.give_up.is_none_or(|at| at > self.now),
+                        "pool/slot-time-within-limit: a transaction was left parked past its submitter's deadline"
+                    );
                 }
             }
         }
@@ -989,12 +1011,19 @@ impl<E: VerifyError> MempoolState<E> {
         for (key, admission) in &self.admissions {
             match &admission.stage {
                 Stage::Verifying { deadline, .. } if *deadline <= now => timed_out.push(*key),
-                Stage::Parked { .. }
+                Stage::Parked { .. } => {
+                    // The earlier of the two ends it, and a tie goes to the
+                    // wait for a parent, so the answer does not depend on how
+                    // late this runs.
+                    let wait_end = admission.missing_since.map(|since| since + T_PARK);
                     if admission
-                        .missing_since
-                        .is_some_and(|since| since + T_PARK <= now) =>
-                {
-                    unparked.push(*key)
+                        .give_up
+                        .is_some_and(|at| at <= now && wait_end.is_none_or(|end| at < end))
+                    {
+                        timed_out.push(*key)
+                    } else if wait_end.is_some_and(|end| end <= now) {
+                        unparked.push(*key)
+                    }
                 }
                 _ => {}
             }
@@ -1314,6 +1343,7 @@ impl<E: VerifyError> MempoolState<E> {
                     missing_since: None,
                     missing_error: None,
                     last_check_used: false,
+                    give_up: None,
                     after_reset: true,
                 },
             );
@@ -1366,8 +1396,13 @@ impl<E: VerifyError> MempoolState<E> {
     /// Starts a verification of an admission that holds its body.
     fn start_admission(&mut self, key: u64) {
         let job = JobId(self.fresh());
-        let deadline = self.now + T_VERIFY;
+        let mut deadline = self.now + T_VERIFY;
         let admission = self.admission_at(key);
+        // `enter` has ended every admission whose submitter's deadline has
+        // passed, so this stays in the future.
+        if let Some(give_up) = admission.give_up {
+            deadline = deadline.min(give_up);
+        }
         admission.stage = Stage::Verifying { job, deadline };
         let tx_id = admission.tx_id;
         let after_reset = admission.after_reset;

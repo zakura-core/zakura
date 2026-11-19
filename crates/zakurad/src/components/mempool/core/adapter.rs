@@ -36,7 +36,9 @@ use zakura_chain::{
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    port::{Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved, Verdict},
+    port::{
+        Charge, LocalFault, PoolHandle, PoolSnapshot, Reservation, Unreserved, Verdict, MAX_PENDING,
+    },
     CreatedOrSpent, Gossip, MempoolDisabledError, OutputNotInPool, QueueSource, Request, Response,
 };
 
@@ -68,6 +70,11 @@ const MAX_TIP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often a waiting request checks the tips again when no new snapshot
 /// arrives, since the state's best tip can move too.
 const TIP_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// How long past its deadline a submission waits for the core's verdict. The
+/// core ends the admission at the deadline, so the peer's slot is freed only
+/// once the core has, and only a stuck core is timed out here.
+const VERDICT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What every submission task shares.
 struct Shared {
@@ -234,30 +241,51 @@ async fn peer_batch(
     else {
         return Ok(Response::Queued(Vec::new()));
     };
-    // The rest take their peer's slots now, in one pass, as today's pool
-    // queues a batch at once: at most the peer's limit of them, and the rest
-    // are dropped without asking the core. Slots that free up while the
-    // batch is worked on take nothing more from it.
-    let held: Vec<(Gossip, PeerSlot)> = fresh
+    // The batch takes its peer's free slots now, in one pass, as today's
+    // pool queues a batch at once, and the ids that find none are dropped
+    // without asking the core. Slots that free up while the batch is worked
+    // on take nothing more from it.
+    let mut candidates = fresh
         .into_iter()
         .filter(|item| !rejected.contains(&item.id()))
-        .filter_map(|item| match PeerSlot::take(&shared, &source) {
-            Some(slot) => Some((item, slot)),
-            None => {
-                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                None
+        .peekable();
+    let mut slots: Vec<PeerSlot> =
+        std::iter::from_fn(|| PeerSlot::take(&shared, &source)).collect();
+    // An id another caller is bringing in hands its slot back, as today's
+    // pool skips a queued id before it counts the peer's limit. The core
+    // holds at most `MAX_PENDING` undecided ids, so a batch stops skipping
+    // after that many, which bounds what one batch costs the core.
+    let mut skipped = 0;
+    while candidates.peek().is_some() {
+        let Some(slot) = slots.pop() else {
+            break;
+        };
+        let item = candidates.next().expect("a candidate was peeked");
+        match shared.handle.reserve(item.id(), deadline).await {
+            Ok(Ok(reservation)) => {
+                start(
+                    shared.clone(),
+                    reservation,
+                    item,
+                    Some(source.clone()),
+                    Some(slot),
+                    deadline,
+                );
             }
-        })
-        .collect();
-    for (item, slot) in held {
-        let _ = queue(
-            shared.clone(),
-            item,
-            Some(source.clone()),
-            Some(slot),
-            deadline,
-        )
-        .await;
+            Ok(Err(Unreserved::Pending)) if skipped < MAX_PENDING => {
+                skipped += 1;
+                slots.push(slot);
+            }
+            Ok(Err(_)) => {}
+            Err(_elapsed) => {
+                let _timeout = timed_out();
+            }
+        }
+    }
+    let dropped = candidates.count();
+    if dropped > 0 {
+        metrics::counter!("mempool.full_queue.per_peer.total")
+            .increment(u64::try_from(dropped).unwrap_or(u64::MAX));
     }
     Ok(Response::Queued(Vec::new()))
 }
@@ -497,6 +525,19 @@ async fn queue(
         Ok(Err(refused)) => return first_stage_refusal(refused),
         Err(_elapsed) => return Err(timed_out()),
     };
+    Ok(start(shared, reservation, item, from, slot, deadline))
+}
+
+/// Starts the task that brings `item` in under `reservation` and answers its
+/// second stage on the returned receiver. `slot` is held until then.
+fn start(
+    shared: Arc<Shared>,
+    reservation: Reservation,
+    item: Gossip,
+    from: Option<QueueSource>,
+    slot: Option<PeerSlot>,
+    deadline: tokio::time::Instant,
+) -> Receiver {
     metrics::counter!("mempool.queued.transactions.total").increment(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
@@ -507,7 +548,7 @@ async fn queue(
         drop(slot);
         let _ = answer.send(result);
     });
-    Ok(receiver)
+    receiver
 }
 
 /// One undecided transaction counted against a peer, from its reservation
@@ -590,8 +631,9 @@ fn first_stage_refusal(refused: Unreserved) -> Result<Receiver, BoxError> {
 /// second-stage answer, all by `deadline`.
 ///
 /// A fetch still out at the deadline is reported as failed, which frees
-/// the slot and reaches the change stream, as today's timeout does. A
-/// verdict that comes after the deadline charges nobody, as today.
+/// the slot and reaches the change stream, as today's timeout does. The
+/// core ends an admission still undecided at the deadline, so the peer's
+/// slot is not freed while its transaction can still get in.
 async fn bring_in(
     shared: Arc<Shared>,
     reservation: Reservation,
@@ -689,7 +731,12 @@ async fn bring_in(
         Some(QueueSource::Zakura(_)) => None,
         _ => sender.and_then(|addr| shared.supplier(addr)),
     };
-    let Ok(verdict) = shared.handle.submit(reservation, tx, deadline).await else {
+    let reservation = reservation.give_up_at(deadline);
+    let Ok(verdict) = shared
+        .handle
+        .submit(reservation, tx, deadline + VERDICT_GRACE)
+        .await
+    else {
         return Err(timed_out());
     };
     // The charge goes to the peer that served the body, here, in the
@@ -1017,7 +1064,9 @@ mod tests {
 
     /// A body whose verdict takes too long ends at the same deadline, which
     /// covers the fetch and the verification together, as today's download
-    /// task does. Its peer's slot is free again.
+    /// task does. The core is told to end the admission then, and a core
+    /// that does not answer is timed out just after. Its peer's slot is free
+    /// again.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_verdict_that_takes_too_long_ends_at_the_task_deadline() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
@@ -1052,6 +1101,11 @@ mod tests {
         else {
             panic!("the body is submitted");
         };
+        assert_eq!(
+            reservation.give_up(),
+            Some(started + RATE_LIMIT_DELAY),
+            "the core ends the admission at today's whole-task deadline"
+        );
         let _accepted = reservation.accept();
 
         let error = receiver
@@ -1061,8 +1115,8 @@ mod tests {
         assert_eq!(error.to_string(), "timeout waiting for verification result");
         assert_eq!(
             started.elapsed(),
-            RATE_LIMIT_DELAY,
-            "today's whole-task deadline"
+            RATE_LIMIT_DELAY + VERDICT_GRACE,
+            "only a core stuck past the deadline is timed out here"
         );
         assert!(core.shared.per_peer.lock().expect("no panics").is_empty());
     }
@@ -1806,6 +1860,47 @@ mod tests {
             "the call dropped the request's body"
         );
         drop(unpolled);
+    }
+
+    /// An id another caller reserved straight through the pool handle, as
+    /// tx-relay does, takes none of a peer's slots: the core answers it as
+    /// pending, and the batch goes on to fetch five new ids.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_id_another_caller_reserved_takes_none_of_the_batch() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let id = |n: u8| {
+            let mut hash = [5; 32];
+            hash[0] = n;
+            UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash))
+        };
+        let elsewhere = id(0);
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: (0..=5).map(|n| Gossip::Id(id(n))).collect(),
+            source: peer(),
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids are rejected");
+        };
+        let _ = reply.send(Default::default());
+        let mut granted = Vec::new();
+        while let Ok(Some(PoolCommand::Reserve { tx_id, reply })) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
+        {
+            if tx_id == elsewhere {
+                let _ = reply.send(Err(Unreserved::Pending));
+            } else {
+                let reservation = ReservationId(u64::from(tx_id.mined_id().0[0]));
+                let _ = reply.send(Ok(inbox.grant(reservation, tx_id, Default::default())));
+                granted.push(tx_id);
+            }
+        }
+        assert_eq!(granted, (1..=5).map(id).collect::<Vec<_>>());
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
     }
 
     /// A peer's batch takes at most the peer's limit of ids, in one pass, as

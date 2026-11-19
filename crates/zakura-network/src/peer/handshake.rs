@@ -43,8 +43,9 @@ use crate::{
     meta_addr::MetaAddrChange,
     peer::{
         gossip_trace::{LegacyGossipTrace, PeerGossipTrace},
-        AnnouncedBlocks, CancelHeartbeatTask, Client, ClientRequest, Connection,
-        ConnectionRequests, ErrorSlot, HandshakeError, MinimumPeerVersion, PeerError, TcpWarmup,
+        AnnouncedBlocks, BlockAnnouncementHook, CancelHeartbeatTask, Client, ClientRequest,
+        Connection, ConnectionAnnouncements, ConnectionRequests, ErrorSlot, HandshakeError,
+        MinimumPeerVersion, PeerError, TcpWarmup,
     },
     peer_registry::{trace_user_agent, PeerRegistry},
     peer_set::{ConnectionTracker, InventoryChange},
@@ -119,6 +120,9 @@ where
     /// writes trace files.
     gossip_trace: LegacyGossipTrace,
 
+    /// Tells the node about blocks peers newly announce.
+    block_announcement_hook: BlockAnnouncementHook,
+
     parent_span: Span,
 }
 
@@ -171,6 +175,7 @@ where
             misbehavior: self.misbehavior.clone(),
             tcp_warmup: self.tcp_warmup.clone(),
             gossip_trace: self.gossip_trace.clone(),
+            block_announcement_hook: self.block_announcement_hook.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -531,6 +536,7 @@ where
     misbehavior: Option<MisbehaviorReporter>,
     tcp_warmup: Option<TcpWarmup>,
     block_checksums: Option<BlockChecksums>,
+    block_announcement_hook: Option<BlockAnnouncementHook>,
 }
 
 impl<S, C> Builder<S, C>
@@ -618,6 +624,7 @@ where
             misbehavior: self.misbehavior,
             tcp_warmup: self.tcp_warmup,
             block_checksums: self.block_checksums,
+            block_announcement_hook: self.block_announcement_hook,
         }
     }
 
@@ -671,6 +678,18 @@ where
     /// If this is unset, the connections share checksums only with each other.
     pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
         self.block_checksums = Some(block_checksums);
+        self
+    }
+
+    /// Call `block_announcement_hook` for each block a peer announces in a single-block `inv`,
+    /// at most a few times per connection per window. Optional.
+    ///
+    /// If this is unset, announcements are not passed on.
+    pub fn with_block_announcement_hook(
+        mut self,
+        block_announcement_hook: BlockAnnouncementHook,
+    ) -> Self {
+        self.block_announcement_hook = Some(block_announcement_hook);
         self
     }
 
@@ -731,6 +750,7 @@ where
             misbehavior,
             tcp_warmup: self.tcp_warmup,
             gossip_trace,
+            block_announcement_hook: self.block_announcement_hook.unwrap_or_default(),
             parent_span: Span::current(),
         })
     }
@@ -761,6 +781,7 @@ where
             misbehavior: None,
             tcp_warmup: None,
             block_checksums: None,
+            block_announcement_hook: None,
         }
     }
 }
@@ -1622,6 +1643,7 @@ where
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
         let gossip_trace = self.gossip_trace.clone();
+        let block_announcement_hook = self.block_announcement_hook.clone();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
@@ -1838,6 +1860,7 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
+            let block_announcements = block_announcement_hook.for_connection();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
             let peer_registry_updater = peer_registry_updater
@@ -1901,6 +1924,7 @@ where
                 .then(move |msg| {
                     let inbound_inv_collector = inbound_inv_collector.clone();
                     let inbound_announced_blocks = inbound_announced_blocks.clone();
+                    let block_announcements = block_announcements.clone();
                     let inbound_gossip_trace = inbound_gossip_trace.clone();
                     let span = debug_span!(parent: inv_inner_conn_span.clone(), "inventory_filter");
                     register_inventory_status(
@@ -1908,6 +1932,7 @@ where
                         connected_addr,
                         inbound_inv_collector,
                         inbound_announced_blocks,
+                        block_announcements,
                         inbound_gossip_trace,
                     )
                     .instrument(span)
@@ -2070,19 +2095,22 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 /// `inv`, solicited or not, and connections without a transient address. Requests for block
 /// bodies withdraw the peer's earlier claim to have those blocks.
 ///
-/// An `inv` that names exactly one block is a new block announcement, and is written to
-/// `gossip_trace`. One that names several is the answer to a query.
+/// An `inv` that names exactly one block is a new block announcement, and is passed to
+/// `block_announcements` and written to `gossip_trace`. One that names several is the answer to
+/// a query.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: broadcast::Sender<InventoryChange>,
     announced_blocks: AnnouncedBlocks,
+    block_announcements: ConnectionAnnouncements,
     gossip_trace: PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {
         Ok(Message::Inv(items)) => {
             announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
             if let [InventoryHash::Block(hash)] = items[..] {
+                block_announcements.announce(hash);
                 gossip_trace.block_inv_received(hash);
             }
         }

@@ -95,7 +95,10 @@ use tokio_util::sync::CancellationToken;
 use tower::{load_shed::LoadShed, timeout::Timeout, util::BoxService, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::block::{self, genesis::regtest_genesis_block};
+use zakura_chain::{
+    block::{self, genesis::regtest_genesis_block},
+    chain_tip::ChainTip,
+};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
@@ -220,6 +223,23 @@ fn check_tcp_slow_start_after_idle() {
 
 fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
+}
+
+/// Claims receipt order in `announcement_claims` for each block a legacy peer newly announces,
+/// so legacy-only blocks follow the same equal-work rule as blocks whose headers arrive first.
+///
+/// The best chain tip stands in for header sync's verified tip, which a node without native
+/// header sync never reports.
+fn legacy_block_announcement_hook(
+    announcement_claims: zakura_consensus::AnnouncementClaims,
+    latest_chain_tip: impl ChainTip + Send + Sync + 'static,
+) -> zakura_network::BlockAnnouncementHook {
+    zakura_network::BlockAnnouncementHook::new(move |hash| {
+        // Before the first block is committed there is no tip to place a claim above.
+        if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
+            announcement_claims.note_announcement(hash, verified_tip);
+        }
+    })
 }
 
 /// The tasks spawned by the `start` command, which are all aborted when this is dropped.
@@ -614,8 +634,8 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
-        // Header sync claims blocks whose headers arrive first, and the block verifier ranks
-        // equal-work bodies by those claims.
+        // Header sync and legacy block `inv`s claim blocks announced first, and the block
+        // verifier ranks equal-work bodies by those claims.
         let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
@@ -722,6 +742,10 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
+                legacy_block_announcement_hook(
+                    announcement_claims.clone(),
+                    latest_chain_tip.clone(),
+                ),
             )
             .await
             .map_err(|error| eyre!(error))?;

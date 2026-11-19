@@ -1,4 +1,7 @@
-//! Claims on receipt order made when a block's header is admitted, and the deadline for its body.
+//! Claims on receipt order made when a block is announced, and the deadline for its body.
+//!
+//! A block is announced when native header sync admits its header, or when a legacy peer first
+//! sends an `inv` for it. The `announced` child holds the `inv` sightings.
 
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -10,6 +13,12 @@ use tokio::time::Instant;
 use zakura_chain::block::{self, HeightDiff};
 
 use super::order;
+
+mod announced;
+
+use announced::Announcements;
+#[cfg(test)]
+pub(super) use announced::MAX_ANNOUNCED_BLOCKS;
 
 /// How long after its claim a block's body still takes the claimed order, whatever its size.
 ///
@@ -23,9 +32,9 @@ use super::order;
 /// histogram.
 pub(super) const CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
 
-/// How far above the verified tip a header can be and still get a claim.
+/// How far above the verified tip a block can be and still get a claim.
 ///
-/// Only blocks racing at the tip need one. Headers further ahead belong to catch-up, and their
+/// Only blocks racing at the tip need one. Blocks further ahead belong to catch-up, and their
 /// bodies cannot arrive inside a deadline anyway.
 const MAX_CLAIM_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 
@@ -74,6 +83,8 @@ struct ClaimTable {
     /// ranked by arrival until the tip passes it again.
     floor: block::Height,
     by_hash: HashMap<block::Hash, Claim>,
+    /// The first legacy `inv` for each block. Its height is only known once the body arrives.
+    announced: Announcements,
     /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
     mined: HashMap<block::Hash, MinedBlock>,
     /// The id given to the next [`MinedBlock`].
@@ -85,6 +96,7 @@ impl Default for ClaimTable {
         Self {
             floor: block::Height::MIN,
             by_hash: HashMap::new(),
+            announced: Announcements::default(),
             mined: HashMap::new(),
             next_mined_id: 0,
         }
@@ -92,11 +104,84 @@ impl Default for ClaimTable {
 }
 
 impl ClaimTable {
-    /// Whether a mined block other than `hash` outranks `claim`.
-    fn is_voided(&self, hash: block::Hash, claim: &Claim) -> bool {
+    /// Raises the floor to `verified_tip`, dropping the claims and mined blocks below it.
+    fn raise_floor(&mut self, verified_tip: block::Height) {
+        self.floor = self.floor.max(verified_tip);
+        let floor = self.floor;
+        self.by_hash.retain(|_, claim| claim.height >= floor);
+        self.mined.retain(|_, mined| mined.height >= floor);
+    }
+
+    /// Whether a block at `height` is close enough above the floor to be claimed.
+    fn is_claimable(&self, height: block::Height) -> bool {
+        (1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - self.floor))
+    }
+
+    /// Whether a mined block other than `hash` outranks a claim on `order` at `height`.
+    fn is_voided(&self, hash: block::Hash, height: block::Height, order: u64) -> bool {
         self.mined.iter().any(|(mined_hash, mined)| {
-            *mined_hash != hash && mined.height == claim.height && claim.order < mined.order
+            *mined_hash != hash && mined.height == height && order < mined.order
         })
+    }
+
+    /// The claims `hash` holds for a body at `height`, each with whether it is voided.
+    ///
+    /// An announcement has no height of its own, so the body's height must be claimable.
+    fn candidates(
+        &self,
+        hash: block::Hash,
+        height: Option<block::Height>,
+    ) -> [Option<(Candidate, bool)>; 2] {
+        let header = self.by_hash.get(&hash).map(|claim| Candidate {
+            source: ClaimSource::Header,
+            height: claim.height,
+            order: claim.order,
+            seen_at: claim.seen_at,
+        });
+        let inv = height
+            .filter(|height| self.is_claimable(*height))
+            .and_then(|height| {
+                let announced = self.announced.get(hash)?;
+                Some(Candidate {
+                    source: ClaimSource::Inv,
+                    height,
+                    order: announced.order,
+                    seen_at: announced.seen_at,
+                })
+            });
+        [header, inv].map(|candidate| {
+            candidate.map(|candidate| {
+                let voided = self.is_voided(hash, candidate.height, candidate.order);
+                (candidate, voided)
+            })
+        })
+    }
+}
+
+/// One way a block was announced, as a body resolving its claim sees it.
+#[derive(Copy, Clone, Debug)]
+struct Candidate {
+    source: ClaimSource,
+    height: block::Height,
+    order: u64,
+    seen_at: Instant,
+}
+
+/// How the claim a body resolved was made.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ClaimSource {
+    /// Native header sync admitted the block's header.
+    Header,
+    /// A legacy peer sent the first `inv` for the block.
+    Inv,
+}
+
+impl ClaimSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Inv => "inv",
+        }
     }
 }
 
@@ -107,15 +192,24 @@ pub(super) enum ClaimOutcome {
     Unclaimed,
     /// The body arrived inside its deadline and takes the claimed order.
     Used {
+        source: ClaimSource,
         order: u64,
         age: Duration,
         bytes: usize,
     },
     /// The body arrived after its deadline and is ranked by its arrival.
-    Expired { age: Duration, bytes: usize },
+    Expired {
+        source: ClaimSource,
+        age: Duration,
+        bytes: usize,
+    },
     /// A block this node mined at the claim's height outranks it, so the body is ranked by its
     /// arrival.
-    Voided { age: Duration, bytes: usize },
+    Voided {
+        source: ClaimSource,
+        age: Duration,
+        bytes: usize,
+    },
 }
 
 impl ClaimOutcome {
@@ -131,22 +225,36 @@ impl ClaimOutcome {
     pub(super) fn record(&self, hash: block::Hash, order: u64) {
         let (outcome, claim) = match *self {
             Self::Unclaimed => ("none", None),
-            Self::Used { age, bytes, .. } => ("used", Some((age, bytes))),
-            Self::Expired { age, bytes } => ("expired", Some((age, bytes))),
-            Self::Voided { age, bytes } => ("voided", Some((age, bytes))),
+            Self::Used {
+                source, age, bytes, ..
+            } => ("used", Some((source, age, bytes))),
+            Self::Expired { source, age, bytes } => ("expired", Some((source, age, bytes))),
+            Self::Voided { source, age, bytes } => ("voided", Some((source, age, bytes))),
         };
-        let size = claim.map_or("none", |(_, bytes)| size_label(bytes));
+        let size = claim.map_or("none", |(_, _, bytes)| size_label(bytes));
+        let source = claim.map_or("none", |(source, _, _)| source.label());
         metrics::counter!(
             "sync.block.announcement_claim",
             "outcome" => outcome,
             "size" => size,
+            "source" => source,
         )
         .increment(1);
-        if let Some((age, _)) = claim {
-            metrics::histogram!("sync.block.announcement_claim.age.seconds", "size" => size)
-                .record(age.as_secs_f64());
+        if let Some((_, age, _)) = claim {
+            metrics::histogram!(
+                "sync.block.announcement_claim.age.seconds",
+                "size" => size,
+                "source" => source,
+            )
+            .record(age.as_secs_f64());
         }
-        tracing::trace!(%hash, outcome, order, "resolved the announcement claim for a block body");
+        tracing::trace!(
+            %hash,
+            outcome,
+            source,
+            order,
+            "resolved the announcement claim for a block body"
+        );
     }
 }
 
@@ -162,11 +270,12 @@ pub(super) fn size_label(bytes: usize) -> &'static str {
     }
 }
 
-/// Receipt-order claims for blocks whose headers were admitted before their bodies arrived.
+/// Receipt-order claims for blocks announced before their bodies arrived.
 ///
-/// Header sync creates claims with [`AnnouncementClaims::begin`], and the block verifier reads
-/// them by block hash, so every body transport follows the same rule. A claim, once made, is
-/// never replaced or renewed.
+/// Header sync creates claims with [`AnnouncementClaims::begin`], legacy block `inv`s with
+/// [`AnnouncementClaims::note_announcement`], and the block verifier reads them by block hash,
+/// so every body transport follows the same rule. A claim, once made, is never replaced or
+/// renewed.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
@@ -206,15 +315,12 @@ impl AnnouncementClaims {
         now: Instant,
     ) -> PendingClaims {
         let mut table = self.table();
-        table.floor = table.floor.max(verified_tip);
-        let floor = table.floor;
-        table.by_hash.retain(|_, claim| claim.height >= floor);
-        table.mined.retain(|_, mined| mined.height >= floor);
+        table.raise_floor(verified_tip);
 
         let mut covered = Vec::new();
         let mut refused: u64 = 0;
         for (hash, height) in headers {
-            if !(1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - floor)) {
+            if !table.is_claimable(height) {
                 continue;
             }
             if let Some(claim) = table.by_hash.get_mut(&hash) {
@@ -241,7 +347,8 @@ impl AnnouncementClaims {
         drop(table);
 
         if refused > 0 {
-            metrics::counter!("sync.block.announcement_claim.refused").increment(refused);
+            metrics::counter!("sync.block.announcement_claim.refused", "source" => "header")
+                .increment(refused);
         }
         PendingClaims {
             claims: self.clone(),
@@ -249,37 +356,80 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Resolves the claim held for `hash` against a body arriving at `now`, whose serialized
-    /// size `bytes` gives for the claim metrics.
+    /// Records the first legacy `inv` for `hash`, so its body can take the order it was announced
+    /// in, and raises the verified tip to `verified_tip` as [`AnnouncementClaims::begin`] does.
     ///
-    /// Resolving does not use the claim up, so an invalid body under the same header cannot take
-    /// it from the real one. `bytes` is called only for a claimed block, after the table lock is
+    /// A block that already has a header claim or an announcement keeps it, so announcing a block
+    /// again never renews its claim. The body later takes the announcement's order only if it
+    /// arrives within the deadline and is one or two blocks above the verified tip.
+    ///
+    /// No header check is needed here: a valid block hash cannot exist before its proof of work,
+    /// and the order only ranks a block after it is fully verified.
+    pub fn note_announcement(&self, hash: block::Hash, verified_tip: block::Height) {
+        self.note_announcement_at(hash, verified_tip, Instant::now())
+    }
+
+    pub(super) fn note_announcement_at(
+        &self,
+        hash: block::Hash,
+        verified_tip: block::Height,
+        now: Instant,
+    ) {
+        let mut table = self.table();
+        table.raise_floor(verified_tip);
+        if table.by_hash.contains_key(&hash) {
+            return;
+        }
+        let noted = table.announced.note(hash, now);
+        drop(table);
+
+        if !noted {
+            metrics::counter!("sync.block.announcement_claim.refused", "source" => "inv")
+                .increment(1);
+        }
+    }
+
+    /// Resolves the claims held for `hash` against a body arriving at `now`, whose coinbase
+    /// `height` places an announcement and whose serialized size `bytes` gives for the claim
+    /// metrics.
+    ///
+    /// A block can hold a header claim and an announcement. The body takes the earlier order of
+    /// those still in force, so a second claim never makes the outcome worse than the first
+    /// alone. If neither is in force, the outcome reports the earlier one.
+    ///
+    /// Resolving does not use a claim up, so an invalid body under the same hash cannot take it
+    /// from the real one. `bytes` is called only for a claimed block, after the table lock is
     /// released, because sizing a block walks its transactions.
     pub(super) fn resolve(
         &self,
         hash: block::Hash,
+        height: Option<block::Height>,
         now: Instant,
         bytes: impl FnOnce() -> usize,
     ) -> ClaimOutcome {
-        let (claim, voided) = {
-            let table = self.table();
-            let Some(claim) = table.by_hash.get(&hash).copied() else {
-                return ClaimOutcome::Unclaimed;
-            };
-            (claim, table.is_voided(hash, &claim))
+        let mut candidates = self.table().candidates(hash, height);
+        candidates.sort_by_key(|held| held.map_or(u64::MAX, |(candidate, _)| candidate.order));
+        let age = |candidate: &Candidate| now.saturating_duration_since(candidate.seen_at);
+        let mut held = candidates.iter().flatten();
+        let in_force = held
+            .clone()
+            .find(|(candidate, voided)| !voided && age(candidate) <= CLAIM_BODY_DEADLINE);
+        let Some(&(claim, voided)) = in_force.or_else(|| held.next()) else {
+            return ClaimOutcome::Unclaimed;
         };
-        let age = now.saturating_duration_since(claim.seen_at);
-        let bytes = bytes();
+
+        let (source, age, bytes) = (claim.source, age(&claim), bytes());
         if voided {
-            ClaimOutcome::Voided { age, bytes }
+            ClaimOutcome::Voided { source, age, bytes }
         } else if age <= CLAIM_BODY_DEADLINE {
             ClaimOutcome::Used {
+                source,
                 order: claim.order,
                 age,
                 bytes,
             }
         } else {
-            ClaimOutcome::Expired { age, bytes }
+            ClaimOutcome::Expired { source, age, bytes }
         }
     }
 
@@ -330,6 +480,15 @@ impl AnnouncementClaims {
     #[cfg(test)]
     pub(super) fn claimed_order(&self, hash: block::Hash) -> Option<u64> {
         self.table().by_hash.get(&hash).map(|claim| claim.order)
+    }
+
+    /// The order of the first announcement held for `hash`.
+    #[cfg(test)]
+    pub(super) fn announced_order(&self, hash: block::Hash) -> Option<u64> {
+        self.table()
+            .announced
+            .get(hash)
+            .map(|announced| announced.order)
     }
 
     /// How many mined blocks have a record.

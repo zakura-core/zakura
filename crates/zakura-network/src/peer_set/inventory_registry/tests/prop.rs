@@ -84,6 +84,7 @@ async fn inv_registry_inbound_wrapper_with(
         inv_stream_tx.clone(),
         Default::default(),
         Default::default(),
+        Default::default(),
     )
     .await;
     assert_eq!(

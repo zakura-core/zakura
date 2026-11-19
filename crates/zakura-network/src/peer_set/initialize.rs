@@ -175,6 +175,7 @@ where
         block_gossip_peer_ips,
         header_sync_driver_startup,
         Vec::new(),
+        peer::BlockAnnouncementHook::default(),
     )
     .await
     .map(
@@ -186,6 +187,9 @@ where
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
+///
+/// Legacy connections pass each block a peer announces in a single-block `inv` to
+/// `block_announcement_hook`.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -196,6 +200,7 @@ pub async fn init_with_zakura<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
+    block_announcement_hook: peer::BlockAnnouncementHook,
 ) -> Result<
     (
         BoxCloneSyncService<Request, Response, BoxError>,
@@ -308,6 +313,7 @@ where
             .with_protected_peer_ips(protected_peer_ips)
             .with_misbehavior(misbehavior.clone())
             .with_block_checksums(block_checksums.clone())
+            .with_block_announcement_hook(block_announcement_hook)
             .with_tcp_warmup(peer::TcpWarmup::spawn(
                 config.tcp_warmup.clone(),
                 latest_chain_tip.clone(),

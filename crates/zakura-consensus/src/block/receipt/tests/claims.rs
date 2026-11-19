@@ -4,7 +4,7 @@ use super::*;
 
 /// What a body of `hash` with no size finds when it arrives at `now` inside its deadline.
 fn used(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> Used {
-    match claims.resolve(hash, now, || 0) {
+    match claims.resolve(hash, Some(CLAIMED), now, || 0) {
         ClaimOutcome::Used { order, age, .. } => Used { order, age },
         outcome => panic!("expected a used claim, found {outcome:?}"),
     }
@@ -114,14 +114,14 @@ fn small_and_full_size_bodies_get_the_same_deadline() {
     for bytes in [1_000, 2_000_000] {
         assert!(
             matches!(
-                claims.resolve(hash(1), just_inside, || bytes),
+                claims.resolve(hash(1), Some(CLAIMED), just_inside, || bytes),
                 ClaimOutcome::Used { order, .. } if order == claimed
             ),
             "a body of {bytes} bytes just inside the deadline takes the claimed order",
         );
         assert!(
             matches!(
-                claims.resolve(hash(1), just_after, || bytes),
+                claims.resolve(hash(1), Some(CLAIMED), just_after, || bytes),
                 ClaimOutcome::Expired { age, .. } if age == just_after - now
             ),
             "a body of {bytes} bytes past the deadline loses the claim",
@@ -248,7 +248,7 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), now, || 0),
+            claims.resolve(hash(1), Some(CLAIMED), now, || 0),
             ClaimOutcome::Voided { .. }
         )
     };
@@ -326,7 +326,7 @@ fn mined_block_records_end_once_the_node_mines_well_above_them() {
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), now, || 0),
+            claims.resolve(hash(1), Some(CLAIMED), now, || 0),
             ClaimOutcome::Voided { .. }
         )
     };

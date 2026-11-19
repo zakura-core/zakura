@@ -106,9 +106,9 @@ impl ReceiptRegistry {
         block: &BlockHandle,
         now: Instant,
     ) -> (ReceiptGuard, Option<ClaimOutcome>) {
-        let claim = self
-            .claims
-            .resolve(hash, now, || block.zcash_serialized_size());
+        let claim = self.claims.resolve(hash, block.coinbase_height(), now, || {
+            block.zcash_serialized_size()
+        });
         let (order, registered, counted) = {
             let mut active = self
                 .active

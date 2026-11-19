@@ -44,7 +44,7 @@ const MACHINE: Machine = Machine {
     rules: &[
         (
             CADENCE,
-            "Failed attempts consume only initial, refilled, and refunded tokens.",
+            "TLS attempts consume only initial, refilled, and refunded tokens.",
             Status::Active,
         ),
         (
@@ -284,13 +284,14 @@ impl CadenceLog {
         ip: IpAddr,
         failures: &mut Vec<(String, MachineFailure)>,
     ) -> bool {
-        let admitted = counts.admit_cadence(
+        let admission = counts.admit_cadence(
             ip,
             false,
             ADDRESS_CAP,
             CONNECTION_CAP + PENDING_CAP,
             self.now(),
-        ) == HandshakeCadenceAdmission::Admit;
+        );
+        let admitted = admission == HandshakeCadenceAdmission::Admit;
         if admitted && !self.windows[host].charge(self.now_ns) {
             failure(
                 failures,
@@ -298,7 +299,12 @@ impl CadenceLog {
                 "an address started more TLS attempts than its cadence pays for",
             );
         }
-        if !admitted && !self.windows[host].refusal_earned(self.now_ns) {
+        // The node's bucket bounds every address together, so only an
+        // address refusal must be earned by that address's charges.
+        if !admitted
+            && admission != HandshakeCadenceAdmission::NodeExhausted
+            && !self.windows[host].refusal_earned(self.now_ns)
+        {
             failure(failures, CONFORMANT, "an address with a token was refused");
         }
         admitted
@@ -424,9 +430,6 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 let registered = counts.can_register(owner.ip, ADDRESS_CAP, false);
                 release_handshake(&mut counts, owner);
                 if registered {
-                    if owner.inbound {
-                        cadence.refund(&mut counts, owner.host, owner.ip);
-                    }
                     counts.add_registered(owner.ip);
                     owner.phase = Phase::Registered;
                     owners[slot] = Some(owner);
@@ -585,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn registrations_and_transport_retries_refund_their_attempts() {
+    fn transport_retries_refund_their_attempts_and_registrations_keep_theirs() {
         let mut input = Vec::new();
         for _ in 0..40 {
             input.extend([0, 0, 0, 9, 0, 0]);

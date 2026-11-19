@@ -81,7 +81,9 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// The wait is flat. It does not stop while a parent is being verified, and
 /// waking the transaction or checking it again does not restart it. When it
 /// ends, a parked transaction is rejected, and one whose inputs keep
-/// arriving during its checks gets one more check and no more.
+/// arriving during its checks gets one more check and no more. A parent
+/// that enters the pool runs a waiting transaction again only a few times
+/// per tip.
 pub const T_PARK: Duration = Duration::from_secs(60);
 
 /// Commands that can wait for the core. A full queue makes

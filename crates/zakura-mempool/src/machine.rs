@@ -47,10 +47,18 @@ use crate::{
     config::Config,
     storage::{
         ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
-        SameEffectsTipRejectionError, Storage, StorageStats,
+        SameEffectsTipRejectionError, Storage, StorageStats, MAX_MEMPOOL_ANCESTORS,
     },
     Instant, MempoolError,
 };
+
+/// How many times, per tip, a transaction entering the pool can run a
+/// waiting transaction again. The pool takes a child with at most
+/// [`MAX_MEMPOOL_ANCESTORS`] unmined ancestors, so an honest child needs at
+/// most that many. The verifier reports every spend of a transaction with a
+/// missing input, so without a cap each parent that arrives would run a
+/// child with one bogus input again, until its wait ends.
+const MAX_PARENT_RETRIES: usize = MAX_MEMPOOL_ANCESTORS;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -213,6 +221,13 @@ struct Admission<E> {
     missing_error: Option<E>,
     /// Whether the one check allowed after that wait ended has been used.
     last_check_used: bool,
+    /// Runs since the tip changed because a transaction entered the pool.
+    /// See [`MAX_PARENT_RETRIES`].
+    parent_retries: usize,
+    /// Whether a parent arrived that the cap did not let run it again. If
+    /// so, the wait ends with the one last check rather than the missing
+    /// inputs it last saw.
+    retry_owed: bool,
     /// When its submitter stops waiting. It ends then as a timeout, whatever
     /// its stage. See `Reservation::give_up_at`.
     give_up: Option<Instant>,
@@ -451,6 +466,8 @@ impl<E: VerifyError> MempoolState<E> {
                 missing_since: None,
                 missing_error: None,
                 last_check_used: false,
+                parent_retries: 0,
+                retry_owed: false,
                 give_up: None,
                 after_reset: false,
             },
@@ -991,6 +1008,10 @@ impl<E: VerifyError> MempoolState<E> {
                         "pool/slot-time-within-limit: a transaction was left parked past its submitter's deadline"
                     );
                 }
+                assert!(
+                    admission.parent_retries <= MAX_PARENT_RETRIES,
+                    "pool/parent-retries: a transaction was run again past its cap"
+                );
             }
         }
     }
@@ -1033,6 +1054,18 @@ impl<E: VerifyError> MempoolState<E> {
             self.fail_locally(key, LocalFault::VerifyTimeout);
         }
         for key in unparked {
+            let admission = self.admission_at(key);
+            if admission.retry_owed && !admission.last_check_used {
+                // The missing inputs it last saw may be out of date, so they
+                // are not cached. A submitter that has gone gets a timeout.
+                if admission.give_up.is_some_and(|at| at <= now) {
+                    self.fail_locally(key, LocalFault::VerifyTimeout);
+                } else {
+                    admission.last_check_used = true;
+                    self.start_admission(key);
+                }
+                continue;
+            }
             // Today a parent that never arrived is a missing-input failure,
             // remembered for these exact bytes until the tip changes.
             let error = self
@@ -1189,7 +1222,7 @@ impl<E: VerifyError> MempoolState<E> {
                     self.unqueue(queued);
                 }
                 self.trim_queue();
-                self.wake(|parent| *parent == hash);
+                self.wake_for_arrival(hash);
             }
             // Found in the best chain by this job's own lookup. Today that
             // leaves the rejection lists alone. Only a block the core sees
@@ -1225,9 +1258,17 @@ impl<E: VerifyError> MempoolState<E> {
                 if last_check {
                     admission.last_check_used = true;
                 }
-                if (arrived && !wait_over) || last_check {
+                let retry = arrived && !wait_over && admission.parent_retries < MAX_PARENT_RETRIES;
+                if retry {
+                    admission.parent_retries += 1;
+                }
+                if retry || last_check {
                     self.start_admission(key);
                     return;
+                }
+                if arrived && !wait_over {
+                    // The cap held it back. It parks below.
+                    admission.retry_owed = true;
                 }
                 if wait_over && arrived {
                     // There is no check left to give, and this answer is
@@ -1343,6 +1384,8 @@ impl<E: VerifyError> MempoolState<E> {
                     missing_since: None,
                     missing_error: None,
                     last_check_used: false,
+                    parent_retries: 0,
+                    retry_owed: false,
                     give_up: None,
                     after_reset: true,
                 },
@@ -1403,6 +1446,8 @@ impl<E: VerifyError> MempoolState<E> {
         if let Some(give_up) = admission.give_up {
             deadline = deadline.min(give_up);
         }
+        // This check sees every parent that has arrived.
+        admission.retry_owed = false;
         admission.stage = Stage::Verifying { job, deadline };
         let tx_id = admission.tx_id;
         let after_reset = admission.after_reset;
@@ -1427,6 +1472,29 @@ impl<E: VerifyError> MempoolState<E> {
         };
         self.jobs.remove(&job);
         self.step.effects.push(Effect::Cancel(job));
+    }
+
+    /// Runs again every admission parked on `parent`, which just entered the
+    /// pool, that has a retry left. One without is owed a last check.
+    fn wake_for_arrival(&mut self, parent: transaction::Hash) {
+        let mut woken = Vec::new();
+        for (key, admission) in &mut self.admissions {
+            let Stage::Parked { on } = &admission.stage else {
+                continue;
+            };
+            if !on.contains(&parent) {
+                continue;
+            }
+            if admission.parent_retries < MAX_PARENT_RETRIES {
+                admission.parent_retries += 1;
+                woken.push(*key);
+            } else {
+                admission.retry_owed = true;
+            }
+        }
+        for key in woken {
+            self.start_admission(key);
+        }
     }
 
     /// Runs again every admission parked on a parent that `arrived` accepts.
@@ -1607,6 +1675,11 @@ impl<E: VerifyError> MempoolState<E> {
     fn set_tip(&mut self, tip: ChainTip) {
         self.tip = tip;
         self.tip_at = self.fresh();
+        // A block changes which parents are still unmined, and a reset sends
+        // pooled parents back through admission.
+        for admission in self.admissions.values_mut() {
+            admission.parent_retries = 0;
+        }
         self.has_tip = true;
         self.switch();
     }

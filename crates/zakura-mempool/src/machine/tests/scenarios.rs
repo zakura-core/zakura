@@ -887,6 +887,89 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait() {
     assert!(bench.reserve(&child).0.is_ok());
 }
 
+/// A child that spends one output that never exists and an output of each
+/// of `parents`, which are not in the pool yet. The verifier reports every
+/// spend of such a child as missing.
+fn child_of_many(runner: &mut TestRunner, parents: usize) -> (Vec<Tx>, Tx, Vec<OutPoint>) {
+    let parents = unrelated(runner, parents);
+    let mut spends = vec![coin(0xb0)];
+    spends.extend(parents.iter().map(|parent| parent.outpoint(0)));
+    let child = build(runner, &spends, 1, None);
+    (parents, child, spends)
+}
+
+/// Admits `parent` and returns the jobs its admission started.
+fn admit_parent(bench: &mut Bench, parent: &Tx) -> Vec<JobId> {
+    let (_, job) = bench.start(parent);
+    started(&bench.pass(job, parent))
+}
+
+/// Arriving parents run a parked transaction again at most
+/// `MAX_MEMPOOL_ANCESTORS` times per tip, however many it names. A block
+/// gives it its retries back.
+#[test]
+fn arriving_parents_run_a_parked_transaction_again_at_most_twice() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 5);
+    let mut bench = Bench::new();
+    let (waiter, job) = bench.start(&child);
+    assert!(bench.missing(job, spends.clone()).is_empty());
+
+    for parent in &parents[..2] {
+        let rerun = admit_parent(&mut bench, parent);
+        assert_eq!(rerun.len(), 1, "an arriving parent runs the child again");
+        assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    }
+    for parent in &parents[2..4] {
+        assert!(
+            admit_parent(&mut bench, parent).is_empty(),
+            "the child's retries are used up"
+        );
+    }
+
+    // A block mines a parent, which runs the child again and gives it its
+    // retries back.
+    let rerun = started(&bench.grow(&[&parents[0]]));
+    assert_eq!(rerun.len(), 1);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[4]);
+    assert_eq!(rerun.len(), 1, "the block gave the child its retries back");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+
+    let step = bench.tick(T_PARK);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+    assert_eq!(bench.machine.slots_in_use(), 0);
+}
+
+/// A parent that arrives while the child is checked counts as a retry too.
+/// One the cap holds back is owed: when the wait ends the child gets one
+/// last check instead of the missing inputs it last saw being cached.
+#[test]
+fn a_parent_the_cap_holds_back_earns_one_last_check() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 3);
+    let mut bench = Bench::new();
+    let (waiter, mut job) = bench.start(&child);
+    for parent in &parents[..2] {
+        bench.admit(parent);
+        let rerun = started(&bench.missing(job, spends.clone()));
+        assert_eq!(rerun.len(), 1, "a parent that arrived during the check");
+        job = rerun[0];
+    }
+    bench.admit(&parents[2]);
+    assert!(
+        bench.missing(job, spends.clone()).is_empty(),
+        "the cap holds the third arrival back"
+    );
+
+    let step = bench.tick(T_PARK);
+    assert!(step.verdict(waiter).is_none());
+    let last = started(&step);
+    assert_eq!(last.len(), 1, "one last check");
+    let step = bench.missing(last[0], vec![coin(0xb0)]);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

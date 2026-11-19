@@ -466,14 +466,12 @@ mod tests {
             authorize_with_reservation(Some(body_bytes)),
             Ok(Authorization::Block(block::Height(1)))
         ));
-        assert!(matches!(
-            authorize_with_reservation(Some(body_bytes - 1)),
-            Err(SinkReject::Protocol(row, _)) if row == CloseRow::REG_CLOSE_7
-        ));
-        assert!(matches!(
-            authorize_with_reservation(None),
-            Err(SinkReject::Protocol(row, _)) if row == CloseRow::REG_CLOSE_6
-        ));
+        let row = |reserved| match authorize_with_reservation(reserved) {
+            Err(SinkReject::Protocol(row, _)) => Some(row),
+            _ => None,
+        };
+        assert_eq!(row(Some(body_bytes - 1)), Some(CloseRow::BSYNC_CLOSE_14));
+        assert_eq!(row(None), Some(CloseRow::REG_CLOSE_6));
     }
 
     #[test]

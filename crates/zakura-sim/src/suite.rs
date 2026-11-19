@@ -27,7 +27,8 @@
 //!   that the suite doesn't run;
 //! - a planted case whose property no harness reports;
 //! - a required seed that fails validation;
-//! - a pending row that a harness now registers;
+//! - a pending row that a harness now registers, or a pending feature
+//!   family none of whose required states still waits;
 //! - a row that names a package, test, target or harness that doesn't
 //!   exist.
 //!
@@ -49,6 +50,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    explore::state::{Coverage, REQUIRED},
     harness::{
         coverage::{Bypass, Ci, Witness, COVERAGE},
         HarnessEntry, HARNESSES,
@@ -1809,7 +1811,8 @@ impl Builder<'_> {
     }
 
     /// The missing-target and pending rows. A pending property or harness
-    /// that is now registered is a problem.
+    /// that is now registered is a problem, and so is a pending feature
+    /// family that no required state waits in.
     fn pending(&mut self) -> Vec<PendingRow> {
         let reported = reported_properties();
         let mut rows = Vec::new();
@@ -1839,6 +1842,13 @@ impl Builder<'_> {
                 self.problem(format!(
                     "{SUITE_FILE} lists `{}` as pending, and it's registered: remove its \
                      `[[pending]]` row",
+                    pending.id
+                ));
+            }
+            if pending.kind == PendingKind::Feature && !feature_waits(&pending.id) {
+                self.problem(format!(
+                    "{SUITE_FILE} lists `{}` as pending, and no required state of it waits: \
+                     remove its `[[pending]]` row",
                     pending.id
                 ));
             }
@@ -2104,6 +2114,14 @@ impl CargoTarget {
     fn is(&self, kind: &str) -> bool {
         self.kind.iter().any(|own| own == kind)
     }
+}
+
+/// Whether a required state of the feature family named `id` still waits
+/// for a collector or a witness ([`REQUIRED`]).
+fn feature_waits(id: &str) -> bool {
+    REQUIRED.iter().any(|row| {
+        row.family.name() == id && matches!(row.coverage, Coverage::Waiting { .. })
+    })
 }
 
 /// Every property ID any harness reports.

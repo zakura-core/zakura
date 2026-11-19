@@ -704,6 +704,20 @@ fn a_registered_pending_row_fails() {
     );
 }
 
+/// A feature family none of whose required states waits leaves the
+/// pending rows.
+#[test]
+fn a_settled_pending_feature_fails() {
+    let mut suite = committed();
+    suite
+        .pending
+        .push(pending("feature/reorg-stage", PendingKind::Feature));
+    assert_problem(
+        &problems(&suite),
+        "lists `feature/reorg-stage` as pending, and no required state of it waits",
+    );
+}
+
 #[test]
 fn every_problem_is_reported_at_once() {
     let mut suite = committed();

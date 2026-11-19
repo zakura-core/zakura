@@ -22,8 +22,9 @@ use zakura_sim::{
     explore::{
         feedback::{Counters, Feature, Feedback, FEATURES, FEEDBACK_VERSION},
         state::{
-            collector, Coverage, Disposition, Family, Fork as ForkState, FrameLabel, Operation,
-            RetireReason, Row, Service, StateFeature, Transition, REQUIRED, SPAN,
+            collector, Coverage, Disposition, Family, Fork as ForkState, FrameLabel, Namespace,
+            ObligationPoint, Operation, ReorgStage, RetireReason, Row, Service, StateFeature,
+            Transition, REQUIRED, SPAN,
         },
     },
     harness::{
@@ -37,14 +38,15 @@ use zakura_sim::{
             policy::{Allow, Hold as HeaderHold, Trigger as HeaderTrigger},
             Policy as HeaderPolicy,
         },
-        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario},
+        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario, WireScenario},
         run_harness,
-        wire_plans::act_scenario,
+        sync_wire::COMBINED_TAG,
+        wire_plans::{act_scenario, progress_scenario},
         HarnessError, Subsystem,
     },
     model::Label,
     observe::{StorageFact, StorageRequest, StorageResult},
-    peer::adversary::Act,
+    peer::{adversary::Act, PeerAction},
     Checker, MemorySink, Observation, Plan, PropertyReport, RecordSink, RunEnd, RunReport,
 };
 
@@ -105,13 +107,13 @@ fn state_features_have_distinct_indices_inside_their_blocks() {
     }
 }
 
-/// [`FEEDBACK_VERSION`] 5's layout: one pinned index per block, and every
+/// [`FEEDBACK_VERSION`] 6's layout: one pinned index per block, and every
 /// vocabulary's size. A change here changes what a corpus means, so it
 /// bumps the version.
 #[test]
 fn the_layout_is_pinned_to_its_version() {
     use zakura_sim::explore::state::*;
-    assert_eq!(FEEDBACK_VERSION, 5);
+    assert_eq!(FEEDBACK_VERSION, 6);
     let pinned = [
         (
             StateFeature::HeaderRetired {
@@ -225,11 +227,22 @@ fn the_layout_is_pinned_to_its_version() {
             28672 + 6,
         ),
         (
+            StateFeature::ReorgStage(ReorgStage::HeaderLocator),
+            28672 + 9,
+        ),
+        (
             StateFeature::Obligation {
                 namespace: Namespace::HeaderSync,
                 point: ObligationPoint::Expired,
             },
-            32768 + 3 * 3 + 2,
+            32768 + 3 * 4 + 2,
+        ),
+        (
+            StateFeature::Obligation {
+                namespace: Namespace::Unlisted,
+                point: ObligationPoint::Withdrawn,
+            },
+            32768 + 7 * 4 + 3,
         ),
         (StateFeature::ConditionsEstablished, 32768 + 512),
         (
@@ -293,10 +306,10 @@ fn the_layout_is_pinned_to_its_version() {
         sizes,
         [
             10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 8, 2, 3, 4, 4, 4, 2, 4, 12, 2, 14, 6,
-            18, 2, 3, 7, 8, 3, 3, 2, 2, 2
+            18, 2, 3, 10, 8, 4, 3, 2, 2, 2
         ]
     );
-    assert_eq!(StateFeature::all().len(), 2_833);
+    assert_eq!(StateFeature::all().len(), 2_844);
     // Swapping two values inside a vocabulary keeps every size above, and
     // can keep every pinned index, but moves both values' indices. The
     // digest of every feature's index pins the whole mapping.
@@ -309,7 +322,7 @@ fn the_layout_is_pinned_to_its_version() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        digest, "97fbed6b88912692acac743b89144d2bf44e6817ba5a03b7d12b63b2a5a9e4dd",
+        digest, "e4484807aee0798357170b57f056b8601981024cb2d0e2f95ece813768db3005",
         "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
     );
 }
@@ -588,6 +601,17 @@ fn witnesses() -> Vec<Witness> {
             act_scenario(Act::StatusBurst),
             plan(),
         ),
+        explicit::<HeaderWire>(
+            "header wire honest peer leaves before the apply",
+            leaving(),
+            Vec::new(),
+        ),
+        explicit::<BlockStorage>("block drain cut short", drain_cut_short(), plan()),
+        drawn(
+            "sync/wire",
+            "sync wire reorg",
+            [&[COMBINED_TAG, 1][..], &plan()].concat(),
+        ),
     ];
     for tag in 1..=14u8 {
         all.push(drawn(
@@ -670,6 +694,26 @@ fn teardown() -> BlockScenario {
                 })),
             )),
         }],
+        ..BlockScenario::default()
+    }
+}
+
+/// The progress fixture with an honest peer that disconnects once it has
+/// served its page. Under the default Plan, it leaves before the node
+/// applies the header it advertised, so `StableMembership` stops holding
+/// while `header-sync/honest-progress`'s obligation is open.
+fn leaving() -> WireScenario {
+    let mut scenario = progress_scenario();
+    scenario.peers[0].script = vec![PeerAction::Disconnect];
+    scenario
+}
+
+/// Eight blocks whose run stops a quarter of the way through its sync and
+/// whose drain ends after ten steps, while the node still has work ready.
+fn drain_cut_short() -> BlockScenario {
+    BlockScenario {
+        steps: Some(2_000),
+        drain_steps: Some(10),
         ..BlockScenario::default()
     }
 }
@@ -827,6 +871,39 @@ fn every_collected_state_has_a_witness() {
             assert!(states.iter().any(shows), "{name} doesn't show {state}");
         }
     }
+    // Each witness built for fuzz-5's waiting states shows its own, and the
+    // reorg shows each of header sync's three stages.
+    let shown_by = |name: &str| {
+        witnesses
+            .iter()
+            .zip(&reached)
+            .find(|(witness, _)| witness.name == name)
+            .map(|(_, states)| states)
+            .unwrap_or_else(|| panic!("no witness {name}"))
+    };
+    for stage in [
+        ReorgStage::HeaderPrepare,
+        ReorgStage::HeaderApply,
+        ReorgStage::HeaderLocator,
+    ] {
+        assert!(
+            shown_by("sync wire reorg").contains(&StateFeature::ReorgStage(stage)),
+            "sync wire reorg doesn't show {stage:?}"
+        );
+    }
+    assert!(
+        shown_by("header wire honest peer leaves before the apply").contains(
+            &StateFeature::Obligation {
+                namespace: Namespace::HeaderSync,
+                point: ObligationPoint::Withdrawn,
+            }
+        ),
+        "the leaving peer withdraws no obligation"
+    );
+    assert!(
+        shown_by("block drain cut short").contains(&StateFeature::IncompleteDrain),
+        "the cut drain is complete"
+    );
     for row in REQUIRED {
         let Coverage::Collected {
             harnesses,
@@ -854,6 +931,25 @@ fn every_collected_state_has_a_witness() {
             .filter(|(witness, _)| witness.drawn && harnesses.contains(&witness.harness))
             .any(|(_, states)| states.iter().any(shows));
         assert_eq!(drawn_shown, drawn, "{}: drawn", row.state);
+    }
+}
+
+/// fuzz-5's acceptance: every required state is collected, or excluded
+/// with a reason. None waits.
+#[test]
+fn every_required_state_is_collected_or_excluded() {
+    for row in REQUIRED {
+        match row.coverage {
+            Coverage::Collected { harnesses, .. } => {
+                assert!(!harnesses.is_empty(), "{}: no harness", row.state);
+            }
+            Coverage::Excluded { why } => {
+                assert!(!why.trim().is_empty(), "{}: no reason", row.state);
+            }
+            Coverage::Waiting { on, why } => {
+                panic!("{} waits on {on}: {why}", row.state)
+            }
+        }
     }
 }
 

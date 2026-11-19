@@ -4405,68 +4405,25 @@ impl EqualWorkTips {
     }
 }
 
-/// Longer than any body deadline, so a body delivered after this wait has lost its claim.
-const PAST_EVERY_BODY_DEADLINE: std::time::Duration =
-    ANNOUNCEMENT_PRIORITY_WINDOW.saturating_add(std::time::Duration::from_millis(50));
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_block_whose_header_came_first_wins_the_tie_only_inside_its_deadline() {
-    let _init_guard = zakura_test::init();
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        for body_is_prompt in [true, false] {
-            let mut tips = EqualWorkTips::new().await;
-            let (a, b) = (tips.a.clone(), tips.b.clone());
-
-            // A's header is admitted first, but B's body reaches the verifier before A's does.
-            tips.admit_header(&a);
-            let b_commit = tips.verifier.call(Request::Commit(b.clone().into()));
-            if !body_is_prompt {
-                tokio::time::sleep(PAST_EVERY_BODY_DEADLINE).await;
-            }
-            let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
-
-            b_commit.await.unwrap();
-            assert_eq!(tips.tip_hash(), Some(b.hash()));
-            a_commit.await.unwrap();
-            let expected = if body_is_prompt { &a } else { &b };
-            assert_eq!(
-                tips.tip_hash(),
-                Some(expected.hash()),
-                "body_is_prompt: {body_is_prompt}",
-            );
-        }
-    })
-    .await
-    .expect("announcement priority test must finish");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_withheld_block_does_not_renew_its_claim_by_being_announced_again() {
+async fn a_block_whose_header_came_first_wins_the_tie_when_its_body_follows_in_time() {
     let _init_guard = zakura_test::init();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut tips = EqualWorkTips::new().await;
         let (a, b) = (tips.a.clone(), tips.b.clone());
 
-        // A's body is withheld past its deadline while its header keeps being delivered.
+        // A's header is admitted first, but B's body reaches the verifier before A's does.
         tips.admit_header(&a);
-        for _ in 0..3 {
-            tokio::time::sleep(PAST_EVERY_BODY_DEADLINE / 3).await;
-            tips.admit_header(&a);
-        }
-
-        // A competitor appears, and A's body is released right after its latest announcement.
         let b_commit = tips.verifier.call(Request::Commit(b.clone().into()));
         let a_commit = tips.verifier.call(Request::Commit(a.clone().into()));
+
         b_commit.await.unwrap();
+        assert_eq!(tips.tip_hash(), Some(b.hash()));
         a_commit.await.unwrap();
-        assert_eq!(
-            tips.tip_hash(),
-            Some(b.hash()),
-            "a withheld block is ranked by the arrival of its body",
-        );
+        assert_eq!(tips.tip_hash(), Some(a.hash()));
     })
     .await
-    .expect("withholding test must finish");
+    .expect("announcement priority test must finish");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

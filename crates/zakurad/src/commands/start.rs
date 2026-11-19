@@ -614,6 +614,9 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
+        // Header sync claims blocks whose headers arrive first, and the block verifier ranks
+        // equal-work bodies by those claims.
+        let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
                 zakura_header_sync_driver_startup(
@@ -622,6 +625,7 @@ impl StartCmd {
                     header_chain_body_evidence.clone(),
                     &config.network.network,
                     &zakura_block_sync_handoff,
+                    announcement_claims.clone(),
                 )
                 .boxed()
                 .await?,
@@ -753,7 +757,7 @@ impl StartCmd {
                 state.clone(),
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
-                zakura_block_sync_handoff.announced_blocks().clone(),
+                announcement_claims,
             )
             .boxed()
             .await;

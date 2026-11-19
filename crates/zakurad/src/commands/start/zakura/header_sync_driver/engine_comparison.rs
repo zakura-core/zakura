@@ -55,7 +55,7 @@ pub(crate) struct ProductionState {
     /// Regtest.
     pub(crate) network: zakura_chain::parameters::Network,
     /// The claim table every port over this state writes to.
-    pub(crate) announced_blocks: zakura_consensus::AnnouncementClaims,
+    pub(crate) announcement_claims: zakura_consensus::AnnouncementClaims,
 }
 
 impl ProductionState {
@@ -106,7 +106,7 @@ impl ProductionState {
             read_state,
             authority,
             network,
-            announced_blocks: Default::default(),
+            announcement_claims: Default::default(),
         }
     }
 
@@ -140,7 +140,7 @@ impl ProductionState {
             self.authority.clone(),
             self.network.clone(),
             snapshots,
-            self.announced_blocks.clone(),
+            self.announcement_claims.clone(),
         ))
     }
 }
@@ -760,7 +760,7 @@ async fn adapter_deadlines_match_the_contract() {
         network: HeaderFixture::regtest().network().clone(),
         adapter_key: key.clone(),
         selected_chain: tokio::sync::watch::channel(None).1,
-        announced_blocks: Default::default(),
+        announcement_claims: Default::default(),
     };
     let anchor = HeaderFixture::regtest().anchor();
     let scope = HeaderWorkAuthority {

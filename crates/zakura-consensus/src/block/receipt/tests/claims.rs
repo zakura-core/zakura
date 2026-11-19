@@ -1,0 +1,262 @@
+//! How claims are made, kept, dropped and resolved.
+
+use super::*;
+
+/// What a body of `hash` with no size finds when it arrives at `now` inside its deadline.
+fn used(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> Used {
+    match claims.resolve(hash, now, || 0) {
+        ClaimOutcome::Used { order, age, .. } => Used { order, age },
+        outcome => panic!("expected a used claim, found {outcome:?}"),
+    }
+}
+
+struct Used {
+    order: u64,
+    age: Duration,
+}
+
+#[test]
+fn a_body_inside_its_deadline_keeps_the_order_of_its_header() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let competitor = order::next();
+
+    let at_the_bound = now + body_deadline(0);
+    let order = body_order(&claims, hash(1), 0, at_the_bound);
+    assert!(order < competitor);
+    assert_eq!(Some(order), claimed_order(&claims, hash(1)));
+    assert!(
+        body_order(&claims, hash(2), 0, now) > competitor,
+        "a claim only reserves priority for the hash it was made for",
+    );
+}
+
+#[test]
+fn the_first_claim_for_a_block_is_permanent() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let first = used(&claims, hash(1), now);
+
+    let later = now + Duration::from_millis(300);
+    claim(&claims, hash(1), later);
+    let again = used(&claims, hash(1), later);
+    assert_eq!(again.order, first.order);
+    assert_eq!(
+        again.age,
+        Duration::from_millis(300),
+        "the claim still dates from the first header",
+    );
+}
+
+#[test]
+fn announcing_a_withheld_block_again_does_not_renew_its_claim() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+
+    // The body is withheld past its deadline while the header is delivered again.
+    let mut late = now;
+    for _ in 0..3 {
+        late += MAX_CLAIM_BODY_DEADLINE;
+        claim(&claims, hash(1), late);
+    }
+    let competitor = order::next();
+    assert!(
+        body_order(&claims, hash(1), 2_000_000, late) > competitor,
+        "a withheld body is ranked by its arrival",
+    );
+}
+
+#[test]
+fn a_claim_keeps_the_order_reserved_before_its_header_apply() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    let arrived_during_apply = order::next();
+    assert!(
+        claims.claimed_order(hash(1)).is_none(),
+        "a claim is not in force until its header is applied",
+    );
+
+    pending.commit();
+    assert!(body_order(&claims, hash(1), 0, now) < arrived_during_apply);
+}
+
+#[test]
+fn a_header_that_is_not_applied_leaves_no_claim() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    drop(claims.begin_at([(hash(1), CLAIMED)], TIP, now));
+    assert!(!claims.is_claimed(hash(1)));
+
+    // A later apply of the same header claims from its own arrival.
+    let later = now + MAX_CLAIM_BODY_DEADLINE;
+    claim(&claims, hash(1), later);
+    let found = used(&claims, hash(1), later);
+    assert_eq!(found.age, Duration::ZERO);
+}
+
+#[test]
+fn the_deadline_grows_with_body_size_up_to_the_window() {
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(body_deadline(0), CLAIM_BASE_GRACE);
+    assert_eq!(
+        body_deadline(MIB),
+        CLAIM_BASE_GRACE + Duration::from_secs(1)
+    );
+    assert_eq!(body_deadline(2 * MIB), MAX_CLAIM_BODY_DEADLINE);
+    assert_eq!(body_deadline(usize::MAX), MAX_CLAIM_BODY_DEADLINE);
+
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let competitor = order::next();
+
+    let past_the_grace = now + CLAIM_BASE_GRACE + Duration::from_millis(1);
+    assert!(body_order(&claims, hash(1), 1_000, past_the_grace) > competitor);
+    assert!(body_order(&claims, hash(1), MIB, past_the_grace) < competitor);
+
+    let past_the_window = now + MAX_CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    assert!(body_order(&claims, hash(1), 2 * MIB, past_the_window) > competitor);
+}
+
+#[test]
+fn only_headers_just_above_the_verified_tip_are_claimed() {
+    let claims = AnnouncementClaims::default();
+    // A batch that reaches from below the tip to far ahead of it, as catch-up delivers.
+    let heights = [99, 100, 101, 102, 103, 5_000].map(block::Height);
+    let headers = heights
+        .into_iter()
+        .enumerate()
+        .map(|(index, height)| (hash(index), height));
+    claims.begin_at(headers, TIP, Instant::now()).commit();
+
+    let claimed: Vec<_> = heights
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| claims.is_claimed(hash(*index)))
+        .map(|(_, height)| height)
+        .collect();
+    assert_eq!(claimed, [block::Height(101), block::Height(102)]);
+}
+
+#[test]
+fn a_full_table_refuses_new_claims_and_keeps_the_old_ones() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    for index in 0..MAX_ANNOUNCEMENT_CLAIMS {
+        claim(&claims, hash(index), now);
+    }
+    let orders = || -> Vec<_> {
+        (0..MAX_ANNOUNCEMENT_CLAIMS)
+            .map(|index| claimed_order(&claims, hash(index)).expect("the claim is held"))
+            .collect()
+    };
+    let before = orders();
+
+    claim(&claims, hash(MAX_ANNOUNCEMENT_CLAIMS), now);
+    assert!(!claims.is_claimed(hash(MAX_ANNOUNCEMENT_CLAIMS)));
+    assert_eq!(orders(), before);
+}
+
+#[test]
+fn claims_below_the_verified_tip_are_dropped_for_good() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+
+    // The claimed height is the new tip, where a tie can still be decided.
+    claims.begin_at([], CLAIMED, now).commit();
+    assert!(claims.is_claimed(hash(1)));
+
+    let above = block::Height(CLAIMED.0 + 1);
+    claims.begin_at([], above, now).commit();
+    assert!(!claims.is_claimed(hash(1)));
+
+    // Neither a new delivery nor a lower tip brings the claim back.
+    claims.begin_at([(hash(1), CLAIMED)], above, now).commit();
+    claim(&claims, hash(1), now);
+    assert!(!claims.is_claimed(hash(1)));
+}
+
+#[test]
+fn a_reservation_overtaken_by_the_verified_tip_is_not_committed() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    claims
+        .begin_at([], block::Height(CLAIMED.0 + 1), now)
+        .commit();
+    pending.commit();
+    assert!(!claims.is_claimed(hash(1)));
+}
+
+#[test]
+fn a_mined_block_outranks_an_earlier_claim_at_its_height() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    claims
+        .begin_at([(hash(2), block::Height(CLAIMED.0 + 1))], TIP, now)
+        .commit();
+    let rival = claimed_order(&claims, hash(1)).expect("the rival was claimed");
+    let above = claimed_order(&claims, hash(2)).expect("the next height was claimed");
+
+    let mined_order = order::next();
+    let mined = claims.mark_mined(hash(3), CLAIMED, mined_order);
+    assert!(
+        body_order(&claims, hash(1), 0, now) > mined_order,
+        "a rival announced first does not displace the mined block",
+    );
+    assert_eq!(
+        body_order(&claims, hash(2), 0, now),
+        above,
+        "a claim at another height is honoured",
+    );
+
+    // The mined block failed verification, so the rival's claim is back in force.
+    drop(mined);
+    assert_eq!(body_order(&claims, hash(1), 0, now), rival);
+}
+
+#[test]
+fn a_mined_watermark_lasts_while_any_request_for_the_block_is_active() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let rival = claimed_order(&claims, hash(1)).expect("the rival was claimed");
+    let voided = || {
+        matches!(
+            claims.resolve(hash(1), now, || 0),
+            ClaimOutcome::Voided { .. }
+        )
+    };
+
+    let mined_order = order::next();
+    let first = claims.mark_mined(hash(3), CLAIMED, mined_order);
+    let duplicate = claims.mark_mined(hash(3), CLAIMED, mined_order);
+    // The duplicate submission is rejected while the first is still verifying.
+    drop(duplicate);
+    assert!(voided());
+
+    // The first submission verified, so the watermark outlives its request.
+    first.keep();
+    assert!(voided());
+
+    // A newer mined block replaces the watermark, and its failure removes it.
+    let next = claims.mark_mined(hash(4), block::Height(CLAIMED.0 + 1), mined_order + 1);
+    assert!(!voided(), "the watermark names one height");
+    drop(next);
+    assert_eq!(body_order(&claims, hash(1), 0, now), rival);
+}
+
+#[test]
+fn size_labels_split_at_their_bounds() {
+    assert_eq!(size_label(99_999), "under_100kB");
+    assert_eq!(size_label(100_000), "under_500kB");
+    assert_eq!(size_label(499_999), "under_500kB");
+    assert_eq!(size_label(999_999), "under_1MB");
+    assert_eq!(size_label(1_000_000), "1MB_or_more");
+}

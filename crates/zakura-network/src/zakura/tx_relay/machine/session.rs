@@ -21,7 +21,8 @@ use super::{
     wanted::{Admission, Changes},
     CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
     PoolView, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
-    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN, PENDING_PER_PEER,
+    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN, PENDING_CAP,
+    PENDING_PER_PEER, PENDING_SHARE,
 };
 use crate::zakura::tx_relay::wire::{inv_payload_bound, MAX_INV_ENTRIES};
 
@@ -1034,7 +1035,7 @@ impl PeerMachine {
         }
         // A submission keeps its claim until its verdict, so nobody fetches
         // the id again while the pool still decides it.
-        for pending in &self.state.pending {
+        for pending in self.state.pending.iter() {
             shared.wanted.unhold(pending.id, pending.generation);
         }
         for (waiter, submitted) in self.submitted_at.drain() {
@@ -1141,14 +1142,24 @@ impl PeerMachine {
             fresh.push((id, size));
         }
         // Room is decided before the table changes, so an id that does not
-        // fit leaves no holder behind.
-        let fits = state.room().min(fresh.len());
+        // fit leaves no holder behind. Past the node-wide cap a session
+        // still holds its share, so peers that fill the cap crowd out
+        // nobody else's first ids.
+        let node_room = PENDING_CAP.saturating_sub(shared.wanted.held());
+        let share_room = PENDING_SHARE.saturating_sub(state.pending.len());
+        let fits = state.room().min(node_room.max(share_room)).min(fresh.len());
         let dropped = fresh.len().saturating_sub(fits);
         state.overflow = state
             .overflow
             .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
         fresh.truncate(fits);
         for (id, size) in fresh {
+            // The set keeps one reference per id, and one it still holds
+            // here names an entry that ended, which its next read of the
+            // ring would drop.
+            if let Some(stale) = self.state.pending.of(id) {
+                self.drop_decided(shared, id, stale.generation);
+            }
             let generation = shared.wanted.hold(id, self.now);
             self.state.pending.push(Pending {
                 id,
@@ -1508,7 +1519,7 @@ impl PeerMachine {
         // later than now is still in its retry delay, as is every one after
         // it, since an entry is ready no earlier than its retry time.
         for ((ready, _), pending) in state.pending.ready() {
-            if *ready > self.now {
+            if ready > self.now {
                 return None;
             }
             // A request given up but still on the wire, or a reserve call,
@@ -1517,7 +1528,7 @@ impl PeerMachine {
             {
                 continue;
             }
-            return Some(*pending);
+            return Some(pending);
         }
         None
     }
@@ -1529,8 +1540,10 @@ impl PeerMachine {
         self.ring_cursor = end;
         let ids: Vec<UnminedTxId> = match changes {
             Changes::Ids(ids) => ids,
-            Changes::Overrun => (&self.state.pending)
-                .into_iter()
+            Changes::Overrun => self
+                .state
+                .pending
+                .iter()
                 .map(|pending| pending.id)
                 .collect(),
         };
@@ -1544,19 +1557,14 @@ impl PeerMachine {
     /// fetch of it this session still had. A reference to an entry its peer
     /// tried goes too.
     fn refile(&mut self, shared: &mut Shared, id: UnminedTxId) {
-        // References are oldest first, and only the newest can name the
-        // current entry, so the stale ones go from the front.
-        let held = loop {
-            let Some(held) = self.state.pending.of(id) else {
-                self.state.pending.unfile(id);
-                return;
-            };
-            let current = shared.wanted.entry(id).map(|entry| entry.generation);
-            if current == Some(held.generation) {
-                break held;
-            }
-            self.drop_decided(shared, id, held.generation);
+        let Some(held) = self.state.pending.of(id) else {
+            return;
         };
+        let current = shared.wanted.entry(id).map(|entry| entry.generation);
+        if current != Some(held.generation) {
+            self.drop_decided(shared, id, held.generation);
+            return;
+        }
         if shared
             .wanted
             .has_tried(self.state.peer, id, held.generation)

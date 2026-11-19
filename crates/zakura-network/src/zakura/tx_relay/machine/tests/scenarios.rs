@@ -15,8 +15,8 @@ use crate::zakura::tx_relay::machine::{
     session::{Timer, Timers},
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN,
-    PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
+    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP,
+    PENDING_PER_PEER, PENDING_SHARE, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -466,6 +466,35 @@ fn a_full_pending_set_counts_new_announcements_as_overflow() {
     let id = bench.id(2);
     bench.inv(honest, &[id]);
     assert!(bench.reserved(id), "another peer's id is not delayed");
+}
+
+/// Past the node-wide pending cap a session takes no more than its share,
+/// counted as overflow, so peers that fill the cap leave every other
+/// session its share. Ids already held by others count as much as new ones.
+#[test]
+fn sessions_past_the_pending_cap_keep_only_their_share() {
+    let mut bench = Bench::new();
+    let script = script_len();
+    let per = u32::try_from(PENDING_PER_PEER).expect("fits");
+    let pool: Vec<UnminedTxId> = (0..per).map(|n| body(n + 1_000, script).id()).collect();
+    let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
+    for peer in 1..=fillers {
+        let session = bench.join(peer);
+        bench.inv(session, &pool);
+    }
+    assert_eq!(bench.machine.wanted().held(), PENDING_CAP);
+
+    let late = bench.join(fillers + 1);
+    bench.inv(late, &pool);
+    let state = bench.machine.session(late).expect("open");
+    assert_eq!(
+        state.pending.len(),
+        PENDING_SHARE,
+        "its share of the shared ids"
+    );
+    let dropped = u64::try_from(PENDING_PER_PEER - PENDING_SHARE).expect("fits");
+    assert_eq!(state.overflow, dropped);
+    assert!(bench.closes().is_empty(), "overflow is no violation");
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest

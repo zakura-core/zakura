@@ -413,141 +413,160 @@ impl Announced {
 /// `TxRelayMachine::ready_at`.
 pub(crate) type ReadyKey = (Time, u64);
 
-/// A session's pending ids, oldest first, indexed by id and by entry, so
-/// a membership check is one lookup.
+/// A session's pending ids: one reference per id, keyed by id, so a
+/// membership check is one lookup.
 ///
 /// It also files the pending entries this session may claim now by their
 /// [`ReadyKey`], so the next claim is the first filed entry, not a scan.
 /// The machine files and unfiles them as entries change; see
 /// `TxRelayMachine::refile`. An entry is filed at most once per id, and
 /// only while this set holds it in the filed generation.
+///
+/// Both maps are B-trees: at a full set a hash map rounds up to twice the
+/// buckets it needs, and the ordered walk keeps every pass over the set
+/// deterministic.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PendingSet {
-    list: BTreeMap<u64, Pending>,
-    next: u64,
-    /// Each id's places in `list`, oldest first.
-    by_id: HashMap<UnminedTxId, Vec<u64>>,
-    by_entry: HashMap<(UnminedTxId, EntryGen), usize>,
-    ready: BTreeMap<ReadyKey, Pending>,
-    filed: HashMap<UnminedTxId, ReadyKey>,
+    held: BTreeMap<OrdId, PendingSlot>,
+    ready: BTreeMap<ReadyKey, UnminedTxId>,
+}
+
+/// An id ordered by its bytes, mined id first, so a B-tree can key on it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct OrdId(UnminedTxId);
+
+impl Ord for OrdId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let bytes = |id: &UnminedTxId| (id.mined_id().0, id.auth_digest().map(|digest| digest.0));
+        bytes(&self.0).cmp(&bytes(&other.0))
+    }
+}
+
+impl PartialOrd for OrdId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// What a [`PendingSet`] keeps for one id.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PendingSlot {
+    generation: EntryGen,
+    size: u32,
+    /// Where it is filed, if it is.
+    filed: Option<ReadyKey>,
+}
+
+impl PendingSlot {
+    /// The pending entry `id` names.
+    fn pending(&self, id: UnminedTxId) -> Pending {
+        Pending {
+            id,
+            generation: self.generation,
+            size: self.size,
+        }
+    }
 }
 
 impl PendingSet {
-    /// The pending ids, oldest first.
-    #[cfg(test)]
-    pub(crate) fn iter(&self) -> std::collections::btree_map::Values<'_, u64, Pending> {
-        self.list.values()
+    /// The pending ids, in id order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Pending> + '_ {
+        self.held.iter().map(|(id, held)| held.pending(id.0))
     }
 
     /// How many are pending.
     pub(crate) fn len(&self) -> usize {
-        self.list.len()
+        self.held.len()
     }
 
-    /// Adds `pending` as the newest. It is not filed until the machine
-    /// files it.
+    /// Adds `pending`, unfiled until the machine files it. The set must not
+    /// already hold its id: a stale reference goes first.
     pub(crate) fn push(&mut self, pending: Pending) {
-        self.next = self.next.saturating_add(1);
-        self.by_id.entry(pending.id).or_default().push(self.next);
-        *self
-            .by_entry
-            .entry((pending.id, pending.generation))
-            .or_default() += 1;
-        self.list.insert(self.next, pending);
+        let old = self.held.insert(
+            OrdId(pending.id),
+            PendingSlot {
+                generation: pending.generation,
+                size: pending.size,
+                filed: None,
+            },
+        );
+        debug_assert!(old.is_none(), "one reference per id");
+        if let Some(key) = old.and_then(|old| old.filed) {
+            self.ready.remove(&key);
+        }
     }
 
     /// Whether `id` is pending, in any generation.
     pub(crate) fn contains(&self, id: UnminedTxId) -> bool {
-        self.by_id.contains_key(&id)
+        self.held.contains_key(&OrdId(id))
     }
 
     /// Whether `id` is pending in `generation`.
     pub(crate) fn holds(&self, id: UnminedTxId, generation: EntryGen) -> bool {
-        self.by_entry.contains_key(&(id, generation))
+        self.held
+            .get(&OrdId(id))
+            .is_some_and(|held| held.generation == generation)
     }
 
-    /// The oldest pending reference to `id` in `generation`.
+    /// The pending reference to `id` in `generation`.
     pub(crate) fn get(&self, id: UnminedTxId, generation: EntryGen) -> Option<Pending> {
-        self.by_id
-            .get(&id)?
-            .iter()
-            .map(|place| self.list[place])
-            .find(|pending| pending.generation == generation)
+        self.of(id)
+            .filter(|pending| pending.generation == generation)
     }
 
-    /// The oldest pending reference to `id`, in any generation.
+    /// The pending reference to `id`, in any generation.
     pub(crate) fn of(&self, id: UnminedTxId) -> Option<Pending> {
-        let place = self.by_id.get(&id)?.first()?;
-        self.list.get(place).copied()
+        self.held.get(&OrdId(id)).map(|held| held.pending(id))
     }
 
-    /// Takes the oldest pending reference to `id` out.
+    /// Takes the pending reference to `id` out, and unfiles it.
     pub(crate) fn take(&mut self, id: UnminedTxId) -> Option<Pending> {
-        let places = self.by_id.get_mut(&id)?;
-        let place = places.remove(0);
-        if places.is_empty() {
-            self.by_id.remove(&id);
+        let held = self.held.remove(&OrdId(id))?;
+        if let Some(key) = held.filed {
+            self.ready.remove(&key);
         }
-        Some(self.remove_place(place))
+        Some(held.pending(id))
     }
 
-    /// Takes the reference at `place`, which `by_id` no longer names, out of
-    /// the list and the other indexes.
-    fn remove_place(&mut self, place: u64) -> Pending {
-        let pending = self
-            .list
-            .remove(&place)
-            .expect("every place by_id named is in the list");
-        self.unindex(pending);
-        pending
-    }
-
-    /// Drops every pending reference to `id` in `generation`.
+    /// Drops the pending reference to `id` if it is in `generation`.
     pub(crate) fn drop_entry(&mut self, id: UnminedTxId, generation: EntryGen) {
-        if !self.holds(id, generation) {
-            return;
-        }
-        let Some(mut places) = self.by_id.remove(&id) else {
-            return;
-        };
-        let list = &mut self.list;
-        let mut dropped = Vec::new();
-        places.retain(|place| {
-            let kept = list[place].generation != generation;
-            if !kept {
-                dropped.push(list.remove(place).expect("checked above"));
-            }
-            kept
-        });
-        if !places.is_empty() {
-            self.by_id.insert(id, places);
-        }
-        for pending in dropped {
-            self.unindex(pending);
+        if self.holds(id, generation) {
+            self.take(id);
         }
     }
 
     /// Files `pending` at `key`, in place of any earlier filing of its id.
+    /// The set holds `pending`.
     pub(crate) fn file(&mut self, pending: Pending, key: ReadyKey) {
-        if let Some(old) = self.filed.insert(pending.id, key) {
+        let Some(held) = self.held.get_mut(&OrdId(pending.id)) else {
+            return;
+        };
+        if let Some(old) = held.filed.replace(key) {
             if old == key {
                 return;
             }
             self.ready.remove(&old);
         }
-        self.ready.insert(key, pending);
+        self.ready.insert(key, pending.id);
     }
 
     /// Unfiles `id`, if it is filed.
     pub(crate) fn unfile(&mut self, id: UnminedTxId) {
-        if let Some(key) = self.filed.remove(&id) {
+        if let Some(key) = self
+            .held
+            .get_mut(&OrdId(id))
+            .and_then(|held| held.filed.take())
+        {
             self.ready.remove(&key);
         }
     }
 
     /// The filed entries, first in line first.
-    pub(crate) fn ready(&self) -> impl Iterator<Item = (&ReadyKey, &Pending)> {
-        self.ready.iter()
+    pub(crate) fn ready(&self) -> impl Iterator<Item = (ReadyKey, Pending)> + '_ {
+        self.ready.iter().map(|(key, id)| {
+            let held = self.held.get(&OrdId(*id)).expect("every filed id is held");
+            (*key, held.pending(*id))
+        })
     }
 
     /// When the first entry not yet ready at `now` becomes ready, found
@@ -560,33 +579,14 @@ impl PendingSet {
     /// Each filed id, its place in line, and what the line holds there.
     #[cfg(test)]
     pub(crate) fn filed(&self) -> Vec<(UnminedTxId, ReadyKey, Option<Pending>)> {
-        self.filed
+        self.held
             .iter()
-            .map(|(id, key)| (*id, *key, self.ready.get(key).copied()))
+            .filter_map(|(id, held)| Some((id.0, held.filed?)))
+            .map(|(id, key)| {
+                let at = self.ready.get(&key).and_then(|at| self.of(*at));
+                (id, key, at)
+            })
             .collect()
-    }
-
-    /// Takes `pending` out of the indexes, and unfiles its id once no
-    /// reference to the filed generation is left.
-    fn unindex(&mut self, pending: Pending) {
-        decrement(&mut self.by_entry, (pending.id, pending.generation));
-        let filed = self
-            .filed
-            .get(&pending.id)
-            .and_then(|key| self.ready.get(key))
-            .map(|filed| filed.generation);
-        if filed == Some(pending.generation) && !self.holds(pending.id, pending.generation) {
-            self.unfile(pending.id);
-        }
-    }
-}
-
-impl<'a> IntoIterator for &'a PendingSet {
-    type Item = &'a Pending;
-    type IntoIter = std::collections::btree_map::Values<'a, u64, Pending>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.list.values()
     }
 }
 

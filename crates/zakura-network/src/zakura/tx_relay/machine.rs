@@ -161,7 +161,10 @@
 //!   its reservation whatever happens next: a decision, a cancelled fetch,
 //!   or the session ending. The pool answers it, which frees the slot.
 //! - **Overflow is counted and is never a violation.** An announcement
-//!   that finds its session's pending set full is dropped.
+//!   that finds its session's pending set full is dropped, and so is one
+//!   that finds every session's pending ids past [`PENDING_CAP`] while its
+//!   own session holds [`PENDING_SHARE`] or more. So peers that fill the
+//!   cap leave every other session its share.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
 //!   body the reactor holds for it, and the supplier's sessions mark an id
@@ -261,6 +264,14 @@ pub(crate) const MAX_REQUESTS_PER_PEER: usize = 5;
 
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
+
+/// Ids every session holds pending, summed, past which a session takes no
+/// more than [`PENDING_SHARE`]: eight full pending sets (*provisional*).
+pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
+
+/// Ids every session may hold pending however many the others hold
+/// (*provisional*).
+pub(crate) const PENDING_SHARE: usize = 256;
 
 /// How many peers the reactor remembers as having tried one wanted entry
 /// before it forgets any. Past that it forgets the oldest peer with no
@@ -1814,7 +1825,7 @@ impl RelayMachine {
             // The claim queue, worked out again from the entries.
             let mut claimable: HashMap<UnminedTxId, ReadyKey> = HashMap::default();
             let mut once: zakura_rt::collections::HashSet<UnminedTxId> = Default::default();
-            for pending in &state.pending {
+            for pending in state.pending.iter() {
                 let entry = wanted.current(pending.id, pending.generation);
                 let entry = entry.expect("relay/pending-names-the-current-entry");
                 let key = (pending.id, entry.generation);
@@ -1844,6 +1855,9 @@ impl RelayMachine {
             let count = live + reactor.unsettled_count(peer);
             assert!(count <= MAX_REQUESTS_PER_PEER, "relay/limit-counted-once");
         }
+
+        let holders: usize = wanted.entries().map(|(_, entry)| entry.holders).sum();
+        assert_eq!(wanted.held(), holders, "relay/held-count");
 
         // The table keeps nothing without a holder or a claim.
         for (id, entry) in wanted.entries() {

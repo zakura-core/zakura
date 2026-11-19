@@ -13,7 +13,6 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use indexmap::IndexSet;
 use zakura_chain::transaction::UnminedTxId;
 use zakura_rt::collections::HashMap;
 
@@ -61,8 +60,9 @@ pub(crate) struct Entry {
     /// asked for it again while the entry lives. Past [`TRIED_PER_ENTRY`]
     /// only a peer with no session is forgotten, so the set holds at most
     /// one more than the larger of that cap and the most peers connected at
-    /// once.
-    pub(crate) tried: IndexSet<PeerKey>,
+    /// once. A list, not a set: it is short, and an empty one costs
+    /// nothing.
+    pub(crate) tried: Vec<PeerKey>,
 }
 
 /// The pool answered `NoRoom`, so nobody claims until `until`. After that
@@ -93,6 +93,9 @@ pub(crate) enum Admission {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WantedIds {
     entries: HashMap<UnminedTxId, Entry>,
+    /// The entries' holders, summed: the pending references every session
+    /// holds to a current entry.
+    held: usize,
     next_generation: u64,
     /// The next place in line to hand out.
     next_order: u64,
@@ -156,7 +159,7 @@ impl WantedIds {
                 retry_delay: None,
                 requeued_at: None,
                 waits_for_other: false,
-                tried: IndexSet::new(),
+                tried: Vec::new(),
                 order: {
                     *order = order.saturating_add(1);
                     *order
@@ -164,7 +167,13 @@ impl WantedIds {
             }
         });
         entry.holders = entry.holders.saturating_add(1);
+        self.held = self.held.saturating_add(1);
         entry.generation
+    }
+
+    /// The pending references every session holds to a current entry.
+    pub(crate) fn held(&self) -> usize {
+        self.held
     }
 
     /// A pending set gives `id` up: it tried it, or its session ended. An
@@ -181,6 +190,7 @@ impl WantedIds {
             .holders
             .checked_sub(1)
             .expect("a pending reference counts as one holder");
+        self.held = self.held.saturating_sub(1);
         self.collect(id);
     }
 
@@ -307,7 +317,10 @@ impl WantedIds {
             .get(&id)
             .is_some_and(|entry| entry.generation == generation)
         {
-            self.entries.remove(&id);
+            if let Some(entry) = self.entries.remove(&id) {
+                // Its holders drop their references as they read the ring.
+                self.held = self.held.saturating_sub(entry.holders);
+            }
             self.note(id);
             true
         } else {
@@ -463,16 +476,18 @@ impl WantedIds {
         else {
             return;
         };
-        if !entry.tried.contains(&peer) && entry.tried.len() >= TRIED_PER_ENTRY {
+        if entry.tried.contains(&peer) {
+            return;
+        }
+        if entry.tried.len() >= TRIED_PER_ENTRY {
             if let Some(gone) = entry.tried.iter().position(|tried| !connected(tried)) {
-                entry.tried.shift_remove_index(gone);
+                entry.tried.remove(gone);
             }
         }
-        if entry.tried.insert(peer) {
-            // The peer's other references to the entry go when their
-            // routines read this.
-            self.note(id);
-        }
+        entry.tried.push(peer);
+        // The peer's other references to the entry go when their routines
+        // read this.
+        self.note(id);
     }
 
     /// Whether `peer` tried `id` in `generation`.

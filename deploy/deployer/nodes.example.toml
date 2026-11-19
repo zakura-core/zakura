@@ -33,7 +33,9 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # bootstrap_peers = ["nodeid@1.2.3.4:8234"] # node_id@addr of the other peers
 # tx_relay        = { enabled = true }      # needs implementation = "core" below
 
-# Optional [mempool] settings, keys passed through verbatim.
+# Optional [mempool] settings, keys passed through verbatim. A [defaults]
+# `setup = "legacy"` or `"v2"` sets the pool, p2p_stack and tx-relay together;
+# see SETUPS in deploy.py.
 # [defaults.mempool]
 # implementation = "core"                   # default | classic | core
 

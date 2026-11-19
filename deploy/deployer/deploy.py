@@ -74,6 +74,9 @@ DEFAULTS = {
     "storage_mode": "archive",
     # One of: default | legacy | zakura | dual.
     "p2p_stack": "dual",
+    # "" or a SETUPS name, "legacy" or "v2". Sets p2p_stack, the [mempool]
+    # implementation and tx-relay together, for comparing pools on real peers.
+    "setup": "",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
@@ -202,6 +205,13 @@ P2P_STACK_VALUES = {
 }
 
 
+# What each `setup` renders. tx-relay needs the pool core, so it only comes with v2.
+SETUPS = {
+    "legacy": {"p2p_stack": "legacy", "implementation": "classic", "tx_relay": False},
+    "v2": {"p2p_stack": "dual", "implementation": "core", "tx_relay": True},
+}
+
+
 def normalize_p2p_stack(value: object, *, where: str) -> str:
     if not isinstance(value, str) or not value:
         raise DeployError(f"{where}: p2p_stack must be a non-empty string")
@@ -259,6 +269,19 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         seen.add(name)
         merged = dict(defaults)
         merged.update(raw)
+        if merged["setup"]:
+            setup = SETUPS.get(merged["setup"])
+            if setup is None:
+                raise DeployError(
+                    f"{name}: unknown setup {merged['setup']!r}; "
+                    f"expected one of: {', '.join(SETUPS)}"
+                )
+            merged["p2p_stack"] = setup["p2p_stack"]
+            merged["mempool"] = {**(merged["mempool"] or {}),
+                                 "implementation": setup["implementation"]}
+            zakura = dict(merged["zakura"] or {})
+            zakura["tx_relay"] = {**zakura.get("tx_relay", {}), "enabled": setup["tx_relay"]}
+            merged["zakura"] = zakura
         publisher = merged["release_state_publisher"]
         build_features = merged["build_features"]
         if (not isinstance(build_features, list)

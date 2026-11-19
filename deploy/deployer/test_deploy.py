@@ -582,30 +582,36 @@ class ConfigKeyTests(unittest.TestCase):
                 nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
             )
 
-    def test_mempool_table_and_tx_relay_render_for_the_v2_setup(self):
-        # The testnet deploy workflow's `setup = v2` writes exactly these tables.
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_config(tmp, """
-                [defaults]
-                network = "Testnet"
+    def test_setups_render_their_p2p_stack_pool_and_tx_relay(self):
+        # The testnet deploy workflow's `setup` input writes this key next to
+        # the fleet's `p2p_stack = "dual"`, which the setup overrides.
+        for setup, stack, pool, tx_relay in (
+            ("legacy", "legacy", "classic", False),
+            ("v2", "dual", "core", True),
+        ):
+            with self.subTest(setup), tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, f"""
+                    [defaults]
+                    network = "Testnet"
+                    p2p_stack = "dual"
+                    setup = "{setup}"
 
-                [defaults.zakura]
-                listen_addr = "0.0.0.0:8234"
-                tx_relay = { enabled = true }
+                    [defaults.zakura]
+                    listen_addr = "0.0.0.0:8234"
 
-                [defaults.mempool]
-                implementation = "core"
+                    [[nodes]]
+                    name = "node-a"
+                    ssh_string = "root@example"
+                    commit = "main"
+                """.replace("                    ", ""))
 
-                [[nodes]]
-                name = "node-a"
-                ssh_string = "root@example"
-                commit = "main"
-            """.replace("                ", ""))
+                node = deploy.load_nodes(path, None)[0]
+                config = tomllib.loads(deploy.render_node_config(node))
 
-            config = tomllib.loads(deploy.render_node_config(deploy.load_nodes(path, None)[0]))
-
-        self.assertEqual(config["mempool"], {"implementation": "core"})
-        self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": True})
+                self.assertEqual(config["network"]["p2p_stack"], stack)
+                self.assertEqual(config["mempool"], {"implementation": pool})
+                self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": tx_relay})
+                self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
 
     def test_internal_miner_requires_an_address_and_the_miner_build(self):
         for extra in ('build_features = ["internal-miner"]',

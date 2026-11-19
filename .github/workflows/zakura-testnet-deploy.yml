@@ -159,10 +159,8 @@ jobs:
             default_p2p_stack="$requested_p2p_stack"
           fi
 
-          # Two setups for comparing pools on real peers. tx-relay needs the pool
-          # core, so it only comes with v2.
-          mempool_table=""
-          tx_relay_line=""
+          # deploy.py's SETUPS says what each setup renders.
+          setup_line=""
           if [ "${SETUP:-auto}" != "auto" ]; then
             if [ -z "${NODE}" ]; then
               echo "setup overrides require one explicit node" >&2
@@ -172,21 +170,7 @@ jobs:
               echo "set p2p_stack or setup, not both" >&2
               exit 1
             fi
-            case "${SETUP}" in
-              legacy)
-                default_p2p_stack="legacy"
-                mempool_table=$'[defaults.mempool]\nimplementation = "classic"'
-                ;;
-              v2)
-                default_p2p_stack="dual"
-                mempool_table=$'[defaults.mempool]\nimplementation = "core"'
-                tx_relay_line='tx_relay = { enabled = true }'
-                ;;
-              *)
-                echo "unknown setup: ${SETUP}" >&2
-                exit 1
-                ;;
-            esac
+            setup_line="setup           = \"${SETUP}\""
           fi
 
           if [ "${HEADER_SYNC_TRACE}" = "true" ] \
@@ -211,6 +195,7 @@ jobs:
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
           p2p_stack       = "${default_p2p_stack}"
+          ${setup_line}
           metrics_endpoint = "127.0.0.1:9999"
           health_listen_addr = "127.0.0.1:8080"
           tracing_filter  = "info,zakura_network::zakura=info"
@@ -220,14 +205,11 @@ jobs:
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
           ${zakura_trace_line}
-          ${tx_relay_line}
           bootstrap_peers = [
               "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
               "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
               "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
           ]
-
-          ${mempool_table}
 
           [[nodes]]
           name       = "zakura-testnet-1"

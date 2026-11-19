@@ -54,23 +54,14 @@ async fn first_padded_ping(link: &mut mpsc::Receiver<WarmupChunk>) -> WarmupChun
 }
 
 #[test]
-fn default_schedule_doubles_to_the_message_limit() {
+fn default_schedule_pads_more_than_a_full_block_in_two_pings() {
     let schedule = TcpWarmupConfig::default().schedule();
 
-    assert_eq!(
-        schedule,
-        [
-            0,
-            14_000,
-            28_000,
-            56_000,
-            112_000,
-            224_000,
-            448_000,
-            896_000,
-            1_792_000,
-            crate::constants::MAX_PING_PADDING,
-        ]
+    assert_eq!(schedule, [0, 800_000, 1_600_000]);
+    let total: u32 = schedule.iter().sum();
+    assert!(
+        total > crate::constants::MAX_PING_PADDING,
+        "the padding grows the window past a full block"
     );
 }
 
@@ -88,7 +79,7 @@ fn schedule_with_equal_first_and_max_sends_one_padded_ping() {
         max_chunk_bytes: 3000,
         ..TcpWarmupConfig::default()
     };
-    assert_eq!(config.schedule(), [0, 1000, 2000, 3000]);
+    assert_eq!(config.schedule(), [0, 1000, 3000]);
 }
 
 #[test]

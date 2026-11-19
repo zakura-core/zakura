@@ -172,8 +172,9 @@
 //!   or the session ending. The pool answers it, which frees the slot.
 //! - **Overflow is counted and is never a violation.** An announcement
 //!   that finds its session's pending set full is dropped, and so is one
-//!   that finds every session's pending ids past [`PENDING_CAP`] while its
-//!   own session holds [`PENDING_SHARE`] or more. So peers that fill the
+//!   that finds every session's pending ids, with the announcements
+//!   sessions keep while they wait for the go or a `Hello`, past
+//!   [`PENDING_CAP`] while its own session holds [`PENDING_SHARE`] or more. So peers that fill the
 //!   cap leave every other session its share.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
@@ -282,8 +283,9 @@ pub(crate) const MAX_OUTSTANDING_BYTES: u64 = INITIAL_WINDOW as u64 * MAX_TX_BYT
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
 
-/// Ids every session holds pending, summed, past which a session takes no
-/// more than [`PENDING_SHARE`]: eight full pending sets (*provisional*).
+/// Ids every session holds pending or keeps while it waits for the go or a
+/// `Hello`, summed, past which a session takes no more than
+/// [`PENDING_SHARE`]: eight full pending sets (*provisional*).
 pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 
 /// Ids every session may hold pending however many the others hold
@@ -780,6 +782,10 @@ pub(crate) struct Shared {
     /// `tx-relay` was told the core stopped, so it claims nothing more and
     /// a slot given back is no room.
     pub(crate) stopped: bool,
+    /// Announcements live sessions keep while they wait for the go or a
+    /// `Hello`, summed. They count against [`PENDING_CAP`] as pending ids
+    /// do.
+    pub(crate) waiting: usize,
     /// How many sessions hear of an admission at once, and when the rest do.
     pub(crate) fan_out: FanOut,
     /// The parameters of the keyed short-id hash.
@@ -802,6 +808,12 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// Pending ids every session holds, and announcements live sessions
+    /// keep while they wait: what [`PENDING_CAP`] bounds.
+    pub(crate) fn pending_total(&self) -> usize {
+        self.wanted.held().saturating_add(self.waiting)
+    }
+
     /// The shared state of a new `tx-relay`.
     pub(crate) fn new(config: RelayConfig) -> Self {
         let mut short_id = blake2b_simd::Params::new();
@@ -815,6 +827,7 @@ impl Shared {
             best_tip: Height(0),
             current: true,
             stopped: false,
+            waiting: 0,
             fan_out: config.fan_out,
             short_id,
             log_read: 0,
@@ -1892,6 +1905,13 @@ impl RelayMachine {
 
         let holders: usize = wanted.entries().map(|(_, entry)| entry.holders).sum();
         assert_eq!(wanted.held(), holders, "relay/held-count");
+        let waiting: usize = self
+            .machines
+            .values()
+            .filter(|machine| !machine.is_ended())
+            .map(|machine| machine.state.waiting.len())
+            .sum();
+        assert_eq!(self.shared.waiting, waiting, "relay/waiting-count");
 
         // The table keeps nothing without a holder or a claim.
         for (id, entry) in wanted.entries() {

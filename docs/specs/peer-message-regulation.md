@@ -1058,9 +1058,9 @@ charge.
     halves when requests miss their deadlines. Its requests also stay within 10,000,000 announced
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
-  - requester's pending ids: at most 8,000 per session, and once sessions hold 64,000 together,
-    none more for a session that holds 256, all provisional. The rest is dropped, never a
-    violation
+  - requester's pending ids, counting those a session keeps before its `Hello` or the go: at
+    most 8,000 per session, and once sessions hold 64,000 together, none more for a session that
+    holds 256, all provisional. The rest is dropped, never a violation
   - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each
     request waits on its data writer as an id, and the writer builds the body from the pool as it
     is when it reaches it, so the data stream's output share bounds the bytes queued to the peer,

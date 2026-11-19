@@ -583,7 +583,8 @@ fn a_full_pending_set_counts_new_announcements_as_overflow() {
 
 /// Past the node-wide pending cap a session takes no more than its share,
 /// counted as overflow, so peers that fill the cap leave every other
-/// session its share. Ids already held by others count as much as new ones.
+/// session its share. Ids already held by others count as much as new ones,
+/// and so do announcements a session keeps while it waits for its `Hello`.
 #[test]
 fn sessions_past_the_pending_cap_keep_only_their_share() {
     let mut bench = Bench::new();
@@ -608,6 +609,14 @@ fn sessions_past_the_pending_cap_keep_only_their_share() {
     let dropped = u64::try_from(PENDING_PER_PEER - PENDING_SHARE).expect("fits");
     assert_eq!(state.overflow, dropped);
     assert!(bench.closes().is_empty(), "overflow is no violation");
+
+    // A session that has not sent its `Hello` keeps what it was announced
+    // while it waits, and that counts against the cap too.
+    let silent = bench.connect(fillers + 2, false);
+    bench.inv(silent, &pool);
+    let state = bench.machine.session(silent).expect("open");
+    assert_eq!(state.waiting.len(), PENDING_SHARE, "its share while it waits");
+    assert_eq!(state.overflow, dropped);
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest

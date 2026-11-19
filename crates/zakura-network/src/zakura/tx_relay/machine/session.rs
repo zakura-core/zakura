@@ -158,9 +158,7 @@ impl PeerMachine {
             // Announcements it made before can join the table now, if it
             // has the go.
             if shared.reactor.has_go(self.state.peer, self.session) {
-                let waiting: Vec<(UnminedTxId, u32)> = std::mem::take(&mut self.state.waiting)
-                    .into_iter()
-                    .collect();
+                let waiting = self.take_waiting(shared);
                 self.take_ids(shared, pool, &waiting);
             }
         }
@@ -202,8 +200,12 @@ impl PeerMachine {
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
-                if state.waiting.len() < PENDING_PER_PEER {
+                let node_room = PENDING_CAP.saturating_sub(shared.pending_total());
+                let fits = state.waiting.len() < PENDING_PER_PEER
+                    && (node_room > 0 || state.waiting.len() < PENDING_SHARE);
+                if fits {
                     state.waiting.insert(id, size);
+                    shared.waiting = shared.waiting.saturating_add(1);
                 } else {
                     state.overflow = state.overflow.saturating_add(1);
                 }
@@ -997,6 +999,7 @@ impl PeerMachine {
             return;
         }
         self.ended = true;
+        self.take_waiting(shared);
         let (peer, session, now) = (self.state.peer, self.session, self.now);
         // Ending with a claim out is the peer's try at that entry, so neither
         // a replacement session nor a later announcement asks it again.
@@ -1095,10 +1098,17 @@ impl PeerMachine {
         // Without a `Hello` it could never be asked, so its announcements
         // wait for one.
         if state.hello.is_some() {
-            let waiting: Vec<(UnminedTxId, u32)> =
-                std::mem::take(&mut state.waiting).into_iter().collect();
+            let waiting = self.take_waiting(shared);
             self.take_ids(shared, pool, &waiting);
         }
+    }
+
+    /// Takes the announcements this session kept while it waited, out of
+    /// the node's count of them.
+    fn take_waiting(&mut self, shared: &mut Shared) -> Vec<(UnminedTxId, u32)> {
+        let waiting = std::mem::take(&mut self.state.waiting);
+        shared.waiting = shared.waiting.saturating_sub(waiting.len());
+        waiting.into_iter().collect()
     }
 
     /// Takes announced ids into this session, which has the go: its pending
@@ -1153,7 +1163,7 @@ impl PeerMachine {
         // fit leaves no holder behind. Past the node-wide cap a session
         // still holds its share, so peers that fill the cap crowd out
         // nobody else's first ids.
-        let node_room = PENDING_CAP.saturating_sub(shared.wanted.held());
+        let node_room = PENDING_CAP.saturating_sub(shared.pending_total());
         let share_room = PENDING_SHARE.saturating_sub(state.pending.len());
         let fits = state.room().min(node_room.max(share_room)).min(fresh.len());
         let dropped = fresh.len().saturating_sub(fits);

@@ -317,7 +317,7 @@ async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable
         .unwrap();
     gossip
         .peer_set
-        .expect_request(Request::AdvertiseMinedBlock(early))
+        .expect_request(Request::AdvertiseBlock(early, None))
         .await
         .respond_error("relay failed".into());
     registration.resolve(Ok(local.clone()));

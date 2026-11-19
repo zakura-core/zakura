@@ -21,8 +21,8 @@ use super::{
     wanted::{Admission, Changes},
     CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
     PoolView, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
-    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN, PENDING_CAP,
-    PENDING_PER_PEER, PENDING_SHARE,
+    INITIAL_WINDOW, INV_RETRY, MAX_OUTSTANDING_BYTES, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN,
+    PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
 };
 use crate::zakura::tx_relay::wire::{inv_payload_bound, MAX_INV_ENTRIES};
 
@@ -154,6 +154,7 @@ impl PeerMachine {
             self.violation(shared, Violation::BadHello);
         } else {
             self.state.hello = Some(hello);
+            self.state.window = INITIAL_WINDOW.min(hello.serves);
             // Announcements it made before can join the table now, if it
             // has the go.
             if shared.reactor.has_go(self.state.peer, self.session) {
@@ -507,9 +508,18 @@ impl PeerMachine {
             shared.ended_verdict(pool, waiter, verdict, self.now);
             return;
         }
+        // Whether the window was full with this body still counted.
+        let full = self.in_flight(shared) >= self.state.window;
         let Some((id, generation)) = self.state.submissions.remove(&waiter) else {
             return self.settle(shared, pool);
         };
+        if full && verdict == Verdict::Admitted {
+            let serves = self
+                .state
+                .hello
+                .map_or(INITIAL_WINDOW, |hello| hello.serves);
+            self.state.window = self.state.window.saturating_add(1).min(serves);
+        }
         let submitted = self
             .submitted_at
             .remove(&waiter)
@@ -1010,7 +1020,7 @@ impl PeerMachine {
         }
         // Its reserve calls still in flight are answered to the reactor, and
         // their grants go back as they arrive. Until then they count against
-        // the peer's 5.
+        // the peer's next session's window.
         shared.reactor.hand_calls(peer, self.state.reserving.len());
         for call in self.calls.keys() {
             shared.ended_calls.insert(*call, peer);
@@ -1279,6 +1289,12 @@ impl PeerMachine {
         missed.sort_by_key(|id| self.state.requests.get_index_of(id));
         // A deadline set twice to the same time has two timers.
         missed.dedup();
+        // A late peer is asked for less at once, as block sync's window dips
+        // once per batch of timeouts. A fetch the pool cancelled counts too,
+        // since the peer was still late.
+        if !missed.is_empty() {
+            self.state.window = (self.state.window / 2).max(1);
+        }
         let mut freed = Vec::new();
         for id in missed {
             let request = self.state.requests.get_mut(&id).expect("the timer stands");
@@ -1499,6 +1515,14 @@ impl PeerMachine {
         }
     }
 
+    /// Ids reserving, requested or awaiting a verdict on this session, with
+    /// what its peer's ended sessions left: what its window counts.
+    fn in_flight(&self, shared: &Shared) -> usize {
+        self.state
+            .in_flight()
+            .saturating_add(shared.reactor.unsettled_count(self.state.peer))
+    }
+
     /// The oldest id this session may claim now, if it has a free slot.
     fn next_claim(&self, shared: &Shared) -> Option<Pending> {
         let (peer, session, state) = (self.state.peer, self.session, &self.state);
@@ -1506,13 +1530,11 @@ impl PeerMachine {
             return None;
         }
         let hello = state.hello?;
-        let in_flight = state
-            .in_flight()
-            .saturating_add(shared.reactor.unsettled_count(peer));
-        let asking = state.requests.len().saturating_add(state.reserving.len());
-        if in_flight >= MAX_REQUESTS_PER_PEER || asking >= hello.serves {
+        debug_assert!(state.window <= hello.serves, "the Hello caps the window");
+        if self.in_flight(shared) >= state.window {
             return None;
         }
+        let asked = state.asked_bytes();
         // The id ready longest goes first: since its first announcement, or
         // since its retry delay ended. Neither fresh work nor retries starve
         // the other. The filed entries are in that order, and one filed
@@ -1527,6 +1549,11 @@ impl PeerMachine {
             if state.requests.contains_key(&pending.id) || state.reserving.contains_key(&pending.id)
             {
                 continue;
+            }
+            // The oldest ready id waits for bytes to free rather than let
+            // smaller ones keep passing it.
+            if asked.saturating_add(u64::from(pending.size)) > MAX_OUTSTANDING_BYTES {
+                return None;
             }
             return Some(pending);
         }

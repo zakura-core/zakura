@@ -15,8 +15,8 @@ use zakura_rt::collections::{HashMap, HashSet};
 #[cfg(doc)]
 use super::MAX_SERVES;
 use super::{
-    CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, KNOWN_CAP, MAX_REQUESTS_PER_PEER,
-    MAX_TX_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
+    CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, INITIAL_WINDOW, KNOWN_CAP,
+    MAX_OUTSTANDING_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
 };
 
 /// What the peer said in its `Hello`.
@@ -124,6 +124,10 @@ pub(crate) struct PeerState {
     pub(crate) reannounced: HashMap<UnminedTxId, u32>,
     /// Ids dropped because the pending set was full.
     pub(crate) overflow: u64,
+    /// The request window: how many ids it may have reserving, requested
+    /// or awaiting a verdict, with what its peer's ended sessions left. See
+    /// the module docs' request limit.
+    pub(crate) window: usize,
 }
 
 impl PeerState {
@@ -144,6 +148,7 @@ impl PeerState {
             cursor: 0,
             reannounced: HashMap::default(),
             overflow: 0,
+            window: INITIAL_WINDOW,
         }
     }
 
@@ -249,6 +254,13 @@ impl PeerState {
         self.held.remove(id);
     }
 
+    /// The announced bytes of what it is asked for or reserving.
+    pub(crate) fn asked_bytes(&self) -> u64 {
+        let requested = self.requests.values().map(|request| request.size);
+        let reserving = self.reserving.values().map(|call| call.pending.size);
+        requested.chain(reserving).map(u64::from).sum()
+    }
+
     /// Ids reserving, requested or awaiting a verdict on this session.
     pub(crate) fn in_flight(&self) -> usize {
         self.reserving
@@ -300,12 +312,10 @@ impl PeerState {
 
 /// The longest a request can wait after it was sent before another
 /// announcer may try: the fixed part plus the time to move the sender
-/// allowance and the most bodies a peer can have outstanding, at the
-/// slowest supported rate.
+/// allowance and the most bytes a session asks for at once, at the slowest
+/// supported rate.
 pub(crate) fn max_span() -> Duration {
-    let bytes = u64::from(MAX_TX_BYTES)
-        .saturating_mul(u64::try_from(MAX_REQUESTS_PER_PEER).unwrap_or(u64::MAX))
-        .saturating_add(SENDER_ALLOWANCE);
+    let bytes = MAX_OUTSTANDING_BYTES.saturating_add(SENDER_ALLOWANCE);
     let transfer = Duration::from_millis(bytes.saturating_mul(1_000) / MIN_RATE);
     BASE_DEADLINE.saturating_add(transfer)
 }

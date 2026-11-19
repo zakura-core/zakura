@@ -20,7 +20,7 @@ use zakura_test::allocations::{measure, AllocationStats};
 use super::{
     tests::{body, hello, on, script_len, SIZE},
     CallId, Granted, PeerKey, RelayConfig, RelayEffect, RelayMachine, SessionId, SnapshotInfo,
-    Unreserved, MAX_REQUESTS_PER_PEER, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
+    Unreserved, MAX_SERVES, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
     TRIED_PER_ENTRY,
 };
 
@@ -161,7 +161,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
 
     // A full pool: those in flight are refused, then one probe a backoff.
     let in_flight = reserves(&machine.take_effects());
-    assert!(in_flight.len() <= sessions_count * MAX_REQUESTS_PER_PEER);
+    assert!(in_flight.len() <= sessions_count * MAX_SERVES);
     for call in &in_flight {
         machine.reserve_answer(*call, Err(Unreserved::NoRoom), now);
     }
@@ -206,7 +206,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
             }
         }
         assert!(granted > 0, "round {round}: the sessions fetch");
-        assert!(machine.reservations_held() <= sessions_count * MAX_REQUESTS_PER_PEER);
+        assert!(machine.reservations_held() <= sessions_count * MAX_SERVES);
         // Each request misses its deadline and gives its slot back, which
         // a session that holds the id and has a free slot claims.
         while machine.reservations_held() > 0 {
@@ -235,7 +235,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
             "round {round}: none closed"
         );
         assert_eq!(machine.calls_in_flight(), carried.len());
-        assert!(carried.len() <= sessions_count * MAX_REQUESTS_PER_PEER);
+        assert!(carried.len() <= sessions_count * MAX_SERVES);
         assert_eq!(
             machine.reservations_held(),
             0,
@@ -270,7 +270,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
             );
         }
         assert!(
-            machine.timers_len() <= 4 * sessions_count * MAX_REQUESTS_PER_PEER,
+            machine.timers_len() <= 4 * sessions_count * MAX_SERVES,
             "round {round}: {} timers kept",
             machine.timers_len()
         );

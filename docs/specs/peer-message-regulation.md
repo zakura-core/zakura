@@ -987,7 +987,8 @@ before v5 carries 32 bytes of `0xFF` as its digest, as ZIP 239 defines for inven
 ```text
 MAX_TX_BYTES      = 2,000,000 bytes
 MAX_INV_ENTRIES   = 1,024
-MAX_SERVES        = 16        requests this node serves at once, sent in its Hello
+MAX_SERVES        = 16        requests this node serves at once, sent in its Hello, and the
+                              most it asks of one peer at once
 ```
 
 | Message | Stream | Payload | Rule | Breach |
@@ -1052,8 +1053,11 @@ charge.
     about 70 KB, which with 64 KiB of write-ahead keeps it within the allowance.
   - on_empty = close the connection (`ordered_byte_rate_overrun`), row 2
 - **Capacity**
-  - requester: at most 5 ids requested or awaiting a verdict per peer, and the node-wide 500
-    undecided transactions the pool core holds
+  - requester: ids requested or awaiting a verdict per peer within a window that starts at 5,
+    grows by one on each admitted body while full, up to what the peer's `Hello` serves, and
+    halves when requests miss their deadlines. Its requests also stay within 10,000,000 announced
+    bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
+    the node-wide 500 undecided transactions the pool core holds
   - requester's pending ids: at most 8,000 per session, and once sessions hold 64,000 together,
     none more for a session that holds 256, all provisional. The rest is dropped, never a
     violation

@@ -3,8 +3,8 @@
 //! Each session's routine runs a [`PeerMachine`], which owns everything
 //! about its peer while the session is live: its [`peer::PeerState`], with
 //! its pending ids and the size it announced for each, its outstanding
-//! requests and their deadlines, its submissions, its limit of
-//! [`MAX_REQUESTS_PER_PEER`] and what it was announced, and also its own
+//! requests and their deadlines, its submissions, its request window and
+//! what it was announced, and also its own
 //! reserve calls, reservations and timers. What every routine shares is a
 //! [`Shared`]:
 //!
@@ -73,11 +73,21 @@
 //!   fetch of the same entry starts while the pool decides it. A verdict
 //!   acts only on the entry its body was fetched for and releases only its
 //!   own claim.
-//! - **The limit of 5 is counted once.** Ids reserving, requested or
+//! - **One request limit, counted once.** Ids reserving, requested or
 //!   awaiting a verdict on a session, plus the reserve calls and unsettled
-//!   submissions its peer's ended sessions left, never exceed
-//!   [`MAX_REQUESTS_PER_PEER`]. A new session gets the go only after every
-//!   older session of its peer ended.
+//!   submissions its peer's ended sessions left, stay within the session's
+//!   window when it claims. The window starts at [`INITIAL_WINDOW`], at
+//!   most what the peer's `Hello` serves. It grows by one, up to that, on
+//!   each admission of a body the session fetched while the window was
+//!   full, and halves, to no less than one, when requests miss their
+//!   deadlines, as block sync's window dips on a timeout. So a peer gets
+//!   more than [`INITIAL_WINDOW`] bodies verified at once only after
+//!   bodies it supplied were admitted, and a new session starts again at
+//!   [`INITIAL_WINDOW`]. What the session asks for at once also stays
+//!   within [`MAX_OUTSTANDING_BYTES`] of announced sizes: the oldest ready
+//!   id that would pass it waits for bytes to free, so the deadline cap
+//!   below holds however large the window grows. A new session gets the go
+//!   only after every older session of its peer ended.
 //! - **One try per peer.** A peer that tried an id isn't asked for it again
 //!   while another holder hasn't tried, so delaying an honest holder costs
 //!   an attacker one peer per try. A peer has tried an entry when it
@@ -190,7 +200,7 @@
 //!   decided entry gives its reservation back then.
 //! - **The table has no cap of its own.** An entry lives while a pending set
 //!   holds it or a claim covers it, so each peer fills only its own share,
-//!   plus its at most [`MAX_REQUESTS_PER_PEER`] unsettled submissions.
+//!   plus its at most [`MAX_SERVES`] unsettled submissions.
 //! - **A full pool costs one probe per backoff.** After a `NoRoom` nobody
 //!   claims until the backoff ends or a verdict frees a slot.
 //! - **A verdict's charge goes to the peer that supplied the body**, even if
@@ -259,8 +269,15 @@ use self::{
 /// Time since a base the IO holds.
 pub(crate) type Time = Duration;
 
-/// Ids requested or awaiting a verdict for one peer, at most.
-pub(crate) const MAX_REQUESTS_PER_PEER: usize = 5;
+/// The request window a session starts with, and the most it asks for at
+/// once before bodies it supplied are admitted.
+pub(crate) const INITIAL_WINDOW: usize = 5;
+
+/// The most announced bytes a session asks for at once: [`INITIAL_WINDOW`]
+/// of the largest transactions, so a window past it never stretches a
+/// deadline beyond [`peer::max_span`].
+// Both widen losslessly: `INITIAL_WINDOW` is 5 and `MAX_TX_BYTES` a `u32`.
+pub(crate) const MAX_OUTSTANDING_BYTES: u64 = INITIAL_WINDOW as u64 * MAX_TX_BYTES as u64;
 
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
@@ -330,8 +347,9 @@ pub(crate) const SMALL_TX_BYTES: u32 = 10_000;
 /// The protocol's largest transaction, which gets [`WINDOW_FULL`].
 pub(crate) const MAX_TX_BYTES: u32 = 2_000_000;
 
-/// The most requests a `Hello` may say it serves: the table's in-flight
-/// maximum.
+/// The one request limit: the most requests a `Hello` may say it serves,
+/// the table's in-flight maximum, what this node serves, and the most its
+/// request window grows to.
 pub(crate) const MAX_SERVES: usize = 16;
 
 /// Today's first cooldown.
@@ -1797,6 +1815,22 @@ impl RelayMachine {
             let asking = state.requests.len() + state.reserving.len();
             let served = state.hello.is_none_or(|hello| asking <= hello.serves);
             assert!(served, "relay/asks-within-hello-serves");
+            let window = state.hello.is_none_or(|hello| {
+                (1..=hello.serves).contains(&state.window) && hello.serves <= MAX_SERVES
+            });
+            assert!(window, "relay/window-within-hello");
+            let asked: u64 = state
+                .requests
+                .values()
+                .map(|request| u64::from(request.size))
+                .chain(
+                    state
+                        .reserving
+                        .values()
+                        .map(|call| u64::from(call.pending.size)),
+                )
+                .sum();
+            assert!(asked <= MAX_OUTSTANDING_BYTES, "relay/outstanding-bytes");
             *in_flight.entry(state.peer).or_default() += state.in_flight();
             let asked = |id: &UnminedTxId| state.requests.contains_key(id);
             let twice = state.reserving.keys().any(asked);
@@ -1853,7 +1887,7 @@ impl RelayMachine {
         for peer in peers {
             let live = in_flight.get(&peer).copied().unwrap_or(0);
             let count = live + reactor.unsettled_count(peer);
-            assert!(count <= MAX_REQUESTS_PER_PEER, "relay/limit-counted-once");
+            assert!(count <= MAX_SERVES, "relay/limit-counted-once");
         }
 
         let holders: usize = wanted.entries().map(|(_, entry)| entry.holders).sum();

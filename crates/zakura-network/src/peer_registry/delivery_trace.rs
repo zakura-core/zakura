@@ -1,10 +1,16 @@
-//! A trace row for every sample that changes a legacy connection's delivery score, and for every
-//! announced block the peer did not deliver.
+//! A trace row for every measured answer time of a legacy connection, and for every announced
+//! block the peer did not deliver.
 //!
 //! Each `delivery_sample` row says what was measured (`kind`), the measured time (`sample_ms`),
 //! the score before and after (`score_before_ms`, `score_ms`), and `weight`, the decayed number of
-//! samples the new score rests on. Together they show why a peer's score is what it is, and how
+//! samples the score rests on. Together they show why a peer's score is what it is, and how
 //! much of it comes from pings rather than blocks.
+//!
+//! `kind` is `ping`, `block` or `large_block`. Both block kinds carry `wire_bytes`, the
+//! serialized size of the blocks in the reply. A `large_block` reply was too big to arrive in
+//! one round trip, so it does not change the score: its `score_before_ms` and `score_ms` are
+//! equal, and both are missing when the peer has no score yet. These rows are the record of how
+//! long each peer takes to deliver large blocks.
 //!
 //! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
 //! a second gossip block request (`request`). The miss preserves the score. With scoring enabled,
@@ -16,25 +22,18 @@
 use std::time::Duration;
 
 use serde::Serialize;
+
+use super::delivery::DeliverySampleKind;
 use zakura_jsonl_trace::{saturating_millis, JsonlEventEmitter, JsonlTraceEvent, JsonlTraceTable};
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("delivery_score", "delivery_score.jsonl");
 
-/// What a delivery sample measured.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeliverySampleKind {
-    /// A heartbeat ping's round trip.
-    Ping,
-    /// A reply to a block request that held at least one requested block.
-    Block,
-}
-
-impl DeliverySampleKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ping => "ping",
-            Self::Block => "block",
-        }
+/// The `kind` column of a sample's row.
+fn label(kind: DeliverySampleKind) -> &'static str {
+    match kind {
+        DeliverySampleKind::Ping => "ping",
+        DeliverySampleKind::Block { .. } if kind.is_round_trip() => "block",
+        DeliverySampleKind::Block { .. } => "large_block",
     }
 }
 
@@ -45,8 +44,11 @@ struct DeliverySampleEvent {
     kind: &'static str,
     sample_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    wire_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     score_before_ms: Option<u64>,
-    score_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_ms: Option<u64>,
     weight: f64,
 }
 
@@ -81,22 +83,27 @@ impl DeliveryTrace {
         }
     }
 
-    /// Records that a `kind` sample of `sample` moved the score from `score_before` to `score`,
-    /// which now rests on `weight` decayed samples.
+    /// Records a `kind` sample of `sample`, with the score before it and after it. The score
+    /// rests on `weight` decayed samples. A sample that does not count toward the score has the
+    /// same score on both sides.
     pub(super) fn sample(
         &self,
         kind: DeliverySampleKind,
         sample: Duration,
         score_before: Option<Duration>,
-        score: Duration,
+        score: Option<Duration>,
         weight: f64,
     ) {
         self.emitter.emit_event(|| DeliverySampleEvent {
             connection_id: self.connection_id,
-            kind: kind.label(),
+            kind: label(kind),
             sample_ms: saturating_millis(sample),
+            wire_bytes: match kind {
+                DeliverySampleKind::Ping => None,
+                DeliverySampleKind::Block { wire_bytes } => Some(wire_bytes),
+            },
             score_before_ms: score_before.map(saturating_millis),
-            score_ms: saturating_millis(score),
+            score_ms: score.map(saturating_millis),
             // Two decimals are enough to see how many recent samples a score rests on.
             weight: (weight * 100.0).round() / 100.0,
         });

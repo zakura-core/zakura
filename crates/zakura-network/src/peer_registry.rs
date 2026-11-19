@@ -13,7 +13,8 @@ mod delivery;
 mod delivery_trace;
 
 use delivery::DeliveryEstimate;
-pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
+pub(crate) use delivery::DeliverySampleKind;
+pub(crate) use delivery_trace::DeliveryTrace;
 
 use crate::{
     peer::ConnectionInfo,
@@ -328,10 +329,14 @@ impl PeerRegistryUpdater {
 
     /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
     ///
+    /// Only a round trip moves the expected answer time: a ping, or a block reply small enough
+    /// to arrive in one ([`DeliverySampleKind::is_round_trip`]). A larger block reply leaves it
+    /// as it was.
+    ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.
     ///
-    /// Each recorded sample is written to the connection's delivery trace.
+    /// Every sample, counted or not, is written to the connection's delivery trace.
     pub(crate) fn record_delivery_sample(
         &self,
         kind: DeliverySampleKind,
@@ -349,20 +354,31 @@ impl PeerRegistryUpdater {
         if !state.active_connections.contains_key(&self.key) {
             return;
         }
-        let estimate = state
-            .delivery_estimates
-            .entry(self.key.clone())
-            .or_default();
-        let score_before = estimate.score();
-        estimate.record(sample, now);
-        let estimate = *estimate;
+        let (score_before, estimate) = if kind.is_round_trip() {
+            let estimate = state
+                .delivery_estimates
+                .entry(self.key.clone())
+                .or_default();
+            let score_before = estimate.score();
+            estimate.record(sample, now);
+            (score_before, *estimate)
+        } else {
+            let estimate = state
+                .delivery_estimates
+                .get(&self.key)
+                .copied()
+                .unwrap_or_default();
+            (estimate.score(), estimate)
+        };
         drop(state);
 
-        let score = estimate
-            .score()
-            .expect("an estimate that just recorded a sample has a score");
-        self.delivery_trace
-            .sample(kind, sample, score_before, score, estimate.weight());
+        self.delivery_trace.sample(
+            kind,
+            sample,
+            score_before,
+            estimate.score(),
+            estimate.weight(),
+        );
     }
 
     /// Traces that the peer announced a block and did not deliver it to a first request, or to a
@@ -483,7 +499,7 @@ mod tests {
         drop(guard);
         assert_eq!(updater.delivery_score(), None);
         updater.record_delivery_sample(
-            DeliverySampleKind::Block,
+            DeliverySampleKind::Block { wire_bytes: 1_700 },
             Duration::from_millis(5),
             Instant::now(),
         );
@@ -507,7 +523,11 @@ mod tests {
 
         let now = Instant::now();
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
-        updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
+        updater.record_delivery_sample(
+            DeliverySampleKind::Block { wire_bytes: 1_700 },
+            Duration::from_millis(30),
+            now,
+        );
         updater.trace_block_missed(true);
         drop(updater);
         guard.shutdown().await;
@@ -529,8 +549,13 @@ mod tests {
         );
         assert_eq!(rows[0]["score_ms"], 10);
         assert_eq!(rows[0]["weight"], 1.0);
+        assert!(
+            rows[0].get("wire_bytes").is_none(),
+            "a ping has no block size"
+        );
         assert_eq!(rows[1]["kind"], "block");
         assert_eq!(rows[1]["sample_ms"], 30);
+        assert_eq!(rows[1]["wire_bytes"], 1_700);
         assert_eq!(rows[1]["score_before_ms"], 10);
         assert_eq!(
             rows[1]["score_ms"], 20,
@@ -543,6 +568,87 @@ mod tests {
         assert!(
             rows[2].get("score_ms").is_none(),
             "a missed block leaves the score alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_block_reply_is_traced_and_leaves_the_score_alone() {
+        use delivery::ROUND_TRIP_REPLY_BYTES;
+
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let registry = PeerRegistry::default();
+        let (_connection, updater) = registry.register_legacy(peer(1));
+        let updater = updater.with_delivery_trace(DeliveryTrace::new(
+            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            7,
+        ));
+        let block = |wire_bytes| DeliverySampleKind::Block { wire_bytes };
+        let now = Instant::now();
+
+        updater.record_delivery_sample(block(1_200_000), Duration::from_secs(4), now);
+        assert_eq!(
+            updater.delivery_score(),
+            None,
+            "a large block alone does not give a peer an expected answer time"
+        );
+
+        updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
+        updater.record_delivery_sample(
+            block(ROUND_TRIP_REPLY_BYTES),
+            Duration::from_millis(30),
+            now,
+        );
+        assert_eq!(
+            updater.delivery_score(),
+            Some(Duration::from_millis(20)),
+            "a block of exactly the size limit counts like a ping"
+        );
+
+        updater.record_delivery_sample(
+            block(ROUND_TRIP_REPLY_BYTES + 1),
+            Duration::from_secs(5),
+            now,
+        );
+        assert_eq!(
+            updater.delivery_score(),
+            Some(Duration::from_millis(20)),
+            "a slow download of a block over the size limit does not raise the expected answer time"
+        );
+        drop(updater);
+        guard.shutdown().await;
+
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("delivery_score.jsonl"))
+                .expect("delivery trace is written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+                .collect();
+        assert_eq!(rows.len(), 4, "every sample is traced, counted or not");
+
+        assert_eq!(rows[0]["event"], "delivery_sample");
+        assert_eq!(rows[0]["kind"], "large_block");
+        assert_eq!(rows[0]["sample_ms"], 4_000);
+        assert_eq!(rows[0]["wire_bytes"], 1_200_000);
+        assert!(
+            rows[0].get("score_before_ms").is_none() && rows[0].get("score_ms").is_none(),
+            "an unmeasured peer still has no score after a large block"
+        );
+        assert_eq!(rows[0]["weight"], 0.0);
+
+        assert_eq!(rows[2]["kind"], "block");
+        assert_eq!(rows[2]["wire_bytes"], ROUND_TRIP_REPLY_BYTES);
+        assert_eq!(rows[2]["score_ms"], 20);
+        assert_eq!(rows[2]["weight"], 2.0);
+
+        assert_eq!(rows[3]["kind"], "large_block");
+        assert_eq!(rows[3]["sample_ms"], 5_000);
+        assert_eq!(rows[3]["wire_bytes"], ROUND_TRIP_REPLY_BYTES + 1);
+        assert_eq!(rows[3]["score_before_ms"], 20);
+        assert_eq!(rows[3]["score_ms"], 20, "the score is unchanged");
+        assert_eq!(
+            rows[3]["weight"], 2.0,
+            "the score rests on the same samples as before"
         );
     }
 

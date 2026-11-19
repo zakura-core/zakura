@@ -1309,7 +1309,7 @@ async fn tx_getdata_routing_ignores_request_slot() {
     );
 }
 
-/// Registers `peer` in `registry`, and records one answer of `answer_ms` for it if given.
+/// Registers `peer` in `registry`, and records one round trip of `answer_ms` for it if given.
 fn measured_peer(
     peer: &mut TestPeer,
     registry: &crate::peer_registry::PeerRegistry,
@@ -1329,7 +1329,7 @@ fn measured_peer(
     });
     if let Some(answer_ms) = answer_ms {
         updater.record_delivery_sample(
-            crate::peer_registry::DeliverySampleKind::Block,
+            crate::peer_registry::DeliverySampleKind::Ping,
             Duration::from_millis(answer_ms),
             std::time::Instant::now(),
         );
@@ -1893,6 +1893,52 @@ async fn a_later_announcer_that_is_not_clearly_faster_is_asked_only_after_a_stal
         other.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
         "a stalled first request gets a second one"
+    );
+}
+
+/// A slow download of a large block does not make the peer that delivered it look slow. On the
+/// next block, a far announcer that is no faster than that peer's round trip is not rushed a
+/// second request, so the single second request stays available for a nearby peer.
+#[tokio::test(start_paused = true)]
+async fn a_slow_large_block_does_not_rush_the_next_second_request_to_a_far_peer() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut far = TestPeer::spawn(2);
+    let (_first_guard, first_samples) = measured_peer(&mut first, &registry, Some(250));
+    let _far_measured = measured_peer(&mut far, &registry, Some(240));
+    // The first peer took five seconds to deliver the previous, 1.2 MB block.
+    first_samples.record_delivery_sample(
+        crate::peer_registry::DeliverySampleKind::Block {
+            wire_bytes: 1_200_000,
+        },
+        Duration::from_secs(5),
+        std::time::Instant::now(),
+    );
+    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut far]);
+
+    announce_block(&mut peer_set, &mut guard, &first).await;
+    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+    let _first_request = request_primary(&mut peer_set, &attempt).await;
+    assert_eq!(
+        first.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()]))
+    );
+    announce_block(&mut peer_set, &mut guard, &far).await;
+
+    assert_not_yet(request_block_again(&mut peer_set, &attempt, 70).await).await;
+    assert_eq!(
+        far.written_now().await,
+        None,
+        "70 ms into a request expected to take 250 ms, a 240 ms peer is not asked"
+    );
+
+    // 750 ms is the stall point for a peer expected to answer in 250 ms.
+    let _second = request_block_again(&mut peer_set, &attempt, 680).await;
+    assert_eq!(
+        far.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the second request is still available once the first request stalls"
     );
 }
 

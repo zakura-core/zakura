@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled:
 ///
 /// - it asks the one expected to answer sooner, from how long each peer has recently taken to
-///   answer pings and block requests. The node records missed announcements in either mode, but
+///   answer pings and requests for blocks small enough to arrive in one round trip (14,600
+///   bytes; larger downloads are measured but do not count). The node records missed announcements in either mode, but
 ///   only when enabled does it pass over an announcer that missed, until a later body from the
 ///   same connection verifies or 10 minutes elapse;
 /// - a block that the first request has not delivered yet is also requested from one other idle

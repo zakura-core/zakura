@@ -1,8 +1,10 @@
 //! An estimate of how long one legacy peer takes to answer a block request.
 //!
-//! The estimate is a time-weighted average of the peer's measured answer times: heartbeat pings
-//! and block replies of any size. Older samples count for less, so a peer that slows
-//! down loses its good estimate within minutes. A peer that announces a block and then does not
+//! The estimate is a time-weighted average of the peer's measured round trips: heartbeat pings,
+//! and block replies small enough to arrive in one round trip ([`ROUND_TRIP_REPLY_BYTES`]). A
+//! larger reply's time depends on the block's size and on how warm the connection is, so it is
+//! measured and traced but leaves the estimate alone. Older samples count for less, so a peer
+//! that slows down loses its good estimate within minutes. A peer that announces a block and then does not
 //! deliver it keeps its score. With scoring enabled, routing passes over it until a later
 //! delivery verifies or the miss expires.
 
@@ -10,6 +12,42 @@ use std::time::{Duration, Instant};
 
 /// How quickly old samples stop counting. A sample this old has `1/e` of a new sample's weight.
 const TIME_CONSTANT: Duration = Duration::from_secs(10 * 60);
+
+/// The largest block reply, in serialized bytes, whose answer time counts toward the estimate.
+///
+/// A new TCP connection may send 10 segments of 1,460 bytes before it waits for an
+/// acknowledgement. A reply that fits arrives in one round trip even on a connection that has
+/// been idle, so its answer time measures what a ping measures. A larger reply takes further
+/// round trips, and how many depends on its size and on how far the connection's window has
+/// grown.
+///
+/// This is an empirical first choice and may be tuned. On mainnet, 3-11 s downloads of
+/// 0.9-1.6 MB blocks raised the delivering peer's estimate from about 250 ms to
+/// 500-2,000 ms.
+pub(crate) const ROUND_TRIP_REPLY_BYTES: u64 = 10 * 1_460;
+
+/// What a delivery sample measured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeliverySampleKind {
+    /// A heartbeat ping's round trip.
+    Ping,
+    /// A reply to a block request that held at least one requested block.
+    Block {
+        /// The serialized size of the blocks in the reply.
+        wire_bytes: u64,
+    },
+}
+
+impl DeliverySampleKind {
+    /// Whether the sample is a round trip, and so counts toward the estimate. Every ping is
+    /// one. A block reply is one when it is at most [`ROUND_TRIP_REPLY_BYTES`].
+    pub(crate) fn is_round_trip(self) -> bool {
+        match self {
+            Self::Ping => true,
+            Self::Block { wire_bytes } => wire_bytes <= ROUND_TRIP_REPLY_BYTES,
+        }
+    }
+}
 
 /// One connection's time-weighted average answer time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -72,6 +110,22 @@ mod tests {
         delayed.record(ms(200), early);
         assert_eq!(delayed.score(), chronological.score());
         assert_eq!(delayed.weight(), chronological.weight());
+    }
+
+    #[test]
+    fn a_block_reply_is_a_round_trip_up_to_the_size_limit() {
+        let block = |wire_bytes| DeliverySampleKind::Block { wire_bytes };
+        assert!(DeliverySampleKind::Ping.is_round_trip());
+        assert!(block(1_700).is_round_trip());
+        assert!(
+            block(ROUND_TRIP_REPLY_BYTES).is_round_trip(),
+            "a reply of exactly the limit still fits one round trip"
+        );
+        assert!(
+            !block(ROUND_TRIP_REPLY_BYTES + 1).is_round_trip(),
+            "one byte over the limit needs another round trip"
+        );
+        assert_eq!(ROUND_TRIP_REPLY_BYTES, 14_600);
     }
 
     #[test]

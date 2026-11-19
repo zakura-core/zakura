@@ -35,7 +35,8 @@ use std::{future::Future, pin::Pin};
 use chrono::{DateTime, Utc};
 use zakura_chain::transaction::UnminedTx;
 use zakura_node_services::mempool::port::{
-    ChainEvent, ChainTip, LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
+    ChainEvent, ChainTip, ChangeSeq, LocalFault, PoolCommand, PoolInbox, PoolSnapshot,
+    ReservationId, Verdict,
 };
 use zakura_rt::{
     collections::HashMap,
@@ -473,7 +474,7 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
 
     /// Publishes the batches, and one snapshot after them, when a batch
     /// changed anything or the snapshot's tip or state would differ. A
-    /// snapshot copies the pool, so steps that changed
+    /// snapshot copies the pool's indexes, so steps that changed
     /// nothing a reader sees publish nothing.
     ///
     /// Batches with no changes are published too when anything is, so the
@@ -488,8 +489,16 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
         }
         self.published = Some(now);
         let machine = &self.machine;
-        self.inbox
-            .publish_batches(batches, |last_change| machine.snapshot(last_change));
+        // Every change to what the pool holds is logged, so the last snapshot
+        // plus these changes is the pool now. The first snapshot starts from
+        // the empty pool the core starts with.
+        let previous = self.inbox.published();
+        let empty = PoolSnapshot::inactive(now.tip, ChangeSeq(0));
+        let previous = previous.as_deref().unwrap_or(&empty);
+        let changes: Vec<_> = batches.iter().flatten().copied().collect();
+        self.inbox.publish_batches(batches, |last_change| {
+            machine.next_snapshot(previous, &changes, last_change)
+        });
     }
 
     /// Starts a verification task for `job`.

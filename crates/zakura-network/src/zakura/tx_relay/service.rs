@@ -589,8 +589,7 @@ impl PoolView for SnapshotView {
 
     fn ids(&self) -> Vec<UnminedTxId> {
         self.0
-            .transactions
-            .iter()
+            .transactions()
             .map(|tx| tx.transaction.id())
             .collect()
     }

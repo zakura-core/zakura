@@ -48,11 +48,10 @@ SSH_COMMON_OPTS = [
 
 DEFAULTS = {
     "deploy_kind": "systemd",
-    # When false, use the existing service and host config. A node may opt in
-    # to the scoring config upgrade alongside its binary.
+    # When false (systemd deploys only): leave the node's config, unit, and state
+    # cache untouched — just swap the binary and restart the existing service.
     # For fleets provisioned outside the deployer with hand-tuned configs.
     "manage_config": True,
-    "upgrade_block_source_score": False,
     "service_name": "zakurad",
     "bin_path": "/usr/local/bin/zakurad",
     "config_path": "/etc/zakura/zakura.toml",
@@ -168,7 +167,6 @@ class Node:
     release_state_publisher: bool = False
     port: object = None
     mempool: object = None  # dict | None: [mempool] settings
-    upgrade_block_source_score: bool = False
     # resolved at runtime
     sha: str = ""
 
@@ -284,11 +282,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             zakura = dict(merged["zakura"] or {})
             zakura["tx_relay"] = {**zakura.get("tx_relay", {}), "enabled": setup["tx_relay"]}
             merged["zakura"] = zakura
-        upgrade_score = merged["upgrade_block_source_score"]
-        if not isinstance(upgrade_score, bool) or (upgrade_score and (
-            merged["manage_config"] or merged["deploy_kind"] != "systemd"
-        )):
-            raise DeployError(f"{name}: upgrade_block_source_score requires a binary-only systemd node")
         publisher = merged["release_state_publisher"]
         build_features = merged["build_features"]
         if (not isinstance(build_features, list)
@@ -347,7 +340,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             process_pattern=merged["process_pattern"],
             container_name=merged["container_name"],
             release_state_publisher=publisher,
-            upgrade_block_source_score=upgrade_score,
             port=merged["port"],
             mempool=merged.get("mempool"),
         ))
@@ -884,8 +876,8 @@ fi
 
 
 # Binary-only deploy (manage_config = false): swap the binary in place and
-# restart the existing service. An explicitly opted-in node upgrades just its
-# scoring settings when it first receives the matching binary.
+# restart the existing service, leaving the node's config, unit, and state cache
+# untouched. Used for fleets provisioned outside the deployer.
 BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
@@ -894,34 +886,12 @@ BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
 
-helper="$STAGE/upgrade_block_source_score.py"
-backup="${{BIN_PATH}}.scoring-backup"
-if [ -f "$helper" ]; then
-    python3 "$helper" prepare --service "$SERVICE" --binary "$STAGE/zakurad.new" "$STAGE" >/dev/null
-    if [ -f "$STAGE/scoring.path" ]; then
-        [ -x "$BIN_PATH" ] || {{ echo "missing binary for config rollback" >&2; exit 1; }}
-        [ "$NO_RESTART" = 0 ] || {{ echo "changing scoring config requires a restart" >&2; exit 1; }}
-    fi
-fi
-
 mkdir -p "$(dirname "$BIN_PATH")"
+
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-# Keep the config paired with this .bak through the outer RPC startup canary.
-# Rotate the pair even when this deployment no longer changes the config.
-if [ -f "$helper" ] || [ -d "$backup" ]; then
-    install -d -m 700 "$backup"
-    rm -f -- "$backup/scoring.path" "$backup/scoring.old" "$backup/scoring.new"
-    if [ -f "$STAGE/scoring.path" ]; then
-        cp -p "$STAGE"/scoring.* "$helper" "$backup/"
-    fi
-fi
 install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
-if [ -f "$STAGE/scoring.path" ] && ! python3 "$helper" apply "$STAGE"; then
-    install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
-    exit 1
-fi
 
 if [ "$NO_RESTART" = "1" ]; then
     echo "installed binary (restart skipped)"
@@ -942,9 +912,6 @@ restart_service() {{
 
 if ! restart_service; then
     echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
-    if [ -f "$backup/scoring.path" ]; then
-        python3 "$backup/upgrade_block_source_score.py" restore "$backup"
-    fi
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
         restart_service || true
@@ -1088,9 +1055,6 @@ def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
     try:
         run(node.scp_to(str(binary), f"{stage}/zakurad"), capture=True)
         run(node.scp_to(str(exporter), f"{stage}/zakura-checkpoints"), capture=True)
-        if node.upgrade_block_source_score:
-            helper = SCRIPT_DIR / "mainnet" / "upgrade_block_source_score.py"
-            run(node.scp_to(str(helper), f"{stage}/{helper.name}"), capture=True)
         command = " ".join(shlex.quote(value) for value in (
             "bash", "-s", "--", stage, node.bin_path, node.service_name, node.sha,
         ))
@@ -1139,9 +1103,6 @@ def install_node(node: Node, binary: Path, stage: str, *, no_restart: bool) -> t
         if node.deploy_kind == "docker" and not node.container_name:
             return (node.name, False, "docker deploy requires container_name")
         run(node.scp_to(str(binary), f"{stage}/zakurad.new"), capture=True)
-        if node.upgrade_block_source_score:
-            helper = SCRIPT_DIR / "mainnet" / "upgrade_block_source_score.py"
-            run(node.scp_to(str(helper), f"{stage}/{helper.name}"), capture=True)
         if node.deploy_kind == "docker":
             script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
                 stage=shlex.quote(stage),

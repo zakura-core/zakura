@@ -55,9 +55,9 @@ peer's IP address; otherwise the address is absent. These addresses are every
 peer's, with nothing left out, which is why `/api/propagation` is not passed
 through: the dashboard drops the private ones when it joins the nodes.
 
-**How well legacy block sources are predicted.** The profiler summarises the
-last 1, 6 or 24 hours of traced legacy block requests (`block_sources.py`, served
-at `/api/sources?hours=N` and shown in the node page's "Where legacy blocks
+**How well peer scores predict block downloads.** The profiler summarises the
+last 1, 6 or 24 hours of requests to announcing Zcash peers (`block_sources.py`, served
+at `/api/sources?hours=N` and shown in the node page's "Where announced blocks
 come from" panel):
 
 - how far each download was from its peer's score, the peer's expected answer

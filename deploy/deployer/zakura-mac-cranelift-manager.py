@@ -364,26 +364,13 @@ def deploy_candidate(mac, linux, candidate_dir, candidate):
         raise ValueError('unexpected staging path')
     binary = candidate_dir / 'zakurad'
     mac.put(binary.read_bytes(), stage + '/zakurad')
+    mac.put((json.dumps(new) + '\n').encode(), stage + '/receipt.json')
     mac.put((json.dumps(candidate) + '\n').encode(), stage + '/acceptance.json')
-    # Store the config pair under root ownership; only its digest crosses to Linux.
-    helper = Path(__file__).resolve().parent / 'mainnet/upgrade_block_source_score.py'
-    mac.put(helper.read_bytes(), stage + '/' + helper.name)
-    score_stage = stage + '/config'
-    score_tool = shlex.join(['sudo', '-n', MAC_PYTHON, stage + '/' + helper.name])
-    prepare = shlex.join(['prepare', '--config', BASE + '/zakurad.toml', '--binary', stage + '/zakurad',
-                          '--expected-digest', old_mac['config_sha256'], score_stage])
-    try:
-        config_digest = mac.run(f'set -eu\nsudo -n chmod 755 {stage}/zakurad\n'
-                                + remote_program('binary_digest.py', stage + '/zakurad',
-                                                 digest(binary), interpreter=MAC_PYTHON)
-                                + f'sudo -n install -d -m 700 {score_stage}\n{score_tool} {prepare}').strip()
-        if not re.fullmatch(r'[a-f0-9]{64}', config_digest):
-            raise ValueError('invalid staged config digest')
-        new['config_sha256'] = config_digest
-        mac.put((json.dumps(new) + '\n').encode(), stage + '/receipt.json')
-    except Exception:
-        mac.run('sudo -n rm -rf -- ' + shlex.quote(stage))
-        raise
+    # Execute on the destination before touching its running node. This also
+    # catches unavailable dylibs / an incompatible deployment target.
+    mac.run(f'set -eu\nsudo -n chmod 755 {stage}/zakurad\n'
+            + remote_program('binary_digest.py', stage + '/zakurad', digest(binary), interpreter=MAC_PYTHON)
+            + f'sudo -n {stage}/zakurad --version >/dev/null\n')
     linux.run('set -eu\nsudo -n cp -p /etc/zakura-mac-verifier/receipt.json /etc/zakura-mac-verifier/receipt.json.previous\n'
               'sudo -n systemctl stop zakura-fleet-watchdog')
     try:
@@ -393,7 +380,6 @@ sudo -n cp -p '{BASE}/bin/zakurad' '{BASE}/bin/zakurad.previous'
 sudo -n cp -p '{BASE}/receipt.json' '{BASE}/receipt.json.previous'
 sudo -n install -m 755 {stage}/zakurad '{BASE}/bin/zakurad.next'
 sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
-{score_tool} apply {score_stage}
 sudo -n cp {stage}/receipt.json '{BASE}/receipt.json'
 sudo -n install -m 644 {stage}/acceptance.json '{BASE}/evidence/ci-acceptance.json'
 sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
@@ -424,7 +410,6 @@ sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
         mac.run(f'''set -eu
 sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad.next'
 sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
-{score_tool} restore {score_stage}
 sudo -n cp -p '{BASE}/receipt.json.previous' '{BASE}/receipt.json'
 sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
 ''', timeout=300)
@@ -432,7 +417,7 @@ sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
         rebind_cursor(linux)
         raise
     finally:
-        mac.run('sudo -n rm -rf -- ' + shlex.quote(stage))
+        mac.run('rm -rf -- ' + shlex.quote(stage))
 
 
 def main():

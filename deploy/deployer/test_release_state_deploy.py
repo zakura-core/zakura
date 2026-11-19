@@ -161,7 +161,7 @@ manage_config = true
 class PairedShellTests(unittest.TestCase):
     """Execute the deployment script with isolated paths and fake host commands."""
 
-    def run_pair(self, failure="", *, resume_marker=False, timer_active=True, reboot_after_failure=False, historical_restarts=0, scoring=False):
+    def run_pair(self, failure="", *, resume_marker=False, timer_active=True, reboot_after_failure=False, historical_restarts=0):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             script = (HERE.parent / "release-state/deploy-archive-pair.sh").read_text()
@@ -183,13 +183,6 @@ class PairedShellTests(unittest.TestCase):
                 path = root / name
                 path.write_text(f"#!/bin/sh\necho zakurad+g{SHA[:12]}\n")
                 path.chmod(0o755)
-            if scoring:
-                shutil.copy(HERE / "mainnet/upgrade_block_source_score.py", root / "stage")
-                (root / "archive.toml").write_text("[consensus]\nvct_fast_sync = false\n")
-                (root / "stage/zakurad").write_text(
-                    "#!/bin/sh\nif [ \"$3\" = generate ]; then echo '[network.block_download_score_and_hedge]'; "
-                    f"else echo zakurad+g{SHA[:12]}; fi\n"
-                )
             options = ["--state-cache-dir", "--full-list", "--mainnet-frontier-output",
                        "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
                        "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms"]
@@ -211,9 +204,6 @@ elif name == "flock":
     if failure == "lock" and args[-1] == "9" and "-u" not in args:
         sys.exit(1)
 elif name == "systemctl":
-    if args == ["show", "-p", "ExecStart", "--value", "zakurad"]:
-        print("argv[]=/bin/zakurad -c " + os.environ["TEST_ROOT"] + "/archive.toml start ;")
-        sys.exit(0)
     if args == ["start", "zakura-release-state.service"]:
         guard = pathlib.Path(os.environ["TEST_ROOT"]) / "etc/systemd/system/zakura-release-state.service.d/deployment-pause.conf"
         if guard.exists():
@@ -269,17 +259,12 @@ elif name == "curl":
                 self.assertEqual(reboot.returncode, 0)
                 self.assertEqual(reboot.stdout.strip(), b"publisher skipped",
                                  "reboot must not bypass the publisher guard")
-            if scoring and result.returncode == 0:
-                import tomllib
-                config = tomllib.loads((root / "archive.toml").read_text())
-                self.assertEqual(config, {"consensus": {"vct_fast_sync": False},
-                                          "network": {"block_download_score_and_hedge": {"enabled": True}}})
             events = log.read_text().splitlines()
             installed = (root / "opt/zakura-release-state/EXPORTER_REVISION").exists()
             return result, events, installed, marker.exists()
 
     def test_success_waits_for_publisher_then_installs_and_publishes(self):
-        result, events, installed, marker = self.run_pair(scoring=True)
+        result, events, installed, marker = self.run_pair()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(installed)
         order = ["systemctl stop zakura-release-state.timer", "flock -w 600 9",

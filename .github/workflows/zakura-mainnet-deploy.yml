@@ -12,15 +12,15 @@ name: Deploy Zakura mainnet fleet
 # per-node configs (external_addr, an inline zakura_node_secret_key that pins
 # each node's iroh identity, custom peers, and mempool/sync tuning) and their
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
-# this deploy sets manage_config = false and keeps the existing unit and cache.
-# The fleet enables legacy block scoring and hedging with compatible binaries.
-# The archive publisher also installs its matching exporter and
+# this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
+# restarts the existing `zakurad` service, leaving the config, unit, and cache
+# untouched. The archive publisher also installs its matching exporter and
 # verifies publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
-# default) rather than the deprecated v2_p2p/legacy_p2p bools. The p2p_stack fields
-# below are dashboard metadata.
+# default) rather than the deprecated v2_p2p/legacy_p2p bools. This workflow does
+# not rewrite node configs; p2p_stack below is dashboard/metadata only.
 
 on:
   workflow_dispatch:
@@ -398,7 +398,6 @@ jobs:
           # Keep the hand-written configs and restart the existing services.
           deploy_kind     = "systemd"
           manage_config   = false
-          upgrade_block_source_score = true
           service_name    = "zakurad"
           bin_path        = "/usr/local/bin/zakurad"
           network         = "Mainnet"
@@ -497,7 +496,7 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
 
-          # Legacy archive node: vct_fast_sync = false, so it holds per-height
+          # Archive node: vct_fast_sync = false, so it holds per-height
           # commitment trees everywhere and never fast-synced. That is what makes it
           # the supported generator for the release-state historical frontier grid —
           # entries come from reads instead of replaying an absent band. Binary-only
@@ -515,7 +514,7 @@ jobs:
           # differs. On dual its body tip wedged: the v2 coordinator logged
           # "accepted block apply lost terminal observation; apply lifecycle is
           # failed" and the header chain ran ~6,000 blocks ahead of the verified
-          # tip. Switching the node to legacy cleared it immediately. Do not flip
+          # tip. Using the configured P2P stack cleared the stall. Do not flip
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
@@ -749,10 +748,6 @@ jobs:
               return
             fi
             echo "Rolling ${SERVICE_NAME} back to ${BIN_PATH}.bak" >&2
-            backup="${BIN_PATH}.scoring-backup"
-            if [ -f "$backup/scoring.path" ]; then
-              python3 "$backup/upgrade_block_source_score.py" restore "$backup" || return 1
-            fi
             install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"
             if restart_service; then
               echo "Rolled back to $("$BIN_PATH" --version)." >&2

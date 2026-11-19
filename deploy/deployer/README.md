@@ -229,25 +229,14 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-The Mainnet fleet enables scoring and hedging for legacy block downloads:
+All Mainnet Linux nodes, including `asia-hedged` and `asia-scored`, use the
+selected deployment ref. Operators enable block download scoring and hedging in
+each node's own config, including the separately deployed Mac verifier:
 
 ```toml
 [network.block_download_score_and_hedge]
 enabled = true
 ```
-
-All Linux Zakura nodes use the selected deployment ref, including the former
-Singapore experiments. The installer checks that the candidate supports the
-setting, then adds or enables it and removes superseded scoring and fixed-delay
-hedging tables. The first config change requires a restart. On ordinary systemd
-nodes, both the initial startup check and the optional RPC canary can restore
-the previous binary and config together. The archive publisher applies
-the config during its paired node/exporter install and retains its existing
-failure and publication policy.
-
-The separately deployed Mac verifier enables the same setting with its accepted
-candidate and records the new config digest in both deployment receipts.
-Dashboard refreshes and status checks do not apply node settings.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
@@ -285,8 +274,7 @@ Zakura identity (the node ids hardcoded as bootstrap peers in
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
-the existing `zakurad` service. The fleet applies the scoring setting
-described above while preserving unrelated node settings. The
+the existing `zakurad` service, leaving the config, unit, and cache untouched. The
 `rpc_listen_addr` / `log_file` / `p2p_stack` /
 `[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
 dashboard's SSH probe, not deployed to nodes. On-node configs should use

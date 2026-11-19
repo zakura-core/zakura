@@ -1,4 +1,4 @@
-"""How well a legacy node's block source scores predict its block downloads.
+"""How well peer scores predict downloads of announced blocks.
 
 A node can use a peer's expected answer time to choose where to request an announced
 block. It can also ask a second announcer while the first request is outstanding.

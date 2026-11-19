@@ -3666,7 +3666,7 @@ footer {
 
       <div class="panel pad pf-panel" role="region" aria-labelledby="pf-src-h" id="pf-sources-panel" hidden>
         <div class="pf-controls">
-          <h3 id="pf-src-h">Where legacy blocks come from</h3>
+          <h3 id="pf-src-h">Where announced blocks come from</h3>
           <div class="pf-group" role="group" aria-label="Hours to summarise">
             <button data-pf-src-hours="1">1 h</button>
             <button data-pf-src-hours="6">6 h</button>
@@ -5136,7 +5136,7 @@ function renderTop() {
       + `<td style="width:28%"><div class="pf-bar" style="width:${(100 * us / peak).toFixed(1)}%;background:${color(cat)}"></div></td></tr>`;
   }).join("");
 }
-// ---- block sources: how well the legacy block source scores predict downloads ----
+// ---- block sources: how well peer scores predict downloads ----
 const SOURCE_REASON = { predicted: "Another announcer expected sooner", stalled: "First request stalled", "fixed delay": "Fixed delay" };
 const SAMPLE_LABEL = { ping: "pings", transaction: "transaction replies", block: "blocks", carried_over: "scores restored on reconnect" };
 function signedMs(value) { return value == null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "") + ms(Math.abs(value)); }
@@ -5154,7 +5154,7 @@ function renderSources() {
   document.querySelectorAll("[data-pf-src-hours]").forEach(b => b.setAttribute("aria-pressed", +b.dataset.pfSrcHours === sources.hours));
   const req = sources.requests;
   if (!req.first) {
-    el("src-note").textContent = `No legacy block requests to a peer that announced the block in the last ${sources.hours} h. The node has block source scores off, or gets its blocks another way.`;
+    el("src-note").textContent = `No block requests to an announcing Zcash peer in the last ${sources.hours} h. The node has block source scores off, or gets its blocks another way.`;
     ["src-pred", "src-second", "src-pen"].forEach(id => { el(id).innerHTML = ""; });
     el("src-mix").textContent = "";
     return;

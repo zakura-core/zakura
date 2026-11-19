@@ -1,9 +1,8 @@
 """How well a legacy node's block source scores predict its block downloads.
 
-A node with `[network.block_source_score]` picks the legacy peer it asks for a gossiped block
-by each peer's expected answer time, its score, and with `second_request` may ask a second
-announcer while the first request is outstanding. This module reads two trace tables and
-answers, per node, whether that is working:
+A node can use a peer's expected answer time to choose where to request an announced
+block. It can also ask a second announcer while the first request is outstanding.
+This module summarises the outcomes recorded in two trace tables:
 
 - `legacy_peer_request` `block_request_finish` rows of first (`advertised`) and second
   (`hedge`) block requests: how far each download was from its peer's score, by block size,

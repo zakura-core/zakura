@@ -55,16 +55,16 @@ peer's IP address; otherwise the address is absent. These addresses are every
 peer's, with nothing left out, which is why `/api/propagation` is not passed
 through: the dashboard drops the private ones when it joins the nodes.
 
-**How well legacy block sources are predicted.** On a node with
-`[network.block_source_score]`, the profiler also summarises, over the last 1,
-6 or 24 hours, how its legacy block requests went (`block_sources.py`, served
+**How well legacy block sources are predicted.** The profiler summarises the
+last 1, 6 or 24 hours of traced legacy block requests (`block_sources.py`, served
 at `/api/sources?hours=N` and shown in the node page's "Where legacy blocks
 come from" panel):
 
 - how far each download was from its peer's score, the peer's expected answer
   time, for first and second requests and by block size;
 - how many second requests were sent, for which reason, how many arrived
-  before the first request's block, and the time they saved;
+  first or delivered the only copy, and the arrival-time difference when both
+  requests delivered and the second arrived first;
 - how often a peer that announced a block did not deliver it, and the time
   until the next block observed on the same connection;
 - what the scores were made of: pings and blocks (older builds also counted

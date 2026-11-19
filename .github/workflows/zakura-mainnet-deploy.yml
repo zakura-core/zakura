@@ -519,15 +519,8 @@ jobs:
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # Legacy-only nodes that measure experimental settings from open PRs.
-          # Each is pinned to the build it runs, because
-          # its hand-written config enables a setting that main does not have yet:
-          # a main build would refuse that config and fail to start. A fleet deploy
-          # therefore reinstalls the pinned build and restarts the node; to change
-          # the build, update the pin. Remove the pin (use "${REF}") once the PR
-          # merges, or remove the entry when the experiment ends.
-          #
-          # asia-hedged measures [network.block_hedge] (#2548).
+          # This binary-only deployment preserves each node's on-disk config.
+          # asia-hedged uses [network.block_hedge] from #2548.
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
@@ -536,8 +529,8 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored measures [network.block_source_score] (#2558) with its
-          # second_request setting (#2572).
+          # asia-scored still uses [network.block_source_score] with second_request.
+          # Keep a compatible pin until the host config is updated for #2595.
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
@@ -703,7 +696,6 @@ jobs:
           if node is None:
               raise SystemExit(f"unknown node: {node_name}")
 
-          uses_rpc_cookie = node_name == "zakura-compat"
           values = {
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
@@ -711,8 +703,12 @@ jobs:
               "RPC_LISTEN_ADDR": node.get(
                   "rpc_listen_addr", defaults["rpc_listen_addr"]
               ),
-              "RPC_AUTH": "cookie" if uses_rpc_cookie else "",
-              "RPC_CONFIG_PATH": "/root/.cache/zakura/.cookie" if uses_rpc_cookie else "",
+              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
+              "RPC_CONFIG_PATH": (
+                  "/root/.cache/zakura/.cookie"
+                  if node_name == "zakura-compat"
+                  else ""
+              ),
           }
           for key, value in values.items():
               print(f"{key}={shlex.quote(str(value))}")
@@ -903,14 +899,14 @@ jobs:
           sudo python3 deploy/runner/refresh_peer_location_db.py /var/lib/zakura-mainnet-dashboard/geo
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
-          # auth for nodes that require it into the dashboard copy.
+          # auth for the compatibility node into this copy (not the deploy config).
           awk '
             { print }
-            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"$/ { uses_cookie = 1 }
-            uses_cookie && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"/ { in_compat = 1 }
+            in_compat && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
-              uses_cookie = 0
+              in_compat = 0
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"

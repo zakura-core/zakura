@@ -229,12 +229,11 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-Both experiment nodes use the legacy P2P stack. `asia-hedged` measures
-`[network.block_hedge]` from PR 2548. `asia-scored` measures
-`[network.block_source_score]` with `second_request` from PR 2572.
-Each entry pins a build that understands the
-settings in its node's config. Unpin an entry when its PR merges, or remove
-it when the experiment ends.
+The two Singapore experiment nodes have hand-written configs. `asia-hedged`
+uses `[network.block_hedge]` from PR 2548. `asia-scored` uses
+`[network.block_source_score]` with `second_request`. Its deployment pin
+must support that config until the host switches to
+`[network.block_download_score_and_hedge]`, the setting introduced in PR 2595.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated

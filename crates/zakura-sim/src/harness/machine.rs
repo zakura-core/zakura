@@ -98,6 +98,7 @@ macro_rules! machine_entry {
             run_bytes: |bytes, sink, extra| {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },
+            run_steered_bytes: None,
             accepts: |_| true,
             families: Vec::new,
             migrate: |_, generator| {
@@ -145,6 +146,7 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     } else {
         machine.rules
     };
+    let known = super::treated_as_known();
     rules
         .iter()
         .map(|&(id, claim, status)| Property {
@@ -153,7 +155,7 @@ fn properties(machine: &Machine) -> Vec<Property<Handle>> {
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View],
-            status,
+            status: super::known_status(&known, id, status),
             check,
             witness: None,
         })

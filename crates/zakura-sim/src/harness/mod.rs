@@ -34,7 +34,7 @@ pub mod sync_wire;
 pub mod wire_node;
 pub mod wire_plans;
 
-use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -175,15 +175,32 @@ pub struct ScenarioFamily {
     pub name: &'static str,
     /// The bytes at the prefix's start that pick it.
     pub tag: Vec<u8>,
+    /// How many values of the byte after the tag pick distinct scenarios,
+    /// such as one fault each. 1 when that byte picks nothing. Only the
+    /// generator's cycle draws read it ([`DrawPolicy::Cycle`]).
+    ///
+    /// [`DrawPolicy::Cycle`]: crate::explore::generate::DrawPolicy::Cycle
+    pub variants: u16,
 }
 
 impl ScenarioFamily {
-    /// The family `tag` picks, named `name`.
+    /// The family `tag` picks, named `name`, with one variant.
     pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
         ScenarioFamily {
             name,
             tag: tag.into(),
+            variants: 1,
         }
+    }
+
+    /// This family, whose byte after the tag picks one of `variants`
+    /// scenarios, from 0.
+    pub fn with_variants(self, variants: usize) -> Self {
+        let variants = u16::try_from(variants)
+            .ok()
+            .filter(|variants| (1..=256).contains(variants))
+            .expect("one byte picks 1 to 256 variants");
+        ScenarioFamily { variants, ..self }
     }
 }
 
@@ -259,8 +276,27 @@ pub fn run_steered<S: Subsystem>(
     sink: &mut dyn RecordSink,
     steer: Box<dyn Steer>,
 ) -> Result<(RunReport, Vec<u8>), HarnessError> {
+    let (run, bytes) = run_steered_keeping::<S>(scenario, prepared, input, sink, steer);
+    let report = run?;
+    Ok((
+        report,
+        bytes.expect("run_set_up sets the Sim up before it runs"),
+    ))
+}
+
+/// [`run_steered`], keeping the Plan bytes the steer recorded even when the
+/// run fails: a harness failure during or after the run keeps the choices
+/// made until then, which replay it. `None` if the harness never set the
+/// Sim up.
+pub(crate) fn run_steered_keeping<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (Result<RunReport, HarnessError>, Option<Vec<u8>>) {
     let mut steered = None;
-    let (report, ()) = run_set_up::<S, ()>(
+    let run = run_set_up::<S, ()>(
         scenario,
         prepared,
         input,
@@ -268,9 +304,9 @@ pub fn run_steered<S: Subsystem>(
         None,
         |sim| steered = Some(sim.steer(steer)),
         |_, _, _, _| (),
-    )?;
-    let steered = steered.expect("run_set_up sets the Sim up before it runs");
-    Ok((report, steered.bytes()))
+    )
+    .map(|(report, ())| report);
+    (run, steered.map(|steered| steered.bytes()))
 }
 
 /// [`run_prepared`], also returning what `read` takes from the harness and
@@ -430,7 +466,53 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
         },
     ];
     properties.extend(S::properties());
+    let known = treated_as_known();
+    for property in &mut properties {
+        property.status = known_status(&known, property.id.as_str(), property.status);
+    }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
+}
+
+/// The variable that names properties a run treats as `Known`, comma
+/// separated, each as `<id>` or `<id>=<issue>`, issue 0 when left out. An
+/// `Active` property it names records its violations and lets the run go
+/// on, as a `Known` one does, so a search can look past an open bug it
+/// keeps finding. A trace records each status, so replaying one needs the
+/// same value. Unset, every property keeps its own status.
+pub const KNOWN_VAR: &str = "ZAKURA_SIM_KNOWN";
+
+/// Property `id`'s status `status`, or `Known` at its issue if `known`,
+/// from [`treated_as_known`], names it and `status` is `Active`.
+pub(crate) fn known_status(known: &BTreeMap<String, u32>, id: &str, status: Status) -> Status {
+    match known.get(id) {
+        Some(&issue) if status == Status::Active => Status::Known { issue },
+        _ => status,
+    }
+}
+
+/// The properties [`KNOWN_VAR`] names, each with its issue.
+///
+/// # Panics
+///
+/// If an issue isn't a number, so a mistyped value can't pass silently.
+pub(crate) fn treated_as_known() -> BTreeMap<String, u32> {
+    let Ok(value) = std::env::var(KNOWN_VAR) else {
+        return BTreeMap::new();
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((id, issue)) => (
+                id.to_owned(),
+                issue
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{KNOWN_VAR}: `{issue}` isn't an issue number")),
+            ),
+            None => (entry.to_owned(), 0),
+        })
+        .collect()
 }
 
 /// Checks [`NO_TASK_PANIC`]: violated at a step where a task panicked.
@@ -506,6 +588,9 @@ pub struct HarnessEntry {
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
+    /// [`explore::run_steered_bytes`], for a harness the scheduler runs. A
+    /// machine has none: it makes no picks to steer.
+    pub run_steered_bytes: Option<SteeredRunFn>,
     /// [`Subsystem::accepts`].
     pub accepts: fn(&[u8]) -> bool,
     /// [`Subsystem::families`]. A machine has none.
@@ -518,6 +603,10 @@ pub struct HarnessEntry {
 /// property, the expectation, the expected co-violations and the sink.
 pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &[String], &mut dyn RecordSink) -> Result<(), WitnessError>;
+
+/// [`HarnessEntry::run_steered_bytes`]: a full fuzz input, the sink and the
+/// steer, returning the run and the input that replays it unsteered.
+pub type SteeredRunFn = fn(&[u8], &mut dyn RecordSink, Box<dyn Steer>) -> (ExploreRun, Vec<u8>);
 
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
@@ -579,6 +668,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         properties: registered::<S>,
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
+        run_steered_bytes: Some(explore::run_steered_bytes::<S>),
         accepts: S::accepts,
         families: S::families,
         migrate: S::migrate,

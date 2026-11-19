@@ -109,6 +109,12 @@ const REDIAL_SETTLE: Duration = Duration::from_secs(10);
 /// How long an [`PeerAction::Open`] waits for the node to refuse the stream.
 const REFUSAL_WAIT: Duration = Duration::from_secs(10);
 
+/// How long a dialing peer whose control handshake failed waits for the
+/// node's connection close to land before it reads the close's code. The
+/// refusal can end the peer's control-stream read before the peer's
+/// endpoint takes the close, which a later datagram carries.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// The address peer `index` binds for its `dial`-th connection, from 0:
 /// `10.<index + 1>.0.<dial + 1>:4000`. A listening peer binds its first.
 /// So every connection incarnation has its own 4-tuple.
@@ -1515,6 +1521,11 @@ impl PeerTask {
             )
             .await
             else {
+                // As the responder waits for the close before it records
+                // one, bounded so a node that never closes still fails.
+                if conn.close_reason().is_none() {
+                    let _ = zakura_rt::time::timeout(CLOSE_WAIT, conn.closed()).await;
+                }
                 self.record_connection_close(
                     &conn,
                     Remote {

@@ -829,6 +829,17 @@ impl PeerWorkQueue {
         true
     }
 
+    /// Count `peer`'s staged headers as progress when its round staged a fair
+    /// share, [`MAX_HEADER_CHUNK_RESERVATION_V1`], since the last count.
+    ///
+    /// The peer picks its own page size, so one filled reservation proves
+    /// little: at one header per page, a peer could hold its round with one
+    /// header per request timeout (F-198).
+    pub(in crate::zakura::header_sync) fn credit_staged_share(&mut self, peer: &ZakuraPeerId) -> bool {
+        self.policy
+            .credit_staged(peer, MAX_HEADER_CHUNK_RESERVATION_V1)
+    }
+
     /// Move `peer`'s staged headers into preparation. See [`WorkPolicy::begin_prepare`].
     pub(in crate::zakura::header_sync) fn begin_prepare(
         &mut self,

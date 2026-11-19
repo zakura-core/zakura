@@ -478,19 +478,35 @@ impl EvictionFixture {
     /// Advertise a target from `session_id` and answer its locator read, so
     /// the reactor sends that session a header request.
     fn start_request(&mut self, session_id: u64) {
+        self.start_request_to(
+            session_id,
+            u32::MAX,
+            block::Height(100),
+            block::Hash([0x52; 32]),
+        );
+    }
+
+    /// Start a request for the target `tip_height`/`tip_hash` from a peer
+    /// that puts at most `max_headers` headers in a page.
+    fn start_request_to(
+        &mut self,
+        session_id: u64,
+        max_headers: u32,
+        tip_height: block::Height,
+        tip_hash: block::Hash,
+    ) {
         let anchor = self.snapshot.frontiers.finalized;
-        let target = block::Hash([0x52; 32]);
         self.reactor.handle_status(
             self.peer.clone(),
             session_id,
             Status {
                 work_anchor_height: anchor.height,
                 work_anchor_hash: anchor.hash,
-                selected_tip_height: block::Height(100),
-                selected_tip_hash: target,
+                selected_tip_height: tip_height,
+                selected_tip_hash: tip_hash,
                 suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
                 oldest_retained_height: anchor.height,
-                max_headers_per_response: u32::MAX,
+                max_headers_per_response: max_headers,
                 max_subscriptions: 1,
                 max_message_bytes: 2_000_000,
                 tree_aux_schema_mask: 0,
@@ -520,6 +536,54 @@ impl EvictionFixture {
             .expect("the advertised target starts a request");
         assert_eq!(active.owner.session_id(), session_id);
         assert_eq!(active.phase, HeaderTargetPhase::Receiving);
+    }
+
+    /// The header `offset` places after the anchor, linked to the header
+    /// before it.
+    fn linked_header(&self, offset: u32) -> block::Header {
+        let mut previous = self.snapshot.frontiers.finalized.hash;
+        let mut header = *regtest_genesis_block().header;
+        for step in 1..=offset {
+            header = *regtest_genesis_block().header;
+            header.previous_block_hash = previous;
+            header.time += chrono::Duration::seconds(i64::from(step));
+            previous = header.hash();
+        }
+        header
+    }
+
+    /// Send the started request's next page: the `offset`th header after the
+    /// anchor, on top of the headers already staged.
+    fn answer_with_header_at(&mut self, session_id: u64, offset: u32, reaches_target: bool) {
+        let anchor = self.snapshot.frontiers.finalized;
+        let ancestor = if offset == 1 {
+            anchor
+        } else {
+            zakura_header_chain::Frontier::new(
+                block::Height(anchor.height.0 + offset - 1),
+                self.linked_header(offset - 1).hash(),
+            )
+        };
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(&self.peer)
+            .expect("the started request is active");
+        let response = Headers {
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
+            common_ancestor_height: ancestor.height,
+            common_ancestor_hash: ancestor.hash,
+            reaches_initial_target: reaches_target,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header: Arc::new(self.linked_header(offset)),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        };
+        self.reactor
+            .deliver_page(self.peer.clone(), session_id, response);
     }
 
     /// Answer the request `start_request` sent `session_id` with one page of
@@ -683,6 +747,124 @@ async fn a_one_header_drip_ends_in_a_stall() {
         assert!(session.1.is_cancelled(), "the drip ends in a stall");
         assert!(!fixture.is_admitted());
     }
+}
+
+/// A last page that lands just inside the deadline starts a prepare. The
+/// peer delivered its round, so the prepare gets a full request timeout and
+/// the old deadline doesn't retire it.
+#[tokio::test(start_paused = true)]
+async fn a_last_page_near_the_deadline_keeps_its_prepare() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    let anchor = fixture.snapshot.frontiers.finalized;
+    let tip = fixture.linked_header(1).hash();
+    fixture.start_request_to(7, u32::MAX, block::Height(anchor.height.0 + 1), tip);
+
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    fixture.answer_with_header_at(7, 1, true);
+    let prepared = Instant::now();
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(prepared + timeout)),
+        "entering the prepare arms a fresh deadline"
+    );
+    assert_eq!(fixture.unproductive_requests(), Some(0));
+
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active(&fixture.peer)
+        .expect("the old deadline doesn't retire the prepare");
+    assert_eq!(active.phase, HeaderTargetPhase::Preparing);
+    assert!(!fixture.cancel.is_cancelled());
+}
+
+/// F-198: a peer that puts one header in each page fills each one-header
+/// reservation. A filled reservation alone isn't progress, so one header
+/// just inside each deadline still ends in a stall.
+#[tokio::test(start_paused = true)]
+async fn a_one_header_page_limit_cannot_hold_the_round() {
+    let mut fixture = eviction_fixture(1, 7);
+    fixture.start_request_to(7, 1, block::Height(10_000), block::Hash([0x52; 32]));
+    let deadline = *fixture
+        .reactor
+        .state
+        .request_deadlines
+        .get(&fixture.peer)
+        .expect("the request has a deadline");
+
+    time::advance(deadline - Instant::now() - std::time::Duration::from_secs(1)).await;
+    fixture.answer_with_header_at(7, 1, false);
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active(&fixture.peer)
+        .expect("the filled reservation continues the round");
+    assert_eq!(active.entries.len(), 1);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&deadline),
+        "one header does not extend the deadline"
+    );
+
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(fixture.cancel.is_cancelled(), "the drip ends in a stall");
+    assert!(!fixture.is_admitted());
+}
+
+/// A peer with one-header pages that stages a fair share of headers,
+/// `MAX_HEADER_CHUNK_RESERVATION_V1`, within the deadline makes progress:
+/// its strikes clear and its request gets a fresh deadline.
+#[tokio::test(start_paused = true)]
+async fn a_fair_share_of_small_pages_is_progress() {
+    let mut fixture = eviction_fixture(3, 7);
+    // Room for one grant per page.
+    let (send, outbound) = framed_channel(1024);
+    fixture._outbound = outbound;
+    fixture.cancel = CancellationToken::new();
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(
+            fixture.peer.clone(),
+            8,
+            send,
+            fixture.cancel.clone(),
+        ),
+    ));
+    let timeout = fixture.reactor.startup.request_timeout;
+    fixture.time_out_one_request(8);
+    fixture.reactor.clear_peer_work_for_test(&fixture.peer);
+    assert_eq!(fixture.unproductive_requests(), Some(1));
+    fixture.start_request_to(8, 1, block::Height(10_000), block::Hash([0x52; 32]));
+    let deadline = *fixture
+        .reactor
+        .state
+        .request_deadlines
+        .get(&fixture.peer)
+        .expect("the request has a deadline");
+
+    time::advance(timeout / 2).await;
+    let share = u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1).expect("the share fits u32");
+    for offset in 1..share {
+        fixture.answer_with_header_at(8, offset, false);
+    }
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&deadline),
+        "less than a fair share is not progress"
+    );
+    assert_eq!(fixture.unproductive_requests(), Some(1));
+
+    fixture.answer_with_header_at(8, share, false);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(Instant::now() + timeout)),
+        "a fair share re-arms the deadline"
+    );
+    assert_eq!(fixture.unproductive_requests(), Some(0));
+    assert!(!fixture.cancel.is_cancelled());
 }
 
 /// A replacement that retires no unanswered request gives the replacement's

@@ -173,6 +173,8 @@ pub struct ActiveHeaderRequest {
     pub common_ancestor: Option<Frontier>,
     /// Complete response pages staged without intermediate state mutation.
     pub entries: Vec<HeaderEntry>,
+    /// How many of `entries` already counted as the round's progress.
+    pub credited_entries: usize,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
     /// The round the queue assigned at start, or [`WorkIncarnation::UNSTARTED`] before it.
@@ -237,6 +239,7 @@ impl ActiveHeaderRequest {
             owner,
             common_ancestor: None,
             entries: Vec::new(),
+            credited_entries: 0,
             phase: HeaderTargetPhase::Receiving,
             incarnation: WorkIncarnation::UNSTARTED,
             cursor: None,
@@ -1119,6 +1122,19 @@ impl WorkPolicy {
         self.request_mut(peer)
     }
 
+    /// Count `peer`'s staged headers as progress when the round staged at
+    /// least `share` of them since the last count. Returns whether it counted.
+    pub(super) fn credit_staged(&mut self, peer: &ZakuraPeerId, share: usize) -> bool {
+        let Some(request) = self.request_mut(peer) else {
+            return false;
+        };
+        if request.entries.len().saturating_sub(request.credited_entries) < share {
+            return false;
+        }
+        request.credited_entries = request.entries.len();
+        true
+    }
+
     fn request_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
         match self.work_by_peer.get_mut(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
@@ -1195,6 +1211,7 @@ impl WorkPolicy {
             },
         };
         request.phase = HeaderTargetPhase::Preparing;
+        request.credited_entries = 0;
         Some(HeaderPortOperation::PrepareHeaderTarget {
             purpose: request.purpose.clone(),
             peer: peer.clone(),

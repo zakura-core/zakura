@@ -75,7 +75,11 @@ fn extract_halo2_inputs_from_blocks() -> Vec<Halo2Input> {
                 continue;
             };
 
-            let Some(bundle) = sighasher.orchard_bundle() else {
+            let Some(bundle) = tx
+                .shielded_bundles(NetworkUpgrade::Nu5)
+                .ok()
+                .and_then(|bundles| bundles.orchard)
+            else {
                 continue;
             };
 

@@ -36,7 +36,7 @@ use super::spawn_fifo;
 #[cfg(test)]
 mod tests;
 
-use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
+use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, VerifiedKeys, CACHE_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -496,6 +496,17 @@ fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static LazyLock<Verif
 /// is a compile error here until it is bound to a key on purpose.
 pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     lazy_verifier_for(network_upgrade)
+}
+
+/// Returns the keys remembered by the Halo2 verifier for `network_upgrade`, or `None` if that
+/// verifier has not been built yet.
+///
+/// Unlike [`verifier_for`], this never builds the verifier, so a lookup does not pay for a
+/// verifying key or start a batch worker.
+pub(super) fn verified_keys_if_built(
+    network_upgrade: NetworkUpgrade,
+) -> Option<VerifiedKeys<'static>> {
+    LazyLock::get(lazy_verifier_for(network_upgrade)).map(Cached::verified_keys)
 }
 
 /// Returns how many times `item` has reached its era's inner Halo2 verifier.

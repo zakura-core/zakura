@@ -274,26 +274,32 @@ impl PrecomputedTxData {
             all_previous_outputs,
         })
     }
+}
 
-    /// Returns the Orchard bundle in `tx_data`.
-    pub fn orchard_bundle(
-        &self,
-    ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
-        self.tx_data.orchard_bundle().cloned()
-    }
+/// A transaction's shielded bundles as `librustzcash` reads them, which is the form the proof
+/// and signature verifiers take.
+///
+/// [`Transaction::shielded_bundles`] reads them.
+#[derive(Clone, Debug, Default)]
+pub struct ShieldedBundles {
+    /// The Sapling bundle, if the transaction has Sapling spends or outputs.
+    pub sapling: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
 
-    /// Returns the Ironwood bundle in `tx_data`.
-    pub fn ironwood_bundle(
-        &self,
-    ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
-        self.tx_data.ironwood_bundle().cloned()
-    }
+    /// The Orchard bundle, if the transaction has Orchard actions.
+    pub orchard: Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
 
-    /// Returns the Sapling bundle in `tx_data`.
-    pub fn sapling_bundle(
-        &self,
-    ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
-        self.tx_data.sapling_bundle().cloned()
+    /// The Ironwood bundle, if the transaction has Ironwood actions.
+    pub ironwood: Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
+}
+
+impl ShieldedBundles {
+    /// Copies the shielded bundles out of a transaction `librustzcash` has read.
+    pub(crate) fn from_librustzcash(tx_data: &zp_tx::TransactionData<zp_tx::Authorized>) -> Self {
+        Self {
+            sapling: tx_data.sapling_bundle().cloned(),
+            orchard: tx_data.orchard_bundle().cloned(),
+            ironwood: tx_data.ironwood_bundle().cloned(),
+        }
     }
 }
 

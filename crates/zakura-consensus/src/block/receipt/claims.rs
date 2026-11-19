@@ -296,10 +296,6 @@ impl AnnouncementClaims {
         order: u64,
     ) -> MinedGuard {
         let mut table = self.table();
-        // Bounds the records on a node without header sync, whose floor never moves.
-        table
-            .mined
-            .retain(|_, mined| height - mined.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
         let table = &mut *table;
         let next_mined_id = table.next_mined_id;
         let mined = match table.mined.entry(hash) {
@@ -319,6 +315,7 @@ impl AnnouncementClaims {
         MinedGuard {
             claims: self.clone(),
             hash,
+            height,
             id: mined.id,
         }
     }
@@ -385,14 +382,22 @@ impl Drop for PendingClaims {
 pub(in crate::block) struct MinedGuard {
     claims: AnnouncementClaims,
     hash: block::Hash,
+    /// The height of this submission's body. Other bodies can share its header hash.
+    height: block::Height,
     id: u64,
 }
 
 impl MinedGuard {
     /// Keeps the record after this guard is gone, because the mined block verified.
     pub(in crate::block) fn keep(self) {
-        if let Some(mined) = self.own_entry(&mut self.claims.table()) {
+        let mut table = self.claims.table();
+        if let Some(mined) = self.own_entry(&mut table) {
             mined.verified = true;
+            mined.height = self.height;
+            // Without header sync the floor never moves. Prune using the body that verified.
+            table
+                .mined
+                .retain(|_, other| self.height - other.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
         }
     }
 

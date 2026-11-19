@@ -264,9 +264,10 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     first.keep();
     assert!(voided());
 
-    // A mined block at the next height that fails leaves this one's record in place.
-    let next = claims.mark_mined(hash(4), block::Height(CLAIMED.0 + 1), mined_order + 1);
-    drop(next);
+    // A higher submission cannot retire this record while pending or after rejection.
+    let higher = claims.mark_mined(hash(4), block::Height(CLAIMED.0 + 3), mined_order + 1);
+    assert!(voided());
+    drop(higher);
     assert!(voided());
 }
 
@@ -333,10 +334,13 @@ fn mined_block_records_end_once_the_node_mines_well_above_them() {
     assert!(voided());
 
     let two_above = block::Height(CLAIMED.0 + 2);
+    let three_above = block::Height(CLAIMED.0 + 3);
+    // Only the body that verifies supplies the height, even when both share a header.
+    let pending = claims.mark_mined(hash(4), three_above, order::next());
     claims.mark_mined(hash(4), two_above, order::next()).keep();
+    drop(pending);
     assert!(voided(), "a record within the claim window is kept");
 
-    let three_above = block::Height(CLAIMED.0 + 3);
     claims
         .mark_mined(hash(5), three_above, order::next())
         .keep();

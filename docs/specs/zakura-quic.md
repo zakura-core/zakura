@@ -463,12 +463,17 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   validated, so it can only drain the unvalidated ledger, and its victim
   answers the Retry with a validated Initial that the other ledger charges.
   Each ledger also has one node-wide bucket of 24 tokens that refills at 24
-  a second. The acceptor takes the node's token before the address's token,
-  and an attempt that either bucket refuses keeps neither token. When the
-  node's bucket is empty, the acceptor returns `Retry` for an unvalidated
-  source and `Refuse` for a validated one. One address's rate stays below
-  the node's, so one busy address can't refuse every other address.
-  The acceptor refunds both tokens, to the ledger it charged, when the
+  a second. Its last 8 tokens are a reserve. While the node's bucket holds
+  8 tokens or fewer, an attempt also spends a token from its address's
+  share: a bucket of one token that refills at an eighth of the node's
+  rate, 3 a second. Above the reserve, one address's
+  default burst of 16 fits. An attempt that any bucket refuses keeps no
+  token. When the node's bucket or the address's share is empty, the
+  acceptor returns `Retry` for an unvalidated source and `Refuse` for a
+  validated one. Busy addresses keep the node's bucket near the reserve,
+  and each spends at most its share of the reserve, so fewer than eight
+  addresses can't refuse every other address.
+  The acceptor refunds every token, to the ledger it charged, when the
   attempt never starts TLS (`cancel_admission`). Every TLS start keeps its
   charge, including a failed handshake or a local refusal after TLS.
 
@@ -1627,7 +1632,8 @@ handshake slot for the TLS deadline plus `control_timeout`.
 
 Changed:
 
-- **ADM-3.** Adds a node-wide bucket to each cadence ledger, keeps both charges
+- **ADM-3.** Adds a node-wide bucket with a per-address reserve share to
+  each cadence ledger, keeps both charges
   once TLS starts, and measures the responder's
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a

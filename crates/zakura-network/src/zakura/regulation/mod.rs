@@ -54,7 +54,7 @@
 mod cadence;
 pub(crate) use cadence::{
     parks_on_exhaustion, Bucket, ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError,
-    CadenceSender, MeteredReady, MeteredSender, RowSend,
+    CadenceSender, MeteredReady, MeteredSender, RowSend, SharedBucket,
 };
 
 mod serve;

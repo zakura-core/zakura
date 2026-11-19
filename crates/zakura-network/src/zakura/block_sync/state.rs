@@ -895,10 +895,26 @@ impl DownloadWindow {
     /// Responses share one ordered stream, so the next accepted body is at
     /// most one protocol-maximum body away. Later owed bodies add no time, so
     /// a silent peer cannot hold its episode open by taking new requests.
+    ///
+    /// Without the requester's figure, only `outstanding` counts. See
+    /// [`Self::block_liveness_deadline_owing`].
     pub(super) fn block_liveness_deadline(&self) -> Option<Instant> {
+        self.block_liveness_deadline_owing(0)
+    }
+
+    /// [`Self::block_liveness_deadline`] where the peer still owes
+    /// `authorized` body bytes under its live response authorizations.
+    ///
+    /// A request that timed out leaves `outstanding`, but the requester still
+    /// accepts its body, and that body counts as progress. So the next body's
+    /// transfer time comes from the authorizations. Each outstanding request
+    /// is also authorized, so `outstanding` only covers a caller with no
+    /// requester.
+    pub(super) fn block_liveness_deadline_owing(&self, authorized: u64) -> Option<Instant> {
         let next_body = self
             .outstanding
             .transfer_bytes()
+            .max(authorized)
             .min(block::MAX_BLOCK_BYTES);
         self.liveness_base_deadline.map(|base| {
             base + min_rate_transfer_time(next_body) + self.liveness_grace.unwrap_or_default()
@@ -977,8 +993,15 @@ impl DownloadWindow {
         self.liveness_grace.is_none()
     }
 
+    #[cfg(test)]
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
-        match self.block_liveness_deadline() {
+        self.check_liveness_owing(now, 0)
+    }
+
+    /// Judge the liveness deadline at `now`, where the peer still owes
+    /// `authorized` body bytes; see [`Self::block_liveness_deadline_owing`].
+    pub(super) fn check_liveness_owing(&self, now: Instant, authorized: u64) -> LivenessOutcome {
+        match self.block_liveness_deadline_owing(authorized) {
             None => LivenessOutcome::Ok,
             // Defensive: a deadline that exists with no recorded request was never armed by
             // `arm_liveness` (which always sets `last_request_at`), so it was not actually

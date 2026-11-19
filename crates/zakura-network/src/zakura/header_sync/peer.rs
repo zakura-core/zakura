@@ -17,6 +17,7 @@ use crate::zakura::{wire_codec::decode_frame, CloseRow, Frame, FramedRecv, SinkR
 
 mod state;
 
+pub(super) use state::STATUS_EVENTS;
 use state::{admits_before_decode, PeerInput, PeerOutput, PeerState};
 
 /// Run the sole peer-owned header-sync session reader.
@@ -36,7 +37,11 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
-    let mut state = PeerState::new(session.peer_id().clone(), session.session_id());
+    let mut state = PeerState::new(
+        session.peer_id().clone(),
+        session.session_id(),
+        session.status_events(),
+    );
     loop {
         let status_due = state.status_due_at();
         let output = zakura_rt::select! {

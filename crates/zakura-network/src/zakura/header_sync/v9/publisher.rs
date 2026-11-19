@@ -84,7 +84,7 @@ use crate::zakura::{
     },
     regulation::{
         Applied, ExecutionSlots, PublicationReporter, PublicationSlots, Push, PushPermit, PushSend,
-        SlotId, SubscriptionFault, SubscriptionLimits, TerminalPermit,
+        SharedBucket, SlotId, SubscriptionFault, SubscriptionLimits, TerminalPermit,
     },
     transport::sim_chain,
     wire_codec::encode_frame,
@@ -104,7 +104,7 @@ pub use machine::{
     trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
     HeaderPublisherSubscriptionView, HeaderPublisherView,
 };
-pub(crate) use state::is_legal;
+pub(crate) use state::{is_legal, OPEN_WALKS};
 use state::{
     on_empty_page, on_following_check, on_lease_acquired, on_lease_refused, on_probe,
     reaches_target, recheck, CapacityWait, Exit, Job, JobKey, LeaseRefused, Output, Page,
@@ -201,6 +201,13 @@ impl PublisherOwner {
             #[cfg(any(test, zakura_sim))]
             life: None,
         }
+    }
+
+    /// This owner, metering its `Open` walks with its connection's
+    /// `open_walks`.
+    fn with_open_walks(mut self, open_walks: SharedBucket) -> Self {
+        self.state = self.state.with_open_walks(open_walks);
+        self
     }
 
     /// This owner, reporting its subscription transitions through `tap`'s
@@ -507,8 +514,36 @@ impl From<Output> for Refusal {
 }
 
 impl Publisher {
+    /// [`Self::spawn_metered`] with a meter of its own, for tests.
+    #[cfg(test)]
+    pub(crate) fn spawn<const HEADER_BYTES: usize>(
+        port: Arc<dyn Port>,
+        push: Push,
+        send: FramedSend,
+        owner: LeaseOwner,
+        limits: PageLimits,
+        cancel: CancellationToken,
+        tap: (
+            Option<crate::zakura::RegulationTap<u64>>,
+            Option<super::CreditTap>,
+        ),
+    ) -> (Self, JoinHandle<()>) {
+        Self::spawn_metered::<HEADER_BYTES>(
+            port,
+            push,
+            send,
+            owner,
+            limits,
+            cancel,
+            SharedBucket::new(OPEN_WALKS),
+            tap,
+        )
+    }
+
     /// Start publishing on one session, and return the handle with the task
-    /// that writes pages and outcomes to `send` until `cancel` fires.
+    /// that writes pages and outcomes to `send` until `cancel` fires. Jobs
+    /// that walk from an `Open`'s locators spend `open_walks`, which the
+    /// session's connection keeps.
     ///
     /// The task re-raises a page job's panic, even one whose page it had
     /// abandoned, so the session's owner sees it through the returned handle
@@ -518,13 +553,15 @@ impl Publisher {
     /// version 9 codec. In test and simulator builds, `tap`'s regulation
     /// tap reports the subscription transitions, and its credit tap the
     /// task's start and end ([`PublisherLife`]).
-    pub(crate) fn spawn<const HEADER_BYTES: usize>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_metered<const HEADER_BYTES: usize>(
         port: Arc<dyn Port>,
         push: Push,
         send: FramedSend,
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
+        open_walks: SharedBucket,
         #[cfg(any(test, zakura_sim))] tap: (
             Option<crate::zakura::RegulationTap<u64>>,
             Option<super::CreditTap>,
@@ -541,7 +578,7 @@ impl Publisher {
                 .session_cancel(&life.peer, life.session_id, cancel.clone());
         }
         let shared = Arc::new(Mutex::new(sim_chain!(
-            PublisherOwner::new(limits) => observed_by((tap, life.clone()))
+            PublisherOwner::new(limits).with_open_walks(open_walks) => observed_by((tap, life.clone()))
         )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.

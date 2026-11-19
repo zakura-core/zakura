@@ -8,9 +8,11 @@ use super::super::{
     events::Event,
     v9::{message_type, Admitted, Ended, Headers, Status, SubscribeHeaders, STATUS_CADENCE},
 };
-use crate::zakura::{regulation::Bucket, Cadence, ZakuraPeerId};
+use crate::zakura::{regulation::SharedBucket, Cadence, ZakuraPeerId};
 
-/// The meter on the `Status` events one session sends the reactor.
+/// The meter on the `Status` events one connection's sessions send the
+/// reactor. The connection keeps it, so a reopened session gets no fresh
+/// burst (F-799).
 ///
 /// `Status` shares its stream with subscription updates and pages, so the
 /// stream's reader forwards an exhausted `Status` instead of parking. This
@@ -19,7 +21,7 @@ use crate::zakura::{regulation::Bucket, Cadence, ZakuraPeerId};
 /// at least one send interval, two refill intervals, apart, so each finds a
 /// token. A `Status` that finds none waits, and a newer one replaces it,
 /// because the reactor keeps only each peer's latest.
-const STATUS_EVENTS: Cadence = Cadence {
+pub(in crate::zakura::header_sync) const STATUS_EVENTS: Cadence = Cadence {
     capacity: 2,
     ..STATUS_CADENCE
 };
@@ -53,19 +55,20 @@ pub(super) enum PeerOutput {
 pub(super) struct PeerState {
     peer: ZakuraPeerId,
     session_id: u64,
-    /// Made full at the first `Status`.
-    status_meter: Option<Bucket>,
+    /// The connection's [`STATUS_EVENTS`] meter.
+    status_meter: SharedBucket,
     /// The latest `Status` the meter held back.
     held_status: Option<Status>,
 }
 
 impl PeerState {
-    /// The routing state of session `session_id` with `peer`.
-    pub(super) fn new(peer: ZakuraPeerId, session_id: u64) -> Self {
+    /// The routing state of session `session_id` with `peer`, whose
+    /// connection keeps `status_meter`.
+    pub(super) fn new(peer: ZakuraPeerId, session_id: u64, status_meter: SharedBucket) -> Self {
         Self {
             peer,
             session_id,
-            status_meter: None,
+            status_meter,
             held_status: None,
         }
     }
@@ -97,20 +100,14 @@ impl PeerState {
     /// When the held `Status` may go, if one is held.
     pub(super) fn status_due_at(&self) -> Option<Instant> {
         self.held_status.as_ref()?;
-        self.status_meter.as_ref().map(Bucket::next_token_at)
+        self.status_meter.next_token_at()
     }
 
     /// The held `Status`'s event, if one is held and the meter has a token at
     /// `now`.
     pub(super) fn release_status(&mut self, now: Instant) -> Option<PeerOutput> {
         self.held_status.as_ref()?;
-        let meter = self
-            .status_meter
-            .get_or_insert_with(|| Bucket::new(STATUS_EVENTS, now));
-        meter.refill(now);
-        if !meter.take() {
-            return None;
-        }
+        self.status_meter.take(now).ok()?;
         let status = self.held_status.take()?;
         Some(PeerOutput::Forward(Event::Status {
             peer: self.peer.clone(),
@@ -157,7 +154,7 @@ mod tests {
     #[test]
     fn a_status_flood_reaches_the_reactor_at_the_meter_rate() {
         let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
-        let mut state = PeerState::new(peer, 1);
+        let mut state = PeerState::new(peer, 1, SharedBucket::new(STATUS_EVENTS));
         let start = Instant::now();
         let mut forwarded = Vec::new();
         for height in 1..=100 {
@@ -197,11 +194,34 @@ mod tests {
         assert_eq!(events, STATUS_EVENTS.capacity + 20);
     }
 
+    /// F-799: a session reopened on the same connection shares its
+    /// connection's meter, so it gets no fresh burst.
+    #[test]
+    fn a_reopened_session_gets_no_fresh_status_burst() {
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let meter = SharedBucket::new(STATUS_EVENTS);
+        let start = Instant::now();
+        let mut first = PeerState::new(peer.clone(), 1, meter.clone());
+        for height in 1..=STATUS_EVENTS.capacity {
+            let output = first.on_input(PeerInput::Status(status_at(height)), start);
+            assert_eq!(forwarded_height(output), height);
+        }
+        let mut reopened = PeerState::new(peer, 2, meter);
+        assert!(matches!(
+            reopened.on_input(PeerInput::Status(status_at(10)), start),
+            PeerOutput::Hold
+        ));
+        assert_eq!(
+            reopened.status_due_at(),
+            Some(start + STATUS_EVENTS.refill_interval)
+        );
+    }
+
     /// A sender at the row's send interval never waits.
     #[test]
     fn a_conformant_status_sender_is_never_held() {
         let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
-        let mut state = PeerState::new(peer, 1);
+        let mut state = PeerState::new(peer, 1, SharedBucket::new(STATUS_EVENTS));
         let start = Instant::now();
         for second in 0..100 {
             let now = start + STATUS_CADENCE.send_interval * second;

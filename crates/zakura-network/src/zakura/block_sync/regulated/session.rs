@@ -32,7 +32,7 @@ const BYTES_PER_REQUEST: u64 = 160;
 const NODE_EXECUTION: usize = 24;
 /// Read-and-encode jobs for one peer: half the node, so a stalled peer cannot
 /// hold every slot. One peer's share still exceeds one connection's throughput.
-const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
+pub(super) const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 // An honest server interleaves at most one body per running job, so keep the
 // owed-ending gate well above one peer's jobs (see `MAX_PENDING_ENDINGS`).
 const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);

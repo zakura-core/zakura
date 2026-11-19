@@ -156,10 +156,12 @@ session even when queued responses have later individual deadlines. It starts wi
 first request or the last accepted body. It adds the base liveness allowance of four
 request timeouts, transfer time at 256 KiB/s for the next owed body, and up to one
 request timeout of local-write grace. Responses share an ordered stream, so the next
-accepted body is at most one protocol-maximum body away. The owed bytes are capped by
-the remaining response-byte authorization and by the remaining bodies at the maximum
-body size. Returned and completed ranges stop counting at once, and later requests
-add no time. A range that owes only its ending uses the separate ending deadline.
+accepted body is at most one protocol-maximum body away. The owed bytes come from the
+live response authorizations, so a range whose request timed out keeps counting while
+the peer may still answer it. They are capped by the remaining response-byte
+authorization and by the remaining bodies at the maximum body size. Completed ranges
+stop counting at once, and later requests add no time. A range that owes only its
+ending uses the separate ending deadline.
 
 **A peer accepts requests but never delivers bodies (probe-first).** Admission in front
 of the window MUST enforce a no-progress policy:

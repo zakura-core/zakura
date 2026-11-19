@@ -33,7 +33,7 @@ use crate::zakura::{
     handle_pipe_exit,
     regulation::{
         CadenceSendError, CadenceSender, Current, ExchangeWriter, SessionKey, SessionTable,
-        StallClose, WriterFence,
+        SharedBucket, StallClose, WriterFence,
     },
     spawn_supervised_pipe,
     transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
@@ -168,6 +168,10 @@ struct PeerSessionInner {
 pub(super) struct HeaderConnectionState {
     status: StdMutex<CadenceSender<CommonMessage>>,
     stalled: AtomicBool,
+    /// The meter on the `Status` events this connection's sessions forward.
+    status_events: SharedBucket,
+    /// The meter on the locator walks this connection's `Open`s cost.
+    open_walks: SharedBucket,
 }
 
 impl HeaderConnectionState {
@@ -175,6 +179,8 @@ impl HeaderConnectionState {
         Self {
             status: StdMutex::new(CadenceSender::new()),
             stalled: AtomicBool::new(false),
+            status_events: SharedBucket::new(super::peer::STATUS_EVENTS),
+            open_walks: SharedBucket::new(super::v9::OPEN_WALKS),
         }
     }
 }
@@ -343,6 +349,11 @@ impl PeerSession {
     /// Peer disconnect/local shutdown token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    /// The meter on the `Status` events this session's connection forwards.
+    pub(super) fn status_events(&self) -> SharedBucket {
+        self.inner.connection.status_events.clone()
     }
 
     /// Record a stall for this connection and close it after a repeat.
@@ -847,6 +858,7 @@ impl Service for HeaderSyncService {
             self.report_cadences(&cadences);
             state
         };
+        let open_walks = connection_state.open_walks.clone();
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
@@ -875,6 +887,7 @@ impl Service for HeaderSyncService {
             session_id,
             send,
             service_cancel_token.clone(),
+            open_walks,
         ); (
             recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)),
             self.header_sync.credit_tap(&peer_id, session_id),
@@ -1029,7 +1042,9 @@ impl Service for HeaderSyncService {
 }
 
 /// Spawn the publisher for one session of `peer`, on a network whose headers
-/// take `header_bytes`. Returns its handle and its task.
+/// take `header_bytes`, metering its `Open` walks with its connection's
+/// `open_walks`. Returns its handle and its task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_publisher(
     header_sync: &HeaderSyncHandle,
     header_bytes: usize,
@@ -1037,6 +1052,7 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
+    open_walks: SharedBucket,
     #[cfg(any(test, zakura_sim))] tap: (Option<RegulationTap<u64>>, Option<super::v9::CreditTap>),
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
@@ -1047,9 +1063,9 @@ fn spawn_publisher(
     };
     let limits = header_sync.page_limits;
     if header_bytes == REGTEST_HEADER_BYTES {
-        sim_arg!(Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        sim_arg!(Publisher::spawn_metered::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel, open_walks); tap)
     } else {
-        sim_arg!(Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        sim_arg!(Publisher::spawn_metered::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel, open_walks); tap)
     }
 }
 

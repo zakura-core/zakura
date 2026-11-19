@@ -47,14 +47,15 @@ use super::{
 use crate::zakura::{
     header_sync::wire::{AuxSchema, MAX_HS_RANGE},
     regulation::{
-        Applied, Bucket, PublicationLedger, PublicationOpened, SlotId, SlotOffer,
+        Applied, PublicationLedger, PublicationOpened, SharedBucket, SlotId, SlotOffer,
         SubscriptionLimits, Totals,
     },
     Cadence,
 };
 
 /// The meter on jobs that lease from an `Open`'s locators: four back to back,
-/// then one every five seconds per session.
+/// then one every five seconds per connection. The connection keeps it, so
+/// a reopened session gets no fresh burst (F-801).
 ///
 /// Such a lease walks the target's retained ancestry down to the nearest
 /// locator. At a locator below the retained headers (at most 65,536), that
@@ -65,7 +66,7 @@ use crate::zakura::{
 /// A session holds one live subscription, so at most one `Open` waits, for
 /// at most one refill interval: far below a subscriber's 30 s request
 /// timeout. A subscriber that opens once per refill interval never waits.
-pub(super) const OPEN_WALKS: Cadence = Cadence {
+pub(crate) const OPEN_WALKS: Cadence = Cadence {
     capacity: 4,
     refill_interval: Duration::from_secs(5),
     send_interval: Duration::from_secs(5),
@@ -261,8 +262,8 @@ pub(super) struct PublisherState {
     in_progress: Option<InProgress>,
     /// Jobs started, which numbers the next [`JobKey`].
     jobs_started: u64,
-    /// The [`OPEN_WALKS`] meter, made full at its first job.
-    open_walks: Option<Bucket>,
+    /// The connection's [`OPEN_WALKS`] meter.
+    open_walks: SharedBucket,
     /// When the meter next lets a job that [`Self::next_job`] held back start.
     walk_due: Option<Instant>,
     /// Terminal outcomes to write, in order.
@@ -283,12 +284,18 @@ impl PublisherState {
             last_served: None,
             in_progress: None,
             jobs_started: 0,
-            open_walks: None,
+            open_walks: SharedBucket::new(OPEN_WALKS),
             walk_due: None,
             terminals: VecDeque::new(),
             writing: None,
             exit: None,
         }
+    }
+
+    /// This publisher, metering its `Open` walks with its connection's
+    /// `open_walks`.
+    pub(super) fn with_open_walks(self, open_walks: SharedBucket) -> Self {
+        Self { open_walks, ..self }
     }
 
     /// Check an `Open` and apply it to the ledger under the slot `offer`. A
@@ -568,12 +575,8 @@ impl PublisherState {
                 let target = subscription.fixed.target;
                 let last = subscription.position.last();
                 if last.is_none() {
-                    let meter = self
-                        .open_walks
-                        .get_or_insert_with(|| Bucket::new(OPEN_WALKS, now));
-                    meter.refill(now);
-                    if !meter.take() {
-                        self.walk_due = Some(meter.next_token_at());
+                    if let Err(due) = self.open_walks.take(now) {
+                        self.walk_due = Some(due);
                         continue;
                     }
                 }

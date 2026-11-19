@@ -2505,7 +2505,8 @@ impl StreamWorkerContext {
         let (Some(cadence), Some(rules)) = (&self.cadence, self.messages) else {
             return;
         };
-        if paused.is_zero() {
+        // A reader that enforces cadence has a wall-clock dispatch budget.
+        if cadence.parks || paused.is_zero() {
             return;
         }
         cadence
@@ -2932,11 +2933,15 @@ fn admit_inbound_message(
             rules,
             cadence.parks,
             |rule, payload_len| {
-                cadence
+                let mut buckets = cadence
                     .buckets
                     .lock()
-                    .expect("Zakura cadence bucket mutex is never poisoned")
-                    .charge_frame(cadence.layout, rule, payload_len)
+                    .expect("Zakura cadence bucket mutex is never poisoned");
+                if cadence.parks {
+                    buckets.charge_dispatch(cadence.layout, rule)
+                } else {
+                    buckets.charge_frame(cadence.layout, rule, payload_len)
+                }
             },
             || {
                 context.conn.trace_rate_limit(
@@ -6516,6 +6521,10 @@ async fn persistent_stream_worker_with_policy(
             _ = inbound_tx.closed() => reader_context.precheck.start(),
         }
         reader_context.credit_read_pause(waiting_since.elapsed());
+        let paced_dispatch = reader_context
+            .cadence
+            .as_ref()
+            .is_some_and(|scope| scope.parks);
         loop {
             let frame = zakura_rt::select! {
                 biased;
@@ -6545,6 +6554,18 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
+                    // Charge paced work only when it has a service slot. A token
+                    // taken before a full-queue wait could outlive its burst.
+                    let slot = if paced_dispatch {
+                        zakura_rt::select! {
+                            biased;
+                            _ = reader_context.connection_token.cancelled() => break,
+                            _ = reader_context.stream_token.cancelled() => break,
+                            slot = inbound_tx.reserve() => slot.ok(),
+                        }
+                    } else {
+                        None
+                    };
                     let admission =
                         admit_inbound_message(&admitted.frame, &reader_context, stream_kind);
                     // A parked frame holds back the rest of this stream, so QUIC
@@ -6556,22 +6577,30 @@ async fn persistent_stream_worker_with_policy(
                     }
                     match admission.ordered_error() {
                         None => {
+                            if paced_dispatch && slot.is_none() {
+                                continue;
+                            }
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
                             }
                             let waiting_since = Instant::now();
-                            let forwarded = zakura_rt::select! {
-                                biased;
-                                _ = reader_context.connection_token.cancelled() => break,
-                                _ = reader_context.stream_token.cancelled() => break,
-                                result = inbound_tx.send(admitted) => result,
+                            let forwarded = if let Some(slot) = slot {
+                                slot.send(admitted);
+                                true
+                            } else {
+                                zakura_rt::select! {
+                                    biased;
+                                    _ = reader_context.connection_token.cancelled() => break,
+                                    _ = reader_context.stream_token.cancelled() => break,
+                                    result = inbound_tx.send(admitted) => result.is_ok(),
+                                }
                             };
                             // While this reader waited for its own handler, the
                             // peer kept sending into transport buffers. Credit the
                             // pause so the buffered burst never counts against it.
                             reader_context.credit_read_pause(waiting_since.elapsed());
-                            if forwarded.is_err() {
+                            if !forwarded {
                                 #[cfg(any(test, zakura_sim))]
                                 if let Some(tap) = reader_context.precheck.tap() {
                                     tap.unqueue_tag();

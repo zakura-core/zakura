@@ -97,7 +97,7 @@ impl CadenceLedger {
     ) -> HandshakeCadenceAdmission {
         if !self.hosts.contains_key(&host) && self.hosts.len() >= max_hosts {
             self.hosts.retain(|_, bucket| {
-                bucket.refill(now);
+                bucket.refill_capped(now);
                 !bucket.is_full()
             });
             if self.hosts.len() >= max_hosts {
@@ -108,7 +108,7 @@ impl CadenceLedger {
             .hosts
             .entry(host)
             .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
-        bucket.refill(now);
+        bucket.refill_capped(now);
         if bucket.take() {
             HandshakeCadenceAdmission::Admit
         } else {
@@ -137,7 +137,7 @@ impl HandshakeCounts {
         let node = ledger
             .node
             .get_or_insert_with(|| Bucket::new(node_handshake_cadence(), now));
-        node.refill(now);
+        node.refill_capped(now);
         if !node.take() {
             return HandshakeCadenceAdmission::NodeExhausted;
         }

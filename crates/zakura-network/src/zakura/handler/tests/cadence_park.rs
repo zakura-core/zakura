@@ -246,6 +246,79 @@ async fn a_parked_reader_holds_its_stream_while_a_sibling_keeps_moving() -> Resu
     Ok(())
 }
 
+/// A full service queue must spend one wall-clock interval once. A buffered
+/// frame pays at dispatch, after the queue has room for it.
+#[tokio::test]
+async fn a_discovery_queue_pause_does_not_inflate_its_dispatch_burst() -> Result<(), BoxError> {
+    use crate::zakura::discovery::wire::{GET_PEERS, GET_SERVICES, HELLO, PEERS, SERVICES};
+
+    const FAST_GET_PEERS: MessageRule = MessageRule {
+        role: MessageRole::Request {
+            max_in_flight: 1,
+            cadence: Some(FAST),
+        },
+        ..GET_PEERS
+    };
+    const DISCOVERY: &[MessageRule] = &[HELLO, FAST_GET_PEERS, PEERS, GET_SERVICES, SERVICES];
+
+    let _guard = zakura_test::init();
+    let mut link = super::read_close_cause::Link::connect().await?;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&GET_PEERS.message_type.to_le_bytes());
+    frame.extend_from_slice(&0u16.to_le_bytes());
+    frame.extend_from_slice(&6u32.to_le_bytes());
+    frame.extend_from_slice(&[0; 6]);
+    let (_peer_send, _peer_recv, send, recv) = link.open(&frame.repeat(6)).await?;
+    let context = tabled_context(Some(DISCOVERY), 128);
+    let connection = context.connection_token.clone();
+    let cause = context.close_cause.clone();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+    let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+    let prelude = StreamPrelude {
+        magic: STREAM_PRELUDE_MAGIC,
+        stream_kind: 900,
+        stream_version: 1,
+        request_id: None,
+        max_frame_bytes: 1024,
+    };
+    let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker(
+        send,
+        recv,
+        prelude,
+        context,
+        inbound_tx,
+        outbound_rx,
+        1,
+    )));
+    let take = |frame: Option<AdmittedFrame>| {
+        assert_eq!(frame.unwrap().frame.message_type, GET_PEERS.message_type);
+    };
+    take(timeout(FAST.refill_interval, inbound_rx.recv()).await?);
+    link.check_sibling(&connection).await?;
+    tokio::time::sleep(FAST.refill_interval * 3).await;
+    // Drain the old slot. Every later frame pays at dispatch, so by any time
+    // `t` at most the burst plus the intervals since the pause have arrived.
+    // Scheduling delay only makes arrivals later, so the bound holds on a
+    // loaded machine.
+    take(inbound_rx.try_recv().ok());
+    let pause_end = Instant::now();
+    for index in 0..4u128 {
+        take(timeout(FAST.refill_interval * 2, inbound_rx.recv()).await?);
+        let earned = (Instant::now() - pause_end).as_nanos() / FAST.refill_interval.as_nanos();
+        assert!(
+            index < u128::from(FAST.capacity) + earned,
+            "frame {index} arrived before its token"
+        );
+    }
+    assert_eq!(cause.get(), None);
+    assert!(!connection.is_cancelled());
+    drop(outbound_tx);
+    drop(inbound_rx);
+    timeout(Duration::from_secs(2), worker).await??;
+    link.close().await;
+    Ok(())
+}
+
 /// Accepts one captured stream that carries `rules`, and runs its worker.
 /// Returns its admitted session, and its context's connection token and close
 /// cause.

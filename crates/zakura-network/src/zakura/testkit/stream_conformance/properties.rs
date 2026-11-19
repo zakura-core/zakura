@@ -520,9 +520,18 @@ pub(crate) async fn sustained_exchanges<A: StreamConformance>(
     a.connect(&b).await?;
     let (a_id, b_id) = (a.id(), b.id());
     let pages = four_windows(&a.shared().plan).1.max(256);
+    let exchanges = a.shared().plan.requests.first().map_or(256, |plan| {
+        if let MessageRole::Request { cadence: Some(cadence), .. } = plan.row.role {
+            // Exercise one refill after the burst. Every further request
+            // would wait another production interval for the same check.
+            cadence.capacity.saturating_add(1).min(256)
+        } else {
+            256
+        }
+    });
     let (from_b, from_a) = tokio::join!(
-        a.exchange(&b_id, 0..256, pages),
-        b.exchange(&a_id, 0..256, pages)
+        a.exchange(&b_id, 0..exchanges, pages),
+        b.exchange(&a_id, 0..exchanges, pages)
     );
     from_b?;
     from_a?;

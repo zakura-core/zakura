@@ -288,6 +288,15 @@ impl Bucket {
         self.last_refill += interval.saturating_mul(earned);
     }
 
+    /// Refill a dispatch or admission budget. A full bucket cannot keep a
+    /// partial token, since the burst already spends the whole capacity.
+    pub(crate) fn refill_capped(&mut self, now: Instant) {
+        self.refill(now);
+        if self.is_full() {
+            self.last_refill = now;
+        }
+    }
+
     /// Takes one token after the caller refills the bucket.
     pub(crate) fn take(&mut self) -> bool {
         if self.tokens == 0 {
@@ -364,8 +373,14 @@ struct CadenceLedger {
 
 impl CadenceLedger {
     /// Charge one frame of a row with `cadence` at `now`.
-    fn charge(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> Charged {
-        let bucket = self.bucket(key, cadence, now);
+    fn charge(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+        dispatch: bool,
+    ) -> Charged {
+        let bucket = self.bucket(key, cadence, now, dispatch);
         if !bucket.take() {
             return Charged::Exhausted;
         }
@@ -382,7 +397,7 @@ impl CadenceLedger {
         cadence: Cadence,
         now: Instant,
     ) -> Result<(), Instant> {
-        let bucket = self.bucket(key, cadence, now);
+        let bucket = self.bucket(key, cadence, now, true);
         if bucket.take() {
             return Ok(());
         }
@@ -391,16 +406,26 @@ impl CadenceLedger {
 
     /// Credit a local read pause of `paused` to a row with `cadence` at `now`.
     fn credit_pause(&mut self, key: CadenceKey, cadence: Cadence, paused: Duration, now: Instant) {
-        self.bucket(key, cadence, now).credit_pause(paused);
+        self.bucket(key, cadence, now, false).credit_pause(paused);
     }
 
     /// The bucket of `key`, created full on first use and refilled to `now`.
-    fn bucket(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> &mut Bucket {
+    fn bucket(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+        dispatch: bool,
+    ) -> &mut Bucket {
         let bucket = self
             .buckets
             .entry(key)
             .or_insert_with(|| Bucket::new(cadence, now));
-        bucket.refill(now);
+        if dispatch {
+            bucket.refill_capped(now);
+        } else {
+            bucket.refill(now);
+        }
         bucket
     }
 }
@@ -463,6 +488,20 @@ impl<C: Clock> CadenceBuckets<C> {
         if let MessageRole::Metered { rate } = rule.role {
             return self.charge_bytes(layout, rule.message_type, rate, payload_len);
         }
+        self.charge_messages(layout, rule, false)
+    }
+
+    /// Charge one paced row when its ordered reader has a dispatch slot.
+    pub(crate) fn charge_dispatch(&mut self, layout: u16, rule: &MessageRule) -> CadenceCharge {
+        self.charge_messages(layout, rule, true)
+    }
+
+    fn charge_messages(
+        &mut self,
+        layout: u16,
+        rule: &MessageRule,
+        dispatch: bool,
+    ) -> CadenceCharge {
         let Some(cadence) = cadence(rule) else {
             return CadenceCharge::Exempt;
         };
@@ -470,7 +509,7 @@ impl<C: Clock> CadenceBuckets<C> {
             layout,
             message_type: rule.message_type,
         };
-        match self.ledger.charge(key, cadence, self.clock.now()) {
+        match self.ledger.charge(key, cadence, self.clock.now(), dispatch) {
             Charged::Exhausted => {
                 metrics::counter!(
                     "zakura.p2p.cadence.exhausted",

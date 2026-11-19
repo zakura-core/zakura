@@ -51,6 +51,34 @@ fn one_token_returns_per_refill_interval_up_to_capacity() {
     );
 }
 
+/// A dispatch bucket that refills while full drops the partial interval, so
+/// any window holds at most `capacity` plus its whole intervals of dispatches.
+#[test]
+fn a_capped_refill_keeps_no_partial_token_while_full() {
+    let start = Instant::now();
+    let interval = EVERY_30_SECONDS.refill_interval;
+    let mut capped = Bucket::new(EVERY_30_SECONDS, start);
+    let mut uncapped = Bucket::new(EVERY_30_SECONDS, start);
+    let burst = start + interval.mul_f64(1.9);
+    capped.refill_capped(burst);
+    uncapped.refill(burst);
+    for bucket in [&mut capped, &mut uncapped] {
+        for _ in 0..EVERY_30_SECONDS.capacity {
+            assert!(bucket.take());
+        }
+    }
+    // The uncapped bucket earns a token 0.1 interval after the burst spent
+    // its capacity.
+    let soon = start + interval * 2;
+    uncapped.refill(soon);
+    assert!(uncapped.take());
+    capped.refill_capped(soon);
+    assert!(!capped.take());
+    assert_eq!(capped.next_token_at(), burst + interval);
+    capped.refill_capped(burst + interval);
+    assert!(capped.take());
+}
+
 #[test]
 fn a_sender_at_exactly_the_refill_rate_never_drifts() {
     // Main's bucket discarded the fractional token on every refill. This row
@@ -454,7 +482,7 @@ proptest! {
             bucket.refill(now);
             match op {
                 LedgerOp::Charge { .. } => {
-                    let admitted = matches!(ledger.charge(key, cadence, now), Charged::Admit { .. });
+                    let admitted = matches!(ledger.charge(key, cadence, now, false), Charged::Admit { .. });
                     prop_assert_eq!(admitted, bucket.tokens > 0);
                     if admitted {
                         bucket.tokens -= 1;
@@ -673,12 +701,12 @@ fn a_charge_reports_a_low_bucket_below_a_quarter_of_capacity() {
         .enumerate()
     {
         assert_eq!(
-            ledger.charge(key, cadence, now),
+            ledger.charge(key, cadence, now, false),
             Charged::Admit { low },
             "charge {charge}"
         );
     }
-    assert_eq!(ledger.charge(key, cadence, now), Charged::Exhausted);
+    assert_eq!(ledger.charge(key, cadence, now, false), Charged::Exhausted);
 }
 
 #[test]

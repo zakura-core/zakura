@@ -8,7 +8,7 @@
 //!
 //! 1. resolves the target to its harness through the fuzz package's
 //!    `[package.metadata.zakura-sim.targets]` table and [`HARNESSES`];
-//! 2. loads the harness's committed seeds ([`seed::load`]);
+//! 2. builds the harness's corpus seeds ([`seed::load`]);
 //! 3. builds the target with [`build_fuzzer`];
 //! 4. runs the built target once on the admitted seeds, as libFuzzer runs a
 //!    list of files, with the suite row's libFuzzer arguments and variables
@@ -59,7 +59,7 @@ use crate::{
     },
     harness::{HarnessEntry, HARNESSES, NO_TASK_PANIC},
     planted::{self, PLANTED_DIR},
-    seed::{self, sha256, Seed},
+    seed::{self, sha256, Seed, SeedSet},
     sim::NO_LIVELOCK,
     suite::{MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
@@ -98,8 +98,6 @@ pub struct TargetsOptions {
     pub sanitizer: String,
     /// cargo-fuzz's target directory.
     pub target_dir: PathBuf,
-    /// The seed directories.
-    pub fixtures: Vec<PathBuf>,
     /// libFuzzer's `-timeout` for one input.
     pub child: Duration,
 }
@@ -119,9 +117,9 @@ pub enum TargetStatus {
     /// The fuzz package maps the target to no harness, or to a harness
     /// that isn't registered.
     Unresolved,
-    /// A required seed of the harness failed validation, or a seed whose
-    /// sidecar doesn't parse or names no registered harness did, since
-    /// [`seed::load`] can't tell that such a seed isn't the harness's.
+    /// A seed of the harness failed validation, or a seed that names no
+    /// registered harness did, since [`seed::load`] can't tell that such a
+    /// seed isn't the harness's.
     SeedsRejected,
     /// The harness has no admitted seed.
     NoSeeds,
@@ -160,14 +158,13 @@ impl TargetStatus {
 /// One admitted seed the target runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedFile {
-    /// The seed's file, relative to the repository's root.
-    pub file: PathBuf,
+    /// The seed's name.
+    pub name: String,
     /// The SHA-256 of its full fuzz input.
     pub sha256: String,
 }
 
-/// A retained production bypass whose committed input runs on the target's
-/// harness.
+/// A retained production bypass whose seed runs on the target's harness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BypassCase {
     /// The property the patch violates.
@@ -190,10 +187,6 @@ pub struct TargetReadiness {
     pub detail: Option<String>,
     /// Each admitted seed the target runs.
     pub seeds: Vec<SeedFile>,
-    /// The optional seeds that failed validation, which no run includes,
-    /// relative to the repository's root: the harness's, and those whose
-    /// sidecar names no registered harness.
-    pub quarantined: Vec<PathBuf>,
     /// The harness's own properties that applied in the target's run of
     /// the seeds.
     pub applied: Vec<String>,
@@ -422,14 +415,13 @@ pub fn max_len(args: &[String]) -> Option<usize> {
 }
 
 /// The retained production bypasses under `repo`'s `qa/planted/` whose
-/// committed input is one of `seeds`, by the input's path. A typed case
-/// names no fuzz input, so no target runs it. A case naming neither an
-/// input nor a typed case, or both, is an error, as `cargo xtask planted`
-/// reports it.
+/// seed is one of `seeds`, by name. A typed case names no seed, so no
+/// target runs it. A case naming neither a seed nor a typed case, or both,
+/// is an error, as `cargo xtask planted` reports it.
 pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
-        input: Option<PathBuf>,
+        seed: Option<String>,
         typed: Option<toml::Table>,
     }
     let mut cases = Vec::new();
@@ -444,18 +436,18 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
             .map_err(|error| format!("reading {}: {error}", case.display()))?;
         let file: CaseFile = toml::from_str(&text)
             .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-        let input = match (file.input, file.typed) {
-            (Some(input), None) => repo.join(input),
+        let name = match (file.seed, file.typed) {
+            (Some(name), None) => name,
             (None, Some(_)) => continue,
-            (input, _) => {
+            (name, _) => {
                 return Err(format!(
-                    "{}: a case names either `input` or `[typed]`, and this names {}",
+                    "{}: a case names either `seed` or `[typed]`, and this names {}",
                     case.display(),
-                    if input.is_some() { "both" } else { "neither" }
+                    if name.is_some() { "both" } else { "neither" }
                 ))
             }
         };
-        if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
+        if !seeds.iter().any(|seed| seed.name == name) {
             continue;
         }
         let property = planted::property_id(&root, &case)
@@ -549,7 +541,6 @@ fn check_target(
         status: TargetStatus::Ready,
         detail: None,
         seeds: Vec::new(),
-        quarantined: Vec::new(),
         applied: Vec::new(),
         unapplied: Vec::new(),
         build: None,
@@ -560,21 +551,15 @@ fn check_target(
         Ok(entry) => entry,
         Err(why) => return Ok(row.with(TargetStatus::Unresolved, why)),
     };
-    let loaded = seed::load(&options.fixtures, Some(entry.name))
-        .map_err(CampaignError::io("listing the seed directories"))?;
+    let loaded = seed::load(SeedSet::Corpus, Some(entry.name));
     row.bypasses = bypasses(&options.repo, &loaded.admitted).map_err(CampaignError::Refused)?;
-    row.quarantined = loaded
-        .quarantined
-        .iter()
-        .map(|failed| seed::from_root(&failed.path))
-        .collect();
     if let Some(failed) = loaded.rejected.first() {
         return Ok(row.with(
             TargetStatus::SeedsRejected,
             format!(
-                "{} seeds that reject the set failed validation; {}: {}",
+                "{} seeds failed validation; {}: {}",
                 loaded.rejected.len(),
-                failed.path.display(),
+                failed.seed.name,
                 failed.error
             ),
         ));
@@ -601,7 +586,7 @@ fn check_target(
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
         files.push((file, seed.input.len()));
         row.seeds.push(SeedFile {
-            file: seed::from_root(&seed.path),
+            name: seed.name.clone(),
             sha256: digest,
         });
     }
@@ -688,8 +673,8 @@ pub fn smoke_command(
 
 impl TargetReadiness {
     /// The row in words: its target, harness, status and detail, the
-    /// harness's own properties that applied and those that didn't, its
-    /// quarantined seeds, and its retained bypasses, one line each.
+    /// harness's own properties that applied and those that didn't, and its
+    /// retained bypasses, one line each.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "{} ({}): {}{}",
@@ -708,14 +693,6 @@ impl TargetReadiness {
                 "  applied in no seed: {}",
                 self.unapplied.join(", ")
             ));
-        }
-        if !self.quarantined.is_empty() {
-            let files: Vec<String> = self
-                .quarantined
-                .iter()
-                .map(|file| file.display().to_string())
-                .collect();
-            lines.push(format!("  quarantined: {}", files.join(", ")));
         }
         if self.bypasses.is_empty() {
             lines.push("  no retained production bypass".to_owned());
@@ -756,12 +733,4 @@ fn sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|error| format!("listing {}: {error}", dir.display()))?;
     paths.sort();
     Ok(paths)
-}
-
-/// True if `a` and `b` name the same file.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
 }

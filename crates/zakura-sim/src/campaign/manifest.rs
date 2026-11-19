@@ -25,7 +25,7 @@ use crate::{
         has_saved_input, violated_property, Bucket, ProcessFailure,
     },
     harness::HarnessEntry,
-    seed,
+    seed::{self, SeedSet},
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, UNKNOWN},
         BuildInfo,
@@ -310,12 +310,10 @@ pub struct WorkerPlan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedsRecord {
-    /// The fixture directories they came from.
-    pub fixtures: Vec<PathBuf>,
-    /// Each admitted seed's full fuzz input, by digest, in order.
+    /// Each admitted seed's name, in order.
+    pub names: Vec<String>,
+    /// Each admitted seed's full fuzz input, by digest, in the same order.
     pub admitted: Vec<Digest>,
-    /// How many optional seeds failed validation and stayed out.
-    pub quarantined: usize,
 }
 
 /// What `start` needs.
@@ -331,8 +329,6 @@ pub struct StartOptions {
     pub workers: Vec<WorkerPlan>,
     /// Each worker's budget.
     pub budget: Budget,
-    /// The fixture directories to take curated seeds from.
-    pub fixtures: Vec<PathBuf>,
     /// The full-suite manifest the run belongs to, if any.
     pub suite: Option<PathBuf>,
     /// Where the operator copies the store.
@@ -470,8 +466,8 @@ impl Store {
 /// Writes the manifest of a campaign segment's first run, and returns the
 /// run locked for [`Prepared::run`].
 ///
-/// The run's initial snapshot holds `options.harness`'s curated seeds from
-/// `options.fixtures`, which must all validate, and with
+/// The run's initial snapshot holds `options.harness`'s corpus seeds, which
+/// must all validate, and with
 /// [`Migration::Carry`] the previous segment's last snapshot too, which
 /// needs clean fuzzer builds in both segments. A store with a run must name
 /// it as `options.parent`, since a store holds one campaign.
@@ -523,16 +519,15 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
             )
         }
     };
-    let report = seed::load(&options.fixtures, Some(options.harness.name))
-        .map_err(CampaignError::io("listing the fixtures"))?;
+    let report = seed::load(SeedSet::Corpus, Some(options.harness.name));
     if !report.rejected.is_empty() {
         let reasons: Vec<String> = report
             .rejected
             .iter()
-            .map(|failed| format!("{}: {}", failed.path.display(), failed.error))
+            .map(|failed| format!("{}: {}", failed.seed.name, failed.error))
             .collect();
         return Err(CampaignError::Refused(format!(
-            "required seeds failed validation: {}",
+            "seeds failed validation: {}",
             reasons.join("; ")
         )));
     }
@@ -574,13 +569,16 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
         workers: options.workers,
         initial_snapshot: snapshot.digest,
         seeds: SeedsRecord {
-            fixtures: options.fixtures,
+            names: report
+                .admitted
+                .iter()
+                .map(|seed| seed.name.clone())
+                .collect(),
             admitted: report
                 .admitted
                 .iter()
                 .map(|seed| Digest::of(&seed.input))
                 .collect(),
-            quarantined: report.quarantined.len(),
         },
         artifacts: options.artifacts,
     };

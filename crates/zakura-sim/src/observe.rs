@@ -2258,6 +2258,24 @@ pub enum TransportFact {
         /// The frame's position among this stream's reads.
         seq: u64,
     },
+    /// The service's receive handle returned the frame, which stays funded
+    /// until the handle releases it.
+    FrameHeld {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+        /// The frame's wire bytes, header included, before its gate clamps
+        /// them.
+        bytes: u64,
+    },
+    /// The service's receive handle released the frame it returned last.
+    FrameReleased {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+    },
     /// A regulation table changed state, inside the lock that applied it.
     Regulated {
         /// The service session's QUIC stream.

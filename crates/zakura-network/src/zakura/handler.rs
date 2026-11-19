@@ -6437,6 +6437,13 @@ async fn persistent_stream_worker_with_policy(
             // A full service channel stops this reader from granting QUIC credit.
             let error = match frame {
                 Ok(admitted) => {
+                    // The reader numbered the frame it just read, so the
+                    // service's held-frame rows can name it.
+                    #[cfg(any(test, zakura_sim))]
+                    let admitted = AdmittedFrame {
+                        seq: reader_context.precheck.tap().map(|tap| tap.reading()),
+                        ..admitted
+                    };
                     let _ = reader_context.freshness_tx.send(Instant::now());
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
@@ -6767,7 +6774,7 @@ async fn request_stream_worker(
 
     // The raw frame stays funded until its service's call ends.
     let (frame, raw_grant) = match frame {
-        Ok(AdmittedFrame { frame, grant }) => (frame, grant),
+        Ok(AdmittedFrame { frame, grant, .. }) => (frame, grant),
         Err(error) => {
             debug!(
                 ?error,
@@ -7099,7 +7106,12 @@ async fn read_admitted_frame(
         |bytes| gate.admit(bytes),
     )
     .await
-    .map(|(frame, grant)| AdmittedFrame { frame, grant })
+    .map(|(frame, grant)| AdmittedFrame {
+        frame,
+        grant,
+        #[cfg(any(test, zakura_sim))]
+        seq: None,
+    })
 }
 
 /// What funds a frame's payload from its allocation on.

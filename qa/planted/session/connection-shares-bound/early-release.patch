@@ -1,0 +1,23 @@
+diff --git a/crates/zakura-network/src/zakura/transport/io.rs b/crates/zakura-network/src/zakura/transport/io.rs
+--- a/crates/zakura-network/src/zakura/transport/io.rs
++++ b/crates/zakura-network/src/zakura/transport/io.rs
+@@ -207,7 +207,8 @@
+                 #[cfg(any(test, zakura_sim))]
+                 self.hold(&admitted);
+                 let AdmittedFrame { frame, grant, .. } = admitted;
+-                self.returned = Some(grant);
++                // Release the frame's grant as the service takes the frame.
++                drop(grant);
+                 #[cfg(any(test, zakura_sim))]
+                 self.take_tag();
+                 Ok(frame)
+@@ -241,7 +242,8 @@
+                 #[cfg(any(test, zakura_sim))]
+                 self.hold(&admitted);
+                 let AdmittedFrame { frame, grant, .. } = admitted;
+-                self.returned = Some(grant);
++                // Release the frame's grant as the service takes the frame.
++                drop(grant);
+                 #[cfg(any(test, zakura_sim))]
+                 self.take_tag();
+                 Some(frame)

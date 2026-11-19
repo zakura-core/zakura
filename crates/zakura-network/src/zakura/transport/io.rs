@@ -46,6 +46,10 @@ impl OrderedStreamFailureCause {
 pub(crate) struct AdmittedFrame {
     pub(crate) frame: Frame,
     pub(crate) grant: FrameGrant,
+    /// The frame's position among its stream's reads, which the persistent
+    /// reader sets for the simulator's held-frame rows.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) seq: Option<u64>,
 }
 
 /// Receive half for bounded, rate-admitted Zakura frames.
@@ -59,8 +63,32 @@ pub struct FramedRecv {
     receiver: FramedReceiver,
     failure_cause: Option<OrderedStreamFailureCause>,
     precheck: Option<PrecheckSlot>,
+    /// The simulator's row for the frame this handle returned last, which
+    /// reports the frame released when it drops: at the next receive or
+    /// with the handle, the points where [`Self::returned`] ends. It stays
+    /// apart from the grant, so a grant that ends early shows. It drops
+    /// before the grant: returning a grant's bytes can end a simulator
+    /// step, and a sample then must not find the frame held and unfunded.
+    #[cfg(any(test, zakura_sim))]
+    held: Option<HeldFrame>,
     /// The admission of the frame this handle returned last.
     returned: Option<FrameGrant>,
+}
+
+/// A frame [`FramedRecv`] handed its service, for the simulator's taps.
+/// Dropping it reports the frame released.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct HeldFrame {
+    tap: Arc<super::StreamTap>,
+    seq: u64,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Drop for HeldFrame {
+    fn drop(&mut self) {
+        self.tap.frame_released(self.seq);
+    }
 }
 
 #[derive(Debug)]
@@ -76,6 +104,8 @@ impl FramedRecv {
             receiver: FramedReceiver::Admitted(receiver),
             failure_cause: None,
             precheck: None,
+            #[cfg(any(test, zakura_sim))]
+            held: None,
             returned: None,
         }
     }
@@ -85,6 +115,8 @@ impl FramedRecv {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
             precheck: None,
+            #[cfg(any(test, zakura_sim))]
+            held: None,
             returned: None,
         }
     }
@@ -118,6 +150,17 @@ impl FramedRecv {
         self.precheck.as_ref().and_then(PrecheckSlot::tap)
     }
 
+    /// Reports `admitted` held by the service, if the reader numbered it and
+    /// the stream has a tap, and keeps the row that reports its release.
+    #[cfg(any(test, zakura_sim))]
+    fn hold(&mut self, admitted: &AdmittedFrame) {
+        let tap = self.stream_tap().cloned();
+        self.held = tap.zip(admitted.seq).map(|(tap, seq)| {
+            tap.frame_held(seq, frame_wire_bytes(admitted.frame.payload.len()));
+            HeldFrame { tap, seq }
+        });
+    }
+
     /// Take the tag of the frame [`Self::recv`] or [`Self::try_recv`] is
     /// returning, so the regulation events it causes name it. Both call it
     /// once per frame they return, and never for a frame they skip.
@@ -146,6 +189,10 @@ impl FramedRecv {
         if let Some(precheck) = &self.precheck {
             precheck.start();
         }
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.held = None;
+        }
         self.returned = None;
         match &mut self.receiver {
             FramedReceiver::Queued(receiver) => loop {
@@ -156,7 +203,10 @@ impl FramedRecv {
                 }
             },
             FramedReceiver::Admitted(receiver) => {
-                let AdmittedFrame { frame, grant } = receiver.try_recv()?;
+                let admitted = receiver.try_recv()?;
+                #[cfg(any(test, zakura_sim))]
+                self.hold(&admitted);
+                let AdmittedFrame { frame, grant, .. } = admitted;
                 self.returned = Some(grant);
                 #[cfg(any(test, zakura_sim))]
                 self.take_tag();
@@ -169,6 +219,10 @@ impl FramedRecv {
     pub async fn recv(&mut self) -> Option<Frame> {
         if let Some(precheck) = &self.precheck {
             precheck.start();
+        }
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.held = None;
         }
         self.returned = None;
         match &mut self.receiver {
@@ -183,7 +237,10 @@ impl FramedRecv {
                 None
             }
             FramedReceiver::Admitted(receiver) => {
-                let AdmittedFrame { frame, grant } = receiver.recv().await?;
+                let admitted = receiver.recv().await?;
+                #[cfg(any(test, zakura_sim))]
+                self.hold(&admitted);
+                let AdmittedFrame { frame, grant, .. } = admitted;
                 self.returned = Some(grant);
                 #[cfg(any(test, zakura_sim))]
                 self.take_tag();
@@ -1164,6 +1221,7 @@ mod tests {
         AdmittedFrame {
             frame: frame(1),
             grant,
+            seq: None,
         }
     }
 
@@ -1198,6 +1256,89 @@ mod tests {
 
         drop(receiver);
         assert_eq!(budget.granted(), 0, "dropping the handle ends everything");
+    }
+
+    /// Records each held-frame row with the bytes its gate grants as the
+    /// row is reported.
+    #[derive(Debug)]
+    struct HeldRows {
+        budget: OutputByteBudget,
+        rows: std::sync::Mutex<Vec<(crate::zakura::TransportEvent, u64)>>,
+    }
+
+    impl crate::zakura::TransportObserver for HeldRows {
+        fn observe(&self, event: crate::zakura::TransportEvent) {
+            if matches!(
+                event,
+                crate::zakura::TransportEvent::FrameHeld { .. }
+                    | crate::zakura::TransportEvent::FrameReleased { .. }
+            ) {
+                self.rows
+                    .lock()
+                    .expect("no test panics while holding it")
+                    .push((event, self.budget.granted()));
+            }
+        }
+    }
+
+    /// The handle reports a frame released before the frame's grant returns
+    /// its bytes, at the next receive and when the handle drops. Returning a
+    /// grant's bytes can end a simulator step, and a sample then must not
+    /// find the frame held while its gate grants nothing for it.
+    #[tokio::test]
+    async fn a_held_frame_is_released_before_its_grant() {
+        use crate::zakura::{ConnTap, StreamTap, TransportEvent};
+
+        let budget = OutputByteBudget::new(1024).unwrap();
+        let observer = Arc::new(HeldRows {
+            budget: budget.clone(),
+            rows: std::sync::Mutex::default(),
+        });
+        let conn = Arc::new(ConnTap::new(
+            observer.clone(),
+            "127.0.0.1:9".parse().expect("a valid socket address"),
+        ));
+        conn.registered(7);
+        let precheck = PrecheckSlot::default();
+        precheck.observe_with(Arc::new(StreamTap::new(conn, 3)));
+        let (sender, receiver) = mpsc::channel(4);
+        let mut receiver = FramedRecv::admitted(receiver).with_precheck(precheck);
+        for seq in 0..2 {
+            sender
+                .send(AdmittedFrame {
+                    seq: Some(seq),
+                    ..admitted(&budget)
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(receiver.recv().await, Some(frame(1)));
+        assert_eq!(receiver.recv().await, Some(frame(1)));
+        drop(receiver);
+
+        let bytes = frame_bytes();
+        let held = |seq| TransportEvent::FrameHeld {
+            conn_id: 7,
+            quic_stream: 3,
+            seq,
+            bytes,
+        };
+        let released = |seq| TransportEvent::FrameReleased {
+            conn_id: 7,
+            quic_stream: 3,
+            seq,
+        };
+        assert_eq!(
+            *observer.rows.lock().expect("no test panics while holding it"),
+            [
+                (held(0), 2 * bytes),
+                (released(0), 2 * bytes),
+                (held(1), bytes),
+                (released(1), bytes),
+            ],
+            "each release row comes while its grant still holds the frame's bytes"
+        );
+        assert_eq!(budget.granted(), 0);
     }
 
     #[tokio::test]

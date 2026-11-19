@@ -1,0 +1,12 @@
+# Drops each received frame's grant as the receive handle returns the
+# frame, so the service holds the frame unfunded while it decodes it. The
+# input's frames stay held after their raw gate grants nothing for them.
+seed = "sync-wire-saturated"
+# Besides io.rs, which the patch changes, the handler admits each frame
+# through its kind's gate and numbers it, and the stream tap and the probe
+# report the held frames and the gate's grants.
+checks = [
+    "crates/zakura-network/src/zakura/handler.rs",
+    "crates/zakura-network/src/zakura/transport/observe.rs",
+    "crates/zakura-network/src/zakura/transport/probe.rs",
+]

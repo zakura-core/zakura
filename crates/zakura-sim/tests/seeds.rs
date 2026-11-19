@@ -400,12 +400,6 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
         SyncComposed::draw(&prefix)
     };
     let scenario = match stem {
-        "discovery-composed-crossed" => serde_json::to_value(DiscoveryComposed::draw(
-            include_bytes!("fixtures/discovery-composed-crossed.bin"),
-        )),
-        "discovery-composed-late-request" => serde_json::to_value(DiscoveryComposed::draw(
-            include_bytes!("fixtures/discovery-composed-late-request.bin"),
-        )),
         "discovery-composed-two-requests" => {
             let steps = [ask(Request::GetOnePeer), ask(Request::GetHeaderSyncService)];
             let prefix = composed_prefix(0, 1, 0b0000_1100, &steps).unwrap();

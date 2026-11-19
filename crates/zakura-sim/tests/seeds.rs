@@ -90,19 +90,19 @@ fn committed_seeds_validate() {
 }
 
 /// Every seed in the known-failure directory validates, and each carries a
-/// witness that expects a violation, which its own test checks.
+/// witness that expects a violation, which its own test checks. Without an
+/// open-bug repro, the directory is absent.
 #[test]
 fn known_failures_validate_and_expect_violations() {
+    if !known_failures().is_dir() {
+        return;
+    }
     let report = load(&[known_failures()], None);
     assert!(
         report.rejected.is_empty() && report.quarantined.is_empty(),
         "{:?} {:?}",
         report.rejected,
         report.quarantined
-    );
-    assert!(
-        !report.admitted.is_empty(),
-        "zakura#2378's input is committed"
     );
     for seed in &report.admitted {
         assert!(
@@ -238,6 +238,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         .find(|(name, _)| stem == format!("sync-wire-{name}"))
     {
         return value(sync_wire::combined(&prefix));
+    }
+    if stem == "sync-wire-reset-mid-write" {
+        return value(sync_wire::combined(&[sync_wire::COMBINED_TAG, 0b0001_0100]));
     }
     if let Some(saved) = SavedSync::ALL
         .into_iter()

@@ -45,7 +45,7 @@
 //! `planted --targets` does, and each case's mutant is `HEAD` with the
 //! case's patch. The list and its cases are read from the tree the runner
 //! runs from. The list and each case's file must match `HEAD`, and the
-//! checkout of `HEAD` must hold the same patches, inputs and production
+//! checkout of `HEAD` must hold the same patches, case files and production
 //! files. Every fuzz build must share the first one's toolchain
 //! ([`TOOLCHAIN_FIELDS`]), which the report records. Each seed runs in both
 //! arms, semantic feedback on and off, which differ only in their store,
@@ -77,7 +77,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     apply, checkout::Checkout, classify as planted_verdict, git, provenance, record,
-    remove_worktree, Expect, Located, Run, Verdict,
+    remove_worktree, seeds, Expect, Located, Run, Verdict,
 };
 use crate::{
     run_command,
@@ -222,6 +222,8 @@ struct Case {
     also_violates: Vec<String>,
     harness: String,
     target: String,
+    /// The witness the case pins: a catalogue case's committed fuzz input,
+    /// or a feedback case's planted case file, which names its seed.
     witness: PathBuf,
     witness_sha256: String,
     /// The review's argument that the mutation can't change behavior.
@@ -499,7 +501,8 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Wr
         arms,
         ..
     } = flags;
-    let (bytes, list) = feedback::read(repo_root)?;
+    let registry = seeds::build(repo_root, &work.join("registry"))?;
+    let (bytes, list) = feedback::read(repo_root, &registry)?;
     // The pins check each case's patch, input and production files at
     // `HEAD`. The list and each case's file come from the tree, so they
     // must match `HEAD` too.

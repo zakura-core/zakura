@@ -4,7 +4,7 @@
 # verdict would find no entry to free them, so its slot leaks. The input's
 # storage never answers a submission, and a reset arrives once the first
 # is submitted.
-input = "crates/zakura-sim/tests/fixtures/block-sync-stalled-reset.bin"
+seed = "block-sync-stalled-reset"
 # Besides sequencer.rs, which the patch changes, the rest of block sync
 # decides when the reset reaches the sequencer. A change there can move the
 # input off the held submission.

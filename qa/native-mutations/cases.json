@@ -170,7 +170,7 @@
     "entry": "bounds",
     "property": "block-sync/reserved-byte-bound",
     "witness": {
-      "input": "crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin"
+      "seed": "block-sync-floor-lane-race"
     },
     "fault_class": "boundary-accounting"
   },

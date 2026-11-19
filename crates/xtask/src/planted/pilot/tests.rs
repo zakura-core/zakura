@@ -7,7 +7,12 @@ use std::ffi::OsString;
 use super::*;
 #[cfg(unix)]
 use crate::planted::wait_until_executable;
-use crate::planted::{end_of, Run};
+use crate::planted::{
+    end_of,
+    planted_layout::PLANTED_DIR,
+    seeds::{Registry, SeedRow},
+    Run,
+};
 
 const ID: &str = "block/reactor-policy";
 const OTHER: &str = "sim/no-task-panic";
@@ -2365,14 +2370,55 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
     }
 }
 
-/// The committed feedback comparison's case list, checked.
+/// The committed feedback comparison's case list, checked against a
+/// registry that lists each case's seed on its target's harness. Only a
+/// built simulator lists the real registry.
 fn committed_list() -> feedback::List {
     let root = crate::repo_root().expect("xtask lives in the workspace");
-    feedback::read(&root).expect("the committed list checks").1
+    let targets = fuzz_targets(&root).expect("cargo metadata reads it");
+    let list: toml::Table = toml::from_str(
+        &fs::read_to_string(root.join(feedback::LIST)).expect("the list is committed"),
+    )
+    .expect("the list parses");
+    let rows = list["case"]
+        .as_array()
+        .expect("the list names cases")
+        .iter()
+        .map(|entry| {
+            let field = |name: &str| entry[name].as_str().expect("a listed case's field");
+            let case_file = root
+                .join(PLANTED_DIR)
+                .join(format!("{}.toml", field("case")));
+            let case: toml::Table = toml::from_str(
+                &fs::read_to_string(&case_file).expect("the planted case is committed"),
+            )
+            .expect("the planted case parses");
+            SeedRow {
+                name: case["seed"]
+                    .as_str()
+                    .expect("a listed case names a seed")
+                    .to_owned(),
+                harness: targets[field("target")]
+                    .clone()
+                    .expect("the target runs a harness"),
+                set: "corpus".to_owned(),
+                status: "admitted".to_owned(),
+                input_sha256: Some("ab".repeat(32)),
+                reason: None,
+            }
+        });
+    // Two listed cases may share a seed.
+    let mut rows: Vec<SeedRow> = rows.collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows.dedup();
+    let registry = Registry::from_rows(rows).expect("each seed runs one harness");
+    feedback::read(&root, &registry)
+        .expect("the committed list checks")
+        .1
 }
 
-/// The committed case list resolves each case to its planted patch, input
-/// and production files, and freezes ten seeds in both arms: ten cases
+/// The committed case list resolves each case to its planted patch, case
+/// file and production files, and freezes ten seeds in both arms: ten cases
 /// on five targets, 300 campaigns of 600 s.
 #[test]
 fn the_feedback_list_plans_paired_arms() {
@@ -2412,13 +2458,14 @@ fn the_feedback_list_plans_paired_arms() {
     );
 }
 
-/// A synthetic repository for [`feedback::resolve`]: one planted input case,
-/// `p/q/name`, whose input runs `h/one` and whose patch changes
-/// `crates/a.rs`, and the fuzz targets `t_one` (`h/one`), `t_two` (`h/two`)
-/// and `t_none`, which runs no harness.
+/// A synthetic repository for [`feedback::resolve`]: one planted seed case,
+/// `p/q/name`, whose seed `x` runs `h/one` and whose patch changes
+/// `crates/a.rs`, the registry that lists `x`, and the fuzz targets `t_one`
+/// (`h/one`), `t_two` (`h/two`) and `t_none`, which runs no harness.
 fn planted_repo() -> (
     tempfile::TempDir,
     crate::planted::Case,
+    Registry,
     BTreeMap<String, Option<String>>,
 ) {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2429,14 +2476,7 @@ fn planted_repo() -> (
         fs::write(path, text).expect("the file is written");
     };
     write("crates/a.rs", "fn a() {}\n");
-    write("in/x.bin", "x");
-    write(
-        "in/x.toml",
-        &format!(
-            "harness = \"h/one\"\nsha256 = \"{}\"\n",
-            hex(&Sha256::digest(b"x"))
-        ),
-    );
+    write("qa/planted/p/q/name.toml", "seed = \"x\"\n");
     write(
         "qa/planted/p/q/name.patch",
         "--- a/crates/a.rs\n+++ b/crates/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn a() { todo!() }\n",
@@ -2444,7 +2484,7 @@ fn planted_repo() -> (
     let case = crate::planted::Case {
         property: "p/q".to_owned(),
         patch: root.join("qa/planted/p/q/name.patch"),
-        witness: crate::planted::Witness::Input(PathBuf::from("in/x.bin")),
+        witness: crate::planted::Witness::Seed("x".to_owned()),
         checks: Vec::new(),
         also_violates: vec!["p/also".to_owned()],
         target: None,
@@ -2455,7 +2495,16 @@ fn planted_repo() -> (
         ("t_two".to_owned(), Some("h/two".to_owned())),
         ("t_none".to_owned(), None),
     ]);
-    (dir, case, targets)
+    let registry = Registry::from_rows([SeedRow {
+        name: "x".to_owned(),
+        harness: "h/one".to_owned(),
+        set: "corpus".to_owned(),
+        status: "admitted".to_owned(),
+        input_sha256: Some(hex(&Sha256::digest(b"x"))),
+        reason: None,
+    }])
+    .expect("one row");
+    (dir, case, registry, targets)
 }
 
 /// A listed case of `id` on `target`, violating `property`.
@@ -2468,16 +2517,18 @@ fn entry(id: &str, property: &str, target: &str) -> feedback::Entry {
     }
 }
 
-/// A listed case resolves to its planted patch, input, harness, allowed
-/// properties and patched production files, hashed in the tree.
+/// A listed case resolves to its planted patch, case file, its seed's
+/// harness, allowed properties and patched production files, hashed in the
+/// tree.
 #[test]
 fn a_listed_case_resolves_to_its_planted_case() {
-    let (dir, planted, targets) = planted_repo();
+    let (dir, planted, registry, targets) = planted_repo();
     let root = dir.path();
     let cases = feedback::resolve(
         root,
         &[entry("p/q/name", "p/q", "t_one")],
         &[planted],
+        &registry,
         &targets,
     )
     .expect("the case resolves");
@@ -2487,7 +2538,7 @@ fn a_listed_case_resolves_to_its_planted_case() {
     assert_eq!(case.id, "p/q/name");
     assert_eq!(case.patch, Path::new("qa/planted/p/q/name.patch"));
     assert_eq!(case.harness, "h/one");
-    assert_eq!(case.witness, Path::new("in/x.bin"));
+    assert_eq!(case.witness, Path::new("qa/planted/p/q/name.toml"));
     assert_eq!(case.also_violates, ["p/also"]);
     let file = |path: &str| file_sha256(&root.join(path)).expect("the file is hashed");
     assert_eq!(
@@ -2495,25 +2546,29 @@ fn a_listed_case_resolves_to_its_planted_case() {
         BTreeMap::from([("crates/a.rs".to_owned(), file("crates/a.rs"))])
     );
     assert_eq!(case.patch_sha256, file("qa/planted/p/q/name.patch"));
-    assert_eq!(case.witness_sha256, file("in/x.bin"));
+    assert_eq!(case.witness_sha256, file("qa/planted/p/q/name.toml"));
     // The runner's pin check in a checkout with the same files passes.
     check_pins(root, "HEAD", &[case]).expect("the tree holds the hashed files");
 }
 
 /// The list rejects a case with no planted patch, an unknown or
 /// harness-less target, a property that isn't the case's, a target that
-/// runs another harness, a case listed twice, a typed case, and an empty
-/// list.
+/// runs another harness, a case listed twice, a typed case, a seed the
+/// registry lacks, and an empty list.
 #[test]
 fn the_feedback_list_rejects_bad_cases() {
-    let (dir, planted, targets) = planted_repo();
+    let (dir, planted, registry, targets) = planted_repo();
     let root = dir.path();
     let typed = crate::planted::Case {
         witness: crate::planted::Witness::Typed {
             harness: "h/one".to_owned(),
             scenario: PathBuf::from("s.json"),
-            plan: PathBuf::from("s.plan"),
+            plan: None,
         },
+        ..planted.clone()
+    };
+    let unknown = crate::planted::Case {
+        witness: crate::planted::Witness::Seed("y".to_owned()),
         ..planted.clone()
     };
     let good = entry("p/q/name", "p/q", "t_one");
@@ -2541,15 +2596,22 @@ fn the_feedback_list_rejects_bad_cases() {
         (
             vec![entry("p/q/name", "p/q", "t_two")],
             &planted,
-            "t_two runs h/two, but the case's input runs h/one",
+            "t_two runs h/two, but the case's seed runs h/one",
         ),
         (vec![good.clone(), good.clone()], &planted, "listed twice"),
-        (vec![good.clone()], &typed, "a typed case has no fuzz input"),
+        (vec![good.clone()], &typed, "a typed case has no seed"),
+        (vec![good.clone()], &unknown, "no seed is named `y`"),
         (Vec::new(), &planted, "the list names no case"),
     ] {
-        let error = feedback::resolve(root, &entries, std::slice::from_ref(planted), &targets)
-            .expect_err(why)
-            .to_string();
+        let error = feedback::resolve(
+            root,
+            &entries,
+            std::slice::from_ref(planted),
+            &registry,
+            &targets,
+        )
+        .expect_err(why)
+        .to_string();
         assert!(error.contains(why), "{why}: {error}");
     }
 }

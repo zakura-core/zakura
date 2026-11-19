@@ -4,35 +4,39 @@
 //!
 //! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
 //! change that bypasses the property's guard, with `<name>.toml` beside it
-//! naming what must find the bug: either the committed fuzz input, whose
-//! own sidecar names its harness, or a typed case, a `[typed]` table naming
-//! the harness, a committed scenario as that harness's JSON and the Plan
-//! bytes it runs under. A typed case is for a scenario the harness's
-//! grammar can't encode, such as one with a control step or more mirrors
-//! than the grammar takes.
+//! naming what must find the bug: either a seed, by its name in the
+//! simulator's seed registry, which names the seed's harness and builds its
+//! input, or a typed case, a `[typed]` table naming the harness, a committed
+//! scenario as that harness's JSON and, optionally, the Plan bytes it runs
+//! under. A typed case without Plan bytes runs the empty Plan. A typed case
+//! is for a scenario the harness's grammar can't encode, such as one with a
+//! control step or more mirrors than the grammar takes.
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
 //! recording build uses the workspace's `planted` profile in
-//! `target/planted/target`, apart from the checkout's own target directory. Then for each case it:
+//! `target/planted/target`, apart from the checkout's own target directory.
+//! The unpatched build lists the seed registry ([`seeds`]), and a case
+//! naming a seed that the registry lacks or rejects fails the run. Then for
+//! each case it:
 //!
-//! 1. records the input with the unpatched build, which must hold the
+//! 1. records the witness with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
 //!    expecting `holds`;
 //! 2. applies the patch, which must not change, delete or rename the
-//!    case's witness files (its input and sidecar, or its scenario and
-//!    Plan bytes), so both runs read the same committed witness. It then
-//!    rebuilds and records the input again, which must violate the case's
-//!    property and no property outside the case's `also_violates`, and pass
-//!    its witness test expecting `violated` beside those;
+//!    case's witness files (the seed registry's source, or its scenario and
+//!    Plan bytes), so both runs read the same witness. It then rebuilds and
+//!    records the witness again, which must violate the case's property and
+//!    no property outside the case's `also_violates`, and pass its witness
+//!    test expecting `violated` beside those;
 //! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
 //!    pass the witness test. A case file's `also_violates` names properties
 //!    the patch's bug breaks too. Any run may violate them beside the case's
 //!    property, and a campaign run may violate one of them instead;
-//! 4. for a typed case, replays the patched trace in a fresh `zakura-sim
-//!    replay`, which must match Exact, since no fuzz target can confirm it;
+//! 4. replays the patched trace in a fresh `zakura-sim replay`, which must
+//!    match Exact;
 //! 5. resets the worktree to `HEAD`, so the next patched build recompiles
 //!    only what the two patches touch.
 //!
@@ -45,19 +49,21 @@
 //!
 //! A patch that doesn't apply or changes a witness file, a build that
 //! fails, a harness failure, a violation of another property, a patch the
-//! input doesn't catch, and a catch that misses the trigger history are
+//! witness doesn't catch, and a catch that misses the trigger history are
 //! each reported as their own failure, never as a catch. The campaign reports how many of its inputs
 //! caught the patch, and how the others' runs ended. It fails the case only
 //! on a run that fails, ends at a harness failure, violates another
 //! property not in `also_violates`, doesn't report the case's property, or
-//! violates it without its trigger history, so the gate stays the committed
-//! input, which must violate the case's property.
+//! violates it without its trigger history, so the gate stays the case's
+//! witness, which must violate the case's property.
 //!
-//! `--targets` runs only the cases whose committed fuzz input runs on a harness
-//! that a simulator fuzz target runs, as the fuzz package's
+//! `--targets` runs only the seed cases whose seed runs on a harness that a
+//! simulator fuzz target runs, as the fuzz package's
 //! `[package.metadata.zakura-sim.targets]` table maps them, and prints
-//! each target's cases, or that it has none. After step 3 it also confirms
-//! each patched input through its target in fresh processes, as
+//! each target's cases, or that it has none. It builds and lists the
+//! registry before it picks the cases. After step 3 it also confirms each
+//! seed's input, which the unpatched build writes, through its target on
+//! the patched checkout in fresh processes, as
 //! `cargo xtask sim-minimize` confirms an original: the patched target must
 //! crash with the case's property alone and name the harness,
 //! `zakura-sim confirm` must find the property's trigger history, and a
@@ -79,11 +85,11 @@
 //! the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
-//! affect: those whose patch, case file, input, patched files or listed
-//! checks changed, or every case if the shared machinery changed: this
-//! runner, the simulator that records and judges each run, its scheduler
-//! and runtime, or the build configuration. A renamed file counts as a
-//! change to its old and its new path.
+//! affect: those whose patch, case file, witness files, patched files or
+//! listed checks changed, or every case if the shared machinery changed:
+//! this runner, the simulator that records and judges each run and builds
+//! each seed, its scheduler and runtime, or the build configuration. A
+//! renamed file counts as a change to its old and its new path.
 //!
 //! `cargo xtask planted pilot (sensitivity|discovery)` runs the mutation
 //! pilot's paired experiments on the reviewed catalogue's cases; see
@@ -102,7 +108,6 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::{
     run_command,
@@ -115,6 +120,7 @@ mod lane;
 mod mutation_loop;
 mod outcome;
 mod pilot;
+mod seeds;
 
 #[allow(dead_code)]
 #[path = "../../zakura-sim/build/provenance.rs"]
@@ -134,6 +140,7 @@ pub(super) use mutation_loop::{run as mutation_loop, triage};
 use outcome::EndOutcome;
 pub(super) use pilot::run as pilot;
 use planted_layout::PLANTED_DIR;
+use seeds::Registry;
 
 /// What every case runs on, relative to the repository root: xtask, which
 /// holds this runner and the flags and arguments it runs with, the
@@ -156,7 +163,7 @@ const SHARED: &[&str] = &[
 /// `Cargo.toml`).
 pub(super) const PROFILE: &str = "planted";
 
-/// Fuzz inputs the short campaign records after the committed input.
+/// Fuzz inputs the short campaign records after the case's witness.
 const CAMPAIGN_INPUTS: usize = 32;
 
 /// The campaign's longest input, in bytes.
@@ -232,7 +239,7 @@ struct Case {
     /// Other properties the patch's bug breaks, which any run may violate
     /// beside the case's property, and a campaign run instead of it.
     also_violates: Vec<String>,
-    /// The simulator fuzz target that runs the input's harness, with
+    /// The simulator fuzz target that runs the seed's harness, with
     /// `--targets`.
     target: Option<String>,
     /// Why no fuzz target confirms the case, if none does.
@@ -242,62 +249,66 @@ struct Case {
 /// What a case runs, with paths relative to the repository root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Witness {
-    /// A committed fuzz input, whose sidecar names its harness.
-    Input(PathBuf),
+    /// A seed of the simulator's registry, by name. The registry names its
+    /// harness and builds its input.
+    Seed(String),
     /// A committed scenario, as `harness`'s JSON, run under the Plan bytes
-    /// in `plan`.
+    /// in `plan`, or the empty Plan without them.
     Typed {
         /// The harness.
         harness: String,
         /// The scenario file.
         scenario: PathBuf,
-        /// The Plan bytes file.
-        plan: PathBuf,
+        /// The Plan bytes file, if any.
+        plan: Option<PathBuf>,
     },
 }
 
 impl Witness {
-    /// The harness it runs on, read from the input's sidecar under
-    /// `root` for a fuzz input.
-    fn harness(&self, root: &Path) -> Result<String, BoxError> {
+    /// The harness it runs on, which `registry` names for a seed.
+    fn harness(&self, registry: &Registry) -> Result<String, BoxError> {
         match self {
-            Witness::Input(input) => harness_of(root, input),
+            Witness::Seed(name) => registry.harness(name),
             Witness::Typed { harness, .. } => Ok(harness.clone()),
         }
     }
 
-    /// Its committed files: the input and its sidecar, or the scenario and
-    /// the Plan bytes.
+    /// The committed files it reads: the seed registry's source, or the
+    /// scenario and the Plan bytes.
     fn files(&self) -> Vec<PathBuf> {
         match self {
-            Witness::Input(input) => vec![input.clone(), input.with_extension("toml")],
-            Witness::Typed { scenario, plan, .. } => vec![scenario.clone(), plan.clone()],
+            Witness::Seed(_) => vec![PathBuf::from(seeds::REGISTRY)],
+            Witness::Typed { scenario, plan, .. } => {
+                std::iter::once(scenario).chain(plan).cloned().collect()
+            }
         }
     }
 
-    /// Its files under `root`, as [`record`] runs them.
+    /// What [`record`] runs, with a typed case's files under `root`.
     fn located(&self, root: &Path) -> Located {
         match self {
-            Witness::Input(input) => Located::Input(root.join(input)),
+            Witness::Seed(name) => Located::Seed(name.clone()),
             Witness::Typed { scenario, plan, .. } => Located::Typed {
                 scenario: root.join(scenario),
-                plan: root.join(plan),
+                plan: plan.as_ref().map(|plan| root.join(plan)),
             },
         }
     }
 }
 
-/// What [`record`] runs, by its files' paths.
+/// What [`record`] runs, by its files' paths or its seed's name.
 #[derive(Clone, Debug)]
 pub(super) enum Located {
     /// A full fuzz input.
     Input(PathBuf),
-    /// A scenario file and its Plan bytes file.
+    /// A seed of the registry, by name.
+    Seed(String),
+    /// A scenario file and its Plan bytes file, if any.
     Typed {
         /// The scenario file.
         scenario: PathBuf,
-        /// The Plan bytes file.
-        plan: PathBuf,
+        /// The Plan bytes file, or `None` for the empty Plan.
+        plan: Option<PathBuf>,
     },
 }
 
@@ -310,17 +321,18 @@ struct TypedFile {
     /// The scenario, as the harness's JSON, relative to the repository
     /// root.
     scenario: PathBuf,
-    /// The Plan bytes, relative to the repository root.
-    plan: PathBuf,
+    /// The Plan bytes, relative to the repository root. Without them the
+    /// scenario runs the empty Plan.
+    plan: Option<PathBuf>,
 }
 
 /// A case's `<name>.toml`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
-    /// The committed fuzz input, relative to the repository root. A case
-    /// names this or `typed`, never both.
-    input: Option<PathBuf>,
+    /// The seed's name in the simulator's registry. A case names this or
+    /// `typed`, never both.
+    seed: Option<String>,
     /// The typed case, for a scenario the harness's grammar can't encode.
     typed: Option<TypedFile>,
     /// Files or directories, relative to the repository root, whose change
@@ -331,7 +343,7 @@ struct CaseFile {
     /// Other properties the patched bug breaks, by ID, as when a leaked
     /// charge also takes the byte budget past its bound. Any run may violate
     /// them beside the case's property, and a campaign input's run instead
-    /// of it. The committed input must still violate the case's property.
+    /// of it. The case's witness must still violate the case's property.
     #[serde(default)]
     also_violates: Vec<String>,
     /// Why `--targets` doesn't confirm the case through its fuzz target, if
@@ -340,13 +352,6 @@ struct CaseFile {
     /// with this reason and runs the others. The case's other runs still
     /// show the catch.
     no_target: Option<String>,
-}
-
-/// A committed fuzz input's sidecar, as `zakura-sim`'s tests check it.
-#[derive(Deserialize)]
-struct Sidecar {
-    harness: String,
-    sha256: String,
 }
 
 /// The `witness.json` that `zakura-sim record --witness` writes beside the
@@ -520,17 +525,77 @@ pub(super) fn run(
     changed_since: Option<&str>,
     targets: bool,
 ) -> Result<(), BoxError> {
-    let mut cases: Vec<Case> = cases(repo_root)?
+    let cases: Vec<Case> = cases(repo_root)?
         .into_iter()
         .filter(|case| property.is_none_or(|p| case.property == p))
         .collect();
-    if targets {
+    let work = repo_root.join("target").join("planted");
+    let worktree = work.join("worktree");
+    let select = Select {
+        property,
+        shard,
+        changed_since,
+        targets,
+    };
+    // Only `--targets` needs the unpatched build before it picks the cases.
+    let mut baseline = None;
+    let picked = pick(repo_root, &work, cases, &select, &mut baseline);
+    let cases = match picked {
+        Ok(Some(cases)) => cases,
+        Ok(None) => return remove_worktree(repo_root, &worktree),
+        Err(error) => {
+            remove_worktree(repo_root, &worktree)?;
+            return Err(error);
+        }
+    };
+    let failed = (|| -> Result<usize, BoxError> {
+        let baseline = match baseline {
+            Some(baseline) => baseline,
+            None => Baseline::build(repo_root, &work)?,
+        };
+        check_seeds(&baseline.registry, &cases)?;
+        run_cases(&worktree, &work, &baseline, &cases)
+    })();
+    remove_worktree(repo_root, &worktree)?;
+    let failed = failed?;
+    if failed > 0 {
+        return Err(format!("{failed} of {} planted cases failed", cases.len()).into());
+    }
+    Ok(())
+}
+
+/// Which cases [`run`] runs: the flags that pick them.
+struct Select<'a> {
+    /// Only this property's cases.
+    property: Option<&'a str>,
+    /// Only this shard of them.
+    shard: Option<Shard>,
+    /// Only those a change since this revision affects.
+    changed_since: Option<&'a str>,
+    /// Only those a simulator fuzz target runs.
+    targets: bool,
+}
+
+/// The cases of `cases`, the property's, that `select` keeps, in path
+/// order, or `None` if `select.changed_since` affects none. With
+/// `select.targets` and a seed case, it builds `baseline` under `work` to
+/// read each seed's harness, and gives each case the target that runs its
+/// seed's harness. Fails on zero cases before the change filter.
+fn pick(
+    repo_root: &Path,
+    work: &Path,
+    mut cases: Vec<Case>,
+    select: &Select<'_>,
+    baseline: &mut Option<Baseline>,
+) -> Result<Option<Vec<Case>>, BoxError> {
+    if select.targets {
         let harnesses = sim_minimize::fuzz_targets(repo_root)?;
-        for case in &mut cases {
-            // A typed case has no fuzz input for a target to run.
-            if let Witness::Input(input) = &case.witness {
-                case.target = target_of(&harnesses, &harness_of(repo_root, input)?);
-            }
+        if cases
+            .iter()
+            .any(|case| matches!(case.witness, Witness::Seed(_)))
+        {
+            let registry = &baseline.insert(Baseline::build(repo_root, work)?).registry;
+            assign_targets(&mut cases, &harnesses, registry)?;
         }
         let skipped;
         (cases, skipped) = through_targets(cases);
@@ -556,7 +621,7 @@ pub(super) fn run(
         }
     }
     if cases.is_empty() {
-        return Err(match (property, targets) {
+        return Err(match (select.property, select.targets) {
             (Some(property), true) => {
                 format!("no planted case for {property} runs on a fuzz target").into()
             }
@@ -568,7 +633,7 @@ pub(super) fn run(
     // The shard picks from the catalogue before `changed_since` does, so a
     // case's shard doesn't move with the changes.
     let total = cases.len();
-    let cases = match shard {
+    let cases = match select.shard {
         Some(shard) => {
             let picked = shard.select(cases);
             if picked.is_empty() {
@@ -580,43 +645,102 @@ pub(super) fn run(
         }
         None => cases,
     };
-    let cases = match changed_since {
-        Some(rev) => {
-            let changed = changed_since_rev(repo_root, rev)?;
-            let mut affected = Vec::new();
-            for case in cases {
-                if is_affected(&watched(repo_root, &case)?, &changed) {
-                    affected.push(case);
-                }
-            }
-            if affected.is_empty() {
-                println!("no planted case is affected by the changes since {rev}");
-                return Ok(());
-            }
-            affected
-        }
-        None => cases,
+    let Some(rev) = select.changed_since else {
+        return Ok(Some(cases));
     };
-    let work = repo_root.join("target").join("planted");
-    let worktree = work.join("worktree");
-    remove_worktree(repo_root, &worktree)?;
-    fs::create_dir_all(&work)?;
-    run_command(
-        git(repo_root)
-            .args(["worktree", "add", "--detach"])
-            .arg(&worktree)
-            .arg("HEAD"),
-    )?;
-    let failed = run_cases(&worktree, &work, &cases);
-    remove_worktree(repo_root, &worktree)?;
-    let failed = failed?;
-    if failed > 0 {
-        return Err(format!("{failed} of {} planted cases failed", cases.len()).into());
+    let changed = changed_since_rev(repo_root, rev)?;
+    let mut affected = Vec::new();
+    for case in cases {
+        if is_affected(&watched(repo_root, &case)?, &changed) {
+            affected.push(case);
+        }
+    }
+    if affected.is_empty() {
+        println!("no planted case is affected by the changes since {rev}");
+        return Ok(None);
+    }
+    Ok(Some(affected))
+}
+
+/// The scratch worktree's unpatched build, and the seed registry it lists.
+struct Baseline {
+    /// A copy of the unpatched `zakura-sim`, which the patched builds in the
+    /// same target directory don't overwrite.
+    binary: PathBuf,
+    /// Every seed, as the unpatched build lists it.
+    registry: Registry,
+}
+
+impl Baseline {
+    /// Checks `HEAD` out in the scratch worktree under `work`, builds the
+    /// unpatched simulator there in `work`'s target directory, copies the
+    /// binary, and lists the seed registry with it.
+    fn build(repo_root: &Path, work: &Path) -> Result<Baseline, BoxError> {
+        let worktree = work.join("worktree");
+        remove_worktree(repo_root, &worktree)?;
+        fs::create_dir_all(work)?;
+        run_command(
+            git(repo_root)
+                .args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .arg("HEAD"),
+        )?;
+        let target = work.join("target");
+        run_command(&mut cargo_sim(&worktree, &target))?;
+        let binary = work.join("baseline-zakura-sim");
+        fs::copy(target.join(PROFILE).join("zakura-sim"), &binary)?;
+        // Every catch is judged against this baseline, so it must be the
+        // clean checkout's own build, never one an earlier run left behind.
+        if let Err(why) = built_from(&binary, &worktree)? {
+            return Err(format!(
+                "the baseline simulator isn't {}'s: {why}",
+                worktree.display()
+            )
+            .into());
+        }
+        let registry = Registry::read(&binary, &work.join("seeds"))?;
+        Ok(Baseline { binary, registry })
+    }
+}
+
+/// Fails, naming each, if a case of `cases` names a seed that `registry`
+/// lacks or rejects.
+fn check_seeds(registry: &Registry, cases: &[Case]) -> Result<(), BoxError> {
+    let failed: Vec<String> = cases
+        .iter()
+        .filter_map(|case| match &case.witness {
+            Witness::Seed(name) => registry
+                .seed(name)
+                .err()
+                .map(|error| format!("{} {}: {error}", case.property, case.patch.display())),
+            Witness::Typed { .. } => None,
+        })
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("cases name unusable seeds: {}", failed.join("; ")).into())
+    }
+}
+
+/// Gives each seed case of `cases` the fuzz target that runs its seed's
+/// harness, which `registry` names, from the fuzz package's targets and the
+/// harnesses they run, `harnesses`. A typed case has no seed for a target
+/// to run.
+fn assign_targets(
+    cases: &mut [Case],
+    harnesses: &BTreeMap<String, Option<String>>,
+    registry: &Registry,
+) -> Result<(), BoxError> {
+    for case in cases {
+        if let Witness::Seed(name) = &case.witness {
+            case.target = target_of(harnesses, &registry.harness(name)?);
+        }
     }
     Ok(())
 }
 
-/// Splits `cases`, each with its fuzz target if one runs its input, into
+/// Splits `cases`, each with its fuzz target if one runs its seed, into
 /// the cases `--targets` confirms through their target, and the cases with
 /// a target whose `no_target` says why not, with that reason. It drops a
 /// case with no target.
@@ -643,7 +767,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 .ok_or_else(|| format!("{} isn't under a property", patch.display()))?;
             let case_file = patch.with_extension("toml");
             let CaseFile {
-                input,
+                seed,
                 typed,
                 checks,
                 also_violates,
@@ -653,8 +777,8 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
-            let witness = match (input, typed) {
-                (Some(input), None) => Witness::Input(input),
+            let witness = match (seed, typed) {
+                (Some(seed), None) => Witness::Seed(seed),
                 (
                     None,
                     Some(TypedFile {
@@ -667,11 +791,11 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     scenario,
                     plan,
                 },
-                (input, _) => {
+                (seed, _) => {
                     return Err(format!(
-                        "{}: a case names either `input` or `[typed]`, and this names {}",
+                        "{}: a case names either `seed` or `[typed]`, and this names {}",
                         case_file.display(),
-                        if input.is_some() { "both" } else { "neither" }
+                        if seed.is_some() { "both" } else { "neither" }
                     )
                     .into())
                 }
@@ -831,31 +955,22 @@ fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Builds the unpatched simulator in `worktree` once, then runs each case
-/// there, writing its traces under `work`, and resets the worktree after
-/// each. Returns how many cases failed.
-fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxError> {
+/// Runs each case in `worktree` against its unpatched `baseline`, writing
+/// its traces under `work`, and resets the worktree after each. Returns
+/// how many cases failed.
+fn run_cases(
+    worktree: &Path,
+    work: &Path,
+    baseline: &Baseline,
+    cases: &[Case],
+) -> Result<usize, BoxError> {
     let target = work.join("target");
-    run_command(&mut cargo_sim(worktree, &target))?;
-    // The patched builds reuse the target directory, so the baseline keeps
-    // its own copy of the binary.
-    let baseline = work.join("baseline-zakura-sim");
-    fs::copy(target.join(PROFILE).join("zakura-sim"), &baseline)?;
-    // Every catch is judged against this baseline, so it must be the clean
-    // checkout's own build, never one an earlier run left behind.
-    if let Err(why) = built_from(&baseline, worktree)? {
-        return Err(format!(
-            "the baseline simulator isn't {}'s: {why}",
-            worktree.display()
-        )
-        .into());
-    }
     let mut failed = 0;
     for (index, case) in cases.iter().enumerate() {
         let scratch = work.join(format!("case-{index}"));
         fs::create_dir_all(&scratch)?;
         let builds = confirm_builds(work);
-        let verdict = check_case(worktree, &scratch, &target, &builds, &baseline, case);
+        let verdict = check_case(worktree, &scratch, &target, &builds, baseline, case);
         run_command(git(worktree).args(["reset", "--hard", "--quiet", "HEAD"]))?;
         run_command(git(worktree).args(["clean", "-fdq"]))?;
         let verdict = verdict?;
@@ -867,7 +982,7 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
     Ok(failed)
 }
 
-/// Runs the input on the unpatched `baseline` binary, then patches
+/// Runs the witness on the unpatched `baseline` binary, then patches
 /// `worktree` and runs it again, building in `target` and writing both
 /// traces under `scratch`. A confirmation through a fuzz target builds
 /// under `builds`.
@@ -876,13 +991,13 @@ fn check_case(
     scratch: &Path,
     target: &Path,
     builds: &Path,
-    baseline: &Path,
+    baseline: &Baseline,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
-    let harness = case.witness.harness(worktree)?;
+    let harness = case.witness.harness(&baseline.registry)?;
     let input = case.witness.located(worktree);
-    let baseline = record(
-        Command::new(baseline),
+    let unpatched = record(
+        Command::new(&baseline.binary),
         &harness,
         &input,
         &case.property,
@@ -890,7 +1005,7 @@ fn check_case(
         &scratch.join("baseline"),
         Some((RUN_DEADLINE, &NEVER_INTERRUPTED)),
     )?;
-    if let Some(why) = baseline_failure(&case.property, &baseline) {
+    if let Some(why) = baseline_failure(&case.property, &unpatched) {
         return Ok(Verdict::BaselineFails(why));
     }
     if let Some(verdict) = apply_case_patch(worktree, case)? {
@@ -909,9 +1024,10 @@ fn check_case(
     }
     let verdict = judge_patched(&patched, &harness, &input, case, scratch, RUN_DEADLINE)?;
     match (&verdict, &case.target) {
-        (Verdict::Caught(_), Some(fuzz)) => {
-            Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
-        }
+        (Verdict::Caught(_), Some(fuzz)) => Ok(through_target(
+            worktree, builds, scratch, case, fuzz, &harness, baseline,
+        )?
+        .unwrap_or(verdict)),
         _ => Ok(verdict),
     }
 }
@@ -944,7 +1060,7 @@ fn apply_case_patch(worktree: &Path, case: &Case) -> Result<Option<Verdict>, Box
         .witness
         .files()
         .into_iter()
-        .filter(|file| changed.contains(&file.as_path()))
+        .filter(|file| changed.iter().any(|path| path.starts_with(file)))
         .collect();
     Ok((!touched.is_empty()).then_some(Verdict::PatchesWitness(touched)))
 }
@@ -1008,13 +1124,14 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
         .map(|(target, _)| target.clone())
 }
 
-/// Confirms `case`'s committed input in the patched `worktree` through the
-/// fuzz target `target`, which runs `harness`, in fresh processes, with
+/// Confirms `case`'s seed in the patched `worktree` through the fuzz target
+/// `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
 /// property, beside no other violation but the case's `also_violates`, and
 /// name `harness`, `zakura-sim confirm` must find the property's trigger
-/// history, and a fresh replay must match Exact. Builds
-/// under `builds`, which outlives the worktree, and writes under `scratch`.
+/// history, and a fresh replay must match Exact. The unpatched `baseline`
+/// writes the seed's input under `scratch`. Builds under `builds`, which
+/// outlives the worktree, and writes under `scratch`.
 ///
 /// The builds are reused, so both pinned binaries must also name the
 /// patched source: each embeds the source digest that `zakura-sim`'s build
@@ -1027,10 +1144,16 @@ fn through_target(
     case: &Case,
     target: &str,
     harness: &str,
+    baseline: &Baseline,
 ) -> Result<Option<Verdict>, BoxError> {
-    let Witness::Input(input) = &case.witness else {
+    let Witness::Seed(name) = &case.witness else {
         unreachable!("`run` gives a typed case no target");
     };
+    let input = seeds::write_input(
+        &baseline.binary,
+        baseline.registry.seed(name)?,
+        &scratch.join("seed"),
+    )?;
     let out = path::absolute(scratch.join("target"))?;
     if out.exists() {
         fs::remove_dir_all(&out)?;
@@ -1038,7 +1161,7 @@ fn through_target(
     let request = sim_minimize::Request {
         target: target.to_owned(),
         harness: harness.to_owned(),
-        input: path::absolute(worktree.join(input))?,
+        input: path::absolute(input)?,
         property: case.property.clone(),
         also_violates: case.also_violates.clone(),
         out: out.clone(),
@@ -1189,30 +1312,6 @@ fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The harness `input`'s sidecar names, once the sidecar's digest matches
-/// the input.
-fn harness_of(worktree: &Path, input: &Path) -> Result<String, BoxError> {
-    let input = worktree.join(input);
-    let sidecar = input.with_extension("toml");
-    let text =
-        fs::read_to_string(&sidecar).map_err(|error| format!("{}: {error}", sidecar.display()))?;
-    let Sidecar { harness, sha256 } =
-        toml::from_str(&text).map_err(|error| format!("{}: {error}", sidecar.display()))?;
-    let bytes = fs::read(&input).map_err(|error| format!("{}: {error}", input.display()))?;
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    if digest != sha256 {
-        return Err(format!(
-            "{}: the sidecar's sha256 isn't the input's",
-            sidecar.display()
-        )
-        .into());
-    }
-    Ok(harness)
-}
-
 /// Applies `patch` to `worktree`, or says why it doesn't apply.
 fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     let output = git(worktree)
@@ -1281,7 +1380,7 @@ impl Expect<'_> {
     }
 }
 
-/// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
+/// Records `input`, a fuzz input, a seed or a typed scenario and its Plan bytes, on
 /// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
 /// `property` that expects `expect`, writing the trace to `out`, and reads
 /// its `end` record and the test's result.
@@ -1354,26 +1453,31 @@ fn record(
     Ok(run)
 }
 
-/// `zakura-sim record`'s arguments for `input`: `--input` and the file, or
-/// `--scenario` with the scenario file's text and `--plan` with the Plan
-/// bytes file.
+/// `zakura-sim record`'s arguments for `input`: `--input` and the file,
+/// `--seed` and the seed's name, or `--scenario` with the scenario file's
+/// text and, if the case has Plan bytes, `--plan` with their file.
 fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
     Ok(match input {
         Located::Input(path) => vec!["--input".into(), path.into()],
-        Located::Typed { scenario, plan } => vec![
-            "--scenario".into(),
-            fs::read_to_string(scenario)
-                .map_err(|error| format!("{}: {error}", scenario.display()))?
-                .into(),
-            "--plan".into(),
-            plan.into(),
-        ],
+        Located::Seed(name) => vec!["--seed".into(), name.into()],
+        Located::Typed { scenario, plan } => {
+            let mut args = vec![
+                "--scenario".into(),
+                fs::read_to_string(scenario)
+                    .map_err(|error| format!("{}: {error}", scenario.display()))?
+                    .into(),
+            ];
+            if let Some(plan) = plan {
+                args.extend(["--plan".into(), plan.into()]);
+            }
+            args
+        }
     })
 }
 
 /// `verdict`, unless it's a catch and `replay`, the fresh replay of the
 /// patched run's trace, says why it missed: then [`Verdict::ReplayMisses`].
-/// Every catch replays, a fuzz input's and a typed case's alike.
+/// Every catch replays, a seed case's and a typed case's alike.
 fn fresh_replay(
     verdict: Verdict,
     replay: impl FnOnce() -> Result<Option<String>, BoxError>,
@@ -1484,7 +1588,7 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
 /// in `also_violates`, which the patched bug breaks too, is expected beside
 /// `property`'s: it neither counts as the catch nor fails the case. Any
 /// other violated property makes the verdict [`Verdict::Unrelated`]. The
-/// committed input and every campaign input are judged by this one rule.
+/// case's witness and every campaign input are judged by this one rule.
 fn classify(property: &str, also_violates: &[String], patched: &Run) -> Verdict {
     let (violation, others_violated, outcome, witness) = match patched {
         Run::Failed(why) | Run::Killed(why) => return Verdict::Failed(why.clone()),
@@ -1629,7 +1733,7 @@ mod tests {
     }
 
     /// A property in the case's `also_violates` may be violated beside the
-    /// case's own, on the committed input as on a campaign input. Only the
+    /// case's own, on the case's witness as on a campaign input. Only the
     /// case's own violation catches the patch, and an unlisted violation
     /// still fails it.
     #[test]
@@ -1939,36 +2043,49 @@ mod tests {
         }
     }
 
-    /// With `--targets`, a case runs through a fuzz target that runs its
-    /// input's harness, such as the discovery wait case through
-    /// `discovery_wait_complete`. Checking each case keeps the test valid as
-    /// cases and targets are added.
+    /// A registry row for the admitted seed `name` on `harness`.
+    fn seed_row(name: &str, harness: &str) -> seeds::SeedRow {
+        seeds::SeedRow {
+            name: name.to_owned(),
+            harness: harness.to_owned(),
+            set: "corpus".to_owned(),
+            status: "admitted".to_owned(),
+            input_sha256: Some("ab".repeat(32)),
+            reason: None,
+        }
+    }
+
+    /// With `--targets`, a seed case runs through the fuzz target that runs
+    /// its seed's harness, such as the discovery wait case's seed through
+    /// `discovery_wait_complete`, and a typed case runs through none. A
+    /// seed the registry lacks fails.
     #[test]
     fn committed_cases_run_through_the_target_of_their_harness() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
-        let mut on_targets = BTreeMap::new();
-        for case in cases(&repo_root).expect("the planted cases parse") {
-            let Witness::Input(input) = &case.witness else {
-                continue;
-            };
-            let harness = harness_of(&repo_root, input).expect("the input has a sidecar");
-            if let Some(target) = target_of(&harnesses, &harness) {
-                assert_eq!(
-                    harnesses.get(&target),
-                    Some(&Some(harness)),
-                    "{}: its target runs its harness",
-                    case.property
-                );
-                on_targets.insert(case.property, target);
-            }
+        let mut cases: Vec<Case> = cases(&repo_root)
+            .expect("the planted cases parse")
+            .into_iter()
+            .filter(|case| case.property == ID || matches!(case.witness, Witness::Typed { .. }))
+            .collect();
+        let registry = Registry::from_rows([seed_row(
+            "discovery-wait-complete",
+            "discovery/wait-complete",
+        )])
+        .expect("one row");
+        assign_targets(&mut cases, &harnesses, &registry).expect("the registry names the seed");
+        for case in &cases {
+            let expected = (case.property == ID).then(|| "discovery_wait_complete".to_owned());
+            assert_eq!(case.target, expected, "{}", case.patch.display());
         }
-        assert_eq!(
-            on_targets
-                .get("discovery/wait-complete-wakes")
-                .map(String::as_str),
-            Some("discovery_wait_complete")
-        );
+        let mut unknown = vec![Case {
+            witness: Witness::Seed("no-such-seed".to_owned()),
+            ..cases[0].clone()
+        }];
+        let error = assign_targets(&mut unknown, &harnesses, &registry)
+            .expect_err("the registry lacks the seed")
+            .to_string();
+        assert!(error.contains("no seed is named `no-such-seed`"), "{error}");
     }
 
     /// `--targets` confirms a case with a target through it, lists a case
@@ -1979,7 +2096,7 @@ mod tests {
         let case = |name: &str, target: Option<&str>, no_target: Option<&str>| Case {
             property: format!("p/{name}"),
             patch: PathBuf::from(format!("qa/planted/p/{name}/case.patch")),
-            witness: Witness::Input(PathBuf::from("in.bin")),
+            witness: Witness::Seed("in".to_owned()),
             checks: Vec::new(),
             also_violates: Vec::new(),
             target: target.map(str::to_owned),
@@ -2005,16 +2122,11 @@ mod tests {
         assert_eq!(skipped[0].1, "too slow");
 
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
         for case in cases(&repo_root).expect("the planted cases parse") {
             if case.no_target.is_some() {
-                let Witness::Input(input) = &case.witness else {
-                    panic!("{}: a typed case runs on no target", case.property);
-                };
-                let harness = harness_of(&repo_root, input).expect("the input has a sidecar");
                 assert!(
-                    target_of(&harnesses, &harness).is_some(),
-                    "{}: `no_target` on a case no target runs",
+                    matches!(case.witness, Witness::Seed(_)),
+                    "{}: a typed case runs on no target",
                     case.property
                 );
             }
@@ -2127,8 +2239,8 @@ mod tests {
     }
 
     /// A case's patch may change only code: one that changes, deletes or
-    /// renames a witness file, typed or fuzz input, stops the case before
-    /// anything runs on the patched checkout.
+    /// renames a witness file, a typed case's or the seed registry's, stops
+    /// the case before anything runs on the patched checkout.
     #[test]
     fn a_patch_may_not_change_the_witness() {
         let repo = tempfile::tempdir().expect("a temporary repository");
@@ -2138,8 +2250,7 @@ mod tests {
             ("src/lib.rs", "fn a() {}\n"),
             ("s.json", "{}\n"),
             ("p.bin", "plan\n"),
-            ("a.bin", "input\n"),
-            ("a.toml", "harness = \"h\"\n"),
+            ("crates/zakura-sim/src/seed/mod.rs", "fn seeds() {}\n"),
         ] {
             fs::create_dir_all(root.join(path).parent().expect("a parent"))
                 .expect("the directory is created");
@@ -2171,9 +2282,12 @@ mod tests {
         let moved = patch("moved.patch", &|| {
             fs::rename(root.join("s.json"), root.join("t.json")).unwrap()
         });
-        let sidecar = patch("sidecar.patch", &write("a.toml"));
-        let input = patch("input.patch", &|| {
-            fs::remove_file(root.join("a.bin")).unwrap()
+        let registry = patch(
+            "registry.patch",
+            &write("crates/zakura-sim/src/seed/mod.rs"),
+        );
+        let removed = patch("removed.patch", &|| {
+            fs::remove_file(root.join("crates/zakura-sim/src/seed/mod.rs")).unwrap()
         });
         let typed = Case {
             property: ID.to_owned(),
@@ -2181,15 +2295,15 @@ mod tests {
             witness: Witness::Typed {
                 harness: "h".to_owned(),
                 scenario: "s.json".into(),
-                plan: "p.bin".into(),
+                plan: Some("p.bin".into()),
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
             target: None,
             no_target: None,
         };
-        let fuzz = Case {
-            witness: Witness::Input("a.bin".into()),
+        let seed = Case {
+            witness: Witness::Seed("a".to_owned()),
             ..typed.clone()
         };
         let judge = |case: &Case, patch: &Path| {
@@ -2208,15 +2322,15 @@ mod tests {
             ))
         };
         assert_eq!(judge(&typed, &code), None, "a code patch goes on");
-        assert_eq!(judge(&fuzz, &code), None, "a code patch goes on");
+        assert_eq!(judge(&seed, &code), None, "a code patch goes on");
         assert_eq!(judge(&typed, &plan), touches(&["p.bin"]));
         assert_eq!(judge(&typed, &moved), touches(&["s.json"]));
-        assert_eq!(judge(&fuzz, &sidecar), touches(&["a.toml"]));
-        assert_eq!(judge(&fuzz, &input), touches(&["a.bin"]));
+        assert_eq!(judge(&seed, &registry), touches(&[seeds::REGISTRY]));
+        assert_eq!(judge(&seed, &removed), touches(&[seeds::REGISTRY]));
         assert_eq!(
-            judge(&typed, &input),
+            judge(&typed, &registry),
             None,
-            "another case's input isn't this witness"
+            "the seed registry isn't a typed case's witness"
         );
     }
 
@@ -2256,7 +2370,7 @@ mod tests {
 
     /// Writes a case for each `(property, name)` under `root`'s
     /// [`PLANTED_DIR`]: a patch that changes `src/<name>.rs`, and a case file
-    /// naming `qa/inputs/<name>.bin`.
+    /// naming the seed `<name>`.
     fn write_cases(root: &Path, cases: &[(&str, &str)]) {
         for (property, name) in cases {
             let dir = root.join(PLANTED_DIR).join(property);
@@ -2268,7 +2382,7 @@ mod tests {
             .expect("the patch is written");
             fs::write(
                 dir.join(format!("{name}.toml")),
-                format!("input = \"qa/inputs/{name}.bin\"\n"),
+                format!("seed = \"{name}\"\n"),
             )
             .expect("the case file is written");
         }
@@ -2373,20 +2487,21 @@ mod tests {
         }
     }
 
-    /// The committed cases parse, and each names an input with a sidecar,
-    /// or a typed case's files.
+    /// The committed cases parse, and each names a seed, or a typed case's
+    /// committed files. Which seeds the registry holds only a built
+    /// simulator lists, so [`run`] checks each name.
     #[test]
-    fn committed_cases_name_their_inputs() {
+    fn committed_cases_name_their_witnesses() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let cases = cases(&repo_root).expect("the planted cases parse");
         assert!(cases.iter().any(|case| case.property == ID));
         for case in &cases {
-            case.witness
-                .harness(&repo_root)
-                .unwrap_or_else(|error| panic!("{}: {error}", case.patch.display()));
+            if let Witness::Seed(name) = &case.witness {
+                assert!(!name.trim().is_empty(), "{}", case.patch.display());
+            }
             for file in case.witness.files() {
                 assert!(
-                    repo_root.join(&file).is_file(),
+                    repo_root.join(&file).exists(),
                     "{}: {} is committed",
                     case.patch.display(),
                     file.display()
@@ -2406,12 +2521,17 @@ mod tests {
         cases(dir.path())
     }
 
-    /// A case file names a fuzz input or a typed case, never both and never
-    /// neither, and a typed case's files are plain relative paths.
+    /// A case file names a seed or a typed case, never both and never
+    /// neither, a typed case's files are plain relative paths, and a typed
+    /// case without Plan bytes runs the empty Plan.
     #[test]
-    fn a_case_names_an_input_or_a_typed_case() {
-        let input = parse_case(r#"input = "fixtures/a.bin""#).expect("an input case parses");
-        assert_eq!(input[0].witness, Witness::Input("fixtures/a.bin".into()));
+    fn a_case_names_a_seed_or_a_typed_case() {
+        let seed = parse_case(r#"seed = "a""#).expect("a seed case parses");
+        assert_eq!(seed[0].witness, Witness::Seed("a".to_owned()));
+        let error = parse_case(r#"input = "fixtures/a.bin""#)
+            .expect_err("a fixture path is refused")
+            .to_string();
+        assert!(error.contains("unknown field `input`"), "{error}");
         let typed = r#"
             [typed]
             harness = "header-sync/storage"
@@ -2424,11 +2544,11 @@ mod tests {
             Witness::Typed {
                 harness: "header-sync/storage".to_owned(),
                 scenario: "qa/planted/x/case.scenario.json".into(),
-                plan: "qa/planted/x/case.plan.bin".into(),
+                plan: Some("qa/planted/x/case.plan.bin".into()),
             }
         );
         let both = r#"
-            input = "fixtures/a.bin"
+            seed = "a"
             [typed]
             harness = "header-sync/storage"
             scenario = "s.json"
@@ -2450,14 +2570,18 @@ mod tests {
             .expect_err("a path outside is refused")
             .to_string();
         assert!(error.contains("isn't a plain path"), "{error}");
-        let missing = r#"
+        let empty_plan = r#"
             [typed]
             harness = "header-sync/storage"
             scenario = "s.json"
         "#;
-        assert!(
-            parse_case(missing).is_err(),
-            "a typed case needs its Plan bytes"
+        assert_eq!(
+            parse_case(empty_plan).expect("a typed case without Plan bytes parses")[0].witness,
+            Witness::Typed {
+                harness: "header-sync/storage".to_owned(),
+                scenario: "s.json".into(),
+                plan: None,
+            }
         );
     }
 
@@ -2480,7 +2604,7 @@ mod tests {
     }
 
     /// The runner's patched judgment replays a caught case's own patched
-    /// trace, a typed case's and a fuzz input's alike: with a `zakura-sim`
+    /// trace, a typed case's and a seed case's alike: with a `zakura-sim`
     /// whose runs violate the case's property, a replay that matches keeps
     /// the catch, and one that doesn't makes it [`Verdict::ReplayMisses`].
     #[cfg(unix)]
@@ -2522,7 +2646,7 @@ mod tests {
             witness: Witness::Typed {
                 harness: "header-sync/storage".to_owned(),
                 scenario: "s.json".into(),
-                plan: "p.bin".into(),
+                plan: Some("p.bin".into()),
             },
             checks: Vec::new(),
             also_violates: Vec::new(),
@@ -2548,17 +2672,17 @@ mod tests {
             matches!(judge(&misses, &typed), Verdict::ReplayMisses(_)),
             "a failed replay of the patched trace isn't a catch"
         );
-        let input = Case {
-            witness: Witness::Input("a.bin".into()),
+        let seed = Case {
+            witness: Witness::Seed("a".to_owned()),
             ..typed.clone()
         };
         assert!(
-            matches!(judge(&misses, &input), Verdict::ReplayMisses(_)),
-            "a fuzz-input case replays too"
+            matches!(judge(&misses, &seed), Verdict::ReplayMisses(_)),
+            "a seed case replays too"
         );
         assert!(
-            matches!(judge(&matches, &input), Verdict::Caught(Some(_))),
-            "a fuzz-input case's matching replay keeps the catch"
+            matches!(judge(&matches, &seed), Verdict::Caught(Some(_))),
+            "a seed case's matching replay keeps the catch"
         );
     }
 
@@ -2610,7 +2734,7 @@ mod tests {
         let case = Case {
             property: ID.to_owned(),
             patch: dir.path().join("case.patch"),
-            witness: Witness::Input("a.bin".into()),
+            witness: Witness::Seed("a".to_owned()),
             checks: Vec::new(),
             also_violates: Vec::new(),
             target: None,
@@ -2648,21 +2772,25 @@ mod tests {
     }
 
     /// A typed case watches its scenario and Plan bytes, and runs with
-    /// `--scenario` holding the scenario's text.
+    /// `--scenario` holding the scenario's text, and `--plan` only if it
+    /// has Plan bytes. A seed case watches the registry and runs with
+    /// `--seed`.
     #[test]
     fn a_typed_case_watches_and_runs_its_files() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let witness = Witness::Typed {
             harness: "header-sync/storage".to_owned(),
             scenario: "s.json".into(),
-            plan: "p.bin".into(),
+            plan: Some("p.bin".into()),
         };
         assert_eq!(
             witness.files(),
             vec![PathBuf::from("s.json"), PathBuf::from("p.bin")]
         );
         assert_eq!(
-            witness.harness(dir.path()).expect("a typed case names it"),
+            witness
+                .harness(&Registry::default())
+                .expect("a typed case names it"),
             "header-sync/storage"
         );
         fs::write(dir.path().join("s.json"), r#"{"mirrors":2}"#).unwrap();
@@ -2676,9 +2804,29 @@ mod tests {
                 dir.path().join("p.bin").into_os_string(),
             ]
         );
-        let input = Witness::Input("a.bin".into());
+        let empty_plan = Witness::Typed {
+            harness: "header-sync/storage".to_owned(),
+            scenario: "s.json".into(),
+            plan: None,
+        };
+        assert_eq!(empty_plan.files(), vec![PathBuf::from("s.json")]);
         assert_eq!(
-            input_args(&input.located(dir.path())).expect("an input needs no read"),
+            input_args(&empty_plan.located(dir.path())).expect("the scenario reads"),
+            vec![
+                OsString::from("--scenario"),
+                OsString::from(r#"{"mirrors":2}"#),
+            ]
+        );
+        let seed = Witness::Seed("a".to_owned());
+        assert_eq!(seed.files(), vec![PathBuf::from(seeds::REGISTRY)]);
+        let registry = Registry::from_rows([seed_row("a", "discovery/wire")]).expect("one row");
+        assert_eq!(seed.harness(&registry).unwrap(), "discovery/wire");
+        assert_eq!(
+            input_args(&seed.located(dir.path())).expect("a seed needs no read"),
+            vec![OsString::from("--seed"), OsString::from("a")]
+        );
+        assert_eq!(
+            input_args(&Located::Input(dir.path().join("a.bin"))).expect("an input needs no read"),
             vec![
                 OsString::from("--input"),
                 dir.path().join("a.bin").into_os_string()

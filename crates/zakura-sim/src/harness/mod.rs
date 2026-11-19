@@ -276,8 +276,27 @@ pub fn run_steered<S: Subsystem>(
     sink: &mut dyn RecordSink,
     steer: Box<dyn Steer>,
 ) -> Result<(RunReport, Vec<u8>), HarnessError> {
+    let (run, bytes) = run_steered_keeping::<S>(scenario, prepared, input, sink, steer);
+    let report = run?;
+    Ok((
+        report,
+        bytes.expect("run_set_up sets the Sim up before it runs"),
+    ))
+}
+
+/// [`run_steered`], keeping the Plan bytes the steer recorded even when the
+/// run fails: a harness failure during or after the run keeps the choices
+/// made until then, which replay it. `None` if the harness never set the
+/// Sim up.
+pub(crate) fn run_steered_keeping<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (Result<RunReport, HarnessError>, Option<Vec<u8>>) {
     let mut steered = None;
-    let (report, ()) = run_set_up::<S, ()>(
+    let run = run_set_up::<S, ()>(
         scenario,
         prepared,
         input,
@@ -285,9 +304,9 @@ pub fn run_steered<S: Subsystem>(
         None,
         |sim| steered = Some(sim.steer(steer)),
         |_, _, _, _| (),
-    )?;
-    let steered = steered.expect("run_set_up sets the Sim up before it runs");
-    Ok((report, steered.bytes()))
+    )
+    .map(|(report, ())| report);
+    (run, steered.map(|steered| steered.bytes()))
 }
 
 /// [`run_prepared`], also returning what `read` takes from the harness and
@@ -446,11 +465,7 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
     properties.extend(S::properties());
     let known = treated_as_known();
     for property in &mut properties {
-        if let Some(&issue) = known.get(property.id.as_str()) {
-            if property.status == Status::Active {
-                property.status = Status::Known { issue };
-            }
-        }
+        property.status = known_status(&known, property.id.as_str(), property.status);
     }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
 }
@@ -463,12 +478,21 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
 /// same value. Unset, every property keeps its own status.
 pub const KNOWN_VAR: &str = "ZAKURA_SIM_KNOWN";
 
+/// Property `id`'s status `status`, or `Known` at its issue if `known`,
+/// from [`treated_as_known`], names it and `status` is `Active`.
+pub(crate) fn known_status(known: &BTreeMap<String, u32>, id: &str, status: Status) -> Status {
+    match known.get(id) {
+        Some(&issue) if status == Status::Active => Status::Known { issue },
+        _ => status,
+    }
+}
+
 /// The properties [`KNOWN_VAR`] names, each with its issue.
 ///
 /// # Panics
 ///
 /// If an issue isn't a number, so a mistyped value can't pass silently.
-fn treated_as_known() -> BTreeMap<String, u32> {
+pub(crate) fn treated_as_known() -> BTreeMap<String, u32> {
     let Ok(value) = std::env::var(KNOWN_VAR) else {
         return BTreeMap::new();
     };

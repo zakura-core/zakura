@@ -58,9 +58,11 @@ struct Claim {
     height: block::Height,
     order: u64,
     seen_at: Instant,
-    /// The header apply that reserved this claim, while that apply is still running. `None` once
-    /// the header chain has accepted the header.
-    applying: Option<u64>,
+    /// The header applies covering this block that are still running.
+    applies: usize,
+    /// Whether the header chain has accepted the header. Until then, the claim lasts only while
+    /// an apply covering it is running.
+    accepted: bool,
 }
 
 /// A block this node mined, and the order its submission took.
@@ -87,8 +89,6 @@ struct ClaimTable {
     by_hash: HashMap<block::Hash, Claim>,
     /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
     mined: HashMap<block::Hash, MinedBlock>,
-    /// The id given to the next header apply's reservations.
-    next_apply: u64,
 }
 
 impl Default for ClaimTable {
@@ -97,7 +97,6 @@ impl Default for ClaimTable {
             floor: block::Height::MIN,
             by_hash: HashMap::new(),
             mined: HashMap::new(),
-            next_apply: 0,
         }
     }
 }
@@ -181,16 +180,16 @@ pub(super) fn size_label(bytes: usize) -> &'static str {
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
-/// Claims reserved for headers that are being applied to the header chain.
+/// The claims a header apply covers while it runs.
 ///
-/// Bodies already take the reserved orders. [`PendingClaims::commit`] keeps the claims once the
-/// header chain accepts the headers, and dropping this removes them.
+/// Bodies already take the claimed orders. [`PendingClaims::commit`] keeps the claims once the
+/// header chain accepts the headers. Dropping this removes a claim that no accepted or running
+/// apply covers.
 #[derive(Debug)]
-#[must_use = "reserved claims are removed unless committed"]
+#[must_use = "claims are removed unless an apply covering them is committed"]
 pub struct PendingClaims {
     claims: AnnouncementClaims,
-    apply: u64,
-    reserved: Vec<block::Hash>,
+    covered: Vec<block::Hash>,
 }
 
 impl AnnouncementClaims {
@@ -200,8 +199,8 @@ impl AnnouncementClaims {
     /// Call this when a header apply starts and commit the result once the header chain has
     /// accepted the headers. The order and time are taken now, and bodies take them from now
     /// on, so neither a rival body nor the block's own body arriving during the apply ranks it
-    /// behind a header that arrived later. A header that fails the apply is also invalid as a
-    /// block, so a body that used its reservation is rejected anyway.
+    /// behind a header that arrived later. A header already reserved by a running apply keeps
+    /// that earlier reservation, and this apply covers it too.
     pub fn begin(
         &self,
         headers: impl IntoIterator<Item = (block::Hash, block::Height)>,
@@ -221,15 +220,18 @@ impl AnnouncementClaims {
         let floor = table.floor;
         table.by_hash.retain(|_, claim| claim.height >= floor);
         table.mined.retain(|_, mined| mined.height >= floor);
-        let apply = table.next_apply;
-        table.next_apply = apply.wrapping_add(1);
 
-        let mut reserved = Vec::new();
+        let mut covered = Vec::new();
         let mut refused: u64 = 0;
         for (hash, height) in headers {
-            if !(1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - floor))
-                || table.by_hash.contains_key(&hash)
-            {
+            if !(1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - floor)) {
+                continue;
+            }
+            if let Some(claim) = table.by_hash.get_mut(&hash) {
+                if !claim.accepted {
+                    claim.applies = claim.applies.saturating_add(1);
+                    covered.push(hash);
+                }
                 continue;
             }
             if table.by_hash.len() >= MAX_ANNOUNCEMENT_CLAIMS {
@@ -240,10 +242,11 @@ impl AnnouncementClaims {
                 height,
                 order: order::next(),
                 seen_at: now,
-                applying: Some(apply),
+                applies: 1,
+                accepted: false,
             };
             table.by_hash.insert(hash, claim);
-            reserved.push(hash);
+            covered.push(hash);
         }
         drop(table);
 
@@ -252,8 +255,7 @@ impl AnnouncementClaims {
         }
         PendingClaims {
             claims: self.clone(),
-            apply,
-            reserved,
+            covered,
         }
     }
 
@@ -295,7 +297,8 @@ impl AnnouncementClaims {
     /// earlier claim at `height` is not honoured.
     ///
     /// The record lasts while the returned guard, or any other guard for the same block, is
-    /// alive. Once one of them is kept, it lasts until the verified tip passes `height`.
+    /// alive. Once one of them is kept, it lasts until header sync reports a verified tip above
+    /// `height`, or this node mines a block more than [`MAX_CLAIM_HEIGHT_ABOVE_TIP`] above it.
     pub(super) fn mark_mined(
         &self,
         hash: block::Hash,
@@ -303,6 +306,10 @@ impl AnnouncementClaims {
         order: u64,
     ) -> MinedGuard {
         let mut table = self.table();
+        // Bounds the records on a node without header sync, whose floor never moves.
+        table
+            .mined
+            .retain(|_, mined| height - mined.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
         let mined = table.mined.entry(hash).or_insert(MinedBlock {
             height,
             order,
@@ -336,14 +343,25 @@ impl AnnouncementClaims {
 }
 
 impl PendingClaims {
-    /// Keeps the reserved claims, because the header chain accepted their headers.
+    /// Keeps the covered claims, because the header chain accepted their headers.
     pub fn commit(mut self) {
+        self.finish(true);
+    }
+
+    fn finish(&mut self, accepted: bool) {
+        if self.covered.is_empty() {
+            return;
+        }
         let mut table = self.claims.table();
-        for hash in std::mem::take(&mut self.reserved) {
-            if let Some(claim) = table.by_hash.get_mut(&hash) {
-                if claim.applying == Some(self.apply) {
-                    claim.applying = None;
-                }
+        for hash in std::mem::take(&mut self.covered) {
+            // The floor may have dropped the claim during the apply.
+            let Some(claim) = table.by_hash.get_mut(&hash) else {
+                continue;
+            };
+            claim.applies = claim.applies.saturating_sub(1);
+            claim.accepted |= accepted;
+            if claim.applies == 0 && !claim.accepted {
+                table.by_hash.remove(&hash);
             }
         }
     }
@@ -351,19 +369,7 @@ impl PendingClaims {
 
 impl Drop for PendingClaims {
     fn drop(&mut self) {
-        if self.reserved.is_empty() {
-            return;
-        }
-        let mut table = self.claims.table();
-        for hash in &self.reserved {
-            if table
-                .by_hash
-                .get(hash)
-                .is_some_and(|claim| claim.applying == Some(self.apply))
-            {
-                table.by_hash.remove(hash);
-            }
-        }
+        self.finish(false);
     }
 }
 

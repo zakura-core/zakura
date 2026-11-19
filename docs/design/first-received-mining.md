@@ -26,9 +26,10 @@ The reservation is called a claim. Four rules define it:
   order and the time when it starts applying a header, so a body that arrives
   during the apply already takes them. The claim is kept once state has
   accepted the header, by which point the header has passed Equihash, its
-  target, parent linkage and contextual difficulty. If state refuses the
-  header, the claim is removed. A body that used it during the apply fails
-  verification anyway, because its header is invalid. A header
+  target, parent linkage and contextual difficulty. Applies of the same header
+  from several peers share the first reservation. If none of them succeeds,
+  the claim is removed, and a later apply of that header claims from its own
+  start, which can only rank the block later. A header
   deferred for a future timestamp gets no claim. Only headers one or two
   blocks above the verified tip are claimed, so catch-up creates none.
 - **A block has one claim, and it is permanent.** A claim, once made, is never
@@ -43,10 +44,11 @@ The reservation is called a claim. Four rules define it:
   1 MiB per second, capped at `MAX_CLAIM_BODY_DEADLINE` (2 seconds). A
   body that arrives later draws a fresh order, as if its header had never been
   seen.
-- **A node keeps the block it mined.** A locally submitted block has no claim
-  and draws its order at submission. A rival's earlier claim at the same
-  height is ignored from that moment, for every mined block that is still
-  verifying or has verified, until the verified tip passes that height. If
+- **A node keeps the block it mined.** A locally submitted block takes its
+  receipt order at submission, like any other body. A rival's earlier claim at
+  the same height is ignored from that moment, for every mined block that is
+  still verifying or has verified, until the verified tip passes that height or
+  the node mines more than two blocks above it. If
   the submitted block fails verification, rival bodies that arrive afterwards
   take their claims again. A rival body that arrived while it was verifying
   keeps its arrival order.

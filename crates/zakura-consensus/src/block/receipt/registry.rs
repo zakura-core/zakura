@@ -37,7 +37,8 @@ type Active = Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>;
 ///
 /// A body that shares no active receipt takes the order of its block's announcement claim if it
 /// arrived inside the claim's deadline and no block this node mined at that height outranks the
-/// claim. Otherwise it takes the next order.
+/// claim. Otherwise it takes the next order. Every body under a claimed hash can therefore take
+/// the same order, while still having a receipt of its own.
 #[derive(Clone, Debug, Default)]
 pub(in crate::block) struct ReceiptRegistry {
     pub(super) active: Active,
@@ -116,8 +117,9 @@ impl ReceiptRegistry {
                 (new_order(), None, true)
             }
         };
-        // A body that shares a receipt was already counted when that receipt was drawn.
-        if drawn {
+        // A body that shares a receipt was counted when that receipt was drawn. An untracked body
+        // is not counted, so junk bodies under a real header cannot skew the claim metrics.
+        if drawn && registered.is_some() {
             claim.record(hash, order);
         }
         ReceiptGuard {

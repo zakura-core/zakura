@@ -116,6 +116,7 @@ use itertools::Itertools;
 use tokio::{
     sync::{broadcast, mpsc as tokio_mpsc, watch},
     task::JoinHandle,
+    time::{sleep_until, Sleep},
 };
 use tower::{
     discover::{Change, Discover},
@@ -323,6 +324,9 @@ where
     /// per gossiped block download, so its concurrency limit bounds the length.
     held_second_requests: Vec<HeldSecondRequest>,
 
+    /// Wakes the owner at the earliest deadline among the held second requests.
+    second_request_timer: Option<Pin<Box<Sleep>>>,
+
     /// The network of this peer set.
     network: Network,
 }
@@ -426,6 +430,7 @@ where
             expose_peer_addresses: config.expose_peer_addresses,
             block_download_score_and_hedge: config.block_download_score_and_hedge.enabled,
             held_second_requests: Vec::new(),
+            second_request_timer: None,
 
             network: config.network.clone(),
         }
@@ -1641,13 +1646,7 @@ where
 
         let (held, response) = HeldSecondRequest::new(hash, attempt);
         self.held_second_requests.push(held);
-        async move {
-            match response.await {
-                Ok(response) => response.await,
-                Err(_window_closed) => Err(NoFasterBlockSource.into()),
-            }
-        }
-        .boxed()
+        response
     }
 
     /// Considers every held second request again, and sends the ones that now qualify.
@@ -1662,7 +1661,7 @@ where
     ///   [`Self::choose_second_request`]). A busy announcer the peer set itself is waiting on
     ///   wakes this task when it becomes ready, as any unready peer does;
     /// - the first request becoming overdue or stalled, an announcer's missed-block mark
-    ///   expiring, or the window ending, through the request's timer.
+    ///   expiring, or the window ending, through one timer for the earliest deadline.
     ///
     /// Does nothing when no request is held.
     fn retry_held_second_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
@@ -1674,8 +1673,9 @@ where
         // A held request needs the announcements that arrive in between.
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
-        // Read before deciding, so each timer counts from a time its decision had reached.
+        // A deadline crossed during the scan must still wake the owner.
         let considered_at = tokio::time::Instant::now();
+        let mut earliest: Option<tokio::time::Instant> = None;
         for mut held in std::mem::take(&mut self.held_second_requests) {
             if !held.poll_open(cx) {
                 continue;
@@ -1691,10 +1691,21 @@ where
                     held.send(response);
                 }
                 None => {
-                    held.poll_next_decision(next_decision, cx);
+                    earliest = Some(earliest.map_or(next_decision, |at| at.min(next_decision)));
                     self.held_second_requests.push(held);
                 }
             }
+        }
+        if let Some(at) = earliest {
+            let timer = self
+                .second_request_timer
+                .get_or_insert_with(|| Box::pin(sleep_until(at)));
+            timer.as_mut().reset(at);
+            if timer.as_mut().poll(cx).is_ready() {
+                cx.waker().wake_by_ref();
+            }
+        } else {
+            self.second_request_timer = None;
         }
         // The length is bounded by the block downloader's concurrency limit, far below the
         // integers an `f64` holds exactly.

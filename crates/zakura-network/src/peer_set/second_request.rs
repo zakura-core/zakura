@@ -18,16 +18,13 @@
 //! Between those events a candidate can only look worse, because the time left on the first
 //! request only shrinks.
 
-use std::{future::Future, pin::Pin, task::Context, time::Duration};
+use std::{task::Context, time::Duration};
 
 use futures::future::BoxFuture;
-use tokio::{
-    sync::oneshot,
-    time::{sleep_until, Instant, Sleep},
-};
+use tokio::{sync::oneshot, time::Instant};
 use zakura_chain::block;
 
-use crate::{BlockHedge, BoxError, Response};
+use crate::{BlockHedge, BoxError, NoFasterBlockSource, Response};
 
 /// The least a candidate must be expected to beat the first request by, so that small errors
 /// in the expected answer times do not send second requests that lose.
@@ -117,7 +114,7 @@ pub(super) fn second_request_reason(
     (best_candidate_score + margin < remaining).then_some(SecondRequestReason::Predicted)
 }
 
-/// The response to a second request that was sent to a peer.
+/// The result a download awaits for its second request.
 pub(super) type SecondResponse = BoxFuture<'static, Result<Response, BoxError>>;
 
 /// A download's request for a second copy of its block, held by the peer set until an announcer
@@ -125,27 +122,24 @@ pub(super) type SecondResponse = BoxFuture<'static, Result<Response, BoxError>>;
 pub(super) struct HeldSecondRequest {
     hash: block::Hash,
     attempt: BlockHedge,
-    /// Receives the response of the second request, once one is sent. Dropping it tells the
-    /// download that no peer was asked.
+    /// Hands the peer's response future to the download once the request is sent.
     reply: oneshot::Sender<SecondResponse>,
-    /// Fires at the next time waiting alone changes the decision, or when the window ends.
-    timer: Pin<Box<Sleep>>,
 }
 
 impl HeldSecondRequest {
-    /// Holds a second request for `hash`, and returns it with the receiver of its response.
-    pub(super) fn new(
-        hash: block::Hash,
-        attempt: BlockHedge,
-    ) -> (Self, oneshot::Receiver<SecondResponse>) {
+    /// Returns the held request and a future that resolves to the peer's response, or
+    /// `NoFasterBlockSource` if the request is dropped before dispatch.
+    pub(super) fn new(hash: block::Hash, attempt: BlockHedge) -> (Self, SecondResponse) {
         let (reply, response) = oneshot::channel();
-        let timer = Box::pin(sleep_until(attempt.window_end()));
         let held = Self {
             hash,
             attempt,
             reply,
-            timer,
         };
+        let response = Box::pin(async move {
+            let dispatched = response.await.map_err(|_| NoFasterBlockSource)?;
+            dispatched.await
+        });
         (held, response)
     }
 
@@ -172,14 +166,6 @@ impl HeldSecondRequest {
     pub(super) fn send(self, response: SecondResponse) {
         // A download that stopped waiting since `poll_open` no longer needs the response.
         let _ = self.reply.send(response);
-    }
-
-    /// Wakes the owner at the next decision, including when it came due during evaluation.
-    pub(super) fn poll_next_decision(&mut self, next: Instant, cx: &mut Context<'_>) {
-        self.timer.as_mut().reset(next);
-        if self.timer.as_mut().poll(cx).is_ready() {
-            cx.waker().wake_by_ref();
-        }
     }
 }
 

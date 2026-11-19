@@ -11,5 +11,5 @@
 harness = "block-sync/storage"
 generator = 3
 sha256 = "0cf040544446e674316e6a22398cc0a2318a2e613523f5afa9c09d774cf96f83"
-scenario_sha256 = "ef7a2693943a5f576cfab7e8029e9ceef242b4bd6c02d7d5b726c360bf127914"
+scenario_sha256 = "af873b78bffa2755a814807a6efa4f190ca54ca44f3dd727ba58c6469d316049"
 source = "crates/zakura-sim/tests/block_table.rs"

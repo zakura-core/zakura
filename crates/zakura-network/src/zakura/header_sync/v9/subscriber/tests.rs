@@ -759,6 +759,47 @@ fn unlinked_headers_fault() {
     );
 }
 
+/// hsync-8: a page above its credit faults before the loop hashes any header.
+/// The page below is unlinked from its first header, which the loop checks
+/// before it hashes that header. So `OverCredit` instead of `Linkage` shows
+/// that the page cost zero header hashes. The refusal spends no credit.
+#[test]
+fn a_page_above_its_credit_faults_before_any_header_hash() {
+    let (mut tree, chain) = chain(8);
+    let fork = tree.extend(chain[1], 2);
+    let locators = [chain[5], chain[0]];
+    let mut fixture = Fixture::open(tree, chain[7], &locators, 1);
+    let frame = page_frame(
+        &fixture.tree,
+        fixture.id,
+        chain[7].hash,
+        chain[5],
+        &fork,
+        false,
+        AuxSchema::None,
+    );
+    let (page, len) = decode_page(&frame);
+    assert_eq!(
+        fixture.sub.receive_page(&page, len),
+        Err(SubscriptionFault::OverCredit.into())
+    );
+
+    let frame = page_frame(
+        &fixture.tree,
+        fixture.id,
+        chain[7].hash,
+        chain[5],
+        &chain[6..7],
+        false,
+        AuxSchema::None,
+    );
+    let (page, len) = decode_page(&frame);
+    fixture
+        .sub
+        .receive_page(&page, len)
+        .expect("the refused page spent none of the one-header credit");
+}
+
 /// A path that reaches the target's height without the target never reaches
 /// it: a first page from a sent locator above the target, or a page whose
 /// last header sits at the target's height under another hash.

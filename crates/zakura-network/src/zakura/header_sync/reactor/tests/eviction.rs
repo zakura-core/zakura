@@ -1,7 +1,9 @@
 use super::*;
 use crate::zakura::{
-    header_sync::HeaderSyncService, regulation::STALL_POLICY, transport::FramedRecv, CloseCause,
-    Service, ServicePeerDirection, SessionDemand, ZakuraConnId, ZAKURA_CAP_HEADER_SYNC,
+    header_sync::{service::HeaderConnectionState, HeaderSyncService},
+    regulation::STALL_POLICY,
+    transport::FramedRecv,
+    CloseCause, Service, ServicePeerDirection, SessionDemand, ZAKURA_CAP_HEADER_SYNC,
 };
 use tokio::time;
 
@@ -269,12 +271,11 @@ struct StallSession {
 }
 
 impl EvictionFixture {
-    /// Connect session `session_id` on connection `conn_id`. A repeated
-    /// `conn_id` reuses `connection` and `close_cause`.
+    /// Connect a session on a test connection that can be reused after a stall.
     fn connect_on(
         &mut self,
         session_id: u64,
-        conn_id: ZakuraConnId,
+        state: &Arc<HeaderConnectionState>,
         connection: &CancellationToken,
         close_cause: &CloseCause,
     ) -> StallSession {
@@ -290,7 +291,7 @@ impl EvictionFixture {
                 connection.clone(),
                 close_cause.clone(),
             )
-            .with_conn_id(conn_id),
+            .with_connection_state(state.clone()),
         ));
         assert!(self.is_admitted(), "the cooldown has passed");
         StallSession {
@@ -298,6 +299,28 @@ impl EvictionFixture {
             connection: connection.clone(),
             close_cause: close_cause.clone(),
         }
+    }
+
+    /// Write a subscription Close and wait for the production response timer.
+    async fn time_out_close(&mut self) {
+        let peer = self.peer.clone();
+        let session = self.reactor.sessions[&peer].session.clone();
+        let status = super::aux_fallback::pruned_status(&self.snapshot, block::Hash([0x53; 32]));
+        let anchor = self.snapshot.frontiers.finalized;
+        session
+            .try_open(&status, &[anchor], AuxSchema::None, 1)
+            .unwrap();
+        assert_eq!(
+            super::aux_fallback::next_update(&mut self._outbound).operation,
+            v9::Operation::Open
+        );
+        self.reactor.close_subscription(&peer);
+        assert_eq!(
+            super::aux_fallback::next_update(&mut self._outbound).operation,
+            v9::Operation::Close
+        );
+        time::advance(self.reactor.startup.request_timeout).await;
+        self.reactor.retire_unanswered_closes(Instant::now());
     }
 }
 
@@ -314,7 +337,8 @@ async fn a_second_stall_on_one_connection_closes_it_under_the_stall_policy() {
     let connection = CancellationToken::new();
     let close_cause = CloseCause::new();
 
-    let first = fixture.connect_on(8, 1, &connection, &close_cause);
+    let state = Arc::new(HeaderConnectionState::new());
+    let first = fixture.connect_on(8, &state, &connection, &close_cause);
     fixture.time_out_one_request(8);
     assert!(!fixture.is_admitted());
     assert!(first.session.is_cancelled());
@@ -324,19 +348,66 @@ async fn a_second_stall_on_one_connection_closes_it_under_the_stall_policy() {
     );
 
     time::advance(cooldown).await;
-    let second = fixture.connect_on(9, 1, &connection, &close_cause);
+    let second = fixture.connect_on(9, &state, &connection, &close_cause);
     fixture.time_out_one_request(9);
     assert!(second.connection.is_cancelled());
     assert_eq!(second.close_cause.get(), Some(STALL_POLICY));
 
     time::advance(cooldown).await;
-    let fresh = fixture.connect_on(10, 2, &CancellationToken::new(), &CloseCause::new());
+    let fresh = fixture.connect_on(
+        10,
+        &Arc::new(HeaderConnectionState::new()),
+        &CancellationToken::new(),
+        &CloseCause::new(),
+    );
     fixture.time_out_one_request(10);
     assert!(fresh.session.is_cancelled());
     assert!(
         !fresh.connection.is_cancelled(),
         "a new connection's first stall keeps it"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_and_a_subscription_close_share_the_connection_stall_history() {
+    for close_first in [true, false] {
+        let mut fixture = eviction_fixture(1, 7);
+        fixture
+            .reactor
+            .handle_peer_disconnected(&fixture.peer.clone(), 7, "test disconnect");
+        let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+        let connection = CancellationToken::new();
+        let sibling = connection.child_token();
+        let cause = CloseCause::new();
+        let state = Arc::new(HeaderConnectionState::new());
+        let first = fixture.connect_on(8, &state, &connection, &cause);
+        if close_first {
+            fixture.time_out_close().await;
+        } else {
+            fixture.time_out_one_request(8);
+        }
+        assert!(first.session.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert_eq!(cause.get(), None);
+
+        time::advance(cooldown).await;
+        let second = fixture.connect_on(9, &state, &connection, &cause);
+        fixture
+            .reactor
+            .state
+            .close_deadlines
+            .insert(fixture.peer.clone(), (8, Instant::now()));
+        fixture.reactor.retire_unanswered_closes(Instant::now());
+        assert!(!second.session.is_cancelled());
+        if close_first {
+            fixture.time_out_one_request(9);
+        } else {
+            fixture.time_out_close().await;
+        }
+        assert!(second.session.is_cancelled());
+        assert!(sibling.is_cancelled());
+        assert_eq!(cause.get(), Some(STALL_POLICY));
+    }
 }
 
 impl EvictionFixture {

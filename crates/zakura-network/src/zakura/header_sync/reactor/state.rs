@@ -21,7 +21,6 @@ use super::{
     PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status, ZakuraPeerId, MAX_HS_RANGE,
     VCT_REPAIR_RETRY_INTERVAL,
 };
-use crate::zakura::ZakuraConnId;
 
 /// The header-sync reactor's scheduling records.
 #[derive(Debug)]
@@ -74,13 +73,6 @@ pub(super) struct ReactorState {
     /// admitted peer limits bound the count, so cycling fresh identities only
     /// ends the earliest holds.
     pub(super) departed_strikes: HashMap<ZakuraPeerId, (u32, Instant)>,
-    /// The connection of each peer's last stall, with when it stalled. A
-    /// second stall on the same connection closes it (`regulation::stall`).
-    ///
-    /// The admitted peer limit bounds the count, as for
-    /// [`Self::departed_strikes`]. Past it the oldest entry goes, which only
-    /// lets that connection's next stall park it again.
-    pub(super) stalled_connections: HashMap<ZakuraPeerId, (ZakuraConnId, Instant)>,
     pub(super) request_deadlines: HashMap<ZakuraPeerId, Instant>,
     /// Peers whose armed request deadline a carried replacement budget
     /// shortened. A timeout under one costs only an ordinary timeout's strike.
@@ -136,7 +128,6 @@ impl ReactorState {
             #[cfg(any(test, zakura_sim))]
             cooldowns_installed: 0,
             departed_strikes: HashMap::new(),
-            stalled_connections: HashMap::new(),
             request_deadlines: HashMap::new(),
             carried_request_deadlines: HashSet::new(),
             close_deadlines: HashMap::new(),
@@ -695,33 +686,6 @@ impl ReactorState {
             .expect("sessions and schedules share their keys");
         schedule.unproductive_requests = schedule.unproductive_requests.saturating_add(1);
         limit != 0 && schedule.unproductive_requests >= limit
-    }
-
-    /// Record a stall of `peer`'s session on `conn_id` at `now`, and return
-    /// whether the same connection stalled before.
-    ///
-    /// At most `max_peers` peers keep a record; past that, the oldest goes.
-    pub(super) fn note_stall(
-        &mut self,
-        peer: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        now: Instant,
-        max_peers: usize,
-    ) -> bool {
-        let repeated = self
-            .stalled_connections
-            .insert(peer.clone(), (conn_id, now))
-            .is_some_and(|(stalled, _)| stalled == conn_id);
-        while self.stalled_connections.len() > max_peers {
-            let oldest = self
-                .stalled_connections
-                .iter()
-                .filter(|(held, _)| *held != peer)
-                .min_by_key(|(_, (_, at))| *at)
-                .map_or_else(|| peer.clone(), |(held, _)| held.clone());
-            self.stalled_connections.remove(&oldest);
-        }
-        repeated
     }
 
     pub(super) fn reset_unproductive_requests(&mut self, peer: &ZakuraPeerId) {

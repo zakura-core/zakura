@@ -49,9 +49,10 @@
 //! | A following frame is written only after its request started | `a_following_frame_needs_its_request_started` |
 //! | Retirement during a following frame's write resets the session | `retirement_during_a_following_write_resets_the_session` |
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, PoisonError};
+use zakura_rt::time::Instant;
 
 use crate::zakura::{
     transport::{FrameWriteClaim, GuardedFrameSlot},
@@ -285,15 +286,21 @@ impl FrameWriteClaim for FencedWrite {
 /// A transport write claim for a later frame of an exchange. See
 /// [`ExchangeWriter::try_follow`].
 #[derive(Debug)]
-struct FollowingWrite(ExchangeWriter);
+struct FollowingWrite {
+    writer: ExchangeWriter,
+    written_at: Option<Arc<OnceLock<Instant>>>,
+}
 
 impl FrameWriteClaim for FollowingWrite {
     fn try_start(&self) -> bool {
-        self.0.try_follow()
+        self.writer.try_follow()
     }
 
     fn written(&self) {
-        self.0.follow_written();
+        self.writer.follow_written();
+        if let Some(written_at) = &self.written_at {
+            let _ = written_at.set(Instant::now());
+        }
     }
 }
 
@@ -378,7 +385,21 @@ impl GuardedFrameSlot<'_> {
         frame: Frame,
         writer: &ExchangeWriter,
     ) -> Result<(), FencedSendError> {
-        if self.send_request(frame, Arc::new(FollowingWrite(writer.clone()))) {
+        self.send_following_with_receipt(frame, writer, None)
+    }
+
+    /// Queue a following frame and optionally record when its full write completes.
+    pub(crate) fn send_following_with_receipt(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+        written_at: Option<Arc<OnceLock<Instant>>>,
+    ) -> Result<(), FencedSendError> {
+        let claim = FollowingWrite {
+            writer: writer.clone(),
+            written_at,
+        };
+        if self.send_request(frame, Arc::new(claim)) {
             Ok(())
         } else {
             Err(FencedSendError::Closed)

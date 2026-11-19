@@ -481,8 +481,7 @@ async fn run(roles: &[Role]) -> Run {
             connection.child_token(),
             connection.clone(),
             CloseCause::new(),
-        )
-        .with_conn_id(u64::try_from(index).expect("a test runs few peers"));
+        );
         if role == Role::Honest {
             honest_tokens = Some((session.cancel_token(), connection));
         } else {

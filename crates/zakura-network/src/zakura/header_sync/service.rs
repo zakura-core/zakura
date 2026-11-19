@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased_named;
@@ -6,8 +6,12 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_rt::sync::mpsc;
 use zakura_rt::{
     collections::HashMap,
-    sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError,
+    },
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -92,7 +96,6 @@ mod session_tests {
                 Subscriber::new(REGTEST_HEADER_BYTES, fence.clone(), &framed_channel(1).1);
             let session = PeerSession::new(
                 ZakuraPeerId::new(vec![0x71; 32]).expect("the peer ID has 32 bytes"),
-                0,
                 1,
                 ServicePeerDirection::Outbound,
                 send,
@@ -100,7 +103,7 @@ mod session_tests {
                 connection.clone(),
                 close_cause,
                 subscriber,
-                Arc::new(StdMutex::new(CadenceSender::new())),
+                Arc::new(HeaderConnectionState::new()),
             );
             session
                 .try_open(&status, &[genesis], AuxSchema::None, 4)
@@ -134,8 +137,6 @@ mod session_tests {
 #[derive(Clone, Debug)]
 pub struct PeerSession {
     peer_id: ZakuraPeerId,
-    /// The connection that carries this session.
-    conn_id: ZakuraConnId,
     session_id: u64,
     direction: ServicePeerDirection,
     inner: Arc<PeerSessionInner>,
@@ -157,14 +158,26 @@ struct PeerSessionInner {
     /// The writer of the last `Open` this session queued. Each later `Grant`
     /// and `Close` follows it, so retirement that skips the `Open` skips them.
     open_writer: StdMutex<Option<ExchangeWriter>>,
-    /// The connection's `Status` cadence.
-    status: StatusCadence,
+    /// Completion of the current subscription's `Close` write, if queued.
+    close_write: StdMutex<Option<Arc<OnceLock<Instant>>>>,
+    connection: Arc<HeaderConnectionState>,
 }
 
-/// One connection's `Status` cadence, which every session of the connection
-/// shares, so a reopened stream cannot reset it. `Status` rows match on every
-/// network.
-type StatusCadence = Arc<StdMutex<CadenceSender<CommonMessage>>>;
+/// State shared by all header-sync sessions of one live connection.
+#[derive(Debug)]
+pub(super) struct HeaderConnectionState {
+    status: StdMutex<CadenceSender<CommonMessage>>,
+    stalled: AtomicBool,
+}
+
+impl HeaderConnectionState {
+    pub(super) fn new() -> Self {
+        Self {
+            status: StdMutex::new(CadenceSender::new()),
+            stalled: AtomicBool::new(false),
+        }
+    }
+}
 
 impl PeerSession {
     /// A session for `peer_id` that sends through `send`, subscribes with
@@ -172,7 +185,6 @@ impl PeerSession {
     #[allow(clippy::too_many_arguments)]
     fn new(
         peer_id: ZakuraPeerId,
-        conn_id: ZakuraConnId,
         session_id: u64,
         direction: ServicePeerDirection,
         send: FramedSend,
@@ -180,11 +192,10 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
         subscriber: Subscriber,
-        status: StatusCadence,
+        connection: Arc<HeaderConnectionState>,
     ) -> Self {
         Self {
             peer_id,
-            conn_id,
             session_id,
             direction,
             inner: Arc::new(PeerSessionInner {
@@ -194,7 +205,8 @@ impl PeerSession {
                 close_cause,
                 subscriber: StdMutex::new(subscriber),
                 open_writer: StdMutex::new(None),
-                status,
+                close_write: StdMutex::new(None),
+                connection,
             }),
             #[cfg(any(test, zakura_sim))]
             origin: None,
@@ -207,10 +219,12 @@ impl PeerSession {
         Self { origin, ..self }
     }
 
-    /// This session, carried by connection `conn_id`.
     #[cfg(test)]
-    pub(crate) fn with_conn_id(self, conn_id: ZakuraConnId) -> Self {
-        Self { conn_id, ..self }
+    pub(super) fn with_connection_state(mut self, connection: Arc<HeaderConnectionState>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the test sets connection state before sharing the session")
+            .connection = connection;
+        self
     }
 
     /// Where the transport got this session, if its [`Peer`] said.
@@ -298,10 +312,8 @@ impl PeerSession {
         let fence = WriterFence::new(cancel_token.clone());
         // An in-process reader with no frame header check.
         let subscriber = Subscriber::new(REGTEST_HEADER_BYTES, fence, &framed_channel(1).1);
-        // Test sessions share one connection.
         Self::new(
             peer_id,
-            0,
             session_id,
             direction,
             send,
@@ -309,7 +321,7 @@ impl PeerSession {
             connection_cancel_token,
             close_cause,
             subscriber,
-            Arc::new(StdMutex::new(CadenceSender::new())),
+            Arc::new(HeaderConnectionState::new()),
         )
     }
 
@@ -323,11 +335,6 @@ impl PeerSession {
         self.session_id
     }
 
-    /// The connection that carries this session.
-    pub(super) fn conn_id(&self) -> ZakuraConnId {
-        self.conn_id
-    }
-
     /// Direction of the underlying connection.
     pub fn direction(&self) -> ServicePeerDirection {
         self.direction
@@ -338,13 +345,15 @@ impl PeerSession {
         self.inner.cancel_token.clone()
     }
 
-    /// Close the connection after its second stall.
-    pub(super) fn close_after_repeated_stall(&self) {
-        StallClose::new(
-            self.inner.connection_cancel_token.clone(),
-            self.inner.close_cause.clone(),
-        )
-        .close();
+    /// Record a stall for this connection and close it after a repeat.
+    pub(super) fn note_stall(&self) {
+        if self.inner.connection.stalled.swap(true, Ordering::Relaxed) {
+            StallClose::new(
+                self.inner.connection_cancel_token.clone(),
+                self.inner.close_cause.clone(),
+            )
+            .close();
+        }
     }
 
     pub(super) fn disconnect_for_port_panic(&self) {
@@ -391,6 +400,7 @@ impl PeerSession {
     pub(super) fn try_send_status(&self, status: Status) -> Result<(), OrderedSendError> {
         let mut cadence = self
             .inner
+            .connection
             .status
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -436,6 +446,7 @@ impl PeerSession {
             return Err(OrderedSendError::Closed);
         }
         *self.open_writer() = Some(writer);
+        *self.close_write() = None;
         Ok(HeaderSyncRequestId::new(id).expect("subscription IDs are nonzero"))
     }
 
@@ -467,9 +478,26 @@ impl PeerSession {
         let Ok(update) = subscriber.close() else {
             return Ok(false);
         };
-        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
-            .map_err(|_| OrderedSendError::Closed)?;
+        let written_at = Arc::new(OnceLock::new());
+        slot.send_following_with_receipt(
+            update_frame(subscriber.header_bytes(), update),
+            &writer,
+            Some(written_at.clone()),
+        )
+        .map_err(|_| OrderedSendError::Closed)?;
+        *self.close_write() = Some(written_at);
         Ok(true)
+    }
+
+    pub(super) fn close_written_at(&self) -> Option<Instant> {
+        self.close_write().as_ref()?.get().copied()
+    }
+
+    fn close_write(&self) -> MutexGuard<'_, Option<Arc<OnceLock<Instant>>>> {
+        self.inner
+            .close_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The writer of the last `Open` this session queued, if any.
@@ -581,8 +609,8 @@ pub struct HeaderSyncService {
     /// Orders admission checks with the table, so an older connection never
     /// replaces a newer one's session.
     admission: StdMutex<()>,
-    /// Each live connection's `Status` cadence.
-    status_cadences: StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>>,
+    /// State that lives until the transport removes each connection.
+    connection_states: StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), Arc<HeaderConnectionState>>>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
 }
@@ -592,7 +620,10 @@ impl HeaderSyncService {
     /// observer's capacity handle, if there is one
     /// ([`super::observe::ReactorEvent::ServiceSizes`]).
     #[cfg(any(test, zakura_sim))]
-    fn report_cadences(&self, cadences: &HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>) {
+    fn report_cadences(
+        &self,
+        cadences: &HashMap<(ZakuraPeerId, ZakuraConnId), Arc<HeaderConnectionState>>,
+    ) {
         let Some(observer) = &self.header_sync.credit_observer else {
             return;
         };
@@ -608,7 +639,7 @@ impl HeaderSyncService {
             header_sync,
             sessions: Arc::default(),
             admission: StdMutex::new(()),
-            status_cadences: StdMutex::new(HashMap::new()),
+            connection_states: StdMutex::new(HashMap::new()),
             service_demand: None,
         }
     }
@@ -794,27 +825,27 @@ impl Service for HeaderSyncService {
         }
 
         #[cfg(not(any(test, zakura_sim)))]
-        let status = self
-            .status_cadences
+        let connection_state = self
+            .connection_states
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry((peer_id.clone(), conn_id))
-            .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+            .or_insert_with(|| Arc::new(HeaderConnectionState::new()))
             .clone();
         // The same insert, reported under the same lock, since a simulated
         // lock is a scheduling point.
         #[cfg(any(test, zakura_sim))]
-        let status = {
+        let connection_state = {
             let mut cadences = self
-                .status_cadences
+                .connection_states
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let status = cadences
+            let state = cadences
                 .entry((peer_id.clone(), conn_id))
-                .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+                .or_insert_with(|| Arc::new(HeaderConnectionState::new()))
                 .clone();
             self.report_cadences(&cadences);
-            status
+            state
         };
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
         // The reader checks each page and outcome header against the
@@ -826,7 +857,6 @@ impl Service for HeaderSyncService {
         let subscriber = subscriber.observed_by(self.header_sync.credit_tap(&peer_id, session_id));
         let session = PeerSession::new(
             peer_id.clone(),
-            conn_id,
             session_id,
             peer.direction,
             send.clone(),
@@ -834,7 +864,7 @@ impl Service for HeaderSyncService {
             connection_cancel_token.clone(),
             close_cause.clone(),
             subscriber,
-            status,
+            connection_state,
         );
         #[cfg(any(test, zakura_sim))]
         let session = session.with_origin(origin);
@@ -945,7 +975,7 @@ impl Service for HeaderSyncService {
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         #[cfg(not(any(test, zakura_sim)))]
-        self.status_cadences
+        self.connection_states
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(peer.clone(), conn_id));
@@ -953,7 +983,7 @@ impl Service for HeaderSyncService {
         #[cfg(any(test, zakura_sim))]
         {
             let mut cadences = self
-                .status_cadences
+                .connection_states
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             cadences.remove(&(peer.clone(), conn_id));

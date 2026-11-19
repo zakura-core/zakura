@@ -3211,13 +3211,7 @@ impl HeaderSyncReactor {
             return;
         }
         let session = handles.session.clone();
-        let limit = self.admitted_peer_limit();
-        if self
-            .state
-            .note_stall(peer, session.conn_id(), Instant::now(), limit)
-        {
-            session.close_after_repeated_stall();
-        }
+        session.note_stall();
         self.drop_unproductive_peer(peer, session_id, reason);
     }
 
@@ -3335,13 +3329,10 @@ impl HeaderSyncReactor {
             return;
         };
         let session_id = handles.session.session_id();
-        let refused = matches!(handles.session.try_close(), Err(OrderedSendError::Full));
-        let attempt = if refused {
-            CloseAttempt::Refused
-        } else {
-            CloseAttempt::Sent {
-                live: handles.session.subscriber().live().is_some(),
-            }
+        let attempt = match handles.session.try_close() {
+            Err(OrderedSendError::Full) => CloseAttempt::Refused,
+            Ok(queued) => CloseAttempt::Sent { live: queued },
+            Err(_) => CloseAttempt::Sent { live: false },
         };
         self.state.record_close_attempt(
             peer,
@@ -3370,13 +3361,30 @@ impl HeaderSyncReactor {
     /// by its deadline.
     fn retire_unanswered_closes(&mut self, now: Instant) {
         for (peer, session_id) in self.state.take_expired_closes(now) {
-            let unanswered = self.sessions.get(&peer).is_some_and(|handles| {
+            let Some(handles) = self.sessions.get(&peer).filter(|handles| {
                 handles.session.session_id() == session_id
                     && handles.session.subscriber().live().is_some()
-            });
-            if unanswered {
-                metrics::counter!("sync.header.subscription.close_timed_out.total").increment(1);
-                self.drop_unproductive_peer(&peer, session_id, "unresponsive");
+            }) else {
+                continue;
+            };
+            // A queued Close does not start the peer's response time. Wait until
+            // the transport has accepted the whole frame before charging a stall.
+            let deadline = handles
+                .session
+                .close_written_at()
+                .map(|written_at| written_at + self.startup.request_timeout);
+            match deadline {
+                Some(deadline) if deadline <= now => {
+                    metrics::counter!("sync.header.subscription.close_timed_out.total")
+                        .increment(1);
+                    self.stall_session(&peer, session_id, "unresponsive");
+                }
+                _ => {
+                    let check_at = deadline.unwrap_or(now + state::CLOSE_RETRY_INTERVAL);
+                    self.state
+                        .close_deadlines
+                        .insert(peer, (session_id, check_at));
+                }
             }
         }
     }

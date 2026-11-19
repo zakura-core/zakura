@@ -259,7 +259,10 @@ fn retirement_during_a_following_write_resets_the_session() {
         assert!(writer.publish(|| {}));
         assert!(writer.try_start(|| true));
         exchange.end();
-        let follow = FollowingWrite(writer);
+        let follow = FollowingWrite {
+            writer,
+            written_at: None,
+        };
         assert!(follow.try_start());
         if written {
             follow.written();

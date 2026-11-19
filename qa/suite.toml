@@ -174,24 +174,6 @@ run = false
 reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_reset_mid_write"
-run = false
-reason = "a tool, not a test: it searches for and rewrites zakura#2378's committed input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_harness.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false

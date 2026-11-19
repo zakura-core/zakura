@@ -330,7 +330,7 @@ pub enum Request {
     /// outstanding, and did not get the first request. It sends the request to the one expected
     /// to answer soonest, but only if that peer should deliver the block clearly before the first
     /// request does, or if the first request has run well past its expected time (see
-    /// `[network.block_source_score] second_request`). It sends at most one such request per
+    /// `[network.block_download_score_and_hedge]`). It sends at most one such request per
     /// block.
     ///
     /// # Returns

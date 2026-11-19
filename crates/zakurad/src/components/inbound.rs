@@ -441,7 +441,7 @@ impl Inbound {
     }
 
     /// Lets a gossiped block also be requested from a second announcer the peer set expects to
-    /// deliver it sooner. See `[network.block_source_score] second_request`.
+    /// deliver it sooner. See `[network.block_download_score_and_hedge] enabled`.
     pub fn with_second_block_request(mut self, enabled: bool) -> Self {
         self.second_block_request = enabled;
         self

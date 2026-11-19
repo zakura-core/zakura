@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     sync::{Arc, OnceLock},
 };
-use zakura_chain::{block::Block, serialization::sha256d};
+use zakura_chain::serialization::sha256d;
 use zakura_rt::sync::watch;
 
 use crate::block_memory::BlockHandle;
@@ -136,18 +136,12 @@ impl Deref for ServedBlock {
     }
 }
 
-impl From<BlockHandle> for ServedBlock {
-    fn from(block: BlockHandle) -> Self {
+impl<T: Into<BlockHandle>> From<T> for ServedBlock {
+    fn from(block: T) -> Self {
         Self {
-            block,
+            block: block.into(),
             pending_send: None,
         }
-    }
-}
-
-impl From<Arc<Block>> for ServedBlock {
-    fn from(block: Arc<Block>) -> Self {
-        BlockHandle::from(block).into()
     }
 }
 

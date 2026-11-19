@@ -175,7 +175,8 @@ async fn warmup_ignores_a_body_still_owned_by_a_submission() {
         };
         async move {
             Ok(Response::Blocks(vec![InventoryResponse::Available((
-                body.into(), None,
+                body.into(),
+                None,
             ))]))
         }
     });

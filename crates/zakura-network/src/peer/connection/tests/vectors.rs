@@ -3320,8 +3320,79 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     .expect("the revoked advert is answered before the request timeout");
 }
 
+/// A verified block too large to arrive in one round trip still clears the connection's missed
+/// block, but its download time does not change the peer's expected answer time.
+#[tokio::test(start_paused = true)]
+async fn a_large_verified_block_clears_a_miss_and_keeps_the_expected_answer_time() {
+    use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
+    let _init_guard = zakura_test::init();
+
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let (_registry_guard, delivery_samples) = registry.register_legacy(crate::ConnectedPeer {
+        addr: "192.0.2.7:8233".parse().expect("valid address"),
+        user_agent: "/Zakura:1.8.9/".into(),
+        version: crate::protocol::external::types::Version(170_100),
+        start_height: block::Height(1),
+        is_inbound: false,
+        rtt: None,
+        ping_sent_at: None,
+    });
+    delivery_samples.record_response(Duration::from_millis(30));
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let connection = connection.with_delivery_samples(Some(delivery_samples.clone()));
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    assert!(
+        block.zcash_serialized_size() > 14_600,
+        "the test block does not fit one round trip"
+    );
+    slot.mark_announced_block_missed();
+    settle().await;
+
+    let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
+    client_tx.send(request).await.expect("connection is open");
+    assert!(matches!(outbound.next().await, Some(Message::GetData(_))));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    peer_tx
+        .send(Ok(Message::Block(BlockHandle::from(block).into())))
+        .await
+        .expect("connection is open");
+    let Response::Blocks(blocks) = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block")
+    else {
+        panic!("expected a block response");
+    };
+    let (received, _) = blocks[0].available().expect("the block was delivered");
+    assert!(
+        slot.announced_block_missed(),
+        "receipt alone does not clear the miss"
+    );
+
+    received.record_verified();
+    assert!(
+        !slot.announced_block_missed(),
+        "a verified large block clears the miss like any other block"
+    );
+    assert_eq!(
+        delivery_samples.delivery_score(),
+        Some(Duration::from_millis(30)),
+        "a five-second download of a large block does not raise the expected answer time"
+    );
+
+    connection_task.abort();
+}
+
 /// Answers to block requests are timed from when the request was written, and recorded as the
-/// peer's delivery samples, whatever the block's size. Block-hash and transaction answers are not.
+/// peer's delivery samples. The block here is small enough to arrive in one round trip, so its
+/// sample sets the expected answer time. Block-hash and transaction answers are not recorded.
 #[tokio::test(start_paused = true)]
 async fn block_answers_are_timed_as_delivery_samples() {
     let _init_guard = zakura_test::init();

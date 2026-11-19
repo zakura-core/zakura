@@ -13,6 +13,7 @@ use zakura_chain::block::Block;
 
 use zakura_chain::{
     block::{self},
+    serialization::ZcashSerialize,
     transaction::{UnminedTx, UnminedTxId},
 };
 
@@ -39,6 +40,8 @@ struct BlockObservation {
     missed: Option<Arc<tokio::time::Instant>>,
     registry: Option<crate::peer_registry::PeerRegistryUpdater>,
     duration: Duration,
+    /// The serialized size of the blocks in the reply.
+    wire_bytes: u64,
     received_at: Instant,
 }
 
@@ -48,7 +51,10 @@ impl DeliveredBlock {
         self.block
     }
 
-    /// Credits a legacy delivery once its exact body has passed verification.
+    /// Credits a legacy delivery once its exact body has passed verification: clears the miss
+    /// the connection had when the reply arrived, and records the reply's answer time, which
+    /// moves the peer's expected answer time only if the reply was small enough to arrive in
+    /// one round trip.
     /// Clones share the same observation. Other transports carry no observation.
     pub fn record_verified(&self) {
         if let Some(observation) = &self.observation {
@@ -58,7 +64,9 @@ impl DeliveredBlock {
                 }
                 if let Some(registry) = &observation.registry {
                     registry.record_delivery_sample(
-                        crate::peer_registry::DeliverySampleKind::Block,
+                        crate::peer_registry::DeliverySampleKind::Block {
+                            wire_bytes: observation.wire_bytes,
+                        },
                         observation.duration,
                         observation.received_at,
                     );
@@ -240,12 +248,26 @@ impl Response {
         if missed.is_none() && registry.is_none() {
             return;
         }
+        // Only the registry reads the size, so a reply that can only clear a miss is not measured.
+        let wire_bytes = if registry.is_some() {
+            blocks
+                .iter()
+                .filter_map(|entry| match entry {
+                    Available((block, _)) => Some(block.zcash_serialized_size()),
+                    Missing(_) => None,
+                })
+                .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
+                .fold(0, u64::saturating_add)
+        } else {
+            0
+        };
         let observation = Arc::new(BlockObservation {
             recorded: OnceLock::new(),
             slot: slot.clone(),
             missed,
             registry,
             duration,
+            wire_bytes,
             received_at: Instant::now(),
         });
         for entry in blocks {

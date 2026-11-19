@@ -555,49 +555,6 @@ jobs:
 
           python3 deploy.py build "${args[@]}"
 
-      - name: Suppress fleet watchdog alerts during deploy
-        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart }}
-        run: |
-          set -euo pipefail
-
-          sudo install -d -m 755 /run/zakura-fleet-watchdog
-          printf '%s\n' "$(( $(date +%s) + 1200 ))" \
-            | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
-
-      - name: Suppress compatibility watchdog alerts during deploy
-        # This stays in workflow-owned code so rollback refs whose deployer
-        # predates suppression are still covered. The compatibility checker reports
-        # this marker with every probe and the fleet watchdog's compatibility lane
-        # honors it for at most 20 minutes; no service restart is needed.
-        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
-        run: |
-          set -euo pipefail
-
-          if ! timeout --signal=TERM --kill-after=5s 60s \
-            ssh \
-              -o BatchMode=yes \
-              -o ConnectTimeout=20 \
-              -o ServerAliveInterval=10 \
-              -o ServerAliveCountMax=3 \
-              -o StrictHostKeyChecking=yes \
-              -- root@159.203.113.196 bash -s <<'REMOTE'; then
-          set -euo pipefail
-
-          marker=/run/zakura-watchdog/deployment-suppressed-until
-          mkdir -p -m 755 "$(dirname "$marker")"
-          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
-          cleanup() {
-            rm -f "$marker_tmp"
-          }
-          trap cleanup EXIT
-          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
-          chmod 644 "$marker_tmp"
-          mv -f "$marker_tmp" "$marker"
-          trap - EXIT
-          REMOTE
-            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
-          fi
-
       - name: Install profiler and prepare trace files
         if: inputs.operation == 'deploy'
         # Verify retention before adding trace_dir. If installation fails, a node
@@ -629,20 +586,34 @@ jobs:
             | python3 deploy/profiler/fleet.py peer-names --private-addresses - "${args[@]}" \
             || echo "::warning::fleet peer names could not be set on every node; see the step log" >&2
 
+      - name: Suppress fleet watchdog alerts during deploy
+        id: mute_fleet
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart }}
+        timeout-minutes: 2
+        run: |
+          expires_at=$(bash deploy/deployer/mainnet/watchdog-mute.sh arm-fleet)
+          [[ "$expires_at" =~ ^[0-9]+$ ]]
+          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+
+      - name: Suppress compatibility watchdog alerts during deploy
+        id: mute_compat
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        timeout-minutes: 2
+        run: |
+          expires_at=$(bash deploy/deployer/mainnet/watchdog-mute.sh arm-compat)
+          [[ "$expires_at" =~ ^[0-9]+$ ]]
+          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+
       - name: Deploy fleet
         if: inputs.operation == 'deploy'
         working-directory: deploy/deployer
         env:
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
           NO_RESTART: ${{ inputs.no_restart }}
           NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${FORCE_REBUILD}" = "true" ]; then
-            args+=(--force)
-          fi
           if [ "${NO_RESTART}" = "true" ]; then
             args+=(--no-restart)
           fi
@@ -1006,6 +977,7 @@ jobs:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}
           PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+          ENSURE_COMPAT_CHECKER: ${{ steps.mute_compat.outputs.expires_at != '' }}
         run: |
           set -euo pipefail
 
@@ -1023,18 +995,41 @@ jobs:
           # and its zakura_monitoring package, activated through symlinks. The live
           # unit and its drop-ins, the state file and every non-Slack env setting are
           # preserved; the webhook (env mode 600) is replaced only when the secret is set.
-          # Once compatibility monitoring is enabled this also refreshes the checker on
-          # zakura-compat. Only zakura-fleet-watchdog restarts.
+          # A compatibility node restart needs the checker even when the compatibility
+          # monitoring lane is disabled. Only zakura-fleet-watchdog restarts here.
           mkdir -p "$RUNNER_TEMP/monitoring"
-          python3 deploy/runner/zakura-monitoring-deploy.py fleet-deploy \
-            --sha "${SHA}" \
-            --known-hosts "$HOME/.ssh/known_hosts" \
-            --deploy-config deploy/deployer/nodes.ci.toml \
-            --work "$RUNNER_TEMP/monitoring"
+          args=(--sha "$SHA" --known-hosts "$HOME/.ssh/known_hosts"
+                --deploy-config deploy/deployer/nodes.ci.toml --work "$RUNNER_TEMP/monitoring")
+          if [[ "$ENSURE_COMPAT_CHECKER" == true ]]; then
+            args+=(--ensure-compat-checker)
+          fi
+          python3 deploy/runner/zakura-monitoring-deploy.py fleet-deploy "${args[@]}"
           if ! sudo grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' /etc/zakura-fleet-watchdog/env; then
             echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
           fi
           sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
+
+      - name: Wait for the compatibility sidecar to sync
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        timeout-minutes: 12
+        run: |
+          python3 deploy/runner/zakura-monitoring-deploy.py check-compat-readiness \
+            --sha "$GITHUB_SHA" --known-hosts "$HOME/.ssh/known_hosts" \
+            --deploy-config deploy/deployer/nodes.ci.toml
+
+      - name: Restore compatibility watchdog alerts
+        if: ${{ always() && steps.mute_compat.outputs.expires_at != '' }}
+        timeout-minutes: 2
+        env:
+          EXPIRES_AT: ${{ steps.mute_compat.outputs.expires_at }}
+        run: bash deploy/deployer/mainnet/watchdog-mute.sh clear-compat "$EXPIRES_AT"
+
+      - name: Restore fleet watchdog alerts
+        if: ${{ always() && steps.mute_fleet.outputs.expires_at != '' }}
+        timeout-minutes: 2
+        env:
+          EXPIRES_AT: ${{ steps.mute_fleet.outputs.expires_at }}
+        run: bash deploy/deployer/mainnet/watchdog-mute.sh clear-fleet "$EXPIRES_AT"
 
       - name: Fetch recent logs on failure
         if: inputs.operation == 'deploy' && failure()

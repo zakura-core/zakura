@@ -516,7 +516,7 @@ fn check(model: &Model, harness: &Harness) {
         "{PROPERTY}"
     );
     assert_eq!(
-        harness.state.deadlines_due(model.now),
+        harness.state.deadlines_due(model.now, 0),
         earliest.is_some_and(|earliest| earliest <= model.now),
         "{PROPERTY}"
     );
@@ -847,7 +847,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     assert_eq!(
         harness
             .state
-            .check_block_liveness(deadline, true, request_timeout),
+            .check_block_liveness(deadline, 0, true, request_timeout),
         super::LivenessDecision::Continue,
     );
 
@@ -859,7 +859,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     assert_eq!(
         harness
             .state
-            .check_block_liveness(extended, true, request_timeout),
+            .check_block_liveness(extended, 0, true, request_timeout),
         super::LivenessDecision::Stall,
         "a renewed full interval must not grant a second grace",
     );
@@ -875,7 +875,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     assert_eq!(
         harness
             .state
-            .check_block_liveness(next_deadline, true, request_timeout),
+            .check_block_liveness(next_deadline, 0, true, request_timeout),
         super::LivenessDecision::Continue,
         "block progress restores the grace",
     );
@@ -891,7 +891,7 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
     assert_eq!(
         harness
             .state
-            .check_block_liveness(last_deadline, true, request_timeout),
+            .check_block_liveness(last_deadline, 0, true, request_timeout),
         super::LivenessDecision::Continue,
         "disarm restores the grace",
     );

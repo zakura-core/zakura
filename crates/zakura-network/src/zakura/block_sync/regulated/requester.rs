@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 
 use crate::zakura::CloseRow;
-use zakura_chain::block::{Hash, Height};
+use zakura_chain::block::{Hash, Height, MAX_BLOCK_BYTES};
 use zakura_rt::{collections::HashMap, time::Instant};
 
 use super::wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES};
@@ -146,6 +146,25 @@ impl Requester {
     /// Live ranges whose every body arrived but whose ending has not.
     pub(super) fn pending_endings(&self) -> usize {
         self.pending_endings
+    }
+
+    /// Body bytes the peer may still send under every live range, including
+    /// one the scheduler abandoned after its timeout, up to one
+    /// protocol-maximum body: the caller needs only the next body on the
+    /// ordered stream.
+    pub(super) fn owed_body_bytes(&self) -> u64 {
+        let mut owed: u64 = 0;
+        for pending in self.ranges.values() {
+            // A range holds at most 128 heights, so the count fits.
+            let bodies = pending.expected.len().saturating_sub(pending.received) as u64;
+            // Received body bytes stay within the u32 response limit.
+            let bytes = u64::from(pending.max_body_bytes).saturating_sub(pending.body_bytes as u64);
+            owed = owed.saturating_add(bytes.min(bodies.saturating_mul(MAX_BLOCK_BYTES)));
+            if owed >= MAX_BLOCK_BYTES {
+                return MAX_BLOCK_BYTES;
+            }
+        }
+        owed
     }
 
     /// Old abandoned work must not pin a height forever while other work advances.

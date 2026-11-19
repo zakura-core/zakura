@@ -38,16 +38,18 @@ impl PeerState {
         }
     }
 
-    /// Check block liveness at `now`. A deadline that falls during brief
-    /// outbound write congestion gets one bounded delay per no-progress
-    /// episode; see [`liveness_grace_allowed`].
+    /// Check block liveness at `now`, while the peer's authorizations owe
+    /// `authorized` body bytes. A deadline that falls during brief outbound
+    /// write congestion gets one bounded delay per no-progress episode; see
+    /// [`liveness_grace_allowed`].
     pub(in super::super) fn check_block_liveness(
         &mut self,
         now: Instant,
+        authorized: u64,
         outbound_full: bool,
         request_timeout: Duration,
     ) -> LivenessDecision {
-        match self.window.check_liveness(now) {
+        match self.window.check_liveness_owing(now, authorized) {
             LivenessOutcome::Ok => LivenessDecision::Continue,
             LivenessOutcome::Disarm => {
                 self.window.clear_liveness_if_idle();

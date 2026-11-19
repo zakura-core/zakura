@@ -101,8 +101,8 @@ impl ReactorState {
 
     /// Panic if the state breaks a rule it keeps: the query state keeps its
     /// own invariants, the pending query carries the current body-work
-    /// authority, the needed heights are sorted and distinct, and this node
-    /// advertises exactly its verified tip.
+    /// authority, the needed heights are sorted and distinct, and the
+    /// mirrored serving tip follows verified progress.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn assert_invariants(&self) {
         self.queries.assert_invariants();
@@ -124,7 +124,7 @@ impl ReactorState {
                 self.progress.verified_block_tip,
                 self.progress.verified_block_hash
             ),
-            "this node advertises its verified tip"
+            "the mirrored serving tip follows verified progress"
         );
     }
 
@@ -860,7 +860,7 @@ pub(super) struct ReactorProgress {
     /// Mirror of the Sequencer's verified tip.
     pub(super) verified_block_tip: block::Height,
     pub(super) verified_block_hash: block::Hash,
-    /// Highest height this node advertises as servable.
+    /// Serving tip from the sequencer's last verified progress update.
     pub(super) servable_high: block::Height,
     pub(super) servable_hash: block::Hash,
     /// Scheduler and query lower bound. It follows the Sequencer's download
@@ -933,13 +933,14 @@ impl ReactorProgress {
         config: &ZakuraBlockSyncConfig,
         committed: Option<&CommittedHeaderChainView>,
     ) -> BlockSyncStatus {
-        // The node can serve its verified chain even while downloading a competing selected chain.
+        // Range reads follow the selected headers. While full state is on a rival
+        // branch, only advertise through the block both chains share.
         let (servable_high, tip_hash) = committed
             .filter(|view| view.frontiers.verified_best != view.body_download_anchor)
             .map_or((self.servable_high, self.servable_hash), |view| {
                 (
-                    view.frontiers.verified_best.height,
-                    view.frontiers.verified_best.hash,
+                    view.body_download_anchor.height,
+                    view.body_download_anchor.hash,
                 )
             });
         BlockSyncStatus {

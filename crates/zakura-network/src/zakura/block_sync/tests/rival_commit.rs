@@ -123,8 +123,8 @@ async fn receive_across_rival_commit(waiting_for_decode: bool) {
             break query_id;
         }
     };
-    assert_eq!(handle.local_status().tip_hash, rival.hash);
-    assert_eq!(handle.local_status().servable_high, height);
+    let status = handle.local_status();
+    assert_eq!(Frontier::new(status.servable_high, status.tip_hash), parent);
     assert_eq!(wiring.view.borrow().download_floor, parent.height);
     assert_eq!(wiring.view.borrow().verified_hash, parent.hash);
     assert_eq!(wiring.view.borrow().reset_epoch, reset_epoch);
@@ -178,9 +178,13 @@ async fn receive_across_rival_commit(waiting_for_decode: bool) {
         BodyWorkEpoch::new(1),
     )));
     await_until(
-        "the verified selected block advances the sequencer",
+        "the verified selected block advances the sequencer and peer status",
         Duration::from_secs(2),
-        || wiring.view.borrow().verified_hash == selected.hash,
+        || {
+            let status = handle.local_status();
+            wiring.view.borrow().verified_hash == selected.hash
+                && Frontier::new(status.servable_high, status.tip_hash) == selected
+        },
     )
     .await
     .unwrap();
@@ -249,7 +253,8 @@ async fn startup_with_divergent_tips_requests_from_the_shared_parent() {
     let wiring = handle.routine_wiring.as_ref().unwrap();
     assert_eq!(wiring.view.borrow().download_floor, parent.height);
     assert_eq!(wiring.view.borrow().verified_hash, parent.hash);
-    assert_eq!(handle.local_status().tip_hash, verified.hash);
+    let status = handle.local_status();
+    assert_eq!(Frontier::new(status.servable_high, status.tip_hash), parent);
     let BlockSyncAction::QueryNeededBlocks { from, .. } = next_action(&mut actions).await else {
         panic!("startup queries the selected branch")
     };

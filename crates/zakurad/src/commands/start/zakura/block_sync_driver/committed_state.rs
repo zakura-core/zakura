@@ -326,6 +326,73 @@ async fn insert(port: &dyn Port, parent: Frontier, blocks: &[FixtureBlock], requ
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn divergent_status_advertises_a_block_the_range_reader_serves() {
+    use zakura_network::zakura::{
+        spawn_block_sync_reactor, BlockSyncFrontiers, BlockSyncStartup, ZakuraBlockSyncConfig,
+    };
+
+    let fixture = BlockFixture::regtest();
+    let selected = fixture.committable(&[], &[BodySpec::exact(900); 3], 0);
+    let rival = fixture.committable(&selected[..1], &[BodySpec::exact(800)], 1);
+    let real = RealSide::start().await;
+    insert(&*real.state.port(), fixture.anchor(), &selected, 1).await;
+    real.commit(&selected[0], 1).await;
+    real.commit(&rival[0], 2).await;
+
+    let view = real.view();
+    assert_eq!(view.frontiers.header_best, selected[2].frontier());
+    assert_eq!(view.frontiers.verified_best, rival[0].frontier());
+    assert_eq!(view.body_download_anchor, selected[0].frontier());
+
+    let config = ZakuraBlockSyncConfig::default();
+    let source = std::sync::Arc::new(StateBlockRangeSource::new(real.state.read_state.clone()));
+    let startup = BlockSyncStartup::new_with_committed_views(
+        BlockSyncFrontiers {
+            finalized_height: view.frontiers.finalized.height,
+            verified_block_tip: view.frontiers.verified_best.height,
+            verified_block_hash: view.frontiers.verified_best.hash,
+        },
+        (
+            view.frontiers.header_best.height,
+            view.frontiers.header_best.hash,
+        ),
+        real.state.read_state.subscribe_header_chain_views(),
+        config
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config,
+    )
+    .with_range_source(source.clone());
+    let (handle, _actions, reactor) = spawn_block_sync_reactor(startup).unwrap();
+    let status = handle.local_status();
+    let (lease, _session) = BlockRangeReadLease::detached();
+    let read = source
+        .read(BlockRangeRead {
+            start_height: status.servable_high,
+            count: 2,
+            max_body_bytes: status.max_response_bytes,
+            lease,
+        })
+        .await
+        .unwrap();
+    let blocks = served(&read.blocks);
+    assert_eq!(
+        blocks.len(),
+        1,
+        "only the shared parent is available at the advertised tip"
+    );
+    assert_eq!(
+        (blocks[0].0, blocks[0].1),
+        (status.servable_high, status.tip_hash)
+    );
+    assert_eq!(
+        Frontier::new(status.servable_high, status.tip_hash),
+        selected[0].frontier()
+    );
+    reactor.abort();
+}
+
 /// ST4.6: committing a main chain, then a longer fork past it, selects the
 /// same fork, anchors the same missing bodies, serves the same ranges and
 /// publishes the same views on both sides. A fork tip with equal work leaves

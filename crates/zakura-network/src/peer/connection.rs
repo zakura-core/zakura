@@ -1481,9 +1481,15 @@ where
             // block advertiser fills. A `Client` caller that sends one as an ordinary request,
             // such as an isolated connection, gets an error instead of an `inv`.
             // Pushes are an option of these adverts.
-            (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_) | PushBlock(..)) => {
-                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
-            }
+            (
+                _,
+                AdvertiseBlock(..)
+                | AdvertiseBlockToAll(_)
+                | AdvertiseMinedBlock(_)
+                | AdvertiseEarlyBlock(_)
+                | PushBlock(..),
+            ) => Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService))),
+            (_, EarlyBlocksByHash(_)) => Ok(Handler::Finished(Err(PeerError::InboundOnlyRequest))),
             // The peer set picks the peer for a hedge and sends it an ordinary `BlocksByHash`.
             (_, BlockByHashPrimary { .. } | BlockByHashHedge { .. }) => {
                 Ok(Handler::Finished(Err(PeerError::HedgeRequiresPeerSet)))
@@ -1842,6 +1848,8 @@ where
                             .into();
 
                         Request::BlocksByHashFrom { hashes, source }.into()
+                    } else if self.connection_info.early_block_relay {
+                        Request::EarlyBlocksByHash(hashes).into()
                     } else {
                         Request::BlocksByHash(hashes).into()
                     }
@@ -1886,9 +1894,9 @@ where
         match req {
             AsRequest(req) => {
                 let requested_blocks = match &req {
-                    Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
-                        Some(hashes.clone())
-                    }
+                    Request::BlocksByHash(hashes)
+                    | Request::BlocksByHashFrom { hashes, .. }
+                    | Request::EarlyBlocksByHash(hashes) => Some(hashes.clone()),
                     _ => None,
                 };
                 self.drive_peer_request(req).await;
@@ -2005,6 +2013,14 @@ where
             } else {
                 self.record_advertised_block_miss(tx.advertised_block.as_ref());
             }
+
+            // Tag deliveries from a negotiated peer, so the block verifier applies the
+            // early-relay scoring rules to blocks this peer sends.
+            let response = if self.connection_info.early_block_relay {
+                response.map(Response::into_early_relay_delivery)
+            } else {
+                response
+            };
 
             let _ = tx.send(response.map_err(Into::into));
         } else {
@@ -2137,7 +2153,7 @@ where
                     }
                 }
             }
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::EarlyBlocks(blocks) => {
                 // Generate one tx message per block,
                 // then a notfound message with all the missing block hashes.
                 let mut missing_hashes = Vec::new();

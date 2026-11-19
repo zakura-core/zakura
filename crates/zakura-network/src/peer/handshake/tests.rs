@@ -22,7 +22,7 @@ use crate::{
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
-use zakura_chain::{block, chain_tip::NoChainTip};
+use zakura_chain::{block, chain_tip::NoChainTip, serialization::ZcashDeserializeInto};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -120,6 +120,27 @@ async fn negotiate_test_pair(
     local_config: Config,
     remote_config: Config,
 ) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
+    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
+    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
+    negotiate_test_pair_with_services(
+        local_config,
+        local_services,
+        remote_config,
+        remote_services,
+        false,
+    )
+    .await
+}
+
+/// Like [`negotiate_test_pair`], with each end advertising exactly the given services. The
+/// remote end treats the local end as a protected peer if `local_is_protected`.
+async fn negotiate_test_pair_with_services(
+    local_config: Config,
+    local_services: PeerServices,
+    remote_config: Config,
+    remote_services: PeerServices,
+    local_is_protected: bool,
+) -> (Arc<ConnectionInfo>, Arc<ConnectionInfo>) {
     let (local_stream, remote_stream) = duplex(16 * 1024);
     let mut local_conn = Framed::new(
         local_stream,
@@ -141,8 +162,6 @@ async fn negotiate_test_pair(
     let local_min_version = MinimumPeerVersion::new(NoChainTip, &local_config.network);
     let remote_min_version = MinimumPeerVersion::new(NoChainTip, &remote_config.network);
 
-    let local_services = local_config.handshake_services(PeerServices::NODE_NETWORK);
-    let remote_services = remote_config.handshake_services(PeerServices::NODE_NETWORK);
     let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
     let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
@@ -171,7 +190,7 @@ async fn negotiate_test_pair(
             remote_services,
             true,
             remote_min_version,
-            false,
+            local_is_protected,
         )
         .await
     });
@@ -879,6 +898,7 @@ fn p2p_v2_upgrade_uses_main_version_services_only() {
         remote: inconsistent_remote,
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         is_protected_peer: false,
+        early_block_relay: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(&config, &connection_info));
@@ -906,6 +926,7 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         remote: version(remote_services),
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         is_protected_peer: false,
+        early_block_relay: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(
@@ -920,8 +941,21 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
+    // The compact blocks bit neither starts nor blocks the upgrade.
+    assert!(!should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_COMPACT_BLOCKS),
+    ));
+    assert!(should_attempt_zakura_upgrade(
+        &test_config(P2pStack::Dual),
+        &connection_info(
+            PeerServices::NODE_NETWORK
+                | PeerServices::NODE_P2P_V2
+                | PeerServices::NODE_COMPACT_BLOCKS
+        ),
+    ));
 
-    // Another service bit neither starts nor blocks the upgrade.
+    // The block push bit neither starts nor blocks the upgrade.
     assert!(!should_attempt_zakura_upgrade(
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH),
@@ -1189,6 +1223,71 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(remote_counter.update_count(), 0);
 }
 
+/// Early block relay is on for a connection only when both ends advertise
+/// [`PeerServices::NODE_COMPACT_BLOCKS`].
+#[tokio::test]
+async fn early_block_relay_requires_both_ends_to_advertise_compact_blocks() {
+    let _init_guard = zakura_test::init();
+
+    let services = |enabled: bool| {
+        if enabled {
+            PeerServices::NODE_NETWORK | PeerServices::NODE_COMPACT_BLOCKS
+        } else {
+            PeerServices::NODE_NETWORK
+        }
+    };
+    let config = || test_config(P2pStack::Legacy);
+
+    let (local, remote) = negotiate_test_pair_with_services(
+        config(),
+        services(true),
+        config(),
+        services(true),
+        false,
+    )
+    .await;
+    assert!(local.early_block_relay);
+    assert!(remote.early_block_relay);
+
+    // A protected peer's block requests can't be served early, so it never negotiates.
+    let (_, remote) =
+        negotiate_test_pair_with_services(config(), services(true), config(), services(true), true)
+            .await;
+    assert!(!remote.early_block_relay);
+
+    for (local_enabled, remote_enabled) in [(true, false), (false, true), (false, false)] {
+        let (local, remote) = negotiate_test_pair_with_services(
+            config(),
+            services(local_enabled),
+            config(),
+            services(remote_enabled),
+            false,
+        )
+        .await;
+        assert!(
+            !local.early_block_relay && !remote.early_block_relay,
+            "one-sided support ({local_enabled}, {remote_enabled}) must keep committed relay",
+        );
+    }
+}
+
+/// Pruned peers (bit 25, the bit Zebra 7.1.0-alpha.0 used for early relay) never negotiate
+/// early block relay.
+#[tokio::test]
+async fn pruned_peers_do_not_negotiate_early_block_relay() {
+    let _init_guard = zakura_test::init();
+
+    let pruned = PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED;
+    let (local, remote) = negotiate_test_pair_with_services(
+        test_config(P2pStack::Legacy),
+        pruned,
+        test_config(P2pStack::Legacy),
+        pruned,
+        false,
+    )
+    .await;
+    assert!(!local.early_block_relay && !remote.early_block_relay);
+}
 /// A peer's announcement of one block is traced under the peer's name. An `inv` that names
 /// several blocks answers a query, and one that names only transactions is not about a block,
 /// so neither is traced.
@@ -1311,6 +1410,27 @@ async fn inbound_invs_record_announced_blocks() {
     .expect("the filter passes the message through");
     assert!(!announced.announced(blocks[0]));
     assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
+}
+
+/// A peer that sent a block body has the block, whether or not it announced it first, so block
+/// gossip never advertises the block back to its supplier.
+#[tokio::test]
+async fn a_received_block_body_counts_as_an_announcement() {
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let announced = AnnouncedBlocks::default();
+    register_inventory_status(
+        Ok(Message::Block(block.clone().into())),
+        ConnectedAddr::new_isolated(),
+        broadcast::channel(16).0,
+        announced.clone(),
+        Default::default(),
+    )
+    .await
+    .expect("the filter passes the message through");
+    assert!(announced.announced(block.hash()));
 }
 
 /// A body request contradicts only the requested blocks' earlier announcements.

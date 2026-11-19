@@ -87,6 +87,7 @@ impl ConnectedClient {
             remote,
             negotiated_version: CURRENT_NETWORK_PROTOCOL_VERSION,
             is_protected_peer: false,
+            early_block_relay: false,
         });
         let addr_label = connection_info.connected_addr.get_transient_addr_label();
 

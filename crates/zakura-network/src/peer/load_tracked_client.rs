@@ -79,6 +79,7 @@ impl From<Client> for LoadTrackedClient {
             registry: client.peer_registry_updater.clone(),
             version: connection_info.remote.version,
             sidecar: false,
+            early_block_relay: connection_info.early_block_relay,
             accepts_block_push: connection_info
                 .remote
                 .services

@@ -142,6 +142,9 @@ pub enum PeerError {
     #[error("block adverts require the dedicated block advert service")]
     AdvertRequiresDedicatedService,
 
+    /// An outbound caller sent a request that only an inbound connection creates.
+    #[error("only inbound connections create this request")]
+    InboundOnlyRequest,
     /// A block hedge request was sent to a single connection. Only the peer set can pick the
     /// peer for a hedge, because it knows which peers announced the block and are idle.
     #[error("block hedge requests require the peer set")]
@@ -214,6 +217,7 @@ impl PeerError {
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
             PeerError::AdvertRequiresDedicatedService => "AdvertRequiresDedicatedService".into(),
+            PeerError::InboundOnlyRequest => "InboundOnlyRequest".into(),
             PeerError::HedgeRequiresPeerSet => "HedgeRequiresPeerSet".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),

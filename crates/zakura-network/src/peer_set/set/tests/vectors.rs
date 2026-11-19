@@ -415,6 +415,7 @@ fn block_gossip_skips_busy_outdated_peers() {
                 registry: None,
                 version: Version(1),
                 sidecar: false,
+                early_block_relay: false,
                 accepts_block_push: false,
             },
         );

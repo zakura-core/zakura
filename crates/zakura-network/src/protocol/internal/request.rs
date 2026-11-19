@@ -287,6 +287,25 @@ pub enum Request {
         IndexSet<block::Hash>,
     ),
 
+    /// Request block data by hashes on a connection that negotiated early block relay.
+    ///
+    /// Only the connection creates this request, for an inbound `getdata` from a peer that set
+    /// [`PeerServices::NODE_COMPACT_BLOCKS`](crate::PeerServices::NODE_COMPACT_BLOCKS)
+    /// while this node set it too. The inbound service may serve early-relay bodies before
+    /// their contextual commit; it must never serve them for [`Request::BlocksByHash`].
+    /// Outbound callers use [`Request::BlocksByHash`].
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    EarlyBlocksByHash(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_block_hashes()")
+        )]
+        IndexSet<block::Hash>,
+    ),
+
     /// Request block data by block hashes from a known advertising peer.
     ///
     /// This is used by authenticated transports that can safely route a
@@ -535,6 +554,18 @@ pub enum Request {
     /// Native gossip uses its existing broadcast policy.
     AdvertiseMinedBlock(AdvertisedBlock),
 
+    /// Advertise a block that passed early-relay checks to legacy peers that negotiated early
+    /// block relay, paced like [`Request::AdvertiseBlock`].
+    ///
+    /// The block must already be servable from the early-relay cache. Connections without
+    /// early block relay, and the Zakura P2P v2 stack, never receive this advertisement.
+    /// Returns at once when no connected peer negotiated early block relay.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Nil`](super::Response::Nil).
+    AdvertiseEarlyBlock(AdvertisedBlock),
+
     /// Request the contents of this node's mempool.
     ///
     /// # Returns
@@ -555,6 +586,9 @@ impl fmt::Display for Request {
             }
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
+            }
+            Request::EarlyBlocksByHash(hashes) => {
+                format!("EarlyBlocksByHash({})", hashes.len())
             }
             Request::BlockByHashPrimary { .. } => "BlockByHashPrimary".to_string(),
             Request::BlockByHashHedge { .. } => "BlockByHashHedge".to_string(),
@@ -583,6 +617,7 @@ impl fmt::Display for Request {
             Request::AdvertiseBlock(_, _) => "AdvertiseBlock".to_string(),
             Request::AdvertiseBlockToAll(_) => "AdvertiseBlockToAll".to_string(),
             Request::AdvertiseMinedBlock(_) => "AdvertiseMinedBlock".to_string(),
+            Request::AdvertiseEarlyBlock(_) => "AdvertiseEarlyBlock".to_string(),
             Request::MempoolTransactionIds => "MempoolTransactionIds".to_string(),
         })
     }
@@ -600,6 +635,7 @@ impl Request {
             | Request::BlocksByHashFrom { .. }
             | Request::BlockByHashPrimary { .. }
             | Request::BlockByHashHedge { .. } => "BlocksByHash",
+            Request::EarlyBlocksByHash(_) => "EarlyBlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -614,6 +650,7 @@ impl Request {
             Request::AdvertiseBlock(_, _)
             | Request::AdvertiseBlockToAll(_)
             | Request::AdvertiseMinedBlock(_) => "AdvertiseBlock",
+            Request::AdvertiseEarlyBlock(_) => "AdvertiseEarlyBlock",
             Request::MempoolTransactionIds => "MempoolTransactionIds",
         }
     }
@@ -624,6 +661,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::EarlyBlocksByHash(_)
                 | Request::BlockByHashPrimary { .. }
                 | Request::BlockByHashHedge { .. }
                 | Request::TransactionsById(_)
@@ -635,6 +673,7 @@ impl Request {
     pub fn block_hash_inventory(&self) -> HashSet<block::Hash> {
         match self {
             Request::BlocksByHash(block_hashes)
+            | Request::EarlyBlocksByHash(block_hashes)
             | Request::BlocksByHashFrom {
                 hashes: block_hashes,
                 ..

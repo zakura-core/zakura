@@ -994,7 +994,7 @@ where
     /// credits the connection that delivered this body.
     async fn verify_candidate(
         self,
-        (block, advertiser_addr, block_height): BlockCandidate,
+        (block, advertiser_addr, block_height, early_relay_delivery): BlockCandidate,
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
         kind: DownloadKind,
@@ -1126,10 +1126,15 @@ where
             None => None,
         };
 
+        // A pushed block takes the ordinary commit path. Only an `EarlyBlocks` response is an
+        // early-relay body.
+        let request = if early_relay_delivery {
+            zakura_consensus::Request::CommitEarlyRelay(block.clone().into_block())
+        } else {
+            zakura_consensus::Request::Commit(block.clone().into_block())
+        };
         self.verifier
-            .oneshot(zakura_consensus::Request::Commit(
-                block.clone().into_block(),
-            ))
+            .oneshot(request)
             .await
             .map(|hash| {
                 block.record_verified();
@@ -1208,7 +1213,7 @@ where
                         Some(zn::PeerSource::LegacySocket(addr)) => Some(*addr),
                         _ => None,
                     };
-                    DownloadedCandidates::single(checks.check(block.into(), pusher_addr)?)
+                    DownloadedCandidates::single(checks.check(block.into(), pusher_addr, false)?)
                 }
                 None => {
                     let downloaded = download_block(
@@ -1246,7 +1251,7 @@ where
                 Ok(accepted) => {
                     if let CompetingReply::Pending(task) = other {
                         tokio::spawn(async move {
-                            if let Ok(Ok((body, _, _))) = task.await {
+                            if let Ok(Ok((body, _, _, _))) = task.await {
                                 body.record_verified_copy(&winner);
                             }
                         });
@@ -1355,7 +1360,14 @@ where
     }
 }
 
-type BlockCandidate = (zn::DeliveredBlock, Option<PeerSocketAddr>, block::Height);
+/// A delivered body, its supplier, its claimed height, and whether the supplier sent it as an
+/// early-relay body.
+type BlockCandidate = (
+    zn::DeliveredBlock,
+    Option<PeerSocketAddr>,
+    block::Height,
+    bool,
+);
 type DownloadError = (BoxError, Option<PeerSocketAddr>);
 
 #[derive(Clone)]
@@ -1371,6 +1383,7 @@ impl CandidateChecks {
         &self,
         block: zn::DeliveredBlock,
         source: Option<PeerSocketAddr>,
+        early_relay_delivery: bool,
     ) -> Result<BlockCandidate, DownloadError> {
         let height = block.coinbase_height().ok_or_else(|| {
             metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
@@ -1396,7 +1409,7 @@ impl CandidateChecks {
                 source,
             ));
         }
-        Ok((block, source, height))
+        Ok((block, source, height, early_relay_delivery))
     }
 }
 
@@ -1443,8 +1456,8 @@ impl DownloadedCandidates {
 /// request is outstanding. Only a reply carrying the requested block wins. An already-sent
 /// request can finish even after the other peer delivers the block.
 ///
-/// Returns the block and the address of the peer that sent it. Fails unless the peer sends
-/// exactly the block `hash`.
+/// Returns the block, the address of the peer that sent it, and whether the peer sent it as an
+/// early-relay body. Fails unless the peer sends exactly the block `hash`.
 async fn download_block<ZN>(
     network: ZN,
     hash: block::Hash,
@@ -1457,8 +1470,8 @@ where
     ZN::Future: Send,
 {
     let validate = move |result| {
-        let (block, source) = requested_block(hash, result)?;
-        checks.check(block, source)
+        let (block, source, early_relay_delivery) = requested_block(hash, result)?;
+        checks.check(block, source, early_relay_delivery)
     };
     if !second_request {
         let request = zn::Request::block_by_hash(hash, download_source);
@@ -1549,11 +1562,15 @@ fn prioritize_race_errors(
 
 /// Extracts the one requested block before a response can win the download race. A wrong hash
 /// retains the supplying peer's address so the caller can attribute the error.
+///
+/// Also returns whether the peer sent the block as an early-relay body.
 fn requested_block(
     hash: block::Hash,
     result: Result<zn::Response, BoxError>,
-) -> Result<(zn::DeliveredBlock, Option<PeerSocketAddr>), DownloadError> {
-    let zn::Response::Blocks(blocks) = result.map_err(|e| (e, None))? else {
+) -> Result<(zn::DeliveredBlock, Option<PeerSocketAddr>, bool), DownloadError> {
+    let response = result.map_err(|e| (e, None))?;
+    let early_relay_delivery = matches!(response, zn::Response::EarlyBlocks(_));
+    let (zn::Response::Blocks(blocks) | zn::Response::EarlyBlocks(blocks)) = response else {
         return Err(("wrong response to block request".into(), None));
     };
     let [entry] = blocks.as_slice() else {
@@ -1588,7 +1605,7 @@ fn requested_block(
             advertiser_addr,
         ));
     }
-    Ok((block, advertiser_addr))
+    Ok((block, advertiser_addr, early_relay_delivery))
 }
 
 #[cfg(test)]

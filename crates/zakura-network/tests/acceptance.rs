@@ -43,5 +43,6 @@ fn connection_info_types_are_public() {
         remote,
         negotiated_version,
         is_protected_peer: false,
+        early_block_relay: false,
     });
 }

@@ -141,6 +141,13 @@ bitflags! {
         /// does not provide network services.
         const NODE_NETWORK = 1;
 
+        /// NODE_COMPACT_BLOCKS means that the node supports compact block relay and early block
+        /// relay, as defined in the draft Compact Block Relay ZIP (zcash/zips#1429).
+        ///
+        /// Both features run only on connections where both ends set this bit. Zebra uses the
+        /// same bit, so negotiated Zakura and Zebra peers interoperate.
+        const NODE_COMPACT_BLOCKS = 1 << 16;
+
         /// NODE_P2P_V2 means that the node can speak the experimental Zakura P2P v2 stack.
         ///
         /// This bit is in the temporary experiment range until a permanent service bit is assigned.
@@ -368,6 +375,7 @@ mod test {
         let _init_guard = zakura_test::init();
 
         assert_eq!(PeerServices::NODE_P2P_V2.bits(), 1 << 24);
+        assert_eq!(PeerServices::NODE_COMPACT_BLOCKS.bits(), 1 << 16);
 
         let decoded =
             PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 27));

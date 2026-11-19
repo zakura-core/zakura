@@ -4322,3 +4322,301 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .await
     .expect("duplicate receipt regression must finish");
 }
+
+/// An early-relay cache with no best tip, for tests that never publish a block.
+fn test_early_relay() -> EarlyRelay {
+    let (_sender, tip, _change) = zs::ChainTipSender::new(None, &Network::Mainnet);
+    EarlyRelay::new(tip)
+}
+
+/// A deterministic failure that early relay can exempt: an input missing from the parent.
+fn post_auth_failure() -> VerifyBlockError {
+    VerifyBlockError::MissingTransparentInput {
+        parent: block::Hash([7; 32]),
+        outpoint: transparent::OutPoint {
+            hash: zakura_chain::transaction::Hash([8; 32]),
+            index: 0,
+        },
+    }
+}
+
+/// Classifies `error` for an early-relay delivery of `block`, with a state that answers the
+/// eligibility check with `eligibility`.
+async fn classify_early_relay_failure(
+    block: &[u8],
+    relay: &EarlyRelay,
+    eligibility: Result<zs::PreparedMinedRelayEligibility, zs::ValidateContextError>,
+    error: VerifyBlockError,
+) -> VerifyBlockError {
+    let block: Arc<Block> = block.zcash_deserialize_into().expect("test vector decodes");
+    let state = service_fn(move |request: zs::Request| {
+        let eligibility = eligibility.clone();
+        async move {
+            assert!(
+                matches!(request, zs::Request::CheckPreparedMinedRelayEligibility(_)),
+                "unexpected state request: {request:?}"
+            );
+            eligibility
+                .map(zs::Response::PreparedMinedRelayEligibility)
+                .map_err(BoxError::from)
+        }
+    });
+    early_relay_failure(
+        state,
+        &Network::Mainnet,
+        block.into(),
+        None,
+        Some(relay),
+        error,
+    )
+    .await
+}
+
+/// After the header and commitments authenticate against a committed parent, a later failure
+/// is unscored, keeps its class, and rejects the hash for later deliveries.
+#[tokio::test(start_paused = true)]
+async fn authenticated_early_relay_failure_is_unscored_and_rejected() {
+    use zs::PreparedMinedRelayEligibility::{Authorized, CommitFirst};
+
+    let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
+    let hash = Arc::<Block>::zcash_deserialize(block_bytes)
+        .expect("test vector decodes")
+        .hash();
+    for eligibility in [Authorized, CommitFirst] {
+        let relay = test_early_relay();
+        let error =
+            classify_early_relay_failure(block_bytes, &relay, Ok(eligibility), post_auth_failure())
+                .await;
+        assert!(
+            matches!(error, VerifyBlockError::EarlyRelay(_)),
+            "{eligibility:?}: {error:?}"
+        );
+        assert_eq!(error.misbehavior_score(), 0);
+        assert_eq!(
+            error.body_verification_class(),
+            post_auth_failure().body_verification_class()
+        );
+        assert!(relay.is_rejected(hash), "{eligibility:?}");
+    }
+}
+
+/// A deterministic failure that already has no score, such as a duplicate spend, still rejects
+/// an authenticated hash, so redeliveries skip verification. The error itself is unchanged.
+#[tokio::test(start_paused = true)]
+async fn authenticated_unscored_deterministic_failure_is_rejected() {
+    use zs::PreparedMinedRelayEligibility::{Authorized, CommitFirst, Unavailable};
+
+    let duplicate_spend = || {
+        VerifyBlockError::Transaction(TransactionError::DuplicateTransparentSpend(
+            transparent::OutPoint {
+                hash: zakura_chain::transaction::Hash([9; 32]),
+                index: 0,
+            },
+        ))
+    };
+    assert_eq!(duplicate_spend().misbehavior_score(), 0);
+    assert!(is_deterministic_failure(&duplicate_spend()));
+
+    let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
+    let hash = Arc::<Block>::zcash_deserialize(block_bytes)
+        .expect("test vector decodes")
+        .hash();
+    for (eligibility, rejected) in [
+        (Authorized, true),
+        (CommitFirst, true),
+        (Unavailable, false),
+    ] {
+        let relay = test_early_relay();
+        let error =
+            classify_early_relay_failure(block_bytes, &relay, Ok(eligibility), duplicate_spend())
+                .await;
+        assert!(
+            matches!(
+                error,
+                VerifyBlockError::Transaction(TransactionError::DuplicateTransparentSpend(_))
+            ),
+            "{eligibility:?}: {error:?}"
+        );
+        assert_eq!(error.misbehavior_score(), 0);
+        assert_eq!(relay.is_rejected(hash), rejected, "{eligibility:?}");
+    }
+
+    // An authentication failure doesn't give an unscored failure a score.
+    let relay = test_early_relay();
+    let error = classify_early_relay_failure(
+        block_bytes,
+        &relay,
+        Err(zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryRoot {
+                actual: [0; 32],
+                expected: [1; 32],
+            },
+        )),
+        duplicate_spend(),
+    )
+    .await;
+    assert_eq!(error.misbehavior_score(), 0);
+    assert!(!relay.is_rejected(hash));
+}
+
+/// An unscored failure that isn't deterministic needs no state check. The state mock panics if
+/// the check runs.
+#[tokio::test(start_paused = true)]
+async fn unscored_retryable_early_relay_failure_skips_the_state_check() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let state = service_fn(|request: zs::Request| async move {
+        panic!("retryable unscored failures need no state check: {request:?}");
+        #[allow(unreachable_code)]
+        Ok::<zs::Response, BoxError>(zs::Response::Committed(block::Hash([0; 32])))
+    });
+    let error = early_relay_failure(
+        state,
+        &Network::Mainnet,
+        block.into(),
+        None,
+        Some(&test_early_relay()),
+        VerifyBlockError::ParentUnavailable {
+            parent: block::Hash([3; 32]),
+        },
+    )
+    .await;
+    assert!(matches!(error, VerifyBlockError::ParentUnavailable { .. }));
+}
+
+/// Without a committed parent, the failure is unscored but its hash is not rejected, because
+/// the block could not be authenticated.
+#[tokio::test(start_paused = true)]
+async fn unauthenticated_early_relay_failure_without_context_is_unscored() {
+    let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
+    let relay = test_early_relay();
+    let error = classify_early_relay_failure(
+        block_bytes,
+        &relay,
+        Ok(zs::PreparedMinedRelayEligibility::Unavailable),
+        post_auth_failure(),
+    )
+    .await;
+    assert!(matches!(error, VerifyBlockError::EarlyRelayUnavailable(_)));
+    assert_eq!(error.misbehavior_score(), 0);
+    assert!(!relay.is_rejected(Arc::<Block>::zcash_deserialize(block_bytes).unwrap().hash()));
+}
+
+/// A block whose header or commitments fail authentication keeps a score.
+#[tokio::test(start_paused = true)]
+async fn failed_early_relay_authentication_is_scored() {
+    let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
+    let relay = test_early_relay();
+    let error = classify_early_relay_failure(
+        block_bytes,
+        &relay,
+        Err(zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryRoot {
+                actual: [0; 32],
+                expected: [1; 32],
+            },
+        )),
+        post_auth_failure(),
+    )
+    .await;
+    assert!(
+        matches!(error, VerifyBlockError::EarlyRelayAdmission { .. }),
+        "{error:?}"
+    );
+    assert!(error.misbehavior_score() > 0);
+    assert!(!relay.is_rejected(Arc::<Block>::zcash_deserialize(block_bytes).unwrap().hash()));
+}
+
+/// Pre-NU5 blocks never authenticate early, so their failures keep their scores without a
+/// state check. The state mock panics if the check runs.
+#[tokio::test(start_paused = true)]
+async fn pre_nu5_early_relay_failure_keeps_its_score() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let state = service_fn(|request: zs::Request| async move {
+        panic!("pre-NU5 failures need no state check: {request:?}");
+        #[allow(unreachable_code)]
+        Ok::<zs::Response, BoxError>(zs::Response::Committed(block::Hash([0; 32])))
+    });
+    let error = early_relay_failure(
+        state,
+        &Network::Mainnet,
+        block.into(),
+        None,
+        Some(&test_early_relay()),
+        post_auth_failure(),
+    )
+    .await;
+    assert!(matches!(
+        error,
+        VerifyBlockError::MissingTransparentInput { .. }
+    ));
+    assert_eq!(error.misbehavior_score(), 100);
+}
+
+/// A recently rejected hash skips verification only for a body that matches the header. The
+/// block hash covers only the header, so a different body under the same hash is verified and
+/// scored for its own fault.
+#[tokio::test(start_paused = true)]
+async fn rejected_early_relay_hash_skips_only_an_authenticated_body() {
+    use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let hash = block.hash();
+
+    let verifier = |relay: EarlyRelay| {
+        let state = service_fn(|request: zs::Request| async move {
+            let response = match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckPreparedMinedRelayEligibility(_) => {
+                    zs::Response::PreparedMinedRelayEligibility(
+                        zs::PreparedMinedRelayEligibility::Authorized,
+                    )
+                }
+                _ => panic!("a rejected redelivery needs no other state request: {request:?}"),
+            };
+            Ok::<_, BoxError>(response)
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("a rejected redelivery must not verify transactions");
+        });
+        SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .with_early_relay(Some(relay))
+    };
+
+    let relay = test_early_relay();
+    relay.reject(hash);
+    let error = verifier(relay.clone())
+        .oneshot(Request::CommitEarlyRelay(Arc::new(block.clone()).into()))
+        .await
+        .expect_err("the hash was rejected");
+    assert!(
+        matches!(error, VerifyBlockError::EarlyRelayRejected(rejected) if rejected == hash),
+        "{error:?}"
+    );
+    assert_eq!(error.misbehavior_score(), 0);
+
+    // The same header with a different body is a payload mismatch, not a rejected redelivery.
+    let mut tampered = block;
+    tampered
+        .transactions
+        .push(shielded_spend_without_transparent_inputs());
+    assert_eq!(tampered.hash(), hash);
+    let error = verifier(relay)
+        .oneshot(Request::CommitEarlyRelay(Arc::new(tampered).into()))
+        .await
+        .expect_err("the body doesn't match the header");
+    assert_eq!(
+        error.body_verification_class(),
+        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+    );
+    assert!(error.misbehavior_score() > 0, "{error:?}");
+}

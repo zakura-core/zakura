@@ -475,6 +475,22 @@ pub struct Config {
     /// Experimental.
     pub advert_window_full_size_bytes: u64,
 
+    /// Enables compact block relay and early block relay with legacy peers that support them.
+    ///
+    /// Both features follow the draft Compact Block Relay ZIP (zcash/zips#1429), which Zebra
+    /// implements. They are negotiated together on service bit 16
+    /// ([`PeerServices::NODE_COMPACT_BLOCKS`]). On a negotiated connection, this node advertises
+    /// and serves a tip child after full semantic verification, before its contextual commit
+    /// finishes. It also stops scoring a negotiated peer for a block that later fails
+    /// transaction or contextual validation, once the block's header and commitments check out
+    /// against a committed parent.
+    ///
+    /// Connections without the bit, and the Zakura P2P v2 stack, keep committed-block relay.
+    /// Defaults to off.
+    ///
+    /// [`PeerServices::NODE_COMPACT_BLOCKS`]: crate::PeerServices::NODE_COMPACT_BLOCKS
+    pub compact_block_relay: bool,
+
     /// The delay before announcing a block to peers outside the initial group.
     ///
     /// The block size sets the initial group's size, not this delay. Each broadcast measures the
@@ -1238,6 +1254,7 @@ impl Default for Config {
             advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+            compact_block_relay: false,
             advert_delay: DEFAULT_ADVERT_DELAY,
             push_relayed_blocks: false,
             tcp_warmup: TcpWarmupConfig::default(),
@@ -1450,6 +1467,7 @@ struct DConfig {
     advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
+    compact_block_relay: bool,
     /// `None` if the config does not set it, so the delay falls back to `advert_delay_max`.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -1500,6 +1518,7 @@ impl Default for DConfig {
             advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
+            compact_block_relay: config.compact_block_relay,
             advert_delay: None,
             advert_delay_max: None,
             advert_delay_min: None,
@@ -1580,6 +1599,7 @@ impl From<Config> for DConfig {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            compact_block_relay,
             advert_delay,
             push_relayed_blocks,
             tcp_warmup,
@@ -1630,6 +1650,7 @@ impl From<Config> for DConfig {
             advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            compact_block_relay,
             advert_delay: Some(advert_delay),
             advert_delay_max: None,
             advert_delay_min: None,
@@ -1668,6 +1689,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            compact_block_relay,
             advert_delay,
             advert_delay_max,
             advert_delay_min: _,
@@ -1851,6 +1873,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            compact_block_relay,
             advert_delay,
             push_relayed_blocks,
             tcp_warmup,

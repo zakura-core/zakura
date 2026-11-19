@@ -97,7 +97,7 @@ fn available(bytes: &[u8], peer: PeerSocketAddr) -> zn::Response {
     ))])
 }
 
-fn assert_copy((block, source, _): BlockCandidate, peer: PeerSocketAddr) {
+fn assert_copy((block, source, _, _): BlockCandidate, peer: PeerSocketAddr) {
     assert_eq!(block.hash(), hash());
     assert_eq!(source, Some(peer));
 }
@@ -682,7 +682,7 @@ async fn a_height_rejection_leaves_the_other_dispatch_eligible() {
                 late_addr,
             )))
             .unwrap();
-        let (accepted, source, height) = download.await.unwrap().unwrap().first;
+        let (accepted, source, height, _) = download.await.unwrap().unwrap().first;
         assert_eq!(
             (accepted.hash(), source, height),
             (block.hash(), Some(late_addr), block::Height(1))
@@ -810,7 +810,7 @@ async fn native_fallback_only_runs_while_the_download_needs_a_body() -> Result<(
                 .unwrap(),
         }
         if let Some(download) = download {
-            let (body, _, _) = tokio::time::timeout(TEST_NET_TIMEOUT, download)
+            let (body, _, _, _) = tokio::time::timeout(TEST_NET_TIMEOUT, download)
                 .await??
                 .map_err(|(error, _)| error)?;
             assert_eq!(body.hash(), hash());

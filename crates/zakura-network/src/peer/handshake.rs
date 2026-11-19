@@ -218,6 +218,13 @@ pub struct ConnectionInfo {
     /// requests are still shed for backpressure, but the connection is not
     /// severed). See [`Connection::handle_inbound_overload`].
     pub is_protected_peer: bool,
+
+    /// Whether both ends advertised [`PeerServices::NODE_COMPACT_BLOCKS`], and the peer is not
+    /// protected.
+    ///
+    /// On these connections, inbound `getdata` may be served early bodies, and blocks this
+    /// node downloads are verified as early-relay deliveries.
+    pub early_block_relay: bool,
 }
 
 /// The peer address that we are handshaking with.
@@ -765,6 +772,15 @@ where
     }
 }
 
+/// Returns true when both version messages advertise compact block relay, which also enables
+/// early block relay.
+///
+/// Isolated connections advertise no services, so they never negotiate it.
+fn negotiated_early_block_relay(local: &VersionMessage, remote: &VersionMessage) -> bool {
+    local.services.contains(PeerServices::NODE_COMPACT_BLOCKS)
+        && remote.services.contains(PeerServices::NODE_COMPACT_BLOCKS)
+}
+
 /// Returns the misbehavior score of an inbound message that failed to deserialize.
 fn inbound_error_misbehavior_score(error: &SerializationError) -> u32 {
     // Strict parsing rejects this fault before semantic verification can assign
@@ -1017,12 +1033,20 @@ where
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
 
     // Limit containing struct size, and avoid multiple duplicates of 300+ bytes of data.
+    // A protected peer's block requests use the source-routed path, which serves only committed
+    // and pending blocks, so it never negotiates early relay.
+    let early_block_relay =
+        !is_protected_peer && negotiated_early_block_relay(&our_version, &remote);
+    if early_block_relay {
+        metrics::counter!("zakura.p2p.handshake.early_block_relay.negotiated").increment(1);
+    }
     let connection_info = Arc::new(ConnectionInfo {
         connected_addr: *connected_addr,
         remote,
         local: our_version,
         negotiated_version,
         is_protected_peer,
+        early_block_relay,
     });
 
     debug!(
@@ -2065,10 +2089,12 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 
 /// Register any advertised or missing inventory in `msg` for `connected_addr`.
 ///
-/// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
-/// a peer that already has the block. Unlike the inventory registry, this covers every block
-/// `inv`, solicited or not, and connections without a transient address. Requests for block
-/// bodies withdraw the peer's earlier claim to have those blocks.
+/// Also records the blocks this peer announces or sends in `announced_blocks`, so block gossip
+/// can skip a peer that already has the block. Unlike the inventory registry, this covers every
+/// block `inv`, solicited or not, and connections without a transient address. A peer that sent
+/// a block body, including one this node requested during sync, is never advertised that block
+/// again, so early block relay doesn't echo a block to its supplier. Requests for block bodies
+/// withdraw the peer's earlier claim to have those blocks.
 ///
 /// An `inv` that names exactly one block is a new block announcement, and is written to
 /// `gossip_trace`. One that names several is the answer to a query.
@@ -2086,6 +2112,7 @@ pub(crate) async fn register_inventory_status(
                 gossip_trace.block_inv_received(hash);
             }
         }
+        Ok(Message::Block(block)) => announced_blocks.record([block.hash()]),
         // A request for the body or a missing response contradicts an earlier announcement.
         Ok(Message::GetData(items) | Message::NotFound(items)) => {
             announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));

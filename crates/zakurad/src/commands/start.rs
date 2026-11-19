@@ -663,6 +663,10 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let early_relay = config
+            .network
+            .compact_block_relay
+            .then(|| zakura_consensus::EarlyRelay::new(latest_chain_tip.clone()));
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -673,6 +677,7 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
+                .with_early_relay(early_relay.clone())
                 .with_second_block_request(config.network.block_source_score.second_request),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
@@ -753,6 +758,7 @@ impl StartCmd {
                 state.clone(),
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
+                early_relay.clone(),
             )
             .boxed()
             .await;
@@ -1030,7 +1036,7 @@ impl StartCmd {
                 sync_status.clone(),
                 latest_chain_tip.clone(),
                 block_announcements,
-                block_adverts,
+                block_adverts.clone(),
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
             )
@@ -1041,6 +1047,15 @@ impl StartCmd {
             block_gossip_task_handle,
             error_exit_status,
         );
+
+        if let Some(early_relay) = early_relay {
+            info!("spawning early-relay block gossip task");
+            let early_gossip_task_handle = spawn_erased(
+                sync::gossip_early_relay_blocks(sync_status.clone(), early_relay, block_adverts)
+                    .in_current_span(),
+            );
+            node_tasks.track(&early_gossip_task_handle);
+        }
 
         // The pool core decides and announces in its own tasks, so it runs
         // them in the queue checker's and the gossip task's places.

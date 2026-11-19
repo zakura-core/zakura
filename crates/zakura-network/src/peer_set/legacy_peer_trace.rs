@@ -5,10 +5,11 @@
 //! that peer; `advertised` means the selected peer recently sent an `inv` for that exact hash.
 //! An `advertised` row also says how the peer was chosen: `candidates` is the number of idle
 //! peers that had announced the block, `score_ms` the chosen peer's expected answer time and
-//! `best_score_ms` the lowest among the candidates (see `[network.block_source_score]`). A score
-//! is missing for a peer whose answers have not been measured yet.
+//! `best_score_ms` the lowest among the candidates (see
+//! `[network.block_download_score_and_hedge]`). A score is missing for a peer whose answers have
+//! not been measured yet.
 //! A `hedge` row is a second request for a block whose first request had not delivered it yet
-//! (see `[network.block_source_score] second_request`). `hedge_reason` says why it was sent:
+//! (see `[network.block_download_score_and_hedge]`). `hedge_reason` says why it was sent:
 //! `predicted` when another announcer was expected to deliver clearly sooner, `stalled` when the
 //! first request ran well past its expected time. `first_request_waited_ms` is how long the first
 //! request had been outstanding since dispatch to a peer, excluding local routing queue time, and

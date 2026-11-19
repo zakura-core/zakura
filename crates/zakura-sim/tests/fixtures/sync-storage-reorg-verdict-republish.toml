@@ -1,0 +1,19 @@
+# The committed fuzz input `sync-storage-reorg-verdict-republish.bin`: the
+# harness that runs it, the generator version it was built for, and its
+# SHA-256. Its first two bytes pick the saved `reorg-verdict` scenario,
+# and its run takes two new body-work epochs. The rest is Plan bytes from the
+# simulator tests' fuzz inputs: `regenerate_reorg_verdict_republish_input`
+# in sync_harness.rs writes the first one whose run, under
+# `keep-work-queue-authority.patch`, publishes a request under the first
+# new epoch after the sequencer applied the second. Rerun it when a sync
+# change moves the input off that order, as #2321 moved
+# `sync-storage-reorg-submit.bin`.
+harness = "sync/storage"
+generator = 3
+sha256 = "44436d4996fb7e530ec5679402e7c5c958f7366aa7ee1916abfccf5fbee3f2ec"
+scenario_sha256 = "078600068283ac3c5ae60d96e3af7fdf28c9c3e9d0e618fa9c1d02b1bf616eb1"
+source = "crates/zakura-sim/tests/sync_harness.rs"
+
+[[witness]]
+property = "sync/block-requests-follow-headers"
+expect = "holds"

@@ -41,6 +41,11 @@ MEMPOOL_METRICS = (
     "mempool_full_queue_per_peer_total",
 )
 
+# Counters whose label says why they moved. Each value of the label is kept as
+# its own series as well as in the total, so a run shows why verification
+# failed, not just how often.
+BREAKDOWN_LABELS = {"mempool_failed_verify_tasks_total": "reason"}
+
 # Must match mempool-load-lab.py's NODE_IP_BASE.
 NODE_IP_BASE = 101
 
@@ -89,6 +94,11 @@ def parse_prometheus(text: str, wanted: tuple[str, ...]) -> dict[str, float]:
             continue
         # Sum across label sets (e.g. per-peer counters).
         out[base] = out.get(base, 0.0) + value
+        label = BREAKDOWN_LABELS.get(base)
+        match = label and re.search(rf'{label}="([^"]*)"', name)
+        if match:
+            key = f'{base}{{{label}="{match.group(1)}"}}'
+            out[key] = out.get(key, 0.0) + value
     return out
 
 
@@ -200,7 +210,9 @@ def propagation_stats(first_seen: dict[str, dict[str, float]], node_count: int) 
 # mined block supersedes; Kresko detects this and rebuilds. Counting these as
 # node rejects makes a healthy run look like a mempool regression -- at low
 # submission counts a single one is several percent.
-WORKLOAD_ERROR_CLASSES = frozenset({"unknown_orchard_anchor", "anchor_rejection"})
+WORKLOAD_ERROR_CLASSES = frozenset(
+    {"unknown_orchard_anchor", "unknown_ironwood_anchor", "anchor_rejection"}
+)
 
 # Event names from Kresko's src/txblast/shielded.rs.
 EVENT_COUNTERS = {
@@ -276,6 +288,7 @@ def tip_convergence(samples: list[dict], nodes: list[dict]) -> dict:
     Convergence alone is not evidence of health: if block production dies
     mid-window every node freezes at the same height, which looks perfectly
     converged. `advanced` is what distinguishes a live chain from a dead one.
+    `blocks_mined` is how far the fastest node's tip moved during the window.
     """
     first: dict[str, int] = {}
     last: dict[str, int] = {}
@@ -291,14 +304,16 @@ def tip_convergence(samples: list[dict], nodes: list[dict]) -> dict:
             silent_tail[node] = silent_tail.get(node, 0) + 1
     heights = list(last.values())
     growth = {node: last[node] - first[node] for node in last}
+    blocks_mined = max(growth.values(), default=0)
     return {
         "heights": last,
         "height_growth": growth,
+        "blocks_mined": blocks_mined,
         "reporting_nodes": len(last),
         "expected_nodes": len(nodes),
         "unresponsive_at_end": sorted(n for n, c in silent_tail.items() if c > 0),
         "spread": (max(heights) - min(heights)) if heights else None,
-        "advanced": bool(growth) and max(growth.values()) > 0,
+        "advanced": blocks_mined > 0,
         "converged": bool(heights)
         and len(last) == len(nodes)
         and (max(heights) - min(heights)) <= 1,
@@ -377,7 +392,7 @@ BACKPRESSURE_HINTS = {
     "mempool_queued_transactions_total": "Cumulative queued. Compare with submitted to see re-queues.",
     "mempool_gossiped_transactions_total": "Cumulative gossiped to peers. Should scale with submissions x peers.",
     "mempool_rejected_transaction_ids": "Size of the rejected-ID cache, NOT a count of rejected workload transactions.",
-    "mempool_failed_verify_tasks_total": "Verification tasks that failed. Non-zero deserves a look.",
+    "mempool_failed_verify_tasks_total": "Verification tasks that failed, with a row per reason below. Non-zero deserves a look.",
     "mempool_full_queue_per_peer_total": "Times a peer's queue was full. The clearest backpressure signal.",
 }
 
@@ -403,7 +418,7 @@ def render_markdown(result: dict) -> str:
     # (label, rendered value, how to read it). The hints exist because several
     # of these numbers are easy to misread: `Confirmed` looks like a success
     # rate but is bounded by block production, and effective throughput looks
-    # like a shortfall against the target rate but is bounded by proving.
+    # like a shortfall against the target rate but follows blocks mined.
     rows = [
         (
             "Transactions submitted",
@@ -440,8 +455,14 @@ def render_markdown(result: dict) -> str:
         (
             "Effective throughput",
             f"{fmt_num(result['effective_tx_per_sec'])} tx/s",
-            "Bounded by Orchard proving, not the mempool. Compare legs against "
-            "each other, never against the requested rate.",
+            "Follows blocks mined, because each in-flight transaction waits for "
+            "a block. Never compare it with the requested rate.",
+        ),
+        (
+            "Blocks mined",
+            fmt_num(convergence["blocks_mined"]),
+            "How far the tip moved during the window. Swings with mining luck, "
+            "and throughput and confirm delay follow it.",
         ),
         (
             "Confirm delay p50 / p95",
@@ -490,7 +511,8 @@ def render_markdown(result: dict) -> str:
     ]
 
     lines += [
-        f"`{meta.get('sha', 'unknown')}` | {meta.get('node_count')} nodes | "
+        f"`{meta.get('sha', 'unknown')}` | {meta.get('profile', 'default')} setup | "
+        f"{meta.get('node_count')} nodes | "
         f"{meta.get('duration_secs')}s | target {meta.get('tx_rate')} tx/s",
         "",
         "| Metric | Value | How to read it |",

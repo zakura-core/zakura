@@ -56,7 +56,9 @@ use super::{
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         publication::{Arming, PublicationEvidence},
-        recovery::{RecoveryEvidence, RecoveryInputs, RecoveryProgress, RECOVERY_BOUND},
+        recovery::{
+            PrefixCutoff, RecoveryEvidence, RecoveryInputs, RecoveryProgress, RECOVERY_BOUND,
+        },
         reservation::ReservationEvidence,
         retirement::RetirementEvidence,
         round_life::RoundLifeEvidence,
@@ -87,7 +89,7 @@ use crate::{
         header_sync_progress::{bounded_adversary_progress, recovery_deadline},
         session::{honest_never_punished, HonestPeers},
     },
-    observe::StorageFact,
+    observe::{ReactorFact, StorageFact},
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
@@ -95,7 +97,7 @@ use crate::{
     },
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Kind, Pending,
-        Property, PropertyId, Source, Sources, Status, Verdict,
+        Property, PropertyId, Source, Sources, Status, TriggerHistory, Verdict,
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
@@ -1241,7 +1243,10 @@ impl Subsystem for Storage {
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
             recovery: if recovery_source(scenario).is_some() {
-                RecoveryEvidence::bounded(&scenario.policy.disruptions)
+                RecoveryEvidence::bounded(
+                    &scenario.policy.disruptions,
+                    PrefixCutoff::Steps(storage_config().budget),
+                )
             } else {
                 RecoveryEvidence::default()
             },
@@ -1373,7 +1378,12 @@ impl Subsystem for Storage {
             ));
         }
         let cooldown = nodes[0].startup.config.unproductive_peer_cooldown;
-        let faults = FaultEvidence::new(attributions, cooldowns.clone(), cooldown);
+        let faults = FaultEvidence::new(
+            attributions,
+            cooldowns.clone(),
+            ports.ends.clone(),
+            cooldown,
+        );
         let names: Vec<_> = nodes
             .iter()
             .map(|node| (node.id.clone(), node.name.clone()))
@@ -1553,6 +1563,11 @@ pub struct WireScenario {
     pub peers: Vec<PeerSpec>,
     /// How the run completes the node's storage operations.
     pub policy: Policy,
+    /// The run's step budget in place of [`wire_config`]'s, for a history
+    /// the default budget can't reach. `None`, and absent from the JSON,
+    /// leaves the budget to [`Harness::config`](crate::Harness::config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
 }
 
 impl WireScenario {
@@ -1576,6 +1591,7 @@ impl Default for WireScenario {
             node: Chain::default(),
             peers: vec![PeerSpec::dialing()],
             policy: Policy::converging(),
+            budget: None,
         }
     }
 }
@@ -1773,8 +1789,9 @@ impl Subsystem for HeaderWire {
     type Scenario = WireScenario;
     type Prepared = WirePorts;
 
-    /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// [`wire_config`], with the scenario's own budget if it names one, or
+    /// else twice its budget for a scenario with status bursts or an
+    /// over-credit objects page. Emptying a `Status` bucket
     /// takes about 600 frames, and the node about 40 steps to read each. The
     /// node must read the whole 45 KB page before it can count objects, so
     /// with every datagram delivered at once, that run spends up to about
@@ -1788,10 +1805,10 @@ impl Subsystem for HeaderWire {
         });
         let config = wire_config();
         RunConfig {
-            budget: if burst {
-                2 * config.budget
-            } else {
-                config.budget
+            budget: match (scenario.budget, burst) {
+                (Some(budget), _) => budget,
+                (None, true) => 2 * config.budget,
+                (None, false) => config.budget,
             },
             ..config
         }
@@ -1926,6 +1943,7 @@ impl Subsystem for HeaderWire {
         let faults = FaultEvidence::new(
             attributions,
             cooldowns,
+            ports.ends.clone(),
             header.startup.config.unproductive_peer_cooldown,
         );
         let (observer, tap) = TransportTap::with_sessions(
@@ -2269,12 +2287,13 @@ impl Storage {
 /// Ends a recovering `header-sync/storage` run once its recovery concludes,
 /// so it ends idle rather than at its budget (Rule 13): once
 /// `header-sync/bounded-adversary-progress` has nothing owed
-/// ([`RecoveryProgress::Concluded`]), once the clock has passed an owed
-/// recovery's deadline, which its expiry needs, or, with no `Recover`
-/// picked yet, once the run has taken [`storage_config`]'s budget, which a
-/// prefix whose recover never comes ran to before. Its pick begins the node
-/// under test's stop, as a `Shutdown` step's does, and a harness task then
-/// stops every node ([`Topology::finish`]). It offers no time boundary.
+/// ([`RecoveryProgress::Concluded`]), or once the clock has passed an owed
+/// recovery's deadline, which its expiry needs. It never ends a run whose
+/// `Recover` wasn't picked: the prefix ends at [`storage_config`]'s budget
+/// at the latest ([`PrefixCutoff`]), and the control source then offers the
+/// `Recover` whatever its trigger (#2355). Its pick begins the node under
+/// test's stop, as a `Shutdown` step's does, and a harness task then stops
+/// every node ([`Topology::finish`]). It offers no time boundary.
 ///
 /// A run that reaches [`RECOVERY_BUDGET`] after its `Recover` pick with no
 /// `recovered` pick yet fails as a harness failure instead. Recovery's
@@ -2293,7 +2312,7 @@ struct RecoveryFinish {
     topology: Rc<Topology>,
     /// Wakes the task that carries the finish out.
     to_task: watch::Sender<bool>,
-    /// The last step observed.
+    /// The last step observed, for [`RECOVERY_BUDGET`].
     step: u64,
     /// Set once the finish was picked.
     done: bool,
@@ -2309,9 +2328,7 @@ impl RecoveryFinish {
         match self.recovery.progress(&self.adoption, &self.ends) {
             RecoveryProgress::Concluded => true,
             RecoveryProgress::Owed { since } => now > recovery_deadline(since),
-            RecoveryProgress::Pending => {
-                self.recovery.started().is_none() && self.step >= storage_config().budget
-            }
+            RecoveryProgress::Pending => false,
         }
     }
 }
@@ -2334,7 +2351,7 @@ impl ActionSource for RecoveryFinish {
         self.to_task.send_replace(true);
     }
 
-    /// Notes the step, for the prefix's budget, and fails the run at
+    /// Notes the step, and fails the run at
     /// [`RECOVERY_BUDGET`] with the `recovered` pick still to come, as
     /// [`RecoveryFinish`] says.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
@@ -2394,7 +2411,8 @@ pub const FAMILY: &str = "header-sync";
 /// [`OUTSTANDING_WORK_BOUNDED`], whose tap only the storage harness
 /// watches, then
 /// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
-/// sender properties (M5-Q13), then `session/honest-never-punished`, then
+/// sender properties (M5-Q13), each judged by its trigger history, then
+/// `session/honest-never-punished`, then
 /// `header-sync/honest-progress` (hdr-8), which only the
 /// [`progress_fixture`] can apply. Header sync's adapter observes none of the downstream templates' effects, so it
 /// registers none of them. `header-sync/storage` doesn't register
@@ -2404,11 +2422,24 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
     properties.retain(|property| property.id.as_str() != OUTSTANDING_WORK_BOUNDED);
     properties.push(header_fault_penalized());
-    properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
-    properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
+    let generated = table_properties(FAMILY, &RegtestMessage::LAYOUT)
+        .into_iter()
+        .chain(sender_properties(FAMILY, &RegtestMessage::LAYOUT))
+        .map(|property| Property {
+            witness: Some(TriggerHistory::LogOf(generated_trigger)),
+            ..property
+        });
+    properties.extend(generated);
     properties.push(honest_never_punished());
     properties.push(crate::domain::header_sync_progress::honest_progress());
     properties
+}
+
+/// Whether `log` reaches the trigger history of header sync's generated
+/// property `id`, over the layout [`wire_properties`] registers it from
+/// ([`crate::table::generated_trigger`]).
+fn generated_trigger(id: &PropertyId, log: &ObservationLog) -> bool {
+    crate::table::generated_trigger(&RegtestMessage::LAYOUT, id, log)
 }
 
 /// The mirror `scenario`'s `Recover` step names, if it has one.
@@ -2491,7 +2522,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::View],
             status: Status::Active,
             check: check_direct_dispatch::<S>,
-            witness: None,
+            witness: Some(TriggerHistory::View(storage_call_dispatched)),
         },
         chunk_budget_bound(),
         teardown_returns_baseline(),
@@ -2606,6 +2637,35 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
     }
 }
 
+/// [`DIRECT_DISPATCH`]'s trigger: a reactor dispatched a storage call,
+/// either to the node's port, whose header storage logs a submission tagged
+/// with a call the reactor's tap logged dispatching, or to its action
+/// channel, which sets the dispatch guard's flag. So the rule had a call to
+/// judge. The publisher's submissions carry no reactor call, so serving
+/// headers alone meets nothing here.
+fn storage_call_dispatched(view: &StorageView, log: &ObservationLog) -> bool {
+    if view.direct_dispatch_broken {
+        return true;
+    }
+    let dispatched: BTreeSet<u64> = log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Dispatched { call, .. },
+                ..
+            } => Some(*call),
+            _ => None,
+        })
+        .collect();
+    log.entries().iter().any(|entry| {
+        matches!(
+            operation_fact(HEADER_SERVICE, &entry.obs),
+            Some(StorageFact::Submitted { call: Some(call), .. }) if dispatched.contains(call)
+        )
+    })
+}
+
 /// [`HEADER_FAULT_PENALIZED`], active.
 fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
     Property {
@@ -2618,8 +2678,20 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
         needs: &[Source::Storage, Source::View],
         status: Status::Active,
         check: check_header_fault_penalized::<S>,
-        witness: None,
+        witness: Some(TriggerHistory::View(penalty_owed)),
     }
+}
+
+/// [`HEADER_FAULT_PENALIZED`]'s trigger: a failed prepare or apply that
+/// owes a penalty delivered its reply to the reactor, which took it, left
+/// it untaken, or dropped it without the harness stopping the node
+/// ([`FaultEvidence::delivered`]), so the rule had something to judge. A
+/// log whose evidence can't be read owes nothing here, and the check itself
+/// reports why.
+fn penalty_owed(view: &StorageView, log: &ObservationLog) -> bool {
+    view.faults
+        .delivered(log.entries())
+        .is_ok_and(|delivered| !delivered.is_empty())
 }
 
 /// What [`HEADER_FAULT_PENALIZED`] expects, as its violations report it.
@@ -2748,6 +2820,28 @@ mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
 
+    /// A wire scenario's own budget replaces the harness's, burst or not,
+    /// and an unset one is left out of the JSON, so every committed
+    /// scenario's digest stays.
+    #[test]
+    fn a_wire_scenario_budget_replaces_the_harness_budget() {
+        let mut scenario = WireScenario::default();
+        assert_eq!(HeaderWire::config(&scenario).budget, wire_config().budget);
+        let json = serde_json::to_value(&scenario).unwrap();
+        assert!(json.get("budget").is_none(), "{json}");
+        scenario.budget = Some(120_000);
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.peers[0].script.push(PeerAction::Act {
+            act: Act::StatusBurst,
+        });
+        assert_eq!(HeaderWire::config(&scenario).budget, 120_000);
+        scenario.budget = None;
+        assert_eq!(
+            HeaderWire::config(&scenario).budget,
+            2 * wire_config().budget
+        );
+    }
+
     /// The fork fixture's window constants restate production's, and its
     /// header cap leaves more than a refill batch of window.
     #[test]
@@ -2849,6 +2943,18 @@ mod tests {
         id: u64,
         taken: bool,
     ) {
+        log_failure(log, attributions, id, true, taken);
+    }
+
+    /// [`log_fault`], with its reply reaching the reactor only if
+    /// `delivered`.
+    fn log_failure(
+        log: &mut ObservationLog,
+        attributions: &crate::storage::FaultAttributions,
+        id: u64,
+        delivered: bool,
+        taken: bool,
+    ) {
         use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
 
         let point = |height| StoragePoint {
@@ -2894,7 +3000,7 @@ mod tests {
                 id,
                 outcome: "engine".to_owned(),
                 result: failed,
-                delivered: true,
+                delivered,
                 generation: 0,
                 state: String::new(),
             },
@@ -2943,8 +3049,12 @@ mod tests {
     fn settled_faults(attributions: crate::storage::FaultAttributions) -> FaultEvidence {
         use crate::{IdleStatus, Outcome};
 
-        let faults =
-            FaultEvidence::new(attributions, Default::default(), std::time::Duration::ZERO);
+        let faults = FaultEvidence::new(
+            attributions,
+            Default::default(),
+            EndEvidence::default(),
+            std::time::Duration::ZERO,
+        );
         faults.end(&RunEnd {
             outcome: Outcome::Idle {
                 status: IdleStatus::Quiescent,
@@ -2988,6 +3098,73 @@ mod tests {
             &actual,
             &["UntakenFault: operation 4 ", "UntakenFault: operation 7 "],
         );
+    }
+
+    /// Logs the reactor's teardown dropping call `call`, with any reply it
+    /// held.
+    fn log_dropped(log: &mut ObservationLog, call: u64) {
+        log.push(Observation::Reactor {
+            instance: 0,
+            seq: 0,
+            storage_seq: 0,
+            node: "node".to_owned(),
+            event: crate::observe::ReactorFact::CallEnded {
+                call,
+                end: "dropped".to_owned(),
+                op: Some(call),
+            },
+        });
+    }
+
+    /// Whether [`HEADER_FAULT_PENALIZED`]'s trigger holds over what
+    /// `history` logs, in a settled run the harness stopped if `stopped`.
+    fn penalty_triggered(
+        stopped: bool,
+        history: impl FnOnce(&mut ObservationLog, &crate::storage::FaultAttributions),
+    ) -> bool {
+        use crate::harness::header_node::fault::tests::{evidence_ending, shutdown};
+
+        // A drop the harness's stop explains is stamped after its
+        // `Shutdown` (see `FaultEvidence::dropped_in_stop`).
+        let ends = if stopped {
+            vec![
+                shutdown(),
+                crate::harness::header_node::ends::EndFact::CallDropped { call: 1 },
+            ]
+        } else {
+            Vec::new()
+        };
+        let faults = evidence_ending(&[], &ends);
+        let mut log = ObservationLog::default();
+        history(&mut log, faults.attributions());
+        penalty_owed(&FaultsOnly(faults).view(), &log)
+    }
+
+    /// [`HEADER_FAULT_PENALIZED`]'s trigger holds for every header-peer
+    /// fault whose reply reached the reactor, since the property judges
+    /// each: one it took, one it left untaken, and one its teardown dropped
+    /// without the harness stopping the node. A drop the harness's stop
+    /// explains and a reply that never reached the reactor leave nothing to
+    /// judge.
+    #[test]
+    fn every_delivered_fault_meets_the_penalty_trigger() {
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, true);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+        }));
+        assert!(penalty_triggered(false, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(true, |log, blamed| {
+            log_fault(log, blamed, 1, false);
+            log_dropped(log, 1);
+        }));
+        assert!(!penalty_triggered(false, |log, blamed| {
+            log_failure(log, blamed, 1, false, false);
+        }));
     }
 
     /// A harness whose view holds only a recovery and the adoption and end

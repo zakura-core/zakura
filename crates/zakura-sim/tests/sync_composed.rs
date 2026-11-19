@@ -103,13 +103,23 @@ fn each_slot_decodes_to_its_step() {
 }
 
 /// Mirror 0's connection closes after the second admission, the chain
-/// grows by one block, and each mirror range read stalls for 3 s. The run
-/// violates nothing and reaches no harness failure.
+/// grows by one block, and each mirror range read stalls for 3 s. Both
+/// steps run, in order, and the run violates nothing and reaches no
+/// harness failure.
 #[test]
 fn a_composed_close_growth_and_stall_holds() {
     let input = prefix(&[[1, 0, 0b0000_0101], [3, 0, 0], [5, 0b0000_0100, 1]]);
     let entry = harness::find("sync/composed").unwrap();
     let run = run_bytes::<SyncComposed>(&input, &mut NullSink, None);
+    let steps: Vec<_> = run
+        .report()
+        .expect("the harness runs the scenario")
+        .picks
+        .iter()
+        .map(|pick| pick.identity.as_str())
+        .filter(|identity| identity.ends_with(":close-if-linked") || identity.ends_with(":grow"))
+        .collect();
+    assert_eq!(steps, ["peer:mirror-0:close-if-linked", "peer:chain:grow"]);
     let classified = classify(entry, &run);
     assert_eq!(classified.outcome, ExploreOutcome::Clean, "{classified:?}");
 }

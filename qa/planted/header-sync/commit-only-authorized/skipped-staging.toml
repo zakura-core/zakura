@@ -1,0 +1,14 @@
+# `PeerWorkQueue::stage_page` takes a page's capacity from its round's
+# reservation without adding the page to the round, and drops the queue's
+# debug assertion that would catch the same mismatch, as a build without
+# debug assertions does. The staging report then shows the round holding
+# fewer headers than it staged. The required failure is `UnstagedPage`.
+# `stored-order` stores the page, reversed. The reactor, the subscriber
+# and the queue decide how the witness's rounds stage, so a change there
+# can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

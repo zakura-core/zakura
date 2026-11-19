@@ -40,6 +40,7 @@ def build_report(events: list[dict]) -> dict:
     }
     node_names = list(start.get("nodes", []))
     missed_by_node: Counter[str] = Counter()
+    block_first_by_node: Counter[str] = Counter()
     spreads = []
     by_submit: dict[str, Counter[str]] = defaultdict(Counter)
     by_impl: dict[str, Counter[str]] = defaultdict(Counter)
@@ -49,12 +50,18 @@ def build_report(events: list[dict]) -> dict:
         tx["mined_height"] = drain.get("mined_height")
         tx["confirmations"] = drain.get("confirmations", 0)
         tx["mined"] = tx["confirmations"] > 0
-        missing = tx.get("missing") or [
-            name for name in node_names if name not in tx.get("first_seen", {})
-        ]
-        tx["missing"] = missing
-        missed_by_node.update(missing)
-        seen_values = list(tx.get("first_seen", {}).values())
+        in_mempool = tx.get("first_seen", {})
+        in_block = tx.get("seen_in_block", {})
+        if "missing" not in tx:
+            tx["missing"] = [
+                name for name in node_names if name not in in_mempool and name not in in_block
+            ]
+        missed_by_node.update(tx["missing"])
+        block_first_by_node.update(in_block.keys())
+        tx["mempool_all"] = bool(node_names) and all(name in in_mempool for name in node_names)
+        # Spread covers mempool arrivals only. A node that first saw the
+        # transaction in a block says when it was mined, not how gossip did.
+        seen_values = list(in_mempool.values())
         spread = round(max(seen_values) - min(seen_values), 3) if len(seen_values) > 1 else None
         tx["spread_secs"] = spread
         if spread is not None:
@@ -70,12 +77,14 @@ def build_report(events: list[dict]) -> dict:
     summary = {
         "submitted": len(submitted),
         "seen_all": sum(bool(tx.get("seen_all")) for tx in submitted),
+        "mempool_all": sum(tx["mempool_all"] for tx in submitted),
         "missed": sum(not tx.get("seen_all") for tx in submitted),
         "mined": sum(tx["mined"] for tx in submitted),
         "unconfirmed": sum(not tx["mined"] for tx in submitted),
         "spread_p50_secs": percentile(spreads, 50),
         "spread_p95_secs": percentile(spreads, 95),
         "missed_by_node": dict(sorted(missed_by_node.items())),
+        "block_first_by_node": dict(sorted(block_first_by_node.items())),
     }
     return {
         "environment": start.get("environment"),
@@ -97,6 +106,7 @@ def markdown(report: dict) -> str:
         f"- Network: `{report.get('network') or 'unknown'}`",
         f"- Submitted: **{summary['submitted']}**",
         f"- Seen on all nodes: **{summary['seen_all']}**",
+        f"- In every mempool: **{summary['mempool_all']}**",
         f"- Propagation misses: **{summary['missed']}**",
         f"- Mined after drain: **{summary['mined']}**",
         f"- Still unconfirmed: **{summary['unconfirmed']}**",
@@ -130,6 +140,13 @@ def markdown(report: dict) -> str:
     if summary["missed_by_node"]:
         lines.extend(
             f"- `{name}`: {count}" for name, count in summary["missed_by_node"].items()
+        )
+    else:
+        lines.append("None.")
+    lines.extend(["", "## First seen in a block, by node", ""])
+    if summary["block_first_by_node"]:
+        lines.extend(
+            f"- `{name}`: {count}" for name, count in summary["block_first_by_node"].items()
         )
     else:
         lines.append("None.")

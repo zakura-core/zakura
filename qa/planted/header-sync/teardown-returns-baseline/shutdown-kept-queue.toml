@@ -1,0 +1,14 @@
+# The reactor's shutdown forgets its work queue instead of retiring each
+# peer's work, so the queue's reservations and leases outlive the reactor
+# and no round is released. Only node settlement can see them. The queue
+# also keeps a clone of the reactor's observer, which is why node
+# settlement keys on the reactor's task ending rather than on its
+# observer. The required failure is `TeardownReserved`, once the stopped
+# reactor's task ends. The input shuts the node down once its first apply
+# is submitted, with that apply held until storage stops, so its round
+# still holds reserved headers at the stop.
+input = "crates/zakura-sim/tests/fixtures/header-storage-w-stop-storage.bin"
+# Besides reactor.rs, which the patch changes, the queue decides what the
+# node still holds at its shutdown. A change there can move the input off
+# a reserved round.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

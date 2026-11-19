@@ -1533,7 +1533,15 @@ impl DiskDb {
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
 
-            let old_path = match fs::canonicalize(&old_path) {
+            // RocksDB reads `old_path`, never the canonical path: on Windows, `fs::canonicalize`
+            // returns verbatim `\\?\` paths, which disable `/` separator normalization. RocksDB
+            // joins its file names with `/`, so it can't open a database at a verbatim path, and
+            // the old database would look missing.
+            //
+            // The move uses the canonical path, so it moves the directory the containment check
+            // below approved. Moving `old_path` would move a symlink rather than its target, and a
+            // relative symlink resolves against its new parent once moved.
+            let canonical_old_path = match fs::canonicalize(&old_path) {
                 Ok(canonicalized_old_path) => canonicalized_old_path,
                 Err(e) => {
                     warn!("could not canonicalize {old_path:?}: {e}");
@@ -1541,7 +1549,7 @@ impl DiskDb {
                 }
             };
 
-            let cache_path = match fs::canonicalize(&config.cache_dir) {
+            let canonical_cache_path = match fs::canonicalize(&config.cache_dir) {
                 Ok(canonicalized_cache_path) => canonicalized_cache_path,
                 Err(e) => {
                     warn!("could not canonicalize {:?}: {e}", config.cache_dir);
@@ -1558,13 +1566,22 @@ impl DiskDb {
             //
             // We don't attempt to guard against malicious symlinks created by attackers
             // (TOCTOU attacks). Zebra should not be run with elevated privileges.
-            if !old_path.starts_with(&cache_path) {
+            if !canonical_old_path.starts_with(&canonical_cache_path) {
                 info!("skipped reusing previous state cache: state is outside cache directory");
                 return None;
             }
 
             let opts = DiskDb::options();
-            let old_db_exists = DB::list_cf(&opts, &old_path).is_ok_and(|cf| !cf.is_empty());
+            let old_db_exists = match DB::list_cf(&opts, &old_path) {
+                Ok(cf) => !cf.is_empty(),
+                Err(e) => {
+                    warn!(
+                        "skipped reusing previous state cache: could not read the database at \
+                         {old_path:?}: {e}"
+                    );
+                    false
+                }
+            };
             let new_db_exists = DB::list_cf(&opts, &new_path).is_ok_and(|cf| !cf.is_empty());
 
             if old_db_exists && !new_db_exists {
@@ -1585,9 +1602,9 @@ impl DiskDb {
                     }
                 };
 
-                match fs::rename(&old_path, &new_path) {
+                match fs::rename(&canonical_old_path, &new_path) {
                     Ok(()) => {
-                        info!("moved state cache from {old_path:?} to {new_path:?}");
+                        info!("moved state cache from {canonical_old_path:?} to {new_path:?}");
 
                         let mut disk_version =
                             database_format_version_on_disk(config, db_kind, major_db_ver, network)
@@ -1632,7 +1649,10 @@ impl DiskDb {
                         return Some(disk_version);
                     }
                     Err(e) => {
-                        warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
+                        warn!(
+                            "could not move state cache from {canonical_old_path:?} to \
+                             {new_path:?}: {e}"
+                        );
                     }
                 };
             }

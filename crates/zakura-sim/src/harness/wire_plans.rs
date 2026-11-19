@@ -251,6 +251,7 @@ pub fn progress_scenario() -> WireScenario {
             reply_holds: Vec::new(),
             disruptions: Vec::new(),
         },
+        budget: None,
     }
 }
 
@@ -289,8 +290,9 @@ fn adversary(
 ///   first. A conformant `subscribe-headers` frame renews that
 ///   subscription.
 /// - `status-burst`: 30 bursts, which empty the `Status` bucket.
-/// - `outcome-crossing`: an unretained `Open` first, on a slow link from
-///   the node, so the crossing `Grant` meets the node's ending in flight.
+/// - `outcome-crossing`, `crossing-close` and `crossing-grant`: an
+///   unretained `Open` first, on a slow link from the node, so the crossing
+///   update meets the node's ending in flight.
 /// - The rest: the peer holds the node's 50 headers, so nobody subscribes.
 pub fn act_scenario(act: Act) -> WireScenario {
     let quiet = AdversarySpec {
@@ -311,7 +313,9 @@ pub fn act_scenario(act: Act) -> WireScenario {
         // 602 tokens, in bursts of 40 with two more each second, as
         // `tests/header_wire_table.rs` sends them.
         Act::StatusBurst => vec![Act::StatusBurst; 30],
-        Act::OutcomeCrossing => vec![Act::UnretainedOpen, Act::OutcomeCrossing],
+        Act::OutcomeCrossing | Act::CrossingClose | Act::CrossingGrant { .. } => {
+            vec![Act::UnretainedOpen, act]
+        }
         act => vec![act],
     };
     let (node, peer) = match act {
@@ -355,9 +359,12 @@ pub fn act_scenario(act: Act) -> WireScenario {
         _ => (PRELOAD, adversary(PRELOAD, None, quiet, script)),
     };
     let mut net = NetScenario::default();
-    if matches!(act, Act::UnretainedOpen | Act::OutcomeCrossing) {
+    if matches!(
+        act,
+        Act::UnretainedOpen | Act::OutcomeCrossing | Act::CrossingClose | Act::CrossingGrant { .. }
+    ) {
         // The node's ending takes longer to arrive than the crossing
-        // `Grant` waits, so the `Grant` crosses it in flight.
+        // update waits, so the update crosses it in flight.
         net.links.push(LinkEntry {
             src: NODE_ADDR,
             dst: peer_addr(0, 0),
@@ -373,6 +380,7 @@ pub fn act_scenario(act: Act) -> WireScenario {
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
+        budget: None,
     }
 }
 

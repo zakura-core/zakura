@@ -416,6 +416,9 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
                 composed_prefix(0, 0x81, 0, &[ask(Request::GetPeers), undeclared]).unwrap();
             serde_json::to_value(DiscoveryComposed::draw(&prefix))
         }
+        "discovery-spam-content-before-margin" => serde_json::to_value(DiscoverySpam::draw(
+            include_bytes!("fixtures/discovery-spam-content-before-margin.bin"),
+        )),
         "discovery-spam-reconnect" => {
             let steps = [
                 undeclared,

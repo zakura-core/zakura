@@ -33,7 +33,7 @@ use zakura_sim::{
     },
     model::Label,
     observe::{BlockSyncFact, RowAt, StorageFact, StorageRequest, StreamId},
-    seed::draws::byte_input,
+    seed::{self, draws::byte_input},
     table::{GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -383,6 +383,34 @@ fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
     if let Err(shortfall) = old_chain_shortfall(&old_chain_plan()) {
         panic!("{shortfall}");
     }
+}
+
+/// The stale-request-body seed holds `receiver-work-authorized` after an
+/// old-chain body answers a stale request for a height that a fork request
+/// reserves. With
+/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
+/// the routine credits that body to the fork request, and the same seed
+/// violates it.
+#[test]
+fn the_stale_request_body_input_holds_receiver_work_authorized() {
+    let input = seed::find("block-sync-stale-request-body")
+        .expect("the seed is registered")
+        .input()
+        .to_vec();
+    let (prefix, plan) = input.split_at(Storage::SCENARIO_BYTES);
+    let scenario = Storage::draw(prefix);
+    assert_eq!(scenario, BlockScenario::reset_mid_flight());
+    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert!(
+        held(&report, &id("block/receiver-work-authorized")),
+        "{:?}",
+        report.properties
+    );
+    assert!(
+        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
+        "no routine judged an old-chain body after a fork request reserved its height"
+    );
 }
 
 /// Four generated IDs no block-sync scenario reaches stay `NotApplicable`

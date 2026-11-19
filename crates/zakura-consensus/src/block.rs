@@ -450,7 +450,7 @@ where
         };
         let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         // Marked before this call returns, so a rival body that arrives next already finds it.
-        let mined_watermark = match (&receipt, block.coinbase_height()) {
+        let mined_record = match (&receipt, block.coinbase_height()) {
             (Some(receipt), Some(height)) if request.is_mined_commit() => {
                 Some(self.receipt_orders.mark_mined(hash, height, receipt.order))
             }
@@ -908,10 +908,10 @@ where
             }
             .await;
 
-            // A mined block that failed, or whose request was dropped, releases its watermark
+            // A mined block that failed, or whose request was dropped, releases its record
             // with this guard, which puts a rival's earlier claim back in force.
-            if let (Ok(_), Some(mined_watermark)) = (&result, mined_watermark) {
-                mined_watermark.keep();
+            if let (Ok(_), Some(mined_record)) = (&result, mined_record) {
+                mined_record.keep();
             }
 
             match result {

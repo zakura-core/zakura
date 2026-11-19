@@ -282,3 +282,57 @@ fn concurrent_applies_of_one_header_keep_the_first_reservation() {
     first.commit();
     assert_eq!(used(&claims, hash(1), now).order, reserved);
 }
+
+#[test]
+fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let first = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    let reserved = claims
+        .claimed_order(hash(1))
+        .expect("the first apply reserved it");
+    let second = claims.begin_at([(hash(1), CLAIMED)], TIP, now + CLAIM_BASE_GRACE);
+
+    // The apply that reserved the claim fails, while another apply of the header succeeds.
+    drop(first);
+    assert_eq!(claims.claimed_order(hash(1)), Some(reserved));
+    second.commit();
+    assert_eq!(used(&claims, hash(1), now).order, reserved);
+
+    // Once accepted, a failed apply of the same header leaves the claim in place.
+    drop(claims.begin_at([(hash(1), CLAIMED)], TIP, now));
+    assert_eq!(claims.claimed_order(hash(1)), Some(reserved));
+
+    // A header no apply succeeds for loses its claim.
+    let failing = [
+        claims.begin_at([(hash(2), CLAIMED)], TIP, now),
+        claims.begin_at([(hash(2), CLAIMED)], TIP, now),
+    ];
+    drop(failing);
+    assert!(!claims.is_claimed(hash(2)));
+}
+
+#[test]
+fn mined_block_records_end_once_the_node_mines_well_above_them() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let voided = || {
+        matches!(
+            claims.resolve(hash(1), now, || 0),
+            ClaimOutcome::Voided { .. }
+        )
+    };
+    claims.mark_mined(hash(3), CLAIMED, order::next()).keep();
+    assert!(voided());
+
+    let two_above = block::Height(CLAIMED.0 + 2);
+    claims.mark_mined(hash(4), two_above, order::next()).keep();
+    assert!(voided(), "a record within the claim window is kept");
+
+    let three_above = block::Height(CLAIMED.0 + 3);
+    claims
+        .mark_mined(hash(5), three_above, order::next())
+        .keep();
+    assert!(!voided());
+}

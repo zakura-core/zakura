@@ -295,6 +295,30 @@ mod tests {
     }
 
     #[test]
+    fn the_default_budget_funds_the_default_connection_count_with_tx_relay_on() {
+        let mut config = ZakuraConfig::default();
+        config.tx_relay.enabled = true;
+        for network in [
+            mainnet(),
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(
+                config
+                    .budgeted_max_connections(&network)
+                    .expect("the default budget funds connections")
+                    >= DEFAULT_ZAKURA_MAX_CONNECTIONS,
+                "{network:?}"
+            );
+        }
+        // The two kinds add their own shares, not a stream window each.
+        assert_eq!(
+            config.connection_memory(&mainnet(), &[]).admitted_bytes,
+            CONNECTION + 4 * MIB + 64 * 1024
+        );
+    }
+
+    #[test]
     fn the_default_budget_funds_the_default_connection_count() {
         let mainnet_memory = default_connection_memory(HEADER_SYNC_BUDGET);
         assert_eq!(

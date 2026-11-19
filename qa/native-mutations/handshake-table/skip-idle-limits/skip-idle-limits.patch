@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1733,8 +1733,6 @@
+         || limits.max_open_streams > local.max_open_streams
+         || limits.max_inbound_queue_depth == 0
+         || limits.max_inbound_queue_depth > local.max_inbound_queue_depth
+-        || limits.idle_timeout_millis == 0
+-        || limits.idle_timeout_millis > local.max_idle_timeout_millis
+     {
+         return Err(ZakuraRejectReason::ResourceLimit);
+     }

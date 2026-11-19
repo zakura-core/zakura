@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::Serialize;
-use support::storage_witnesses;
+use support::{handshake_seeds, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -38,7 +38,20 @@ fn load(dirs: &[PathBuf], harness: Option<&str>) -> SeedReport {
     seed::load(dirs, harness).expect("the directories list")
 }
 
-/// Every committed seed passes validation, and none is left out.
+/// The committed seeds that fail by design, outside the seed corpus.
+fn known_failures() -> PathBuf {
+    fixtures().join("known-failures")
+}
+
+/// The committed seeds that run too long for a fuzz input, outside the
+/// seed corpus.
+fn slow_seeds() -> PathBuf {
+    fixtures().join("slow-seeds")
+}
+
+/// Every committed seed passes validation, and none is left out. No seed
+/// in the corpus expects a violation, since fuzz campaigns and target
+/// checks run each one as an input that passes.
 #[test]
 fn committed_seeds_validate() {
     let report = load(&[fixtures()], None);
@@ -63,6 +76,66 @@ fn committed_seeds_validate() {
     assert_eq!(report.admitted.len(), inputs);
     assert!(inputs > 0, "the S4.7 input is committed");
     assert!(report.admitted.iter().all(|seed| seed.sidecar.required));
+    let failing: Vec<&Path> = report
+        .admitted
+        .iter()
+        .filter(|seed| seed.sidecar.expects_violation())
+        .map(|seed| seed.path.as_path())
+        .collect();
+    assert!(
+        failing.is_empty(),
+        "these seeds fail by design, so they belong in {}: {failing:?}",
+        known_failures().display()
+    );
+}
+
+/// Every seed in the known-failure directory validates, and each carries a
+/// witness that expects a violation, which its own test checks.
+#[test]
+fn known_failures_validate_and_expect_violations() {
+    let report = load(&[known_failures()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "zakura#2378's input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            seed.sidecar.expects_violation(),
+            "{} expects no violation, so it belongs in the seed corpus",
+            seed.path.display()
+        );
+    }
+}
+
+/// Every seed in the slow-seed directory validates, and none expects a
+/// violation: each runs clean, only too long for a fuzz input.
+#[test]
+fn slow_seeds_validate_and_expect_no_violation() {
+    let report = load(&[slow_seeds()], None);
+    assert!(
+        report.rejected.is_empty() && report.quarantined.is_empty(),
+        "{:?} {:?}",
+        report.rejected,
+        report.quarantined
+    );
+    assert!(
+        !report.admitted.is_empty(),
+        "the stuck-floor input is committed"
+    );
+    for seed in &report.admitted {
+        assert!(
+            !seed.sidecar.expects_violation(),
+            "{} expects a violation, so it belongs in {}",
+            seed.path.display(),
+            known_failures().display()
+        );
+    }
 }
 
 /// The scenario each committed seed is meant to run, by its file's stem,
@@ -70,6 +143,65 @@ fn committed_seeds_validate() {
 fn intended(stem: &str) -> Option<serde_json::Value> {
     fn value(scenario: impl Serialize) -> Option<serde_json::Value> {
         Some(serde_json::to_value(scenario).expect("scenarios serialize"))
+    }
+    if let Some(curated) = handshake_seeds::handshake_seeds()
+        .into_iter()
+        .find(|curated| curated.stem == stem)
+    {
+        return value(curated.scenario);
+    }
+    if stem == "handshake-partial-session" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction, PeerSpec},
+        };
+        let mut peer = PeerSpec::dialing();
+        peer.capabilities |= 1 << 59;
+        peer.handshake = Some(HandshakeSpec::default());
+        peer.script = vec![
+            PeerAction::Offer {
+                kind: 902,
+                version: 1,
+                wire_id: 1,
+            },
+            PeerAction::Close,
+        ];
+        return value(Scenario {
+            peers: vec![peer; 3],
+            ..Scenario::default()
+        });
+    }
+    if stem == "handshake-stream-churn" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerAction},
+        };
+        let mut scenario = Scenario::default();
+        scenario.net.default_link.min_delay_ms = 0;
+        scenario.net.default_link.max_delay_ms = 0;
+        scenario.peers[0].handshake = Some(HandshakeSpec::default());
+        scenario.peers[0].script = vec![
+            PeerAction::Open {
+                kind: u16::MAX,
+                version: 1
+            };
+            64
+        ];
+        scenario.peers[0].script.push(PeerAction::Close);
+        return value(scenario);
+    }
+    if stem == "handshake-installed-services" {
+        use zakura_sim::{
+            harness::handshake_wire::Scenario,
+            peer::{handshake::options::HandshakeSpec, PeerSpec},
+        };
+        return value(Scenario {
+            peers: vec![PeerSpec {
+                handshake: Some(HandshakeSpec::default()),
+                ..PeerSpec::listening()
+            }],
+            ..Scenario::default()
+        });
     }
     if let Some(plan) = SavedPlan::ALL
         .into_iter()
@@ -120,10 +252,48 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(scenario);
     }
     match stem {
-        // The fork while storage holds a submission, with every read stalled.
-        "sync-wire-reset-mid-write" => {
-            value(sync_wire::combined(&[sync_wire::COMBINED_TAG, 0b0001_0100]))
+        "handshake-counts-owners" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0],
+        }),
+        "handshake-counts-pending" => value(zakura_sim::record::machine::MachineScenario {
+            input: vec![128, 1, 128],
+        }),
+        "handshake-counts-cadence" => value(zakura_sim::record::machine::MachineScenario {
+            input: [8, 0, 0].repeat(32),
+        }),
+        "handshake-cadence-burst" | "handshake-cadence-conformant" => {
+            let conformant = stem == "handshake-cadence-conformant";
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.net.default_link.min_delay_ms = 0;
+            scenario.net.default_link.max_delay_ms = 0;
+            scenario.net.default_link.reorder = false;
+            scenario.peers = (0..if conformant { 16 } else { 1 })
+                .map(|index| {
+                    let mut peer = zakura_sim::peer::PeerSpec::dialing();
+                    peer.handshake = Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                        control: zakura_sim::peer::handshake::options::ControlFault::Network,
+                        bind_ip: Some("192.0.2.1".parse().unwrap()),
+                        retries: if conformant { 1 } else { 31 },
+                        retry_delay_ms: if conformant { 1_000 } else { 0 },
+                        dial_delay_ms: index * 60,
+                        ..Default::default()
+                    });
+                    peer
+                })
+                .collect();
+            value(scenario)
         }
+        "handshake-slow-control" => {
+            let mut scenario = zakura_sim::harness::handshake_wire::Scenario::default();
+            scenario.peers[0].handshake =
+                Some(zakura_sim::peer::handshake::options::HandshakeSpec {
+                    length_delay_ms: 9_000,
+                    payload_delay_ms: 9_000,
+                    ..Default::default()
+                });
+            value(scenario)
+        }
+
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],
@@ -207,7 +377,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
 /// in [`intended`].
 #[test]
 fn committed_seeds_record_their_intended_scenarios() {
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     for seed in &report.admitted {
         let stem = seed.path.file_stem().and_then(|s| s.to_str()).unwrap();
         let scenario = intended(stem).unwrap_or_else(|| panic!("{stem} has no intended scenario"));
@@ -229,7 +399,7 @@ fn committed_seeds_record_their_intended_scenarios() {
 fn planted_inputs_carry_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let catalogue = root.join(planted::PLANTED_DIR);
-    let report = load(&[fixtures()], None);
+    let report = load(&[fixtures(), slow_seeds()], None);
     let reported: BTreeSet<String> = HARNESSES
         .iter()
         .flat_map(|entry| (entry.properties)())
@@ -257,9 +427,14 @@ fn planted_inputs_carry_their_witnesses() {
         );
         let table: toml::Table = toml::from_str(&fs::read_to_string(case).unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
-        // A typed case runs a committed scenario, not a seed.
+        // A typed case runs a committed scenario under Plan bytes or a
+        // scripted Plan, not a seed.
         if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
-            for file in ["scenario", "plan"] {
+            let run = ["plan", "script"]
+                .into_iter()
+                .find(|file| typed.contains_key(*file))
+                .unwrap_or_else(|| panic!("{}: no plan or script", case.display()));
+            for file in ["scenario", run] {
                 let path = typed[file].as_str().unwrap();
                 assert!(root.join(path).is_file(), "{}: no {path}", case.display());
             }
@@ -269,7 +444,7 @@ fn planted_inputs_carry_their_witnesses() {
         let seed = report
             .admitted
             .iter()
-            .find(|seed| seed.path == fixtures().join(input.file_name().unwrap()))
+            .find(|seed| seed.path.canonicalize().ok() == input.canonicalize().ok())
             .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
         assert!(
             seed.sidecar

@@ -287,6 +287,27 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
     assert_eq!(derived - configured, 2 * (92 * (64 << 20) - (1 << 30)));
 }
 
+/// With `tx-relay` on, the serve output bound adds, for each admitted connection,
+/// the built `Tx` and the unwritten `Inv` a session holds outside its output gate.
+/// The default config still fits, and the admitted connections are unchanged.
+#[test]
+fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
+    let mut config = Config::default();
+    let off_limits = ZakuraLocalLimits::from_config(&config);
+    let off = NodeEnvelope::for_node(&config, &off_limits, &[], 16)
+        .expect("the default config fits")
+        .serve_output_bytes;
+    config.zakura.tx_relay.enabled = true;
+    let limits = ZakuraLocalLimits::from_config(&config);
+    assert_eq!(limits.max_connections, off_limits.max_connections);
+    let on = NodeEnvelope::for_node(&config, &limits, &[], 16)
+        .expect("the default config fits with tx-relay on")
+        .serve_output_bytes;
+    let per_session = u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
+    let connections = u128::try_from(limits.max_connections).expect("a connection count fits");
+    assert_eq!(on - off, connections * per_session);
+}
+
 /// Each serving family funds one session per connection that can serve at once: the
 /// inbound plus outbound session slots, clamped to the admitted connections. The
 /// retained bound counts that output, because guarded serving frames skip the

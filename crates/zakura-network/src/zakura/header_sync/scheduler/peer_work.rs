@@ -1053,6 +1053,62 @@ impl PeerWorkQueue {
         self.budget.remaining()
     }
 
+    /// Check the queue's invariants, and its policy's:
+    ///
+    /// - the budget claims at most its capacity;
+    /// - the budget's reserved count is exactly what the live request
+    ///   reservations have left, and none is empty;
+    /// - only started work holds staged capacity, and no lease is empty;
+    /// - a receiving round owns at least one budget unit per staged header;
+    /// - the budget owns at least what the queue's leases hold, since calls
+    ///   may keep more.
+    #[cfg(any(test, feature = "header-fuzz"))]
+    pub(in crate::zakura::header_sync) fn assert_invariants(&self) {
+        self.policy.assert_invariants();
+        let usage = self.budget.usage();
+        assert!(
+            usage.claimed() <= self.budget.0.capacity,
+            "the budget claims {usage:?} of {}",
+            self.budget.0.capacity
+        );
+        let reserved: usize = self
+            .request_reservations
+            .values()
+            .map(HeaderCountReservation::remaining)
+            .sum();
+        assert_eq!(usage.reserved, reserved, "reserved headers");
+        assert!(
+            self.request_reservations
+                .values()
+                .all(|reservation| reservation.remaining() != 0),
+            "a spent reservation stays live"
+        );
+        let mut owned = 0;
+        for (peer, leases) in &self.staged_capacity {
+            let Some(request) = self.policy.active(peer) else {
+                panic!("{peer:?} holds staged capacity without started work");
+            };
+            assert!(
+                leases.iter().all(|lease| lease.0.count != 0),
+                "{peer:?} holds an empty lease"
+            );
+            let count = self.owned_header_count(peer);
+            if request.phase == HeaderTargetPhase::Receiving {
+                assert!(
+                    count >= request.entries.len(),
+                    "{peer:?} owns {count} budget units for {} staged headers",
+                    request.entries.len()
+                );
+            }
+            owned += count;
+        }
+        assert!(
+            usage.owned >= owned,
+            "the budget owns {} but the queue's leases hold {owned}",
+            usage.owned
+        );
+    }
+
     #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn chunk_budget_usage(&self) -> (usize, usize) {
         let usage = self.budget.usage();
@@ -1260,7 +1316,7 @@ fn staged_page(
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]
-mod model_tests;
+mod machine_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1277,6 +1277,61 @@ impl WorkPolicy {
         slots
     }
 
+    /// Check the policy's invariants:
+    ///
+    /// - it holds at most [`MAX_STAGED_TARGETS_V1`] peers' work;
+    /// - each started round has its own incarnation, at most the last one
+    ///   assigned;
+    /// - only a receiving round holds staged headers, and only after its first
+    ///   page fixed the common ancestor;
+    /// - every repair episode belongs to a started round.
+    #[cfg(any(test, feature = "header-fuzz"))]
+    pub(super) fn assert_invariants(&self) {
+        assert!(
+            self.work_by_peer.len() <= MAX_STAGED_TARGETS_V1,
+            "{} peers hold work",
+            self.work_by_peer.len()
+        );
+        let mut incarnations = Vec::new();
+        for (peer, work) in &self.work_by_peer {
+            let PeerWorkState::Active { request, .. } = work else {
+                continue;
+            };
+            let incarnation = request.incarnation.get();
+            assert!(
+                incarnation != WorkIncarnation::UNSTARTED.get()
+                    && incarnation <= self.last_incarnation,
+                "{peer:?}'s round has incarnation {incarnation}"
+            );
+            incarnations.push(incarnation);
+            if !request.entries.is_empty() {
+                assert_eq!(
+                    request.phase,
+                    HeaderTargetPhase::Receiving,
+                    "{peer:?} holds staged headers outside receiving"
+                );
+                assert!(
+                    request.common_ancestor.is_some(),
+                    "{peer:?} staged headers without an ancestor"
+                );
+            }
+        }
+        incarnations.sort_unstable();
+        let rounds = incarnations.len();
+        incarnations.dedup();
+        assert_eq!(
+            incarnations.len(),
+            rounds,
+            "two rounds share an incarnation"
+        );
+        for owner in self.repair_episodes.keys() {
+            assert!(
+                self.active_owner(*owner).is_some(),
+                "a repair episode outlives its round"
+            );
+        }
+    }
+
     /// Headers owned in each phase, where `owned` reads one peer's count.
     pub(super) fn phase_counts(&self, owned: impl Fn(&ZakuraPeerId) -> usize) -> PhaseCounts {
         let mut counts = PhaseCounts::default();

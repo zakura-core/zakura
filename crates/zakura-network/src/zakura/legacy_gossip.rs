@@ -45,6 +45,7 @@ use crate::{
 
 use super::trace::BlockBodySource;
 use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
+use super::TxRelaySessions;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
@@ -265,6 +266,105 @@ static FIRST_SEEN_BY_SUPERVISOR: OnceLock<std::sync::Mutex<HashMap<u64, FirstSee
     OnceLock::new();
 static NEXT_LEGACY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The adapter's switch for transaction traffic. It holds `tx-relay`'s
+/// live-session record, or `None` when `tx-relay` is not registered, and
+/// then every check is one branch on the empty option.
+///
+/// With a live session, the adapter stops moving that peer's transactions.
+/// It checks when a message arrives from the peer, and when it chooses the
+/// peers an advert goes to or a request may ask. Work queued or chosen
+/// before the session went live still runs. Each check looks at the message
+/// kind first, so block traffic never reads the record.
+#[derive(Clone, Debug, Default)]
+struct TxRelaySwitch(Option<TxRelaySessions>);
+
+impl TxRelaySwitch {
+    /// The switch for adapters built from `supervisor`.
+    fn for_supervisor(supervisor: &ZakuraSupervisorHandle) -> Self {
+        Self(supervisor.tx_relay_sessions().cloned())
+    }
+
+    /// Whether `tx-relay` has a live session for `peer`. Callers check the
+    /// message kind first.
+    fn relays(&self, peer: &ZakuraPeerId) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|sessions| sessions.is_live(peer))
+    }
+
+    /// Whether the adapter drops `frame` from or to `peer`: a transaction id
+    /// advert while `peer` has a live `tx-relay` session.
+    fn drops_advert(&self, peer: &ZakuraPeerId, frame: &LegacyGossipFrame) -> bool {
+        self.0.is_some()
+            && matches!(frame, LegacyGossipFrame::AdvertiseTransactionIds(_))
+            && self.relays(peer)
+    }
+
+    /// The answer the adapter gives in place of serving `frame` from `peer`,
+    /// when it is a transaction request and `peer` has a live `tx-relay`
+    /// session. `None` means serve it as usual.
+    fn answer_for(&self, peer: &ZakuraPeerId, frame: &LegacyRequestFrame) -> Option<Response> {
+        self.0.as_ref()?;
+        if !frame.kind().is_transaction() || !self.relays(peer) {
+            return None;
+        }
+        frame.tx_relay_answer()
+    }
+
+    /// Whether the adapter must not send a request of `kind` to `peer`.
+    fn skips_request(&self, peer: &ZakuraPeerId, kind: LegacyRequestKind) -> bool {
+        self.0.is_some() && kind.is_transaction() && self.relays(peer)
+    }
+}
+
+/// Counts `count` transaction messages of `message_type` received on the
+/// adapter, with `tx-relay` on or off. Each decoded wire message counts once
+/// by its type: a chunked transaction once its chunks are reassembled, and a
+/// `Nil` answer to a mempool request as an empty id list (type 16).
+fn count_received_tx_messages(message_type: u16, count: u64) {
+    metrics::counter!(
+        "zakura.p2p.legacy.inbound.tx_messages",
+        "type" => message_type_label(message_type),
+    )
+    .increment(count);
+}
+
+/// Counts one adapter frame of `message_type` dropped at the full inbound
+/// queue, as `work`, gossip or request.
+fn count_queue_full(work: &'static str, message_type: u16) {
+    metrics::counter!(
+        "zakura.p2p.legacy.inbound.queue_full",
+        "work" => work,
+        "type" => message_type_label(message_type),
+    )
+    .increment(1);
+}
+
+/// A metric label for a legacy message type.
+fn message_type_label(message_type: u16) -> &'static str {
+    match message_type {
+        MSG_ADVERTISE_BLOCK => "1",
+        MSG_ADVERTISE_TX_IDS => "2",
+        MSG_REQUEST_BLOCKS_BY_HASH => "3",
+        MSG_REQUEST_TRANSACTIONS_BY_ID => "4",
+        MSG_RESPONSE_BLOCK => "5",
+        MSG_RESPONSE_TRANSACTION => "6",
+        MSG_RESPONSE_MISSING_BLOCKS => "7",
+        MSG_RESPONSE_MISSING_TRANSACTIONS => "8",
+        MSG_REQUEST_FIND_BLOCKS => "9",
+        MSG_REQUEST_FIND_HEADERS => "10",
+        MSG_REQUEST_MEMPOOL_TRANSACTION_IDS => "11",
+        MSG_REQUEST_PING => "12",
+        MSG_REQUEST_PUSH_TRANSACTION => "13",
+        MSG_RESPONSE_BLOCK_HASHES => "14",
+        MSG_RESPONSE_BLOCK_HEADERS => "15",
+        MSG_RESPONSE_TRANSACTION_IDS => "16",
+        MSG_RESPONSE_PONG => "17",
+        MSG_RESPONSE_NIL => "18",
+        _ => "other",
+    }
+}
+
 /// A typed legacy gossip frame carried by Zakura stream kind 2.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyGossipFrame {
@@ -342,6 +442,14 @@ impl LegacyGossipFrame {
                 Ok(Self::AdvertiseTransactionIds(ids))
             }
             message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
+        }
+    }
+
+    /// This frame's wire message type.
+    fn message_type(&self) -> u16 {
+        match self {
+            Self::AdvertiseBlock(_) => MSG_ADVERTISE_BLOCK,
+            Self::AdvertiseTransactionIds(_) => MSG_ADVERTISE_TX_IDS,
         }
     }
 
@@ -562,6 +670,27 @@ impl LegacyRequestFrame {
         }
     }
 
+    /// The answer this node gives in place of serving a transaction request
+    /// whose peer's transactions belong to `tx-relay`: every id missing, an
+    /// empty mempool, or done for a push, whose body is dropped. `None` for
+    /// other requests.
+    fn tx_relay_answer(&self) -> Option<Response> {
+        match self {
+            Self::TransactionsById(ids) => Some(Response::Transactions(
+                ids.iter()
+                    .copied()
+                    .map(InventoryResponse::Missing)
+                    .collect(),
+            )),
+            Self::MempoolTransactionIds => Some(Response::TransactionIds(Vec::new())),
+            Self::PushTransaction(_) => Some(Response::Nil),
+            Self::BlocksByHash(_)
+            | Self::FindBlocks { .. }
+            | Self::FindHeaders { .. }
+            | Self::Ping => None,
+        }
+    }
+
     fn kind(&self) -> LegacyRequestKind {
         match self {
             Self::BlocksByHash(_) => LegacyRequestKind::Blocks,
@@ -572,6 +701,29 @@ impl LegacyRequestFrame {
             Self::Ping => LegacyRequestKind::Ping,
             Self::PushTransaction(_) => LegacyRequestKind::PushTransaction,
         }
+    }
+}
+
+#[cfg(test)]
+impl LegacyRequestFrame {
+    /// Decodes `frames`, the answer to this request sent as `request_id`, as
+    /// the request client decodes an answer: bound to the inventory it asked
+    /// for. A test seam for `tx-relay`'s adapter tests.
+    pub(super) fn decode_answer(
+        &self,
+        request_id: u64,
+        frames: Vec<Frame>,
+    ) -> Result<Response, LegacyGossipError> {
+        let requested = match self {
+            Self::BlocksByHash(hashes) => {
+                Some(RequestedInventory::Blocks(hashes.iter().copied().collect()))
+            }
+            Self::TransactionsById(ids) => Some(RequestedInventory::Transactions(
+                ids.iter().copied().collect(),
+            )),
+            _ => None,
+        };
+        LegacyResponseCodec::decode_response(request_id, self.kind(), frames, requested.as_ref())
     }
 }
 
@@ -587,6 +739,15 @@ pub(super) enum LegacyRequestKind {
 }
 
 impl LegacyRequestKind {
+    /// Whether this kind moves transactions, so `tx-relay` takes it over for
+    /// a peer with a live session.
+    fn is_transaction(self) -> bool {
+        match self {
+            Self::Transactions | Self::MempoolTransactionIds | Self::PushTransaction => true,
+            Self::Blocks | Self::FindBlocks | Self::FindHeaders | Self::Ping => false,
+        }
+    }
+
     /// Distinct peers one request of this kind tries before giving up.
     fn max_attempts(self) -> usize {
         match self {
@@ -851,6 +1012,7 @@ impl LegacyResponseCodec {
                         }
                     }
                     transactions.push(InventoryResponse::Available((transaction, None)));
+                    count_received_tx_messages(MSG_RESPONSE_TRANSACTION, 1);
                 }
                 LegacyResponseItem::Frame(frame) => match frame.message_type {
                     MSG_RESPONSE_MISSING_BLOCKS => {
@@ -883,6 +1045,7 @@ impl LegacyResponseCodec {
                             }
                             transactions.push(InventoryResponse::Missing(id));
                         }
+                        count_received_tx_messages(MSG_RESPONSE_MISSING_TRANSACTIONS, 1);
                     }
                     MSG_RESPONSE_BLOCK_HASHES => {
                         if request_kind != LegacyRequestKind::FindBlocks {
@@ -904,6 +1067,7 @@ impl LegacyResponseCodec {
                         }
                         reassembler.reject_if_active()?;
                         transaction_ids.extend(decode_tx_ids_response(request_id, frame.payload)?);
+                        count_received_tx_messages(MSG_RESPONSE_TRANSACTION_IDS, 1);
                     }
                     MSG_RESPONSE_PONG => {
                         if request_kind != LegacyRequestKind::Ping {
@@ -937,6 +1101,11 @@ impl LegacyResponseCodec {
                         }
                         reassembler.reject_if_active()?;
                         decode_id_only_response(request_id, frame.payload)?;
+                        // An empty mempool answer, which counts as the id list
+                        // it stands for.
+                        if request_kind == LegacyRequestKind::MempoolTransactionIds {
+                            count_received_tx_messages(MSG_RESPONSE_TRANSACTION_IDS, 1);
+                        }
                         saw_nil = true;
                     }
                     message_type => {
@@ -1490,6 +1659,7 @@ fn reject_trailing(reader: &Cursor<&[u8]>) -> Result<(), LegacyGossipError> {
 pub struct ZakuraGossipBroadcast {
     first_seen: FirstSeenCache,
     outbound: LegacyGossipOutbound,
+    switch: TxRelaySwitch,
 }
 
 impl ZakuraGossipBroadcast {
@@ -1500,6 +1670,7 @@ impl ZakuraGossipBroadcast {
         Self {
             first_seen,
             outbound,
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
         }
     }
 
@@ -1509,7 +1680,9 @@ impl ZakuraGossipBroadcast {
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
         self.outbound.remember_latest_block(&frame);
-        self.outbound.send_to_peers(frame, exclude).await
+        self.outbound
+            .send_to_peers(frame, exclude, &self.switch)
+            .await
     }
 
     async fn record_first_seen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
@@ -1753,12 +1926,15 @@ impl LegacyGossipOutbound {
         session.try_send_advertise_block(hash).map_err(Into::into)
     }
 
+    /// Queues `frame` to every session except `exclude`'s, and except peers
+    /// whose transaction adverts `switch` leaves to `tx-relay`.
     async fn send_to_peers(
         &self,
         frame: LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
+        switch: &TxRelaySwitch,
     ) -> Result<(), BoxError> {
-        let sessions: Vec<_> = {
+        let mut sessions: Vec<_> = {
             let state = self
                 .state
                 .lock()
@@ -1770,6 +1946,8 @@ impl LegacyGossipOutbound {
                 .map(|(_peer_id, session)| session.clone())
                 .collect()
         };
+        // Checked outside the session lock, so the two locks never nest.
+        sessions.retain(|session| !switch.drops_advert(session.peer_id(), &frame));
 
         send_to_sessions(sessions, frame)
     }
@@ -2277,6 +2455,7 @@ fn record_block_response_source(
 #[derive(Clone, Debug)]
 pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
+    switch: TxRelaySwitch,
     request_timeout: Duration,
     slots: LegacyClientSlots,
     trace: ZakuraTrace,
@@ -2310,6 +2489,7 @@ impl ZakuraRequestClient {
             .unwrap_or(1)
             .max(1);
         Self {
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
             slots: LegacyClientSlots::new(
@@ -2356,7 +2536,9 @@ impl ZakuraRequestClient {
         let _slot = timeout(self.request_timeout, self.slots.acquire(request_kind))
             .await
             .map_err(|_| -> BoxError { "Zakura legacy request client is at capacity".into() })?;
-        let handles = self.ready_handles().await?;
+        let mut handles = self.ready_handles().await?;
+        // A peer whose transactions belong to `tx-relay` is not asked.
+        handles.retain(|handle| !self.switch.skips_request(handle.peer_id(), request_kind));
         let candidates = request_candidates(
             &handles,
             preferred.as_ref(),
@@ -2748,6 +2930,7 @@ pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
     inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
+    switch: TxRelaySwitch,
     trace: ZakuraTrace,
 }
 
@@ -2788,21 +2971,39 @@ impl LegacyGossipSink {
             inbound_tx,
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
             trace,
         }
     }
 }
 
 impl LegacyGossipSink {
+    /// Decodes a gossip frame from `peer_id` and queues it for the worker.
+    /// A frame over the retained-byte budget or the queue is dropped, and a
+    /// transaction advert from a peer `switch` leaves to `tx-relay` is
+    /// dropped with no penalty.
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
         inbound_budget: &InboundBudget,
+        switch: &TxRelaySwitch,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
         let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+        let message_type = frame.message_type();
+        if message_type == MSG_ADVERTISE_TX_IDS {
+            count_received_tx_messages(message_type, 1);
+        }
+        if switch.drops_advert(&peer_id, &frame) {
+            return Ok(());
+        }
         let Some(charge) = inbound_budget.try_charge(frame.retained_bytes()) else {
-            metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "gossip").increment(1);
+            metrics::counter!(
+                "zakura.p2p.legacy.inbound.refused",
+                "work" => "gossip",
+                "type" => message_type_label(message_type),
+            )
+            .increment(1);
             debug!("legacy gossip inbound bytes exhausted: dropping frame");
             return Ok(());
         };
@@ -2813,6 +3014,7 @@ impl LegacyGossipSink {
         })) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
+                count_queue_full("gossip", message_type);
                 debug!("legacy gossip inbound queue full: dropping frame");
                 Ok(())
             }
@@ -2832,7 +3034,13 @@ impl LegacyGossipSink {
             return Ok(());
         }
 
-        Self::enqueue_gossip_frame(&self.inbound_tx, &self.inbound_budget, peer_id, frame)
+        Self::enqueue_gossip_frame(
+            &self.inbound_tx,
+            &self.inbound_budget,
+            &self.switch,
+            peer_id,
+            frame,
+        )
     }
 
     /// Every protocol check a request meets before `request` does any work.
@@ -2859,9 +3067,28 @@ impl LegacyGossipSink {
             let request = Self::decode_request(stream_kind, &frame)?;
             // The block owns `frame` until the response, so free its payload now.
             drop(frame);
+            let message_type = request.kind().message_type();
+            if request.kind().is_transaction() {
+                count_received_tx_messages(message_type, 1);
+            }
+            // `tx-relay` owns this peer's transactions, so answer it here
+            // with no penalty.
+            if let Some(answer) = self.switch.answer_for(&peer_id, &request) {
+                return LegacyResponseCodec::encode_response(
+                    request_id,
+                    answer,
+                    max_frame_bytes,
+                    max_message_bytes,
+                )
+                .map_err(SinkReject::local);
+            }
             let Some(charge) = self.inbound_budget.try_charge(request.retained_bytes()) else {
-                metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "request")
-                    .increment(1);
+                metrics::counter!(
+                    "zakura.p2p.legacy.inbound.refused",
+                    "work" => "request",
+                    "type" => message_type_label(message_type),
+                )
+                .increment(1);
                 return Err(SinkReject::local("legacy request inbound bytes exhausted"));
             };
             let (response_tx, response_rx) = oneshot::channel();
@@ -2876,6 +3103,7 @@ impl LegacyGossipSink {
                 })) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    count_queue_full("request", message_type);
                     return Err(SinkReject::local("legacy request inbound queue full"));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -2955,6 +3183,7 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let inbound_budget = self.inbound_budget.clone();
+        let switch = self.switch.clone();
         let peer_id = peer.id.clone();
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
@@ -3042,6 +3271,7 @@ impl ZakuraService for LegacyGossipSink {
                     match Self::enqueue_gossip_frame(
                         &inbound_tx,
                         &inbound_budget,
+                        &switch,
                         peer_id.clone(),
                         frame,
                     ) {
@@ -3913,6 +4143,7 @@ mod tests {
             inbound_tx,
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
+            switch: TxRelaySwitch::default(),
             trace: ZakuraTrace::noop(),
         }
     }

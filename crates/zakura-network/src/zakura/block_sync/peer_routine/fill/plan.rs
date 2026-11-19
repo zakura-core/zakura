@@ -1,4 +1,5 @@
-//! Pure decisions of one fill attempt: lane selection and retry filtering.
+//! Pure decisions of one fill attempt: lane selection, lane orchestration, and
+//! retry filtering.
 //! Nothing here acquires a resource, reads a clock, or takes a lock; the routine
 //! passes in every observation. The work queue derives funding from the retained
 //! take ([`TakenRequest::admit`](crate::zakura::block_sync::work_queue::TakenRequest::admit)).
@@ -9,7 +10,10 @@ use zakura_chain::block;
 use zakura_rt::time::Instant;
 
 use crate::zakura::block_sync::{
-    admission::{admit, floor_rescue_high, AdmissionOutcome, AdmissionSnapshot, RequestPriority},
+    admission::{
+        admit, floor_rescue_high, request_priority, AdmissionOutcome, AdmissionSnapshot,
+        RequestPriority,
+    },
     ZakuraBlockSyncConfig,
 };
 
@@ -123,6 +127,50 @@ pub(super) fn plan_above_floor(
         AdmissionOutcome::LookaheadAtCap => Err(FillStop::LookaheadCap),
         AdmissionOutcome::InflightBudgetEmpty => Err(FillStop::InflightBudget),
     }
+}
+
+/// Which lane took an attempt's run.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum Lane {
+    /// The floor lane, which plans from the probed floor height.
+    Floor,
+    /// The above-floor lane, which plans from the first pending height.
+    AboveFloor,
+}
+
+/// Take the run that `snapshot` admits: from the probed `floor_start` if any,
+/// else from the first pending height above the floor.
+///
+/// `take` takes a lane's plan from the work queue and returns the run's first
+/// height, or `None` for an empty run. `first_pending` finds the above-floor
+/// lane's start, and runs only when that lane plans.
+///
+/// The probe and the take run at separate synchronization points, so another
+/// routine can take `floor_start` first. The floor take then starts above the
+/// floor, and it needs an above-floor slot like the above-floor lane. On a
+/// refusal the caller drops the take, which returns its run.
+pub(super) fn take_lanes(
+    config: &ZakuraBlockSyncConfig,
+    limits: &FillLimits,
+    snapshot: AdmissionSnapshot,
+    floor_start: Option<block::Height>,
+    mut take: impl FnMut(Lane, TakePlan) -> Option<block::Height>,
+    first_pending: impl FnOnce() -> Option<block::Height>,
+) -> Result<Lane, FillStop> {
+    if let Some(plan) = plan_floor(config, limits, snapshot, floor_start)? {
+        if let Some(first) = take(Lane::Floor, plan) {
+            if request_priority(snapshot.download_floor, first) == RequestPriority::AboveFloor {
+                limits.above_floor_slot()?;
+            }
+            return Ok(Lane::Floor);
+        }
+    }
+
+    limits.above_floor_slot()?;
+    let plan = plan_above_floor(config, limits, snapshot, first_pending())?;
+    take(Lane::AboveFloor, plan)
+        .map(|_| Lane::AboveFloor)
+        .ok_or(FillStop::NoWork)
 }
 
 /// One taken item's retry facts, read when the filter visits it.

@@ -1,0 +1,3 @@
+# Each control step stays below ten seconds, but the whole exchange takes eighteen.
+input = "crates/zakura-sim/tests/fixtures/handshake-slow-control.bin"
+checks = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-sim/src/harness/handshake_wire.rs", "crates/zakura-sim/src/peer/handshake.rs"]

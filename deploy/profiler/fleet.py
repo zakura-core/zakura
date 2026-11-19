@@ -6,7 +6,7 @@ its entry says where the dashboard reaches its profiler:
 
     monitor = { profiler_url = "http://127.0.0.1:8098" }
 
-Three steps, each safe to repeat:
+Four steps, each safe to repeat:
 
     fleet.py ensure-trace-config --config nodes.toml [--node NAME]
         Install the profiler and verify trace retention before adding `trace_dir`
@@ -14,6 +14,15 @@ Three steps, each safe to repeat:
         file changes apart from peer names in the same section. Peer names come from
         the fleet inventory; the old environment override is removed only after the
         config is verified. The node is not restarted. Existing trace settings are preserved.
+
+    fleet.py peer-names --config nodes.toml --private-addresses FILE [--node NAME]
+        Tell the node the names of the other nodes in the list, by address, so its
+        trace files name them when a block is announced or served over the legacy
+        network; the cluster view (deploy/runner/propagation.py) joins nodes on
+        those names. A node whose address is in FILE (a JSON list of addresses, `-`
+        for stdin; the dashboard host's private list) is named to no node, and
+        nothing is written when FILE cannot be read. The node is not restarted: the
+        names take effect the next time it starts.
 
     fleet.py install --config nodes.toml [--node NAME]
         Copy the profiler to the node, point it at that node's log and trace files,
@@ -45,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PROFILER_FILES = ("zakura_profiler.py", "stacks.py", "blocks.py", "page.html")
+PROFILER_FILES = ("zakura_profiler.py", "stacks.py", "blocks.py", "peer_addresses.py")
 PROFILER_UNIT = "zakura-profiler.service"
 TUNNEL_UNIT = "zakura-profiler-tunnel@.service"
 # The archive-vct-off tunnel from before every node had one; it holds a tunnel port.
@@ -57,7 +66,6 @@ PROFILER_PORT = 8097
 TRACE_DIR = "/mnt/data/zakura-traces"
 TRACE_MARKER = ".zakura-profiler-managed"
 TRACE_TABLE_CAP_MB = 200
-ZAKURA_SECTION = re.compile(r"^\s*\[network\.zakura\]\s*(#.*)?$")
 # `systemctl show -p ExecStart` prints the command line as `argv[]=... ;`.
 CONFIG_ARGUMENT = re.compile(r"argv\[\]=[^;]*?\s(?:-c|--config)[ =](\S+)")
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=yes")
@@ -134,38 +142,42 @@ def trace_dir_of(config_text):
     return zakura.get("trace_dir") if isinstance(zakura, dict) else None
 
 
-def with_trace_dir(config_text, trace_dir=TRACE_DIR):
-    """`config_text` with `trace_dir` added under `[network.zakura]`.
+def with_setting(config_text, section, key, value, toml_value=None):
+    """`config_text` with `key = value` added under the table named by `section`.
 
-    A config that already sets `trace_dir` is returned as it is, whatever its value.
-    Otherwise one line is added below the section's heading, or the section is added
-    at the end of the file. Every other byte stays, and the result is parsed to
-    confirm that the new setting is the only difference; a layout this cannot edit
-    safely (the section written as an inline table, say) raises `FleetError`.
+    `section` is the table's path, such as `("network", "zakura")`. A config that
+    already sets `key` there is returned as it is, whatever its value. Otherwise one
+    line is added below the section's heading, or the section is added at the end of
+    the file. Every other byte stays, and the result is parsed to confirm that the new
+    setting is the only difference; a layout this cannot edit safely (the section
+    written as an inline table, say) raises `FleetError`.
     """
-    return with_zakura_setting(config_text, "trace_dir", trace_dir, json.dumps(trace_dir))
-
-
-def with_zakura_setting(config_text, key, value, toml_value):
-    """Add a missing setting, preserving existing values and verifying every other setting."""
-    before = parse_config(config_text)
-    if key in before.get("network", {}).get("zakura", {}):
+    table = parse_config(config_text)
+    for name in section:
+        table = table.get(name, {}) if isinstance(table, dict) else {}
+    if isinstance(table, dict) and key in table:
         return config_text
-    setting = f"{key} = {toml_value}\n"
+    # TOML writes a boolean bare and a string the way JSON does.
+    setting = f"{key} = {json.dumps(value) if toml_value is None else toml_value}\n"
+    heading_text = "[" + ".".join(section) + "]"
+    is_heading = re.compile(r"^\s*" + re.escape(heading_text) + r"\s*(#.*)?$")
     lines = config_text.splitlines(keepends=True)
-    heading = next((i for i, line in enumerate(lines) if ZAKURA_SECTION.match(line)), None)
+    heading = next((i for i, line in enumerate(lines) if is_heading.match(line)), None)
     if heading is None:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
-        lines += ["\n", "[network.zakura]\n", setting]
+        lines += ["\n", heading_text + "\n", setting]
     else:
         if not lines[heading].endswith("\n"):
             lines[heading] += "\n"
         lines.insert(heading + 1, setting)
     edited = "".join(lines)
 
-    expected = copy.deepcopy(before)
-    expected.setdefault("network", {}).setdefault("zakura", {})[key] = value
+    expected = copy.deepcopy(parse_config(config_text))
+    target = expected
+    for name in section:
+        target = target.setdefault(name, {})
+    target[key] = value
     try:
         after = tomllib.loads(edited)
     except tomllib.TOMLDecodeError as error:
@@ -192,7 +204,7 @@ def with_trace_peer_names(config_text, node, nodes):
     inline_table = "{ " + ", ".join(
         f"{json.dumps(ip)} = {json.dumps(name)}" for ip, name in names.items()
     ) + " }"
-    return with_zakura_setting(config_text, "trace_peer_names", names, inline_table)
+    return with_setting(config_text, ("network", "zakura"), "trace_peer_names", names, inline_table)
 
 
 # Remove only the obsolete tracing override, after the replacement config is verified.
@@ -206,6 +218,27 @@ if [ -f "$path" ]; then
     systemctl daemon-reload
 fi
 """
+
+
+def with_trace_dir(config_text, trace_dir=TRACE_DIR):
+    """`config_text` with `trace_dir` under `[network.zakura]`, unless it already names one."""
+    return with_setting(config_text, ("network", "zakura"), "trace_dir", trace_dir)
+
+
+def with_peer_addresses(config_text):
+    """`config_text` with `expose_peer_addresses = true` under `[network]`, unless it sets it.
+
+    With it the node writes its peers' addresses, not `v4redacted`, in its log and in
+    the trace rows of each block download, which is what lets the cluster view say
+    which outside peer served a block. A config that sets it to `false` is left alone.
+    """
+    return with_setting(config_text, ("network",), "expose_peer_addresses", True)
+
+
+def exposes_peer_addresses(config_text):
+    """Whether a node config lets the node write its peers' addresses."""
+    network = parse_config(config_text).get("network", {})
+    return isinstance(network, dict) and network.get("expose_peer_addresses") is True
 
 
 def config_path_from_unit(exec_start):
@@ -333,6 +366,23 @@ mkdir -- "$1"
 READ_TRACE_MARKER_SCRIPT = f'if [ -f "$1/{TRACE_MARKER}" ]; then printf managed; fi'
 
 
+# Installs stdin as a drop-in of the node's service; prints whether it differed.
+WRITE_DROP_IN_SCRIPT = """
+set -euo pipefail
+directory="/etc/systemd/system/$1.d"
+install -d -m 755 "$directory"
+cat > "$directory/$2.new"
+if cmp -s "$directory/$2.new" "$directory/$2"; then
+    rm "$directory/$2.new"
+    echo unchanged
+else
+    mv "$directory/$2.new" "$directory/$2"
+    systemctl daemon-reload
+    echo written
+fi
+"""
+
+
 # ---- running things on a node ----
 
 
@@ -376,7 +426,7 @@ def ensure_trace_config(node, nodes):
     Existing trace settings are preserved. The service is never restarted here.
     """
     path, text = read_node_config(node)
-    edited = with_trace_peer_names(with_trace_dir(text), node, nodes)
+    edited = with_peer_addresses(with_trace_peer_names(with_trace_dir(text), node, nodes))
     if trace_dir_of(text) is None:
         remote(node, CLAIM_TRACE_SCRIPT, TRACE_DIR)
         start_profiler(node, TRACE_DIR, manage_traces=True)
@@ -387,7 +437,59 @@ def ensure_trace_config(node, nodes):
     remote(node, REMOVE_PEER_NAMES_SCRIPT, node.service_name)
     if edited == text:
         return f"already writes trace files to {trace_dir_of(text)} with configured peer names"
-    return f"updated trace settings in {path}; they take effect when the node next starts"
+    hidden = "" if exposes_peer_addresses(edited) else "; its config keeps peer addresses hidden"
+    return f"updated trace settings in {path}; they take effect when the node next starts{hidden}"
+
+
+def peer_address(node):
+    """The address other nodes see `node` connect from: the host it is reached at over SSH."""
+    host = node.ssh_string.rpartition("@")[2]
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError as error:
+        raise FleetError(f"{node.name} is reached at {host!r}, which is not an IP address") from error
+
+
+def address_key(text):
+    """One spelling of an IP address, with an IPv4 address written in IPv6 form as IPv4."""
+    address = ipaddress.ip_address(text)
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def parse_private_addresses(text):
+    """The set of addresses in a private list (a JSON list of IP address strings).
+
+    Raises `FleetError` for anything else, so that peer names are never written
+    without the list.
+    """
+    try:
+        listed = json.loads(text)
+        if not isinstance(listed, list) or not all(isinstance(item, str) for item in listed):
+            raise ValueError("not a list of addresses")
+        return frozenset(address_key(item) for item in listed)
+    except ValueError as error:
+        raise FleetError(f"the private address list cannot be read ({error})") from None
+
+
+def named_peers(node, nodes, private):
+    """The nodes in `nodes` that `node` is told about: every other node, except one whose
+    address is in `private`."""
+    return [peer for peer in nodes if peer.name != node.name and address_key(peer_address(peer)) not in private]
+
+
+def set_peer_names(node, nodes, private):
+    """Save typed fleet peer names, excluding private addresses and preserving explicit mappings."""
+    peers = named_peers(node, nodes, private)
+    path, text = read_node_config(node)
+    edited = with_trace_peer_names(text, node, peers)
+    if edited != text:
+        write_node_config(node, path, edited)
+    remote(node, REMOVE_PEER_NAMES_SCRIPT, node.service_name)
+    left_out = len(nodes) - 1 - len(peers)
+    kept = f", leaving out {left_out} with a private address" if left_out else ""
+    if edited == text:
+        return f"already names its {len(peers)} fleet peers{kept}"
+    return f"names its {len(peers)} fleet peers once the node next starts{kept}"
 
 
 def install_profiler(node):
@@ -448,10 +550,15 @@ def for_each_node(nodes, step):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     steps = parser.add_subparsers(dest="step", required=True)
-    for name in ("ensure-trace-config", "install"):
+    for name in ("ensure-trace-config", "peer-names", "install"):
         step = steps.add_parser(name)
         step.add_argument("--config", required=True, help="the deployer's node list")
         step.add_argument("--node", default="", help="only this node; all profiled nodes when empty")
+        if name in ("peer-names", "ensure-trace-config"):
+            step.add_argument(
+                "--private-addresses", required=True,
+                help="JSON list of addresses never to name to a node, `-` for stdin",
+            )
     tunnels = steps.add_parser("tunnels")
     tunnels.add_argument("--config", required=True, help="the deployer's node list")
     return parser.parse_args(argv)
@@ -467,18 +574,29 @@ def main(argv=None):
     if args.step == "tunnels":
         install_tunnels(nodes)
         return 0
-    fleet_nodes = nodes
+    fleet = nodes
+    private = frozenset()
+    if args.step in ("peer-names", "ensure-trace-config"):
+        try:
+            if args.private_addresses == "-":
+                listed = sys.stdin.read()
+            else:
+                with open(args.private_addresses, encoding="utf-8") as handle:
+                    listed = handle.read()
+            private = parse_private_addresses(listed)
+        except (OSError, FleetError) as error:
+            print(f"peer names not written: {error}", file=sys.stderr)
+            return 2
     if args.node:
         nodes = [node for node in nodes if node.name == args.node]
         if not nodes:
             print(f"{args.node} has no profiler in {args.config}; nothing to do")
             return 0
-
-    def step(node):
-        if args.step == "ensure-trace-config":
-            return ensure_trace_config(node, fleet_nodes)
-        return install_profiler(node)
-
+    step = {
+        "ensure-trace-config": lambda node: ensure_trace_config(node, named_peers(node, fleet, private)),
+        "peer-names": lambda node: set_peer_names(node, fleet, private),
+        "install": install_profiler,
+    }[args.step]
     return 1 if for_each_node(nodes, step) else 0
 
 

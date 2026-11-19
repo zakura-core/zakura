@@ -23,6 +23,7 @@ use zakura_chain::{
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{ChainTipBlock, ChainTipSender};
 
+mod boundary;
 mod prop;
 mod vector;
 

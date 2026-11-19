@@ -8,15 +8,19 @@
 //!
 //! 1. resolves the target to its harness through the fuzz package's
 //!    `[package.metadata.zakura-sim.targets]` table and [`HARNESSES`];
-//! 2. loads the harness's committed seeds ([`seed::load`]), and runs each
-//!    admitted seed in this process on a [`Worker`], counting which of the
-//!    harness's properties applied;
+//! 2. loads the harness's committed seeds ([`seed::load`]);
 //! 3. builds the target with [`build_fuzzer`];
 //! 4. runs the built target once on the admitted seeds, as libFuzzer runs a
 //!    list of files, with the suite row's libFuzzer arguments and variables
 //!    and [`STATS_VAR`] set;
 //! 5. reads the process's stats file, which must name the mapped harness,
-//!    be complete, and count at least one run per seed.
+//!    be complete, and count at least one run per seed, and takes the
+//!    harness's properties that applied from its counts.
+//!
+//! The checker runs no seed itself. libFuzzer's `-rss_limit_mb` reads the
+//! process's peak resident size, and Linux carries a process's peak across
+//! `exec`, so a target spawned from a checker that grew past the limit
+//! fails its first input out of memory.
 //!
 //! Each target gets one [`TargetStatus`], and each status means one thing.
 //! A target is ready only if every step passed and at least one of its
@@ -33,6 +37,7 @@
 //! `[[missing-target]]` row, so it accounts for every harness.
 
 use std::{
+    collections::BTreeSet,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -50,7 +55,7 @@ use super::{
 use crate::{
     explore::{
         stats::{Counts, ProcessStats, STATS_VAR},
-        ProcessExit, ProcessFailure, Worker, ABANDON_LIMIT_VAR, EXPECT_VAR,
+        ProcessExit, ProcessFailure, ABANDON_LIMIT_VAR, EXPECT_VAR,
     },
     harness::{HarnessEntry, HARNESSES, NO_TASK_PANIC},
     planted::{self, PLANTED_DIR},
@@ -64,7 +69,9 @@ use crate::{
 pub const READINESS_FILE: &str = "readiness.json";
 
 /// The report's format version. Version 2 adds the missing targets.
-pub const READINESS_VERSION: u32 = 2;
+/// Version 3 takes the applied properties from the target's stats file and
+/// drops each seed's run in the checker.
+pub const READINESS_VERSION: u32 = 3;
 
 /// The properties every harness checks. A target whose seeds apply only
 /// these runs no property of its own harness.
@@ -150,17 +157,13 @@ impl TargetStatus {
     }
 }
 
-/// One seed's run in this process.
+/// One admitted seed the target runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SeedRun {
+pub struct SeedFile {
     /// The seed's file, relative to the repository's root.
     pub file: PathBuf,
     /// The SHA-256 of its full fuzz input.
     pub sha256: String,
-    /// What the explorer did with its run, such as `clean`.
-    pub outcome: String,
-    /// The properties whose evaluation applied in its run.
-    pub applied: Vec<String>,
 }
 
 /// A retained production bypass whose committed input runs on the target's
@@ -185,15 +188,16 @@ pub struct TargetReadiness {
     /// What the status is about, for every status but
     /// [`TargetStatus::Ready`].
     pub detail: Option<String>,
-    /// Each admitted seed's run in this process.
-    pub seeds: Vec<SeedRun>,
+    /// Each admitted seed the target runs.
+    pub seeds: Vec<SeedFile>,
     /// The optional seeds that failed validation, which no run includes,
     /// relative to the repository's root: the harness's, and those whose
     /// sidecar names no registered harness.
     pub quarantined: Vec<PathBuf>,
-    /// The harness's own properties that applied in some seed's run.
+    /// The harness's own properties that applied in the target's run of
+    /// the seeds.
     pub applied: Vec<String>,
-    /// The harness's own properties that applied in no seed's run.
+    /// The harness's own properties that applied in no run of the target's.
     pub unapplied: Vec<String>,
     /// The built target's identity, with its commit and whether the
     /// checkout was dirty, so a copy of the report names what it checked.
@@ -270,47 +274,34 @@ pub fn resolve(manifest: &str, target: &str) -> Result<&'static HarnessEntry, St
         .ok_or_else(|| format!("`{target}` maps to `{name}`, which no harness registers"))
 }
 
-/// Runs `input` on `entry`'s harness on `worker`, and returns what the
-/// explorer did with it and the properties whose evaluation applied.
-pub fn run_seed(
-    worker: &mut Worker,
-    entry: &'static HarnessEntry,
-    input: &[u8],
-) -> (String, Vec<String>) {
-    worker.explore(entry, input, move |_, run, classified| {
-        let mut counts = Counts::for_harness(entry);
-        counts.record(run, classified, &[]);
-        let outcome = counts
-            .outcomes
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "none".to_owned());
-        let applied = counts
-            .properties
-            .into_iter()
-            .filter(|(_, counts)| counts.applied())
-            .map(|(id, _)| id)
-            .collect();
-        (outcome, applied)
-    })
-}
-
 /// The harness's own properties, other than [`SHARED_PROPERTIES`], split
-/// into those that applied in some seed's run and those that didn't.
-pub fn own_applicability(entry: &HarnessEntry, seeds: &[SeedRun]) -> (Vec<String>, Vec<String>) {
+/// into those in `applied` and those not.
+pub fn own_applicability(
+    entry: &HarnessEntry,
+    applied: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
     (entry.properties)()
         .into_iter()
         .map(|property| property.id)
         .filter(|id| !SHARED_PROPERTIES.contains(&id.as_str()))
-        .partition(|id| seeds.iter().any(|seed| seed.applied.contains(id)))
+        .partition(|id| applied.contains(id))
+}
+
+/// The properties whose evaluation applied in some run `counts` counts.
+pub fn applied_properties(counts: &Counts) -> BTreeSet<String> {
+    counts
+        .properties
+        .iter()
+        .filter(|(_, counts)| counts.applied())
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// What the target's run on `seeds`, each seed's file and its length in
 /// bytes, came to, judged from how it exited, its output `log`, and the
 /// stats files it left, `stats`. Only the `harness` the manifest maps the
-/// target to, the row's `-max_len` ([`max_len`]) and the `applied` own
-/// properties of the seeds' in-process runs are needed besides.
+/// target to, the row's `-max_len` ([`max_len`]) and the harness's own
+/// properties that applied in the run, `applied`, are needed besides.
 ///
 /// The run must exit cleanly, report each seed's file as run, run each
 /// seed whole, and leave
@@ -512,16 +503,22 @@ pub fn check_targets(
             )));
         }
     }
+    let selected: Vec<&DeclaredTarget> = declared
+        .iter()
+        .filter(|target| options.targets.is_empty() || options.targets.contains(&target.name))
+        .collect();
+    if selected.is_empty() {
+        return Err(CampaignError::Refused(format!(
+            "{SUITE_FILE} declares no target to check"
+        )));
+    }
     let mut report = Readiness {
         version: READINESS_VERSION,
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
         missing_targets: suite.missing_target.clone(),
     };
-    for target in declared
-        .iter()
-        .filter(|target| options.targets.is_empty() || options.targets.contains(&target.name))
-    {
+    for target in selected {
         let row = check_target(options, &manifest, target)?;
         checked(&row);
         report.targets.push(row);
@@ -596,23 +593,18 @@ fn check_target(
         fs::create_dir_all(sub)
             .map_err(CampaignError::io(format!("creating {}", sub.display())))?;
     }
-    let mut worker = Worker::new();
     let mut files = Vec::new();
     for seed in &loaded.admitted {
-        let (outcome, applied) = run_seed(&mut worker, entry, &seed.input);
         let digest = sha256(&seed.input);
         let file = seeds_dir.join(&digest);
         fs::write(&file, &seed.input)
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
         files.push((file, seed.input.len()));
-        row.seeds.push(SeedRun {
+        row.seeds.push(SeedFile {
             file: seed::from_root(&seed.path),
             sha256: digest,
-            outcome,
-            applied,
         });
     }
-    (row.applied, row.unapplied) = own_applicability(entry, &row.seeds);
 
     let fuzzer = dir.join("fuzzer");
     match build_fuzzer(
@@ -642,9 +634,10 @@ fn check_target(
         .iter()
         .map(|path| ProcessStats::read(path))
         .collect();
-    row.fuzzer_runs = stats
-        .iter()
-        .find_map(|stats| stats.as_ref().ok().map(|stats| stats.counts.runs));
+    let counted = stats.iter().find_map(|stats| stats.as_ref().ok());
+    row.fuzzer_runs = counted.map(|stats| stats.counts.runs);
+    let applied = counted.map_or_else(BTreeSet::new, |stats| applied_properties(&stats.counts));
+    (row.applied, row.unapplied) = own_applicability(entry, &applied);
     let (status, detail) = judge_run(
         entry.name,
         &files,

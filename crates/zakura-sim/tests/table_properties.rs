@@ -123,6 +123,9 @@ fn every_row_yields_its_templates() {
                 // Three framing labels, the role's own, `BadContent`, and
                 // the cadence template. An announcement always has a cadence.
                 MessageRole::Announcement { .. } => 3 + 1 + 1,
+                // Three framing labels, `OverRate` and `BadContent`. A
+                // metered row has no cadence.
+                MessageRole::Metered { .. } => 3 + 1 + 1,
                 MessageRole::Request { cadence, .. } => 3 + 1 + 1 + usize::from(cadence.is_some()),
                 MessageRole::Response { .. } => 3 + 2 + 1,
                 MessageRole::Subscription { cadence, .. } => {

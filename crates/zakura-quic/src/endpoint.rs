@@ -81,6 +81,17 @@ pub trait Acceptor: Send + Sync + 'static {
     /// crypto work and must not block (ADM-4).
     fn admit(&self, incoming: &IncomingInfo) -> Admit;
 
+    /// Returns any application admission charge when a transport limit, a
+    /// stateless Retry or a rejected first packet prevents an accepted attempt
+    /// from starting TLS.
+    /// Runs synchronously on the endpoint task, after `admit` returned `Accept`.
+    fn cancel_admission(&self, _incoming: &IncomingInfo) {}
+
+    /// Ends application transport accounting for an accepted attempt not cancelled above.
+    /// When `handed_off` is true, `handle` has synchronously taken responsibility
+    /// for the reservation. Otherwise the application must release it here.
+    fn finish_admission(&self, _handed_off: bool) {}
+
     /// ALPNs to offer, in preference order (WIRE-2).
     fn alpns(&self) -> Vec<Vec<u8>>;
 
@@ -144,6 +155,11 @@ pub(crate) struct SocketSlot {
     pub(crate) stopped: AtomicBool,
 }
 
+/// The simulator's callback for each admitted QUIC attempt's remote address
+/// and whether that address was validated.
+#[cfg(zakura_sim)]
+type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
+
 /// State the handles and every endpoint task share. It holds no command
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
@@ -152,6 +168,8 @@ pub(crate) struct Shared {
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
+    #[cfg(zakura_sim)]
+    pub(crate) admission_observer: std::sync::Mutex<Option<AdmissionObserver>>,
     pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
@@ -163,6 +181,18 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    #[cfg(zakura_sim)]
+    pub(crate) fn observe_handshake_attempt(&self, remote: SocketAddr, validated: bool) {
+        let observer = self
+            .admission_observer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(remote, validated);
+        }
+    }
+
     /// One socket's endpoint config, with the injected seed, reset key and
     /// CID generator.
     pub(crate) fn endpoint_config(&self) -> quinn_proto::EndpointConfig {
@@ -218,6 +248,11 @@ impl fmt::Debug for QuicEndpoint {
 }
 
 impl QuicEndpoint {
+    /// Reads admission counters without retaining the endpoint or changing its schedule.
+    #[cfg(zakura_sim)]
+    pub fn admission_probe(&self) -> AdmissionProbe {
+        AdmissionProbe(Arc::downgrade(&self.inner.shared))
+    }
     /// Binds one socket per address in `bind` (API-2).
     pub fn bind(
         secret: NodeSecretKey,
@@ -262,6 +297,8 @@ impl QuicEndpoint {
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
             pending: PendingTable::default(),
+            #[cfg(zakura_sim)]
+            admission_observer: std::sync::Mutex::new(None),
             connections: ConnectionSlots::new(
                 bind.max_connections,
                 bind.dial_reserve,
@@ -756,7 +793,7 @@ fn finish_dial(
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected, target, alpn))
+    Ok(Conn::new(conn, expected, target, true, alpn))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -779,6 +816,7 @@ async fn establish(
 /// Finishes one inbound handshake and hands the connection to the acceptor.
 pub(crate) async fn inbound_handshake(
     connecting: Connecting,
+    source_validated: bool,
     deadline: Option<Duration>,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
@@ -787,6 +825,11 @@ pub(crate) async fn inbound_handshake(
     let remote = connecting.remote;
     let shared = connecting.conn.shared.clone();
     let result = establish(connecting, deadline).await;
+    #[cfg(zakura_sim)]
+    pending.table.record(HandshakeEvent::Finished {
+        remote,
+        error: result.as_ref().err().map(ToString::to_string),
+    });
     record_handshake(&result, started);
     let Ok((conn, handshake)) = result else {
         // A failed or timed-out attempt keeps its pending slot until the
@@ -806,7 +849,8 @@ pub(crate) async fn inbound_handshake(
     };
     // `handle` runs before the pending count drops, so an acceptor that moves
     // the connection into its own accounting there leaves no gap (ADM-7).
-    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, alpn));
+    let pending = pending.handoff();
+    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, source_validated, alpn));
     drop(pending);
     handled.await;
 }
@@ -832,6 +876,7 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
         .max_pending_per_ip
         .is_some_and(|limit| info.pending_from_ip >= limit as usize)
     {
+        acceptor.cancel_admission(info);
         return Admit::Refuse;
     }
     // Rule 5.
@@ -840,6 +885,7 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
             .retry_threshold
             .is_some_and(|threshold| info.pending_total >= threshold as usize)
     {
+        acceptor.cancel_admission(info);
         return Admit::Retry;
     }
     Admit::Accept
@@ -933,7 +979,44 @@ async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
 
 /// Handshakes in progress, in total and per source IP (ADM-7).
 #[derive(Clone, Default)]
-pub(crate) struct PendingTable(Arc<Mutex<PendingCounts>>);
+pub(crate) struct PendingTable(
+    Arc<Mutex<PendingCounts>>,
+    #[cfg(zakura_sim)] Arc<counter::AtomicUsize>,
+    /// Recorded events, or `None` until a probe asks to drain them.
+    #[cfg(zakura_sim)]
+    Arc<std::sync::Mutex<Option<Vec<HandshakeEvent>>>>,
+);
+
+/// Production admission and TLS decisions retained for simulator observation.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug)]
+pub enum HandshakeEvent {
+    /// The endpoint applied both the acceptor and QUIC admission policy.
+    Admission {
+        /// The counters and validation state before admission.
+        incoming: IncomingInfo,
+        /// The resulting admission action.
+        decision: Admit,
+        /// The configured per-address TLS limit.
+        max_pending_per_ip: Option<u32>,
+        /// The configured threshold for unvalidated sources.
+        retry_threshold: Option<u32>,
+    },
+    /// An admitted inbound connection started TLS.
+    Started {
+        /// The peer's socket address.
+        remote: SocketAddr,
+        /// The configured TLS timeout.
+        deadline: Option<Duration>,
+    },
+    /// TLS completed or failed, before control-handshake dispatch.
+    Finished {
+        /// The peer's socket address.
+        remote: SocketAddr,
+        /// The production TLS or timeout error, if any.
+        error: Option<String>,
+    },
+}
 
 #[derive(Default)]
 struct PendingCounts {
@@ -941,7 +1024,128 @@ struct PendingCounts {
     by_ip: HashMap<IpAddr, usize>,
 }
 
+/// A weak simulator probe of QUIC admission counters.
+#[cfg(zakura_sim)]
+#[derive(Clone)]
+pub struct AdmissionProbe(std::sync::Weak<Shared>);
+
+/// QUIC admission counters at one scheduler boundary.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionSample {
+    /// Pending charges currently transferring into the handler's accounting.
+    pub handoffs: usize,
+    /// Inbound connections still completing TLS.
+    pub pending: usize,
+    /// Pending TLS connections by admission group.
+    pub hosts: Vec<(IpAddr, usize)>,
+    /// Connections holding live slots, including outbound attempts.
+    pub live: usize,
+    /// Inbound connections holding live slots.
+    pub inbound: usize,
+    /// Connections holding shutdown-drain slots.
+    pub closing: usize,
+    /// The total live-slot capacity.
+    pub max_live: usize,
+    /// The inbound live-slot capacity.
+    pub max_inbound: usize,
+    /// The live-slot ceiling for inbound admission that protects outbound dials.
+    pub below_reserve: usize,
+}
+
+#[cfg(zakura_sim)]
+impl AdmissionProbe {
+    /// Starts recording handshake events for [`Self::take_events`].
+    ///
+    /// The endpoint records nothing before this call, so an endpoint whose
+    /// events no one drains keeps no history.
+    pub fn record_events(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared
+                .pending
+                .2
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// Drains events without adding simulator scheduling points.
+    pub fn take_events(&self) -> Vec<HandshakeEvent> {
+        assert!(
+            zakura_rt::sim::in_boundary_read(),
+            "QUIC admission probes require a boundary read"
+        );
+        let Some(shared) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let mut events = shared
+            .pending
+            .2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        events.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Reports each Initial that reaches cryptographic handshake processing,
+    /// with whether its source address was validated. The callback runs
+    /// without adding a scheduler preemption point.
+    pub fn observe_attempts(&self, observer: impl Fn(SocketAddr, bool) + Send + Sync + 'static) {
+        if let Some(shared) = self.0.upgrade() {
+            *shared
+                .admission_observer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(observer));
+        }
+    }
+
+    /// Reads through peeks. A held pending lock leaves the transition unsampled.
+    pub fn read(&self) -> Option<AdmissionSample> {
+        use zakura_rt::sim::{in_boundary_read, Peek};
+        assert!(
+            in_boundary_read(),
+            "QUIC admission probes require a boundary read"
+        );
+        let shared = self.0.upgrade()?;
+        match shared.pending.0.peek(|pending| {
+            let held = Held::unpack(shared.connections.counts.held.peek());
+            let mut hosts: Vec<_> = pending
+                .by_ip
+                .iter()
+                .map(|(&ip, &count)| (ip, count))
+                .collect();
+            hosts.sort_unstable();
+            AdmissionSample {
+                handoffs: shared.pending.1.load(Ordering::Relaxed),
+                pending: pending.total,
+                hosts,
+                live: held.live,
+                inbound: held.inbound,
+                closing: shared.connections.counts.closing.peek(),
+                max_live: shared.connections.max,
+                max_inbound: shared.connections.max_inbound,
+                below_reserve: shared.connections.below_reserve,
+            }
+        }) {
+            Peek::Current(sample) | Peek::Poisoned(sample) => Some(sample),
+            Peek::Held { .. } => None,
+        }
+    }
+}
+
 impl PendingTable {
+    #[cfg(zakura_sim)]
+    pub(crate) fn record(&self, event: HandshakeEvent) {
+        if let Some(events) = self
+            .2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            events.push(event);
+        }
+    }
+
     pub(crate) fn total(&self) -> usize {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).total
     }
@@ -956,13 +1160,15 @@ impl PendingTable {
             .unwrap_or(0)
     }
 
-    pub(crate) fn enter(&self, ip: IpAddr) -> PendingGuard {
+    pub(crate) fn enter(&self, ip: IpAddr, acceptor: Arc<dyn Acceptor>) -> PendingGuard {
         let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         counts.total += 1;
         *counts.by_ip.entry(ip).or_default() += 1;
         PendingGuard {
             table: self.clone(),
             ip,
+            acceptor,
+            handing_off: false,
         }
     }
 }
@@ -971,6 +1177,17 @@ impl PendingTable {
 pub(crate) struct PendingGuard {
     table: PendingTable,
     ip: IpAddr,
+    acceptor: Arc<dyn Acceptor>,
+    handing_off: bool,
+}
+
+impl PendingGuard {
+    fn handoff(mut self) -> Self {
+        #[cfg(zakura_sim)]
+        self.table.1.fetch_add(1, Ordering::Relaxed);
+        self.handing_off = true;
+        self
+    }
 }
 
 impl Drop for PendingGuard {
@@ -983,6 +1200,12 @@ impl Drop for PendingGuard {
                 counts.by_ip.remove(&self.ip);
             }
         }
+        #[cfg(zakura_sim)]
+        if self.handing_off {
+            self.table.1.fetch_sub(1, Ordering::Relaxed);
+        }
+        drop(counts);
+        self.acceptor.finish_admission(self.handing_off);
     }
 }
 
@@ -1186,6 +1409,8 @@ impl ConnectionSlots {
             max_closing: self.max_closing,
             inbound,
             closing: AtomicBool::new(false),
+            #[cfg(zakura_sim)]
+            release: crate::SlotProbe::default(),
         })
     }
 }
@@ -1214,6 +1439,8 @@ pub(crate) struct ConnectionSlot {
     max_closing: usize,
     inbound: bool,
     closing: AtomicBool,
+    #[cfg(zakura_sim)]
+    pub(crate) release: crate::SlotProbe,
 }
 
 impl ConnectionSlot {
@@ -1267,12 +1494,126 @@ impl Drop for ConnectionSlot {
             self.release_live();
             metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         }
+        #[cfg(zakura_sim)]
+        self.release.finish();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_transport_owner_releases_application_reservation() {
+        struct AcceptorWithReservation(std::sync::atomic::AtomicUsize);
+        impl Acceptor for AcceptorWithReservation {
+            fn admit(&self, _: &IncomingInfo) -> Admit {
+                Admit::Accept
+            }
+            fn finish_admission(&self, handed_off: bool) {
+                self.0.fetch_add(
+                    if handed_off { 10 } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+            fn handle(&self, _: Conn) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+        let acceptor = Arc::new(AcceptorWithReservation(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let pending = PendingTable::default();
+        let owner = pending.enter("192.0.2.1".parse().unwrap(), acceptor.clone());
+        assert_eq!(pending.total(), 1);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(owner);
+        assert_eq!(pending.total(), 0);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let owner = pending.enter("192.0.2.2".parse().unwrap(), acceptor.clone());
+        drop(owner.handoff());
+        assert_eq!(pending.total(), 0);
+        assert_eq!(acceptor.0.load(std::sync::atomic::Ordering::Relaxed), 11);
+    }
+
+    #[test]
+    fn transport_rejections_cancel_only_accepted_application_admission() {
+        struct ChargedAcceptor {
+            decision: Admit,
+            cancelled: std::sync::atomic::AtomicUsize,
+        }
+        impl Acceptor for ChargedAcceptor {
+            fn admit(&self, _: &IncomingInfo) -> Admit {
+                self.decision
+            }
+            fn cancel_admission(&self, _: &IncomingInfo) {
+                self.cancelled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                Vec::new()
+            }
+            fn handle(&self, _: Conn) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+        let mut acceptor = ChargedAcceptor {
+            decision: Admit::Accept,
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let info = IncomingInfo {
+            remote: "192.0.2.1:8234".parse().unwrap(),
+            validated: false,
+            pending_total: 1,
+            pending_from_ip: 1,
+        };
+        let config = QuicConfig {
+            retry_threshold: Some(0),
+            ..QuicConfig::default()
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Retry);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let config = QuicConfig {
+            max_pending_per_ip: Some(1),
+            ..config
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Refuse);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        acceptor.decision = Admit::Refuse;
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Refuse);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        acceptor.decision = Admit::Accept;
+        let config = QuicConfig {
+            max_pending_per_ip: None,
+            retry_threshold: None,
+            ..config
+        };
+        assert_eq!(decide(&config, &acceptor, &info), Admit::Accept);
+        assert_eq!(
+            acceptor
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 
     /// Concurrent address batches cannot cross the discovery ceiling, and a
     /// refused batch leaves no partial claim. Inbound and maintained dials

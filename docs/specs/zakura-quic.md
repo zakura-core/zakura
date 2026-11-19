@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-10. Version 0.20.
+Status: draft for review, 2026-11-17. Version 0.21.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -41,7 +41,12 @@ source and has Zakura count each global IPv6 /64 as one IP; it changes ADM-1,
 ADM-3, ADM-7 and API-3, and adds §16 rows; §17q lists each change. Version
 0.20 gives inbound connections their own transport cap and sizes Zakura's
 dial reserve for one full address record, so discovery keeps the outbound
-share when inbound is full (ADM-12); §17r explains it.
+share when inbound is full (ADM-12); §17r explains it. Version 0.21 adds a
+per-address handshake cadence with one ledger per source validation state,
+returns admission charges through two new acceptor hooks, reports a
+connection's source validation, and caps a closed connection's drain at
+`SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
+each change.
 
 ## 0. Conventions
 
@@ -443,6 +448,23 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   the acceptor returns `Retry` for an unvalidated source and `Refuse` for a
   validated source.
 
+  Zakura's acceptor then charges the source's admission host one token of a
+  handshake cadence: a bucket of `max_connections_per_ip` tokens (16 at the
+  defaults) that refills over the dialer's shortest redial interval, 1 s, so
+  every node the per-IP cap allows behind one address can redial once a
+  second. It keeps one ledger for validated sources and one for unvalidated
+  sources, each bounded at `max_connections + max_pending_handshakes`
+  addresses (124 at the defaults). A ledger drops only full buckets, so
+  address churn can't erase debt. When the source's bucket is empty, or its
+  ledger is full without it, the acceptor returns `Retry` for an unvalidated
+  source and `Refuse` for a validated one. A spoofed Initial is never
+  validated, so it can only drain the unvalidated ledger, and its victim
+  answers the Retry with a validated Initial that the other ledger charges.
+  The acceptor refunds the token, to the ledger it charged, when the attempt
+  registers, when it never starts TLS (`cancel_admission`), and when Zakura
+  refuses it after TLS for its own capacity. A failed handshake keeps its
+  charge.
+
   A control handshake is an inbound connection past TLS that hasn't
   registered yet. The transport stops counting a connection when TLS
   finishes, so Zakura counts it against its IP from then until registration.
@@ -579,6 +601,11 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     endpoint send racing the switch can add one datagram. That queue counts
     against its socket's `SOCKET_DATAGRAM_QUEUE_BYTES`, so beyond bookkeeping
     a closed connection costs the CTRL-26 budget nothing.
+  - The task MUST drop the connection's state `SHUTDOWN_DRAIN` (3 s) after
+    the close, even if `quinn-proto` is still draining. Its drain lasts
+    three PTOs, which the peer's RTT sets, so without the cap a slow or
+    delaying peer could hold a closing slot for as long as it liked. A late
+    packet after the cap at worst draws a stateless reset.
   - If `max_closing_connections` are already held, the task MUST drop the
     connection's state at once instead of draining it. A late packet for it
     gets at most a stateless reset. Admission never counts closed
@@ -867,9 +894,21 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3;
   - `fn pending_group(&self, ip: IpAddr) -> IpAddr`, default `ip`, the group
     that ADM-7 counts the IP's pending handshakes under. It must not block
-    (ADM-4).
+    (ADM-4);
+  - `fn cancel_admission(&self, incoming: &IncomingInfo)`, default no-op. The
+    endpoint calls it on its own task, after `admit` returned `Accept`, when
+    the attempt never starts TLS: rule 3 or 5 of ADM-3, a full ADM-12 cap, or
+    a first packet that `quinn-proto` rejects. The acceptor returns any charge
+    `admit` took, so a source whose attempt never reached TLS pays nothing;
+  - `fn finish_admission(&self, handed_off: bool)`, default no-op. The
+    endpoint calls it once for every accepted attempt not cancelled above,
+    when ADM-7 stops counting it. `handed_off` is true when `handle` has
+    already taken over the attempt's accounting; otherwise the acceptor
+    releases what `admit` reserved.
 - **API-4.** `Conn`:
-  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `alpn()` and `stable_id()`;
+  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `source_validated()`,
+    `alpn()` and `stable_id()`. `source_validated()` is `IncomingInfo::validated`
+    for an inbound connection, and true for an outbound one;
   - `open_bi()`, `accept_bi()`, `close(code, reason)`, `closed()` and
     `close_reason()`;
   - `async stats() -> Option<ConnStats>`, `None` once the connection task has
@@ -1540,3 +1579,24 @@ Changed:
   can't race an inbound claim or close.
 - **§16.** Adds the inbound cap, race, dial reserve and bootstrap address
   tests.
+
+## 17s. Changes in version 0.21
+
+A peer could repeat failed handshakes at no rate cost, and each one costs
+the node about 3.5 ms of CPU. The first cadence shared one ledger across
+validated and unvalidated sources. A spoofed Initial that carried only
+`CONNECTION_CLOSE` was accepted, charged and closed at once with no refund,
+so about 32 spoofed Initials a second locked an honest address out, and
+spoofed sources from many addresses could fill the ledger and refuse
+unrelated peers (zakura#2337 review, V12 F-766).
+
+Changed:
+
+- **ADM-3.** Adds the handshake cadence, with one ledger per source
+  validation state. Only `Retry` answers an unvalidated source that runs
+  out, so spoofed sources can't refuse a validated one.
+- **ADM-13.** Caps a closed connection's drain at `SHUTDOWN_DRAIN`.
+- **API-3.** Adds `Acceptor::cancel_admission` and
+  `Acceptor::finish_admission`.
+- **API-4.** Adds `Conn::source_validated`, so an acceptor can refund the
+  ledger it charged once the attempt has become a connection.

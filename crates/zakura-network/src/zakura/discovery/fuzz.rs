@@ -1,13 +1,18 @@
-//! Machine models and drivers for discovery's shared state: the record book and
-//! [`DiscoveryState`], each checked against an independent model.
+//! Machine drivers for discovery's shared state: the record book and
+//! [`DiscoveryState`].
 //!
-//! The models restate the documented rules. They never call the code they
-//! check. `zakura-sim` replays these drivers through [`trace_discovery_book_bytes`]
-//! and [`trace_discovery_state_bytes`].
+//! Each driver runs the real owner and checks its invariants after every
+//! operation. It compares results and reported changes only with what the
+//! driver sent and the owner reported earlier: which records it imported,
+//! from whom and when they expire, which dials it reported, which sessions it
+//! admitted and removed, and which peers it marked connected. It never
+//! re-derives an eviction victim, an ordering or a sample. Named scenarios in
+//! `fuzz/state_tests.rs` and `protocol.rs` pin those rules. `zakura-sim`
+//! replays these drivers through [`trace_discovery_book_bytes`] and
+//! [`trace_discovery_state_bytes`].
 
 use std::{
     any::Any,
-    cmp::Reverse,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::{catch_unwind, AssertUnwindSafe},
     time::Duration,
@@ -15,7 +20,6 @@ use std::{
 
 use rand_10::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -23,8 +27,8 @@ use super::protocol::{
     BookChange, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
     DiscoveryRecordValidationContext, DiscoveryServiceSummary, EvictionCause, ImportOutcome,
     ServiceSummaryEnvelope, Services, ZakuraDiscoveryBook, ZakuraDiscoveryBookLimits,
-    ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraNodeRecord, ZakuraNodeRecordBody,
-    ZakuraServiceId,
+    ZakuraDiscoveryConfig, ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraNodeRecord,
+    ZakuraNodeRecordBody, ZakuraServiceId,
 };
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
@@ -136,7 +140,7 @@ fn record_with_services(
     .expect("the signer authors its own record")
 }
 
-// Book model.
+// Book driver.
 
 /// Who supplied a record.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -165,18 +169,6 @@ enum BookOp {
         limit: usize,
     },
     Advance(u64),
-}
-
-/// The model's view of one stored entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ModelEntry {
-    sequence: u64,
-    expires: u64,
-    source: Option<NodeId>,
-    confirmed: bool,
-    failures: u32,
-    last_seen: u64,
-    last_success: Option<u64>,
 }
 
 /// One import's result in a machine step.
@@ -210,203 +202,6 @@ impl From<ImportOutcome> for ImportFact {
     }
 }
 
-/// An independent restatement of the book's documented rules.
-#[derive(Default)]
-struct BookModel {
-    entries: HashMap<NodeId, ModelEntry>,
-    /// The record changes the current operation made.
-    changes: Vec<BookChange>,
-}
-
-impl BookModel {
-    fn relay_of(source: Option<NodeId>, node_id: NodeId) -> Option<NodeId> {
-        source.filter(|source| *source != node_id)
-    }
-
-    fn relayed_by(&self, relay: NodeId) -> usize {
-        self.entries
-            .iter()
-            .filter(|(node_id, entry)| Self::relay_of(entry.source, **node_id) == Some(relay))
-            .count()
-    }
-
-    /// Each relay's attributed entries, in node id order.
-    fn relayed_counts(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<NodeId, usize> = HashMap::new();
-        for (node_id, entry) in &self.entries {
-            if let Some(relay) = Self::relay_of(entry.source, *node_id) {
-                *counts.entry(relay).or_default() += 1;
-            }
-        }
-        let mut counts: Vec<_> = counts
-            .into_iter()
-            .map(|(relay, count)| (hex::encode(relay.as_bytes()), count))
-            .collect();
-        counts.sort_unstable();
-        counts
-    }
-
-    fn import(
-        &mut self,
-        node_id: NodeId,
-        sequence: u64,
-        expires: u64,
-        source: Option<NodeId>,
-        now: u64,
-    ) -> ImportFact {
-        if expires.saturating_add(SKEW) < now {
-            return ImportFact::Expired;
-        }
-        let first_party = source == Some(node_id);
-        let relay = Self::relay_of(source, node_id);
-        let relay_full = relay.is_some_and(|relay| self.relayed_by(relay) >= BOOK_MAX_PER_RELAY);
-
-        if let Some(entry) = self.entries.get_mut(&node_id) {
-            // An expired record no longer orders its node's records.
-            let stored_orders = entry.expires >= now;
-            if stored_orders && sequence < entry.sequence {
-                return ImportFact::IgnoredOlder;
-            }
-            let same_sequence = stored_orders && sequence == entry.sequence;
-            // A full relay cannot take over an entry.
-            let incoming = if relay_full { entry.source } else { source };
-            // A same-sequence relay copy keeps the author's own provenance.
-            let keeps_author =
-                same_sequence && entry.source == Some(node_id) && incoming != Some(node_id);
-            if !keeps_author {
-                entry.source = incoming;
-            }
-            entry.last_seen = now;
-            // A reset or replayed record over an expired one inherits no
-            // confirmation.
-            if !stored_orders && sequence <= entry.sequence {
-                entry.confirmed = false;
-            }
-            entry.confirmed |= first_party;
-            if same_sequence {
-                return ImportFact::MetadataUpdated;
-            }
-            self.changes.push(BookChange::Replaced {
-                node_id,
-                previous_sequence: entry.sequence,
-                sequence,
-                source: entry.source,
-            });
-            entry.sequence = sequence;
-            entry.expires = expires;
-            return ImportFact::Updated;
-        }
-
-        if let Some(relay) = relay.filter(|_| relay_full) {
-            let mut expired: Vec<NodeId> = self
-                .entries
-                .iter()
-                .filter(|(id, entry)| {
-                    Self::relay_of(entry.source, **id) == Some(relay) && entry.expires < now
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            if expired.is_empty() {
-                return ImportFact::RelayFull;
-            }
-            expired.sort_unstable_by_key(|id| *id.as_bytes());
-            for id in expired {
-                let entry = self.entries.remove(&id).expect("the filter found this id");
-                self.changes.push(BookChange::Evicted {
-                    node_id: id,
-                    sequence: entry.sequence,
-                    cause: EvictionCause::RelayQuota,
-                });
-            }
-        }
-        self.changes.push(BookChange::Installed {
-            node_id,
-            sequence,
-            source,
-        });
-        self.entries.insert(
-            node_id,
-            ModelEntry {
-                sequence,
-                expires,
-                source,
-                confirmed: first_party,
-                failures: 0,
-                last_seen: now,
-                last_success: None,
-            },
-        );
-        if self.entries.len() > BOOK_MAX_RECORDS {
-            let victim = self.eviction_victim(now);
-            let entry = self.entries.remove(&victim).expect("the victim is stored");
-            self.changes.push(BookChange::Evicted {
-                node_id: victim,
-                sequence: entry.sequence,
-                cause: EvictionCause::BookLimit,
-            });
-            if victim == node_id {
-                return ImportFact::BookFull;
-            }
-        }
-        ImportFact::Added
-    }
-
-    /// The documented eviction order: the earliest-expiring expired entry,
-    /// then the most-failed never-dialed entry, then the least valuable entry
-    /// with unconfirmed entries first.
-    fn eviction_victim(&self, now: u64) -> NodeId {
-        let entries = || self.entries.iter();
-        entries()
-            .filter(|(_, entry)| entry.expires < now)
-            .min_by_key(|(id, entry)| (entry.expires, *id.as_bytes()))
-            .or_else(|| {
-                entries()
-                    .filter(|(_, entry)| {
-                        entry.last_success.is_none() && entry.failures >= HIGH_FAILURES
-                    })
-                    .max_by_key(|(id, entry)| {
-                        (
-                            entry.failures,
-                            Reverse(entry.last_seen),
-                            Reverse(*id.as_bytes()),
-                        )
-                    })
-            })
-            .or_else(|| {
-                entries().min_by_key(|(id, entry)| {
-                    (
-                        entry.confirmed,
-                        entry.last_success.unwrap_or(0),
-                        entry.last_seen,
-                        *id.as_bytes(),
-                    )
-                })
-            })
-            .map(|(id, _)| *id)
-            .expect("an over-full book has an entry")
-    }
-
-    fn dial_success(&mut self, node_id: NodeId, now: u64) {
-        if let Some(entry) = self.entries.get_mut(&node_id) {
-            entry.last_success = Some(now);
-            entry.confirmed = true;
-            entry.failures = 0;
-        }
-    }
-
-    fn dial_failure(&mut self, node_id: NodeId) {
-        if let Some(entry) = self.entries.get_mut(&node_id) {
-            entry.failures = entry.failures.saturating_add(1);
-        }
-    }
-
-    fn is_sample_eligible(&self, node_id: NodeId, now: u64) -> bool {
-        self.entries
-            .get(&node_id)
-            .is_some_and(|entry| entry.confirmed && entry.expires >= now)
-    }
-}
-
 fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> ImportFact {
     match result {
         Ok(outcome) => outcome.into(),
@@ -422,34 +217,87 @@ fn import_result(result: Result<ImportOutcome, DiscoveryBookError>) -> ImportFac
     }
 }
 
-fn observed_entry(book: &ZakuraDiscoveryBook, node_id: NodeId) -> Option<ModelEntry> {
-    book.get(&node_id).map(|entry| ModelEntry {
-        sequence: entry.record().body.sequence,
-        expires: entry.record().body.expires_at_unix_secs,
-        source: entry.source(),
-        confirmed: entry.is_confirmed(),
-        failures: entry.failure_count(),
-        last_seen: entry.last_seen(),
-        last_success: entry.last_success(),
-    })
-}
-
 const BOOK_PROPERTY: &str = "discovery/record-book";
 
-/// The real book and its model at one point in a history.
+/// What the driver knows of one stored entry: the changes the book reported,
+/// and the operations the driver chose since the entry's install.
+#[derive(Clone, Debug)]
+struct Tracked {
+    sequence: u64,
+    /// The signed expiry of the record the driver imported.
+    expires: u64,
+    /// Dial failures since the install or the last successful dial.
+    failures: u32,
+    /// The last import that refreshed the entry.
+    last_seen: u64,
+    /// The last successful dial since the install.
+    last_success: Option<u64>,
+    /// Whether the author's own `Hello` or a successful dial vouched for the
+    /// entry since its install. Only a vouched entry may be confirmed.
+    vouched: bool,
+}
+
+impl Tracked {
+    fn expired(&self, now: u64) -> bool {
+        self.expires < now
+    }
+
+    /// Never dialed, and failed at least the eviction threshold.
+    fn failing(&self) -> bool {
+        self.last_success.is_none() && self.failures >= HIGH_FAILURES
+    }
+}
+
+/// Checks that a record-limit eviction took its victim from the first
+/// nonempty tier among `candidates`: expired entries, then never-dialed
+/// failing entries, then unconfirmed entries.
+fn check_eviction_tier(
+    victim: &Tracked,
+    victim_confirmed: bool,
+    candidates: &HashMap<NodeId, Tracked>,
+    now: u64,
+    confirmed: impl Fn(&NodeId) -> bool,
+) {
+    if candidates.values().any(|candidate| candidate.expired(now)) {
+        assert!(
+            victim.expired(now),
+            "{BOOK_PROPERTY}: evicted a live entry beside an expired one"
+        );
+    } else if candidates.values().any(Tracked::failing) {
+        assert!(
+            victim.failing(),
+            "{BOOK_PROPERTY}: evicted a working entry beside a failing one"
+        );
+    } else {
+        assert!(
+            !victim_confirmed || candidates.keys().all(confirmed),
+            "{BOOK_PROPERTY}: evicted a confirmed entry beside an unconfirmed one"
+        );
+    }
+}
+
+/// The book's entries just before an import.
+struct Before {
+    tracked: HashMap<NodeId, Tracked>,
+    sources: HashMap<NodeId, Option<NodeId>>,
+    confirmed: HashSet<NodeId>,
+    relayed: HashMap<NodeId, usize>,
+}
+
+/// The real book at one point in a history, and what the driver sent it.
 struct BookDriver {
     book: ZakuraDiscoveryBook,
-    model: BookModel,
     rng: StdRng,
     disclosed: HashMap<(usize, u64), HashSet<NodeId>>,
     authors: Vec<NodeSecretKey>,
     now: u64,
+    tracked: HashMap<NodeId, Tracked>,
+    /// The epoch and length of the sample snapshot after the last sample.
+    snapshot: Option<(u64, usize)>,
     /// The record changes the book reported for the current operation.
     changes: Vec<BookChange>,
     /// The current import's result, if the operation imported a record.
     result: Option<ImportFact>,
-    /// What the model predicts for the current import.
-    expected_result: Option<ImportFact>,
     /// The current sample's signed records, as they would go on the wire.
     sample: Vec<Vec<u8>>,
 }
@@ -474,23 +322,41 @@ impl BookDriver {
                 Some(local),
                 DisclosureKey::new(key),
             ),
-            model: BookModel::default(),
             rng: StdRng::seed_from_u64(seed),
             disclosed: HashMap::new(),
             authors: (0..AUTHORS).map(author).collect(),
             now: START,
+            tracked: HashMap::new(),
+            snapshot: None,
             changes: Vec::new(),
             result: None,
-            expected_result: None,
             sample: Vec::new(),
+        }
+    }
+
+    fn before(&self) -> Before {
+        let mut sources = HashMap::new();
+        let mut confirmed = HashSet::new();
+        for signer in &self.authors {
+            let node_id = signer.public();
+            if let Some(entry) = self.book.get(&node_id) {
+                sources.insert(node_id, entry.source());
+                if entry.is_confirmed() {
+                    confirmed.insert(node_id);
+                }
+            }
+        }
+        Before {
+            tracked: self.tracked.clone(),
+            sources,
+            confirmed,
+            relayed: self.book.relayed_counts().into_iter().collect(),
         }
     }
 
     fn apply(&mut self, op: BookOp) {
         self.changes.clear();
-        self.model.changes.clear();
         self.result = None;
-        self.expected_result = None;
         self.sample.clear();
         let now = self.now;
         match op {
@@ -511,6 +377,7 @@ impl BookDriver {
                     Supplier::Relay(index) => (Some(relay(index)), None),
                     Supplier::Nobody => (None, None),
                 };
+                let before = self.before();
                 // Every supplier's record takes the production path: verify, then install.
                 let result = match VerifiedRecord::verify(record, &context) {
                     Ok(verified) => self.book.import_verified_record(
@@ -523,20 +390,31 @@ impl BookDriver {
                     ),
                     Err(error) => Err(error.into()),
                 };
-                self.expected_result =
-                    Some(self.model.import(node_id, sequence, expires, source, now));
                 self.result = Some(import_result(result));
+                self.check_import(node_id, sequence, expires, expires_in, supplier, &before);
             }
             BookOp::DialSuccess(author) => {
                 let node_id = self.authors[author].public();
                 self.book
                     .mark_dial_success(&node_id, Some(author_socket(author)), now);
-                self.model.dial_success(node_id, now);
+                if let Some(tracked) = self.tracked.get_mut(&node_id) {
+                    tracked.failures = 0;
+                    tracked.last_success = Some(now);
+                    tracked.vouched = true;
+                    assert!(
+                        self.book
+                            .get(&node_id)
+                            .is_some_and(|entry| entry.is_confirmed()),
+                        "{BOOK_PROPERTY}: a successful dial left its entry unconfirmed"
+                    );
+                }
             }
             BookOp::DialFailure(author) => {
                 let node_id = self.authors[author].public();
                 self.book.mark_dial_failure(&node_id, now);
-                self.model.dial_failure(node_id);
+                if let Some(tracked) = self.tracked.get_mut(&node_id) {
+                    tracked.failures = tracked.failures.saturating_add(1);
+                }
             }
             BookOp::Sample { requester, limit } => {
                 let sample = self.book.sample_peers_with_rng(
@@ -556,29 +434,37 @@ impl BookDriver {
                     sample.len(),
                     "{BOOK_PROPERTY}: a sample repeats no node"
                 );
+                // A sample discloses only live, vouched records, as stored.
                 for record in &sample {
                     let node_id = record.body.node_id;
+                    let tracked = self
+                        .tracked
+                        .get(&node_id)
+                        .unwrap_or_else(|| panic!("{BOOK_PROPERTY}: disclosed an unknown node"));
                     assert!(
-                        self.model.is_sample_eligible(node_id, now),
-                        "{BOOK_PROPERTY}: disclosed {:?}",
-                        node_id
+                        tracked.vouched && !tracked.expired(now),
+                        "{BOOK_PROPERTY}: disclosed {node_id:?}"
                     );
-                    assert_eq!(
-                        Some(record.body.sequence),
-                        self.model.entries.get(&node_id).map(|entry| entry.sequence),
-                        "{BOOK_PROPERTY}"
-                    );
+                    assert_eq!(record.body.sequence, tracked.sequence, "{BOOK_PROPERTY}");
                 }
-                let window = self
-                    .disclosed
-                    .entry((requester, now / DISCLOSURE_EPOCH))
-                    .or_default();
+                let epoch = now / DISCLOSURE_EPOCH;
+                let window = self.disclosed.entry((requester, epoch)).or_default();
                 window.extend(ids);
                 assert!(
                     window.len() <= SAMPLE_WINDOW,
                     "{BOOK_PROPERTY}: one requester saw {} ids in an epoch",
                     window.len()
                 );
+                // Within an epoch the snapshot grows only while one window
+                // covers it.
+                let len = self.book.sample_snapshot_len();
+                if let Some((last_epoch, last_len)) = self.snapshot {
+                    assert!(
+                        last_epoch != epoch || len <= last_len || last_len < SAMPLE_WINDOW,
+                        "{BOOK_PROPERTY}: the snapshot grew from {last_len} to {len} past a window"
+                    );
+                }
+                self.snapshot = Some((epoch, len));
             }
             BookOp::Advance(secs) => {
                 self.now += secs;
@@ -586,32 +472,278 @@ impl BookDriver {
         }
     }
 
+    /// Checks one import's result and changes against the entries before it,
+    /// and applies the changes to the tracked entries.
+    fn check_import(
+        &mut self,
+        node_id: NodeId,
+        sequence: u64,
+        expires: u64,
+        expires_in: i64,
+        supplier: Supplier,
+        before: &Before,
+    ) {
+        let now = self.now;
+        let result = self.result.expect("an import has a result");
+        let supplied = match supplier {
+            Supplier::Author => Some(node_id),
+            Supplier::Relay(index) => Some(relay(index)),
+            Supplier::Nobody => None,
+        };
+        let relay_count = |relay: NodeId| before.relayed.get(&relay).copied().unwrap_or(0);
+        assert_eq!(
+            result == ImportFact::Expired,
+            expires_in == EXPIRED_ON_ARRIVAL,
+            "{BOOK_PROPERTY}: {result:?} for a record that expires in {expires_in}s"
+        );
+
+        let mut installed = false;
+        let mut replaced = false;
+        for change in &self.changes {
+            match *change {
+                BookChange::Installed {
+                    node_id: id,
+                    sequence: installed_sequence,
+                    source,
+                } => {
+                    assert_eq!(
+                        (id, installed_sequence, source),
+                        (node_id, sequence, supplied),
+                        "{BOOK_PROPERTY}: installed another record"
+                    );
+                    assert!(
+                        self.tracked
+                            .insert(
+                                id,
+                                Tracked {
+                                    sequence,
+                                    expires,
+                                    failures: 0,
+                                    last_seen: now,
+                                    last_success: None,
+                                    vouched: false,
+                                },
+                            )
+                            .is_none(),
+                        "{BOOK_PROPERTY}: installed a stored node"
+                    );
+                    installed = true;
+                }
+                BookChange::Replaced {
+                    node_id: id,
+                    previous_sequence,
+                    sequence: replaced_sequence,
+                    source,
+                } => {
+                    assert_eq!(
+                        (id, replaced_sequence),
+                        (node_id, sequence),
+                        "{BOOK_PROPERTY}: replaced with another record"
+                    );
+                    let tracked = self
+                        .tracked
+                        .get_mut(&id)
+                        .unwrap_or_else(|| panic!("{BOOK_PROPERTY}: replaced an unknown node"));
+                    assert_eq!(tracked.sequence, previous_sequence, "{BOOK_PROPERTY}");
+                    // A later sequence replaces a live record. An expired
+                    // record no longer orders its node's records.
+                    assert!(
+                        sequence > previous_sequence || tracked.expired(now),
+                        "{BOOK_PROPERTY}: sequence {sequence} replaced live {previous_sequence}"
+                    );
+                    tracked.sequence = sequence;
+                    tracked.expires = expires;
+                    assert_eq!(
+                        Some(source),
+                        self.book.get(&id).map(|entry| entry.source()),
+                        "{BOOK_PROPERTY}: the replacement reported another source"
+                    );
+                    replaced = true;
+                }
+                BookChange::Evicted {
+                    node_id: id,
+                    sequence: evicted_sequence,
+                    cause,
+                } => {
+                    let candidates = self.tracked.clone();
+                    let victim = self
+                        .tracked
+                        .remove(&id)
+                        .unwrap_or_else(|| panic!("{BOOK_PROPERTY}: evicted an unknown node"));
+                    assert_eq!(victim.sequence, evicted_sequence, "{BOOK_PROPERTY}");
+                    match cause {
+                        EvictionCause::RelayQuota => {
+                            // Only a full relay's next new record evicts its
+                            // expired entries.
+                            let relay = supplied.filter(|_| matches!(supplier, Supplier::Relay(_)));
+                            assert!(
+                                relay.is_some_and(|relay| relay_count(relay) == BOOK_MAX_PER_RELAY)
+                                    && !before.tracked.contains_key(&node_id)
+                                    && victim.expired(now)
+                                    && before.sources.get(&id).copied().flatten() == relay,
+                                "{BOOK_PROPERTY}: an unjustified relay-quota eviction"
+                            );
+                        }
+                        EvictionCause::BookLimit => {
+                            assert_eq!(
+                                candidates.len(),
+                                BOOK_MAX_RECORDS + 1,
+                                "{BOOK_PROPERTY}: evicted below the record limit"
+                            );
+                            let confirmed = |id: &NodeId| {
+                                before.confirmed.contains(id)
+                                    || (*id == node_id && supplier == Supplier::Author)
+                            };
+                            check_eviction_tier(
+                                &victim,
+                                confirmed(&id),
+                                &candidates,
+                                now,
+                                confirmed,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let stored = before.tracked.get(&node_id);
+        match result {
+            ImportFact::Added | ImportFact::BookFull => assert!(
+                stored.is_none() && installed,
+                "{BOOK_PROPERTY}: {result:?} without an install"
+            ),
+            ImportFact::Updated => assert!(
+                stored.is_some() && replaced,
+                "{BOOK_PROPERTY}: an update without a replacement"
+            ),
+            ImportFact::MetadataUpdated => assert!(
+                stored.is_some_and(|stored| stored.sequence == sequence && !stored.expired(now)),
+                "{BOOK_PROPERTY}: a metadata update of another record"
+            ),
+            ImportFact::IgnoredOlder => assert!(
+                stored.is_some_and(|stored| sequence < stored.sequence && !stored.expired(now)),
+                "{BOOK_PROPERTY}: ignored a record that orders after the stored one"
+            ),
+            ImportFact::RelayFull => {
+                let relay = supplied
+                    .filter(|_| matches!(supplier, Supplier::Relay(_)))
+                    .unwrap_or_else(|| panic!("{BOOK_PROPERTY}: no relay was full"));
+                assert!(
+                    stored.is_none() && relay_count(relay) == BOOK_MAX_PER_RELAY,
+                    "{BOOK_PROPERTY}: refused below the relay quota"
+                );
+                assert!(
+                    before.tracked.iter().all(|(id, tracked)| {
+                        before.sources.get(id).copied().flatten() != Some(relay)
+                            || !tracked.expired(now)
+                    }),
+                    "{BOOK_PROPERTY}: a full relay kept an expired entry"
+                );
+            }
+            ImportFact::Expired => {}
+        }
+        if !matches!(
+            result,
+            ImportFact::Added | ImportFact::BookFull | ImportFact::Updated
+        ) {
+            assert!(
+                self.changes.is_empty(),
+                "{BOOK_PROPERTY}: {result:?} changed records"
+            );
+        }
+        if !matches!(
+            result,
+            ImportFact::Added | ImportFact::Updated | ImportFact::MetadataUpdated
+        ) {
+            return;
+        }
+        let tracked = self
+            .tracked
+            .get_mut(&node_id)
+            .expect("a stored import is tracked");
+        tracked.last_seen = now;
+        let entry = self
+            .book
+            .get(&node_id)
+            .expect("a stored import is in the book");
+        if supplier == Supplier::Author {
+            tracked.vouched = true;
+            assert!(
+                entry.is_confirmed(),
+                "{BOOK_PROPERTY}: the author's own record left its entry unconfirmed"
+            );
+        }
+        // A relay's copy of the author's own record keeps the author's
+        // provenance. Otherwise a relay with room takes the entry over.
+        let author_kept = result == ImportFact::MetadataUpdated
+            && before.sources.get(&node_id) == Some(&Some(node_id));
+        if author_kept {
+            assert_eq!(
+                entry.source(),
+                Some(node_id),
+                "{BOOK_PROPERTY}: lost the author's provenance"
+            );
+        } else if let Supplier::Relay(index) = supplier {
+            if relay_count(relay(index)) < BOOK_MAX_PER_RELAY {
+                assert_eq!(
+                    entry.source(),
+                    Some(relay(index)),
+                    "{BOOK_PROPERTY}: a relay with room did not take the entry"
+                );
+            }
+        }
+    }
+
     fn check(&mut self, after_step: &mut impl FnMut(&mut ZakuraDiscoveryBook, u64)) {
         after_step(&mut self.book, self.now);
-        assert_view_matches(BOOK_PROPERTY, &self.actual_view(), &self.expected_view());
-        assert!(
-            self.model.entries.len() <= BOOK_MAX_RECORDS,
-            "{BOOK_PROPERTY}"
+        self.book.assert_invariants();
+        assert_eq!(
+            self.book.discovered_len(),
+            self.tracked.len(),
+            "{BOOK_PROPERTY}: the book's entries disagree with its reported changes"
         );
-        assert!(
-            self.book.sample_snapshot_len() <= BOOK_MAX_RECORDS.max(SAMPLE_WINDOW),
-            "{BOOK_PROPERTY}: the sample snapshot exceeds the book"
-        );
-        for index in 0..RELAYS {
+        for signer in &self.authors {
+            let node_id = signer.public();
+            let entry = self.book.get(&node_id);
+            let Some(tracked) = self.tracked.get(&node_id) else {
+                assert!(entry.is_none(), "{BOOK_PROPERTY}: an unreported entry");
+                continue;
+            };
+            let entry = entry.unwrap_or_else(|| panic!("{BOOK_PROPERTY}: an unreported removal"));
+            assert_eq!(
+                (
+                    entry.record().body.sequence,
+                    entry.record().body.expires_at_unix_secs
+                ),
+                (tracked.sequence, tracked.expires),
+                "{BOOK_PROPERTY}: the stored record"
+            );
+            assert_eq!(
+                (
+                    entry.failure_count(),
+                    entry.last_success(),
+                    entry.last_seen()
+                ),
+                (tracked.failures, tracked.last_success, tracked.last_seen),
+                "{BOOK_PROPERTY}: dial metadata"
+            );
             assert!(
-                self.model.relayed_by(relay(index)) <= BOOK_MAX_PER_RELAY,
-                "{BOOK_PROPERTY}"
+                !entry.is_confirmed() || tracked.vouched,
+                "{BOOK_PROPERTY}: an unearned confirmation"
             );
         }
     }
 
-    fn actual_view(&self) -> BookView {
+    fn view(&self) -> BookView {
         let mut entries: Vec<_> = self
             .authors
             .iter()
             .filter_map(|signer| {
-                observed_entry(&self.book, signer.public())
-                    .map(|entry| entry_fact(signer.public(), &entry))
+                let node_id = signer.public();
+                self.book
+                    .get(&node_id)
+                    .map(|entry| entry_fact(node_id, entry))
             })
             .collect();
         entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
@@ -627,24 +759,6 @@ impl BookDriver {
                 .collect(),
             changes: self.changes.iter().map(BookFact::from).collect(),
             result: self.result,
-        }
-    }
-
-    fn expected_view(&self) -> BookView {
-        let mut entries: Vec<_> = self
-            .model
-            .entries
-            .iter()
-            .map(|(node_id, entry)| entry_fact(*node_id, entry))
-            .collect();
-        entries.sort_unstable_by(|left, right| left.node.cmp(&right.node));
-        BookView {
-            now: self.now,
-            discovered: self.model.entries.len(),
-            entries,
-            relayed: self.model.relayed_counts(),
-            changes: self.model.changes.iter().map(BookFact::from).collect(),
-            result: self.expected_result,
         }
     }
 }
@@ -681,16 +795,16 @@ pub struct BookEntryFact {
     pub last_success: Option<u64>,
 }
 
-fn entry_fact(node_id: NodeId, entry: &ModelEntry) -> BookEntryFact {
+fn entry_fact(node_id: NodeId, entry: &ZakuraDiscoveryEntry) -> BookEntryFact {
     BookEntryFact {
         node: hex::encode(node_id.as_bytes()),
-        sequence: entry.sequence,
-        expires: entry.expires,
-        source: entry.source.map(|source| hex::encode(source.as_bytes())),
-        confirmed: entry.confirmed,
-        failures: entry.failures,
-        last_seen: entry.last_seen,
-        last_success: entry.last_success,
+        sequence: entry.record().body.sequence,
+        expires: entry.record().body.expires_at_unix_secs,
+        source: entry.source().map(|source| hex::encode(source.as_bytes())),
+        confirmed: entry.is_confirmed(),
+        failures: entry.failure_count(),
+        last_seen: entry.last_seen(),
+        last_success: entry.last_success(),
     }
 }
 
@@ -779,7 +893,7 @@ impl From<&BookChange> for BookFact {
     }
 }
 
-/// The book's state after one operation, read from the owner or derived by its model.
+/// The book's state after one operation, read from the book.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BookView {
@@ -806,9 +920,7 @@ pub struct BookStep {
     /// The original causal bytes.
     pub input: Vec<u8>,
     /// State read from the real book.
-    pub actual: BookView,
-    /// State derived independently by the model.
-    pub expected: BookView,
+    pub view: BookView,
     /// The sample's signed records in hex, for a sample operation.
     pub sample: Vec<String>,
     /// How many node ids the current sample snapshot retains.
@@ -821,32 +933,10 @@ pub struct BookStep {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriverFailure {
-    /// Whether the independent check named its property.
+    /// Whether the failed check named its property.
     pub property_failure: bool,
     /// The panic payload, without the panic hook's source location.
     pub message: String,
-}
-
-/// Fails `property` unless the owner's view matches the model's.
-///
-/// The panic names only the first differing field. The step record keeps both
-/// views, so a shrink can delete an unrelated operation and keep the same failure.
-fn assert_view_matches<V: Eq + Serialize>(property: &str, actual: &V, expected: &V) {
-    if actual == expected {
-        return;
-    }
-    let values = (serde_json::to_value(actual), serde_json::to_value(expected));
-    let field = match &values {
-        (Ok(Value::Object(actual)), Ok(expected)) => actual
-            .iter()
-            .find(|(name, value)| expected.get(name.as_str()) != Some(*value))
-            .map(|(name, _)| name.as_str()),
-        _ => None,
-    };
-    panic!(
-        "{property}: {} differs from the model",
-        field.unwrap_or("the view")
-    );
 }
 
 fn driver_failure(payload: &(dyn Any + Send), property: &str) -> DriverFailure {
@@ -888,8 +978,7 @@ pub fn trace_discovery_book_bytes(data: &[u8]) -> Vec<BookStep> {
         steps.push(BookStep {
             step: index + 1,
             input: step_input(input, index + 1, BOOK_OP_BYTES),
-            actual: driver.actual_view(),
-            expected: driver.expected_view(),
+            view: driver.view(),
             sample: driver.sample.iter().map(hex::encode).collect(),
             snapshot_ids: driver.book.sample_snapshot_len(),
             failure,
@@ -901,7 +990,7 @@ pub fn trace_discovery_book_bytes(data: &[u8]) -> Vec<BookStep> {
     steps
 }
 
-// DiscoveryState model.
+// DiscoveryState driver.
 
 fn local_config() -> ZakuraDiscoveryLocalConfig {
     ZakuraDiscoveryLocalConfig {
@@ -1008,110 +1097,70 @@ enum StateOp {
     ReadHints,
 }
 
-/// The model's view of one peer.
-#[derive(Clone, Debug, Default)]
-struct PeerModel {
-    /// The admitted `(connection, session, outbound)`.
-    admitted: Option<(ZakuraConnId, u64, bool)>,
-    connected: bool,
-    /// Whether the book holds the peer's `Hello` record.
-    in_book: bool,
-    /// Whether the peer's `Hello` backs a service hint.
-    hinted: bool,
-    /// Local expiry of the peer's live summaries.
-    live_until: Option<u64>,
+const STATE_PROPERTY: &str = "discovery/session-installation";
+
+/// What the driver sent the state, by peer index.
+#[derive(Debug)]
+struct Sessions {
+    /// Each peer's admitted `(connection, session, outbound)`, as the
+    /// admissions and removals the driver sent leave it.
+    admitted: [Option<(ZakuraConnId, u64, bool)>; PEERS],
+    connected: [bool; PEERS],
+    /// Whether a current installation put the peer's `Hello` in the book.
+    in_book: [bool; PEERS],
+    /// When the last current `Services` arrived, and its declared TTL.
+    received: [Option<(u64, u64)>; PEERS],
 }
 
-/// An independent restatement of the session and service-hint rules.
-struct StateModel {
-    peers: Vec<PeerModel>,
-}
-
-impl StateModel {
-    fn new() -> Self {
-        Self {
-            peers: vec![PeerModel::default(); PEERS],
-        }
-    }
-
+impl Sessions {
     fn is_current(&self, peer: usize, conn_id: ZakuraConnId, session_id: u64) -> bool {
-        self.peers[peer]
-            .admitted
+        self.admitted[peer]
             .is_some_and(|(conn, session, _)| (conn, session) == (conn_id, session_id))
     }
 
     fn admitted_in(&self, outbound: bool) -> usize {
-        self.peers
+        self.admitted
             .iter()
-            .filter(|peer| peer.admitted.is_some_and(|(_, _, out)| out == outbound))
+            .filter(|admitted| admitted.is_some_and(|(_, _, out)| out == outbound))
             .count()
-    }
-
-    fn admit(
-        &mut self,
-        peer: usize,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-        outbound: bool,
-    ) -> ServiceAdmissionDecision {
-        match self.peers[peer].admitted {
-            // Only a later (connection, session) replaces an admitted session.
-            Some((conn, session, _)) if (conn_id, session_id) <= (conn, session) => {
-                return ServiceAdmissionDecision::RejectNotUseful;
-            }
-            // A same-direction replacement keeps its slot.
-            Some((_, _, out)) if out == outbound => {}
-            // A new peer or a direction change needs a free destination slot.
-            _ if self.admitted_in(outbound) >= PEER_CAP => {
-                return ServiceAdmissionDecision::RejectFull;
-            }
-            _ => {}
-        }
-        self.peers[peer].admitted = Some((conn_id, session_id, outbound));
-        ServiceAdmissionDecision::Admit
-    }
-
-    /// Drops what a disconnected peer or an expired summary no longer backs.
-    fn sync(&mut self, now: u64) {
-        for peer in &mut self.peers {
-            if !peer.connected {
-                peer.hinted = false;
-                peer.live_until = None;
-            }
-            if peer.live_until.is_some_and(|until| until <= now) {
-                peer.live_until = None;
-            }
-        }
     }
 
     fn connected_node_ids(&self) -> Vec<NodeId> {
         (0..PEERS)
-            .filter(|peer| self.peers[*peer].connected)
+            .filter(|peer| self.connected[*peer])
             .map(|peer| peer_secret(peer).public())
             .collect()
     }
 }
 
-const STATE_PROPERTY: &str = "discovery/session-installation";
+/// The index of the state peer with `node_id`.
+fn peer_index(node_id: NodeId) -> usize {
+    (0..PEERS)
+        .find(|peer| peer_secret(*peer).public() == node_id)
+        .expect("the state holds only the driver's peers")
+}
 
-/// The real state and its model at one point in a history.
+/// The real state at one point in a history, and what the driver sent it.
 struct StateDriver {
     state: DiscoveryState,
-    model: StateModel,
+    sent: Sessions,
     pending: Vec<(usize, ZakuraConnId, u64, VerifiedRecord)>,
     hellos: Vec<VerifiedRecord>,
     now: u64,
     /// The current operation's installation result.
     result: Option<InstallFact>,
-    /// What the model predicts for the current operation's installation.
-    expected_result: Option<InstallFact>,
 }
 
 impl StateDriver {
     fn new() -> Self {
         Self {
             state: discovery_state(),
-            model: StateModel::new(),
+            sent: Sessions {
+                admitted: [None; PEERS],
+                connected: [false; PEERS],
+                in_book: [false; PEERS],
+                received: [None; PEERS],
+            },
             pending: Vec::new(),
             // Each peer's `Hello` verifies once; every start reuses the evidence.
             hellos: (0..PEERS)
@@ -1122,13 +1171,11 @@ impl StateDriver {
                 .collect(),
             now: START,
             result: None,
-            expected_result: None,
         }
     }
 
     fn apply(&mut self, op: StateOp) {
         self.result = None;
-        self.expected_result = None;
         let now = self.now;
         match op {
             StateOp::Admit {
@@ -1140,11 +1187,31 @@ impl StateDriver {
                 let decision = self
                     .state
                     .admit_session(session(peer, conn_id, session_id), direction(outbound));
-                assert_eq!(
-                    decision,
-                    self.model.admit(peer, conn_id, session_id, outbound),
-                    "{STATE_PROPERTY}"
-                );
+                let current = self.sent.admitted[peer];
+                match decision {
+                    ServiceAdmissionDecision::Admit => {
+                        // Only a later (connection, session) replaces an
+                        // admitted session.
+                        assert!(
+                            current.is_none_or(|(conn, session, _)| {
+                                (conn_id, session_id) > (conn, session)
+                            }),
+                            "{STATE_PROPERTY}: admitted an older session over {current:?}"
+                        );
+                        self.sent.admitted[peer] = Some((conn_id, session_id, outbound));
+                    }
+                    ServiceAdmissionDecision::RejectNotUseful => assert!(
+                        current.is_some_and(|(conn, session, _)| {
+                            (conn_id, session_id) <= (conn, session)
+                        }),
+                        "{STATE_PROPERTY}: refused a later session as not useful"
+                    ),
+                    ServiceAdmissionDecision::RejectFull => assert!(
+                        current.is_none_or(|(_, _, out)| out != outbound)
+                            && self.sent.admitted_in(outbound) == PEER_CAP,
+                        "{STATE_PROPERTY}: refused a session as full below its cap"
+                    ),
+                }
             }
             StateOp::RemoveSession {
                 peer,
@@ -1153,22 +1220,19 @@ impl StateDriver {
             } => {
                 self.state
                     .remove_session(&session(peer, conn_id, session_id));
-                if self.model.is_current(peer, conn_id, session_id) {
-                    self.model.peers[peer].admitted = None;
+                if self.sent.is_current(peer, conn_id, session_id) {
+                    self.sent.admitted[peer] = None;
                 }
             }
             StateOp::RemoveConnection { peer, conn_id } => {
                 self.state
                     .remove_connection(&session(peer, conn_id, 0).peer_id, conn_id);
-                if self.model.peers[peer]
-                    .admitted
-                    .is_some_and(|(conn, _, _)| conn == conn_id)
-                {
-                    self.model.peers[peer].admitted = None;
+                if self.sent.admitted[peer].is_some_and(|(conn, _, _)| conn == conn_id) {
+                    self.sent.admitted[peer] = None;
                 }
             }
             StateOp::SetConnected { peer, connected } => {
-                self.model.peers[peer].connected = connected;
+                self.sent.connected[peer] = connected;
             }
             StateOp::StartHello {
                 peer,
@@ -1184,7 +1248,9 @@ impl StateDriver {
                 }
                 let (peer, conn_id, session_id, verified) =
                     self.pending.remove(index % self.pending.len());
-                let connected = self.model.connected_node_ids();
+                let connected = self.sent.connected_node_ids();
+                let hints = self.state.retained_hints();
+                let discovered = self.state.book().discovered_len();
                 let result = self.state.install_session_record(
                     &session(peer, conn_id, session_id),
                     verified,
@@ -1193,21 +1259,54 @@ impl StateDriver {
                     now,
                     &mut Vec::new(),
                 );
-                self.result = Some(install_fact(&result));
-                if self.model.is_current(peer, conn_id, session_id) {
-                    let expected = if self.model.peers[peer].in_book {
-                        ImportFact::MetadataUpdated
-                    } else {
-                        ImportFact::Added
-                    };
-                    self.expected_result = Some(InstallFact::Installed(expected));
-                    // An install first drops what disconnected peers no longer back.
-                    self.model.sync(now);
-                    self.model.peers[peer].in_book = true;
-                    self.model.peers[peer].hinted = true;
-                } else {
-                    self.expected_result = Some(InstallFact::Superseded);
+                let result = install_fact(&result);
+                let current = self.sent.is_current(peer, conn_id, session_id);
+                match &result {
+                    InstallFact::Superseded => {
+                        assert!(
+                            !current,
+                            "{STATE_PROPERTY}: refused the current session's result"
+                        );
+                        assert_eq!(
+                            (
+                                self.state.retained_hints(),
+                                self.state.book().discovered_len()
+                            ),
+                            (hints, discovered),
+                            "{STATE_PROPERTY}: a superseded result changed the state"
+                        );
+                    }
+                    InstallFact::Installed(outcome) => {
+                        assert!(current, "{STATE_PROPERTY}: installed a superseded result");
+                        let expected = if self.sent.in_book[peer] {
+                            ImportFact::MetadataUpdated
+                        } else {
+                            ImportFact::Added
+                        };
+                        assert_eq!(*outcome, expected, "{STATE_PROPERTY}");
+                        self.sent.in_book[peer] = true;
+                        // The install backs the peer's hint, and drops the
+                        // hints of disconnected peers.
+                        let node_id = peer_secret(peer).public();
+                        let hints = self.state.retained_hints();
+                        assert!(
+                            hints
+                                .iter()
+                                .any(|(id, record, _)| *id == node_id && *record),
+                            "{STATE_PROPERTY}: an install left no record hint"
+                        );
+                        assert!(
+                            hints.iter().all(|(id, _, _)| {
+                                *id == node_id || self.sent.connected[peer_index(*id)]
+                            }),
+                            "{STATE_PROPERTY}: an install kept a disconnected peer's hint"
+                        );
+                    }
+                    InstallFact::Failed(error) => {
+                        panic!("{STATE_PROPERTY}: the generated Hello failed: {error}")
+                    }
                 }
+                self.result = Some(result);
             }
             StateOp::ReceiveServices {
                 peer,
@@ -1216,7 +1315,8 @@ impl StateDriver {
                 ttl,
             } => {
                 let node_id = peer_secret(peer).public();
-                let connected = self.model.connected_node_ids();
+                let connected = self.sent.connected_node_ids();
+                let hints = self.state.retained_hints();
                 self.state
                     .receive_session_live_summaries(
                         &session(peer, conn_id, session_id),
@@ -1226,12 +1326,28 @@ impl StateDriver {
                         now,
                     )
                     .expect("generated summaries decode");
-                if self.model.is_current(peer, conn_id, session_id) {
-                    self.model.sync(now);
-                    if self.model.peers[peer].connected {
-                        self.model.peers[peer].live_until =
-                            Some((now + ttl).min(now + LIVE_SUMMARY_TTL));
-                    }
+                let after = self.state.retained_hints();
+                if !self.sent.is_current(peer, conn_id, session_id) {
+                    assert_eq!(
+                        after, hints,
+                        "{STATE_PROPERTY}: a superseded session's summaries changed the hints"
+                    );
+                    return;
+                }
+                assert!(
+                    after
+                        .iter()
+                        .all(|(id, _, _)| self.sent.connected[peer_index(*id)]),
+                    "{STATE_PROPERTY}: summaries kept a disconnected peer's hint"
+                );
+                if self.sent.connected[peer] {
+                    assert!(
+                        after
+                            .iter()
+                            .any(|(id, _, live)| *id == node_id && *live == 1),
+                        "{STATE_PROPERTY}: a connected peer's summary was not kept"
+                    );
+                    self.sent.received[peer] = Some((now, ttl));
                 }
             }
             StateOp::Advance(secs) => {
@@ -1244,59 +1360,77 @@ impl StateDriver {
     /// Reads each peer's hints the way production does, which drops stale ones.
     fn check_reads(&mut self) {
         let now = self.now;
-        let connected = self.model.connected_node_ids();
-        self.model.sync(now);
-        for (index, peer) in self.model.peers.iter().enumerate() {
-            let node_id = peer_secret(index).public();
-            let has_entry = peer.hinted || peer.live_until.is_some();
-            assert_eq!(
-                self.state
-                    .active_services(node_id, &connected, now)
-                    .is_some(),
-                peer.connected && has_entry,
-                "{STATE_PROPERTY}: peer {} service hints",
-                index
+        let connected = self.sent.connected_node_ids();
+        for peer in 0..PEERS {
+            let node_id = peer_secret(peer).public();
+            let active = self
+                .state
+                .active_services(node_id, &connected, now)
+                .is_some();
+            let live = self
+                .state
+                .live_service_summaries(node_id, &connected, now)
+                .is_some_and(|summaries| !summaries.is_empty());
+            assert!(
+                !active || self.sent.connected[peer],
+                "{STATE_PROPERTY}: peer {peer} serves hints while disconnected"
             );
-            assert_eq!(
-                self.state
-                    .live_service_summaries(node_id, &connected, now)
-                    .map(|summaries| !summaries.is_empty()),
-                (peer.connected && has_entry).then_some(peer.live_until.is_some()),
-                "{STATE_PROPERTY}: peer {} live summaries",
-                index
-            );
+            // A live summary lasts no longer than its declared TTL, and no
+            // longer than the local cap.
+            if live {
+                let (received, ttl) = self.sent.received[peer].unwrap_or_else(|| {
+                    panic!("{STATE_PROPERTY}: peer {peer} live without summaries")
+                });
+                assert!(
+                    now < received + ttl && now < received + LIVE_SUMMARY_TTL,
+                    "{STATE_PROPERTY}: peer {peer} live summaries outlived their TTL"
+                );
+            }
         }
     }
 
     fn check_sessions(&self) {
-        // The caps hold on the real state alone, whatever the model says.
-        let snapshot = self.state.peer_snapshot();
-        assert!(
-            snapshot.inbound_peers <= PEER_CAP && snapshot.outbound_peers <= PEER_CAP,
-            "{STATE_PROPERTY}: admitted sessions exceed a direction cap: {snapshot:?}"
-        );
-        for (index, peer) in self.model.peers.iter().enumerate() {
-            if let Some((conn_id, session_id, _)) = peer.admitted {
+        self.state.assert_invariants();
+        for (peer, admitted) in self.sent.admitted.iter().enumerate() {
+            if let Some((conn_id, session_id, _)) = admitted {
                 assert!(
                     self.state
-                        .is_current_session(&session(index, conn_id, session_id)),
-                    "{STATE_PROPERTY}"
+                        .is_current_session(&session(peer, *conn_id, *session_id)),
+                    "{STATE_PROPERTY}: lost peer {peer}'s admitted session"
                 );
             }
         }
         assert_eq!(
             self.state.peer_snapshot(),
             ServicePeerSnapshot::new(
-                self.model.admitted_in(false),
-                self.model.admitted_in(true),
+                self.sent.admitted_in(false),
+                self.sent.admitted_in(true),
                 peer_limits()
             ),
-            "{STATE_PROPERTY}"
+            "{STATE_PROPERTY}: admitted sessions"
         );
-        assert_view_matches(STATE_PROPERTY, &self.actual_view(), &self.expected_view());
+        assert_eq!(
+            self.state.book().discovered_len(),
+            self.sent.in_book.iter().filter(|in_book| **in_book).count(),
+            "{STATE_PROPERTY}: the book holds a Hello no current session installed"
+        );
+        // Each record hint comes from an installed `Hello`, and each live
+        // summary from a current `Services`. A peer's summaries replace its
+        // last ones.
+        for (node_id, record, live) in self.state.retained_hints() {
+            let peer = peer_index(node_id);
+            assert!(
+                !record || self.sent.in_book[peer],
+                "{STATE_PROPERTY}: peer {peer} has an unearned record hint"
+            );
+            assert!(
+                live <= 1,
+                "{STATE_PROPERTY}: peer {peer} keeps {live} live summaries"
+            );
+        }
     }
 
-    fn actual_view(&self) -> SessionView {
+    fn view(&self) -> SessionView {
         SessionView {
             now: self.now,
             admitted: self
@@ -1322,45 +1456,6 @@ impl StateDriver {
                 .collect(),
             discovered: self.state.book().discovered_len(),
             installation: self.result.clone(),
-        }
-    }
-
-    fn expected_view(&self) -> SessionView {
-        let mut admitted: Vec<_> = self
-            .model
-            .peers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, peer)| {
-                peer.admitted
-                    .map(|(conn_id, session_id, outbound)| AdmittedFact {
-                        peer: hex::encode(peer_secret(index).public().as_bytes()),
-                        conn_id,
-                        session_id,
-                        outbound,
-                    })
-            })
-            .collect();
-        admitted.sort_unstable_by(|left, right| left.peer.cmp(&right.peer));
-        let mut hints: Vec<_> = self
-            .model
-            .peers
-            .iter()
-            .enumerate()
-            .filter(|(_, peer)| peer.hinted || peer.live_until.is_some())
-            .map(|(index, peer)| HintFact {
-                node: hex::encode(peer_secret(index).public().as_bytes()),
-                record: peer.hinted,
-                live_summaries: usize::from(peer.live_until.is_some()),
-            })
-            .collect();
-        hints.sort_unstable_by(|left, right| left.node.cmp(&right.node));
-        SessionView {
-            now: self.now,
-            admitted,
-            hints,
-            discovered: self.model.peers.iter().filter(|peer| peer.in_book).count(),
-            installation: self.expected_result.clone(),
         }
     }
 }
@@ -1411,7 +1506,7 @@ pub struct HintFact {
     pub live_summaries: usize,
 }
 
-/// Session and hint state after one operation, read from the owner or derived by its model.
+/// Session and hint state after one operation, read from the owner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionView {
@@ -1436,9 +1531,7 @@ pub struct DiscoverySessionStep {
     /// The original causal bytes.
     pub input: Vec<u8>,
     /// State read from the real owner.
-    pub actual: SessionView,
-    /// State derived independently by the model.
-    pub expected: SessionView,
+    pub view: SessionView,
     /// The first failure, if this operation stopped the run.
     pub failure: Option<DriverFailure>,
 }
@@ -1462,8 +1555,7 @@ pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<DiscoverySessionStep> {
         steps.push(DiscoverySessionStep {
             step: index + 1,
             input: step_input(input, index + 1, STATE_OP_BYTES),
-            actual: driver.actual_view(),
-            expected: driver.expected_view(),
+            view: driver.view(),
             failure,
         });
         if stop {
@@ -1521,6 +1613,10 @@ fn decode_state_v2(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
     })
 }
 
+/// An import expiry, relative to now, past the clock-skew tolerance, so the
+/// record expired before it arrived. Decoder v3 chooses it.
+const EXPIRED_ON_ARRIVAL: i64 = -400;
+
 /// The bytes each record-book operation reads.
 const BOOK_OP_BYTES: usize = 2;
 
@@ -1547,7 +1643,7 @@ fn decode_book_v3(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
                 sequence: (rest % 4) as u64,
                 expires_in: match a >> 6 {
                     // Past the clock-skew tolerance, so the record expired before it arrived.
-                    0 if rest == 0 => -400,
+                    0 if rest == 0 => EXPIRED_ON_ARRIVAL,
                     // Lapsed, but inside the clock-skew tolerance.
                     0 => -100,
                     1 | 2 => 900,

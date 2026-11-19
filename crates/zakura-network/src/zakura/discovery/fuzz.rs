@@ -1682,8 +1682,8 @@ fn encode_book_v3(op: &BookOp) -> [u8; BOOK_OP_BYTES] {
         .unwrap_or_else(|| panic!("decoder v3 has no bytes for {op:?}"))
 }
 
-/// The committed record-book witness, `zakura-sim`'s
-/// `tests/fixtures/discovery-record-book.bin`, under the current decoder.
+/// The record-book witness, `zakura-sim`'s `discovery-record-book` seed,
+/// under the current decoder.
 ///
 /// Its steps reach each planted bypass's trigger:
 /// - step 6 evicts at the record limit;
@@ -1736,3 +1736,12 @@ pub fn discovery_book_witness_bytes() -> Vec<u8> {
     .flat_map(encode_book_v3)
     .collect()
 }
+
+/// The session-installation witness, `zakura-sim`'s
+/// `discovery-session-installation` seed: it installs a current result,
+/// rejects a stale result, retains a hint, and reads it.
+pub const DISCOVERY_STATE_WITNESS: &[u8] = &[
+    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
+    7, 0, 0, 40, 8, 0, 0, 0, // Peer 0 disconnects while peer 1's `Hello` installs.
+    3, 0, 1, 0, 0, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
+];

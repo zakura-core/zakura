@@ -1,4 +1,4 @@
-input = "crates/zakura-sim/tests/fixtures/handshake-installed-services.bin"
+seed = "handshake-installed-services"
 checks = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/registry.rs"]
 # The patch counts discovery as negotiated on every connection, so a peer's
 # discovery stream on a connection that didn't negotiate it opens instead of

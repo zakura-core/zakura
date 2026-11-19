@@ -1,8 +1,0 @@
-# The committed fuzz input `discovery-composed-undeclared.bin` for `discovery/composed`.
-# A peer that asks for peers, then sends an undeclared message type,
-# which the node refuses.
-harness = "discovery/composed"
-generator = 1
-sha256 = "a8f8ba64b101e9bb670e9ea95f10459ca55379eb48081e16c886bf05b94bc61a"
-scenario_sha256 = "fa4a00420db1239e8e8f65d21e2ddb0ca74f1b8719a724b349453c83eef33b10"
-source = "crates/zakura-sim/tests/targets.rs"

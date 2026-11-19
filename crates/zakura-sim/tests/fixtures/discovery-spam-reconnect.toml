@@ -1,8 +1,0 @@
-# The committed fuzz input `discovery-spam-reconnect.bin` for `discovery/spam`.
-# One spammer sends undeclared types back to back, disconnects and dials
-# again, beside an honest peer that asks for peers.
-harness = "discovery/spam"
-generator = 1
-sha256 = "953e620644e98dc8a913bf18f1104144a9d1b41f04a1633e36cc46a409b42543"
-scenario_sha256 = "ffe81d0d2a36cdc6f83698054f7517cd3c83c2dbfa22a5e5937d3a252329a97d"
-source = "crates/zakura-sim/tests/discovery_spam.rs"

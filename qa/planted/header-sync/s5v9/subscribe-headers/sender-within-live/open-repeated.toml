@@ -10,7 +10,7 @@
 # Besides service.rs, which the patch changes, the rest of these decide
 # when the node subscribes and how its updates reach the wire. A change
 # there can move the input off its `Open`.
-input = "crates/zakura-sim/tests/fixtures/header-wire-honest-sync.bin"
+seed = "header-wire-honest-sync"
 # Past the stop, the node goes on to close the honest peer's connection
 # with `service_protocol_reject`, so `conformant-never-closes` and
 # `honest-never-punished` break too, but only later.

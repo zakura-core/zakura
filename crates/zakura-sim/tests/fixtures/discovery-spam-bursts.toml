@@ -1,8 +1,0 @@
-# The committed fuzz input `discovery-spam-bursts.bin` for `discovery/spam`.
-# Three spammers send `Hello` bursts and repeated requests past the
-# margin, beside an honest peer that asks for services and peers.
-harness = "discovery/spam"
-generator = 1
-sha256 = "0337f446140537a1ed6801a7435e64668cff5140d03f0ad5ecb5fb1e340554b2"
-scenario_sha256 = "e694d2fac5a5aabd1eddb9bb2a630161da6c45d563ea21eaa14db5ae68ac1a42"
-source = "crates/zakura-sim/tests/targets.rs"

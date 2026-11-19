@@ -785,9 +785,9 @@ jobs:
           path: ${{ runner.temp }}/sim-targets/readiness.json
           if-no-files-found: ignore
 
-  # `cargo xtask planted --targets` runs each retained bypass whose committed
-  # input runs on a simulator fuzz target's harness, and confirms the patched
-  # input through that target in fresh processes. It rebuilds the patched
+  # `cargo xtask planted --targets` runs each retained bypass whose seed runs
+  # on a simulator fuzz target's harness, and confirms the seed's input on
+  # the patched checkout through that target in fresh processes. It rebuilds the patched
   # simulator and the target with AddressSanitizer for each case, so it
   # shards the cases as sim-planted does: fourteen shards, and each night the
   # job's two parts run the two shards the UTC weekday picks, so each case

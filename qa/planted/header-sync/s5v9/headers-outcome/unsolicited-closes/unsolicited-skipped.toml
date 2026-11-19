@@ -12,4 +12,3 @@ checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/s
 [typed]
 harness = "header-sync/wire"
 scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-headers-outcome-unsolicited.json"
-plan = "crates/zakura-sim/tests/fixtures/header-wire-default.plan"

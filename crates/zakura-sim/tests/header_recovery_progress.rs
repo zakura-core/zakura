@@ -200,7 +200,7 @@ fn the_recovery_control_holds_at_its_recovered_pick() {
 /// gives A's every time, and B's log differs.
 #[test]
 fn the_recovery_control_repeats_a_a_and_a_b_a() {
-    let plans = [committed_plan(), byte_inputs(16, 256).remove(6)];
+    let plans = [Vec::new(), byte_inputs(16, 256).remove(6)];
     let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
         .into_iter()
         .map(|plan| {
@@ -220,8 +220,8 @@ fn the_recovery_control_repeats_a_a_and_a_b_a() {
 }
 
 /// The fixtures `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-recovery-<name>.json` with its Plan bytes
-/// beside it in `header-recovery-<name>.plan`.
+/// as `tests/fixtures/header-recovery-<name>.json`.
+/// Each runs under the empty Plan.
 fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
     [
         ("successor", RecoveryFixture::Successor),
@@ -232,11 +232,6 @@ fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
     .map(|(name, fixture)| (name, LivenessScenario::Recovery(fixture)))
 }
 
-/// The Plan bytes every committed fixture runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture file `header-recovery-<name>.<extension>`.
 fn fixture_file(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -244,8 +239,8 @@ fn fixture_file(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-recovery-{name}.{extension}"))
 }
 
-/// Each committed fixture is its named fixture, as JSON, with the fixed
-/// Plan bytes, and holds and applies under them.
+/// Each committed fixture is its named fixture, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_fixtures_match_their_names() {
     for (name, fixture) in committed_fixtures() {
@@ -254,38 +249,16 @@ fn the_committed_fixtures_match_their_names() {
                 .unwrap_or_else(|error| panic!("{name}: {error}")),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            committed, fixture,
-            "{name}: run `regenerate_recovery_fixtures`"
-        );
-        let plan =
-            fs::read(fixture_file(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_recovery_fixtures`"
-        );
+        assert_eq!(committed, fixture, "{name}");
         let LivenessScenario::Recovery(recovery) = fixture else {
             unreachable!("committed fixtures are recovery fixtures");
         };
-        let run = run(recovery, zakura_sim::Plan::from_fuzz(&plan));
+        let run = run(recovery, zakura_sim::Plan::from_fuzz(&[]));
         assert_eq!(
             outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
             &PropertyOutcome::Held { applicable: 1 },
             "{name}"
         );
-    }
-}
-
-/// Rewrites the committed fixtures from their names.
-#[test]
-#[ignore = "rewrites the committed recovery fixtures"]
-fn regenerate_recovery_fixtures() {
-    for (name, fixture) in committed_fixtures() {
-        let json = serde_json::to_string_pretty(&fixture).expect("fixtures serialize");
-        fs::write(fixture_file(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture_file(name, "plan"), committed_plan())
-            .expect("the fixture directory exists");
     }
 }
 
@@ -311,10 +284,6 @@ fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
             Liveness::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture_file(name, "plan")
-                .to_str()
-                .expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

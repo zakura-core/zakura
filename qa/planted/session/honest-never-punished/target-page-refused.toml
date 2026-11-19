@@ -5,7 +5,7 @@
 # `conformant-never-closes`. Both are violated at the close, with cause
 # `service_protocol_reject`, and the runner expects that co-violation. The input is the saved honest-sync
 # Plan, whose honest peer serves the node its whole chain.
-input = "crates/zakura-sim/tests/fixtures/header-wire-honest-sync.bin"
+seed = "header-wire-honest-sync"
 also_violates = ["header-sync/s5v9/conformant-never-closes"]
 # Besides state.rs, which the patch changes, the rest of header sync
 # decides how the honest peer's pages reach the node. A change there can

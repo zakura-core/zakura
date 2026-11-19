@@ -19,7 +19,7 @@ use zakura_sim::{
         PeerAction,
     },
     property::Assume,
-    NullSink, Observation, RunReport,
+    seed, NullSink, Observation, RunReport,
 };
 
 /// Runs `prefix` on `discovery/spam` under the all-defaults Plan, and
@@ -133,7 +133,7 @@ fn a_spammer_keeps_going_after_its_connection_ends() {
 /// `conformant-never-closes`.
 #[test]
 fn a_request_with_bad_content_is_refused_before_its_margin() {
-    run_clean(include_bytes!(
-        "fixtures/discovery-spam-content-before-margin.bin"
-    ));
+    let seed =
+        seed::find("discovery-spam-content-before-margin").expect("the found input is a seed");
+    run_clean(seed.input());
 }

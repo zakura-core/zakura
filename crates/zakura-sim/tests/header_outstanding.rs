@@ -1,6 +1,6 @@
 //! hdr-9d.1: `header-sync/outstanding-work-bounded` on `header-sync/storage`.
 //! Every committed authority and reset witness holds it and applies, under
-//! its committed Plan bytes and under generated plans.
+//! the empty Plan and under generated plans.
 //! `cargo xtask planted header-sync/outstanding-work-bounded` checks that its
 //! bypasses break it.
 #![cfg(zakura_sim)]
@@ -86,14 +86,12 @@ fn held(stem: &str, report: &RunReport) {
     );
 }
 
-/// Each committed witness holds the property and applies under its own
-/// Plan bytes, which the planted gate runs.
+/// Each committed witness holds the property and applies under the empty
+/// Plan, which the planted gate runs.
 #[test]
 fn the_committed_witnesses_hold_outstanding_work_bounded() {
     for stem in WITNESSES {
-        let plan =
-            fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-        let report = run(stem, &scenario(stem), Plan::from_fuzz(&plan));
+        let report = run(stem, &scenario(stem), Plan::from_fuzz(&[]));
         held(stem, &report);
     }
 }
@@ -138,12 +136,10 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
         let scenario = scenario(stem);
         let prepared = Storage::prepare(&scenario);
         let evidence = prepared.outstanding.clone();
-        let plan =
-            fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
         let report = run_prepared::<Storage>(
             &scenario,
             prepared,
-            Plan::from_fuzz(&plan),
+            Plan::from_fuzz(&[]),
             &mut MemorySink::default(),
             None,
         )
@@ -211,15 +207,13 @@ fn refused_twice(label: &str, report: &RunReport, evidence: &OutstandingEvidence
 /// refusal installs no stall. Either way the next pass's pruning must drop
 /// a wait no stall references. The retried acquire is refused again under
 /// the new generation, after which the read is released. Under its
-/// committed Plan and generated ones, the publisher keeps one wait at a
+/// empty Plan and generated ones, the publisher keeps one wait at a
 /// time and the property holds.
 #[test]
 fn the_capacity_waits_fixture_refuses_twice_and_holds() {
     let stem = "header-outstanding-capacity-waits";
     let scenario = scenario(stem);
-    let committed =
-        fs::read(fixture(stem, "plan")).unwrap_or_else(|error| panic!("{stem}: {error}"));
-    let mut plans = vec![Plan::from_fuzz(&committed)];
+    let mut plans = vec![Plan::from_fuzz(&[])];
     plans.extend(inputs(8, 256));
     for (index, input) in plans.into_iter().enumerate() {
         let prepared = Storage::prepare(&scenario);
@@ -233,7 +227,7 @@ fn the_capacity_waits_fixture_refuses_twice_and_holds() {
 
 /// The capacity-waits fixture with the commit put off until nothing else
 /// but a time advance can run, so the publisher takes the first refusal
-/// and stalls on its wait before the commit. The committed Plan takes the
+/// and stalls on its wait before the commit. The empty Plan takes the
 /// commit as soon as it's offered, the other order. The history holds in
 /// both as [`refused_twice`] checks, and `waits-kept` breaks in both.
 #[test]

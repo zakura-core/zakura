@@ -1,7 +1,7 @@
 # The full property suite (campaign.md, C1): what the suite runs beyond the
 # harness registry. `cargo xtask sim-suite` joins this file with the
 # registered harnesses and their properties, the coverage manifest, the
-# planted cases under qa/planted/, the committed seeds, the test and fuzz
+# planted cases under qa/planted/, the seed registry, the test and fuzz
 # targets `cargo metadata` reports and their sources, and fails if any of
 # them is missing here. A new harness, fuzz target or ignored test fails
 # the check until this file runs it, excludes it with a reason, or lists it
@@ -75,12 +75,6 @@ run = true
 timeout-secs = 3600
 
 [[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "the_reply_first_input_holds_capacity_release_wakes"
-run = true
-timeout-secs = 3600
-
-[[ignored]]
 file = "crates/zakura-sim/tests/block_resource_properties.rs"
 test = "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound"
 run = true
@@ -120,106 +114,16 @@ run = true
 timeout-secs = 1800
 
 [[ignored]]
-file = "crates/zakura-sim/tests/discovery.rs"
-test = "regenerate_wait_complete_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/replay_exact.rs"
-test = "regenerate_discovery_book_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
-test = "regenerate_saved_plans"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved Plans"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_witness.rs"
 test = "regenerate_planted_scenarios"
 run = false
 reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/header_authority.rs"
-test = "regenerate_authority_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed authority witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
-test = "regenerate_reset_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_hold_release.rs"
-test = "regenerate_hold_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed hold fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_peer_retirement.rs"
-test = "regenerate_retirement_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_recovery_progress.rs"
-test = "regenerate_recovery_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
 test = "regenerate_late_fault_fixture"
 run = false
 reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_stale_chain.rs"
-test = "regenerate_chain_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_reset_mid_write"
-run = false
-reason = "a tool, not a test: it searches for and rewrites zakura#2378's committed input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_harness.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_harness.rs"
-test = "regenerate_reorg_stale_body_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed reorg stale-body input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_harness.rs"
-test = "regenerate_reorg_verdict_republish_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed reorg verdict-republish input under a planted patch"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
-test = "regenerate_saved_plans"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
@@ -232,72 +136,6 @@ file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
 test = "regenerate_planted_guard_scenarios"
 run = false
 reason = "a tool, not a test: it rewrites the planted cases' scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_chain_selected.rs"
-test = "regenerate_selection_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication_liveness.rs"
-test = "regenerate_liveness_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed liveness witnesses from their fixtures"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication.rs"
-test = "regenerate_publication_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed publication witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_storage_seeds.rs"
-test = "regenerate_storage_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed seeds"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
-test = "regenerate_witness_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed witness seeds"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "regenerate_reset_mid_flight_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_table.rs"
-test = "regenerate_old_chain_plan"
-run = false
-reason = "a tool, not a test: it rewrites the committed old-chain Plan bytes"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "regenerate_capacity_frontier_first_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed frontier-first input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_flood_watch.rs"
-test = "regenerate_flood_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_release_wake.rs"
-test = "regenerate_release_wake_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_repair.rs"
-test = "regenerate_repair_seeds"
-run = false
-reason = "a tool, not a test: it rewrites the committed inputs"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's

@@ -1,7 +1,0 @@
-# The committed fuzz input `sync-composed-reset.bin` for `sync/composed`.
-# The mirrors reset to a fork at height 3 that ends one above the tip.
-harness = "sync/composed"
-generator = 1
-sha256 = "ee37155c86900e149eb3fcd04d425f9f867edf2eb859b0d413066ca47f3309e2"
-scenario_sha256 = "b9a3e6b7a79259147ccb7c72e4fa95bc59128e40e238645bc498969e77b46818"
-source = "crates/zakura-sim/tests/targets.rs"

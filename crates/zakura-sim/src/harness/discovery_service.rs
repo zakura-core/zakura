@@ -332,8 +332,8 @@ fn discovering(spec: PeerSpec, script: DiscoveryScript) -> PeerSpec {
 /// The first byte of every saved Plan's tag.
 const TAG: u8 = 0xFE;
 
-/// A saved Plan's scenario. Each has a committed input under
-/// `tests/fixtures/discovery-wire-<name>.bin` and a pinned end record.
+/// A saved Plan's scenario. Each runs as the seed
+/// `discovery-wire-<name>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavedPlan {
     /// A peer dials the node, and both sides exchange `Hello`, `GetPeers`
@@ -368,7 +368,7 @@ impl SavedPlan {
         SavedPlan::LateResponse,
     ];
 
-    /// The fixture's name, `discovery-wire-<name>.bin`.
+    /// Its name, as in its seed's, `discovery-wire-<name>`.
     pub fn name(self) -> &'static str {
         match self {
             SavedPlan::Exchange => "exchange",

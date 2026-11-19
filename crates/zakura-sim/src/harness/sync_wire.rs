@@ -70,6 +70,7 @@ use crate::{
     observe::TransportFact,
     peer::{key_index, peer_addr, peer_id, peer_of, NODE_ADDR},
     property::{Capture, HasView, Property, PropertyId, Source, Sources},
+    witness::Expect,
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, RunConfig, Sim,
     TaskHold,
 };
@@ -648,8 +649,8 @@ impl Subsystem for SyncWire {
     }
 }
 
-/// A saved scenario of `sync/wire`. Each has a committed input under
-/// `tests/fixtures/sync-wire-<name>.bin`.
+/// A saved scenario of `sync/wire`. Each is the seed `sync-wire-<name>`:
+/// its tag and the empty Plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavedWire {
     /// Eight blocks from two mirrors, one dialing each way.
@@ -732,7 +733,7 @@ impl SavedWire {
         SavedWire::ReplaceClaims,
     ];
 
-    /// The fixture's name, `sync-wire-<name>.bin`.
+    /// Its name, which names its seed `sync-wire-<name>`.
     pub fn name(self) -> &'static str {
         match self {
             SavedWire::Honest => "honest",
@@ -761,20 +762,19 @@ impl SavedWire {
             .find(|saved| prefix.get(..2) == Some(&saved.tag()[..]))
     }
 
-    /// The properties whose trigger history its committed input reaches,
-    /// each with the outcome the unpatched run gives, for its sidecar's
-    /// `[[witness]]` entries.
-    pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
+    /// The properties whose trigger history its seed reaches, each with the
+    /// outcome the unpatched run gives.
+    pub fn witnesses(self) -> &'static [(&'static str, Expect)] {
         match self {
             SavedWire::Honest => &[],
             SavedWire::Replace | SavedWire::ReplaceClaims => {
-                &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")]
+                &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, Expect::Holds)]
             }
-            SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, "holds")],
+            SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, Expect::Holds)],
             SavedWire::Saturated => &[
-                (connection::CREDIT_ISOLATED, "holds"),
-                (connection::SEND_ISOLATED, "holds"),
-                (connection::CONNECTION_SHARES_BOUND, "holds"),
+                (connection::CREDIT_ISOLATED, Expect::Holds),
+                (connection::SEND_ISOLATED, Expect::Holds),
+                (connection::CONNECTION_SHARES_BOUND, Expect::Holds),
             ],
         }
     }
@@ -907,8 +907,8 @@ pub const REPLACE_GROWTH_MS: u64 = 11_000;
 pub const REPLACE_GROWTH: u32 = 4;
 
 /// Curated combinations for the `sync_wire` fuzz target's seeds, each a
-/// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a
-/// committed input under `tests/fixtures/sync-wire-<name>.bin`.
+/// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each is the
+/// seed `sync-wire-<name>`: its prefix and the empty Plan.
 pub const CURATED: [(&str, [u8; 2]); 4] = [
     // The fork while storage holds a submission, and the node's
     // connection to mirror-1 replaced once storage admits two bodies.

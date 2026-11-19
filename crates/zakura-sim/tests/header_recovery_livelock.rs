@@ -15,7 +15,8 @@ mod support;
 
 use std::time::Duration;
 
-use support::{inputs, storage_witnesses};
+use support::inputs;
+use zakura_sim::harness::header_sync::storage_witnesses;
 use zakura_sim::{
     domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
     harness::{

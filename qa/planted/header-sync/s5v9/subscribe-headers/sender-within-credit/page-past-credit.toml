@@ -16,4 +16,3 @@ checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network
 [typed]
 harness = "header-sync/wire"
 scenario = "crates/zakura-sim/tests/fixtures/header-wire-planted-held-subscription.json"
-plan = "crates/zakura-sim/tests/fixtures/header-wire-default.plan"

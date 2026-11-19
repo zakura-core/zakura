@@ -156,9 +156,8 @@ pub trait Subsystem: HasView + Sized + 'static {
     }
 
     /// Carries a full fuzz input built for an older `generator` to this one
-    /// with its meaning kept, as a seed's `derived_from` claims it was. Fails
-    /// by default: a harness that never changed its generator migrates
-    /// nothing.
+    /// with its meaning kept. Fails by default: a harness that never changed
+    /// its generator migrates nothing.
     fn migrate(_source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
         Err(format!(
             "{} migrates no generator-{generator} input",

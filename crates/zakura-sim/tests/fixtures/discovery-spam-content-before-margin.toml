@@ -1,8 +1,0 @@
-# The committed fuzz input `discovery-spam-content-before-margin.bin` for `discovery/spam`.
-# A spammer's `GetServices` with bad wanted services, past the margin,
-# which the node refuses at decode (seed 4106, run 302).
-harness = "discovery/spam"
-generator = 1
-sha256 = "d69a4c4dfaf8f2263ae17789f2da4598e13929e6061db526a47466c752fc77d8"
-scenario_sha256 = "4ad50eb0bc612cc1761c73746826508cbf61c6549647374c1e5e998ba8563e10"
-source = "crates/zakura-sim/tests/discovery_spam.rs"

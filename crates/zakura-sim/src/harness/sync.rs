@@ -99,6 +99,7 @@ use crate::{
         header_sync::TeardownView,
     },
     property::{Capture, HasView, Property, PropertyId, Sources},
+    witness::Expect,
     ActionSource, Boundary, Identity, ObservationLog, RunConfig, Sim,
 };
 
@@ -1361,8 +1362,8 @@ pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>>
     properties
 }
 
-/// A saved scenario of `sync/storage`. Each has a committed input under
-/// `tests/fixtures/sync-storage-<name>.bin`.
+/// A saved scenario of `sync/storage`. Each is the seed
+/// `sync-storage-<name>`: its tag and the empty Plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavedSync {
     /// Eight blocks from two mirrors, one dialing each way.
@@ -1465,7 +1466,7 @@ impl SavedSync {
         SavedSync::TeardownHeaders,
     ];
 
-    /// The fixture's name, `sync-storage-<name>.bin`.
+    /// Its name, which names its seed `sync-storage-<name>`.
     pub fn name(self) -> &'static str {
         match self {
             SavedSync::Honest => "honest",
@@ -1492,33 +1493,32 @@ impl SavedSync {
         [TAG, (index + 1) as u8]
     }
 
-    /// The properties whose trigger history its committed input reaches,
-    /// each with the outcome the unpatched run gives, for its sidecar's
-    /// `[[witness]]` entries, which `cargo xtask planted` checks.
-    pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
+    /// The properties whose trigger history its seed reaches, each with the
+    /// outcome the unpatched run gives, which `cargo xtask planted` checks.
+    pub fn witnesses(self) -> &'static [(&'static str, Expect)] {
         match self {
             SavedSync::Honest => &[],
             SavedSync::Reorg => &[
-                (FRONTIER_WORK_CONSISTENT, "holds"),
-                (cross::TIPS_CONSISTENT, "holds"),
-                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
-                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
+                (FRONTIER_WORK_CONSISTENT, Expect::Holds),
+                (cross::TIPS_CONSISTENT, Expect::Holds),
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, Expect::Holds),
             ],
             SavedSync::ReorgRequest => &[
-                (FRONTIER_WORK_CONSISTENT, "holds"),
-                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
-                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
+                (FRONTIER_WORK_CONSISTENT, Expect::Holds),
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, Expect::Holds),
             ],
             SavedSync::ReorgQuery | SavedSync::ReorgSubmit | SavedSync::ReorgVerdict => &[
-                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, "holds"),
-                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, "holds"),
+                (cross::BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
+                (cross::HEADER_REORG_RETIRES_BLOCK_WORK, Expect::Holds),
             ],
-            SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, "holds")],
+            SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, Expect::Holds)],
             SavedSync::TeardownQuery | SavedSync::TeardownSubmission => &[
-                (BLOCK_TEARDOWN_RETURNS_BASELINE, "holds"),
-                (cross::TEARDOWN_RETURNS_BASELINE, "holds"),
+                (BLOCK_TEARDOWN_RETURNS_BASELINE, Expect::Holds),
+                (cross::TEARDOWN_RETURNS_BASELINE, Expect::Holds),
             ],
-            SavedSync::TeardownHeaders => &[(cross::TEARDOWN_RETURNS_BASELINE, "holds")],
+            SavedSync::TeardownHeaders => &[(cross::TEARDOWN_RETURNS_BASELINE, Expect::Holds)],
         }
     }
 

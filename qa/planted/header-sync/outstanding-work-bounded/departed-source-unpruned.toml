@@ -5,5 +5,5 @@
 # source that's neither an admitted peer nor a held departure. The
 # reactor's repair path decides when a supplier is charged and when its
 # history is pruned, so a change there can move the input off it.
-input = "crates/zakura-sim/tests/fixtures/header-repair-supplier-pruned.bin"
+seed = "header-repair-supplier-pruned"
 checks = ["crates/zakura-network/src/zakura/header_sync"]

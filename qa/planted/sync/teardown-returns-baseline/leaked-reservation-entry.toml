@@ -4,7 +4,7 @@
 # harness stops it, and header sync's half of the property reports the
 # leak. `header-sync/teardown-returns-baseline` catches the same patch on
 # the header harness, which `sync/storage` doesn't register.
-input = "crates/zakura-sim/tests/fixtures/sync-storage-teardown-query.bin"
+seed = "sync-storage-teardown-query"
 # Besides peer_work.rs, which the patch changes, the reactor decides when
 # rounds retire. A change there can move the input off that release.
 checks = ["crates/zakura-network/src/zakura/header_sync"]

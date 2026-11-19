@@ -1,8 +1,0 @@
-# The committed fuzz input `sync-composed-every-step.bin` for `sync/composed`.
-# Every control kind once: two closes, growth, a reset, a held range
-# read and a teardown.
-harness = "sync/composed"
-generator = 1
-sha256 = "ed3eca173a6f48685015b0ad6ee2f75cd91724bcb9434b3f4acbce99c74f004e"
-scenario_sha256 = "22ea708028f604a071fd5511e63c99d0e4306879cf24d3d90a448a7938d0a773"
-source = "crates/zakura-sim/tests/targets.rs"

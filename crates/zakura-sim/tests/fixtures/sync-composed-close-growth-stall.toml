@@ -1,8 +1,0 @@
-# The committed fuzz input `sync-composed-close-growth-stall.bin` for `sync/composed`.
-# Mirror 0's connection closes after the second admission, the chain
-# grows, and each mirror range read stalls for 3 s.
-harness = "sync/composed"
-generator = 1
-sha256 = "69c4bda6e79f589874ce63e10a2406a46e2836d014574300520ae40eabbd3e5f"
-scenario_sha256 = "ed2269fc73fe83f3148bf30168e076ba18af7308e374a5c79e95020bd7274786"
-source = "crates/zakura-sim/tests/sync_composed.rs"

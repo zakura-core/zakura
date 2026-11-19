@@ -51,6 +51,8 @@ mod events;
 mod peer_registry;
 mod peer_routine;
 mod pipe;
+#[cfg(any(test, zakura_sim))]
+mod progress;
 mod reactor;
 mod regulated;
 mod reorder;
@@ -90,6 +92,8 @@ pub use events::{
 };
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use peer_routine::routine_accepts_body;
+#[cfg(any(test, zakura_sim))]
+pub use progress::{block_progress_deadline, block_progress_turn, BlockProgressUnbounded};
 pub use reactor::spawn_block_sync_reactor;
 pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
 pub use request::BlockSizeEstimate;

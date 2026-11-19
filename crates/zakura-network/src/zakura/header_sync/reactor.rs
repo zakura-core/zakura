@@ -1269,6 +1269,16 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
+        // A pass that waits for its refill owes older offers their turn first,
+        // so an offer that would overtake one waits for that pass.
+        if self.state.cached_pass_deferred
+            && !self.peer_work_queue.has_work(&peer)
+            && self
+                .state
+                .overtakes_waiting(&peer, status.selected_tip_hash)
+        {
+            return;
+        }
         // This offer is considered synchronously. If it remains blocked, changing
         // its payload cannot make another peer eligible. Shared ownership and
         // effective locator claims below invalidate the global pass when needed.
@@ -1404,6 +1414,7 @@ impl HeaderSyncReactor {
                     self.state.bump_scheduling_revision();
                 }
                 self.state.spend_status(&peer);
+                self.state.take_turn(&peer);
                 if self
                     .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                         peer: peer.clone(),
@@ -1420,9 +1431,11 @@ impl HeaderSyncReactor {
                 metrics::counter!("sync.header.target.already_active").increment(1);
             }
             QueueWorkResult::TargetAlreadyAssigned => {
+                self.state.note_waiting_for_target(&peer, target_tip_hash);
                 metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
             }
             QueueWorkResult::AtCapacity => {
+                self.state.note_waiting_for_slot(&peer);
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
                 observe!(
                     self,
@@ -1489,6 +1502,7 @@ impl HeaderSyncReactor {
             );
             row.insert(hs_trace::PEERS_CONSIDERED.into(), peers.into());
         });
+        self.state.clear_waiting();
         let offers = self.state.cached_offers(
             local,
             |peer| self.peer_work_queue.has_work(peer),
@@ -1502,14 +1516,20 @@ impl HeaderSyncReactor {
         );
         for (peer, target) in offers {
             if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
+                // The pass would serve this offer next.
+                self.state.note_waiting_for_slot(&peer);
                 break;
             }
             // Leave a held-back status unspent without counting it as refused on every event.
             if self
                 .peer_work_queue
                 .is_target_assigned(target.status.selected_tip_hash)
-                || self.ordinary_headroom(&peer, &target.status) == 0
             {
+                self.state
+                    .note_waiting_for_target(&peer, target.status.selected_tip_hash);
+                continue;
+            }
+            if self.ordinary_headroom(&peer, &target.status) == 0 {
                 continue;
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);

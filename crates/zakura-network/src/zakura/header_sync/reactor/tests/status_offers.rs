@@ -2728,3 +2728,44 @@ async fn a_ready_peer_waits_behind_at_most_two_queues_and_one_event_per_peer() {
     // The flood keeps the queue full, so the bound is nearly tight.
     assert!(before >= capacity, "only {before} events went first");
 }
+
+/// D3: offers of one target take turns in the order their peers last took
+/// one, not by peer key. A peer that arrives under a fresh low key after the
+/// honest one waits behind it, even when it sends its status just after the
+/// target frees, while the cached pass waits for its refill.
+#[tokio::test(start_paused = true)]
+async fn a_later_peer_with_a_lower_key_waits_behind_an_earlier_offer() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let target = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &owner, target);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "the owner holds the target");
+
+    // A fresh key that sorts below the honest one arrives later. With the
+    // pass budget spent, the owner leaves, and the late status arrives
+    // before the deferred pass runs.
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.schedule_cached_statuses();
+    assert!(
+        reactor.state.cached_pass_deferred,
+        "the pass waits for its refill"
+    );
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the late offer doesn't overtake the honest one"
+    );
+
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, target);
+}

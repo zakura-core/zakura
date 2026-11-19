@@ -302,8 +302,6 @@ def localize_fleet(lab: Path, args) -> None:
     for config in sorted((lab / "nodes").glob("*/zakura*.toml")):
         config.write_text(to_node_schema(config.read_text()))
     pin_chain_topology(lab, args.node_count)
-    enable_zakura_traces(lab, args.node_count)
-    apply_node_profile(lab, args.node_count, args.profile)
 
 
 def to_node_schema(text: str) -> str:
@@ -358,68 +356,35 @@ def pin_chain_topology(lab: Path, node_count: int) -> None:
         config.write_text(text)
 
 
-def enable_zakura_traces(lab: Path, node_count: int) -> None:
-    """Points each run config's `[network.zakura] trace_dir` at its node's `ZAKURA_TRACE_DIR`.
-
-    A `trace_dir` line already right under the table header is replaced, so
-    the rewrite can run again on the same config.
-    """
-    for index in range(node_count):
-        node_dir = lab / "nodes" / node_name(index)
-        config = node_dir / "zakura.toml"
-        # json.dumps quotes the path as a valid TOML basic string.
-        line = f"trace_dir = {json.dumps(str(node_dir / ZAKURA_TRACE_DIR))}\n"
-        text, replaced = re.subn(
-            r"(?m)^\[network\.zakura\]\n(?:trace_dir = .*\n)?",
-            lambda _: "[network.zakura]\n" + line,
-            config.read_text(),
-        )
-        if replaced != 1:
-            raise RuntimeError(f"{config}: expected one [network.zakura] table")
-        config.write_text(text)
-
-
-def apply_node_profile(lab: Path, node_count: int, profile: str) -> None:
-    """Sets each run config's P2P stack, mempool implementation and tx-relay switch.
-
-    The values come from `NODE_PROFILES[profile]`. Rerunning on a rewritten
-    config replaces them rather than adding keys.
-    """
-    settings = NODE_PROFILES[profile]
-    relay = f"[network.zakura.tx_relay]\nenabled = {settings['tx_relay']}\n"
-    for index in range(node_count):
-        config = lab / "nodes" / node_name(index) / "zakura.toml"
-        text, stacks = re.subn(
-            r'(?m)^p2p_stack = ".*"$',
-            f'p2p_stack = "{settings["p2p_stack"]}"',
-            config.read_text(),
-        )
-        text, pools = re.subn(
-            r"(?m)^\[mempool\]\n(?:implementation = .*\n)?",
-            f'[mempool]\nimplementation = "{settings["implementation"]}"\n',
-            text,
-        )
-        if stacks != 1 or pools != 1:
-            raise RuntimeError(f"{config}: expected one p2p_stack key and one [mempool] table")
-        text, relays = re.subn(
-            r"(?m)^\[network\.zakura\.tx_relay\]\n(?:enabled = .*\n)?", relay, text
-        )
-        if relays == 0:
-            # Kresko's pinned zakura predates tx-relay, so it renders no table.
-            text = text.rstrip("\n") + "\n\n" + relay
-        config.write_text(text)
-
-
 # ---------------------------------------------------------------------------- #
 # Node lifecycle
 # ---------------------------------------------------------------------------- #
 
 
-# zakurad maps ZAKURA_<FIELD> environment variables onto config fields, so any
-# stray one in the environment is read as a config key and the node refuses to
-# start ("unknown field `dir`"). The lab always passes an explicit config file,
-# so nothing of ours belongs in that namespace.
-def node_env() -> dict:
+def run_overrides(node_dir: Path, profile: str) -> dict[str, str]:
+    """Returns the `ZAKURA_*` config overrides a run node starts with.
+
+    They set the P2P stack, mempool implementation and tx-relay switch from
+    `NODE_PROFILES[profile]`, and point `[network.zakura] trace_dir` into
+    `node_dir`. zakurad applies `ZAKURA_SECTION__KEY` variables on top of the
+    config file (see `ZakuradConfig::load`), so Kresko's file stays as rendered.
+    """
+    settings = NODE_PROFILES[profile]
+    return {
+        "ZAKURA_NETWORK__P2P_STACK": settings["p2p_stack"],
+        "ZAKURA_MEMPOOL__IMPLEMENTATION": settings["implementation"],
+        "ZAKURA_NETWORK__ZAKURA__TX_RELAY__ENABLED": settings["tx_relay"],
+        "ZAKURA_NETWORK__ZAKURA__TRACE_DIR": str(node_dir / ZAKURA_TRACE_DIR),
+    }
+
+
+def node_env(overrides: dict[str, str]) -> dict[str, str]:
+    """Returns this process's environment with `overrides` as its only `ZAKURA_*` variables.
+
+    zakurad reads every `ZAKURA_*` variable as a config key. Inherited ones are
+    dropped, since an exported `ZAKURA_DIR` once made the node refuse to start
+    with "unknown field `dir`".
+    """
     hijacked = sorted(k for k in os.environ if k.startswith("ZAKURA_"))
     if hijacked:
         print(
@@ -427,7 +392,8 @@ def node_env() -> dict:
             + ", ".join(hijacked),
             file=sys.stderr,
         )
-    return {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    return {**env, **overrides}
 
 
 def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Popen:
@@ -435,6 +401,8 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
     node_dir = lab / "nodes" / name
     config = node_dir / ("zakura.bootstrap.toml" if bootstrap else "zakura.toml")
     suffix = "bootstrap" if bootstrap else "run"
+    # The bootstrap node only seeds the chain with P2P off, so it keeps Kresko's config.
+    overrides = {} if bootstrap else run_overrides(node_dir, args.profile)
     log_path = node_dir / f"{suffix}.log"
     log = open(log_path, "ab")
     proc = subprocess.Popen(
@@ -443,9 +411,13 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
         stderr=subprocess.STDOUT,
         # Own process group, so stopping a node never signals the whole lab.
         start_new_session=True,
-        env=node_env(),
+        env=node_env(overrides),
     )
-    print(f"started {name} ({suffix}) pid={proc.pid} log={log_path}", flush=True)
+    # The collected zakura.toml doesn't show the overrides, so this line records them.
+    print(
+        f"started {name} ({suffix}) pid={proc.pid} log={log_path} overrides={overrides}",
+        flush=True,
+    )
     return proc
 
 

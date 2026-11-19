@@ -128,12 +128,14 @@ the rate by (wanted interval - 4 s) / (observed interval - 4 s). Main has no
 proof-of-work checks, but the internal miner still solves to the template's
 difficulty.
 
-**Each leg runs one node setup.** `up --profile` sets the P2P stack, the
-mempool implementation and tx-relay in every run config. `legacy` is what
-Mainnet runs today, legacy P2P and the classic pool. `v2` is P2P v2 (`dual`,
-which upgrades every lab peer), tx-relay and the pool core, which tx-relay
-needs. By default (`setups: legacy-vs-v2`) the workflow runs a legacy baseline
-leg and a v2 target leg on the same commit.
+**Each leg runs one node setup.** `up --profile` starts every run node with
+`ZAKURA_*` environment overrides for the P2P stack, the mempool implementation
+and tx-relay. zakurad applies them on top of the config file, so a collected
+`zakura.toml` still shows Kresko's values, and the lab's `started` line lists
+what each node got. `legacy` is what Mainnet runs today, legacy P2P and the
+classic pool. `v2` is P2P v2 (`dual`, which upgrades every lab peer), tx-relay
+and the pool core, which tx-relay needs. By default (`setups: legacy-vs-v2`)
+the workflow runs a legacy baseline leg and a v2 target leg on the same commit.
 
 P2P v2 can't announce blocks faster than about one per 15 s for long. Its
 block-sync status allows a burst of 22 messages and earns one more every 15 s,
@@ -146,7 +148,7 @@ than one per 15 s, a v2 deficit in reach or confirm delay comes from block
 relay first.
 
 **Nodes write Zakura traces.** The node logs run at INFO and say nothing about
-block-sync requests, so the lab also sets each node's
+block-sync requests, so the same overrides also set each run node's
 `[network.zakura] trace_dir` to `nodes/<name>/zakura-traces`. `collect` keeps
 the `block_sync`, `header_sync`, `chain_tip`, `mempool` and `ratelimit` tables,
 which show when each block was requested, committed and applied to the mempool,

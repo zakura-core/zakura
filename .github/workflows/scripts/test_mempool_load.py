@@ -334,50 +334,6 @@ class LabConfigRewrite(unittest.TestCase):
         text = lab.to_node_schema(self.KRESKO_NETWORK)
         self.assertEqual(lab.to_node_schema(text), text)
 
-    def test_each_node_traces_into_its_own_dir(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab_dir = Path(tmp)
-            node_dir = lab_dir / "nodes" / lab.node_name(0)
-            node_dir.mkdir(parents=True)
-            config = node_dir / "zakura.toml"
-            config.write_text('[network.zakura]\nlisten_addr = "127.0.0.101:18234"\n')
-            # Twice, as on a config an earlier run already rewrote: still one key.
-            lab.enable_zakura_traces(lab_dir, 1)
-            lab.enable_zakura_traces(lab_dir, 1)
-            text = config.read_text()
-        self.assertEqual(text.count("trace_dir = "), 1)
-        self.assertIn(f'[network.zakura]\ntrace_dir = "{node_dir / lab.ZAKURA_TRACE_DIR}"\n', text)
-
-    def test_profiles_set_the_p2p_stack_pool_and_tx_relay(self):
-        import tempfile
-        import tomllib
-
-        # The run config's layout: Kresko renders `p2p_stack` and `[mempool]`,
-        # but its pinned zakura predates tx-relay, so there is no relay table.
-        run_config = (
-            "[mempool]\ntx_cost_limit = 80000000\n\n"
-            '[network]\np2p_stack = "default"\n\n'
-            '[network.zakura]\nlisten_addr = "127.0.0.101:18234"\n'
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            lab_dir = Path(tmp)
-            config = lab_dir / "nodes" / lab.node_name(0) / "zakura.toml"
-            config.parent.mkdir(parents=True)
-            config.write_text(run_config)
-            parsed = {}
-            # legacy over v2 also checks a rewritten config gets new values, not new keys.
-            for profile in ("v2", "legacy"):
-                lab.apply_node_profile(lab_dir, 1, profile)
-                parsed[profile] = tomllib.loads(config.read_text())
-        self.assertEqual(parsed["v2"]["network"]["p2p_stack"], "dual")
-        self.assertEqual(parsed["v2"]["mempool"]["implementation"], "core")
-        self.assertIs(parsed["v2"]["network"]["zakura"]["tx_relay"]["enabled"], True)
-        self.assertEqual(parsed["legacy"]["network"]["p2p_stack"], "legacy")
-        self.assertEqual(parsed["legacy"]["mempool"]["implementation"], "classic")
-        self.assertIs(parsed["legacy"]["network"]["zakura"]["tx_relay"]["enabled"], False)
-
     def test_each_node_seeds_only_its_predecessor(self):
         import tempfile
 
@@ -405,19 +361,51 @@ class LabConfigRewrite(unittest.TestCase):
 class NodeEnvironment(unittest.TestCase):
     """zakurad reads ZAKURA_* env vars as config keys."""
 
+    def test_profiles_reach_run_nodes_as_config_overrides(self):
+        node_dir = Path("/lab/nodes") / lab.node_name(1)
+
+        def fields(profile):
+            # zakurad drops the prefix, lowercases the rest and nests on `__`.
+            env = lab.node_env(lab.run_overrides(node_dir, profile))
+            return {
+                key.removeprefix("ZAKURA_").lower().replace("__", "."): value
+                for key, value in env.items()
+                if key.startswith("ZAKURA_")
+            }
+
+        traces = str(node_dir / lab.ZAKURA_TRACE_DIR)
+        self.assertEqual(
+            fields("v2"),
+            {
+                "network.p2p_stack": "dual",
+                "mempool.implementation": "core",
+                "network.zakura.tx_relay.enabled": "true",
+                "network.zakura.trace_dir": traces,
+            },
+        )
+        self.assertEqual(
+            fields("legacy"),
+            {
+                "network.p2p_stack": "legacy",
+                "mempool.implementation": "classic",
+                "network.zakura.tx_relay.enabled": "false",
+                "network.zakura.trace_dir": traces,
+            },
+        )
+
     def test_zakura_prefixed_vars_are_dropped(self):
         # A real failure: exporting ZAKURA_DIR made the node reject its config
         # with "unknown field `dir`" -- the env var, not the file, was the
         # problem, which is a genuinely confusing thing to debug.
         os.environ["ZAKURA_DIR"] = "/tmp/should-not-reach-the-node"
         self.addCleanup(lambda: os.environ.pop("ZAKURA_DIR", None))
-        env = lab.node_env()
+        env = lab.node_env({})
         self.assertNotIn("ZAKURA_DIR", env)
 
     def test_unrelated_vars_are_preserved(self):
         os.environ["MEMPOOL_LOAD_PROBE"] = "keep-me"
         self.addCleanup(lambda: os.environ.pop("MEMPOOL_LOAD_PROBE", None))
-        env = lab.node_env()
+        env = lab.node_env({})
         self.assertEqual(env.get("MEMPOOL_LOAD_PROBE"), "keep-me")
         self.assertIn("PATH", env)
 

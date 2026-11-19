@@ -154,6 +154,7 @@ class PortSafety(unittest.TestCase):
         self.assertLess(__import__("time").monotonic() - started, 5)
 
 
+
 class Teardown(unittest.TestCase):
     """Nothing this harness starts may outlive a `down`."""
 
@@ -252,35 +253,32 @@ class Teardown(unittest.TestCase):
 class PeeringCheck(unittest.TestCase):
     """A network that never peers measures nothing, so `up` must catch it."""
 
-    def with_peer_counts(self, sequence):
-        """Stub rpc_call to return successive peer lists per node."""
-        calls = {"n": 0}
+    def with_peer_counts(self, counts):
+        """Stub rpc_call so node i reports counts[i] peers."""
+        by_url = {f"http://{lab.node_ip(i)}:{lab.RPC_PORT}": n for i, n in enumerate(counts)}
 
         def fake(url, method, params=None, timeout=15):
             self.assertEqual(method, "getpeerinfo")
-            result = sequence[min(calls["n"], len(sequence) - 1)]
-            calls["n"] += 1
-            return result
+            return [{"addr": "x"}] * by_url[url]
 
         original = lab.rpc_call
         lab.rpc_call = fake
         self.addCleanup(lambda: setattr(lab, "rpc_call", original))
 
-    def test_peered_nodes_pass_immediately(self):
-        self.with_peer_counts([[{"addr": "x"}]])
-        self.assertTrue(lab.wait_for_peers(3, timeout_secs=5, poll_secs=0.01))
+    def test_the_pinned_chain_passes(self):
+        self.with_peer_counts([1, 2, 2, 1])
+        self.assertTrue(lab.wait_for_peers(4, timeout_secs=5, poll_secs=0.01))
 
-    def test_asymmetric_peer_counts_are_accepted(self):
-        # A healthy 3-node lab really does report 2/0/1: getpeerinfo lists a
-        # connection from the dialling side only. Grading per node would
-        # reject a fully connected network.
-        self.with_peer_counts([[{"a": 1}, {"a": 2}], [], [{"a": 3}]])
-        self.assertTrue(lab.wait_for_peers(3, timeout_secs=5, poll_secs=0.01))
+    def test_an_extra_link_is_rejected(self):
+        # A real run: seeding every node with every other one formed a star in
+        # one leg and a chain in the next, so legs measured different layouts.
+        self.with_peer_counts([3, 1, 1, 1])
+        self.assertFalse(lab.wait_for_peers(4, timeout_secs=0.5, poll_secs=0.01))
 
     def test_isolated_nodes_are_reported(self):
         # The exact bug a real run hit: a stale peer list produced three live,
         # mining, transaction-accepting nodes that never found each other.
-        self.with_peer_counts([[]])
+        self.with_peer_counts([0, 0, 0])
         self.assertFalse(lab.wait_for_peers(3, timeout_secs=0.5, poll_secs=0.01))
 
     def test_rpc_failure_counts_as_unpeered(self):
@@ -293,8 +291,107 @@ class PeeringCheck(unittest.TestCase):
         self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
 
 
+class LabConfigRewrite(unittest.TestCase):
+    """Kresko's configs need main's schema and the pinned chain before a node starts."""
+
+    KRESKO_NETWORK = (
+        "[network]\n"
+        'initial_testnet_peers = [\n    "127.0.0.102:18233",\n    "127.0.0.103:18233",\n]\n'
+        'listen_addr = "127.0.0.101:18233"\n'
+        'network = "Testnet"\n'
+        "[network.testnet_parameters]\n"
+        "disable_pow = true\n"
+        "post_blossom_pow_target_spacing = 5\n"
+        "[network.testnet_parameters.activation_heights]\n"
+        "NU5 = 130\n"
+        "[network.testnet_parameters.pre_nu6_funding_streams]\n"
+        "recipients = []\n"
+    )
+
+    def test_custom_parameters_move_to_the_explicit_network_table(self):
+        text = lab.to_node_schema(self.KRESKO_NETWORK)
+        self.assertNotIn("testnet_parameters", text)
+        self.assertNotIn('network = "Testnet"', text)
+        self.assertNotIn("post_blossom_pow_target_spacing", text)
+        self.assertIn("[network.network]\ndisable_pow = true\n", text)
+        self.assertIn("[network.network.activation_heights]", text)
+        # The empty funding-stream tables stay: without them the node falls
+        # back to public Testnet streams and panics on the short halving interval.
+        self.assertIn("[network.network.pre_nu6_funding_streams]", text)
+
+    def test_pow_mode_keys_become_main_ones(self):
+        # Kresko's pow mode enforces proof of work from pow_start_height, a
+        # key main doesn't have, so main has to skip proof of work instead.
+        text = lab.to_node_schema(
+            self.KRESKO_NETWORK.replace(
+                "disable_pow = true\n", "disable_pow = false\npow_start_height = 130\n"
+            )
+        )
+        self.assertIn("[network.network]\ndisable_pow = true\n", text)
+        self.assertNotIn("pow_start_height", text)
+
+    def test_a_current_schema_config_is_unchanged(self):
+        text = lab.to_node_schema(self.KRESKO_NETWORK)
+        self.assertEqual(lab.to_node_schema(text), text)
+
+    def test_each_node_seeds_only_its_predecessor(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab_dir = Path(tmp)
+            for i in range(3):
+                node_dir = lab_dir / "nodes" / lab.node_name(i)
+                node_dir.mkdir(parents=True)
+                (node_dir / "zakura.toml").write_text(self.KRESKO_NETWORK)
+            lab.pin_chain_topology(lab_dir, 3)
+            seeds = [
+                (lab_dir / "nodes" / lab.node_name(i) / "zakura.toml").read_text().split("\n")[1]
+                for i in range(3)
+            ]
+        self.assertEqual(
+            seeds,
+            [
+                f'initial_testnet_peers = ["{lab.node_ip(3)}:18233"]',
+                f'initial_testnet_peers = ["{lab.node_ip(0)}:18233"]',
+                f'initial_testnet_peers = ["{lab.node_ip(1)}:18233"]',
+            ],
+        )
+
+
 class NodeEnvironment(unittest.TestCase):
     """zakurad reads ZAKURA_* env vars as config keys."""
+
+    def test_profiles_reach_run_nodes_as_config_overrides(self):
+        node_dir = Path("/lab/nodes") / lab.node_name(1)
+
+        def fields(profile):
+            # zakurad drops the prefix, lowercases the rest and nests on `__`.
+            env = lab.node_env(lab.run_overrides(node_dir, profile))
+            return {
+                key.removeprefix("ZAKURA_").lower().replace("__", "."): value
+                for key, value in env.items()
+                if key.startswith("ZAKURA_")
+            }
+
+        traces = str(node_dir / lab.ZAKURA_TRACE_DIR)
+        self.assertEqual(
+            fields("v2"),
+            {
+                "network.p2p_stack": "dual",
+                "mempool.implementation": "core",
+                "network.zakura.tx_relay.enabled": "true",
+                "network.zakura.trace_dir": traces,
+            },
+        )
+        self.assertEqual(
+            fields("legacy"),
+            {
+                "network.p2p_stack": "legacy",
+                "mempool.implementation": "classic",
+                "network.zakura.tx_relay.enabled": "false",
+                "network.zakura.trace_dir": traces,
+            },
+        )
 
     def test_zakura_prefixed_vars_are_dropped(self):
         # A real failure: exporting ZAKURA_DIR made the node reject its config
@@ -302,13 +399,13 @@ class NodeEnvironment(unittest.TestCase):
         # problem, which is a genuinely confusing thing to debug.
         os.environ["ZAKURA_DIR"] = "/tmp/should-not-reach-the-node"
         self.addCleanup(lambda: os.environ.pop("ZAKURA_DIR", None))
-        env = lab.node_env()
+        env = lab.node_env({})
         self.assertNotIn("ZAKURA_DIR", env)
 
     def test_unrelated_vars_are_preserved(self):
         os.environ["MEMPOOL_LOAD_PROBE"] = "keep-me"
         self.addCleanup(lambda: os.environ.pop("MEMPOOL_LOAD_PROBE", None))
-        env = lab.node_env()
+        env = lab.node_env({})
         self.assertEqual(env.get("MEMPOOL_LOAD_PROBE"), "keep-me")
         self.assertIn("PATH", env)
 
@@ -437,6 +534,31 @@ class KreskoConfigGeneration(unittest.TestCase):
         self.assertEqual(config["ssh_key_path"], "")
         self.assertEqual(config["ssh_pub_key_path"], "")
 
+    def test_genesis_sizes_difficulty_for_the_mining_nodes(self):
+        # Kresko multiplies its rate by every node in config.json, but only
+        # --miner-nodes nodes mine, one solver thread each.
+        import tempfile
+
+        calls = []
+        original = lab.run
+        lab.run = lambda cmd, **kwargs: calls.append(cmd)
+        self.addCleanup(lambda: setattr(lab, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.cmd_genesis(
+                self.make_args(
+                    node_count=4,
+                    lab_dir=tmp,
+                    latest_upgrade="nu7",
+                    kresko_binary="kresko",
+                    zakurad_binary="zakurad",
+                    maturity_padding_blocks=125,
+                    miner_nodes=1,
+                    miner_sol_per_sec=2.0,
+                )
+            )
+        genesis = calls[0]
+        self.assertEqual(genesis[genesis.index("--pow-sol-per-sec") + 1], "0.5")
+
     def test_orchard_knobs_are_threaded_through(self):
         config = lab.build_kresko_config(
             self.make_args(orchard_lanes_per_miner=16, orchard_lane_value_zats=1234)
@@ -453,6 +575,8 @@ mempool_queued_transactions_total 42
 zcash_mempool_size_transactions 7
 mempool_full_queue_per_peer_total{peer="1.2.3.4:8233"} 3
 mempool_full_queue_per_peer_total{peer="5.6.7.8:8233"} 4
+mempool_failed_verify_tasks_total{reason="in_state"} 5
+mempool_failed_verify_tasks_total{reason="timeout"} 2
 some_unrelated_metric 999
 malformed_metric not_a_number
 """
@@ -468,6 +592,14 @@ malformed_metric not_a_number
         # figure we grade is the total across peers.
         out = monitor.parse_prometheus(self.EXPOSITION, monitor.MEMPOOL_METRICS)
         self.assertEqual(out["mempool_full_queue_per_peer_total"], 7.0)
+
+    def test_keeps_each_failed_verify_reason(self):
+        # A run where downstream nodes failed most relayed transactions could
+        # not say why from the total alone.
+        out = monitor.parse_prometheus(self.EXPOSITION, monitor.MEMPOOL_METRICS)
+        self.assertEqual(out["mempool_failed_verify_tasks_total"], 7.0)
+        self.assertEqual(out['mempool_failed_verify_tasks_total{reason="in_state"}'], 5.0)
+        self.assertEqual(out['mempool_failed_verify_tasks_total{reason="timeout"}'], 2.0)
 
     def test_ignores_comments_and_malformed_values(self):
         out = monitor.parse_prometheus(self.EXPOSITION, ("malformed_metric",))
@@ -579,22 +711,25 @@ class TxblastTraces(unittest.TestCase):
         # A live run produced exactly this: one unknown_orchard_anchor among 22
         # submissions is 4.35%, close enough to the 5% threshold to fail a
         # healthy PR. It is the blaster racing a new block, not a node reject.
+        # From NU6.3 the blast spends Ironwood, and the same race names that pool.
         import tempfile
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trace_dir = self.write_trace(
-                Path(tmpdir),
-                [{"event": "tx_submitted"} for _ in range(21)]
-                + [
-                    {"event": "tx_submit_failed", "error_class": "unknown_orchard_anchor"},
-                    {"event": "chain_rebuild_started"},
-                ],
-            )
-            out = monitor.read_txblast_traces(trace_dir)
-        self.assertEqual(out["workload_failures"], 1)
-        self.assertEqual(out["node_rejects"], 0)
-        self.assertEqual(out["reject_rate"], 0.0)
-        self.assertEqual(out["chain_rebuilds"], 1)
+        for anchor_class in ("unknown_orchard_anchor", "unknown_ironwood_anchor"):
+            with self.subTest(anchor_class):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    trace_dir = self.write_trace(
+                        Path(tmpdir),
+                        [{"event": "tx_submitted"} for _ in range(21)]
+                        + [
+                            {"event": "tx_submit_failed", "error_class": anchor_class},
+                            {"event": "chain_rebuild_started"},
+                        ],
+                    )
+                    out = monitor.read_txblast_traces(trace_dir)
+                self.assertEqual(out["workload_failures"], 1)
+                self.assertEqual(out["node_rejects"], 0)
+                self.assertEqual(out["reject_rate"], 0.0)
+                self.assertEqual(out["chain_rebuilds"], 1)
 
     def test_genuine_node_rejects_still_count(self):
         import tempfile
@@ -694,6 +829,7 @@ class Convergence(unittest.TestCase):
         out = monitor.tip_convergence(samples, self.NODES)
         self.assertTrue(out["advanced"])
         self.assertEqual(out["height_growth"]["miner-0"], 40)
+        self.assertEqual(out["blocks_mined"], 40)
 
     def test_a_node_that_stops_answering_is_reported(self):
         samples = [
@@ -810,9 +946,9 @@ class Verdict(unittest.TestCase):
         self.assertTrue(any("reject rate" in r for r in reasons))
 
     def test_reject_rate_is_not_graded_below_the_sample_floor(self):
-        # Throughput is proving-bound, so a short run submits tens of
-        # transactions where one reject is already several percent. Grading
-        # that would fail healthy runs on noise.
+        # Throughput is bounded by block production, so a short run submits
+        # tens of transactions where one reject is already several percent.
+        # Grading that would fail healthy runs on noise.
         result = self.healthy_result()
         result["throughput"]["submitted"] = 22
         result["throughput"]["reject_rate"] = 0.2
@@ -880,7 +1016,7 @@ class Reporting(unittest.TestCase):
                 "spread_p50_secs": 0.4,
                 "spread_p95_secs": 1.2,
             },
-            "convergence": {"spread": 0, "heights": {}},
+            "convergence": {"spread": 0, "heights": {}, "blocks_mined": 12},
             "backpressure": {"mempool_full_queue_per_peer_total": 7.0},
             "peak_mempool_txs": 220,
             "panics": [],
@@ -1100,6 +1236,7 @@ class Comparison(unittest.TestCase):
             },
             "effective_tx_per_sec": 3.33,
             "peak_mempool_txs": 200,
+            "convergence": {"blocks_mined": 12},
         }
         for section, values in overrides.items():
             if isinstance(values, dict):
@@ -1120,20 +1257,18 @@ class Comparison(unittest.TestCase):
         cd = self.row_for(rows, "Confirm delay p95 (ms)")
         self.assertEqual(cd["verdict"], "info")
 
-    def test_throughput_drop_is_flagged_as_worse(self):
-        target = self.leg(throughput={"submitted": 500})
+    def test_throughput_is_reported_but_not_graded(self):
+        # A target leg that mined half the blocks submits about half as much.
+        # That is mining luck, so it must not read as a regression.
+        target = self.leg(throughput={"submitted": 500}, convergence={"blocks_mined": 6})
         rows = compare.build_rows(self.leg(), target)
         row = self.row_for(rows, "Transactions submitted")
-        self.assertEqual(row["verdict"], "WORSE")
+        self.assertEqual(row["verdict"], "info")
         self.assertAlmostEqual(row["delta_pct"], -50.0)
-
-    def test_throughput_gain_is_flagged_as_better(self):
-        target = self.leg(throughput={"submitted": 2000})
-        rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Transactions submitted")["verdict"], "better")
+        self.assertEqual(self.row_for(rows, "Blocks mined in window")["target"], 6)
 
     def test_latency_direction_is_inverted(self):
-        # Higher propagation latency is a regression, unlike higher throughput.
+        # Higher propagation latency is a regression, unlike higher reach.
         target = self.leg(propagation={"spread_p95_secs": 5.0})
         rows = compare.build_rows(self.leg(), target)
         self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "WORSE")
@@ -1143,14 +1278,14 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "better")
 
     def test_small_deltas_are_treated_as_noise(self):
-        target = self.leg(throughput={"submitted": 1050})  # +5%
+        target = self.leg(propagation={"txids_on_all_nodes": 945})  # +5%
         rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Transactions submitted")["verdict"], "=")
+        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "=")
 
     def test_zero_baseline_does_not_produce_infinity(self):
-        baseline = self.leg(throughput={"submitted": 0})
+        baseline = self.leg(propagation={"txids_on_all_nodes": 0})
         rows = compare.build_rows(baseline, self.leg())
-        row = self.row_for(rows, "Transactions submitted")
+        row = self.row_for(rows, "Txids reaching all nodes")
         self.assertIsNone(row["delta_pct"])
         # Unbounded, but unambiguously an improvement in direction.
         self.assertEqual(row["verdict"], "better")
@@ -1184,7 +1319,7 @@ class Comparison(unittest.TestCase):
     def test_gate_passes_clean_legs_and_fails_a_regression(self):
         rows = compare.build_rows(self.leg(), self.leg())
         self.assertEqual(compare.gate(self.leg(), self.leg(), rows), ("pass", []))
-        target = self.leg(throughput={"submitted": 400})
+        target = self.leg(throughput={"reject_rate": 0.10})
         rows = compare.build_rows(self.leg(), target)
         self.assertEqual(compare.gate(self.leg(), target, rows)[0], "fail")
 
@@ -1230,11 +1365,11 @@ class Comparison(unittest.TestCase):
         self.assertEqual(status, 1)
 
     def test_report_names_the_regressed_metrics(self):
-        target = self.leg(throughput={"submitted": 400})
+        target = self.leg(propagation={"txids_on_all_nodes": 400})
         rows = compare.build_rows(self.leg(), target)
         report = compare.render(self.leg(), target, rows)
         self.assertIn("regressed beyond the noise floor", report)
-        self.assertIn("Transactions submitted", report)
+        self.assertIn("Txids reaching all nodes", report.split("regressed beyond")[-1])
         # Zero-baseline deltas must not render as a numeric infinity. Check the
         # delta cells specifically -- "info"/"informational" appear elsewhere.
         import re

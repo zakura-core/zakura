@@ -30,8 +30,8 @@
 //!   baseline failure, under `generator_baseline_failures`. Either way that
 //!   harness and seed's lane is `baseline-fails` for every case. The
 //!   witness lane doesn't depend on it.
-//! - **Exclusions.** Every `inproc` search skips each committed input under
-//!   [`EXCLUDED_DIRS`], by SHA-256, so it can't rediscover a witness. A
+//! - **Exclusions.** Every `inproc` search skips each seed's input in the
+//!   registry, by SHA-256, so it can't rediscover a seed witness. A
 //!   `libfuzzer` campaign starts from an empty corpus and excludes nothing.
 //! - **Classes.** A lane gets the witness lane's classes
 //!   ([`classify::generated`]).
@@ -83,13 +83,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::{
     super::lane::{
         self, campaign_failure, confirm_and_replay, left_failures, run_lane_child, BuildFailure,
-        CampaignBounds, CampaignFacts, Confirm, LaneError, LaneSpec, EXPECT_VAR,
+        CampaignBounds, CampaignFacts, Confirm, LaneError, LaneSpec, StartCorpus, EXPECT_VAR,
     },
+    super::seeds::{self, Registry},
     classify::{self, kill_violations, Class, Classified, GenerateFacts, GenerateStop, Reason},
     host_memory, key, scoped,
     triage::Triage,
@@ -97,7 +97,6 @@ use super::{
     WORK_LIST,
 };
 use crate::{
-    planted::pilot::hex,
     sim_minimize::{self, ChildEnd},
     BoxError,
 };
@@ -109,14 +108,6 @@ const DEFAULT_SEEDS: &[u64] = &[11, 23, 47, 89, 179];
 /// `seconds_per_seed`.
 const DEFAULT_SECONDS: u64 = 600;
 
-/// The directories whose committed inputs every search excludes, relative
-/// to the repository root.
-pub(super) const EXCLUDED_DIRS: &[&str] = &[
-    "qa/planted",
-    "qa/native-mutations",
-    "crates/zakura-sim/tests/fixtures",
-];
-
 /// The fuzz package a `libfuzzer` lane builds its targets from, relative to
 /// the repository root.
 const FUZZ_DIR: &str = "qa/fuzz/sim";
@@ -124,19 +115,16 @@ const FUZZ_DIR: &str = "qa/fuzz/sim";
 /// True if `changed`, paths relative to the repository root, holds one
 /// whose change can change any case's generator lanes under `flags`: the
 /// work list, whose `[[no-generator]]` records decide which cases get a
-/// lane, then a `.bin` input under [`EXCLUDED_DIRS`], the only files an
-/// `inproc` search skips ([`write_exclusions`]), or a file under
-/// [`FUZZ_DIR`], whose targets a `libfuzzer` lane builds. False with the
-/// lanes off, so a triage-only commit selects no case.
+/// lane, then the seed registry's source, whose inputs an `inproc` search
+/// skips ([`write_exclusions`]), or a file under [`FUZZ_DIR`], whose
+/// targets a `libfuzzer` lane builds. False with the lanes off, so a
+/// triage-only commit selects no case.
 pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {
     flags.on()
         && changed.iter().any(|path| {
             path == Path::new(WORK_LIST)
                 || match flags.mode {
-                    GenerateMode::Inproc => {
-                        path.extension().is_some_and(|extension| extension == "bin")
-                            && EXCLUDED_DIRS.iter().any(|dir| path.starts_with(dir))
-                    }
+                    GenerateMode::Inproc => path.starts_with(seeds::REGISTRY),
                     GenerateMode::Libfuzzer => path.starts_with(FUZZ_DIR),
                 }
         })
@@ -145,9 +133,6 @@ pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {
 /// The file every `inproc` search reads its exclusions from, under
 /// `--out`.
 const EXCLUDE_FILE: &str = "generate/exclude.txt";
-
-/// The empty corpus every `libfuzzer` campaign starts from, under `--out`.
-const EMPTY_CORPUS: &str = "generate/empty-corpus";
 
 /// The directory, under a search's, where `zakura-sim generate` writes.
 pub(super) const SEARCH_DIR: &str = "search";
@@ -325,7 +310,7 @@ pub(in crate::planted) struct GenerateConfig {
     /// A `libfuzzer` campaign's budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) seconds: Option<u64>,
-    /// How many committed inputs every search excludes.
+    /// How many seed inputs every search excludes.
     pub(in crate::planted) excluded_inputs: usize,
 }
 
@@ -811,8 +796,6 @@ pub(super) struct Lanes {
     pub(super) baselines: BTreeMap<Pair, GenBaseline>,
     /// The digests every `inproc` search excludes.
     pub(super) exclude: PathBuf,
-    /// The empty corpus every `libfuzzer` campaign starts from.
-    pub(super) corpus: PathBuf,
     /// Each harness's fuzz target, for `libfuzzer` lanes.
     pub(super) targets: BTreeMap<String, String>,
     /// The unpatched build's `zakura-sim`, copied out of slot 0's target.
@@ -1234,24 +1217,10 @@ fn harness_targets(tree: &Path) -> Result<BTreeMap<String, String>, BoxError> {
     Ok(targets)
 }
 
-/// Writes the SHA-256 of every committed input under [`EXCLUDED_DIRS`] in
-/// `tree` to `file`, one per line. Returns how many it wrote.
-pub(super) fn write_exclusions(tree: &Path, file: &Path) -> Result<usize, BoxError> {
-    let mut digests = BTreeSet::new();
-    let mut pending: Vec<PathBuf> = EXCLUDED_DIRS.iter().map(|dir| tree.join(dir)).collect();
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "bin") {
-                digests.insert(hex(&Sha256::digest(fs::read(&path)?)));
-            }
-        }
-    }
+/// Writes the SHA-256 of every admitted seed's input in `registry` to
+/// `file`, one per line, each once. Returns how many it wrote.
+pub(super) fn write_exclusions(registry: &Registry, file: &Path) -> Result<usize, BoxError> {
+    let digests: BTreeSet<&str> = registry.input_digests().collect();
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1335,10 +1304,10 @@ pub(super) fn baseline_lane(
 }
 
 impl Runner {
-    /// Sets the generator lanes up on slot 0's unpatched `built`, and runs
-    /// each harness and seed's baseline search. Returns the lanes, the
-    /// setup the report records, and the baselines' property findings and
-    /// failures.
+    /// Sets the generator lanes up on slot 0's unpatched `built`, which
+    /// lists `registry`, and runs each harness and seed's baseline search.
+    /// Returns the lanes, the setup the report records, and the baselines'
+    /// property findings and failures.
     pub(super) fn lanes(
         &self,
         cases: &[LoopCase],
@@ -1346,6 +1315,7 @@ impl Runner {
         slot: &Slot,
         built: &Built,
         source: &str,
+        registry: &Registry,
     ) -> Result<(Lanes, GenerateConfig, BaselineFound), BoxError> {
         let flags = self.generate.clone();
         let sim = built
@@ -1353,9 +1323,7 @@ impl Runner {
             .as_ref()
             .ok_or("the unpatched build made no zakura-sim binary")?;
         let exclude = self.out.join(EXCLUDE_FILE);
-        let excluded_inputs = write_exclusions(&slot.tree, &exclude)?;
-        let corpus = self.out.join(EMPTY_CORPUS);
-        fs::create_dir_all(&corpus)?;
+        let excluded_inputs = write_exclusions(registry, &exclude)?;
         let unpatched_sim = self.out.join(UNPATCHED_SIM);
         fs::create_dir_all(unpatched_sim.parent().expect("the copy lies under --out"))?;
         fs::copy(sim, &unpatched_sim)?;
@@ -1392,7 +1360,6 @@ impl Runner {
             plans,
             baselines: BTreeMap::new(),
             exclude,
-            corpus,
             targets,
             unpatched_sim,
         };
@@ -1457,7 +1424,7 @@ impl Runner {
                         .map_err(|_| format!("a libfuzzer seed fits a u32, and {seed} doesn't"))?,
                     feedback: "on",
                     libfuzzer_args: &[],
-                    corpus: &lanes.corpus,
+                    corpus: StartCorpus::NoSeeds,
                 };
                 // One worker per campaign, so a lane's memory is one
                 // process's, as an `inproc` search's is.

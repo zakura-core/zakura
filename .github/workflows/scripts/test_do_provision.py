@@ -611,6 +611,21 @@ class Retention(unittest.TestCase):
         deleted = {c.args[2] for c in api.call_args_list if c.args[1] == "delete"}
         self.assertEqual(deleted, {"v-node", "v-state"})
 
+    @patch.object(retention, "output")
+    @patch.object(retention, "doctl")
+    def test_main_skips_image_a_bake_is_still_creating(self, api, _):
+        # A bake's in-progress image has no `regions` yet (reaper run 1872).
+        baking = dict(
+            id="baking",
+            name="zakura-pr-node-baking",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            status="new",
+        )
+        api.side_effect = lambda *a: [baking] if a[:2] == ("image", "list-user") else []
+        with patch("sys.argv", ["retention", "--checkpoint", "100", "--apply"]):
+            retention.main()
+        self.assertFalse([c for c in api.call_args_list if c.args[1] == "delete"])
+
     def test_stale_or_missing_regions_are_visible(self):
         now = datetime(2026, 9, 4, tzinfo=timezone.utc)
         self.assertEqual(retention.stale_regions([image("nyc1")], now), ["sfo3"])

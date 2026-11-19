@@ -42,6 +42,12 @@ on:
         type: boolean
         required: false
         default: false
+      setup:
+        description: "Pool setup for one node: legacy (legacy P2P, classic pool) or v2 (dual P2P, pool core, tx-relay)"
+        type: choice
+        required: false
+        options: [auto, legacy, v2]
+        default: auto
       header_sync_trace:
         description: "Write structured header/block-sync traces to the data volume"
         type: boolean
@@ -151,6 +157,7 @@ jobs:
           NODE: ${{ inputs.node }}
           P2P_STACK: ${{ inputs.p2p_stack }}
           REF: ${{ inputs.ref }}
+          SETUP: ${{ inputs.setup }}
         run: |
           set -euo pipefail
 
@@ -185,6 +192,20 @@ jobs:
             tx_relay_line="tx_relay = true"
           fi
 
+          # deploy.py's SETUPS says what each setup renders.
+          setup_line=""
+          if [ "${SETUP:-auto}" != "auto" ]; then
+            if [ -z "${NODE}" ]; then
+              echo "setup overrides require one explicit node" >&2
+              exit 1
+            fi
+            if [ "$requested_p2p_stack" != "auto" ]; then
+              echo "set p2p_stack or setup, not both" >&2
+              exit 1
+            fi
+            setup_line="setup           = \"${SETUP}\""
+          fi
+
           if [ "${HEADER_SYNC_TRACE}" = "true" ] \
             && [ -z "${NODE}" ]; then
             echo "header_sync_trace requires one explicit node" >&2
@@ -209,6 +230,7 @@ jobs:
           p2p_stack       = "${default_p2p_stack}"
           ${mempool_implementation_line}
           ${tx_relay_line}
+          ${setup_line}
           metrics_endpoint = "127.0.0.1:9999"
           health_listen_addr = "127.0.0.1:8080"
           tracing_filter  = "info,zakura_network::zakura=info"

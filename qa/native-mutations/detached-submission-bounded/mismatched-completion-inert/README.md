@@ -14,7 +14,7 @@ nothing. A detached submission whose verdict arrives while a newer body is
 ## Witness
 
 The witness is `qa/planted/block-sync/detached-submission-bounded/keep-detached-after-verdict.toml`, which runs
-`crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin`.
+the seed `block-sync-stale-beside-current`.
 
 The input resets the chain while storage holds a submission at height 2,
 which the reset detaches. Its retryable verdict reaches block sync at 5 s

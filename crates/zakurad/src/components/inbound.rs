@@ -397,6 +397,10 @@ pub struct Inbound {
 
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// Whether a gossiped block can also be requested from a second announcer expected to
+    /// deliver it sooner.
+    second_block_request: bool,
 }
 
 impl Inbound {
@@ -426,12 +430,20 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks: PendingBlockRegistry::default(),
+            second_block_request: false,
         }
     }
 
     /// Shares one pending-block registry with the mining RPCs.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.pending_blocks = pending_blocks;
+        self
+    }
+
+    /// Lets a gossiped block also be requested from a second announcer the peer set expects to
+    /// deliver it sooner. See `[network.block_download_score_and_hedge] enabled`.
+    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
+        self.second_block_request = enabled;
         self
     }
 
@@ -478,15 +490,19 @@ impl Service<zn::Request> for Inbound {
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
 
-                    let block_downloads = Box::pin(BlockDownloads::new(
-                        full_verify_concurrency_limit,
-                        self.expose_peer_addresses,
-                        Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
-                        Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
-                        state.clone(),
-                        latest_chain_tip,
-                        network,
-                    ));
+                    let block_downloads = Box::pin(
+                        BlockDownloads::new(
+                            misbehavior.clone(),
+                            full_verify_concurrency_limit,
+                            self.expose_peer_addresses,
+                            Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
+                            Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
+                            state.clone(),
+                            latest_chain_tip,
+                            network,
+                        )
+                        .with_second_block_request(self.second_block_request),
+                    );
 
                     result = Ok(());
                     Setup::Initialized {
@@ -542,24 +558,10 @@ impl Service<zn::Request> for Inbound {
                         continue;
                     };
 
-                    // A rewritten coinbase height on a tip child is rejected before the block
-                    // reaches the verifier, so it is never a `RouterError` or a
-                    // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
-                    // the one rejection that must re-request the block: the poisoned response
-                    // held the per-hash dedupe slot while it was outstanding, so honest peers'
-                    // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
-                    // the re-request the block waits for the syncer's next round, which is the
-                    // delay the attack is trying to cause.
-                    //
-                    // Scoring and re-requesting are kept together here rather than split across
-                    // `block_misbehavior`, because the re-request needs `block_downloads` and
-                    // the two decisions are the same decision.
+                    // Each candidate's height was checked and attributed at receipt. A mismatch
+                    // reaches this stream only if the download ended without an eligible body.
+                    // Retry because announcements for this hash were deduplicated while it ran.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
-                        if let Some(advertiser_addr) = advertiser_addr {
-                            misbehavior
-                                .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
-                        }
-
                         // A failed parent recovery is left to the syncer. A re-request would
                         // leave the recovery bounds, because it is an ordinary download.
                         if !mismatch.parent_recovery {
@@ -673,7 +675,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(zn::DeliveredBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();
@@ -723,7 +725,7 @@ impl Service<zn::Request> for Inbound {
                             Some((block, size)) => {
                                 total_size += size;
 
-                                blocks.push(Available((block, None)))
+                                blocks.push(Available((block.into(), None)))
                             },
                             // We don't need to limit the size of the missing block IDs list,
                             // because it is already limited to the size of the getdata request
@@ -875,6 +877,10 @@ impl Service<zn::Request> for Inbound {
                 block_downloads.download_and_verify(block.hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
+            zn::Request::PushBlock(block, source) => {
+                block_downloads.verify_pushed(block, source);
+                async { Ok(zn::Response::Nil) }.boxed()
+            }
             // The size of this response is limited by the `Connection` state machine in the network layer
             zn::Request::MempoolTransactionIds => {
                 mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {
@@ -884,6 +890,7 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
+            zn::Request::BlockByHashPrimary { .. } | zn::Request::BlockByHashHedge { .. } => unreachable!("block download coordination is local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

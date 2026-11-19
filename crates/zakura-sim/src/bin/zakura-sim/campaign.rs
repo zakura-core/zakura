@@ -28,7 +28,7 @@ pub const USAGE: &str = "\
   zakura-sim campaign start --store <dir> --campaign <name> --sim <name> --build <sha256>
       --seconds <n> [--workers <n>] [--seed <n>] [--cpus <list>]... [--max-len <n>]
       [--timeout <s>] [--rss-limit-mb <n>] [--max-restarts <n>] [--abandon-limit <n>]
-      [--feedback on|off] [--compact-secs <s>] [--fixtures <dir>]... [--suite <file>]
+      [--feedback on|off] [--compact-secs <s>] [--seeds corpus|none] [--suite <file>]
       [--artifacts <uri>] [--libfuzzer-arg <flag>]... [--parent <sha256> --corpus carry|seeds]
   zakura-sim campaign resume --store <dir> [--run <sha256>] [--build <sha256>] [--seconds <n>]
       [--workers <n>]
@@ -37,7 +37,7 @@ pub const USAGE: &str = "\
   zakura-sim campaign evidence --store <dir> [--run <sha256>] [--out <file>]
   zakura-sim campaign verify --store <dir>
   zakura-sim targets --out <dir> [--target <name>]... [--sanitizer address|none]
-      [--target-dir <dir>] [--fixtures <dir>]... [--child-secs <s>]
+      [--target-dir <dir>] [--child-secs <s>]
 ";
 
 /// What each subcommand does.
@@ -46,7 +46,7 @@ pub const HELP: &str = "\
 `build` builds a fuzz target of qa/fuzz/sim with the pinned nightly and saves
 the binary in the store with its build record, named by its SHA-256.
 `start` writes a run manifest whose initial snapshot holds the harness's
-curated seeds, then runs --workers fuzzer processes for --seconds each and
+corpus seeds, or nothing with --seeds none, then runs --workers fuzzer processes for --seconds each and
 restarts one that ends early up to --max-restarts times. When they stop, it
 saves the union of the initial snapshot and every worker's corpus as a new
 snapshot, compacts it with libFuzzer's merge if --compact-secs is set, and
@@ -113,7 +113,6 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
         "--target",
         "--sanitizer",
         "--target-dir",
-        "--fixtures",
         "--child-secs",
     ])?;
     let repo = repo_root();
@@ -127,14 +126,6 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
     if child == 0 {
         return Err(Error::Usage("--child-secs must be at least 1".to_owned()));
     }
-    let mut fixtures: Vec<PathBuf> = flags
-        .many("--fixtures")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    if fixtures.is_empty() {
-        fixtures.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
-    }
     let options = TargetsOptions {
         out: PathBuf::from(flags.required("--out")?),
         targets: flags
@@ -146,7 +137,6 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
         target_dir: flags
             .one("--target-dir")?
             .map_or_else(|| repo.join("target").join("sim-fuzz"), PathBuf::from),
-        fixtures,
         child: std::time::Duration::from_secs(child),
         repo,
     };
@@ -217,7 +207,7 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
         "--abandon-limit",
         "--feedback",
         "--compact-secs",
-        "--fixtures",
+        "--seeds",
         "--suite",
         "--artifacts",
         "--libfuzzer-arg",
@@ -251,10 +241,6 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
         )),
         _ => return Err(Error::Usage("--parent and --corpus go together".to_owned())),
     };
-    let mut fixtures: Vec<PathBuf> = flags.many("--fixtures").iter().map(PathBuf::from).collect();
-    if fixtures.is_empty() {
-        fixtures.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
-    }
     let options = StartOptions {
         campaign: flags.required("--campaign")?.to_owned(),
         harness: entry,
@@ -290,7 +276,15 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
                 .map(str::to_owned)
                 .collect(),
         },
-        fixtures,
+        seeds: match flags.one("--seeds")? {
+            None | Some("corpus") => true,
+            Some("none") => false,
+            Some(other) => {
+                return Err(Error::Usage(format!(
+                    "--seeds is `corpus` or `none`, not `{other}`"
+                )))
+            }
+        },
         suite: flags.one("--suite")?.map(PathBuf::from),
         artifacts: flags.one("--artifacts")?.map(str::to_owned),
         parent,

@@ -196,6 +196,16 @@ fn the_committed_suite_covers_the_registry() {
                 "{row:?}"
             ),
             Expect::Unimplemented => assert!(row.pending.is_some(), "{row:?}"),
+            // A native bypass runs in the droplet mutation campaign, not
+            // here, so its row names an existing patch and the reason.
+            Expect::Excluded => assert!(
+                row.pending.is_some()
+                    && row.patch.is_some_and(|patch| seed::repo_root()
+                        .join("qa/native-mutations")
+                        .join(patch)
+                        .is_file()),
+                "{row:?}"
+            ),
             other => panic!("{}: {other:?}", row.id),
         }
     }
@@ -701,12 +711,12 @@ fn every_problem_is_reported_at_once() {
         row.harness == "header-sync/flood"
     });
     remove(&mut suite.ignored, |row| {
-        row.test == "regenerate_wait_complete_input"
+        row.test == "regenerate_planted_reader_scenarios"
     });
     remove(&mut suite.target, |row| row.name == "race_fixtures");
     let problems = problems(&suite);
     assert_problem(&problems, "no target runs the harness `header-sync/flood`");
-    assert_problem(&problems, "regenerate_wait_complete_input is ignored");
+    assert_problem(&problems, "regenerate_planted_reader_scenarios is ignored");
     assert_problem(&problems, "defines the target `race_fixtures`");
     assert_problem(&problems, "no target runs the harness `race/ab-ba`");
 }

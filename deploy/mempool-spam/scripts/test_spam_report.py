@@ -15,40 +15,51 @@ import round_robin_selfsend
 import spam_report
 
 
-def submitted(txid: str, first_seen: dict, seen_after_mined: dict, nodes: list[str]) -> dict:
+def submitted(
+    txid: str, first_seen: dict, seen_in_block: dict, nodes: list[str], unobserved=()
+) -> dict:
     """A `submitted` event as the driver logs it."""
-    missing = [name for name in nodes if name not in first_seen and name not in seen_after_mined]
+    unobserved = list(unobserved)
+    missing = [
+        name
+        for name in nodes
+        if name not in first_seen and name not in seen_in_block and name not in unobserved
+    ]
     return {
         "event": "submitted",
         "txid": txid,
         "submit": nodes[0],
         "impl": "zakura",
         "first_seen": first_seen,
-        "seen_after_mined": seen_after_mined,
+        "seen_in_block": seen_in_block,
+        "unobserved": unobserved,
         "missing": missing,
-        "seen_all": len(first_seen) == len(nodes),
-        "inconclusive": bool(seen_after_mined) and not missing,
+        "seen_all": not missing and not unobserved,
+        "inconclusive": bool(unobserved) and not missing,
     }
 
 
 class GradingTests(unittest.TestCase):
-    def test_a_node_that_only_shows_a_mined_transaction_is_inconclusive(self):
+    def test_an_unsettled_node_is_inconclusive_and_a_block_sighting_is_seen(self):
         nodes = ["a", "b"]
         events = [
             {"event": "start", "nodes": nodes},
             submitted("pass", {"a": 0.1, "b": 0.4}, {}, nodes),
             submitted("late", {"a": 0.1}, {"b": 2.0}, nodes),
+            submitted("unsettled", {"a": 0.1}, {}, nodes, unobserved=["b"]),
             submitted("miss", {"a": 0.1}, {}, nodes),
         ]
-        for txid in ("pass", "late", "miss"):
+        for txid in ("pass", "late", "unsettled", "miss"):
             events.append({"event": "drain_result", "txid": txid, "confirmations": 1})
 
         summary = spam_report.build_report(events)["summary"]
 
-        self.assertEqual(summary["seen_all"], 1)
+        self.assertEqual(summary["seen_all"], 2)
+        self.assertEqual(summary["mempool_all"], 1)
         self.assertEqual(summary["inconclusive"], 1)
         self.assertEqual(summary["missed"], 1)
         self.assertEqual(summary["missed_by_node"], {"b": 1})
+        self.assertEqual(summary["block_first_by_node"], {"b": 1})
 
     def test_an_old_log_without_the_split_proves_neither_a_pass_nor_a_miss(self):
         nodes = ["a", "b"]
@@ -77,9 +88,9 @@ class RunStatusTests(unittest.TestCase):
         events = [
             {"event": "start", "nodes": nodes},
             submitted("pass", {"a": 0.1, "b": 0.4}, {}, nodes),
-            submitted("late", {"a": 0.1}, {"b": 2.0}, nodes),
+            submitted("unsettled", {"a": 0.1}, {}, nodes, unobserved=["b"]),
         ]
-        for txid in ("pass", "late"):
+        for txid in ("pass", "unsettled"):
             events.append({"event": "drain_result", "txid": txid, "confirmations": 1})
         summary = spam_report.build_report(events)["summary"]
 
@@ -200,14 +211,19 @@ class TransactionStateTests(unittest.TestCase):
 
         def rpc_call(_url, method, params=None, timeout=30, auth=None):
             asked.append(method)
-            return [] if method == "getrawmempool" else {"txid": "t"}
+            if method == "getrawmempool":
+                # The pool listing uses up the rest of the window.
+                time.sleep(0.05)
+                return []
+            return {"txid": "t"}
 
         with mock.patch.object(round_robin_selfsend, "rpc_call", rpc_call):
-            state = round_robin_selfsend.transaction_state(
-                {"rpc_url": "http://node"}, "t", start_by=time.monotonic() - 1
-            )
+            with self.assertRaises(round_robin_selfsend.RunDurationElapsed):
+                round_robin_selfsend.transaction_state(
+                    {"rpc_url": "http://node"}, "t", deadline=time.monotonic() + 0.02
+                )
 
-        self.assertEqual((state, asked), (None, ["getrawmempool"]))
+        self.assertEqual(asked, ["getrawmempool"])
 
     def test_a_pooled_transaction_is_in_the_pool(self):
         self.assertEqual(self.state(["t"], None), round_robin_selfsend.IN_POOL)
@@ -221,9 +237,9 @@ class TransactionStateTests(unittest.TestCase):
         tx = {"txid": "t", "confirmations": 2, "height": 10, "blockhash": "b"}
         self.assertEqual(self.state([], tx), round_robin_selfsend.IN_CHAIN)
 
-    def test_a_side_chain_transaction_settles_nothing(self):
+    def test_a_side_chain_transaction_is_in_a_block(self):
         tx = {"txid": "t", "confirmations": 0, "height": -1, "blockhash": "b"}
-        self.assertIsNone(self.state([], tx))
+        self.assertEqual(self.state([], tx), round_robin_selfsend.IN_CHAIN)
 
     def test_only_a_not_found_answer_is_absent(self):
         not_found = round_robin_selfsend.RpcError("not found", round_robin_selfsend.RPC_NOT_FOUND)
@@ -248,7 +264,7 @@ class MatrixTests(unittest.TestCase):
         samples = {n: 0 for n in "abcde"}
         lock = threading.Lock()
 
-        def state(node, _txid, deadline=None, start_by=None):
+        def state(node, _txid, deadline=None):
             with lock:
                 samples[node["name"]] += 1
                 count = samples[node["name"]]
@@ -272,7 +288,7 @@ class MatrixTests(unittest.TestCase):
         samples = {"a": 0}
         lock = threading.Lock()
 
-        def state(node, _txid, deadline=None, start_by=None):
+        def state(node, _txid, deadline=None):
             if node["name"] == "b":
                 # b's one sample outlasts the window.
                 time.sleep(0.15)
@@ -302,28 +318,11 @@ class MatrixTests(unittest.TestCase):
             )
         self.assertEqual(unobserved, ["a"])
 
-    def test_a_sample_is_bounded_by_the_run_not_the_window(self):
-        nodes = [{"name": "a"}]
-        deadlines = []
-
-        def state(_node, _txid, deadline=None, start_by=None):
-            deadlines.append(deadline)
-            return round_robin_selfsend.ABSENT
-
-        with mock.patch.object(round_robin_selfsend, "transaction_state", state):
-            _, _, unobserved = round_robin_selfsend.first_seen_matrix(
-                nodes, "t", duration=0.05, interval=0.01
-            )
-
-        self.assertTrue(deadlines)
-        self.assertEqual(set(deadlines), {None})
-        self.assertEqual(unobserved, [], "a full window's absence is a miss")
-
     def test_an_interrupted_sample_after_an_absent_one_is_unobserved(self):
         nodes = [{"name": "a"}]
         answers = iter([round_robin_selfsend.ABSENT])
 
-        def state(_node, _txid, deadline=None, start_by=None):
+        def state(_node, _txid, deadline=None):
             answer = next(answers, None)
             if answer is None:
                 raise round_robin_selfsend.RunDurationElapsed("deadline")
@@ -340,7 +339,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}, {"name": "b"}]
         answers = {"a": round_robin_selfsend.IN_POOL, "b": round_robin_selfsend.ABSENT}
 
-        def state(node, _txid, deadline=None, start_by=None):
+        def state(node, _txid, deadline=None):
             return answers[node["name"]]
 
         with mock.patch.object(round_robin_selfsend, "transaction_state", state):
@@ -355,7 +354,7 @@ class MatrixTests(unittest.TestCase):
         nodes = [{"name": "a"}, {"name": "b"}]
         answers = {"a": round_robin_selfsend.IN_CHAIN, "b": None}
 
-        def state(node, _txid, deadline=None, start_by=None):
+        def state(node, _txid, deadline=None):
             return answers[node["name"]]
 
         with mock.patch.object(round_robin_selfsend, "transaction_state", state):
@@ -366,10 +365,7 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(in_pool, {})
         self.assertEqual(list(after_mined), ["a"])
         self.assertEqual(unobserved, ["b"])
-        event = submitted("t", in_pool, after_mined, ["a", "b"])
-        event["unobserved"] = unobserved
-        event["missing"] = []
-        event["inconclusive"] = True
+        event = submitted("t", in_pool, after_mined, ["a", "b"], unobserved)
         summary = spam_report.build_report([{"event": "start", "nodes": ["a", "b"]}, event])[
             "summary"
         ]

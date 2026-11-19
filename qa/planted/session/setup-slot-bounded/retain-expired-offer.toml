@@ -1,0 +1,2 @@
+seed = "handshake-partial-session"
+checks = ["crates/zakura-network/src/zakura/handler/service_session.rs"]

@@ -80,6 +80,10 @@ DEFAULTS = {
     # Renders [network.zakura.tx_relay] enabled = true. It needs the core pool
     # and a v2 stack, or zakurad leaves tx-relay off without saying so.
     "tx_relay": False,
+    # "" or a SETUPS name, "legacy" or "v2". Sets p2p_stack, the [mempool]
+    # implementation and tx-relay together, for comparing pools on real peers.
+    # It can't be combined with mempool_implementation or tx_relay.
+    "setup": "",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
@@ -104,6 +108,9 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Optional [defaults.mempool] table -> rendered [mempool], keys passed
+    # through, e.g. `implementation = "core"`. Absent -> zakurad's defaults.
+    "mempool": None,
     # Optional [defaults.testnet_parameters] table -> rendered as the inline
     # `network = { ... }` value, for configured testnets such as the NU7 fork.
     # Absent -> no section, so the node runs the default public network.
@@ -168,6 +175,7 @@ class Node:
     container_name: str
     release_state_publisher: bool = False
     port: object = None
+    mempool: object = None  # dict | None: [mempool] settings
     # resolved at runtime
     sha: str = ""
 
@@ -203,6 +211,13 @@ P2P_STACK_VALUES = {
     "legacy",
     "zakura",
     "dual",
+}
+
+
+# What each `setup` renders. tx-relay needs the pool core, so it only comes with v2.
+SETUPS = {
+    "legacy": {"p2p_stack": "legacy", "implementation": "classic", "tx_relay": False},
+    "v2": {"p2p_stack": "dual", "implementation": "core", "tx_relay": True},
 }
 
 
@@ -280,6 +295,23 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         seen.add(name)
         merged = dict(defaults)
         merged.update(raw)
+        if merged["setup"]:
+            if merged["mempool_implementation"] or merged["tx_relay"]:
+                raise DeployError(
+                    f"{name}: set setup or mempool_implementation and tx_relay, not both"
+                )
+            setup = SETUPS.get(merged["setup"])
+            if setup is None:
+                raise DeployError(
+                    f"{name}: unknown setup {merged['setup']!r}; "
+                    f"expected one of: {', '.join(SETUPS)}"
+                )
+            merged["p2p_stack"] = setup["p2p_stack"]
+            merged["mempool"] = {**(merged["mempool"] or {}),
+                                 "implementation": setup["implementation"]}
+            zakura = dict(merged["zakura"] or {})
+            zakura["tx_relay"] = {**zakura.get("tx_relay", {}), "enabled": setup["tx_relay"]}
+            merged["zakura"] = zakura
         publisher = merged["release_state_publisher"]
         build_features = merged["build_features"]
         if (not isinstance(build_features, list)
@@ -291,7 +323,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             raise DeployError(f"{name}: tx_relay must be a boolean")
         if merged["tx_relay"]:
             pool = normalize_mempool_implementation(
-                merged["mempool_implementation"], where=f"[[nodes]] {name}"
+                merged["mempool_implementation"]
+                or str((merged["mempool"] or {}).get("implementation", "")),
+                where=f"[[nodes]] {name}",
             )
             stack = normalize_p2p_stack(merged["p2p_stack"], where=f"[[nodes]] {name}")
             if pool != "core" or stack not in ("dual", "zakura"):
@@ -355,6 +389,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             container_name=merged["container_name"],
             release_state_publisher=publisher,
             port=merged["port"],
+            mempool=merged.get("mempool"),
         ))
 
     if only:
@@ -591,19 +626,19 @@ def render_toml_pair(key: str, value: object) -> str:
     return f"{toml_key(key)} = {toml_scalar(value)}"
 
 
-def render_zakura_block(zakura: object) -> str:
-    """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
+def render_table_block(header: str, table: object) -> str:
+    """Render a `[header]` section from a dict, or "" if unset.
 
-    Recognises `dev_network` (str), `listen_addr` (str), and `bootstrap_peers`
-    (list of `node_id@addr` strings). Unknown keys are passed through verbatim so
-    the deployer does not need to learn every Zakura field.
+    Keys pass through verbatim, so the deployer does not need to learn every
+    zakurad field. A nested dict renders as an inline table, so a
+    `[network.zakura]` table can carry `tx_relay = { enabled = true }`.
     """
-    if not zakura:
+    if not table:
         return ""
-    lines = ["[network.zakura]"]
-    for key, value in zakura.items():
+    lines = [f"[{header}]"]
+    for key, value in table.items():
         lines.append(render_toml_pair(key, value))
-    # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
+    # Leading/trailing blank lines so the section reads cleanly between its neighbours.
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -649,11 +684,12 @@ def render_node_config(node: Node) -> str:
     if node.internal_miner:
         mining_lines.append("internal_miner = true")
     mining_block = "[mining]\n" + "\n".join(mining_lines) + "\n" if mining_lines else ""
-    mempool_block = (
-        f'[mempool]\nimplementation = "{node.mempool_implementation}"\n'
-        if node.mempool_implementation
-        else ""
-    )
+    mempool = dict(node.mempool or {})
+    if node.mempool_implementation:
+        mempool["implementation"] = node.mempool_implementation
+    zakura = dict(node.zakura or {})
+    if node.tx_relay:
+        zakura["tx_relay"] = {**zakura.get("tx_relay", {}), "enabled": True}
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -675,12 +711,14 @@ def render_node_config(node: Node) -> str:
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
-        "ZAKURA_BLOCK": render_zakura_block(node.zakura)
-        + ("[network.zakura.tx_relay]\nenabled = true\n" if node.tx_relay else ""),
+        "ZAKURA_BLOCK": render_table_block("network.zakura", zakura),
+        "BLOCK_DOWNLOAD_SCORE_AND_HEDGE": render_table_block(
+            "network.block_download_score_and_hedge", {"enabled": True}
+        ) if node.network == "Mainnet" else "",
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
         "MINING_BLOCK": mining_block,
-        "MEMPOOL_BLOCK": mempool_block,
+        "MEMPOOL_BLOCK": render_table_block("mempool", mempool),
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,

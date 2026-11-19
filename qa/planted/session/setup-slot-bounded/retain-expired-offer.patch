@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handler/service_session.rs
++++ b/crates/zakura-network/src/zakura/handler/service_session.rs
+@@ -168,7 +168,7 @@
+     /// Expiry releases every arrived member and briefly defers another offer.
+     pub(super) fn expire(&mut self, now: Instant) {
+         for (kind, wire_id) in self.state.expire(now) {
+-            let arrived = self.streams.remove(&kind);
++            let arrived = self.streams.get(&kind);
+             if let Some(member) = arrived.as_ref().and_then(|arrived| arrived.first()) {
+                 trace_session_step(
+                     &member.context.conn,

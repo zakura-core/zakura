@@ -102,7 +102,7 @@ jobs:
           key: ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-${{ github.run_id }}
           restore-keys: |
             ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-
-      - name: Add the harness's committed seeds
+      - name: Add the harness's corpus seeds
         if: matrix.harness != ''
         env:
           HARNESS: ${{ matrix.harness }}

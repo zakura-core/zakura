@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import json
 import os
 import signal
@@ -14,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -44,6 +44,9 @@ RUN_LOG = ROOT / "logs/round-robin.jsonl"
 STATUS_FILE = ROOT / "logs/round-robin-status.json"
 ZECD_RPC_URL = "http://127.0.0.1:18888"
 NETWORK = "test"
+# How long one first-seen poll may wait for a node. Nodes are polled in
+# parallel, so a dead node only costs its own poll, never another node's time.
+POLL_RPC_TIMEOUT = 2.0
 
 
 class RpcError(RuntimeError):
@@ -134,32 +137,32 @@ def wait_next_block(
     raise TimeoutError(f"no new block after height {start_height}")
 
 
-IN_POOL = "pool"
-IN_CHAIN = "chain"
+IN_POOL = "mempool"
+IN_CHAIN = "block"
 # The node answered that it holds the transaction nowhere.
 ABSENT = "absent"
 # `getrawtransaction`'s error code for a transaction a node does not know.
 RPC_NOT_FOUND = -5
-# The exit status of a run with no miss but a round no pool was seen to hold.
+# The exit status of a run with no miss but a round not seen on every node.
 EXIT_INCONCLUSIVE = 3
 
 
-def transaction_state(
-    node: dict, txid: str, deadline: float | None = None, start_by: float | None = None
-) -> str | None:
-    """Where `node` holds `txid`: IN_POOL, IN_CHAIN once mined, ABSENT, or None
-    if its answers do not settle it.
+def transaction_state(node: dict, txid: str, deadline: float | None = None) -> str | None:
+    """Where `node` holds `txid`: IN_POOL, IN_CHAIN once in any block, ABSENT,
+    or None if its answers do not settle it.
 
-    A node that only knows the transaction from a block never showed it held
-    the transaction in its pool, so the two are told apart. ABSENT needs a
-    definite answer: the pool listing without the transaction, and the
-    lookup's "not found" error. A failed or unclear answer is None, and so is
-    a pool listing without it that answered after `start_by`, since the
-    lookup would then start too late to say anything about the window.
+    IN_CHAIN covers side-chain blocks too, which come back with a block hash
+    and zero confirmations. ABSENT needs a definite answer: the pool listing
+    without the transaction, and the lookup's "not found" error. A failed or
+    unclear answer is None, and so is a node that did not answer in time.
+    Each RPC waits at most `POLL_RPC_TIMEOUT` and never past `deadline`, and
+    raises `RunDurationElapsed` rather than start after it.
     """
     try:
         if txid in rpc_call(
-            node["rpc_url"], "getrawmempool", timeout=remaining_timeout(deadline, 10)
+            node["rpc_url"],
+            "getrawmempool",
+            timeout=remaining_timeout(deadline, POLL_RPC_TIMEOUT),
         ):
             return IN_POOL
         listed = True
@@ -167,14 +170,12 @@ def transaction_state(
         raise
     except Exception:  # noqa: BLE001
         listed = False
-    if start_by is not None and time.monotonic() >= start_by:
-        return None
     try:
         tx = rpc_call(
             node["rpc_url"],
             "getrawtransaction",
             [txid, 1],
-            timeout=remaining_timeout(deadline, 10),
+            timeout=remaining_timeout(deadline, POLL_RPC_TIMEOUT),
         )
     except RunDurationElapsed:
         raise
@@ -185,13 +186,9 @@ def transaction_state(
     # Only an answer about this transaction settles anything.
     if not isinstance(tx, dict) or tx.get("txid") != txid:
         return None
-    if int(tx.get("confirmations") or 0) > 0:
+    if tx.get("blockhash") or int(tx.get("confirmations") or 0) > 0:
         return IN_CHAIN
-    # A pooled transaction has no block. One in a side-chain block has a block
-    # hash and height -1, and shows nothing about the pool.
-    if tx.get("blockhash") is None and tx.get("height") is None:
-        return IN_POOL
-    return None
+    return IN_POOL
 
 
 def first_seen_matrix(
@@ -201,65 +198,57 @@ def first_seen_matrix(
     interval=1.0,
     run_deadline: float | None = None,
 ) -> tuple[dict[str, float], dict[str, float], list[str]]:
-    """When each node first showed `txid`: in its pool, or only once mined.
+    """Poll every node in parallel until each holds `txid` or the window closes.
 
-    Returns two maps from node name to seconds since the poll started, and
-    the other nodes whose last answer was not a definite ABSENT, or every
-    unsettled node if the window was cut short. A node in the second map was
-    first sampled after the block, and one in the list was never definitely
-    without the transaction for the whole window, so for either, whether its
-    pool held it is unknown. Only the rest are misses.
+    Returns the seconds until each node held `txid` in its mempool, and, for
+    nodes that first found it already in a block, the seconds until that.
+    Also returns the other nodes whose last answer was not a definite ABSENT,
+    or every unsettled node if the run's deadline or a stop cut the window
+    short. Whether those nodes held it is unknown. Only the rest are misses.
     """
     started = time.monotonic()
     window_end = started + duration
     deadline = window_end if run_deadline is None else min(window_end, run_deadline)
-    in_pool: dict[str, float] = {}
-    after_mined: dict[str, float] = {}
-    last: dict[str, str | None] = {}
-    run_elapsed = False
 
-    def poll(node: dict) -> tuple[str | None, float | None, bool]:
-        """Polls one node until it settles or the window ends. Returns its last
-        state, when that state settled it if it did, and whether the run's
-        deadline cut a sample short.
+    def poll(node: dict) -> tuple[str | None, float | None]:
+        """Polls `node` until it settles or the window closes. Returns its last
+        state, and when that state settled it if it did.
 
         Each node has its own poller, so a slow node delays only itself.
         """
         state = None
         while time.monotonic() < deadline and not STOP:
             try:
-                # A sample begun inside the window finishes its first read, so
-                # the window's end never cuts that answer short. Only the
-                # run's own deadline does.
-                state = transaction_state(node, txid, deadline=run_deadline, start_by=deadline)
+                state = transaction_state(node, txid, deadline)
             except RunDurationElapsed:
                 # The interrupted sample settles nothing, whatever came before.
-                return None, None, True
+                return None, None
             if state in (IN_POOL, IN_CHAIN):
-                return state, round(time.monotonic() - started, 3), False
+                return state, round(time.monotonic() - started, 3)
             time.sleep(min(interval, max(0, deadline - time.monotonic())))
-        return state, None, False
+        return state, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        polled = list(pool.map(poll, nodes))
-    for node, (state, settled_at, cut) in zip(nodes, polled):
-        last[node["name"]] = state
-        run_elapsed = run_elapsed or cut
-        if state == IN_POOL:
-            in_pool[node["name"]] = settled_at
-        elif state == IN_CHAIN:
-            after_mined[node["name"]] = settled_at
+    in_mempool: dict[str, float] = {}
+    in_block: dict[str, float] = {}
+    last: dict[str, str | None] = {}
+    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        for node, (state, elapsed) in zip(nodes, pool.map(poll, nodes)):
+            last[node["name"]] = state
+            if state == IN_POOL:
+                in_mempool[node["name"]] = elapsed
+            elif state == IN_CHAIN:
+                in_block[node["name"]] = elapsed
     # A window the run's deadline or a stop cut short gave no node its full
     # time, so no absence in it is a miss.
-    cut_short = STOP or run_elapsed or deadline < window_end
+    cut_short = STOP or deadline < window_end
     unobserved = [
         node["name"]
         for node in nodes
-        if node["name"] not in in_pool
-        and node["name"] not in after_mined
+        if node["name"] not in in_mempool
+        and node["name"] not in in_block
         and (cut_short or last.get(node["name"]) != ABSENT)
     ]
-    return in_pool, after_mined, unobserved
+    return in_mempool, in_block, unobserved
 
 
 def mined_state(nodes: list[dict], txid: str) -> tuple[int | None, int]:
@@ -622,7 +611,7 @@ def main() -> int:
                 node, args.amount, run_deadline=run_deadline
             )
             submitted_txids.append(txid)
-            seen, seen_after_mined, unobserved = first_seen_matrix(
+            seen, seen_in_block, unobserved = first_seen_matrix(
                 nodes,
                 txid,
                 duration=args.matrix_secs,
@@ -634,7 +623,7 @@ def main() -> int:
                 candidate["name"]
                 for candidate in nodes
                 if candidate["name"] not in seen
-                and candidate["name"] not in seen_after_mined
+                and candidate["name"] not in seen_in_block
                 and candidate["name"] not in unobserved
             ]
             log_event(
@@ -648,12 +637,12 @@ def main() -> int:
                     "inventory_pre": before,
                     "inventory_post": after,
                     "first_seen": seen,
-                    "seen_after_mined": seen_after_mined,
+                    "seen_in_block": seen_in_block,
                     "unobserved": unobserved,
                     "missing": missing,
-                    "seen_count": len(seen),
-                    "seen_all": len(seen) == len(nodes),
-                    "inconclusive": bool(seen_after_mined or unobserved) and not missing,
+                    "seen_count": len(seen) + len(seen_in_block),
+                    "seen_all": not missing and not unobserved,
+                    "inconclusive": bool(unobserved) and not missing,
                     "send_secs": round(time.monotonic() - started, 3),
                     "wait_block": args.wait_block,
                 }

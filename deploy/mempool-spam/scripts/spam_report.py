@@ -40,6 +40,7 @@ def build_report(events: list[dict]) -> dict:
     }
     node_names = list(start.get("nodes", []))
     missed_by_node: Counter[str] = Counter()
+    block_first_by_node: Counter[str] = Counter()
     spreads = []
     by_submit: dict[str, Counter[str]] = defaultdict(Counter)
     by_impl: dict[str, Counter[str]] = defaultdict(Counter)
@@ -49,19 +50,28 @@ def build_report(events: list[dict]) -> dict:
         tx["mined_height"] = drain.get("mined_height")
         tx["confirmations"] = drain.get("confirmations", 0)
         tx["mined"] = tx["confirmations"] > 0
-        if "seen_after_mined" in tx:
+        in_mempool = tx.get("first_seen", {})
+        in_block = tx.get("seen_in_block", {})
+        if "unobserved" in tx:
             missing = tx.get("missing", [])
+            tx["mempool_all"] = bool(node_names) and all(
+                name in in_mempool for name in node_names
+            )
         else:
-            # Logged before a pool sighting was told apart from one after
-            # mining, or a definite absence from a failed answer. Such a
-            # round proves neither that every pool held the transaction nor
-            # that any missed it.
+            # Logged before a definite absence was told apart from a failed
+            # answer, or a mempool arrival from a first sighting in a block.
+            # Such a round proves neither that every node held the
+            # transaction nor that any missed it.
             tx["seen_all"] = False
+            tx["mempool_all"] = False
             tx["inconclusive"] = True
             missing = []
         tx["missing"] = missing
         missed_by_node.update(missing)
-        seen_values = list(tx.get("first_seen", {}).values())
+        block_first_by_node.update(in_block.keys())
+        # Spread covers mempool arrivals only. A node that first saw the
+        # transaction in a block says when it was mined, not how gossip did.
+        seen_values = list(in_mempool.values())
         spread = round(max(seen_values) - min(seen_values), 3) if len(seen_values) > 1 else None
         tx["spread_secs"] = spread
         if spread is not None:
@@ -77,8 +87,9 @@ def build_report(events: list[dict]) -> dict:
     summary = {
         "submitted": len(submitted),
         "seen_all": sum(bool(tx.get("seen_all")) for tx in submitted),
-        # A round where a node only showed the transaction after it was mined
-        # neither passes nor misses.
+        "mempool_all": sum(tx["mempool_all"] for tx in submitted),
+        # A round where a node's answers never settled whether it held the
+        # transaction neither passes nor misses.
         "inconclusive": sum(bool(tx.get("inconclusive")) for tx in submitted),
         "missed": sum(bool(tx["missing"]) for tx in submitted),
         "mined": sum(tx["mined"] for tx in submitted),
@@ -86,6 +97,7 @@ def build_report(events: list[dict]) -> dict:
         "spread_p50_secs": percentile(spreads, 50),
         "spread_p95_secs": percentile(spreads, 95),
         "missed_by_node": dict(sorted(missed_by_node.items())),
+        "block_first_by_node": dict(sorted(block_first_by_node.items())),
     }
     return {
         "environment": start.get("environment"),
@@ -107,6 +119,7 @@ def markdown(report: dict) -> str:
         f"- Network: `{report.get('network') or 'unknown'}`",
         f"- Submitted: **{summary['submitted']}**",
         f"- Seen on all nodes: **{summary['seen_all']}**",
+        f"- In every mempool: **{summary['mempool_all']}**",
         f"- Inconclusive rounds: **{summary['inconclusive']}**",
         f"- Propagation misses: **{summary['missed']}**",
         f"- Mined after drain: **{summary['mined']}**",
@@ -141,6 +154,13 @@ def markdown(report: dict) -> str:
     if summary["missed_by_node"]:
         lines.extend(
             f"- `{name}`: {count}" for name, count in summary["missed_by_node"].items()
+        )
+    else:
+        lines.append("None.")
+    lines.extend(["", "## First seen in a block, by node", ""])
+    if summary["block_first_by_node"]:
+        lines.extend(
+            f"- `{name}`: {count}" for name, count in summary["block_first_by_node"].items()
         )
     else:
         lines.append("None.")

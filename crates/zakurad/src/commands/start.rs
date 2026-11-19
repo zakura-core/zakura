@@ -385,8 +385,11 @@ impl StartCmd {
     ///
     /// Pruned nodes advertise block service so peers can discover and reconnect to them.
     /// Requests for block bodies outside their retention window still return `notfound`.
+    ///
+    /// Every node advertises [`PeerServices::NODE_BLOCK_PUSH`], because the inbound block
+    /// downloader verifies blocks that peers push without a request.
     fn advertised_services(config: &ZakuradConfig) -> PeerServices {
-        let mut services = PeerServices::NODE_NETWORK;
+        let mut services = PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH;
         if matches!(config.state.storage_mode, StorageMode::Pruned(_)) {
             services |= PeerServices::NODE_PRUNED;
         }
@@ -669,7 +672,8 @@ impl StartCmd {
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,
                 )
-                .with_pending_blocks(pending_blocks.clone()),
+                .with_pending_blocks(pending_blocks.clone())
+                .with_second_block_request(config.network.block_download_score_and_hedge.enabled),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,

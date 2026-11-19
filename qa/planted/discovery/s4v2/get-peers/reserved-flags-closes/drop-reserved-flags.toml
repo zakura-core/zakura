@@ -13,4 +13,3 @@ checks = [
 [typed]
 harness = "discovery/wire"
 scenario = "qa/planted/discovery/s4v2/get-peers/reserved-flags-closes/drop-reserved-flags.scenario.json"
-plan = "qa/planted/discovery/s4v2/get-peers/reserved-flags-closes/drop-reserved-flags.plan.bin"

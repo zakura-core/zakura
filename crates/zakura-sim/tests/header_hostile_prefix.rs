@@ -7,12 +7,10 @@ mod support;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
-use support::{
-    inputs,
-    storage_witnesses::{self, OWNER, TAKER},
-};
+use support::inputs;
 use zakura_header_chain::Frontier;
 use zakura_scheduler::SimInstant;
+use zakura_sim::harness::header_sync::storage_witnesses::{self, OWNER, TAKER};
 use zakura_sim::{
     check::{after_step, NaReason, PropertyOutcome},
     domain::{

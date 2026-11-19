@@ -3,7 +3,7 @@
 # routine charges any refused reservation past `M`. The input's budget
 # covers one body of unknown size, and its routines pause in their
 # handoffs, so other mirrors' requests charge it past `M + 2·B + h·B`.
-input = "crates/zakura-sim/tests/fixtures/block-sync-paused-handoffs.bin"
+seed = "block-sync-paused-handoffs"
 # Besides admission.rs and peer_routine.rs, which the patch changes, the
 # harness drives the rest of block sync and the Zakura transport under it.
 # A change there can move the input off its paused handoffs.

@@ -13,4 +13,3 @@ checks = ["crates/zakura-network/src/zakura/header_sync"]
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-retire-preparing-close.json"
-plan = "crates/zakura-sim/tests/fixtures/header-retire-preparing-close.plan"

@@ -571,7 +571,7 @@ fn committed_book_witness_reaches_each_planted_trigger() {
 
 #[test]
 fn session_trace_separates_stale_results_and_retained_hints() {
-    let steps = trace_discovery_state_bytes(STATE_TRACE_WITNESS);
+    let steps = trace_discovery_state_bytes(DISCOVERY_STATE_WITNESS);
     assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
     let installations = || {
         steps
@@ -647,13 +647,6 @@ fn book_trace_witness() -> Vec<u8> {
     .collect()
 }
 
-/// Installs a current result, rejects a stale result, retains a hint, and reads it.
-const STATE_TRACE_WITNESS: &[u8] = &[
-    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
-    7, 0, 0, 40, 8, 0, 0, 0, // Peer 0 disconnects while peer 1's `Hello` installs.
-    3, 0, 1, 0, 0, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0,
-];
-
 #[test]
 #[should_panic(expected = "discovery/record-book")]
 fn discovery_book_witness_rejects_unearned_confirmation() {
@@ -673,32 +666,38 @@ fn discovery_book_witness_rejects_extra_dial_failure() {
 #[test]
 #[should_panic(expected = "discovery/session-installation")]
 fn discovery_state_witness_rejects_lost_admission() {
-    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, sessions| {
-        if let Some((conn, id, _)) = sessions.admitted[0] {
-            state.remove_session(&session(0, conn, id));
-        }
-    });
+    run_state(
+        decode_state_v2(DISCOVERY_STATE_WITNESS),
+        |state, sessions| {
+            if let Some((conn, id, _)) = sessions.admitted[0] {
+                state.remove_session(&session(0, conn, id));
+            }
+        },
+    );
 }
 
 #[test]
 #[should_panic(expected = "discovery/session-installation")]
 fn discovery_state_witness_rejects_unearned_service_hint() {
-    run_state(decode_state_v2(STATE_TRACE_WITNESS), |state, sessions| {
-        if sessions.connected[0] {
-            if let Some((conn, id, _)) = sessions.admitted[0] {
-                let verified = VerifiedRecord::verify(hello(0), &context(START))
-                    .expect("fixture is authentic");
-                state
-                    .install_session_record(
-                        &session(0, conn, id),
-                        verified,
-                        None,
-                        &[],
-                        START,
-                        &mut Vec::new(),
-                    )
-                    .expect("session is current");
+    run_state(
+        decode_state_v2(DISCOVERY_STATE_WITNESS),
+        |state, sessions| {
+            if sessions.connected[0] {
+                if let Some((conn, id, _)) = sessions.admitted[0] {
+                    let verified = VerifiedRecord::verify(hello(0), &context(START))
+                        .expect("fixture is authentic");
+                    state
+                        .install_session_record(
+                            &session(0, conn, id),
+                            verified,
+                            None,
+                            &[],
+                            START,
+                            &mut Vec::new(),
+                        )
+                        .expect("session is current");
+                }
             }
-        }
-    });
+        },
+    );
 }

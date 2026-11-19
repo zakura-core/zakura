@@ -21,11 +21,12 @@ pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 512;
 /// expired rather than unclaimed.
 const ANNOUNCEMENT_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
 
-/// The receipt order and time of a block's first announcement.
+/// Receipt order, time and highest verified tip at the block's first legacy announcement.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct Announcement {
     pub(super) order: u64,
     pub(super) seen_at: Instant,
+    pub(super) tip_at_announcement: block::Height,
 }
 
 /// First announcements by block hash, bounded by [`MAX_ANNOUNCED_BLOCKS`].
@@ -38,7 +39,12 @@ impl Announcements {
     /// Records `hash` as first announced at `now`, unless it already has an announcement.
     ///
     /// Returns `false` if the store is full of unexpired announcements and refused `hash`.
-    pub(super) fn note(&mut self, hash: block::Hash, now: Instant) -> bool {
+    pub(super) fn note(
+        &mut self,
+        hash: block::Hash,
+        tip_at_announcement: block::Height,
+        now: Instant,
+    ) -> bool {
         if self.0.contains_key(&hash) {
             return true;
         }
@@ -53,6 +59,7 @@ impl Announcements {
             Announcement {
                 order: order::next(),
                 seen_at: now,
+                tip_at_announcement,
             },
         );
         true

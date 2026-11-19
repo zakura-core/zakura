@@ -42,7 +42,9 @@ The reservation is called a claim. Five rules define it:
   block's discovery. And receipt order is only compared between fully
   validated, committed blocks, so a fake or stale hash cannot help any block.
   The `inv` carries no height, so the body's coinbase height must be one or two
-  blocks above the verified tip, the same window header claims use. On a node
+  blocks above the highest verified tip seen at the first announcement. A rival
+  can reach that height first and still lose the tie. The claim stops applying
+  once the highest verified tip passes the body's height. On a node
   without native header sync, the best chain tip at `inv` time stands in for
   the verified tip.
 - **Each block keeps its first claim of each kind, and neither is renewed.** A

@@ -29,6 +29,9 @@ fn a_body_inside_its_inv_deadline_outranks_a_rival_announced_later() {
     announce(&claims, hash(2), rival_at);
     let rival = body_order(&claims, hash(2), 0, rival_at);
 
+    // After the rival commits, another peer announces it at the new tip.
+    claims.note_announcement_at(hash(2), CLAIMED, rival_at);
+
     let at_the_bound = now + CLAIM_BODY_DEADLINE;
     assert_eq!(
         used(&claims, hash(1), CLAIMED, at_the_bound),
@@ -74,6 +77,21 @@ fn an_inv_claims_only_bodies_just_above_the_verified_tip() {
     for height in [101, 102].map(block::Height) {
         assert!(used(&claims, hash(1), height, now).is_some());
     }
+}
+
+#[test]
+fn advancing_the_tip_cannot_make_an_out_of_range_announcement_eligible() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    announce(&claims, hash(1), now);
+
+    // A duplicate sees a newer tip. Height 103 was three ahead at the first announcement.
+    claims.note_announcement_at(hash(1), block::Height(101), now);
+    assert_eq!(used(&claims, hash(1), block::Height(103), now), None);
+
+    // Once the tip passes height 101, a tie there can no longer be decided.
+    claims.note_announcement_at(hash(2), block::Height(102), now);
+    assert_eq!(used(&claims, hash(1), CLAIMED, now), None);
 }
 
 #[test]

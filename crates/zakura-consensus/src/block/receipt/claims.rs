@@ -103,6 +103,11 @@ impl Default for ClaimTable {
     }
 }
 
+/// Whether a block was close enough above the verified tip when first announced.
+fn in_claim_window(height: block::Height, tip_at_announcement: block::Height) -> bool {
+    (1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - tip_at_announcement))
+}
+
 impl ClaimTable {
     /// Raises the floor to `verified_tip`, dropping the claims and mined blocks below it.
     fn raise_floor(&mut self, verified_tip: block::Height) {
@@ -110,11 +115,6 @@ impl ClaimTable {
         let floor = self.floor;
         self.by_hash.retain(|_, claim| claim.height >= floor);
         self.mined.retain(|_, mined| mined.height >= floor);
-    }
-
-    /// Whether a block at `height` is close enough above the floor to be claimed.
-    fn is_claimable(&self, height: block::Height) -> bool {
-        (1..=MAX_CLAIM_HEIGHT_ABOVE_TIP).contains(&(height - self.floor))
     }
 
     /// Whether a mined block other than `hash` outranks a claim on `order` at `height`.
@@ -139,10 +139,10 @@ impl ClaimTable {
             seen_at: claim.seen_at,
         });
         let inv = height
-            .filter(|height| self.is_claimable(*height))
+            .filter(|height| *height >= self.floor)
             .and_then(|height| {
                 let announced = self.announced.get(hash)?;
-                Some(Candidate {
+                in_claim_window(height, announced.tip_at_announcement).then_some(Candidate {
                     source: ClaimSource::Inv,
                     height,
                     order: announced.order,
@@ -320,7 +320,7 @@ impl AnnouncementClaims {
         let mut covered = Vec::new();
         let mut refused: u64 = 0;
         for (hash, height) in headers {
-            if !table.is_claimable(height) {
+            if !in_claim_window(height, table.floor) {
                 continue;
             }
             if let Some(claim) = table.by_hash.get_mut(&hash) {
@@ -361,7 +361,8 @@ impl AnnouncementClaims {
     ///
     /// A block that already has a header claim or an announcement keeps it, so announcing a block
     /// again never renews its claim. The body later takes the announcement's order only if it
-    /// arrives within the deadline and is one or two blocks above the verified tip.
+    /// arrives within the deadline, its height was one or two above the tip at announcement,
+    /// and the highest tip seen since then has not passed that height.
     ///
     /// No header check is needed here: a valid block hash cannot exist before its proof of work,
     /// and the order only ranks a block after it is fully verified.
@@ -380,7 +381,8 @@ impl AnnouncementClaims {
         if table.by_hash.contains_key(&hash) {
             return;
         }
-        let noted = table.announced.note(hash, now);
+        let tip_at_announcement = table.floor;
+        let noted = table.announced.note(hash, tip_at_announcement, now);
         drop(table);
 
         if !noted {

@@ -229,9 +229,10 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-All Mainnet Linux nodes, including `asia-hedged` and `asia-scored`, use the
-selected deployment ref. Operators enable block download scoring and hedging in
-each node's own config, including the separately deployed Mac verifier:
+Mainnet Linux nodes use the selected deployment ref except for `asia-scored`,
+which stays pinned to the build that supports its experiment config. Operators
+enable scoring and hedging in the other nodes' configs, including the separately
+deployed Mac verifier:
 
 ```toml
 [network.block_download_score_and_hedge]

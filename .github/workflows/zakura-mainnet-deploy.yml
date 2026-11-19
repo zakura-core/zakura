@@ -518,7 +518,6 @@ jobs:
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # The former experiment nodes now run the selected fleet build.
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
@@ -531,7 +530,8 @@ jobs:
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "${REF}"
+          # Keep the build that supports this node's hand-written experiment config.
+          commit     = "2063d360d69ce2ffdced871c6e06bf7b0c2bf394"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF

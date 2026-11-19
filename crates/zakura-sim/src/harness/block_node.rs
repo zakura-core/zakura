@@ -84,7 +84,7 @@ use self::{
 use super::header_node::LINK_DEPTH;
 use crate::{
     harness::policy::LinkEffect,
-    observe::{StorageFact, StorageRequest, StorageResult},
+    observe::{BlockSyncFact, StorageFact, StorageRequest, StorageResult},
     storage::{decode_block, BlockStorage, BLOCK_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, Sim,
 };
@@ -369,6 +369,23 @@ impl ActionSource for PolicySource {
         let mut predicates = self.predicates.borrow_mut();
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
+            // A routine's last snapshot ends its session, whether its link
+            // closed or only the session reset.
+            if let Observation::BlockSync {
+                event:
+                    BlockSyncFact::Routine {
+                        connection,
+                        ended: true,
+                        ..
+                    },
+                ..
+            } = &entry.obs
+            {
+                let links = self.effects.links.borrow();
+                if let Some(link) = links.iter().find(|link| link.conn_id == *connection) {
+                    predicates.record_link(LinkEffect::SessionEnded, &link.peer);
+                }
+            }
             if let Observation::Storage { service, fact, .. } = &entry.obs {
                 if service != BLOCK_SERVICE {
                     continue;

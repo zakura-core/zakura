@@ -48,8 +48,10 @@
 //!
 //! - **Timeout**, armed with the hand-off. The check keeps each ordinary
 //!   round's request deadline itself, from the three events that arm it in
-//!   production: the round's `Started`, each `PageStaged` on it, and its
-//!   apply's `Dispatched`, which follows a successful prepare. Each arm of
+//!   production: the round's `Started`, each continuation's
+//!   `ReservationOpened`, which follows a page that filled the round's
+//!   reservation, and its apply's `Dispatched`, which follows a successful
+//!   prepare. Each arm of
 //!   the owner's round, once ready, is a [`HandoffFact::Armed`]. One made
 //!   while the fixture held obliges, and its obligation the request timeout
 //!   after it expires (see the property). The round's next arm answers it,
@@ -559,7 +561,13 @@ impl Retirement {
                 }
                 PortCall::VctContext { .. } => {}
             },
-            ReactorEvent::PageStaged { request, .. } => self.arm(&request.owner, true),
+            // A page that continues the round rearms its deadline, and the
+            // continuation's reservation follows at once. A page that only
+            // stages headers rearms nothing (#2248).
+            ReactorEvent::ReservationOpened {
+                request: Some(request),
+                ..
+            } => self.arm(&request.owner, true),
             ReactorEvent::Retired { request, .. }
                 if matches!(request.owner, HeaderSyncWorkOwner::Header(_)) =>
             {

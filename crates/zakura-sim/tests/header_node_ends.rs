@@ -1,7 +1,6 @@
 //! hdr-9a: the node's end facts on `header-sync/storage`. The harness
-//! records each environment action where it acts, a link the node's own
-//! service cancels records nothing, and every view-side fact takes the
-//! node's next stamp. A reactor that returns by itself is recorded, not
+//! records each environment action where it acts, a replacement closes no
+//! link, and every view-side fact takes the node's next stamp. A reactor that returns by itself is recorded, not
 //! failed (`tests/header_pairing.rs`).
 #![cfg(zakura_sim)]
 
@@ -135,12 +134,11 @@ fn close_and_relink_steps_record_the_connections_they_end() {
 }
 
 /// A relink that replaces `mirror-0`'s session while its first prepare is
-/// held, without a close step. Under some plans the node's own service
-/// then closes the first link, which the session view sees as
-/// `LinkClosed`. The harness records only its relink: a connection the
-/// node's service cancels records no end.
+/// held, without a close step. The replacement resets only the old session,
+/// so the node's service never closes the first link, and the harness
+/// records only its relink.
 #[test]
-fn a_service_side_close_records_no_end() {
+fn a_replacement_closes_no_link_and_records_only_its_relink() {
     let scenario = StorageScenario {
         policy: Policy {
             holds: vec![Hold {
@@ -158,7 +156,6 @@ fn a_service_side_close_records_no_end() {
         }],
         ..StorageScenario::default()
     };
-    let mut service_closed = 0;
     for input in inputs(16, 256) {
         let ran = run(&scenario, input);
         let first = first_link(&ran.sessions, "mirror-0");
@@ -170,17 +167,15 @@ fn a_service_side_close_records_no_end() {
                 EnvironmentAction::Relink
             )],
         );
-        if ran.sessions.contains(&SessionFact::LinkClosed {
-            peer: "mirror-0".to_owned(),
-            connection: first,
-        }) {
-            service_closed += 1;
-        }
+        assert!(
+            !ran.sessions.contains(&SessionFact::LinkClosed {
+                peer: "mirror-0".to_owned(),
+                connection: first,
+            }),
+            "the replacement closed the first link: {:#?}",
+            ran.sessions
+        );
     }
-    assert!(
-        service_closed > 0,
-        "no plan's service closed the first link"
-    );
 }
 
 /// A churn and a `Relink` of the same mirror overlap, so two relinks can be

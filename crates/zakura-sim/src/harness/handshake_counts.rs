@@ -248,6 +248,7 @@ fn operations(input: &[u8]) -> Vec<u8> {
         _ => {
             for slot in 0..70u8 {
                 let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+                operations.extend([7, NODE_REFILL_MS, 0]);
                 operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
             }
             for slot in 70..94 {
@@ -259,6 +260,12 @@ fn operations(input: &[u8]) -> Vec<u8> {
     operations.extend(input.iter().skip(3).take(1536 - operations.len()));
     operations
 }
+
+/// Milliseconds that refill the node's cadence by at least one token: it
+/// refills 24 tokens a second. A burst that waits this long before each
+/// attempt is never refused for the node's rate, so it reaches the
+/// connection caps.
+const NODE_REFILL_MS: u8 = 42;
 
 /// The cadence refills one token per sixteenth of a second: sixteen nodes
 /// share an address, and each retries once a second.
@@ -622,6 +629,7 @@ mod tests {
         let mut input = Vec::new();
         for slot in 0..70u8 {
             let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+            input.extend([7, NODE_REFILL_MS, 0]);
             input.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
         }
         for slot in 70..94u8 {

@@ -344,8 +344,8 @@ impl Shows {
 
 /// What each witness seed's run shows, by stem, and which [`PLAN_BYTES`]
 /// slice of the [`byte_inputs`] stream is its Plan. Most use slice 16.
-/// The hold, the reconsider, the release and two forks use a slice whose
-/// run orders their overlap that way.
+/// The hold, the reconsider, the release, the release faults and two forks
+/// use a slice whose run orders their overlap that way.
 fn shows(stem: &str) -> (Shows, usize) {
     use std::cmp::Ordering;
     let witness = stem
@@ -375,7 +375,10 @@ fn shows(stem: &str) -> (Shows, usize) {
         .find(|(kind, _, outcome, _)| storage_witnesses::fault_stem(*kind, outcome) == stem)
     {
         let _ = allow;
-        return (Shows::Failed(kind, outcome), 16);
+        // Under slice 16, the plan answers the first release from the
+        // engine rather than with its fault.
+        let slice = if kind == OpKind::Release { 2 } else { 16 };
+        return (Shows::Failed(kind, outcome), slice);
     }
     match witness {
         "reset-locator" => (Shows::HeldAcrossReset(OpKind::Locator), 16),

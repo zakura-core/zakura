@@ -640,10 +640,11 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    fn new(snapshot: EngineSnapshot) -> Self {
+    fn new(anchor: Frontier, snapshot: EngineSnapshot) -> Self {
         record_published_snapshot(&snapshot);
         let (sender, _) = watch::channel(snapshot.clone());
         let (views, _) = watch::channel(CommittedHeaderChainView::new(
+            anchor,
             snapshot,
             zakura_header_chain::BodyWorkEpoch::default(),
         ));
@@ -693,12 +694,13 @@ impl Publisher {
             .push(sender);
     }
 
-    fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect) {
-        self.publish_with_hint_changes(snapshot, effect, Vec::new());
+    fn publish(&self, anchor: Frontier, snapshot: EngineSnapshot, effect: TransitionEffect) {
+        self.publish_with_hint_changes(anchor, snapshot, effect, Vec::new());
     }
 
     fn publish_with_hint_changes(
         &self,
+        anchor: Frontier,
         snapshot: EngineSnapshot,
         effect: TransitionEffect,
         updates: Vec<(
@@ -716,7 +718,7 @@ impl Publisher {
         } else {
             previous_epoch
         };
-        let mut view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        let mut view = CommittedHeaderChainView::new(anchor, snapshot.clone(), body_work_epoch);
         view.body_size_hint_batches = self.views.borrow().body_size_hint_batches.clone();
         view.body_size_hint_revision = if !updates.is_empty() {
             previous_hint_revision
@@ -3050,7 +3052,11 @@ impl HeaderChainRuntime {
             return Err(error);
         }
         memory_swap();
-        self.publisher.publish(current, checkpoint_effect);
+        self.publisher.publish(
+            transition_engine.body_download_anchor(),
+            current,
+            checkpoint_effect,
+        );
         Ok(ApplyResult::Committed)
     }
 
@@ -3659,7 +3665,11 @@ impl HeaderChainRuntime {
             transition_engine.install_committed_transition(transition)?;
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
-            self.publisher.publish(current, transition_effect);
+            self.publisher.publish(
+                transition_engine.body_download_anchor(),
+                current,
+                transition_effect,
+            );
             #[cfg(test)]
             fault(FaultPoint::AfterPublish)?;
             return Ok(ApplyResult::ResourceStalled(receipt));
@@ -3778,8 +3788,12 @@ impl HeaderChainRuntime {
                 ))
             })
             .collect();
-        self.publisher
-            .publish_with_hint_changes(current, transition_effect, updates);
+        self.publisher.publish_with_hint_changes(
+            transition_engine.body_download_anchor(),
+            current,
+            transition_effect,
+            updates,
+        );
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
@@ -4308,14 +4322,14 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(transition_engine.body_download_anchor(), current.clone());
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
-            current: current.clone(),
+            current,
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         drop(writer);
@@ -4394,14 +4408,14 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(transition_engine.body_download_anchor(), current.clone());
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
-            current: current.clone(),
+            current,
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {
@@ -4473,14 +4487,14 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(transition_engine.body_download_anchor(), current.clone());
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
-            current: current.clone(),
+            current,
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {
@@ -4690,14 +4704,14 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(transition_engine.body_download_anchor(), current.clone());
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
-            current: current.clone(),
+            current,
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {

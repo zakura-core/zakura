@@ -201,8 +201,7 @@ impl ReactorState {
     /// Whether the committed verified tip lies off the selected chain at or
     /// above its tip.
     ///
-    /// Such a tip leaves no selected height above the floor, yet only state's
-    /// answer names the common ancestor block sync must reset to.
+    /// Allow a scheduling refresh even when the last missing height is already claimed.
     fn verified_tip_diverged(&self) -> bool {
         self.committed_view.as_ref().is_some_and(|view| {
             let frontiers = view.frontiers;
@@ -930,11 +929,24 @@ impl ReactorProgress {
     }
 
     /// The status this node advertises before body retention applies.
-    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
+    pub(super) fn local_status(
+        &self,
+        config: &ZakuraBlockSyncConfig,
+        committed: Option<&CommittedHeaderChainView>,
+    ) -> BlockSyncStatus {
+        // The node can serve its verified chain even while downloading a competing selected chain.
+        let (servable_high, tip_hash) = committed
+            .filter(|view| view.frontiers.verified_best != view.body_download_anchor)
+            .map_or((self.servable_high, self.servable_hash), |view| {
+                (
+                    view.frontiers.verified_best.height,
+                    view.frontiers.verified_best.hash,
+                )
+            });
         BlockSyncStatus {
             servable_low: block::Height::MIN,
-            servable_high: self.servable_high,
-            tip_hash: self.servable_hash,
+            servable_high,
+            tip_hash,
             max_blocks_per_response: config.advertised_max_blocks_per_response(),
             max_inflight_requests: config.advertised_max_inflight_requests(),
             max_response_bytes: config.advertised_max_response_bytes(),
@@ -1003,12 +1015,12 @@ impl BootstrapGate {
 
 // ---- committed authority ----
 
-/// The verified and finalized frontiers a committed snapshot carries.
-pub(super) fn block_sync_frontiers(snapshot: &EngineSnapshot) -> BlockSyncFrontiers {
+/// Committed progress along the selected path used for scheduling downloads.
+pub(super) fn block_sync_frontiers(view: &CommittedHeaderChainView) -> BlockSyncFrontiers {
     BlockSyncFrontiers {
-        finalized_height: snapshot.frontiers.finalized.height,
-        verified_block_tip: snapshot.frontiers.verified_best.height,
-        verified_block_hash: snapshot.frontiers.verified_best.hash,
+        finalized_height: view.frontiers.finalized.height,
+        verified_block_tip: view.body_download_anchor.height,
+        verified_block_hash: view.body_download_anchor.hash,
     }
 }
 
@@ -1178,17 +1190,17 @@ impl ReactorState {
             None => FrontierUpdate::Initial(frontiers),
             Some(_) if body_work_epoch_changed => FrontierUpdate::Unchanged,
             Some(old)
-                if old.frontiers.verified_best != view.frontiers.verified_best
+                if old.body_download_anchor != view.body_download_anchor
                     || old.frontiers.finalized != view.frontiers.finalized =>
             {
                 debug_assert!(
-                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
-                    "same-epoch verified authority cannot retreat"
+                    view.body_download_anchor.height >= old.body_download_anchor.height,
+                    "same-epoch body download anchor cannot retreat"
                 );
                 debug_assert!(
-                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
-                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
-                    "same-epoch verified authority cannot replace a hash at the same height"
+                    view.body_download_anchor.height != old.body_download_anchor.height
+                        || view.body_download_anchor.hash == old.body_download_anchor.hash,
+                    "same-epoch body download anchor cannot replace a hash at the same height"
                 );
                 FrontierUpdate::Advanced(frontiers)
             }

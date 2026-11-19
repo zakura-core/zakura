@@ -913,8 +913,8 @@ const RETAINED_HINT_BATCHES: usize = 16;
 impl ViewPublisher {
     /// A publisher whose first view is `snapshot` at the first body-work
     /// epoch, as `Publisher::new` builds it.
-    pub(crate) fn new(snapshot: EngineSnapshot) -> Self {
-        let view = CommittedHeaderChainView::new(snapshot, BodyWorkEpoch::default());
+    pub(crate) fn new(anchor: zakura_header_chain::Frontier, snapshot: EngineSnapshot) -> Self {
+        let view = CommittedHeaderChainView::new(anchor, snapshot, BodyWorkEpoch::default());
         let (sender, _) = watch::channel(Some(view.clone()));
         ViewPublisher {
             view,
@@ -944,6 +944,7 @@ impl ViewPublisher {
     /// revision and add a batch. The caller sends the view.
     pub(crate) fn next(
         &mut self,
+        anchor: zakura_header_chain::Frontier,
         snapshot: EngineSnapshot,
         effect: TransitionEffect,
         updates: Vec<(block::Height, block::Hash, BodySizeHint)>,
@@ -956,7 +957,7 @@ impl ViewPublisher {
         } else {
             self.view.body_work_epoch
         };
-        let mut view = CommittedHeaderChainView::new(snapshot, body_work_epoch);
+        let mut view = CommittedHeaderChainView::new(anchor, snapshot, body_work_epoch);
         view.body_size_hint_batches = self.view.body_size_hint_batches.clone();
         view.body_size_hint_revision = self.view.body_size_hint_revision;
         if !updates.is_empty() {

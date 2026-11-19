@@ -160,7 +160,7 @@ impl EnginePort {
                 .expect("a one-node engine is coherent");
         // Production mirrors the current snapshot as soon as it attaches.
         let (selected, _) = watch::channel(Some(engine.snapshot()));
-        let views = ViewPublisher::new(engine.snapshot());
+        let views = ViewPublisher::new(engine.body_download_anchor(), engine.snapshot());
         EnginePort {
             key: AdapterKey::new(),
             config,
@@ -906,7 +906,7 @@ impl EnginePort {
             .install_committed_transition(transition)
             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
         let updates = hint_updates(&engine, hints);
-        self.publish_locked(after, effect, updates);
+        self.publish_locked(engine.body_download_anchor(), after, effect, updates);
         drop(engine);
         Ok(match stalled {
             Some(receipt) => ApplyHeaderTargetOutcome::ResourceStalled(receipt),
@@ -1091,6 +1091,7 @@ impl EnginePort {
     /// meet only each other here, and park.
     fn publish_locked(
         &self,
+        anchor: zakura_header_chain::Frontier,
         snapshot: EngineSnapshot,
         effect: TransitionEffect,
         updates: Vec<(block::Height, block::Hash, BodySizeHint)>,
@@ -1098,7 +1099,7 @@ impl EnginePort {
         let (view, views) = {
             let mut publisher = self.views();
             (
-                publisher.next(snapshot.clone(), effect, updates),
+                publisher.next(anchor, snapshot.clone(), effect, updates),
                 publisher.sender(),
             )
         };

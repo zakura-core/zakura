@@ -1477,7 +1477,7 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
 fn coalesced_replacement_cannot_hide_body_work_epoch() {
     let (_, _, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let publisher = Publisher::new(initial.frontiers.verified_best, initial.clone());
     let subscriber = publisher.subscribe_views();
     assert_eq!(
         subscriber.borrow().body_work_epoch,
@@ -1486,7 +1486,11 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
 
     let mut compatible = initial.clone();
     compatible.state_version = StateVersion::new(initial.state_version.get() + 1);
-    publisher.publish(compatible.clone(), TransitionEffect::none());
+    publisher.publish(
+        compatible.frontiers.verified_best,
+        compatible.clone(),
+        TransitionEffect::none(),
+    );
     assert_eq!(
         publisher.view().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::default()
@@ -1496,11 +1500,19 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
     invalidated.state_version = StateVersion::new(compatible.state_version.get() + 1);
     let mut invalidating_effect = TransitionEffect::none();
     invalidating_effect.body_work = zakura_header_chain::BodyWorkEffect::Invalidated;
-    publisher.publish(invalidated.clone(), invalidating_effect);
+    publisher.publish(
+        invalidated.frontiers.verified_best,
+        invalidated.clone(),
+        invalidating_effect,
+    );
 
     let mut later_extension = invalidated;
     later_extension.state_version = StateVersion::new(later_extension.state_version.get() + 1);
-    publisher.publish(later_extension, TransitionEffect::none());
+    publisher.publish(
+        later_extension.frontiers.verified_best,
+        later_extension,
+        TransitionEffect::none(),
+    );
     assert_eq!(
         subscriber.borrow().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::new(1),
@@ -1508,7 +1520,11 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
     );
 
     let before_resource_stall = publisher.view().body_work_epoch;
-    publisher.publish(publisher.snapshot(), TransitionEffect::resource_stalled());
+    publisher.publish(
+        publisher.view().body_download_anchor,
+        publisher.snapshot(),
+        TransitionEffect::resource_stalled(),
+    );
     assert_eq!(publisher.view().body_work_epoch, before_resource_stall);
 }
 
@@ -1516,15 +1532,23 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
 fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
     let (_, _, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let publisher = Publisher::new(initial.frontiers.verified_best, initial.clone());
 
     let mut first_checkpoint = initial;
     first_checkpoint.state_version = StateVersion::new(first_checkpoint.state_version.get() + 1);
-    publisher.publish(first_checkpoint.clone(), TransitionEffect::none());
+    publisher.publish(
+        first_checkpoint.frontiers.verified_best,
+        first_checkpoint.clone(),
+        TransitionEffect::none(),
+    );
 
     let mut second_checkpoint = first_checkpoint;
     second_checkpoint.state_version = StateVersion::new(second_checkpoint.state_version.get() + 1);
-    publisher.publish(second_checkpoint, TransitionEffect::none());
+    publisher.publish(
+        second_checkpoint.frontiers.verified_best,
+        second_checkpoint,
+        TransitionEffect::none(),
+    );
 
     assert_eq!(
         publisher.view().body_work_epoch,

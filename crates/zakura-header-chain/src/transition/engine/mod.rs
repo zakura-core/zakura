@@ -439,6 +439,11 @@ impl HeaderChainEngine {
         self.metadata.snapshot()
     }
 
+    /// Highest verified block on the selected header chain.
+    pub fn body_download_anchor(&self) -> crate::Frontier {
+        super::common_body_frontier(self.selected_projection(), self.verified_projection())
+    }
+
     /// Return complete engine metadata.
     pub const fn metadata(&self) -> &EngineMetadata {
         &self.metadata

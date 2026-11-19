@@ -266,7 +266,7 @@ fn view_at(
 ) -> CommittedHeaderChainView {
     let mut snapshot = view.snapshot.clone();
     snapshot.frontiers.verified_best = verified_best;
-    CommittedHeaderChainView::new(snapshot, epoch)
+    CommittedHeaderChainView::new(snapshot.frontiers.verified_best, snapshot, epoch)
 }
 
 /// The query ID `id` counts as.

@@ -60,6 +60,7 @@ fn authority_view(generation: u8) -> CommittedHeaderChainView {
         hash: header_hash(VIEW_HEADER_TIP),
     };
     CommittedHeaderChainView::new(
+        frontier,
         EngineSnapshot {
             mode: EngineMode::Integrated,
             state_version: StateVersion::new(1),

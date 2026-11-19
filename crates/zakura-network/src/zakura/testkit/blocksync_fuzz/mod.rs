@@ -91,7 +91,7 @@ pub(crate) async fn run_scenario(
     );
     let (snapshots, committed_views) =
         watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
-            initial,
+            initial.frontiers.verified_best, initial,
             zakura_header_chain::BodyWorkEpoch::default(),
         )));
 
@@ -404,7 +404,7 @@ fn spawn_timeline_driver(
             };
             snapshots
                 .send(Some(zakura_header_chain::CommittedHeaderChainView::new(
-                    current,
+                    current.frontiers.verified_best, current,
                     body_work_epoch,
                 )))
                 .expect("the fuzz reactor keeps its committed-snapshot receiver");

@@ -411,7 +411,8 @@ impl EnginePort {
             }
             let current = transition.snapshot_after_commit().clone();
             engine.install_committed_transition(transition)?;
-            let view = self.publish_locked(current, effect, Vec::new());
+            let view =
+                self.publish_locked(engine.body_download_anchor(), current, effect, Vec::new());
             return Ok(Applied {
                 result: ApplyResult::ResourceStalled(receipt),
                 installed: Some(Installed { effect, view }),
@@ -442,7 +443,7 @@ impl EnginePort {
         engine.install_committed_transition(transition)?;
         memory_swap();
         let updates = hint_updates(engine, hints);
-        let view = self.publish_locked(current, effect, updates);
+        let view = self.publish_locked(engine.body_download_anchor(), current, effect, updates);
         Ok(Applied {
             result: ApplyResult::Committed,
             installed: Some(Installed { effect, view }),

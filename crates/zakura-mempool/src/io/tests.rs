@@ -983,7 +983,7 @@ async fn a_reset_gets_the_pool_back_within_its_share_of_the_slots() {
         while harness
             .handle
             .snapshot()
-            .is_none_or(|snapshot| snapshot.tip != new_tip || snapshot.transactions.len() < POOLED)
+            .is_none_or(|snapshot| snapshot.tip != new_tip || snapshot.len() < POOLED)
         {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

@@ -768,8 +768,10 @@ impl<E: VerifyError> MempoolState<E> {
         self.tip
     }
 
-    /// The pool as a snapshot, for the change log position `last_change`.
-    pub fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
+    /// The pool as a snapshot, for the change log position `last_change`,
+    /// built from scratch, as tests' reference for [`Self::next_snapshot`].
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
         if !self.active {
             return PoolSnapshot::inactive(self.tip, last_change);
         }
@@ -777,6 +779,28 @@ impl<E: VerifyError> MempoolState<E> {
             self.tip,
             last_change,
             self.storage.mining_transactions().cloned().collect(),
+            self.storage.transaction_dependencies().clone(),
+        )
+    }
+
+    /// The snapshot after `changes`, the step's changes, built from
+    /// `previous`, the snapshot published before them. See
+    /// [`PoolSnapshot::after`].
+    pub fn next_snapshot(
+        &self,
+        previous: &PoolSnapshot,
+        changes: &[Change],
+        last_change: ChangeSeq,
+    ) -> PoolSnapshot {
+        if !self.active {
+            return PoolSnapshot::inactive(self.tip, last_change);
+        }
+        previous.after(
+            self.tip,
+            last_change,
+            changes,
+            |id| self.storage.transactions().get(id),
+            self.storage.mining_order().collect(),
             self.storage.transaction_dependencies().clone(),
         )
     }
@@ -866,8 +890,7 @@ impl<E: VerifyError> MempoolState<E> {
         if self.active {
             assert!(
                 snapshot
-                    .transactions
-                    .iter()
+                    .transactions()
                     .eq(self.storage.mining_transactions()),
                 "a snapshot holds the storage's mining transactions, in mining order, with their stamps"
             );

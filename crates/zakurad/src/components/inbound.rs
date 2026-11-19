@@ -401,6 +401,8 @@ pub struct Inbound {
     /// Whether a gossiped block can also be requested from a second announcer expected to
     /// deliver it sooner.
     second_block_request: bool,
+    /// Shares the node's bounded writer for local-submission wait traces.
+    trace: zakura_jsonl_trace::JsonlEventEmitter,
 }
 
 impl Inbound {
@@ -431,6 +433,7 @@ impl Inbound {
             )),
             pending_blocks: PendingBlockRegistry::default(),
             second_block_request: false,
+            trace: zakura_jsonl_trace::JsonlEventEmitter::noop(),
         }
     }
 
@@ -444,6 +447,12 @@ impl Inbound {
     /// deliver it sooner. See `[network.block_download_score_and_hedge] enabled`.
     pub fn with_second_block_request(mut self, enabled: bool) -> Self {
         self.second_block_request = enabled;
+        self
+    }
+
+    /// Records completed local-submission waits using the node's existing trace writer.
+    pub fn with_trace(mut self, trace: zakura_jsonl_trace::JsonlEventEmitter) -> Self {
+        self.trace = trace;
         self
     }
 
@@ -501,7 +510,9 @@ impl Service<zn::Request> for Inbound {
                             latest_chain_tip,
                             network,
                         )
-                        .with_second_block_request(self.second_block_request),
+                        .with_second_block_request(self.second_block_request)
+                        .with_pending_blocks(self.pending_blocks.clone())
+                        .with_trace(self.trace.clone()),
                     );
 
                     result = Ok(());

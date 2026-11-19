@@ -37,7 +37,8 @@ fn the_hook_writes_one_record_per_run_and_nothing_when_unset() {
     // runs it).
     let input = seed::find("discovery-wait-complete")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     let run = || {
         run_harness::<WaitComplete>(
             &Default::default(),

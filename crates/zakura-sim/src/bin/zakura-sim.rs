@@ -306,7 +306,7 @@ mod cli {
                     RecordInput::Input(&input)
                 }
                 (None, Some(seed), None, None, None) => {
-                    input = seed.input;
+                    input = seed.input().to_vec();
                     RecordInput::Input(&input)
                 }
                 (None, None, Some(text), plan_path, None) => {
@@ -674,7 +674,7 @@ mod cli {
         if let Some(out) = &flags.out {
             create(out)?;
             for seed in &report.admitted {
-                write(&out.join(seed.input_sha256()), &seed.input)?;
+                write(&out.join(seed.input_sha256()), seed.input())?;
             }
         }
         for seed in &report.admitted {

@@ -52,44 +52,32 @@ pub(super) fn seeds() -> Vec<Seed> {
             vec![0],
         )
         .witness("discovery/verification-capacity", Expect::Holds),
-        Seed::new(
+        Seed::built(
             "discovery-wait-complete",
             "discovery/wait-complete",
             "crates/zakura-sim/tests/witness.rs",
-            built(&WAIT_COMPLETE, wait_complete_input),
+            || {
+                static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
+                INPUT.get_or_init(wait_complete_input)
+            },
         )
         .witness("discovery/wait-complete-wakes", Expect::Holds),
     ];
     for plan in SavedPlan::ALL {
-        let mut input = plan.tag().to_vec();
-        let seed = |input| {
-            Seed::new(
-                format!("discovery-wire-{}", plan.name()),
-                DiscoveryWire::NAME,
-                "crates/zakura-sim/tests/discovery_wire_lifecycle.rs",
-                input,
-            )
-        };
+        let name = format!("discovery-wire-{}", plan.name());
+        let source = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs";
         seeds.push(match plan {
-            SavedPlan::LateResponse => {
-                input.extend(built(&LATE_RESPONSE, late_response_plan));
-                seed(input).witness("discovery/late-response-admitted", Expect::Holds)
-            }
-            _ => seed(input),
+            SavedPlan::LateResponse => Seed::built(name, DiscoveryWire::NAME, source, || {
+                static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
+                INPUT.get_or_init(|| {
+                    [&SavedPlan::LateResponse.tag()[..], &late_response_plan()].concat()
+                })
+            })
+            .witness("discovery/late-response-admitted", Expect::Holds),
+            _ => Seed::new(name, DiscoveryWire::NAME, source, plan.tag().to_vec()),
         });
     }
     seeds
-}
-
-/// [`wait_complete_input`], once built.
-static WAIT_COMPLETE: OnceLock<Vec<u8>> = OnceLock::new();
-
-/// [`late_response_plan`], once built.
-static LATE_RESPONSE: OnceLock<Vec<u8>> = OnceLock::new();
-
-/// The Plan in `cell`, which `build` builds on the process's first call.
-fn built(cell: &OnceLock<Vec<u8>>, build: fn() -> Vec<u8>) -> Vec<u8> {
-    cell.get_or_init(build).clone()
 }
 
 /// A step's option count, the index it picked, and the index of the option

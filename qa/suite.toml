@@ -76,6 +76,12 @@ timeout-secs = 3600
 
 [[ignored]]
 file = "crates/zakura-sim/tests/block_resource_properties.rs"
+test = "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_resource_properties.rs"
 test = "every_floor_churn_plan_asks_for_the_floor_before_the_reset"
 run = true
 timeout-secs = 1800

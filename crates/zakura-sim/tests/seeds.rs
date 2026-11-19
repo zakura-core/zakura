@@ -112,18 +112,18 @@ fn good() -> Seed {
 /// is rejected.
 #[test]
 fn a_seed_must_fit_its_harness() {
-    let seed = Seed {
-        harness: "no/such-harness".to_owned(),
-        ..good()
-    };
+    let mut seed = good();
+    seed.harness = "no/such-harness".to_owned();
     assert_eq!(
         seed::check(&seed),
         Err(SeedError::UnknownHarness("no/such-harness".to_owned()))
     );
-    let mut seed = seed::find("header-storage-default").expect("the seed is registered");
+    let seed = seed::find("header-storage-default").expect("the seed is registered");
+    let mut input = seed.input().to_vec();
     // Generator 2's prefix, which the current header-storage generator
     // decodes as its fallback scenario.
-    seed.input[0] = 2;
+    input[0] = 2;
+    let seed = Seed::new(seed.name, &seed.harness, &seed.source, input);
     assert_eq!(seed::check(&seed), Err(SeedError::OtherGenerator));
 }
 
@@ -144,10 +144,8 @@ fn bad_witnesses_are_rejected() {
         seed::check(&seed),
         Err(SeedError::DuplicateWitness(property))
     );
-    let seed = Seed {
-        source: " ".to_owned(),
-        ..good()
-    };
+    let mut seed = good();
+    seed.source = " ".to_owned();
     assert_eq!(seed::check(&seed), Err(SeedError::NoSource));
 }
 
@@ -155,11 +153,10 @@ fn bad_witnesses_are_rejected() {
 /// and a known failure must.
 #[test]
 fn witnesses_fit_the_set() {
-    let violated = Seed {
-        witness: Vec::new(),
-        ..good()
-    }
-    .witness(&good().witness[0].property, Expect::Violated);
+    let mut violated = good();
+    let property = violated.witness.remove(0).property;
+    assert!(violated.witness.is_empty());
+    let violated = violated.witness(&property, Expect::Violated);
     for set in [SeedSet::Corpus, SeedSet::Slow] {
         assert_eq!(
             seed::check(&violated.clone().in_set(set)),

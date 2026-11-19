@@ -23,7 +23,8 @@ use zakura_sim::{
 fn input() -> Vec<u8> {
     seed::find("discovery-wait-complete")
         .expect("the seed is registered")
-        .input
+        .input()
+        .to_vec()
 }
 
 /// S4.7's scenario under `input`.

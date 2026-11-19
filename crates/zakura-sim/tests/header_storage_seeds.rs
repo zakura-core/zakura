@@ -57,10 +57,10 @@ fn scenario_seeds_run_clean() {
     assert_eq!(seeds.len(), 10);
     for seed in seeds {
         let name = &seed.name;
-        let plan = seed.input.len() - Storage::SCENARIO_BYTES;
+        let plan = seed.input().len() - Storage::SCENARIO_BYTES;
         assert_eq!(plan, if name == BARE { 0 } else { 1_024 }, "{name}");
-        let scenario = Storage::draw(&seed.input[..Storage::SCENARIO_BYTES]);
-        let run = (entry.run_bytes)(&seed.input, &mut NullSink, None);
+        let scenario = Storage::draw(&seed.input()[..Storage::SCENARIO_BYTES]);
+        let run = (entry.run_bytes)(seed.input(), &mut NullSink, None);
         let report = run
             .report()
             .unwrap_or_else(|| panic!("{name}: {:?}", run.result));
@@ -97,14 +97,14 @@ fn generator_2_inputs_migrate_to_their_seeds() {
     let prefix = Storage::SCENARIO_BYTES;
     for name in MIGRATED {
         let seed = seed::find(name).unwrap_or_else(|| panic!("{name} is registered"));
-        let mut old = seed.input.clone();
+        let mut old = seed.input().to_vec();
         old[0] = OLD_GENERATOR;
         assert_eq!(
             grammar::v2::decode(&old[..prefix]).unwrap(),
-            Storage::draw(&seed.input[..prefix]),
+            Storage::draw(&seed.input()[..prefix]),
             "{name}"
         );
-        assert_eq!(grammar::migrate(&old).unwrap(), seed.input, "{name}");
+        assert_eq!(grammar::migrate(&old).unwrap(), seed.input(), "{name}");
         assert_eq!(
             Storage::draw(&old[..prefix]),
             StorageScenario::default(),

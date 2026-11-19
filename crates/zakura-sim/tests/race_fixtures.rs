@@ -145,7 +145,8 @@ fn saved_plan<F: Fixture>() -> Vec<u8> {
     let name = format!("race-schedule-{}", F::NAME.trim_start_matches("race/"));
     let input = seed::find(&name)
         .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input;
+        .input()
+        .to_vec();
     input[<Race<F> as Subsystem>::SCENARIO_BYTES..].to_vec()
 }
 

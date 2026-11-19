@@ -1196,7 +1196,8 @@ fn a_foreign_storage_failure_replays_exactly() {
 fn block_seed(name: &str) -> Vec<u8> {
     zakura_sim::seed::find(name)
         .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// `block/work-ownership`'s seed.
@@ -1588,7 +1589,8 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
 fn reactor_input() -> Vec<u8> {
     zakura_sim::seed::find("header-reactor-policy")
         .expect("the header reactor's seed is registered")
-        .input
+        .input()
+        .to_vec()
 }
 
 #[test]
@@ -1648,7 +1650,8 @@ fn reactor_machine_records_and_replays_without_transport() {
 fn publisher_input() -> Vec<u8> {
     zakura_sim::seed::find("header-publisher-policy")
         .expect("the header publisher's seed is registered")
-        .input
+        .input()
+        .to_vec()
 }
 
 #[test]

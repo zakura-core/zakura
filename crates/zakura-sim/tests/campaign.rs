@@ -1145,7 +1145,7 @@ fn a_changed_generator_starts_a_new_segment() {
     let seeds: BTreeSet<Digest> = zakura_sim::seed::load(SeedSet::Corpus, Some(SIM))
         .admitted
         .iter()
-        .map(|seed| Digest::of(&seed.input))
+        .map(|seed| Digest::of(seed.input()))
         .collect();
     assert_eq!(inputs(&fixture.store, &manifest.initial_snapshot), seeds);
 }

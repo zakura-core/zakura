@@ -78,7 +78,8 @@ fn book_record(handle: &ZakuraDiscoveryHandle, node: NodeId) -> Option<ZakuraNod
 fn the_peer_record_enters_the_book() {
     let input = seed::find("discovery-wait-complete")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     let spawned = RefCell::new(None);
     let (report, _) = recorded(
         run_config(),

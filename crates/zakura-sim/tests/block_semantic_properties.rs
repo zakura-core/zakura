@@ -12,7 +12,7 @@ use support::inputs;
 use zakura_sim::{
     domain::block_sync_semantic::{
         CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
-        REACTOR_QUERY_LIFECYCLE, SUBMIT_ONLY_REQUESTED,
+        REACTOR_QUERY_LIFECYCLE, STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
     },
     harness::{
         block_node::{
@@ -42,6 +42,11 @@ const STALLED_RESET: &str = "block-sync-stalled-reset";
 /// queue's decoded bytes fill the cap.
 const DECODED_INPUT_STALL: &str = "block-sync-decoded-input-stall";
 
+/// The seed that picks the stale-beside-current scenario: a reset detaches a
+/// held submission, whose late retryable verdict reaches block sync while
+/// the fork's first submission waits in storage.
+const STALE_BESIDE_CURRENT: &str = "block-sync-stale-beside-current";
+
 /// The seed that picks the capacity-release scenario, under a plan where
 /// block sync handles the detached commit's tip before its reply.
 const CAPACITY_FRONTIER_FIRST: &str = "block-sync-capacity-frontier-first";
@@ -50,7 +55,8 @@ const CAPACITY_FRONTIER_FIRST: &str = "block-sync-capacity-frontier-first";
 fn input(name: &str) -> Vec<u8> {
     seed::find(name)
         .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// The scenario and Plan that `zakura-sim record --input` runs for `input`.
@@ -180,6 +186,20 @@ fn the_reset_mid_flight_input_holds_reactor_query_lifecycle() {
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
     assert!(model.reactor_queries.saw_query_at_storage);
+}
+
+/// The stale-beside-current seed's stale verdict releases only its own
+/// submission. With `release-by-height.patch`, it releases the fork's
+/// submission at the same height, which storage still holds, and the same
+/// seed violates the property.
+#[test]
+fn the_stale_beside_current_input_holds_stale_completion_inert() {
+    witnessed(
+        seeded(STALE_BESIDE_CURRENT),
+        STALE_COMPLETION_INERT,
+        Expect::Holds,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset

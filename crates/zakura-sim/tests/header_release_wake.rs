@@ -70,7 +70,8 @@ fn deferred_input() -> Vec<u8> {
 fn seed_input(name: &str) -> Vec<u8> {
     seed::find(name)
         .unwrap_or_else(|| panic!("{name} is registered"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// `input`'s Plan, after its scenario byte.

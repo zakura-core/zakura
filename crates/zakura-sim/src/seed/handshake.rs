@@ -392,7 +392,7 @@ mod tests {
         for (seed, scenario) in wire_seeds() {
             let intended = serde_json::to_value(scenario).expect("scenarios serialize");
             assert_eq!(
-                scenario_sha256(&entry.scenario(&seed.input)),
+                scenario_sha256(&entry.scenario(seed.input())),
                 scenario_sha256(&intended),
                 "{}",
                 seed.name

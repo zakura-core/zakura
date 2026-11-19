@@ -638,7 +638,7 @@ fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
         .map(|witness| (witness.property.as_str(), witness.expect.as_str()))
         .collect();
     assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "violated")]);
-    let (prefix, plan) = seed.input.split_at(SyncWire::SCENARIO_BYTES);
+    let (prefix, plan) = seed.input().split_at(SyncWire::SCENARIO_BYTES);
     let (report, _, _) =
         run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
     assert!(

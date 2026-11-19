@@ -1,0 +1,34 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+index 222e40c12..38b4b0fdc 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+@@ -861,16 +861,21 @@ impl Sequencer {
+         height: block::Height,
+         hash: block::Hash,
+     ) -> bool {
+-        let Some(submission) = self.in_flight_submissions.get(&token) else {
++        // Release the newest submission at the height, whichever owner and
++        // token it has.
++        let _ = (owner, source, token, hash);
++        let Some((&token, submission)) = self
++            .in_flight_submissions
++            .iter()
++            .rev()
++            .find(|(_, submission)| submission.height == height)
++        else {
+             return false;
+         };
+-        if submission.owner != owner
+-            || submission.source != source
+-            || submission.height != height
+-            || submission.hash != hash
+-        {
+-            return false;
+-        }
++        // Keep reading the source this bypass ignores, so the patched build
++        // has no unread field.
++        let _ = submission.source;
++        let hash = submission.hash;
+         let bytes = submission.bytes;
+         let decoded_attributed_memory_bytes = submission.decoded_attributed_memory_bytes;
+         let detached = submission.detached;

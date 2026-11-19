@@ -75,7 +75,8 @@ const SEEDS: [(&str, RepairScenario); 4] = [
 fn seed_input(name: &str) -> Vec<u8> {
     seed::find(name)
         .unwrap_or_else(|| panic!("{name} is registered"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// Each seed's name, fixture and input, in the order of [`SEEDS`].

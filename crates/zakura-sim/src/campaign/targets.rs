@@ -580,11 +580,11 @@ fn check_target(
     }
     let mut files = Vec::new();
     for seed in &loaded.admitted {
-        let digest = sha256(&seed.input);
+        let digest = sha256(seed.input());
         let file = seeds_dir.join(&digest);
-        fs::write(&file, &seed.input)
+        fs::write(&file, seed.input())
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
-        files.push((file, seed.input.len()));
+        files.push((file, seed.input().len()));
         row.seeds.push(SeedFile {
             name: seed.name.clone(),
             sha256: digest,

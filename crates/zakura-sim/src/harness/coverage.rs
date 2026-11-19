@@ -642,7 +642,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "the_handoff_input_holds_payload_inventory_agrees",
+            "the_stalled_reset_seed_holds_payload_inventory_agrees",
         ),
         bypass: Bypass::Planted("lost-payload-release"),
     },
@@ -1331,7 +1331,7 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("skipped-apply"),
     },
     // The stuck floor's witness test is ignored, since one debug run takes
-    // minutes. `cargo xtask planted` runs its committed input unpatched as a
+    // minutes. `cargo xtask planted` runs its seed unpatched as a
     // witness test that expects a hold, before it runs the patch.
     Coverage {
         property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
@@ -1353,7 +1353,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::BUDGET_LEDGERS_AGREE,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "the_handoff_input_holds_budget_ledgers_agree",
+            "the_stalled_reset_seed_holds_budget_ledgers_agree",
         ),
         bypass: Bypass::Planted("handoff-keeps-charge"),
     },

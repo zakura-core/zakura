@@ -542,7 +542,7 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
     let mut sources: Vec<Source<'_>> = report
         .admitted
         .iter()
-        .map(|seed| Source::Input(&seed.input))
+        .map(|seed| Source::Input(seed.input()))
         .collect();
     let carried = previous
         .as_ref()
@@ -585,7 +585,7 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
             admitted: report
                 .admitted
                 .iter()
-                .map(|seed| Digest::of(&seed.input))
+                .map(|seed| Digest::of(seed.input()))
                 .collect(),
         },
         artifacts: options.artifacts,

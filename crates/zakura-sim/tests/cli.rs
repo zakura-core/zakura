@@ -440,7 +440,8 @@ fn seeds_fill_a_corpus() {
     assert!(output.status.success(), "{output:?}");
     let input = zakura_sim::seed::find("discovery-wait-complete")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     let digest: String = Sha256::digest(&input)
         .iter()
         .map(|byte| format!("{byte:02x}"))

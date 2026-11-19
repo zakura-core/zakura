@@ -51,6 +51,14 @@ const PEERS_LEAVE: &str = "block-sync-peers-leave";
 /// charged bodies to the sequencer while storage never answers.
 const STALLED_RESET: &str = "block-sync-stalled-reset";
 
+/// The seed that races two routines for the floor lane in the
+/// paused-handoffs scenario.
+const FLOOR_LANE_RACE: &str = "block-sync-floor-lane-race";
+
+/// The seed that picks the stuck-floor scenario: one mirror withholds
+/// height 3, so the commit window fills.
+const STUCK_FLOOR: &str = "block-sync-stuck-floor";
+
 /// The resource bounds every run that rests judges. Teardown applies only
 /// once every peer leaves.
 const IDS: [&str; 4] = [
@@ -65,7 +73,8 @@ const IDS: [&str; 4] = [
 fn seeded(name: &str) -> WitnessScenario<Storage> {
     let input = seed::find(name)
         .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input;
+        .input()
+        .to_vec();
     let (prefix, plan) = input.split_at(Storage::SCENARIO_BYTES);
     WitnessScenario {
         scenario: Storage::draw(prefix),
@@ -79,6 +88,30 @@ fn seeded(name: &str) -> WitnessScenario<Storage> {
 #[test]
 fn the_paused_handoffs_input_holds_reserved_byte_bound() {
     holds(seeded(PAUSED_HANDOFFS), RESERVED_BYTE_BOUND);
+}
+
+/// The floor-lane race seed holds the reserved bound. The node refuses the
+/// losing routine's take above the floor for capacity. With
+/// `qa/native-mutations/bounds/wide-floor-lane`, that take counts as a
+/// floor request and charges past `M`, and the same seed violates it.
+#[test]
+fn the_floor_lane_race_input_holds_reserved_byte_bound() {
+    let witness = seeded(FLOOR_LANE_RACE);
+    assert_eq!(witness.scenario, BlockScenario::paused_handoffs());
+    holds(witness, RESERVED_BYTE_BOUND);
+}
+
+/// The stuck-floor scenario fills the commit window and holds the retained
+/// bound. The seed runs 1,500,000 steps, which `wide-commit-window.patch`
+/// needs to retain 805 bodies. The window fills within 400,000, so this
+/// test stops there.
+#[test]
+#[ignore = "a debug run takes minutes; `cargo xtask planted` runs the seed unpatched"]
+fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
+    let mut witness = seeded(STUCK_FLOOR);
+    assert_eq!(witness.scenario, BlockScenario::stuck_floor());
+    witness.scenario.steps = Some(400_000);
+    holds(witness, RETAINED_BYTE_BOUND);
 }
 
 /// The production node captures every runtime payload through receipt and

@@ -66,7 +66,7 @@ fn saved() -> BTreeMap<&'static str, Seed> {
             "each schedule is named for its fixture"
         );
         assert_eq!(
-            seed::decode(harness::find(&seed.harness).unwrap(), &seed.input),
+            seed::decode(harness::find(&seed.harness).unwrap(), seed.input()),
             Ok(seed::scenario_sha256(&race)),
             "{}: the planted race on 2 workers",
             seed.name
@@ -95,7 +95,7 @@ fn each_race_has_a_saved_schedule() {
         let dir = TempDir::new().unwrap();
         let (_, result) = record_witness(
             harness::find(name).unwrap(),
-            RecordInput::Input(&seed.input),
+            RecordInput::Input(seed.input()),
             dir.path(),
             &witness.property,
             witness.expect.parse().unwrap(),
@@ -122,7 +122,7 @@ fn record_all(root: &Path) -> BTreeMap<&'static str, Trace> {
             std::fs::create_dir(&dir).unwrap();
             let trace = record(
                 harness::find(name).unwrap(),
-                RecordInput::Input(&seed.input),
+                RecordInput::Input(seed.input()),
                 &dir,
             )
             .unwrap();

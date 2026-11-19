@@ -112,9 +112,19 @@ pub struct Seed {
     /// The property witnesses the seed carries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<SeedWitness>,
-    /// The full fuzz input: the scenario prefix, then the Plan bytes.
+    /// The full fuzz input, or the builder that makes it.
     #[serde(skip)]
-    pub input: Vec<u8>,
+    input: Input,
+}
+
+/// A seed's full fuzz input: the scenario prefix, then the Plan bytes.
+#[derive(Clone, Debug)]
+enum Input {
+    /// Bytes built with the seed.
+    Bytes(Vec<u8>),
+    /// A builder that takes seconds, so it runs only when a caller reads
+    /// the input, and keeps its bytes for the rest of the process.
+    Built(fn() -> &'static [u8]),
 }
 
 impl Seed {
@@ -127,7 +137,30 @@ impl Seed {
             set: SeedSet::Corpus,
             source: source.to_owned(),
             witness: Vec::new(),
-            input,
+            input: Input::Bytes(input),
+        }
+    }
+
+    /// [`Seed::new`] with an input that `build` makes the first time a
+    /// caller reads it, for a builder slow enough that loading another
+    /// harness's seeds shouldn't wait for it.
+    pub fn built(
+        name: impl Into<String>,
+        harness: &str,
+        source: &str,
+        build: fn() -> &'static [u8],
+    ) -> Seed {
+        Seed {
+            input: Input::Built(build),
+            ..Seed::new(name, harness, source, Vec::new())
+        }
+    }
+
+    /// The full fuzz input: the scenario prefix, then the Plan bytes.
+    pub fn input(&self) -> &[u8] {
+        match &self.input {
+            Input::Bytes(bytes) => bytes,
+            Input::Built(build) => build(),
         }
     }
 
@@ -147,7 +180,7 @@ impl Seed {
 
     /// The SHA-256 of [`Seed::input`], in hex, which names it in a corpus.
     pub fn input_sha256(&self) -> String {
-        sha256(&self.input)
+        sha256(self.input())
     }
 
     /// Whether a witness expects its property violated, so the seed fails by
@@ -376,10 +409,10 @@ pub fn from_root(path: &Path) -> PathBuf {
 pub fn check(seed: &Seed) -> Result<(), SeedError> {
     let entry = harness::find(&seed.harness)
         .map_err(|_| SeedError::UnknownHarness(seed.harness.clone()))?;
-    if !entry.accepts_input(&seed.input) {
+    if !entry.accepts_input(seed.input()) {
         return Err(SeedError::OtherGenerator);
     }
-    decode(entry, &seed.input)?;
+    decode(entry, seed.input())?;
     if seed.source.trim().is_empty() {
         return Err(SeedError::NoSource);
     }

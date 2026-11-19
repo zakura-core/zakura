@@ -516,7 +516,8 @@ where
 fn seed(stem: &str) -> Vec<u8> {
     zakura_sim::seed::find(stem)
         .unwrap_or_else(|| panic!("{stem} is registered"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// Plan bytes after a scenario prefix, the same on every call.
@@ -603,7 +604,11 @@ fn witnesses() -> Vec<Witness> {
     // fuzz-12 item 7's witness seeds.
     for witness in zakura_sim::seed::all() {
         if witness.name.starts_with("header-storage-w-") {
-            all.push(drawn("header-sync/storage", &witness.name, witness.input));
+            all.push(drawn(
+                "header-sync/storage",
+                &witness.name,
+                witness.input().to_vec(),
+            ));
         }
     }
     // fuzz-13's saved Plans, each run from its seed.

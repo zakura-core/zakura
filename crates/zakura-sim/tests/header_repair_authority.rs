@@ -62,7 +62,8 @@ fn a_successful_repair_holds_commit_and_reset_properties() {
     for (stem, scenario) in SEEDS {
         let input = seed::find(stem)
             .unwrap_or_else(|| panic!("{stem} is registered"))
-            .input;
+            .input()
+            .to_vec();
         let report = run(stem, scenario, &input);
         for property in [COMMIT_ONLY_AUTHORIZED, RESET_INVALIDATES_WORK] {
             let outcome = report

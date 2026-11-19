@@ -768,7 +768,8 @@ fn seed_input(plan: SavedPlan) -> Vec<u8> {
     let name = format!("header-wire-{}", plan.name());
     seed::find(&name)
         .unwrap_or_else(|| panic!("{name} is registered"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// Runs an input as `zakura-sim record --input` does: its prefix picks the

@@ -603,7 +603,8 @@ fn seed_input_records_and_classifies() {
     let discovery = harness::find("discovery/wait-complete").unwrap();
     let input = zakura_sim::seed::find("discovery-wait-complete")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     let mut sink = MemorySink::default();
     let recorded = (discovery.run_bytes)(&input, &mut sink, None);
     assert_eq!(

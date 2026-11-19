@@ -58,7 +58,8 @@ fn committed() -> Vec<u8> {
     let name = format!("header-wire-{}", SavedPlan::HonestProgress.name());
     seed::find(&name)
         .unwrap_or_else(|| panic!("{name} is registered"))
-        .input
+        .input()
+        .to_vec()
 }
 
 /// The progress seed's Plan, after its two-byte scenario tag.

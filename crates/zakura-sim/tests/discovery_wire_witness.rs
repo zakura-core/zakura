@@ -534,7 +534,8 @@ fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
 fn late_response_admitted_applies_in_its_saved_plan() {
     let input = zakura_sim::seed::find("discovery-wire-late-response")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
     assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
     let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);

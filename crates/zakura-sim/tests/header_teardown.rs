@@ -33,7 +33,8 @@ use zakura_sim::{
 static CLOSE_RELINK_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
     zakura_sim::seed::find("header-storage-close-relink")
         .expect("the seed is registered")
-        .input
+        .input()
+        .to_vec()
 });
 
 /// `header-sync/teardown-returns-baseline` holds on the committed

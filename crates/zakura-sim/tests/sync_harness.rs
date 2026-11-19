@@ -288,7 +288,8 @@ fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
 fn the_stale_body_input_refuses_an_old_epoch_body() {
     let input = seed::find(REORG_STALE_BODY)
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     assert_eq!(
         SyncStorage::draw(&input[..SyncStorage::SCENARIO_BYTES]),
         SavedSync::Reorg.scenario()

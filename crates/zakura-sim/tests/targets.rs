@@ -24,7 +24,7 @@ use zakura_sim::{
         ProcessExit, Worker,
     },
     harness::{HarnessEntry, HARNESSES},
-    seed,
+    seed::{self, SeedSet},
     suite::{SuiteFile, SUITE_FILE},
 };
 
@@ -64,11 +64,6 @@ fn manifest() -> String {
     fs::read_to_string(root().join(FUZZ_PACKAGE).join("Cargo.toml")).unwrap()
 }
 
-/// The committed seeds' directory.
-fn fixtures() -> PathBuf {
-    root().join("crates/zakura-sim/tests/fixtures")
-}
-
 /// Each target's own properties that no seed applies. These targets' seeds
 /// run honest and single-fault scenarios, and the coverage manifest names
 /// the test where each listed property applies, such as a frame-conformance
@@ -77,7 +72,7 @@ fn fixtures() -> PathBuf {
 /// fails the test until it leaves the list, so the list only shrinks.
 ///
 /// `block-sync/capacity-release-wakes` applies only once the commit window
-/// fills, which only the capacity-release seeds in `fixtures/slow-seeds/`
+/// fills, which only the slow-set capacity-release seeds
 /// reach. Those run too long for a fuzz input, so they are outside the
 /// corpus, and their own tests apply the property.
 const UNAPPLIED: &[(&str, &[&str])] = &[
@@ -214,7 +209,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let mut mismatched = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
-        let loaded = seed::load(&[fixtures()], Some(entry.name)).unwrap();
+        let loaded = seed::load(SeedSet::Corpus, Some(entry.name));
         assert!(
             loaded.rejected.is_empty(),
             "{}: {:?}",
@@ -230,11 +225,11 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
         if let Some(max) = max_len(&target.args) {
             for seed in &loaded.admitted {
                 assert!(
-                    seed.input.len() <= max,
+                    seed.input().len() <= max,
                     "{}: -max_len={max} cuts {} ({} bytes)",
                     target.name,
-                    seed.path.display(),
-                    seed.input.len()
+                    seed.name,
+                    seed.input().len()
                 );
             }
         }
@@ -243,8 +238,8 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             .admitted
             .iter()
             .flat_map(|seed| {
-                let (outcome, applied) = run_seed(&mut worker, entry, &seed.input);
-                assert_eq!(outcome, "clean", "{}", seed.path.display());
+                let (outcome, applied) = run_seed(&mut worker, entry, seed.input());
+                assert_eq!(outcome, "clean", "{}", seed.name);
                 applied
             })
             .collect();
@@ -320,8 +315,8 @@ fn declared_targets_are_the_sim_packages() {
 /// storage seeds carry the planted cases that name the close-and-relink and
 /// stale-prepare seeds.
 #[test]
-fn bypasses_follow_their_committed_input() {
-    let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
+fn bypasses_follow_their_seed() {
+    let load = |harness| seed::load(SeedSet::Corpus, Some(harness)).admitted;
     let discovery = bypasses(&root(), &load("discovery/wait-complete")).unwrap();
     assert_eq!(discovery.len(), 1, "{discovery:?}");
     assert_eq!(discovery[0].property, "discovery/wait-complete-wakes");
@@ -581,9 +576,8 @@ fn a_seed_past_max_len_is_unaccounted() {
     assert_eq!(judge(None).0, TargetStatus::Ready);
 }
 
-/// A checkout with this repository's suite and fuzz manifest, and one
-/// seed directory, so `check_targets` stops at each harness's seeds.
-fn checkout(dir: &Path) -> (PathBuf, PathBuf) {
+/// A checkout holding a copy of this repository's suite and fuzz manifest.
+fn checkout(dir: &Path) -> PathBuf {
     let repo = dir.join("repo");
     for file in [
         PathBuf::from(SUITE_FILE),
@@ -592,50 +586,7 @@ fn checkout(dir: &Path) -> (PathBuf, PathBuf) {
         fs::create_dir_all(repo.join(&file).parent().unwrap()).unwrap();
         fs::copy(root().join(&file), repo.join(&file)).unwrap();
     }
-    let fixtures = dir.join("fixtures");
-    fs::create_dir_all(&fixtures).unwrap();
-    (repo, fixtures)
-}
-
-/// An optional seed that fails validation is quarantined, and its row
-/// names it, so no seed drops out of the report unseen. The report on
-/// disk is the one returned.
-#[test]
-fn quarantined_seeds_stay_in_the_report() {
-    use zakura_sim::campaign::{check_targets, Readiness, TargetsOptions, READINESS_FILE};
-    let dir = tempfile::tempdir().unwrap();
-    let (repo, fixtures) = checkout(dir.path());
-    fs::write(fixtures.join("stale.bin"), b"stale").unwrap();
-    fs::write(
-        fixtures.join("stale.toml"),
-        "harness = \"discovery/wait-complete\"\ngenerator = 1\nsha256 = \"00\"\n\
-         scenario_sha256 = \"00\"\nsource = \"a test\"\nrequired = false\n",
-    )
-    .unwrap();
-    let options = TargetsOptions {
-        repo,
-        out: dir.path().join("out"),
-        targets: vec!["discovery_wait_complete".to_owned()],
-        sanitizer: "none".to_owned(),
-        target_dir: dir.path().join("target"),
-        fixtures: vec![fixtures.clone()],
-        child: std::time::Duration::from_secs(1),
-    };
-    let report = check_targets(&options, |_| {}).unwrap();
-    let [row] = report.targets.as_slice() else {
-        panic!("{report:?}")
-    };
-    assert_eq!(row.status, TargetStatus::NoSeeds, "{row:?}");
-    assert_eq!(row.quarantined, [fixtures.join("stale.bin")]);
-    // The check stopped before the build, so the row names no build.
-    assert_eq!(row.build, None);
-    assert!(row
-        .lines()
-        .iter()
-        .any(|line| line.contains("quarantined") && line.contains("stale.bin")));
-    let written: Readiness =
-        serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
-    assert_eq!(written, report);
+    repo
 }
 
 /// The report lists each harness no target runs with its
@@ -645,21 +596,29 @@ fn quarantined_seeds_stay_in_the_report() {
 fn the_report_lists_every_missing_target() {
     use zakura_sim::campaign::{check_targets, Readiness, TargetsOptions, READINESS_FILE};
     let dir = tempfile::tempdir().unwrap();
-    let (repo, fixtures) = checkout(dir.path());
+    let repo = checkout(dir.path());
+    // The copied manifest maps the checked target to no harness, so its row
+    // is unresolved and the check builds nothing.
+    let manifest = repo.join(FUZZ_PACKAGE).join("Cargo.toml");
+    let mapped = fs::read_to_string(&manifest).unwrap().replacen(
+        "discovery_wait_complete = \"discovery/wait-complete\"",
+        "discovery_wait_complete = \"no/such-harness\"",
+        1,
+    );
+    fs::write(&manifest, mapped).unwrap();
     let options = TargetsOptions {
         repo,
         out: dir.path().join("out"),
         targets: vec!["discovery_wait_complete".to_owned()],
         sanitizer: "none".to_owned(),
         target_dir: dir.path().join("target"),
-        fixtures: vec![fixtures],
         child: std::time::Duration::from_secs(1),
     };
     let report = check_targets(&options, |_| {}).unwrap();
     let missing = suite().missing_target;
     assert!(!missing.is_empty(), "{SUITE_FILE} lists missing targets");
     assert_eq!(report.missing_targets, missing);
-    // The one checked target has no seed, so it's the only row not ready.
+    // The one checked target is unresolved, so it's the only row not ready.
     let not_ready: Vec<&str> = report.not_ready().map(|row| row.target.as_str()).collect();
     assert_eq!(not_ready, ["discovery_wait_complete"]);
     let written: Readiness =

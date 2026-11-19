@@ -17,7 +17,8 @@ use zakura_sim::{
 fn counts_trace_replays_with_each_named_rule() {
     let input = seed::find("handshake-counts-owners")
         .expect("the seed is registered")
-        .input;
+        .input()
+        .to_vec();
     (handshake_counts::ENTRY.witness)(
         &(handshake_counts::ENTRY.draw)(&input),
         PlanInput::Bytes(Vec::new()),
@@ -40,7 +41,7 @@ fn counts_trace_replays_with_each_named_rule() {
 
 /// The scenario the `handshake/wire` seed `name` runs.
 fn seeded(name: &str) -> Scenario {
-    Wire::draw(&seed::find(name).expect("the seed is registered").input)
+    Wire::draw(seed::find(name).expect("the seed is registered").input())
 }
 
 fn run(scenario: Scenario) -> zakura_sim::RunReport {

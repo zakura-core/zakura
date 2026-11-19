@@ -31,7 +31,8 @@ use zakura_sim::{
 static STALE_PREPARE_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
     zakura_sim::seed::find("header-storage-stale-prepare")
         .expect("the seed is registered")
-        .input
+        .input()
+        .to_vec()
 });
 
 /// `header-sync/stale-completion-inert` holds on the committed stale-prepare

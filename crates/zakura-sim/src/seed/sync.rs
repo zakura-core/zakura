@@ -76,19 +76,17 @@ const RESET_MID_WRITE_SEED: u64 = 23;
 ///
 /// The steered run takes a few seconds, so the first call runs it and later
 /// calls in the process reuse its bytes.
-fn reset_mid_write() -> Vec<u8> {
+fn reset_mid_write() -> &'static [u8] {
     static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
-    INPUT
-        .get_or_init(|| {
-            let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
-            let ports = SyncWire::prepare(&scenario);
-            let input = Plan::from_fuzz(&xorshift_plan(RESET_MID_WRITE_SEED));
-            let steer = Box::new(WriterLast::default());
-            let (_, plan) = run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
-                .unwrap_or_else(|error| panic!("the steered zakura#2378 run fails: {error}"));
-            [&RESET_MID_WRITE_PREFIX[..], &plan].concat()
-        })
-        .clone()
+    INPUT.get_or_init(|| {
+        let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
+        let ports = SyncWire::prepare(&scenario);
+        let input = Plan::from_fuzz(&xorshift_plan(RESET_MID_WRITE_SEED));
+        let steer = Box::new(WriterLast::default());
+        let (_, plan) = run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
+            .unwrap_or_else(|error| panic!("the steered zakura#2378 run fails: {error}"));
+        [&RESET_MID_WRITE_PREFIX[..], &plan].concat()
+    })
 }
 
 /// Seed `seed`'s Plan bytes: enough xorshift64 output that no `sync/wire`
@@ -232,11 +230,11 @@ pub(super) fn seeds() -> Vec<Seed> {
         .witness(BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
     ];
     // zakura#2378 is open, so the seed fails by design.
-    let known_failure = Seed::new(
+    let known_failure = Seed::built(
         "sync-wire-reset-mid-write",
         SyncWire::NAME,
         WIRE,
-        reset_mid_write(),
+        reset_mid_write,
     )
     .witness(STALLED_SERVICE_ISOLATED, Expect::Violated)
     .in_set(SeedSet::KnownFailure);

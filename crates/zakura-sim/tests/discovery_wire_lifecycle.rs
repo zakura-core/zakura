@@ -61,7 +61,8 @@ fn run(scenario: &WireScenario, plan: &[u8]) -> (RunReport, Vec<String>, NodeHan
 fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
     let input = seed::find(&format!("discovery-wire-{}", plan.name()))
         .expect("each saved Plan has a seed")
-        .input;
+        .input()
+        .to_vec();
     let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
     run(&DiscoveryWire::draw(prefix), plan)
 }

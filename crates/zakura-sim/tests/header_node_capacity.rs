@@ -198,7 +198,8 @@ fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
 static CLOSE_RELINK_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
     zakura_sim::seed::find("header-storage-close-relink")
         .expect("the seed is registered")
-        .input
+        .input()
+        .to_vec()
 });
 
 /// `header-sync/chunk-budget-bound` holds on the committed close-and-relink

@@ -419,7 +419,7 @@ fn witness_seeds_show_their_overlaps() {
     for seed in seeds {
         let stem = &seed.name;
         let shows = shows(stem);
-        let run = (entry.run_bytes)(&seed.input, &mut NullSink, None);
+        let run = (entry.run_bytes)(seed.input(), &mut NullSink, None);
         let report = run
             .report()
             .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));

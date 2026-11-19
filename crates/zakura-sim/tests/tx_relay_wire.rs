@@ -11,8 +11,7 @@ mod support;
 use std::{collections::BTreeSet, sync::Arc};
 
 use support::script::{run_under, Node, OBSERVED};
-use zakura_network::zakura::tx_relay_sim::TX_RELAY_STREAMS;
-use zakura_network::zakura::{CloseOutcome, CloseRow};
+use zakura_network::zakura::{tx_relay_sim::TX_RELAY_STREAMS, CloseOutcome, CloseRow};
 use zakura_sim::{
     domain::tx_relay::{
         lock, SharedRelay, ANNOUNCE_AFTER_ADMISSION, COOLING_BODIES_DROPPED,
@@ -24,7 +23,7 @@ use zakura_sim::{
         run_prepared,
         tx_relay::{
             composed_prefix, read_log, wire_properties, RelayScenario, TxRelayWire, COMPOSED_BYTES,
-            NEUTRAL_WITNESSES, ROW_WITNESSES, STALL_WITNESS,
+            DOMAIN_WITNESSES, NEUTRAL_WITNESSES, ROW_WITNESSES, STALL_WITNESS,
         },
         Subsystem,
     },
@@ -116,83 +115,6 @@ fn answer(chosen: Answer, faults: bool) -> u8 {
     u8::try_from(index).expect("a few answers")
 }
 
-/// Each domain property's named witness.
-fn domain_witnesses() -> Vec<(&'static str, [u8; COMPOSED_BYTES])> {
-    vec![
-        // A pool that takes 2 s to decide holds five bodies at once.
-        (
-            REQUESTS_WITHIN_LIMIT,
-            prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT]),
-        ),
-        // Twenty bodies of the node's, announced, then asked for at once.
-        (
-            SERVING_WITHIN_LIMIT,
-            prefix(0x30, 0, 0, &[WAIT, RelayStep::FetchBurst, WAIT]),
-        ),
-        (
-            PENDING_WITHIN_BOUND,
-            prefix(0, 0x80, 0, &[RelayStep::FillPending, WAIT]),
-        ),
-        (
-            SKIP_SET_WITHIN_BOUND,
-            prefix(0, 0x80, 0, &[RelayStep::FillKnown, WAIT]),
-        ),
-        (
-            REQUESTED_BODIES_ONLY,
-            prefix(0, 0x80, 0, &[RelayStep::UnrequestedTx { tx: 0 }, WAIT]),
-        ),
-        // Bad bodies first, each earning a cooldown, answered a second
-        // apart: the second arrives while its peer cools.
-        (
-            COOLING_BODIES_DROPPED,
-            prefix(0x08, 0x08, 0x10, &[RelayStep::AnnounceAll, WAIT]),
-        ),
-        (STALLED_PEERS_PARKED, STALL_WITNESS()),
-        (
-            HELLO_FIRST,
-            prefix(
-                0,
-                0,
-                0x20,
-                &[
-                    RelayStep::Announce,
-                    RelayStep::Wait { secs: 1 },
-                    RelayStep::Hello,
-                    WAIT,
-                ],
-            ),
-        ),
-        // The peer asks for a body it supplied, which the node never
-        // announces back to it.
-        (
-            NO_PROBE,
-            prefix(
-                0,
-                0,
-                0,
-                &[
-                    RelayStep::AnnounceAll,
-                    WAIT,
-                    RelayStep::Probe { tx: 0 },
-                    WAIT,
-                ],
-            ),
-        ),
-        // Peer 0's bodies, admitted, go to peer 1.
-        (
-            ANNOUNCE_AFTER_ADMISSION,
-            composed_prefix(
-                0,
-                1,
-                0,
-                &[(0, RelayStep::AnnounceAll), (1, WAIT), (1, WAIT)],
-            )
-            .expect("a witness fits the grammar"),
-        ),
-        (FAULT_CLOSE_NAMES_A_BROKEN_ROW, (ROW_WITNESSES[4].witness)()),
-    ]
-}
-
 /// A prefix decodes to the steps it encodes, the encoder refuses a step
 /// that breaks a rule unless byte 1 allows one, a prefix with another
 /// version byte draws the default scenario, and every domain property has
@@ -221,25 +143,81 @@ fn a_prefix_round_trips_its_steps() {
         TxRelayWire::draw(&hostile).peers[0].steps,
         [RelayStep::BadHello]
     );
-    let witnessed: BTreeSet<&str> = domain_witnesses().iter().map(|(id, _)| *id).collect();
+    let witnessed: BTreeSet<&str> = DOMAIN_WITNESSES.iter().map(|(id, _)| *id).collect();
     assert_eq!(witnessed, IDS.into_iter().collect());
     assert_eq!(answer(Answer::Never, false), 2);
 }
 
-/// Each domain property applies in its witness, reaches its trigger and
-/// holds, and the run violates nothing.
+/// Runs domain property `id`'s witness: the property applies, reaches
+/// its trigger and holds, and the run violates nothing.
+fn holds_in_its_witness(id: &str) {
+    let (_, witness) = DOMAIN_WITNESSES
+        .iter()
+        .find(|(witnessed, _)| *witnessed == id)
+        .unwrap_or_else(|| panic!("{id} has a witness"));
+    let (report, evidence) = run(&witness());
+    assert!(held(&report, id), "{id}: {:?}", outcome(&report, id));
+    let triggered = lock(&evidence)
+        .facts
+        .get(id)
+        .is_some_and(|fact| fact.triggered);
+    assert!(triggered, "{id}: its witness never reached its trigger");
+    assert_eq!(violated(&report), Vec::<String>::new(), "{id}");
+}
+
 #[test]
-fn each_domain_property_holds_in_its_witness() {
-    for (id, prefix) in domain_witnesses() {
-        let (report, evidence) = run(&prefix);
-        assert!(held(&report, id), "{id}: {:?}", outcome(&report, id));
-        let triggered = lock(&evidence)
-            .facts
-            .get(id)
-            .is_some_and(|fact| fact.triggered);
-        assert!(triggered, "{id}: its witness never reached its trigger");
-        assert_eq!(violated(&report), Vec::<String>::new(), "{id}");
-    }
+fn requests_within_limit_holds_in_its_witness() {
+    holds_in_its_witness(REQUESTS_WITHIN_LIMIT);
+}
+
+#[test]
+fn serving_within_limit_holds_in_its_witness() {
+    holds_in_its_witness(SERVING_WITHIN_LIMIT);
+}
+
+#[test]
+fn pending_within_bound_holds_in_its_witness() {
+    holds_in_its_witness(PENDING_WITHIN_BOUND);
+}
+
+#[test]
+fn skip_set_within_bound_holds_in_its_witness() {
+    holds_in_its_witness(SKIP_SET_WITHIN_BOUND);
+}
+
+#[test]
+fn requested_bodies_only_holds_in_its_witness() {
+    holds_in_its_witness(REQUESTED_BODIES_ONLY);
+}
+
+#[test]
+fn cooling_bodies_dropped_holds_in_its_witness() {
+    holds_in_its_witness(COOLING_BODIES_DROPPED);
+}
+
+#[test]
+fn stalled_peers_parked_holds_in_its_witness() {
+    holds_in_its_witness(STALLED_PEERS_PARKED);
+}
+
+#[test]
+fn hello_first_holds_in_its_witness() {
+    holds_in_its_witness(HELLO_FIRST);
+}
+
+#[test]
+fn no_probe_holds_in_its_witness() {
+    holds_in_its_witness(NO_PROBE);
+}
+
+#[test]
+fn announce_after_admission_holds_in_its_witness() {
+    holds_in_its_witness(ANNOUNCE_AFTER_ADMISSION);
+}
+
+#[test]
+fn fault_close_names_a_broken_row_holds_in_its_witness() {
+    holds_in_its_witness(FAULT_CLOSE_NAMES_A_BROKEN_ROW);
 }
 
 /// Each fault row's witness closes the connection naming that row, and

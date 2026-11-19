@@ -876,6 +876,83 @@ pub const STALL_WITNESS: Prefix = || {
         .expect("the witness fits its grammar")
 };
 
+/// Peer 0's `steps` under node byte `node`, peers byte `peers` and answer
+/// byte `answer`, with no helper unless `peers` asks for one.
+fn steps_prefix(node: u8, peers: u8, answer: u8, steps: &[RelayStep]) -> [u8; COMPOSED_BYTES] {
+    let steps: Vec<(usize, RelayStep)> = steps.iter().map(|step| (0, *step)).collect();
+    composed_prefix(node, peers, answer, &steps).expect("a witness fits its grammar")
+}
+
+/// Waits ten seconds.
+const WAIT_LONG: RelayStep = RelayStep::Wait { secs: 10 };
+
+/// Each domain property's named witness, in the order
+/// [`crate::domain::tx_relay::IDS`] lists them.
+pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
+    // A pool that takes 2 s to decide holds five bodies at once.
+    (properties::REQUESTS_WITHIN_LIMIT, || {
+        steps_prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT_LONG])
+    }),
+    // Twenty bodies of the node's, announced, then asked for at once.
+    (properties::SERVING_WITHIN_LIMIT, || {
+        steps_prefix(0x30, 0, 0, &[WAIT_LONG, RelayStep::FetchBurst, WAIT_LONG])
+    }),
+    (properties::PENDING_WITHIN_BOUND, || {
+        steps_prefix(0, 0x80, 0, &[RelayStep::FillPending, WAIT_LONG])
+    }),
+    (properties::SKIP_SET_WITHIN_BOUND, || {
+        steps_prefix(0, 0x80, 0, &[RelayStep::FillKnown, WAIT_LONG])
+    }),
+    // A body under another id than the one requested, which the node must
+    // not submit.
+    (properties::REQUESTED_BODIES_ONLY, || {
+        (ROW_WITNESSES[6].witness)()
+    }),
+    // Bad bodies first, each earning a cooldown, answered a second apart:
+    // the second arrives while its peer cools.
+    (properties::COOLING_BODIES_DROPPED, || {
+        steps_prefix(0x08, 0x08, 0x10, &[RelayStep::AnnounceAll, WAIT_LONG])
+    }),
+    (properties::STALLED_PEERS_PARKED, STALL_WITNESS),
+    // An announcement before the peer's `Hello`, which the node holds.
+    (properties::HELLO_FIRST, || {
+        steps_prefix(
+            0,
+            0,
+            0x20,
+            &[RelayStep::Announce, WAIT, RelayStep::Hello, WAIT_LONG],
+        )
+    }),
+    // The peer asks for a body it supplied, which the node never announces
+    // back to it.
+    (properties::NO_PROBE, || {
+        steps_prefix(
+            0,
+            0,
+            0,
+            &[
+                RelayStep::AnnounceAll,
+                WAIT_LONG,
+                RelayStep::Probe { tx: 0 },
+                WAIT_LONG,
+            ],
+        )
+    }),
+    // Peer 0's bodies, admitted, go to peer 1.
+    (properties::ANNOUNCE_AFTER_ADMISSION, || {
+        composed_prefix(
+            0,
+            1,
+            0,
+            &[(0, RelayStep::AnnounceAll), (1, WAIT_LONG), (1, WAIT_LONG)],
+        )
+        .expect("the witness fits its grammar")
+    }),
+    (properties::FAULT_CLOSE_NAMES_A_BROKEN_ROW, || {
+        (ROW_WITNESSES[5].witness)()
+    }),
+];
+
 /// `tx-relay/wire`'s step budget: room for a script of [`COMPOSED_SLOTS`]
 /// steps and a park's three minutes.
 pub const BUDGET: u64 = 400_000;

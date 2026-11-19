@@ -609,6 +609,16 @@ impl RelayEvidence {
         else {
             return;
         };
+        let answers = [
+            CloseRow::RELAY_CLOSE_9,
+            CloseRow::RELAY_CLOSE_10,
+            CloseRow::RELAY_CLOSE_11,
+            CloseRow::RELAY_CLOSE_12,
+        ];
+        if answers.contains(&row) {
+            // The node refused an answer it must not submit.
+            self.trigger(REQUESTED_BODIES_ONLY);
+        }
         let peer = self.conn_peers.get(&connection).copied();
         let broke = peer
             .and_then(|peer| self.broken.get(&peer))

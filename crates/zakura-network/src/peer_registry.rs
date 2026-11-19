@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::task::AtomicWaker;
 use zakura_chain::block;
 
 mod delivery;
@@ -164,6 +165,7 @@ impl PeerRegistry {
                 registry: self.clone(),
                 key,
                 delivery_trace: DeliveryTrace::default(),
+                score_waker: Arc::default(),
             },
         )
     }
@@ -291,6 +293,9 @@ pub(crate) struct PeerRegistryUpdater {
     key: ConnectionKey,
     /// Where this connection's delivery samples are traced.
     delivery_trace: DeliveryTrace,
+    /// The task to wake when a delivery sample is recorded, shared by this updater's clones.
+    /// Empty unless the peer set is holding a second block request that this peer could serve.
+    score_waker: Arc<AtomicWaker>,
 }
 
 impl PeerRegistryUpdater {
@@ -363,6 +368,16 @@ impl PeerRegistryUpdater {
             .expect("an estimate that just recorded a sample has a score");
         self.delivery_trace
             .sample(kind, sample, score_before, score, estimate.weight());
+        self.score_waker.wake();
+    }
+
+    /// Registers the task polling with `cx` to be woken the next time a delivery sample is
+    /// recorded for this connection. Only the last registered task is woken, once.
+    ///
+    /// Register before reading [`Self::delivery_score`], so that a sample recorded between the
+    /// read and the task going to sleep still wakes it.
+    pub(crate) fn notify_when_score_changes(&self, cx: &std::task::Context<'_>) {
+        self.score_waker.register(cx.waker());
     }
 
     /// Traces that the peer announced a block and did not deliver it to a first request, or to a

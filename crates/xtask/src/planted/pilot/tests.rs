@@ -2512,7 +2512,7 @@ fn the_feedback_list_rejects_bad_cases() {
         witness: crate::planted::Witness::Typed {
             harness: "h/one".to_owned(),
             scenario: PathBuf::from("s.json"),
-            plan: PathBuf::from("s.plan"),
+            plan: crate::planted::PlanFile::Bytes(PathBuf::from("s.plan")),
         },
         ..planted.clone()
     };

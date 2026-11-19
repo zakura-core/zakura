@@ -1,0 +1,12 @@
+# The reader skips a page whose header the subscriber's precheck refuses
+# as past its subscription's unspent byte credit, reading and dropping its
+# payload, instead of closing the connection. Its input is the saved
+# over-credit-header Plan, whose adversary sends a page whose declared
+# length is a byte past the byte credit, so
+# `header-sync/s5v9/subscribe-headers/over-credit-closes` is the only ID
+# it breaks.
+# Besides the files the patch changes, the rest of these decide which
+# frames the input's peers send and when the node judges them. A change
+# there can move the input off its frame.
+input = "crates/zakura-sim/tests/fixtures/header-wire-over-credit-header.bin"
+checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

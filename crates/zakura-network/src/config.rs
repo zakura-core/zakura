@@ -49,7 +49,7 @@ use crate::{
     BoxError, PeerSocketAddr,
 };
 
-mod block_source_score;
+mod block_download_score_and_hedge;
 mod cache_dir;
 mod tcp_warmup;
 mod unconditional_peers;
@@ -57,7 +57,7 @@ mod unconditional_peers;
 #[cfg(test)]
 mod tests;
 
-pub use block_source_score::BlockSourceScoreConfig;
+pub use block_download_score_and_hedge::BlockDownloadScoreAndHedgeConfig;
 pub use cache_dir::CacheDir;
 pub use tcp_warmup::TcpWarmupConfig;
 pub use unconditional_peers::{UnconditionalPeerName, UnconditionalPeers};
@@ -508,7 +508,7 @@ pub struct Config {
     pub tcp_warmup: TcpWarmupConfig,
 
     /// Settings for choosing which legacy peer to ask for an announced block.
-    pub block_source_score: BlockSourceScoreConfig,
+    pub block_download_score_and_hedge: BlockDownloadScoreAndHedgeConfig,
 }
 
 impl Config {
@@ -1241,7 +1241,7 @@ impl Default for Config {
             advert_delay: DEFAULT_ADVERT_DELAY,
             push_relayed_blocks: false,
             tcp_warmup: TcpWarmupConfig::default(),
-            block_source_score: BlockSourceScoreConfig::default(),
+            block_download_score_and_hedge: BlockDownloadScoreAndHedgeConfig::default(),
         }
     }
 }
@@ -1471,7 +1471,7 @@ struct DConfig {
     advert_delay_min: Option<de::IgnoredAny>,
     push_relayed_blocks: bool,
     tcp_warmup: TcpWarmupConfig,
-    block_source_score: BlockSourceScoreConfig,
+    block_download_score_and_hedge: BlockDownloadScoreAndHedgeConfig,
 }
 
 impl Default for DConfig {
@@ -1505,7 +1505,7 @@ impl Default for DConfig {
             advert_delay_min: None,
             push_relayed_blocks: config.push_relayed_blocks,
             tcp_warmup: config.tcp_warmup,
-            block_source_score: config.block_source_score,
+            block_download_score_and_hedge: config.block_download_score_and_hedge,
         }
     }
 }
@@ -1583,7 +1583,7 @@ impl From<Config> for DConfig {
             advert_delay,
             push_relayed_blocks,
             tcp_warmup,
-            block_source_score,
+            block_download_score_and_hedge,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1635,7 +1635,7 @@ impl From<Config> for DConfig {
             advert_delay_min: None,
             push_relayed_blocks,
             tcp_warmup,
-            block_source_score,
+            block_download_score_and_hedge,
         }
     }
 }
@@ -1673,7 +1673,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay_min: _,
             push_relayed_blocks,
             tcp_warmup,
-            block_source_score,
+            block_download_score_and_hedge,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1692,7 +1692,6 @@ impl<'de> Deserialize<'de> for Config {
         .map_err(de::Error::custom)?;
         zakura.tx_relay.validate().map_err(de::Error::custom)?;
         tcp_warmup.validate().map_err(de::Error::custom)?;
-        block_source_score.validate().map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1854,7 +1853,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_delay,
             push_relayed_blocks,
             tcp_warmup,
-            block_source_score,
+            block_download_score_and_hedge,
         })
     }
 }

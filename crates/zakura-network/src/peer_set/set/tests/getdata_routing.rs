@@ -1343,13 +1343,13 @@ fn measured_peer(
 }
 
 /// Builds a peer set from `peers`, each of which announced `BLOCK_HASH`, with
-/// `[network.block_source_score]` set to `scored`.
+/// `[network.block_download_score_and_hedge]` set to `scored`.
 async fn peer_set_with_block_advertisers(
     peers: &mut [&mut TestPeer],
     scored: bool,
 ) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
     let mut config = crate::Config::default();
-    config.block_source_score.enabled = scored;
+    config.block_download_score_and_hedge.enabled = scored;
     let (mut peer_set, mut guard) = peer_set_with_peers(peers, config);
     for peer in peers.iter() {
         announce_block(&mut peer_set, &mut guard, peer).await;
@@ -1513,7 +1513,7 @@ async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
     let _other = measured_peer(&mut other, &registry, Some(100));
 
     let mut config = crate::Config::default();
-    config.block_source_score.enabled = true;
+    config.block_download_score_and_hedge.enabled = true;
     let (mut peer_set, mut guard) = peer_set_with_peers(&mut [&mut missing, &mut other], config);
     announce_block(&mut peer_set, &mut guard, &missing).await;
     let response = request_block(&mut peer_set).await;
@@ -1642,13 +1642,12 @@ async fn an_announcer_that_does_not_deliver_a_second_request_is_not_preferred_ne
     assert_eq!(near.written_now().await, None);
 }
 
-/// A peer set with block source scores and second block requests on, built from `peers`.
+/// A peer set with block source scores on, which also sends second block requests, built from `peers`.
 fn peer_set_with_second_requests(
     peers: &mut [&mut TestPeer],
 ) -> (PeerSet<TestDiscover, MockChainTip>, PeerSetGuard) {
     let mut config = crate::Config::default();
-    config.block_source_score.enabled = true;
-    config.block_source_score.second_request = true;
+    config.block_download_score_and_hedge.enabled = true;
     peer_set_with_peers(peers, config)
 }
 

@@ -234,6 +234,7 @@ impl Request {
 const SESSION: u64 = 0;
 
 /// An answer waiting for its hold.
+#[derive(Clone)]
 struct Held {
     due: Instant,
     answer: Answer,

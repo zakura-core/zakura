@@ -305,11 +305,22 @@ impl DiscoveryPeer {
 
     /// Carries out `act`: checks it's ready, builds its frames from the
     /// models' state now, and labels each, failing unless the models give
-    /// the act's frame the act's label.
+    /// the act's frame the act's label. An act that fails puts back the held
+    /// answers it took, so a composed peer that skips it still sends them.
     pub(crate) fn act(&mut self, act: DiscoveryAct) -> Result<Vec<Outgoing>, String> {
         if !self.ready(act) {
             return Err(format!("{}'s precondition doesn't hold", act.name()));
         }
+        let held = self.models.as_ref().map(|models| models.held.clone());
+        let sent = self.act_ready(act);
+        if let (Err(_), Some(models), Some(held)) = (&sent, self.models.as_mut(), held) {
+            models.held = held;
+        }
+        sent
+    }
+
+    /// [`Self::act`] for an `act` that is ready.
+    fn act_ready(&mut self, act: DiscoveryAct) -> Result<Vec<Outgoing>, String> {
         let row = act.row();
         let sent = match act {
             DiscoveryAct::UndeclaredType { message_type } => {

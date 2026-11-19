@@ -1,7 +1,7 @@
 # The full property suite (campaign.md, C1): what the suite runs beyond the
 # harness registry. `cargo xtask sim-suite` joins this file with the
 # registered harnesses and their properties, the coverage manifest, the
-# planted cases under qa/planted/, the committed seeds, the test and fuzz
+# planted cases under qa/planted/, the seed registry, the test and fuzz
 # targets `cargo metadata` reports and their sources, and fails if any of
 # them is missing here. A new harness, fuzz target or ignored test fails
 # the check until this file runs it, excludes it with a reason, or lists it

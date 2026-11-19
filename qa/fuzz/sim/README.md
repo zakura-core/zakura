@@ -25,7 +25,7 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 manual dispatch, and `block_sync_storage` on its seeds alone. That run is a smoke: it shows each target still builds and
 runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
 campaigns. It caches `corpus/<target>/` under the target's name and a digest of
-its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
+its harness's `cargo xtask sim-versions` output, adds the harness's corpus seeds, and replays that corpus in a
 fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
 whose target has no harness or no campaign.
 
@@ -59,36 +59,35 @@ rows pass `-len_control=0`.
   `-max_len=4096`, the input size the grammar is built for, and
   `-len_control=0`. A run takes tens to hundreds of milliseconds, so
   libFuzzer's default length control keeps mutations inside the prefix for
-  hours. Its committed seeds,
-  `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
-  the grammar and carry Plan bytes past the prefix.
+  hours. Its corpus seeds, `header-storage-*`, each use part of the grammar
+  and carry Plan bytes past the prefix.
 - `sync_storage` runs `sync/storage`, header sync and block sync on one
   node over one engine. Its two-byte prefix picks a saved scenario, or the
-  default one, so the target fuzzes each scenario's schedule. Its committed
-  seeds are `crates/zakura-sim/tests/fixtures/sync-storage-*.bin`.
+  default one, so the target fuzzes each scenario's schedule. Its corpus
+  seeds are `sync-storage-*`.
 - `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
   simulated QUIC behind real handlers, so header sync, block sync and
   discovery share each connection. Its two-byte prefix picks a saved
   scenario (`0xFC`), fuzz-13's combined actions (`0xFB`, then a byte of
   actions: the mirrors' fork at one stage of the block pipeline, a
   connection replacement, and a read stall), or the honest scenario. Its
-  committed seeds are `crates/zakura-sim/tests/fixtures/sync-wire-*.bin`.
+  corpus seeds are `sync-wire-*`.
 - `block_sync_storage` runs `block-sync/storage`, a block-sync node on
   controlled block storage with mirror peers. Its two-byte prefix picks a
   saved scenario or the default one. A generated run takes about 96 s and
   needs about 7 GB, so its suite row sets `-rss_limit_mb=8192` and a
   one-second smoke and scheduled campaign. libFuzzer runs the whole corpus
   before it checks `-max_total_time`, so those runs replay the seeds and
-  generate nothing. Long runs search it. Its committed seeds are
-  `crates/zakura-sim/tests/fixtures/block-sync-*.bin`.
+  generate nothing. Long runs search it. Its corpus seeds are
+  `block-sync-*`.
 - `discovery_wire` runs `discovery/wire`, the discovery node behind its
   real transport on simulated QUIC. Its two-byte prefix picks a saved
-  Plan's scenario or the default one. Its committed seeds are
-  `crates/zakura-sim/tests/fixtures/discovery-wire-*.bin`.
+  Plan's scenario or the default one. Its corpus seeds are
+  `discovery-wire-*`.
 - `header_sync_wire` runs `header-sync/wire`, the header-sync node behind
   its real transport on simulated QUIC. Its two-byte prefix picks a saved
-  Plan's scenario or the default one. Its committed seeds are
-  `crates/zakura-sim/tests/fixtures/header-wire-*.bin`.
+  Plan's scenario or the default one. Its corpus seeds are
+  `header-wire-*`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
@@ -403,8 +402,8 @@ would fail its targets out of memory. Each target gets one status:
 - `no-applicable-property`: all of that, except that no seed's run applied
   a property of the harness's own;
 - `unresolved`: the table maps the target to no registered harness;
-- `seeds-rejected`: a required seed of the harness, or a seed whose sidecar
-  doesn't say a registered harness, failed validation;
+- `seeds-rejected`: a seed of the harness, or a seed that names no
+  registered harness, failed validation;
 - `no-seeds`: the harness has no admitted seed;
 - `build-failed`: `cargo fuzz build` failed;
 - `seeds-failed`: the target failed on the seeds, with a panic, a crash, a
@@ -415,9 +414,8 @@ would fail its targets out of memory. Each target gets one status:
   which libFuzzer cuts it to.
 
 It prints each target's status, the harness's own properties that applied
-and those that didn't, the optional seeds it quarantined, and the retained
-bypasses under `qa/planted/` whose input runs on the harness, or that there
-are none. It then prints each harness that no target runs, with the reason
+and those that didn't, and the retained bypasses under `qa/planted/` whose
+seed runs on the harness, or that there are none. It then prints each harness that no target runs, with the reason
 its `[[missing-target]]` row in `qa/suite.toml` gives, so the report
 accounts for every harness. `<dir>/readiness.json` holds the same report,
 with each built target's commit, dirty state and toolchain from its build
@@ -427,9 +425,9 @@ target is `ready`. A missing target doesn't fail it. A seed run shows that a
 target builds and runs its harness. It says nothing about how well the
 target searches.
 
-`cargo xtask planted --targets` runs each retained bypass whose input runs
-on a target's harness, and also confirms the patched input through that
-target in fresh processes, as `sim-minimize` confirms an original: the
+`cargo xtask planted --targets` runs each retained bypass whose seed runs
+on a target's harness, and also confirms the seed's input on the patched
+checkout through that target in fresh processes, as `sim-minimize` confirms an original: the
 patched target must crash with the property alone and name the harness,
 `zakura-sim confirm` must find the property's trigger history, and a fresh
 replay must match Exact. It builds the patched `zakura-sim` and target in
@@ -449,42 +447,31 @@ for each case, which takes hours over the whole catalogue, so the nightly
 
 ## Seeds
 
-Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`
-with a `<name>.toml` sidecar. The sidecar records the harness, the generator
-version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
-the test or plan the seed comes from, and the property witnesses it carries.
-A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
-scenario prefix, such as a saved Plan's tag, that encodes its scenario.
-A seed carried to a new generator with its meaning kept names its source in
-a `[derived_from]` table: the source file's SHA-256 and the generator it was
-built for. The source is kept as `sources/<sha256>.bin` beside the seed, and
-the seed check migrates it again with the harness's own migration, which
-must give the seed's input. The `header-sync/storage` seeds were migrated
-from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
-another generator than its harness's is rejected, even when the harness
-would draw a fallback scenario for it.
+Curated seeds are built in code: the registry, `crates/zakura-sim/src/seed/`,
+builds each seed's full fuzz input from typed fields, a saved scenario's
+tag, or a fixed draw, and names its harness, the test that runs it and the
+property witnesses it carries. No seed is committed as bytes. A planted case
+or a mutation-loop witness names a seed by name.
 
-The seed corpus is the fixture directory's own seeds. Campaigns, `cargo
-xtask sim-targets` and `--out` run each one as an input that passes, so no
-corpus seed carries a witness with `expect = "violated"` or
-`"violated-set"`. A seed that fails by design, such as a pinned repro of an
-open bug, sits in a subdirectory with that witness, and only its own test
-loads it: `known-failures/` holds open-bug repros, and `race-schedules/`
-holds the planted races' violating schedules. The seed tests fail on a
-corpus seed that expects a violation and on a known failure that doesn't.
+Each seed belongs to one set. Campaigns, `cargo xtask sim-targets` and
+`--out` run each `corpus` seed as an input that passes, so no corpus seed
+carries a witness that expects a violation. A seed that fails by design,
+such as a pinned repro of an open bug or a planted race's violating
+schedule, sits in the `known-failure` set with that witness, and only its
+own test runs it. The seed check fails on a corpus seed that expects a
+violation and on a known failure that doesn't.
 
-A seed that runs clean but too long for a fuzz input sits in `slow-seeds/`.
-Each of its runs takes 20 minutes or more in a target's AddressSanitizer
-build, far past a campaign's 30-second input timeout, so the seed would
-fail every campaign's first pass over its corpus. Its own tests and its
-planted case still run it.
+A seed that runs clean but too long for a fuzz input sits in the `slow`
+set. Each of its runs takes 20 minutes or more in a target's
+AddressSanitizer build, far past a campaign's 30-second input timeout, so
+the seed would fail every campaign's first pass over its corpus. Its own
+tests and its planted case still run it.
 
-`cargo xtask sim-seeds` validates every seed against the current generators.
-A required seed that fails, such as one built for an older generator or one
-whose prefix now decodes to another scenario, fails the command with the
-reason. A seed with `required = false` is quarantined instead. With `--sim`
-and `--out`, it writes one harness's admitted seeds into a corpus, each named
-by its SHA-256:
+`cargo xtask sim-seeds` builds and validates one set's seeds against the
+current generators, the corpus by default or the set `--set` names. A seed
+that fails, such as one whose prefix decodes to another scenario, fails the
+command with the reason. With `--sim` and `--out`, it writes one harness's
+admitted seeds into a corpus, each named by its SHA-256:
 
 ```console
 cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/discovery_wait_complete

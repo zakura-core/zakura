@@ -4,9 +4,9 @@ Each patch here plants a bug that a named test detects outside the planted
 runner. The README beside each patch names that test and how to run it.
 
 `cargo xtask planted` reads a case file for every patch under `qa/planted`,
-and the case file names either a committed fuzz input or a typed case: a
-committed scenario and the Plan bytes it runs under, for a scenario the fuzz
-grammar can't encode. These patches have no case file, so they live here.
+and the case file names either a seed of the simulator's registry or a
+typed case: a committed scenario and, optionally, the Plan bytes it runs
+under, for a scenario the fuzz grammar can't encode. These patches have no case file, so they live here.
 
 `cases.json` maps every patch to its package, exact test selector, source,
 and intended assertion. Most cases use library tests. The handoff case uses
@@ -22,7 +22,7 @@ host. `python3 scripts/mutation_inventory.py --loop` checks them.
 With `--generate-runs <n>`, the loop also gives each case generator lanes:
 `zakura-sim generate` searches `n` inputs drawn from each seed of
 `--generate-seeds` for a violation of the case's property, skipping every
-committed input here and under `qa/planted`. Each input starts with one of
+seed's input in the registry. Each input starts with one of
 the harness's scenario families' tags, or none, picked uniformly.
 `--generate-harness` picks the harness, `auto` by default.
 `--generate-harness-runs <harness>=<n>` gives one harness its own count, for

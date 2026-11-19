@@ -268,22 +268,6 @@ fn size_labels_split_at_their_bounds() {
 }
 
 #[test]
-fn concurrent_applies_of_one_header_keep_the_first_reservation() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    let first = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
-    let reserved = claims
-        .claimed_order(hash(1))
-        .expect("the first apply reserved it");
-    let second = claims.begin_at([(hash(1), CLAIMED)], TIP, now + CLAIM_BASE_GRACE);
-
-    // The later apply finishes first. The claim keeps the earlier reservation.
-    second.commit();
-    first.commit();
-    assert_eq!(used(&claims, hash(1), now).order, reserved);
-}
-
-#[test]
 fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
@@ -302,6 +286,17 @@ fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
     // Once accepted, a failed apply of the same header leaves the claim in place.
     drop(claims.begin_at([(hash(1), CLAIMED)], TIP, now));
     assert_eq!(claims.claimed_order(hash(1)), Some(reserved));
+
+    // A later apply that finishes first keeps the earlier reservation too.
+    let earlier = claims.begin_at([(hash(3), CLAIMED)], TIP, now);
+    let reserved = claims
+        .claimed_order(hash(3))
+        .expect("the earlier apply reserved it");
+    claims
+        .begin_at([(hash(3), CLAIMED)], TIP, now + CLAIM_BASE_GRACE)
+        .commit();
+    earlier.commit();
+    assert_eq!(used(&claims, hash(3), now).order, reserved);
 
     // A header no apply succeeds for loses its claim.
     let failing = [
@@ -335,4 +330,41 @@ fn mined_block_records_end_once_the_node_mines_well_above_them() {
         .mark_mined(hash(5), three_above, order::next())
         .keep();
     assert!(!voided());
+}
+
+#[test]
+fn mined_block_records_end_once_the_verified_tip_passes_them() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claims.mark_mined(hash(3), CLAIMED, order::next()).keep();
+
+    // At the verified tip a rival at the mined block's height can still win a tie.
+    claims.begin_at([], CLAIMED, now).commit();
+    assert_eq!(claims.mined_blocks(), 1);
+
+    claims
+        .begin_at([], block::Height(CLAIMED.0 + 1), now)
+        .commit();
+    assert_eq!(claims.mined_blocks(), 0);
+}
+
+#[test]
+fn a_guard_for_a_pruned_record_leaves_a_newer_record_alone() {
+    let claims = AnnouncementClaims::default();
+    let stale = claims.mark_mined(hash(3), CLAIMED, order::next());
+    // Mining well above it prunes the record while its request is still verifying.
+    claims
+        .mark_mined(hash(4), block::Height(CLAIMED.0 + 3), order::next())
+        .keep();
+    let again = claims.mark_mined(hash(3), CLAIMED, order::next());
+    assert_eq!(claims.mined_blocks(), 2);
+
+    drop(stale);
+    assert_eq!(
+        claims.mined_blocks(),
+        2,
+        "the newer record is still verifying"
+    );
+    drop(again);
+    assert_eq!(claims.mined_blocks(), 1);
 }

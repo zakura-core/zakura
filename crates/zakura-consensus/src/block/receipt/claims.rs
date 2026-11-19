@@ -25,7 +25,7 @@ pub(super) const MAX_CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
 pub(super) const CLAIM_BASE_GRACE: Duration = Duration::from_millis(500);
 
 /// The slowest honest body transfer that still keeps a claim, in bytes per second.
-const CLAIM_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+const MIN_HONEST_BODY_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// How far above the verified tip a header can be and still get a claim.
 ///
@@ -46,7 +46,7 @@ pub(super) const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
 pub(super) fn body_deadline(bytes: usize) -> Duration {
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     let transfer =
-        Duration::from_micros(bytes.saturating_mul(1_000_000) / CLAIM_FLOOR_BYTES_PER_SEC);
+        Duration::from_micros(bytes.saturating_mul(1_000_000) / MIN_HONEST_BODY_BYTES_PER_SEC);
     CLAIM_BASE_GRACE
         .saturating_add(transfer)
         .min(MAX_CLAIM_BODY_DEADLINE)
@@ -73,6 +73,9 @@ struct Claim {
 struct MinedBlock {
     height: block::Height,
     order: u64,
+    /// Identifies this record to its guards, so a guard for a pruned record leaves a newer
+    /// record for the same block alone.
+    record: u64,
     /// The requests still verifying this block.
     pending: usize,
     /// Whether a request for this block has verified it.
@@ -89,6 +92,8 @@ struct ClaimTable {
     by_hash: HashMap<block::Hash, Claim>,
     /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
     mined: HashMap<block::Hash, MinedBlock>,
+    /// The id of the next [`MinedBlock`] record.
+    next_record: u64,
 }
 
 impl Default for ClaimTable {
@@ -97,6 +102,7 @@ impl Default for ClaimTable {
             floor: block::Height::MIN,
             by_hash: HashMap::new(),
             mined: HashMap::new(),
+            next_record: 0,
         }
     }
 }
@@ -310,16 +316,23 @@ impl AnnouncementClaims {
         table
             .mined
             .retain(|_, mined| height - mined.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
+        let next_record = table.next_record;
         let mined = table.mined.entry(hash).or_insert(MinedBlock {
             height,
             order,
+            record: next_record,
             pending: 0,
             verified: false,
         });
         mined.pending = mined.pending.saturating_add(1);
+        let record = mined.record;
+        if record == next_record {
+            table.next_record = next_record.wrapping_add(1);
+        }
         MinedGuard {
             claims: self.clone(),
             hash,
+            record,
         }
     }
 
@@ -333,6 +346,12 @@ impl AnnouncementClaims {
     #[cfg(test)]
     pub(super) fn claimed_order(&self, hash: block::Hash) -> Option<u64> {
         self.table().by_hash.get(&hash).map(|claim| claim.order)
+    }
+
+    /// How many mined blocks have a record.
+    #[cfg(test)]
+    pub(super) fn mined_blocks(&self) -> usize {
+        self.table().mined.len()
     }
 
     fn table(&self) -> MutexGuard<'_, ClaimTable> {
@@ -379,12 +398,23 @@ impl Drop for PendingClaims {
 pub(in crate::block) struct MinedGuard {
     claims: AnnouncementClaims,
     hash: block::Hash,
+    record: u64,
+}
+
+impl MinedGuard {
+    /// This guard's record, unless it was pruned.
+    fn record<'a>(&self, table: &'a mut ClaimTable) -> Option<&'a mut MinedBlock> {
+        table
+            .mined
+            .get_mut(&self.hash)
+            .filter(|mined| mined.record == self.record)
+    }
 }
 
 impl MinedGuard {
     /// Keeps the record after this guard is gone, because the mined block verified.
     pub(in crate::block) fn keep(self) {
-        if let Some(mined) = self.claims.table().mined.get_mut(&self.hash) {
+        if let Some(mined) = self.record(&mut self.claims.table()) {
             mined.verified = true;
         }
     }
@@ -393,7 +423,7 @@ impl MinedGuard {
 impl Drop for MinedGuard {
     fn drop(&mut self) {
         let mut table = self.claims.table();
-        let Some(mined) = table.mined.get_mut(&self.hash) else {
+        let Some(mined) = self.record(&mut table) else {
             return;
         };
         mined.pending = mined.pending.saturating_sub(1);

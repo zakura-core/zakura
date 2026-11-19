@@ -207,3 +207,48 @@ fn overlapping_receipts_keep_priority_until_the_last_caller_finishes() {
     assert_eq!(Arc::strong_count(&block), 1);
     assert!(register(&registry, block).order > original_order);
 }
+
+#[test]
+fn claim_outcomes_are_counted_once_per_tracked_receipt() {
+    let claims = AnnouncementClaims::default();
+    let registry = ReceiptRegistry::new(claims.clone());
+    let now = Instant::now();
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    claims
+        .begin_at([(block.hash(), block::Height(1))], block::Height(0), now)
+        .commit();
+    let variant = |count: usize| {
+        let mut variant = block.clone();
+        for _ in 0..count {
+            variant.transactions.push(block.transactions[0].clone());
+        }
+        BlockHandle::from(Arc::new(variant))
+    };
+    let counted = |body: &BlockHandle| {
+        let (receipt, counted) = registry.draw(block.hash(), body, now);
+        (receipt, counted.is_some())
+    };
+
+    let first = variant(0);
+    let (first_receipt, first_counted) = counted(&first);
+    assert!(first_counted, "a newly tracked receipt is counted");
+    let (shared, shared_counted) = counted(&variant(0));
+    assert_eq!(shared.order, first_receipt.order);
+    assert!(
+        !shared_counted,
+        "a shared receipt was counted when it was drawn"
+    );
+
+    let tracked: Vec<_> = (1..MAX_BODIES_PER_HASH)
+        .map(|count| counted(&variant(count)))
+        .collect();
+    assert!(tracked.iter().all(|(_, counted)| *counted));
+    let (untracked, untracked_counted) = counted(&variant(MAX_BODIES_PER_HASH));
+    assert!(untracked.registered.is_none());
+    assert!(
+        !untracked_counted,
+        "a body past the per-hash bound is not counted"
+    );
+}

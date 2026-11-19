@@ -1,0 +1,8 @@
+# The committed fuzz input `discovery-composed-late-request.bin` for `discovery/composed`.
+# A request run whose last requests reach the evidence after the node
+# tore their connection down (seed 4203, run 416).
+harness = "discovery/composed"
+generator = 1
+sha256 = "f635803c9b11e32a5c7cde85321f63a7fced7da8812daa442ea1d5753f22a16f"
+scenario_sha256 = "e619656cb44b897734776a8cb1f5776df71bbd3022b4718e888a530313fe69a6"
+source = "crates/zakura-sim/tests/discovery_composed.rs"

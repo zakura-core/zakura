@@ -1070,6 +1070,19 @@ impl PeerRoutine {
                 if self.accept_unmatched_queued_body(body) {
                     return;
                 }
+                // The block reached the commit pipeline from another source while this
+                // peer's request was in flight, so we withdrew the request. The peer
+                // still sent the block we asked for, so it has made progress and must
+                // not be parked as silent.
+                if height <= self.io.download_floor() {
+                    self.state.record_superseded_body(
+                        Instant::now(),
+                        self.config.effective_liveness_timeout(),
+                    );
+                    self.publish_slot_diagnostics();
+                    metrics::counter!("sync.block.response.superseded_credited").increment(1);
+                    return;
+                }
                 // Local retirement, reorgs and GC change interest, not authority.
                 metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
                 tracing::debug!(

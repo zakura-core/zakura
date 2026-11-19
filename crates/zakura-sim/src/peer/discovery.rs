@@ -663,6 +663,11 @@ impl DiscoveryPeer {
                         model.open_crossed(SESSION);
                     }
                     labels
+                } else if faults.contains(Label::BadContent) {
+                    // The node decodes a request before its serving counts
+                    // it, so a request whose content fails is refused
+                    // before any margin applies.
+                    Labels::NONE
                 } else {
                     model.clone().request_frame(SESSION)
                 }

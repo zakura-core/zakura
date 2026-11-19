@@ -30,6 +30,7 @@ handshake_counts = "handshake/counts"
 block_sync_storage = "block-sync/storage"
 discovery_wire = "discovery/wire"
 discovery_composed = "discovery/composed"
+discovery_spam = "discovery/spam"
 header_sync_wire = "header-sync/wire"
 
 [features]
@@ -196,6 +197,13 @@ bench = false
 [[bin]]
 name = "discovery_composed"
 path = "fuzz_targets/discovery_composed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_spam"
+path = "fuzz_targets/discovery_spam.rs"
 test = false
 doc = false
 bench = false

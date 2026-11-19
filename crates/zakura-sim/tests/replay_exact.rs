@@ -801,6 +801,166 @@ fn planted_host_clock_is_nondeterministic() {
     }
 }
 
+/// One task that sends a payload holding the host clock, eight bytes at a
+/// fixed length: a planted nondeterminism only the payload digest shows.
+struct PlantedPayload {
+    // Kept for the run, so the receiving socket stays bound.
+    _receiver: zakura_quic::sim::SimSocket,
+}
+
+no_view!(PlantedPayload);
+
+impl Subsystem for PlantedPayload {
+    const NAME: &'static str = "test/planted-payload";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// Room for the send and its delivery.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
+    /// Adds the network and spawns the sender.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        let net = zakura_sim::harness::NetScenario::default().net();
+        sim.add_source(Box::new(net.clone()));
+        let addr = |n| std::net::SocketAddr::from(([10, 0, 0, n], 4000));
+        let (a, b) = (
+            net.sim().bind(addr(1)).unwrap(),
+            net.sim().bind(addr(2)).unwrap(),
+        );
+        sim.scheduler().spawn_root("sender", async move {
+            // u128 to u64 keeps the clock's low bits, which change between runs.
+            let payload = (host_nanos() as u64).to_le_bytes();
+            let transmit = zakura_quic::Transmit {
+                destination: addr(2),
+                ecn: None,
+                size: payload.len(),
+                segment_size: None,
+                src_ip: None,
+            };
+            zakura_quic::UdpIo::try_send(&a, &transmit, &payload)
+                .expect("a simulated send never fails");
+        });
+        PlantedPayload { _receiver: b }
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// A host-random payload byte at an unchanged length replays as
+/// nondeterministic, at the step that sent it.
+#[test]
+fn planted_payload_byte_is_nondeterministic() {
+    let payload = entry::<PlantedPayload>();
+    let dir = record(&payload, &[]);
+    let trace = open(dir.path());
+    let sent = first_step(&trace, |step| step.pick.starts_with("task:sender"));
+    std::thread::sleep(Duration::from_micros(10));
+    match replay_with(&trace, &payload, ReplayOptions::default()) {
+        Err(ReplayError::Nondeterministic { step, field }) => {
+            assert_eq!((step, field), (sent, "obs"));
+        }
+        other => panic!("expected Nondeterministic, got {other:?}"),
+    }
+}
+
+/// A source whose setup observation reads the host clock, and which
+/// observes nothing after it.
+struct SetupClock(Cell<bool>);
+
+impl ActionSource for SetupClock {
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {}
+
+    /// Reads the host clock the first time, at setup's step 0.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if !self.0.replace(true) {
+            log.push(Observation::Fake {
+                source: "setup-clock".into(),
+                event: format!("read {}", host_nanos()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut zakura_sim::RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The [`SetupClock`] source and one task, so the run takes a step.
+struct PlantedSetup;
+
+no_view!(PlantedSetup);
+
+impl Subsystem for PlantedSetup {
+    const NAME: &'static str = "test/planted-setup";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// Room for the task.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
+    /// Adds the clock and a task that yields once.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        sim.add_source(Box::new(SetupClock(Cell::new(false))));
+        sim.scheduler().spawn_root("task", async {
+            zakura_rt::task::yield_now().await;
+        });
+        PlantedSetup
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// A changed step 0 observation replays as nondeterministic, through the
+/// digest `init` carries.
+#[test]
+fn changed_setup_observation_is_nondeterministic() {
+    let setup = entry::<PlantedSetup>();
+    let dir = record(&setup, &[]);
+    assert!(
+        open(dir.path()).init.unwrap().obs.is_some(),
+        "a recording digests step 0"
+    );
+    std::thread::sleep(Duration::from_micros(10));
+    match replay_with(&open(dir.path()), &setup, ReplayOptions::default()) {
+        Err(ReplayError::Nondeterministic { step, field }) => {
+            assert_eq!((step, field), (0, "init"));
+        }
+        other => panic!("expected Nondeterministic, got {other:?}"),
+    }
+}
+
 /// How [`Effects`] changes its observations on a later run, so a replay can
 /// show that each change is caught.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1192,7 +1352,18 @@ fn a_foreign_storage_failure_replays_exactly() {
     assert!(report.verified(), "{report:?}");
 }
 
-const WORK_INPUT: &[u8] = include_bytes!("fixtures/block-work-ownership.bin");
+/// Block seed `name`'s op tape.
+fn block_seed(name: &str) -> Vec<u8> {
+    zakura_sim::seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is a registered seed"))
+        .input()
+        .to_vec()
+}
+
+/// `block/work-ownership`'s seed.
+fn work_input() -> Vec<u8> {
+    block_seed("block-work-ownership")
+}
 
 #[test]
 fn work_machine_replay_child() {
@@ -1205,7 +1376,7 @@ fn work_machine_replay_child() {
 
 #[test]
 fn work_machine_records_and_replays_without_transport() {
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     let trace = open(dir.path());
     let entry = harness::find("block/work-ownership").unwrap();
     (entry.witness)(
@@ -1218,7 +1389,7 @@ fn work_machine_records_and_replays_without_transport() {
     )
     .unwrap();
     assert_eq!(trace.steps.len(), 10);
-    assert_eq!(trace.meta.scenario["input"], json!(WORK_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(work_input()));
     assert!(trace
         .steps
         .iter()
@@ -1261,7 +1432,7 @@ fn work_machine_records_and_replays_without_transport() {
 
 #[test]
 fn work_machine_preserves_empty_and_short_inputs() {
-    for input in [&[][..], &[0, 0][..], WORK_INPUT] {
+    for input in [&[][..], &[0, 0][..], &work_input()[..]] {
         let entry = harness::find("block/work-ownership").unwrap();
         let dir = record(entry, input);
         let trace = open(dir.path());
@@ -1281,7 +1452,7 @@ fn work_machine_preserves_empty_and_short_inputs() {
 
 #[test]
 fn work_machine_prefix_and_missing_evidence_never_verify() {
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     edit(dir.path(), |lines| {
         lines.truncate(5);
     });
@@ -1299,7 +1470,7 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
     assert!(!report.complete);
     assert!(report.end.is_none());
 
-    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let dir = record_named("block/work-ownership", &work_input());
     edit(dir.path(), |lines| {
         step(lines, 2).as_object_mut().unwrap().remove("machine");
     });
@@ -1312,9 +1483,15 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
     ));
 }
 
-const FUNDING_INPUT: &[u8] = include_bytes!("fixtures/block-work-funding.bin");
+/// `block/work-funding`'s seed.
+fn funding_input() -> Vec<u8> {
+    block_seed("block-work-funding")
+}
 
-const RETENTION_INPUT: &[u8] = include_bytes!("fixtures/block-decoded-retention.bin");
+/// `block/decoded-retention`'s seed.
+fn retention_input() -> Vec<u8> {
+    block_seed("block-decoded-retention")
+}
 
 #[test]
 fn decoded_retention_replay_child() {
@@ -1323,7 +1500,7 @@ fn decoded_retention_replay_child() {
         assert!(report.verified(), "{report:?}");
         assert_eq!(
             report.end.unwrap().steps,
-            RETENTION_INPUT.len() as u64 / 4 + 1
+            retention_input().len() as u64 / 4 + 1
         );
     }
 }
@@ -1332,7 +1509,7 @@ fn decoded_retention_replay_child() {
 fn decoded_retention_replays_final_holders_in_a_fresh_process() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("block/decoded-retention").unwrap();
-    let dir = record(entry, RETENTION_INPUT);
+    let dir = record(entry, &retention_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1343,9 +1520,9 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.meta.scenario["input"], json!(RETENTION_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(retention_input()));
     assert_eq!(trace.meta.generator, 1);
-    assert_eq!(trace.steps.len(), RETENTION_INPUT.len() / 4 + 1);
+    assert_eq!(trace.steps.len(), retention_input().len() / 4 + 1);
     let Some(MachineStep::DecodedRetention(parts)) = trace.steps[5].machine.as_deref() else {
         panic!("missing allocation reads")
     };
@@ -1402,7 +1579,7 @@ fn decoded_retention_replays_final_holders_in_a_fresh_process() {
 #[test]
 fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
     let entry = harness::find("block/decoded-retention").unwrap();
-    for input in [&[][..], &[0, 0][..], RETENTION_INPUT] {
+    for input in [&[][..], &[0, 0][..], &retention_input()[..]] {
         let dir = record(entry, input);
         let trace = open(dir.path());
         assert_eq!(trace.steps.len(), input.len().div_ceil(4) + 1);
@@ -1433,7 +1610,7 @@ fn work_funding_replay_child() {
         assert!(report.verified(), "{report:?}");
         assert_eq!(
             report.end.unwrap().steps,
-            (FUNDING_INPUT.len() / 4 + 1) as u64
+            (funding_input().len() / 4 + 1) as u64
         );
     }
 }
@@ -1442,7 +1619,7 @@ fn work_funding_replay_child() {
 fn work_funding_records_and_replays_retained_runtime_owners() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("block/work-funding").unwrap();
-    let dir = record(entry, FUNDING_INPUT);
+    let dir = record(entry, &funding_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1453,8 +1630,8 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
-    assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
+    assert_eq!(trace.steps.len(), funding_input().len() / 4 + 1);
+    assert_eq!(trace.meta.scenario["input"], json!(funding_input()));
     assert_eq!(trace.meta.generator, 2);
     assert!(trace
         .steps
@@ -1506,7 +1683,7 @@ fn work_funding_records_and_replays_retained_runtime_owners() {
 #[test]
 fn work_funding_preserves_short_inputs_and_observes_drain() {
     let entry = harness::find("block/work-funding").unwrap();
-    for input in [&[][..], &[0, 0][..], FUNDING_INPUT, &[0; 512][..]] {
+    for input in [&[][..], &[0, 0][..], &funding_input()[..], &[0; 512][..]] {
         let dir = record(entry, input);
         let trace = open(dir.path());
         let mut sink = zakura_sim::MemorySink::default();
@@ -1538,7 +1715,7 @@ fn work_funding_preserves_short_inputs_and_observes_drain() {
 
 #[test]
 fn work_funding_missing_evidence_and_drain_cannot_verify() {
-    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    let dir = record_named("block/work-funding", &funding_input());
     edit(dir.path(), |lines| {
         step(lines, 2).as_object_mut().unwrap().remove("machine");
     });
@@ -1549,7 +1726,7 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
             field: "machine"
         })
     ));
-    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    let dir = record_named("block/work-funding", &funding_input());
     edit(dir.path(), |lines| {
         lines.truncate(lines.len() - 2);
     });
@@ -1568,7 +1745,13 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
     assert!(report.end.is_none());
 }
 
-const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/header-reactor-policy.bin");
+/// The `header-reactor-policy` seed's op tape.
+fn reactor_input() -> Vec<u8> {
+    zakura_sim::seed::find("header-reactor-policy")
+        .expect("the header reactor's seed is registered")
+        .input()
+        .to_vec()
+}
 
 #[test]
 fn reactor_machine_replay_child() {
@@ -1580,7 +1763,8 @@ fn reactor_machine_replay_child() {
 
 #[test]
 fn reactor_machine_records_and_replays_without_transport() {
-    let dir = record_named("header/reactor-policy", REACTOR_INPUT);
+    let input = reactor_input();
+    let dir = record_named("header/reactor-policy", &input);
     let trace = open(dir.path());
     let entry = harness::find("header/reactor-policy").unwrap();
     (entry.witness)(
@@ -1592,7 +1776,7 @@ fn reactor_machine_records_and_replays_without_transport() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), REACTOR_INPUT.len().div_ceil(4));
+    assert_eq!(trace.steps.len(), input.len().div_ceil(4));
     assert!(trace
         .steps
         .iter()
@@ -1622,12 +1806,19 @@ fn reactor_machine_records_and_replays_without_transport() {
     ));
 }
 
-const PUBLISHER_INPUT: &[u8] = include_bytes!("fixtures/header-publisher-policy.bin");
+/// The `header-publisher-policy` seed's op tape.
+fn publisher_input() -> Vec<u8> {
+    zakura_sim::seed::find("header-publisher-policy")
+        .expect("the header publisher's seed is registered")
+        .input()
+        .to_vec()
+}
 
 #[test]
 fn publisher_machine_records_and_replays_without_transport() {
     let name = "header/publisher-policy";
-    let dir = record_named(name, PUBLISHER_INPUT);
+    let input = publisher_input();
+    let dir = record_named(name, &input);
     let trace = open(dir.path());
     (harness::find(name).unwrap().witness)(
         &trace.meta.scenario,
@@ -1638,7 +1829,7 @@ fn publisher_machine_records_and_replays_without_transport() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), PUBLISHER_INPUT.len().div_ceil(4));
+    assert_eq!(trace.steps.len(), input.len().div_ceil(4));
     assert!(trace
         .steps
         .iter()
@@ -1660,7 +1851,8 @@ fn publisher_machine_records_and_replays_without_transport() {
 
 #[test]
 fn reactor_machine_preserves_empty_and_short_inputs() {
-    for input in [&[][..], &[0, 0][..], REACTOR_INPUT] {
+    let reactor = reactor_input();
+    for input in [&[][..], &[0, 0][..], &reactor[..]] {
         let entry = harness::find("header/reactor-policy").unwrap();
         let dir = record(entry, input);
         let trace = open(dir.path());
@@ -1677,7 +1869,10 @@ fn reactor_machine_preserves_empty_and_short_inputs() {
     }
 }
 
-const BLOCK_REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
+/// `block/reactor-policy`'s seed.
+fn block_reactor_input() -> Vec<u8> {
+    block_seed("block-reactor-policy")
+}
 
 #[test]
 fn block_reactor_machine_replay_child() {
@@ -1692,7 +1887,7 @@ fn block_reactor_machine_replay_child() {
 fn reactor_machine_records_and_replays_query_identities() {
     use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
     let entry = harness::find("block/reactor-policy").unwrap();
-    let dir = record(entry, BLOCK_REACTOR_INPUT);
+    let dir = record(entry, &block_reactor_input());
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1704,7 +1899,7 @@ fn reactor_machine_records_and_replays_query_identities() {
     )
     .unwrap();
     assert_eq!(trace.steps.len(), 15);
-    assert_eq!(trace.meta.scenario["input"], json!(BLOCK_REACTOR_INPUT));
+    assert_eq!(trace.meta.scenario["input"], json!(block_reactor_input()));
     assert!(trace
         .steps
         .iter()
@@ -1750,50 +1945,6 @@ fn reactor_machine_records_and_replays_query_identities() {
     ));
 }
 
-const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
-
-/// The committed record-book input is the witness `zakura-network` encodes
-/// under the current decoder.
-#[test]
-fn discovery_book_input_is_the_encoded_witness() {
-    assert_eq!(
-        DISCOVERY_BOOK_INPUT,
-        zakura_network::zakura::discovery_book_witness_bytes(),
-        "the committed input changed; regenerate it with regenerate_discovery_book_input if \
-         that's intended"
-    );
-}
-
-/// Rewrites `fixtures/discovery-record-book.{bin,toml}` from the witness
-/// `zakura-network` encodes. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo
-/// test -p zakura-sim --test replay_exact -- --ignored
-/// regenerate_discovery_book_input`.
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_discovery_book_input() {
-    let entry = harness::find("discovery/record-book").unwrap();
-    let input = zakura_network::zakura::discovery_book_witness_bytes();
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-record-book");
-    std::fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-    let sidecar = format!(
-        "harness = \"{harness}\"\n\
-         generator = {generator}\n\
-         sha256 = \"{digest}\"\n\
-         scenario_sha256 = \"{scenario}\"\n\
-         source = \"crates/zakura-sim/tests/replay_exact.rs\"\n\
-         \n\
-         [[witness]]\n\
-         property = \"{harness}\"\n\
-         expect = \"holds\"\n",
-        harness = entry.name,
-        generator = entry.generator,
-        digest = zakura_sim::seed::sha256(&input),
-        scenario = zakura_sim::seed::scenario_sha256(&(entry.draw)(&input)),
-    );
-    std::fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
-}
-const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
-
 #[test]
 fn discovery_machine_replay_child() {
     if let Some(dir) = std::env::var_os("ZAKURA_DISCOVERY_MACHINE_CHILD") {
@@ -1820,7 +1971,8 @@ fn replay_in_child(dir: &Path) {
 fn discovery_book_records_and_replays_signed_samples() {
     use zakura_sim::record::machine::MachineStep;
     let entry = harness::find("discovery/record-book").unwrap();
-    let dir = record(entry, DISCOVERY_BOOK_INPUT);
+    let input = zakura_network::zakura::discovery_book_witness_bytes();
+    let dir = record(entry, &input);
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1832,7 +1984,7 @@ fn discovery_book_records_and_replays_signed_samples() {
     )
     .unwrap();
     assert_eq!(trace.meta.generator, 3);
-    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 2);
+    assert_eq!(trace.steps.len(), input.len() / 2);
     assert!(trace
         .steps
         .iter()
@@ -1878,7 +2030,7 @@ fn discovery_book_records_and_replays_signed_samples() {
 #[test]
 fn discovery_state_records_and_replays_installations() {
     let entry = harness::find("discovery/session-installation").unwrap();
-    let dir = record(entry, DISCOVERY_STATE_INPUT);
+    let dir = record(entry, zakura_network::zakura::DISCOVERY_STATE_WITNESS);
     let trace = open(dir.path());
     (entry.witness)(
         &trace.meta.scenario,
@@ -1889,7 +2041,10 @@ fn discovery_state_records_and_replays_installations() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.steps.len(), DISCOVERY_STATE_INPUT.len() / 4);
+    assert_eq!(
+        trace.steps.len(),
+        zakura_network::zakura::DISCOVERY_STATE_WITNESS.len() / 4
+    );
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     replay_in_child(dir.path());

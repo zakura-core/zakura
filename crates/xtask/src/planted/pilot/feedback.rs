@@ -4,8 +4,9 @@
 //! The list freezes the comparison's bounds, seeds and arms, and names
 //! retained planted cases, each by its path under `qa/planted/`, with its
 //! property, fuzz target and fault class. [`read`] checks each case against
-//! the planted catalogue and the fuzz package's target table, and returns it
-//! as a pilot [`Case`] whose hashes are those of the tree's files. The
+//! the planted catalogue, the seed registry and the fuzz package's target
+//! table, and returns it as a pilot [`Case`] whose hashes are those of the
+//! tree's files. The
 //! runner then checks the same hashes in its checkout of `HEAD`
 //! ([`super::check_pins`]), so a case changed but not committed fails
 //! before any campaign runs.
@@ -16,7 +17,8 @@ use serde::Deserialize;
 
 use super::{
     super::{
-        cases, harness_of, patched_files, planted_layout::PLANTED_DIR, Case as Planted, Witness,
+        cases, patched_files, planted_layout::PLANTED_DIR, seeds::Registry, Case as Planted,
+        Witness,
     },
     check_libfuzzer_args, file_sha256, Bounds, Case, ConfirmationBounds,
 };
@@ -44,7 +46,7 @@ pub(super) struct Entry {
     pub(super) case: String,
     /// The property the patch must violate: the case's directory.
     pub(super) property: String,
-    /// The simulator fuzz target that runs the case's input's harness.
+    /// The simulator fuzz target that runs the case's seed's harness.
     pub(super) target: String,
     /// The fault the patch plants, for the report's counts.
     pub(super) fault_class: String,
@@ -61,9 +63,10 @@ pub(super) struct List {
     pub(super) cases: Vec<Case>,
 }
 
-/// Reads and checks the case list in `repo_root`, and returns its bytes,
-/// for the report's digest, and its cases ([`resolve`]).
-pub(super) fn read(repo_root: &Path) -> Result<(Vec<u8>, List), BoxError> {
+/// Reads and checks the case list in `repo_root` against the seed
+/// `registry`, and returns its bytes, for the report's digest, and its
+/// cases ([`resolve`]).
+pub(super) fn read(repo_root: &Path, registry: &Registry) -> Result<(Vec<u8>, List), BoxError> {
     let path = repo_root.join(LIST);
     let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let file: ListFile = toml::from_str(std::str::from_utf8(&bytes)?)
@@ -71,7 +74,7 @@ pub(super) fn read(repo_root: &Path) -> Result<(Vec<u8>, List), BoxError> {
     let targets = fuzz_targets(repo_root)?;
     check_libfuzzer_args(&file.bounds, &targets).map_err(|error| format!("{LIST}: {error}"))?;
     let planted = cases(repo_root)?;
-    let cases = resolve(repo_root, &file.cases, &planted, &targets)
+    let cases = resolve(repo_root, &file.cases, &planted, registry, &targets)
         .map_err(|error| format!("{LIST}: {error}"))?;
     Ok((
         bytes,
@@ -84,18 +87,22 @@ pub(super) fn read(repo_root: &Path) -> Result<(Vec<u8>, List), BoxError> {
 }
 
 /// Each of `entries` as a pilot case, from the `planted` cases under
-/// `repo_root` and the fuzz package's `targets`, each mapped to the harness
-/// it runs. A case's ID is its path, its production files are those its
-/// patch changes, and each hash is of the file in `repo_root`.
+/// `repo_root`, the seed `registry`, which names each seed's harness, and
+/// the fuzz package's `targets`, each mapped to the harness it runs. A
+/// case's ID is its path, its production files are those its patch
+/// changes, and each hash is of the file in `repo_root`. Its witness is its
+/// planted case file, which names its seed: a campaign starts from no seed,
+/// so the pins only check that the case still names the same one.
 ///
 /// Fails on a case listed twice, one with no planted patch, one whose
-/// property isn't its planted case's, a typed case, a
-/// target that isn't a fuzz target, and a target that runs another harness
-/// than the case's input.
+/// property isn't its planted case's, a typed case, a seed the registry
+/// lacks or rejects, a target that isn't a fuzz target, and a target that
+/// runs another harness than the case's seed.
 pub(super) fn resolve(
     repo_root: &Path,
     entries: &[Entry],
     planted: &[Planted],
+    registry: &Registry,
     targets: &BTreeMap<String, Option<String>>,
 ) -> Result<Vec<Case>, BoxError> {
     let mut resolved = Vec::new();
@@ -124,8 +131,8 @@ pub(super) fn resolve(
             )
             .into());
         }
-        let Witness::Input(input) = &found.witness else {
-            return Err(format!("{id}: a typed case has no fuzz input for a target to run").into());
+        let Witness::Seed(seed) = &found.witness else {
+            return Err(format!("{id}: a typed case has no seed for a target to run").into());
         };
         let harness = match targets.get(&entry.target) {
             None => {
@@ -136,14 +143,17 @@ pub(super) fn resolve(
             }
             Some(Some(harness)) => harness,
         };
-        let input_harness = harness_of(repo_root, input)?;
-        if &input_harness != harness {
+        let seed_harness = registry
+            .harness(seed)
+            .map_err(|error| format!("{id}: {error}"))?;
+        if &seed_harness != harness {
             return Err(format!(
-                "{id}: {} runs {harness}, but the case's input runs {input_harness}",
+                "{id}: {} runs {harness}, but the case's seed runs {seed_harness}",
                 entry.target
             )
             .into());
         }
+        let case_file = patch.with_extension("toml");
         let production_files = patched_files(repo_root, &found.patch)?
             .into_iter()
             .map(|path| {
@@ -163,10 +173,10 @@ pub(super) fn resolve(
             production_files,
             property: found.property.clone(),
             also_violates: found.also_violates.clone(),
-            harness: input_harness,
+            harness: seed_harness,
             target: entry.target.clone(),
-            witness: input.clone(),
-            witness_sha256: file_sha256(&repo_root.join(input))?,
+            witness_sha256: file_sha256(&repo_root.join(&case_file))?,
+            witness: case_file,
             equivalent: None,
             discovery_excluded: None,
         });

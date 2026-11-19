@@ -193,12 +193,23 @@ class MainnetWorkflowMonitoringTests(unittest.TestCase):
         self.assertIn("if: inputs.operation == 'monitoring'", self.job)
         self.assertIn('if [ "${NODE}" != "zakura-compat" ]; then', self.job)
         self.assertIn("^[0-9a-f]{40}$", self.job)
-        self.assertIn(
-            "if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'",
-            self.workflow,
-        )
         for stage in ("install", "validate", "cutover", "soak", "finalize", "rollback"):
             self.assertIn(stage, self.workflow.split("monitoring_stage:", 1)[1].split("\n\n", 1)[0])
+
+    def test_fleet_job_runs_for_dashboard_or_non_mac_deploys(self):
+        fleet_job = self.workflow.split("\n  deploy:\n", 1)[1]
+        self.assertEqual(
+            fleet_job.splitlines()[0].strip(),
+            "if: inputs.operation == 'dashboard' || (inputs.operation == 'deploy' && inputs.node != 'zakura-mac-os')",
+        )
+
+    def test_only_mac_deploy_status_bypasses_fleet_serialization(self):
+        concurrency = self.workflow.split("\nconcurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
+        self.assertIn(
+            "inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status'",
+            concurrency,
+        )
+        self.assertIn("|| 'zakura-mainnet-deploy'", concurrency)
 
     def test_monitoring_never_touches_nodes_dashboard_or_gateway(self):
         for forbidden in ("python3 deploy.py", "deploy/deployer", "cargo", "zakurad", "dashboard", "broadcast",
@@ -317,6 +328,18 @@ class MountRenderingTests(NodeBuilder, unittest.TestCase):
 
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
+
+
+class BlockDownloadConfigTests(NodeBuilder, unittest.TestCase):
+    def test_mainnet_configs_enable_block_download_scoring_and_hedging(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(network="Mainnet")))
+        self.assertIs(config["network"]["block_download_score_and_hedge"]["enabled"], True)
+
+    def test_other_networks_keep_their_binary_default(self):
+        for network in ("Testnet", "Regtest"):
+            with self.subTest(network=network):
+                config = tomllib.loads(deploy.render_node_config(self.node(network=network)))
+                self.assertNotIn("block_download_score_and_hedge", config["network"])
 
 
 class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
@@ -581,6 +604,37 @@ class ConfigKeyTests(unittest.TestCase):
             self.assertEqual(
                 nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
             )
+
+    def test_setups_render_their_p2p_stack_pool_and_tx_relay(self):
+        # The testnet deploy workflow's `setup` input writes this key next to
+        # the fleet's `p2p_stack = "dual"`, which the setup overrides.
+        for setup, stack, pool, tx_relay in (
+            ("legacy", "legacy", "classic", False),
+            ("v2", "dual", "core", True),
+        ):
+            with self.subTest(setup), tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, f"""
+                    [defaults]
+                    network = "Testnet"
+                    p2p_stack = "dual"
+                    setup = "{setup}"
+
+                    [defaults.zakura]
+                    listen_addr = "0.0.0.0:8234"
+
+                    [[nodes]]
+                    name = "node-a"
+                    ssh_string = "root@example"
+                    commit = "main"
+                """.replace("                    ", ""))
+
+                node = deploy.load_nodes(path, None)[0]
+                config = tomllib.loads(deploy.render_node_config(node))
+
+                self.assertEqual(config["network"]["p2p_stack"], stack)
+                self.assertEqual(config["mempool"], {"implementation": pool})
+                self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": tx_relay})
+                self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
 
     def test_internal_miner_requires_an_address_and_the_miner_build(self):
         for extra in ('build_features = ["internal-miner"]',

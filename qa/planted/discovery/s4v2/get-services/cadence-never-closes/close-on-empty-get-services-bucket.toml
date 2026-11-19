@@ -14,4 +14,3 @@ also_violates = ["discovery/s4v2/conformant-never-closes"]
 [typed]
 harness = "discovery/wire"
 scenario = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.scenario.json"
-plan = "qa/planted/discovery/s4v2/get-services/cadence-never-closes/close-on-empty-get-services-bucket.plan.bin"

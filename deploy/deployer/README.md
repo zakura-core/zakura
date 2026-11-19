@@ -99,12 +99,18 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `setup` — optionally put the selected node on `legacy` (legacy P2P and the
+  classic pool) or `v2` (dual P2P, the pool core and tx-relay), for comparing
+  pools on real peers. The default `auto` keeps the fleet's setup, and
+  deploying a node with `auto` again restores it. It can't be combined with
+  `p2p_stack`.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
-Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
-explicit `node`, preventing canary settings from being applied fleet-wide.
+Explicit `p2p_stack` or `setup` overrides and `header_sync_trace = true`
+require an explicit `node`, preventing canary settings from being applied
+fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
@@ -223,12 +229,17 @@ lifecycle is failed`. The fleet is binary-only, so that setting lives in the
 node's own config; flipping this host to config-managed without carrying it
 across would silently reintroduce the stall.
 
-`asia-hedged` and `asia-scored` are legacy-only nodes in Singapore that each
-measure one experimental setting from an open PR: `[network.block_hedge]` from
-PR 2548 and `[network.block_source_score]` from PR 2558. Their configs enable those
-settings, so each entry is pinned to the build the node runs instead of the
-deployed ref: a build from `main` would refuse the config. Unpin an entry when
-its PR merges, or remove it when the experiment ends.
+Mainnet Linux nodes use the selected deployment ref except for `asia-scored`,
+which stays pinned to the build that supports its experiment config. The default
+deployment template enables scoring and hedging when it renders a Mainnet node
+config. Set `manage_config = true` on a new fleet entry if the deployer will
+install its config and service. For a hand-provisioned node, include the same
+setting in its initial config, as on the Mac verifier:
+
+```toml
+[network.block_download_score_and_hedge]
+enabled = true
+```
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
@@ -243,8 +254,9 @@ A node only becomes deployable once the deployer runner can reach it. The fleet'
 deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
 `~/.ssh/authorized_keys`, and the node's address must be in the workflow's
 host-key pin list. A host that is missing the key fails the deploy with
-`Permission denied (publickey)` at the scp step, after a successful build. One-time runner bootstrap from an operator machine with SSH access
-and CI credentials in `~/agents-env`:
+`Permission denied (publickey)` at the scp step, after a successful build.
+One-time runner bootstrap from an operator machine with SSH access and CI
+credentials in `~/agents-env`:
 
 ```bash
 cd deploy/deployer
@@ -253,6 +265,9 @@ cd deploy/deployer
 
 The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 (`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`).
+Use `operation=dashboard` to refresh the status site and profiler tunnels from
+the selected workflow branch. The dashboard operation ignores binary deployment
+inputs.
 
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
@@ -273,8 +288,8 @@ is separate future work.
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 
 - service: `zakura-mainnet-dashboard.service`
-- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server listens on
-  `127.0.0.1:8090` only)
+- URL: `https://status.mainnet.zakura.valargroup.dev/` (Caddy; the server
+  listens on `127.0.0.1:8090` only)
 - install dir: `/opt/zakura-mainnet-dashboard`
 
 The fleet pages (`/`, `/node/*`, `/profile/*`) and their data (`/data*`) need a

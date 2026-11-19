@@ -2,7 +2,7 @@
 """Drive an isolated local-genesis mempool-load testnet.
 
 Generates a throwaway chain with the Kresko Rust binary, runs N zakurad nodes
-peered to each other, mines, and blasts funded Orchard transactions at one
+peered to each other, mines, and blasts funded shielded transactions at one
 node's RPC. Used identically by the local rehearsal and by the CI droplet, so a
 green local run means the CI path is exercising the same code.
 
@@ -49,6 +49,28 @@ ZAKURA_P2P_PORT = 18234
 RPC_READY_TIMEOUT_SECS = 180
 
 
+# Each node's Zakura JSONL trace directory, under its node dir. The node logs
+# run at INFO and say nothing about block-sync requests, so these tables are
+# the only record of when a block was requested, committed and applied to the
+# mempool.
+ZAKURA_TRACE_DIR = "zakura-traces"
+ZAKURA_TRACE_TABLES = (
+    "block_sync",
+    "header_sync",
+    "legacy_gossip",
+    "chain_tip",
+    "mempool",
+    "ratelimit",
+)
+
+# The node setups a run compares. `legacy` is what Mainnet runs today. `v2`
+# moves blocks and transactions to P2P v2 (`dual` upgrades every lab peer) and
+# swaps in the pool core, which tx-relay needs.
+NODE_PROFILES = {
+    "legacy": {"p2p_stack": "legacy", "implementation": "classic", "tx_relay": "false"},
+    "v2": {"p2p_stack": "dual", "implementation": "core", "tx_relay": "true"},
+}
+
 # Artifact allowlist. Collection copies exactly these globs -- never the lab dir
 # wholesale -- so a new secret file appearing in the payload cannot silently
 # start being uploaded. Kept here rather than in the workflow so the unit tests
@@ -57,6 +79,7 @@ COLLECTED_PATHS = (
     "nodes/*/run.log",
     "nodes/*/bootstrap.log",
     "nodes/*/zakura.toml",
+    *(f"nodes/*/{ZAKURA_TRACE_DIR}/{table}.jsonl" for table in ZAKURA_TRACE_TABLES),
     "traces/*.jsonl",
     "txblast.log",
     "config.json",
@@ -158,6 +181,12 @@ def build_kresko_config(args) -> dict:
     network_kind is pinned to local-genesis: Kresko's require_local_genesis()
     gate then refuses every public-network command, so a misconfigured run
     cannot reach a real network.
+
+    mining_mode is `pow` so Kresko seeds the chain at a difficulty sized for
+    the target spacing (see `--miner-sol-per-sec`). `generate` seeds at the
+    easiest one, and NU7 averages difficulty over 102 blocks, too slowly to
+    move a short run, so its blocks came every ~7 s. zakurad's internal miner
+    solves (200, 9) on any testnet, hence `common` Equihash parameters.
     """
     miners = [
         {
@@ -182,9 +211,9 @@ def build_kresko_config(args) -> dict:
         "ssh_key_path": "",
         "provider": "digitalocean",
         "network_kind": "local-genesis",
-        "mining_mode": "generate",
+        "mining_mode": "pow",
         "block_time_secs": args.block_time_secs,
-        "equihash_params": "regtest",
+        "equihash_params": "common",
         "daa": {},
         "orchard_txblast": {
             "lanes_per_miner": args.orchard_lanes_per_miner,
@@ -202,10 +231,6 @@ def cmd_genesis(args) -> int:
     config = build_kresko_config(args)
     (lab / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
-    # NU6.3 gates the Ironwood shielded pool, so a chain that stops below it
-    # cannot exercise Ironwood at all. Nu7 is deliberately not requested: a
-    # release zakurad compiles its consensus branch id out, and no block at an
-    # Nu7 activation height can be mined.
     env = {**os.environ, "KRESKO_LATEST_NETWORK_UPGRADE": args.latest_upgrade}
     # Recorded so the blast uses the same upgrade as the chain. Kresko's
     # transaction builder derives its consensus branch id from this, and a
@@ -221,6 +246,10 @@ def cmd_genesis(args) -> int:
             str(Path(args.kresko_binary).resolve()),
             "--maturity-padding-blocks",
             str(args.maturity_padding_blocks),
+            # Kresko multiplies this by every node in config.json, but only
+            # --miner-nodes nodes mine, with one solver thread each.
+            "--pow-sol-per-sec",
+            str(args.miner_sol_per_sec * args.miner_nodes / args.node_count),
             "--orchard-lanes-per-miner",
             str(args.orchard_lanes_per_miner),
             "--orchard-lane-value-zats",
@@ -270,6 +299,61 @@ def localize_fleet(lab: Path, args) -> None:
             str(args.miner_nodes),
         ]
     )
+    for config in sorted((lab / "nodes").glob("*/zakura*.toml")):
+        config.write_text(to_node_schema(config.read_text()))
+    pin_chain_topology(lab, args.node_count)
+
+
+def to_node_schema(text: str) -> str:
+    """Rewrites Kresko's custom-network section into the form zakura main accepts.
+
+    Kresko renders configs for the zakura experiment branch it pins: custom
+    parameters under `[network.testnet_parameters]` next to `network = "Testnet"`,
+    plus `post_blossom_pow_target_spacing`, and in `pow` mining mode
+    `pow_start_height` with `disable_pow = false`. Main takes custom parameters
+    only as the explicit `[network.network]` table and has neither key. Without
+    `pow_start_height` the unsolved seeded blocks only pass with proof of work
+    off, so `disable_pow` stays true. The internal miner still solves to the
+    template's difficulty, which is what sets the block rate.
+    """
+    if "[network.testnet_parameters" not in text:
+        return text
+    text, replaced = re.subn(r'(?m)^network = "Testnet"\n', "", text)
+    if replaced != 1:
+        raise RuntimeError('expected one `network = "Testnet"` line next to testnet_parameters')
+    text = re.sub(r"(?m)^(post_blossom_pow_target_spacing|pow_start_height) = .*\n", "", text)
+    text = re.sub(r"(?m)^disable_pow = false$", "disable_pow = true", text)
+    return text.replace("[network.testnet_parameters", "[network.network")
+
+
+def chain_seed(index: int, node_count: int) -> str:
+    """Returns the one peer node `index` dials in the chain 0-1-...-(n-1).
+
+    Node k dials node k-1. Node 0 gets the address one past the last node,
+    where nothing listens, so it dials no one but still has a seed.
+    """
+    return f"{node_ip(index - 1 if index else node_count)}:{P2P_PORT}"
+
+
+def pin_chain_topology(lab: Path, node_count: int) -> None:
+    """Seeds each node with only its predecessor, so every run has the same chain.
+
+    Seeding every node with every other one left each run a random 3- or 4-link
+    layout, a star in one leg and a 3-hop chain in the next, which swamped the
+    pool difference in the propagation numbers. The blaster submits to node 0,
+    so the chain measures relay over 1 to n-1 hops.
+    """
+    # Only the run config peers; the bootstrap config runs with P2P off.
+    for index in range(node_count):
+        config = lab / "nodes" / node_name(index) / "zakura.toml"
+        text, replaced = re.subn(
+            r"(?ms)^initial_testnet_peers = \[.*?\]$",
+            f'initial_testnet_peers = ["{chain_seed(index, node_count)}"]',
+            config.read_text(),
+        )
+        if replaced != 1:
+            raise RuntimeError(f"{config}: expected one initial_testnet_peers list")
+        config.write_text(text)
 
 
 # ---------------------------------------------------------------------------- #
@@ -277,11 +361,30 @@ def localize_fleet(lab: Path, args) -> None:
 # ---------------------------------------------------------------------------- #
 
 
-# zakurad maps ZAKURA_<FIELD> environment variables onto config fields, so any
-# stray one in the environment is read as a config key and the node refuses to
-# start ("unknown field `dir`"). The lab always passes an explicit config file,
-# so nothing of ours belongs in that namespace.
-def node_env() -> dict:
+def run_overrides(node_dir: Path, profile: str) -> dict[str, str]:
+    """Returns the `ZAKURA_*` config overrides a run node starts with.
+
+    They set the P2P stack, mempool implementation and tx-relay switch from
+    `NODE_PROFILES[profile]`, and point `[network.zakura] trace_dir` into
+    `node_dir`. zakurad applies `ZAKURA_SECTION__KEY` variables on top of the
+    config file (see `ZakuradConfig::load`), so Kresko's file stays as rendered.
+    """
+    settings = NODE_PROFILES[profile]
+    return {
+        "ZAKURA_NETWORK__P2P_STACK": settings["p2p_stack"],
+        "ZAKURA_MEMPOOL__IMPLEMENTATION": settings["implementation"],
+        "ZAKURA_NETWORK__ZAKURA__TX_RELAY__ENABLED": settings["tx_relay"],
+        "ZAKURA_NETWORK__ZAKURA__TRACE_DIR": str(node_dir / ZAKURA_TRACE_DIR),
+    }
+
+
+def node_env(overrides: dict[str, str]) -> dict[str, str]:
+    """Returns this process's environment with `overrides` as its only `ZAKURA_*` variables.
+
+    zakurad reads every `ZAKURA_*` variable as a config key. Inherited ones are
+    dropped, since an exported `ZAKURA_DIR` once made the node refuse to start
+    with "unknown field `dir`".
+    """
     hijacked = sorted(k for k in os.environ if k.startswith("ZAKURA_"))
     if hijacked:
         print(
@@ -289,7 +392,8 @@ def node_env() -> dict:
             + ", ".join(hijacked),
             file=sys.stderr,
         )
-    return {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    return {**env, **overrides}
 
 
 def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Popen:
@@ -297,6 +401,8 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
     node_dir = lab / "nodes" / name
     config = node_dir / ("zakura.bootstrap.toml" if bootstrap else "zakura.toml")
     suffix = "bootstrap" if bootstrap else "run"
+    # The bootstrap node only seeds the chain with P2P off, so it keeps Kresko's config.
+    overrides = {} if bootstrap else run_overrides(node_dir, args.profile)
     log_path = node_dir / f"{suffix}.log"
     log = open(log_path, "ab")
     proc = subprocess.Popen(
@@ -305,9 +411,13 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
         stderr=subprocess.STDOUT,
         # Own process group, so stopping a node never signals the whole lab.
         start_new_session=True,
-        env=node_env(),
+        env=node_env(overrides),
     )
-    print(f"started {name} ({suffix}) pid={proc.pid} log={log_path}", flush=True)
+    # The collected zakura.toml doesn't show the overrides, so this line records them.
+    print(
+        f"started {name} ({suffix}) pid={proc.pid} log={log_path} overrides={overrides}",
+        flush=True,
+    )
     return proc
 
 
@@ -464,15 +574,14 @@ def cmd_up(args) -> int:
         # Recorded after each spawn, not once at the end: if a later spawn
         # raises, the nodes already started must still be visible to `down`.
         write_pidfile(lab, procs)
-
-    failed = []
-    for i in range(args.node_count):
-        url = f"http://{node_ip(i)}:{RPC_PORT}"
-        if not wait_for_rpc(url, proc=procs[node_name(i)]):
-            failed.append(node_name(i))
-    if failed:
-        print(f"nodes never came up: {', '.join(failed)}", file=sys.stderr)
-        return 1
+        # Node i+1 dials only node i. A refused dial isn't retried for about two
+        # minutes, so one node starting 2 ms early cut the chain in 9 of 21 runs.
+        # zakurad binds its P2P listener before it starts RPC, so an answering RPC
+        # means node i is listening. Probing the P2P port itself would take the
+        # node's one connection per IP (every lab node dials from 127.0.0.1).
+        if not wait_for_rpc(f"http://{node_ip(i)}:{RPC_PORT}", proc=procs[node_name(i)]):
+            print(f"{node_name(i)} never came up", file=sys.stderr)
+            return 1
 
     if args.node_count > 1 and not wait_for_peers(args.node_count):
         # A network whose nodes never find each other still runs, still mines,
@@ -531,34 +640,31 @@ def wait_for_chain_convergence(
 
 
 def wait_for_peers(node_count: int, timeout_secs: int = 120, poll_secs: float = 5.0) -> bool:
-    """Wait until the fleet has enough connections to form a connected graph.
+    """Wait until every node's peer count matches the chain `pin_chain_topology` set.
 
-    Graded on the total across nodes, not per node: `getpeerinfo` reports a
-    connection from the dialling side, so in a healthy 3-node lab the counts
-    are routinely 2/0/1. Requiring every node to report a peer would reject a
-    perfectly connected network. n-1 connections is the minimum that can span
-    n nodes, so anything less is definitely partitioned.
+    `getpeerinfo` lists inbound and outbound connections, so the chain's ends
+    report 1 and every inner node reports 2. Any other count means a link is
+    missing or an extra one formed, and the run would measure a different layout.
     """
-    needed = node_count - 1
+    want = [1] + [2] * (node_count - 2) + [1]
     deadline = time.monotonic() + timeout_secs
-    counts: dict[str, int] = {}
+    counts: list[int] = []
     while True:
-        counts = {}
+        counts = []
         for i in range(node_count):
             url = f"http://{node_ip(i)}:{RPC_PORT}"
             try:
-                counts[node_name(i)] = len(rpc_call(url, "getpeerinfo", timeout=5))
+                counts.append(len(rpc_call(url, "getpeerinfo", timeout=5)))
             except (urllib.error.URLError, OSError, RuntimeError, json.JSONDecodeError):
-                counts[node_name(i)] = 0
-        if sum(counts.values()) >= needed:
+                counts.append(0)
+        if counts == want:
             print(f"peer connections: {counts}", flush=True)
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(poll_secs)
     print(
-        f"only {sum(counts.values())} peer connection(s) after {timeout_secs}s, "
-        f"need {needed}: {counts}",
+        f"peer counts {counts} after {timeout_secs}s, want the chain's {want}",
         file=sys.stderr,
     )
     return False
@@ -621,7 +727,7 @@ def stop_pid(pid: int, name: str) -> bool:
 
 
 def cmd_blast(args) -> int:
-    """Run the funded Orchard transaction blast against node 0's RPC."""
+    """Run the funded shielded transaction blast against node 0's RPC."""
     lab = Path(args.lab_dir).resolve()
     trace_dir = lab / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -754,21 +860,27 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--chain-id", default="mempool-load")
     gen.add_argument(
         "--latest-upgrade",
-        # nu6_1, not nu6_3, until Kresko's transaction builder can follow. Its
-        # zcash_protocol 0.7 has no Nu6_2/Nu6_3 variants, so on an NU6.3 chain
-        # it signs at NU6.1's consensus branch id and every transaction is
-        # rejected -- the blast dies during bootstrap and the run measures
-        # nothing. Kresko can now *express* NU6.2/NU6.3 (valargroup/kresko),
-        # so this becomes nu6_3 once its zcash stack is bumped to the 0.10 /
-        # 0.29 / orchard 0.15 line that Zakura already uses.
-        #
-        # Ironwood is gated on NU6.3, so Ironwood coverage waits on that too.
-        default="nu6_1",
-        help="newest network upgrade the generated chain activates "
-        "(nu6_3 needs a Kresko built against zcash_protocol 0.10+)",
+        # NU7, like Mainnet: its rules and its 25 s target spacing. Main has no
+        # key to override the spacing, so an earlier upgrade targets 75 s. The
+        # target doesn't set a short run's block rate, though (see the README).
+        # From NU6.3 the blast spends Ironwood, because NU6.3 closes Orchard to
+        # new value.
+        default="nu7",
+        help="newest network upgrade the generated chain activates",
     )
     gen.add_argument("--experiment", default="mempool-load")
-    gen.add_argument("--block-time-secs", type=int, default=5)
+    # Kresko spaces the seeded blocks by this and sizes their difficulty for
+    # it. The default matches NU7's 25 s target. A value off the chain's target
+    # skews its first difficulty adjustments.
+    gen.add_argument("--block-time-secs", type=int, default=25)
+    # The internal miner's rate Kresko sizes the starting difficulty for. On a
+    # c-16 under the default blast, blocks averaged 7.4 s at 17 solutions per
+    # block and 13.5 s at 50, which fits about 5.4 solutions/s plus ~4 s of
+    # fixed delay per block. Kresko's formula has no fixed delay, so this is
+    # the value that lands blocks near 23 s, a little under the 25 s target.
+    # The limit is the easiest difficulty the chain can use, so a rate set too
+    # high would leave every block slower than the target.
+    gen.add_argument("--miner-sol-per-sec", type=float, default=4.0)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)
     # 32, not Kresko's 384: every lane is proved during bootstrap, so a large
     # inventory means a bounded run never reaches steady state.
@@ -777,6 +889,12 @@ def build_parser() -> argparse.ArgumentParser:
     gen.set_defaults(func=cmd_genesis)
 
     up = sub.add_parser("up", help="seed and start every node")
+    up.add_argument(
+        "--profile",
+        choices=sorted(NODE_PROFILES),
+        default="legacy",
+        help="node setup: legacy (legacy P2P, classic pool) or v2 (P2P v2, tx-relay, pool core)",
+    )
     up.set_defaults(func=cmd_up)
 
     down = sub.add_parser("down", help="stop every node")

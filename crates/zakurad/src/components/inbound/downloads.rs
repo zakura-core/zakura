@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use futures::{
@@ -868,42 +867,6 @@ where
     }
 }
 
-/// How often a block download asks the peer set whether another announcer should deliver the
-/// block sooner than the first request.
-const SECOND_REQUEST_CHECK_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Asks the peer set to send a second request for `hash`, every [`SECOND_REQUEST_CHECK_INTERVAL`]
-/// until it sends one, and returns that request's result.
-///
-/// Returns [`zn::NoFasterBlockSource`] once the dispatch window closes without a second request.
-async fn request_block_again<ZN>(
-    network: ZN,
-    hash: block::Hash,
-    attempt: zn::BlockHedge,
-) -> Result<zn::Response, BoxError>
-where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
-{
-    loop {
-        tokio::time::sleep(SECOND_REQUEST_CHECK_INTERVAL).await;
-        if attempt.elapsed_if_open().is_none() {
-            return Err(zn::NoFasterBlockSource.into());
-        }
-        let result = network
-            .clone()
-            .oneshot(zn::Request::BlockByHashHedge {
-                hash,
-                attempt: attempt.clone(),
-            })
-            .await;
-        match result {
-            Err(error) if error.is::<zn::NoFasterBlockSource>() => continue,
-            result => return result,
-        }
-    }
-}
-
 impl<ZN, ZV, ZS> TaskSpawner<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -1480,15 +1443,22 @@ where
         .oneshot(primary)
         .map(validate.clone())
         .boxed();
-    let mut second = request_block_again(network, hash, attempt.clone())
+    // Asked once. The peer set holds this request, and sends it when another announcer should
+    // deliver the block sooner or the first request stalls. It fails with
+    // `NoFasterBlockSource` once the window closes without one.
+    let mut second = network
+        .oneshot(zn::Request::BlockByHashHedge {
+            hash,
+            attempt: attempt.clone(),
+        })
         .map(validate)
         .boxed();
 
     tokio::select! {
         biased;
         result = &mut first => {
-            // A queued check can be dropped. A dispatched request can still supply or
-            // finish transferring the block.
+            // A second request that was not sent can be withdrawn by dropping it. One that
+            // was sent can still supply or finish transferring the block.
             if !attempt.close() {
                 return result.map(DownloadedCandidates::single);
             }

@@ -13,4 +13,3 @@ checks = [
 [typed]
 harness = "discovery/wire"
 scenario = "qa/planted/discovery/s4v2/get-services/short-payload-closes/drop-short-payload.scenario.json"
-plan = "qa/planted/discovery/s4v2/get-services/short-payload-closes/drop-short-payload.plan.bin"

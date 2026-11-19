@@ -1,2 +1,2 @@
-input = "crates/zakura-sim/tests/fixtures/handshake-partial-session.bin"
+seed = "handshake-partial-session"
 checks = ["crates/zakura-network/src/zakura/handler/service_session.rs"]

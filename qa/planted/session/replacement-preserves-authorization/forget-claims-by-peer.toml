@@ -5,7 +5,7 @@
 # until the replacement's routine publishes a claim. The held routine's
 # drop then detaches its replacement's claims, which only the registry's
 # fingerprints of the entry show.
-input = "crates/zakura-sim/tests/fixtures/sync-wire-replace-claims.bin"
+seed = "sync-wire-replace-claims"
 # Besides peer_registry.rs and state.rs, which the patch changes, the
 # routine's drop decides which generation's writes reach an entry.
 checks = ["crates/zakura-network/src/zakura/block_sync/peer_routine.rs"]

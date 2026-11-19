@@ -11,6 +11,7 @@ use serde_json::json;
 
 use super::{
     super::outcome::EndOutcome,
+    super::seeds::{Registry, SeedRow},
     build_failure,
     classify::{
         self, read_record, Applicability, Class, Ended, GenerateFacts, GenerateStop, Observed,
@@ -983,7 +984,7 @@ fn planted_cases_read_their_property() {
     let case = repo.path().join("qa/planted/race/lost-update");
     fs::create_dir_all(&case).unwrap();
     fs::write(case.join("plain.patch"), "").unwrap();
-    fs::write(case.join("plain.toml"), "input = \"in.bin\"\n").unwrap();
+    fs::write(case.join("plain.toml"), "seed = \"in\"\n").unwrap();
     let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0].property, "race/lost-update");
@@ -1043,10 +1044,11 @@ fn a_case_watches_its_work_list_entrys_paths() {
 
 /// With generator lanes on, every case watches the inputs the lanes read:
 /// the work list, whose `[[no-generator]]` records apply to a planted case
-/// that names no entry, then the excluded `.bin` inputs for an `inproc`
-/// search or the fuzz targets for a `libfuzzer` lane. A triage-only change
-/// affects no case. With the lanes off, a planted case watches none of
-/// them.
+/// that names no entry, then the seed registry, whose inputs an `inproc`
+/// search excludes, or the fuzz targets for a `libfuzzer` lane. A
+/// triage-only change affects no case. With the lanes off, a planted case
+/// watches neither the work list nor the fuzz targets. Every case watches
+/// the registry, which is shared machinery.
 #[test]
 fn generator_lanes_watch_their_inputs() {
     let repo_root = crate::repo_root().expect("xtask lives in the workspace");
@@ -1070,18 +1072,19 @@ fn generator_lanes_watch_their_inputs() {
         ..inproc.clone()
     };
     let work_list = "qa/native-mutations/work-list.toml";
-    let excluded = "qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.plan.bin";
+    let registry = "crates/zakura-sim/src/seed/handshake.rs";
     let target = "qa/fuzz/sim/fuzz_targets/block_sync_storage.rs";
     let triage = "qa/native-mutations/triage.toml";
-    for path in [work_list, excluded, target, triage] {
+    for path in [work_list, target, triage] {
         assert!(!watches(&GenerateFlags::default(), path), "off: {path}");
     }
+    assert!(watches(&GenerateFlags::default(), registry));
     assert!(watches(&inproc, work_list));
-    assert!(watches(&inproc, excluded));
+    assert!(super::generate::affected(&inproc, &[registry.into()]));
     assert!(!watches(&inproc, target));
     assert!(!watches(&inproc, triage));
     assert!(watches(&libfuzzer, work_list));
-    assert!(!watches(&libfuzzer, excluded));
+    assert!(!super::generate::affected(&libfuzzer, &[registry.into()]));
     assert!(watches(&libfuzzer, target));
 }
 
@@ -1587,7 +1590,6 @@ fn fake_kill(
             },
         )]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim,
     };
@@ -1859,7 +1861,6 @@ fn only_a_confirmed_unpatched_violation_is_a_property_finding() {
             ),
         ]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: out.path().join("zakura-sim"),
     };
@@ -2149,25 +2150,37 @@ fn each_case_gets_a_generator_harness_or_a_reason() {
     );
 }
 
+/// The exclusions list each admitted seed's input digest once, and no
+/// rejected seed, which has none.
 #[test]
-fn exclusions_list_every_committed_input_once() {
+fn exclusions_list_every_seed_input_once() {
+    let row = |name: &str, digest: Option<&str>| SeedRow {
+        name: name.to_owned(),
+        harness: "h".to_owned(),
+        set: "corpus".to_owned(),
+        status: if digest.is_some() {
+            "admitted"
+        } else {
+            "rejected"
+        }
+        .to_owned(),
+        input_sha256: digest.map(str::to_owned),
+        reason: digest.is_none().then(|| "bad".to_owned()),
+    };
+    let one = "a".repeat(64);
+    let two = "b".repeat(64);
+    let registry = Registry::from_rows([
+        row("a", Some(&one)),
+        row("b", Some(&two)),
+        row("c", Some(&one)),
+        row("d", None),
+    ])
+    .unwrap();
     let tree = tempfile::tempdir().unwrap();
-    for (path, bytes) in [
-        ("qa/planted/a/witness.bin", &b"one"[..]),
-        ("qa/native-mutations/inputs/b.bin", b"two"),
-        ("crates/zakura-sim/tests/fixtures/c.bin", b"one"),
-        ("qa/planted/a/witness.toml", b"not an input"),
-        ("elsewhere/d.bin", b"three"),
-    ] {
-        let path = tree.path().join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
-    }
     let file = tree.path().join("out/exclude.txt");
-    assert_eq!(write_exclusions(tree.path(), &file).unwrap(), 2);
+    assert_eq!(write_exclusions(&registry, &file).unwrap(), 2);
     let text = fs::read_to_string(&file).unwrap();
-    assert_eq!(text.lines().count(), 2);
-    assert!(text.lines().all(|line| line.len() == 64));
+    assert_eq!(text, format!("{one}\n{two}\n"));
 }
 
 #[test]
@@ -2779,7 +2792,6 @@ fn the_unpatched_build_reruns_a_kills_input() {
         plans: Vec::new(),
         baselines: BTreeMap::new(),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: sim,
     };
@@ -2856,7 +2868,6 @@ fn a_generator_lane_the_cap_killed_reruns_alone() {
             ((harness.to_owned(), 8), baseline(true)),
         ]),
         exclude: out.path().join("exclude.txt"),
-        corpus: out.path().join("corpus"),
         targets: BTreeMap::new(),
         unpatched_sim: out.path().join("zakura-sim"),
     };

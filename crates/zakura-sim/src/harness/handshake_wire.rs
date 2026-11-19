@@ -337,10 +337,17 @@ impl Subsystem for Wire {
         .into_iter()
         .enumerate()
         .map(|(index, name)| {
-            super::ScenarioFamily::new(
+            let family = super::ScenarioFamily::new(
                 name,
                 [u8::try_from(index).expect("ten families fit in a byte")],
-            )
+            );
+            // `draw` picks each fault by the byte after the tag.
+            match index {
+                0 => family.with_variants(HELLO_FAULTS.len()),
+                1 => family.with_variants(ACK_FAULTS.len()),
+                2 => family.with_variants(PRELUDE_FAULTS.len()),
+                _ => family,
+            }
         })
         .collect();
         for (mode, name) in ["quic-pending", "quic-retry", "quic-timeout"]

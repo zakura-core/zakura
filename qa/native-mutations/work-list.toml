@@ -17,10 +17,11 @@
 #   per message type. Its `table` prefixes every generated ID it covers.
 #
 # Each witness is one of:
-# - `planted = "<case>.toml"`: the committed input or typed scenario of a
-#   retained `qa/planted/` case, which `zakura-sim record --witness <id>
+# - `planted = "<case>.toml"`: the seed or typed scenario of a retained
+#   `qa/planted/` case, which `zakura-sim record --witness <id>
 #   --expect holds` runs on the unpatched build;
-# - `input = "<file>.bin"`: a committed fuzz input with its sidecar;
+# - `seed = "<name>"`: a seed of the simulator's registry,
+#   `crates/zakura-sim/src/seed/`, which names its harness;
 # - `test = "<selector>"` with `test_target = "<file>"`: one `zakura-sim`
 #   integration test, run with `--exact`.
 # Every witness holds on `main`.
@@ -595,7 +596,7 @@ shared = []
 [[entry.instance]]
 property = "session/installed-services-authorized"
 code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/registry.rs", "crates/zakura-network/src/zakura/regulation/session_table.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-installed-services.bin" }
+witness = { seed = "handshake-installed-services" }
 
 [[entry]]
 id = "session-capacity"
@@ -619,7 +620,7 @@ shared = []
 [[entry.instance]]
 property = "session/setup-slot-bounded"
 code = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs", "crates/zakura-network/src/zakura/handler/service_session.rs", "crates/zakura-network/src/zakura/handler/service_session/state.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-partial-session.bin" }
+witness = { seed = "handshake-partial-session" }
 
 [[entry]]
 id = "session-stream-opens"
@@ -631,7 +632,7 @@ shared = []
 [[entry.instance]]
 property = "session/stream-opens-bounded"
 code = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/lifetime.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-stream-churn.bin" }
+witness = { seed = "handshake-stream-churn" }
 
 [[entry]]
 id = "handshake-honest"
@@ -687,7 +688,7 @@ shared = []
 [[entry.instance]]
 property = "handshake/finishes-in-time"
 code = ["crates/zakura-network/src/zakura/handler.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-slow-control.bin" }
+witness = { seed = "handshake-slow-control" }
 
 
 [[entry]]
@@ -700,7 +701,7 @@ shared = []
 [[entry.instance]]
 property = "session/renegotiation-covers-inflight-handshakes"
 code = ["crates/zakura-network/src/zakura/handler.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-capability-before.bin" }
+witness = { seed = "handshake-capability-before" }
 
 
 [[entry]]
@@ -713,12 +714,12 @@ shared = ["crates/zakura-network/src/zakura/transport/handshake_counts.rs", "cra
 [[entry.instance]]
 property = "handshake/attempts-within-cadence"
 code = []
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-burst.bin" }
+witness = { seed = "handshake-cadence-burst" }
 
 [[entry.instance]]
 property = "handshake/cadence-never-refuses-conformant"
 code = ["crates/zakura-network/src/zakura/discovery/redial.rs"]
-witness = { input = "crates/zakura-sim/tests/fixtures/handshake-cadence-conformant.bin" }
+witness = { seed = "handshake-cadence-conformant" }
 
 # Each `[[no-generator]]` names `Active` IDs that no generator harness can
 # reach, and why. A generator harness is one that reports the ID and doesn't

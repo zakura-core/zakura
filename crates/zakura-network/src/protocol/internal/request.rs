@@ -121,6 +121,11 @@ impl BlockHedge {
         self.state().first
     }
 
+    /// When the window for dispatching a second request ends, unless it is closed sooner.
+    pub(crate) fn window_end(&self) -> Instant {
+        self.started + Self::WINDOW
+    }
+
     /// Publish the dual-stack deadline before the legacy future is dropped.
     pub(crate) fn legacy_timeout(&self) {
         self.state().legacy_timed_out = true;
@@ -330,18 +335,23 @@ pub enum Request {
     /// outstanding, and did not get the first request. It sends the request to the one expected
     /// to answer soonest, but only if that peer should deliver the block clearly before the first
     /// request does, or if the first request has run well past its expected time (see
-    /// `[network.block_source_score] second_request`). It sends at most one such request per
-    /// block.
+    /// `[network.block_download_score_and_hedge]`). It sends at most one such request per
+    /// download.
+    ///
+    /// Send this once per download. The peer set holds the request while `attempt`'s window is
+    /// open, and decides again whenever a peer announces the block, an announcer becomes a
+    /// better source, or the first request becomes overdue or stalls. Dropping the response
+    /// future before a second request is sent withdraws it.
     ///
     /// # Returns
     ///
-    /// Returns [`Response::Blocks`](super::Response::Blocks), or fails at once with
-    /// [`NoFasterBlockSource`](crate::NoFasterBlockSource) when no peer was asked, so the caller
-    /// can ask again later.
+    /// Returns [`Response::Blocks`](super::Response::Blocks) from the second request, or fails
+    /// with [`NoFasterBlockSource`](crate::NoFasterBlockSource) once the window closes without
+    /// any peer being asked.
     BlockByHashHedge {
         /// The block to request.
         hash: block::Hash,
-        /// Shared dispatch window, checked by the peer set after any queue wait.
+        /// Shared dispatch window, which also tells the peer set where the first request went.
         #[cfg_attr(
             any(test, feature = "proptest-impl"),
             proptest(value = "BlockHedge::new(Instant::now())")

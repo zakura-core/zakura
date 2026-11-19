@@ -373,8 +373,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
 }
 
 /// The intended scenario of a `discovery/composed` or `sync/composed` seed:
-/// the one its steps' encoding draws, or for a found input, the one its bytes
-/// draw.
+/// the one its steps' encoding draws.
 fn composed(stem: &str) -> Option<serde_json::Value> {
     use discovery_service::{composed_prefix, DiscoveryComposed};
     use sync_wire::{SyncComposed, SYNC_COMPOSED_BYTES, SYNC_COMPOSED_VERSION};
@@ -397,12 +396,6 @@ fn composed(stem: &str) -> Option<serde_json::Value> {
         SyncComposed::draw(&prefix)
     };
     let scenario = match stem {
-        "discovery-composed-crossed" => serde_json::to_value(DiscoveryComposed::draw(
-            include_bytes!("fixtures/discovery-composed-crossed.bin"),
-        )),
-        "discovery-composed-late-request" => serde_json::to_value(DiscoveryComposed::draw(
-            include_bytes!("fixtures/discovery-composed-late-request.bin"),
-        )),
         "discovery-composed-two-requests" => {
             let steps = [ask(Request::GetOnePeer), ask(Request::GetHeaderSyncService)];
             let prefix = composed_prefix(0, 1, 0b0000_1100, &steps).unwrap();

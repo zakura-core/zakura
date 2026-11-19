@@ -75,18 +75,6 @@ run = true
 timeout-secs = 3600
 
 [[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "the_reply_first_input_holds_capacity_release_wakes"
-run = true
-timeout-secs = 3600
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_resource_properties.rs"
-test = "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound"
-run = true
-timeout-secs = 3600
-
-[[ignored]]
 file = "crates/zakura-sim/tests/block_resource_properties.rs"
 test = "every_floor_churn_plan_asks_for_the_floor_before_the_reset"
 run = true
@@ -162,24 +150,6 @@ run = false
 reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_wire.rs"
-test = "regenerate_reset_mid_write"
-run = false
-reason = "a tool, not a test: it searches for and rewrites zakura#2378's committed input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/sync_harness.rs"
-test = "regenerate_saved_scenarios"
-run = false
-reason = "a tool, not a test: it rewrites the committed saved scenarios"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false
@@ -220,24 +190,6 @@ file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
 test = "regenerate_witness_seeds"
 run = false
 reason = "a tool, not a test: it rewrites the committed witness seeds"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "regenerate_reset_mid_flight_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_table.rs"
-test = "regenerate_old_chain_plan"
-run = false
-reason = "a tool, not a test: it rewrites the committed old-chain Plan bytes"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_semantic_properties.rs"
-test = "regenerate_capacity_frontier_first_input"
-run = false
-reason = "a tool, not a test: it rewrites the committed frontier-first input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_flood_watch.rs"

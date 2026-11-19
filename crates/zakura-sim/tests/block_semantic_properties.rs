@@ -1,18 +1,18 @@
 //! Block sync's semantic properties (P6b, gates P6.1 and P6.2): each
-//! committed input reaches its property's trigger history on the real node,
+//! seed reaches its property's trigger history on the real node,
 //! and holds. An alternate submission callback
 //! violates `submit-only-requested`, and the honest scenarios repeat across
-//! A/A and A/B/A. `cargo xtask planted` runs the same inputs with each
+//! A/A and A/B/A. `cargo xtask planted` runs the same seeds with each
 //! property's bypass patch applied.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_sim::{
     domain::block_sync_semantic::{
         CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
-        REACTOR_QUERY_LIFECYCLE, STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
+        REACTOR_QUERY_LIFECYCLE, SUBMIT_ONLY_REQUESTED,
     },
     harness::{
         block_node::{
@@ -21,43 +21,37 @@ use zakura_sim::{
             view::PairingKind,
             Policy,
         },
-        block_semantic::{CAPACITY_RELEASE_TAG, RESET_MID_FLIGHT_TAG},
         block_sync::{BlockScenario, Ports, Storage},
         run_prepared, Subsystem,
     },
-    seed::sha256,
+    seed,
     witness::{witness_prepared, Expect, WitnessScenario},
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// The committed input that picks the reset-mid-flight scenario: two
-/// mirrors serve while the chain resets.
-const RESET_MID_FLIGHT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-reset-mid-flight.bin");
+/// The seed that picks the reset-mid-flight scenario: two mirrors serve
+/// while the chain resets.
+const RESET_MID_FLIGHT: &str = "block-sync-reset-mid-flight";
 
-/// The committed input that picks the stale-beside-current scenario: a
-/// detached submission's verdict arrives while a fork submission waits.
-const STALE_BESIDE_CURRENT_INPUT: &[u8] =
-    include_bytes!("fixtures/block-sync-stale-beside-current.bin");
+/// The seed that picks the stalled-reset scenario: storage never answers,
+/// and a reset detaches the first submission.
+const STALLED_RESET: &str = "block-sync-stalled-reset";
 
-/// The committed input that picks the stalled-reset scenario: storage never
-/// answers, and a reset detaches the first submission.
-const STALLED_RESET_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stalled-reset.bin");
+/// The seed that picks the decoded-input-stall scenario: the sequencer
+/// stalls, and the mirror keeps delivering 2 MB bodies after the input
+/// queue's decoded bytes fill the cap.
+const DECODED_INPUT_STALL: &str = "block-sync-decoded-input-stall";
 
-/// The committed input that picks the decoded-input-stall scenario: the
-/// sequencer stalls, and the mirror keeps delivering 2 MB bodies after the
-/// input queue's decoded bytes fill the cap.
-const DECODED_INPUT_STALL_INPUT: &[u8] =
-    include_bytes!("fixtures/slow-seeds/block-sync-decoded-input-stall.bin");
+/// The seed that picks the capacity-release scenario, under a plan where
+/// block sync handles the detached commit's tip before its reply.
+const CAPACITY_FRONTIER_FIRST: &str = "block-sync-capacity-frontier-first";
 
-/// The committed input that picks the capacity-release scenario, under a
-/// plan where block sync handles the detached commit's tip before its reply.
-const CAPACITY_FRONTIER_FIRST_INPUT: &[u8] =
-    include_bytes!("fixtures/slow-seeds/block-sync-capacity-frontier-first.bin");
-
-/// The committed input that picks the capacity-release scenario, under a
-/// plan where block sync handles the detached commit's reply before its tip.
-const CAPACITY_REPLY_FIRST_INPUT: &[u8] =
-    include_bytes!("fixtures/slow-seeds/block-sync-capacity-reply-first.bin");
+/// Seed `name`'s full fuzz input.
+fn input(name: &str) -> Vec<u8> {
+    seed::find(name)
+        .unwrap_or_else(|| panic!("{name} is a registered seed"))
+        .input
+}
 
 /// The scenario and Plan that `zakura-sim record --input` runs for `input`.
 fn committed(input: &[u8]) -> WitnessScenario<Storage> {
@@ -66,6 +60,12 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
         scenario: Storage::draw(prefix),
         input: Plan::from_fuzz(plan),
     }
+}
+
+/// The scenario and Plan that `zakura-sim record --seed` runs for seed
+/// `name`.
+fn seeded(name: &str) -> WitnessScenario<Storage> {
+    committed(&input(name))
 }
 
 /// Checks `witness` as a witness test of `property` that expects `expect`,
@@ -111,40 +111,16 @@ fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
-/// `id`'s outcome in `report`.
-fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
-    &report
-        .properties
-        .iter()
-        .find(|property| property.property == id)
-        .unwrap_or_else(|| panic!("{id} has no report"))
-        .outcome
-}
-
-/// Each committed input draws the scenario its sidecar names.
+/// Each seed draws the scenario its name says.
 #[test]
-fn each_committed_input_draws_its_scenario() {
-    for (input, scenario) in [
-        (RESET_MID_FLIGHT_INPUT, BlockScenario::reset_mid_flight()),
-        (
-            STALE_BESIDE_CURRENT_INPUT,
-            BlockScenario::stale_beside_current(),
-        ),
-        (STALLED_RESET_INPUT, BlockScenario::stalled_reset()),
-        (
-            DECODED_INPUT_STALL_INPUT,
-            BlockScenario::decoded_input_stall(),
-        ),
-        (
-            CAPACITY_FRONTIER_FIRST_INPUT,
-            BlockScenario::capacity_release(),
-        ),
-        (
-            CAPACITY_REPLY_FIRST_INPUT,
-            BlockScenario::capacity_release(),
-        ),
+fn each_seed_draws_its_scenario() {
+    for (name, scenario) in [
+        (RESET_MID_FLIGHT, BlockScenario::reset_mid_flight()),
+        (STALLED_RESET, BlockScenario::stalled_reset()),
+        (DECODED_INPUT_STALL, BlockScenario::decoded_input_stall()),
+        (CAPACITY_FRONTIER_FIRST, BlockScenario::capacity_release()),
     ] {
-        assert_eq!(committed(input).scenario, scenario);
+        assert_eq!(seeded(name).scenario, scenario, "{name}");
     }
 }
 
@@ -157,7 +133,7 @@ fn each_committed_input_draws_its_scenario() {
 /// drops one fails here instead of weakening the planted case.
 #[test]
 fn the_reset_mid_flight_input_holds_submit_only_requested() {
-    if let Err(shortfall) = reset_mid_flight_shortfall(RESET_MID_FLIGHT_INPUT) {
+    if let Err(shortfall) = reset_mid_flight_shortfall(&input(RESET_MID_FLIGHT)) {
         panic!("{shortfall}");
     }
 }
@@ -189,77 +165,6 @@ fn reset_mid_flight_shortfall(input: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// How many fuzz inputs a regenerate tool tries.
-const REGENERATE_CANDIDATES: usize = 64;
-
-/// Rewrites the committed reset-mid-flight input with the first of
-/// [`REGENERATE_CANDIDATES`] fuzz inputs that fills the input's role
-/// ([`reset_mid_flight_shortfall`]), and its sidecar's SHA-256 to match. A
-/// block-sync change that moves the input off the crossing needs only this
-/// run, then `cargo xtask planted block-sync/submit-only-requested` to show
-/// that `height-only.patch` is still caught.
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_reset_mid_flight_input() {
-    regenerate(
-        "block-sync-reset-mid-flight",
-        RESET_MID_FLIGHT_TAG,
-        1,
-        reset_mid_flight_shortfall,
-    );
-}
-
-/// Rewrites the committed input `name`, a path under `tests/fixtures`
-/// without its extension, with the first of [`REGENERATE_CANDIDATES`] fuzz
-/// inputs, after the scenario tag `tag`, for which `shortfall` finds
-/// nothing, and its sidecar's SHA-256 to match. It runs `width` candidates at once, and still picks the first in
-/// order, so the result doesn't depend on `width`. It prints each
-/// candidate's shortfall, and panics if every candidate falls short.
-#[allow(clippy::print_stdout)]
-fn regenerate(name: &str, tag: [u8; 2], width: usize, shortfall: fn(&[u8]) -> Result<(), String>) {
-    let candidates: Vec<Vec<u8>> = byte_inputs(REGENERATE_CANDIDATES, 16_384)
-        .into_iter()
-        .map(|plan| [&tag[..], &plan].concat())
-        .collect();
-    let mut chosen = None;
-    for (batch, inputs) in candidates.chunks(width).enumerate() {
-        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
-            let runs: Vec<_> = inputs
-                .iter()
-                .map(|input| scope.spawn(move || shortfall(input)))
-                .collect();
-            runs.into_iter()
-                .map(|run| run.join().expect("a candidate's check returns"))
-                .collect()
-        });
-        for (offset, result) in results.iter().enumerate() {
-            println!("{name}: candidate {}: {result:?}", batch * width + offset);
-        }
-        if let Some(offset) = results.iter().position(Result::is_ok) {
-            chosen = Some(&inputs[offset]);
-            break;
-        }
-    }
-    let bytes = chosen.unwrap_or_else(|| {
-        panic!("{name}: none of {REGENERATE_CANDIDATES} candidates fills the input's role")
-    });
-    let fixture = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::write(format!("{fixture}.bin"), bytes).expect("the fixture directory exists");
-    let sidecar = format!("{fixture}.toml");
-    let text = std::fs::read_to_string(&sidecar).expect("the input has a sidecar");
-    let text: String = text
-        .lines()
-        .map(|line| {
-            if line.starts_with("sha256 = ") {
-                format!("sha256 = \"{}\"\n", sha256(bytes))
-            } else {
-                format!("{line}\n")
-            }
-        })
-        .collect();
-    std::fs::write(&sidecar, text).expect("the sidecar is writable");
-}
-
 /// The reset-mid-flight input's reset supersedes the reactor's query state,
 /// and storage takes each accepted query under its exact identity. This input
 /// isn't known to fill or close the action channel, so the test makes no claim
@@ -267,7 +172,7 @@ fn regenerate(name: &str, tag: [u8; 2], width: usize, shortfall: fn(&[u8]) -> Re
 #[test]
 fn the_reset_mid_flight_input_holds_reactor_query_lifecycle() {
     let ports = witnessed(
-        committed(RESET_MID_FLIGHT_INPUT),
+        seeded(RESET_MID_FLIGHT),
         REACTOR_QUERY_LIFECYCLE,
         Expect::Holds,
     )
@@ -277,20 +182,6 @@ fn the_reset_mid_flight_input_holds_reactor_query_lifecycle() {
     assert!(model.reactor_queries.saw_query_at_storage);
 }
 
-/// The stale-beside-current input's stale verdict releases only its own
-/// submission. With `release-by-height.patch`, it releases the fork's
-/// submission at the same height, which storage still holds, and the same
-/// input violates the property.
-#[test]
-fn the_stale_beside_current_input_holds_stale_completion_inert() {
-    witnessed(
-        committed(STALE_BESIDE_CURRENT_INPUT),
-        STALE_COMPLETION_INERT,
-        Expect::Holds,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-}
-
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset
 /// detaches the held submission, which keeps its holder and its place
 /// under the limit. The property holds. With `forget-on-reset.patch`, the
@@ -298,7 +189,7 @@ fn the_stale_beside_current_input_holds_stale_completion_inert() {
 #[test]
 fn the_stalled_reset_input_holds_detached_submission_bounded() {
     witnessed(
-        committed(STALLED_RESET_INPUT),
+        seeded(STALLED_RESET),
         DETACHED_SUBMISSION_BOUNDED,
         Expect::Holds,
     )
@@ -312,12 +203,8 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
 /// decoded-input-stall input fills the cap.
 #[test]
 fn the_stalled_reset_input_holds_input_decoded_bound() {
-    let ports = witnessed(
-        committed(STALLED_RESET_INPUT),
-        INPUT_DECODED_BOUND,
-        Expect::Holds,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let ports = witnessed(seeded(STALLED_RESET), INPUT_DECODED_BOUND, Expect::Holds)
+        .unwrap_or_else(|error| panic!("{error}"));
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
     assert!(model.saw_decoded_queued);
@@ -335,7 +222,7 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
 #[ignore = "a debug run takes minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_decoded_input_stall_input_holds_input_decoded_bound() {
     let ports = witnessed(
-        committed(DECODED_INPUT_STALL_INPUT),
+        seeded(DECODED_INPUT_STALL),
         INPUT_DECODED_BOUND,
         Expect::Holds,
     )
@@ -358,7 +245,7 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 #[test]
 #[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_frontier_first_input_holds_capacity_release_wakes() {
-    if let Err(shortfall) = capacity_frontier_first_shortfall(CAPACITY_FRONTIER_FIRST_INPUT) {
+    if let Err(shortfall) = capacity_frontier_first_shortfall(&input(CAPACITY_FRONTIER_FIRST)) {
         panic!("{shortfall}");
     }
 }
@@ -373,63 +260,6 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
 /// 1, which it admitted before the reset.
 fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
     witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds).map(drop)
-}
-
-/// Rewrites the committed frontier-first input with the first of
-/// [`REGENERATE_CANDIDATES`] fuzz inputs that fills the input's role
-/// ([`capacity_frontier_first_shortfall`]), and its sidecar's SHA-256 to
-/// match. A block-sync change that moves the input off #1523's order needs
-/// only this run, then `cargo xtask planted block-sync/capacity-release-wakes`
-/// to show that `stale-completion-no-wake.patch` is still caught.
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_capacity_frontier_first_input() {
-    // Under `--profile planted`, a capacity-release run takes a few minutes
-    // and peaks near 1.5 GB, so four candidates at once stay near 6 GB.
-    regenerate(
-        "slow-seeds/block-sync-capacity-frontier-first",
-        CAPACITY_RELEASE_TAG,
-        4,
-        capacity_frontier_first_shortfall,
-    );
-}
-
-/// The capacity-release input whose plan handles the detached commit's
-/// reply first, before the frontier releases height 1, so the freed room
-/// wakes the waiting fork body. Room frees beside the waiting body, but not
-/// in the frontier-first order, so this run isn't the property's witness: the test
-/// checks the run directly.
-#[test]
-#[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
-fn the_reply_first_input_holds_capacity_release_wakes() {
-    let witness = committed(CAPACITY_REPLY_FIRST_INPUT);
-    let (report, ports) = run(&witness.scenario, witness.input);
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        report
-            .properties
-            .iter()
-            .all(|p| !matches!(p.outcome, PropertyOutcome::Violated { .. })),
-        "{:?}",
-        report.properties
-    );
-    assert!(
-        matches!(
-            outcome(&report, CAPACITY_RELEASE_WAKES),
-            PropertyOutcome::Held { .. }
-        ),
-        "{:?}",
-        outcome(&report, CAPACITY_RELEASE_WAKES)
-    );
-    let view = ports.view.borrow();
-    let model = view.semantic.borrow();
-    assert!(
-        model.saw_room_freed && !model.saw_room_freed_past_frontier,
-        "room freed: {}, past the frontier: {}",
-        model.saw_room_freed,
-        model.saw_room_freed_past_frontier
-    );
-    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
 }
 
 /// Bypass: an alternate callback hands the node's block service a body

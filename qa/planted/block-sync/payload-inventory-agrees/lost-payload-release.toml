@@ -1,2 +1,2 @@
-seed = "block-sync-handoff"
+seed = "block-sync-stalled-reset"
 checks = ["crates/zakura-sim/src/domain/block_sync.rs"]

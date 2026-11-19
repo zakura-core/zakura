@@ -787,8 +787,8 @@ fn state_is_only_frontier_publisher() {
 
     assert!(
         STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER
-                .contains("fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect)"),
+            && STATE_PUBLISHER.contains("views: watch::Sender<CommittedHeaderChainView>")
+            && STATE_PUBLISHER.contains("self.views.send_replace("),
         "state must retain the sole committed-snapshot publisher"
     );
 }

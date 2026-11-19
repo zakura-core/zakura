@@ -15,6 +15,7 @@ pub mod grammar;
 pub mod liveness;
 mod release_wake;
 mod repair;
+pub mod storage_witnesses;
 
 pub use flood::{Flood, FloodScenario, FLOODERS};
 pub use liveness::Liveness;

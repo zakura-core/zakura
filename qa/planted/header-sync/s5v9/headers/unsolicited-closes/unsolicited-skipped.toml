@@ -7,5 +7,5 @@
 # Besides the files the patch changes, the rest of these decide which
 # frames the input's peers send and when the node judges them. A change
 # there can move the input off its frame.
-input = "crates/zakura-sim/tests/fixtures/header-wire-unsolicited.bin"
+seed = "header-wire-unsolicited"
 checks = ["crates/zakura-network/src/zakura/transport", "crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

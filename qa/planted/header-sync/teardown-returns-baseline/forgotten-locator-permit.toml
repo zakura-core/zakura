@@ -6,7 +6,7 @@
 # required failure is `TeardownLocatorPermits`, once the stopped
 # reactor's task ends. The input's node reads a locator and then shuts
 # down.
-input = "crates/zakura-sim/tests/fixtures/header-storage-w-stop-storage.bin"
+seed = "header-storage-w-stop-storage"
 # Besides dispatch.rs, which the patch changes, the rest of header sync
 # decides when the node reads a locator and when it stops. A change there
 # can move the input off a locator read before its shutdown.

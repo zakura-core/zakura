@@ -8,4 +8,3 @@ checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network
 [typed]
 harness = "header-sync/storage"
 scenario = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-limit.json"
-plan = "crates/zakura-sim/tests/fixtures/header-outstanding-serving-limit.plan"

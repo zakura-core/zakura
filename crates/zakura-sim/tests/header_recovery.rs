@@ -18,9 +18,10 @@ use std::{
     sync::Arc,
 };
 
-use support::{inputs, storage_witnesses};
+use support::inputs;
 use tempfile::TempDir;
 use zakura_scheduler::SimInstant;
+use zakura_sim::harness::header_sync::storage_witnesses;
 use zakura_sim::{
     check::after_step,
     check::Phase,

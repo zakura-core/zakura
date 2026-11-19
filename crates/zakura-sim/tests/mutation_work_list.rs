@@ -310,10 +310,13 @@ fn check_witness(owner: &str, witness: &serde_json::Value) {
             "{owner}: {} has no test {test}",
             file.display()
         );
+    } else if let Some(name) = field("seed") {
+        assert!(
+            zakura_sim::seed::find(name).is_some(),
+            "{owner}: no seed is named {name}"
+        );
     } else {
-        let path = field("planted")
-            .or_else(|| field("input"))
-            .unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
+        let path = field("planted").unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
         assert!(root().join(path).is_file(), "{owner}: {path} doesn't exist");
     }
 }

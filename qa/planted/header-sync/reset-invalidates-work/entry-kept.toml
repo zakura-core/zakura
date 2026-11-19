@@ -12,4 +12,3 @@ also_violates = ["header-sync/outstanding-work-bounded"]
 [typed]
 harness = "header-sync/storage"
 scenario = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.json"
-plan = "crates/zakura-sim/tests/fixtures/header-reset-held-prepare.plan"

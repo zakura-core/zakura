@@ -3,7 +3,7 @@
 # input handles the detached commit's tip first, so the frontier releases
 # height 1 before its stale reply frees room, and the waiting fork body
 # stays unsubmitted.
-input = "crates/zakura-sim/tests/fixtures/slow-seeds/block-sync-capacity-frontier-first.bin"
+seed = "block-sync-capacity-frontier-first"
 # Besides sequencer_task.rs, which the patch changes, the rest of block sync
 # decides whether the tip or the reply arrives first. A change there can
 # move the input off that order.

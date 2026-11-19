@@ -15,10 +15,7 @@ mod support;
 
 use std::{cell::RefCell, rc::Rc};
 
-use support::{
-    inputs,
-    storage_witnesses::{hold, mirror, step, NODE, SOURCE},
-};
+use support::inputs;
 use zakura_sim::{
     check::after_step,
     domain::header_sync::{
@@ -34,7 +31,10 @@ use zakura_sim::{
             stale::StaleEvidence,
             Chain, ControlAction, Policy, Reset,
         },
-        header_sync::{Dialer, Storage, StorageScenario, Weights},
+        header_sync::{
+            storage_witnesses::{hold, mirror, step, NODE, SOURCE},
+            Dialer, Storage, StorageScenario, Weights,
+        },
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},

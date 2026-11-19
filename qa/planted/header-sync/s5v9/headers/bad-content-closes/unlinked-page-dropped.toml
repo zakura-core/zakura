@@ -8,5 +8,5 @@
 # Besides peer.rs, which the patch changes, the rest of header sync
 # decides which pages the input's peer sends and when the node judges
 # them. A change there can move the input off its page.
-input = "crates/zakura-sim/tests/fixtures/header-wire-bad-content.bin"
+seed = "header-wire-bad-content"
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation"]

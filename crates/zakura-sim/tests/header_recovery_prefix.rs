@@ -10,9 +10,9 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use support::{
-    byte_inputs, inputs,
-    storage_witnesses::{hold, recover, recovering, reset, SOURCE},
+use support::{byte_inputs, inputs};
+use zakura_sim::harness::header_sync::storage_witnesses::{
+    hold, recover, recovering, reset, SOURCE,
 };
 use zakura_sim::{
     domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,

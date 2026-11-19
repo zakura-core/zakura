@@ -7,8 +7,11 @@
 //! `--planted <prefix>`, the retained `qa/planted/` cases whose path under
 //! `qa/planted/` starts with the prefix. A property ID prefix selects its
 //! cases, and a case's path without `.patch` selects that case alone. Each case names a patch, the property the patch
-//! must violate, and one witness: a planted case's committed input or
-//! typed scenario, a committed fuzz input, or one `zakura-sim` test.
+//! must violate, and one witness: a planted case's seed or typed scenario,
+//! a seed of the simulator's registry by name, or one `zakura-sim` test.
+//! The unpatched build lists the registry, which names each seed's
+//! harness, and writes each seed's input, which every slot runs
+//! ([`super::seeds`]).
 //!
 //! The runner checks out `HEAD`, the pinned revision, once per worker slot
 //! under `--work`. Each slot owns its worktree and target directory, and
@@ -61,7 +64,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     process::Command,
     sync::{atomic::Ordering, Mutex},
     thread,
@@ -80,7 +83,9 @@ use super::{
     lane::{sim_build_failure, BuildFailure},
     patched_files,
     pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
-    planted_layout, provenance, remove_worktree, CaseFile, PLANTED_DIR, PROFILE, SHARED,
+    planted_layout, provenance, remove_worktree,
+    seeds::{self, Registry},
+    CaseFile, PLANTED_DIR, PROFILE, SHARED,
 };
 use crate::{
     run_command,
@@ -141,15 +146,15 @@ const POLL: Duration = Duration::from_millis(50);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(super) enum WitnessSpec {
-    /// A retained planted case's committed input or typed scenario.
+    /// A retained planted case's seed or typed scenario.
     Planted {
         /// The case file, relative to the repository root.
         planted: PathBuf,
     },
-    /// A committed fuzz input, whose sidecar names its harness.
-    Input {
-        /// The input, relative to the repository root.
-        input: PathBuf,
+    /// A seed of the simulator's registry, which names its harness.
+    Seed {
+        /// The seed's name.
+        seed: String,
     },
     /// One `zakura-sim` integration test.
     Test {
@@ -200,6 +205,9 @@ enum Runnable {
         args: Vec<String>,
         property: String,
     },
+    /// `zakura-sim record` of a seed, before the registry names its harness
+    /// ([`resolve_seeds`]), which makes it a [`Runnable::Record`].
+    Seed { name: String, property: String },
     /// One test in one test binary.
     Test { target: String, test: String },
     /// `zakura-sim generate`'s search on a harness: `runs` inputs drawn
@@ -720,20 +728,17 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
         WitnessSpec::Planted { planted } => {
             watched.push(planted.clone());
             let file: CaseFile = toml::from_str(&fs::read_to_string(repo_root.join(planted))?)?;
-            if let Some(input) = file.input {
-                watched.push(input.with_extension("toml"));
-                watched.push(input);
+            if file.seed.is_some() {
+                watched.push(PathBuf::from(seeds::REGISTRY));
             }
             if let Some(typed) = file.typed {
                 let plan = typed.plan_file()?;
-                watched.extend([typed.scenario, plan.path().to_path_buf()]);
+                watched.push(typed.scenario);
+                watched.extend(plan.map(|plan| plan.path().to_path_buf()));
             }
             watched.extend(file.checks);
         }
-        WitnessSpec::Input { input } => {
-            watched.push(input.with_extension("toml"));
-            watched.push(input.clone());
-        }
+        WitnessSpec::Seed { .. } => watched.push(PathBuf::from(seeds::REGISTRY)),
         WitnessSpec::Test { test_target, .. } => {
             watched.push(PathBuf::from(format!(
                 "crates/zakura-sim/tests/{test_target}.rs"
@@ -951,14 +956,13 @@ impl Runner {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let runnables = &slot_runnables[0];
         let source = provenance::Provenance::read(&slots[0].tree, provenance::SOURCE_PATHS).source;
         let all: Vec<usize> = (0..cases.len()).collect();
         let host_jobs = thread::available_parallelism().map_or(1, usize::from);
         let baseline_dir = self.out.join("baseline");
         let built = match self.build(
             &slots[0],
-            runnables,
+            &slot_runnables[0],
             &all,
             self.generate.on(),
             &baseline_dir,
@@ -967,6 +971,23 @@ impl Runner {
             Ok(built) => built,
             Err(failure) => return Err(format!("the unpatched build fails: {failure}").into()),
         };
+        // Only the simulator lists the registry, and a build without it
+        // runs only tests, so no seed.
+        let registry = match &built.sim {
+            Some(sim) => Some((sim, Registry::read(sim, &baseline_dir.join("seeds"))?)),
+            None => None,
+        };
+        let slot_runnables = match &registry {
+            Some((sim, registry)) => resolve_seeds(
+                slot_runnables,
+                sim,
+                registry,
+                &baseline_dir.join("seed-inputs"),
+            )?,
+            None => slot_runnables,
+        };
+        let registry = registry.map(|(_, registry)| registry);
+        let runnables = &slot_runnables[0];
         // Every slot starts from slot 0's dependencies, so a slot's first
         // mutant rebuilds only the workspace crates.
         for slot in &slots[1..] {
@@ -990,8 +1011,11 @@ impl Runner {
         }
         let baselines = self.baselines(cases, runnables, &slots[0], &built, &source)?;
         let (lanes, generate, found) = if self.generate.on() {
+            let registry = registry
+                .as_ref()
+                .ok_or("the generator lanes' build made no zakura-sim binary")?;
             let (lanes, config, found) =
-                self.lanes(cases, runnables, &slots[0], &built, &source)?;
+                self.lanes(cases, runnables, &slots[0], &built, &source, registry)?;
             (Some(lanes), Some(config), found)
         } else {
             (None, None, generate::BaselineFound::default())
@@ -1395,7 +1419,7 @@ impl Runner {
             .iter()
             .filter_map(|index| match &runnables[*index] {
                 Runnable::Test { target, .. } => Some(target.as_str()),
-                Runnable::Record { .. } | Runnable::Generate { .. } => None,
+                Runnable::Record { .. } | Runnable::Seed { .. } | Runnable::Generate { .. } => None,
             })
             .collect();
         let mut built = Built::default();
@@ -1490,6 +1514,9 @@ impl Runner {
                     .args(["--witness", property, "--expect", "holds"]);
                 (command, None)
             }
+            Runnable::Seed { name, .. } => {
+                return Err(format!("the registry never named the seed {name}'s harness").into())
+            }
             Runnable::Generate {
                 harness,
                 seed,
@@ -1563,18 +1590,12 @@ impl Runner {
     }
 }
 
-/// How the runner runs `witness` for `property`, reading a planted case or
-/// an input's sidecar from `tree`.
+/// How the runner runs `witness` for `property`, reading a planted case
+/// from `tree`. A seed's run waits for the registry ([`resolve_seeds`]).
 fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnable, BoxError> {
-    let input_args = |input: &Path| -> Result<Runnable, BoxError> {
-        Ok(Runnable::Record {
-            harness: super::harness_of(tree, input)?,
-            args: vec![
-                "--input".to_owned(),
-                tree.join(input).to_string_lossy().into_owned(),
-            ],
-            property: property.to_owned(),
-        })
+    let seed = |name: &str| Runnable::Seed {
+        name: name.to_owned(),
+        property: property.to_owned(),
     };
     match witness {
         WitnessSpec::Planted { planted } => {
@@ -1584,31 +1605,36 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
                     .map_err(|error| format!("{}: {error}", path.display()))?,
             )
             .map_err(|error| format!("{}: {error}", path.display()))?;
-            match (file.input, file.typed) {
-                (Some(input), None) => input_args(&input),
+            match (file.seed, file.typed) {
+                (Some(name), None) => Ok(seed(&name)),
                 (None, Some(typed)) => {
                     let plan = typed
                         .plan_file()
                         .map_err(|error| format!("{}: {error}", path.display()))?;
-                    Ok(Runnable::Record {
-                        harness: typed.harness,
-                        args: vec![
-                            "--scenario".to_owned(),
-                            fs::read_to_string(tree.join(&typed.scenario))?,
+                    let mut args = vec![
+                        "--scenario".to_owned(),
+                        fs::read_to_string(tree.join(&typed.scenario))?,
+                    ];
+                    if let Some(plan) = plan {
+                        args.extend([
                             plan.flag().to_owned(),
                             tree.join(plan.path()).to_string_lossy().into_owned(),
-                        ],
+                        ]);
+                    }
+                    Ok(Runnable::Record {
+                        harness: typed.harness,
+                        args,
                         property: property.to_owned(),
                     })
                 }
                 _ => Err(format!(
-                    "{}: names neither or both of input and typed",
+                    "{}: names neither or both of seed and typed",
                     path.display()
                 )
                 .into()),
             }
         }
-        WitnessSpec::Input { input } => input_args(input),
+        WitnessSpec::Seed { seed: name } => Ok(seed(name)),
         WitnessSpec::Test { test, test_target } => Ok(Runnable::Test {
             target: test_target.clone(),
             test: test.clone(),
@@ -1616,11 +1642,57 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
     }
 }
 
+/// Each slot's runnables of `slot_runnables` with every seed's run a
+/// `zakura-sim record --input` of the seed's input, on the harness
+/// `registry` names. `sim`, the unpatched build's `zakura-sim`, writes each
+/// input under `inputs`: a seed's builder can run the code a mutant
+/// changes, so every slot runs the unpatched build's input. Fails on a seed
+/// the registry lacks or rejects.
+fn resolve_seeds(
+    slot_runnables: Vec<Vec<Runnable>>,
+    sim: &Path,
+    registry: &Registry,
+    inputs: &Path,
+) -> Result<Vec<Vec<Runnable>>, BoxError> {
+    let mut written: BTreeMap<String, PathBuf> = BTreeMap::new();
+    slot_runnables
+        .into_iter()
+        .map(|runnables| {
+            runnables
+                .into_iter()
+                .map(|runnable| match runnable {
+                    Runnable::Seed { name, property } => {
+                        let file = match written.get(&name) {
+                            Some(file) => file.clone(),
+                            None => {
+                                let seed = registry.seed(&name)?;
+                                let file = path::absolute(seeds::write_input(
+                                    sim,
+                                    seed,
+                                    &inputs.join(&name),
+                                )?)?;
+                                written.insert(name.clone(), file.clone());
+                                file
+                            }
+                        };
+                        Ok(Runnable::Record {
+                            harness: registry.harness(&name)?,
+                            args: vec!["--input".to_owned(), file.display().to_string()],
+                            property,
+                        })
+                    }
+                    runnable => Ok(runnable),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// A case's witness in words.
 fn describe(witness: &WitnessSpec) -> String {
     match witness {
         WitnessSpec::Planted { planted } => planted.display().to_string(),
-        WitnessSpec::Input { input } => input.display().to_string(),
+        WitnessSpec::Seed { seed } => format!("seed {seed}"),
         WitnessSpec::Test { test, test_target } => format!("{test_target}::{test}"),
     }
 }

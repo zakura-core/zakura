@@ -7,7 +7,7 @@
 # forgotten reservation unreported and uncapped, where the resource probe
 # catches it instead. The input's node reserves headers for its first
 # mirror.
-input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+seed = "header-storage-close-relink"
 # Besides peer_work.rs, which the patch changes, the reactor decides when
 # the node first reserves. A change there can move the input off that
 # reservation.

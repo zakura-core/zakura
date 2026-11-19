@@ -1,2 +1,2 @@
-input = "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin"
+seed = "block-decoded-retention"
 checks = ["crates/zakura-node-services/src/block_memory/model.rs"]

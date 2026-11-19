@@ -7,7 +7,7 @@
 # reactor's task ends. The input shuts the node down once its first apply
 # is submitted, with that apply held until storage stops, so its round
 # still holds reserved headers at the stop.
-input = "crates/zakura-sim/tests/fixtures/header-storage-w-stop-storage.bin"
+seed = "header-storage-w-stop-storage"
 # Besides reactor.rs, which the patch changes, the queue decides what the
 # node still holds at its shutdown. A change there can move the input off
 # a reserved round.

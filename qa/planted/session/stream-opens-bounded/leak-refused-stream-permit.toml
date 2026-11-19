@@ -1,2 +1,2 @@
-input = "crates/zakura-sim/tests/fixtures/handshake-stream-churn.bin"
+seed = "handshake-stream-churn"
 checks = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/lifetime.rs"]

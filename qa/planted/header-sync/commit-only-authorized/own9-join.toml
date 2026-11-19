@@ -6,7 +6,7 @@
 # failure. The input is the saved reopen Plan, whose peer finishes its
 # header stream once both subscriptions end, so the node reopens it on the
 # same connection.
-input = "crates/zakura-sim/tests/fixtures/header-wire-reopen.bin"
+seed = "header-wire-reopen"
 # The reactor and the subscriber decide when both subscriptions end, and so
 # when the peer finishes its stream and the node reopens it, so a change
 # there can move the input off the reopen.

@@ -170,7 +170,7 @@
     "entry": "bounds",
     "property": "block-sync/reserved-byte-bound",
     "witness": {
-      "input": "crates/zakura-sim/tests/fixtures/block-sync-floor-lane-race.bin"
+      "seed": "block-sync-floor-lane-race"
     },
     "fault_class": "boundary-accounting"
   },
@@ -224,7 +224,7 @@
     "entry": "budget-ledgers-agree",
     "property": "block-sync/budget-ledgers-agree",
     "witness": {
-      "test": "the_handoff_input_holds_budget_ledgers_agree",
+      "test": "the_stalled_reset_seed_holds_budget_ledgers_agree",
       "test_target": "block_resource_properties"
     },
     "fault_class": "resource-lifetime"

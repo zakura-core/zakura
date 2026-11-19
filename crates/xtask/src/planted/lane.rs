@@ -75,8 +75,37 @@ pub(in crate::planted) struct LaneSpec<'a> {
     pub(in crate::planted) feedback: &'a str,
     /// Extra libFuzzer flags for the target, such as `-len_control=0`.
     pub(in crate::planted) libfuzzer_args: &'a [String],
-    /// The directory the campaign's initial inputs come from.
-    pub(in crate::planted) corpus: &'a Path,
+    /// Where the campaign's initial inputs come from.
+    pub(in crate::planted) corpus: StartCorpus<'a>,
+}
+
+/// Where a lane's campaign takes its initial inputs from. Every lane starts
+/// from no input; how `campaign start` says so depends on the tree's
+/// simulator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::planted) enum StartCorpus<'a> {
+    /// `--seeds none`, for a tree that builds its seeds in code.
+    NoSeeds,
+    /// `--fixtures <dir>` with an empty directory, for a pinned tree from
+    /// before seeds were built in code, which loads its seeds from fixture
+    /// directories.
+    EmptyFixtures(&'a Path),
+}
+
+impl<'a> StartCorpus<'a> {
+    /// How `tree`'s `campaign start` starts from no input: [`NoSeeds`] if
+    /// the tree has the seed registry, `crates/zakura-sim/src/seed/mod.rs`,
+    /// and [`EmptyFixtures`] with `empty` if not.
+    ///
+    /// [`NoSeeds`]: StartCorpus::NoSeeds
+    /// [`EmptyFixtures`]: StartCorpus::EmptyFixtures
+    pub(in crate::planted) fn of_tree(tree: &Path, empty: &'a Path) -> StartCorpus<'a> {
+        if tree.join("crates/zakura-sim/src/seed/mod.rs").is_file() {
+            StartCorpus::NoSeeds
+        } else {
+            StartCorpus::EmptyFixtures(empty)
+        }
+    }
 }
 
 /// Why a build failed.
@@ -384,8 +413,16 @@ pub(in crate::planted) fn start_args(
         args.push("--libfuzzer-arg".into());
         args.push(arg.into());
     }
-    args.push("--fixtures".into());
-    args.push(spec.corpus.into());
+    match spec.corpus {
+        StartCorpus::NoSeeds => {
+            args.push("--seeds".into());
+            args.push("none".into());
+        }
+        StartCorpus::EmptyFixtures(dir) => {
+            args.push("--fixtures".into());
+            args.push(dir.into());
+        }
+    }
     args
 }
 

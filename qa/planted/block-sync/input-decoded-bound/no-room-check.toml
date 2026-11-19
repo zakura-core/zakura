@@ -2,7 +2,7 @@
 # block beside the raw bytes, as the routine did before #1522's fix. The
 # input pauses the sequencer, so the queue's decoded bodies pass the
 # decoded-byte cap by far more than one body per routine.
-input = "crates/zakura-sim/tests/fixtures/slow-seeds/block-sync-decoded-input-stall.bin"
+seed = "block-sync-decoded-input-stall"
 # Besides reorder.rs, which the patch changes, the rest of block sync
 # decides which bodies reach the queue and when. A change there can move
 # the input's bodies off the cap. The case takes about a minute, so changes

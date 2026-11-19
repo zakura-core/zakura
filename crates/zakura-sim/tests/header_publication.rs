@@ -9,7 +9,7 @@ mod support;
 
 use std::{cell::RefCell, collections::HashMap, fs, path::PathBuf, process::Command, rc::Rc};
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
@@ -519,8 +519,8 @@ fn a_quiet_startup_adopts_only_the_seeded_record() {
 }
 
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-publication-<name>.json` with its Plan bytes
-/// beside it in `header-publication-<name>.plan`.
+/// as `tests/fixtures/header-publication-<name>.json`.
+/// Each runs under the empty Plan.
 fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     [
         ("invalidate-only", invalidate_only()),
@@ -530,11 +530,6 @@ fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     ]
 }
 
-/// The Plan bytes every committed witness runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture `header-publication-<name>.<extension>`.
 fn fixture(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -542,8 +537,8 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-publication-{name}.{extension}"))
 }
 
-/// Each committed witness is its builder's scenario, as JSON, with the
-/// fixed Plan bytes, and holds and applies under them.
+/// Each committed witness is its builder's scenario, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_witnesses_match_their_builders() {
     for (name, scenario) in committed_witnesses() {
@@ -555,16 +550,9 @@ fn the_committed_witnesses_match_their_builders() {
         assert_eq!(
             serde_json::to_value(&committed).expect("scenarios serialize"),
             serde_json::to_value(&scenario).expect("scenarios serialize"),
-            "{name}: run `regenerate_publication_witnesses`"
+            "{name}"
         );
-        let plan =
-            fs::read(fixture(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_publication_witnesses`"
-        );
-        let (report, _) = run(&scenario, zakura_sim::Plan::from_fuzz(&plan));
+        let (report, _) = run(&scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
                 outcome(&report, STATE_PUBLICATION_CONSISTENT),
@@ -575,24 +563,13 @@ fn the_committed_witnesses_match_their_builders() {
     }
 }
 
-/// Rewrites the committed witnesses from their builders.
-#[test]
-#[ignore = "rewrites the committed publication witnesses"]
-fn regenerate_publication_witnesses() {
-    for (name, scenario) in committed_witnesses() {
-        let json = serde_json::to_string_pretty(&scenario).expect("scenarios serialize");
-        fs::write(fixture(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture(name, "plan"), committed_plan()).expect("the fixture directory exists");
-    }
-}
-
 /// The invalidate-only witness's log and the property's report depend only
 /// on the scenario and the plan: plan A twice, then B, then A again, gives
 /// A's every time, and B's log differs.
 #[test]
 fn the_publication_witness_repeats_a_a_and_a_b_a() {
     let scenario = invalidate_only();
-    let plans = [committed_plan(), vec![7; 256]];
+    let plans = [Vec::new(), vec![7; 256]];
     let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
         .into_iter()
         .map(|plan| {
@@ -629,8 +606,6 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             Storage::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture(name, "plan").to_str().expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

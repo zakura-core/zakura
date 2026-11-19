@@ -18,4 +18,3 @@ also_violates = ["header-sync/peer-retirement-progress"]
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-recovery-closes.json"
-plan = "crates/zakura-sim/tests/fixtures/header-recovery-closes.plan"

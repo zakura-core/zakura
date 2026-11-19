@@ -113,6 +113,24 @@ impl ExchangeModel {
         Labels::NONE
     }
 
+    /// Opens one more request from `session`'s peer, one that
+    /// [`ExchangeModel::request_frame`] labelled `OverMargin` by this model's
+    /// count but that the node can still admit: its answers can cross the
+    /// request in flight, so the node's own count may be lower. A node that
+    /// refuses it closes the session, so the request stays open for as
+    /// long as the model is read.
+    ///
+    /// # Panics
+    ///
+    /// If the node hasn't advertised a limit on `session`.
+    pub fn open_crossed(&mut self, session: SessionId) {
+        let served = self
+            .served
+            .get_mut(&session)
+            .expect("the node advertises a limit when the session starts");
+        served.open = served.open.saturating_add(1);
+    }
+
     /// The node wrote the ending of one answer on `session`. False if none
     /// is open.
     pub fn answered(&mut self, session: SessionId) -> bool {

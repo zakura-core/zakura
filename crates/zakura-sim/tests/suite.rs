@@ -711,12 +711,12 @@ fn every_problem_is_reported_at_once() {
         row.harness == "header-sync/flood"
     });
     remove(&mut suite.ignored, |row| {
-        row.test == "regenerate_wait_complete_input"
+        row.test == "regenerate_planted_reader_scenarios"
     });
     remove(&mut suite.target, |row| row.name == "race_fixtures");
     let problems = problems(&suite);
     assert_problem(&problems, "no target runs the harness `header-sync/flood`");
-    assert_problem(&problems, "regenerate_wait_complete_input is ignored");
+    assert_problem(&problems, "regenerate_planted_reader_scenarios is ignored");
     assert_problem(&problems, "defines the target `race_fixtures`");
     assert_problem(&problems, "no target runs the harness `race/ab-ba`");
 }

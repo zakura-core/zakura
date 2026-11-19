@@ -21,4 +21,3 @@ also_violates = ["header-sync/bounded-adversary-progress"]
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-hold-serving-read.json"
-plan = "crates/zakura-sim/tests/fixtures/header-hold-serving-read.plan"

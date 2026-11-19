@@ -1018,11 +1018,6 @@ fn a_punishment_before_any_judgement_reaches_the_honest_trigger() {
     assert_eq!(judged(Punished::Judged, Expect::Holds), Ok(()));
 }
 
-/// The committed Plan bytes every typed planted input below runs under:
-/// none, so each step takes its first action by identity, as the default
-/// Plan does.
-const DEFAULT_PLAN: &str = "header-wire-default.plan";
-
 /// The committed scenarios of the generated IDs' typed planted cases
 /// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
 /// focused scenario ([`act_scenario`]) for each act no saved Plan takes,
@@ -1158,8 +1153,7 @@ fn scenario_json(scenario: &WireScenario) -> String {
     serde_json::to_string_pretty(scenario).expect("scenarios serialize") + "\n"
 }
 
-/// The committed typed planted inputs are what their builders give, and
-/// their Plan bytes are empty.
+/// The committed typed planted inputs are what their builders give.
 ///
 /// This fails if a builder or the scenario format changes; after a
 /// deliberate change, run `regenerate_planted_scenarios`.
@@ -1177,10 +1171,9 @@ fn planted_scenarios_match_their_builders() {
             "run `regenerate_planted_scenarios`"
         );
     }
-    assert_eq!(read(DEFAULT_PLAN), "");
 }
 
-/// Rewrites the typed planted inputs and their empty Plan bytes. Run it
+/// Rewrites the typed planted inputs. Run it
 /// with `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
 /// header_wire_witness -- --ignored regenerate_planted_scenarios`.
 #[test]
@@ -1190,5 +1183,4 @@ fn regenerate_planted_scenarios() {
         let file = fixture_file(&format!("header-wire-planted-{name}.json"));
         std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
     }
-    std::fs::write(fixture_file(DEFAULT_PLAN), "").expect("the fixture directory exists");
 }

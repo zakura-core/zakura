@@ -15,4 +15,3 @@ checks = [
 [typed]
 harness = "block-sync/storage"
 scenario = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.scenario.json"
-plan = "qa/planted/block-sync/teardown-returns-baseline/kept-session-sender.plan.bin"

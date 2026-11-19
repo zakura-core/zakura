@@ -12,7 +12,7 @@ use std::{fs, path::PathBuf, process::Command};
 
 use zakura_network::zakura::observe::HeaderTargetPhase;
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -354,7 +354,7 @@ fn the_departure_fixture_repeats_a_a_and_a_b_a() {
         stage: Stage::Preparing,
         by: Departs::Relink,
     };
-    let plans = [committed_plan(), vec![7; 256]];
+    let plans = [Vec::new(), vec![7; 256]];
     let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
         .into_iter()
         .map(|plan| {
@@ -371,8 +371,8 @@ fn the_departure_fixture_repeats_a_a_and_a_b_a() {
 }
 
 /// The fixtures `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-retire-<name>.json` with its Plan bytes beside
-/// it in `header-retire-<name>.plan`.
+/// as `tests/fixtures/header-retire-<name>.json`.
+/// Each runs under the empty Plan.
 fn committed_fixtures() -> [(&'static str, LivenessScenario); 8] {
     [
         ("timeout", LivenessScenario::Timeout { late_apply: false }),
@@ -422,11 +422,6 @@ fn committed_fixtures() -> [(&'static str, LivenessScenario); 8] {
     ]
 }
 
-/// The Plan bytes every committed fixture runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture file `header-retire-<name>.<extension>`.
 fn fixture_file(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -434,8 +429,8 @@ fn fixture_file(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-retire-{name}.{extension}"))
 }
 
-/// Each committed fixture is its named fixture, as JSON, with the fixed
-/// Plan bytes, and holds and applies under them.
+/// Each committed fixture is its named fixture, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_fixtures_match_their_names() {
     for (name, fixture) in committed_fixtures() {
@@ -444,18 +439,8 @@ fn the_committed_fixtures_match_their_names() {
                 .unwrap_or_else(|error| panic!("{name}: {error}")),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            committed, fixture,
-            "{name}: run `regenerate_retirement_fixtures`"
-        );
-        let plan =
-            fs::read(fixture_file(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_retirement_fixtures`"
-        );
-        let (report, _, _) = run(fixture, zakura_sim::Plan::from_fuzz(&plan));
+        assert_eq!(committed, fixture, "{name}");
+        let (report, _, _) = run(fixture, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
                 outcome(&report, PEER_RETIREMENT_PROGRESS),
@@ -463,18 +448,6 @@ fn the_committed_fixtures_match_their_names() {
             ),
             "{name}"
         );
-    }
-}
-
-/// Rewrites the committed fixtures from their names.
-#[test]
-#[ignore = "rewrites the committed retirement fixtures"]
-fn regenerate_retirement_fixtures() {
-    for (name, fixture) in committed_fixtures() {
-        let json = serde_json::to_string_pretty(&fixture).expect("fixtures serialize");
-        fs::write(fixture_file(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture_file(name, "plan"), committed_plan())
-            .expect("the fixture directory exists");
     }
 }
 
@@ -500,10 +473,6 @@ fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
             Liveness::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture_file(name, "plan")
-                .to_str()
-                .expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

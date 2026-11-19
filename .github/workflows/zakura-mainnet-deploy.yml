@@ -60,9 +60,9 @@ on:
         type: string
         default: ""
       operation:
-        description: "deploy builds and deploys nodes; monitoring only stages compatibility monitoring (node=zakura-compat, ref=full tested SHA)"
+        description: "deploy updates nodes; dashboard refreshes the status site and profiler tunnels; monitoring stages compatibility monitoring"
         type: choice
-        options: [deploy, monitoring]
+        options: [deploy, dashboard, monitoring]
         default: deploy
       monitoring_stage:
         description: "fleet-deploy refreshes active monitoring; initial cutover uses install, validate, cutover, soak, finalize"
@@ -74,7 +74,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status' && format('zakura-mac-status-{0}', github.run_id) || 'zakura-mainnet-deploy' }}
+  group: ${{ inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status' && format('zakura-mac-status-{0}', github.run_id) || 'zakura-mainnet-deploy' }}
   cancel-in-progress: false
 
 jobs:
@@ -258,8 +258,8 @@ jobs:
           retention-days: 90
 
   deploy:
-    if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'
-    name: "Deploy Zakura mainnet ${{ inputs.ref }}"
+    if: inputs.operation == 'dashboard' || (inputs.operation == 'deploy' && inputs.node != 'zakura-mac-os')
+    name: "${{ inputs.operation == 'dashboard' && 'Deploy Zakura mainnet dashboard' || format('Deploy Zakura mainnet {0}', inputs.ref) }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
     timeout-minutes: 600
     environment: zakura-mainnet
@@ -275,6 +275,7 @@ jobs:
 
     steps:
       - name: Validate deploy inputs
+        if: inputs.operation == 'deploy'
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
@@ -309,6 +310,7 @@ jobs:
       # Keep orchestration from this workflow revision even when deploying an old
       # release. Only the binaries come from the requested ref.
       - name: Resolve deployment commit
+        if: inputs.operation == 'deploy'
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
@@ -323,12 +325,14 @@ jobs:
           echo "DEPLOY_COMMIT=$(git rev-parse 'FETCH_HEAD^{commit}')" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
+        if: inputs.operation == 'deploy'
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: stable
           cache: false
 
       - name: Install build dependencies
+        if: inputs.operation == 'deploy'
         run: |
           set -euo pipefail
           sudo apt-get -qq update
@@ -384,16 +388,14 @@ jobs:
 
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
-        env:
-          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
 
-          REF="$DEPLOY_COMMIT"
+          # Dashboard-only runs use the tooling checkout and never resolve a binary ref.
+          REF="${DEPLOY_COMMIT:-$GITHUB_SHA}"
           cat > nodes.ci.toml <<EOF
           [defaults]
-          # Binary-only: swap the binary and restart the existing service; leave
-          # the hand-tuned config, unit, and /root/.cache/zebra state untouched.
+          # Keep the hand-written configs and restart the existing services.
           deploy_kind     = "systemd"
           manage_config   = false
           service_name    = "zakurad"
@@ -494,11 +496,11 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
 
-          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # Archive node: vct_fast_sync = false, so it holds per-height
           # commitment trees everywhere and never fast-synced. That is what makes it
           # the supported generator for the release-state historical frontier grid —
           # entries come from reads instead of replaying an absent band. Binary-only
-          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # like the rest of the fleet, so its vct_fast_sync = false config is not
           # rewritten by a deploy; that setting is the whole point of the node.
           [[nodes]]
           name       = "archive-vct-off"
@@ -509,41 +511,33 @@ jobs:
           rpc_listen_addr = "127.0.0.1:8232"
           log_file   = "/var/log/zakura/zakura.log"
           # Metadata only under manage_config = false, but it records why this node
-          # differs. On `dual` its body tip wedged: the v2 coordinator logged
-          # `accepted block apply lost terminal observation; apply lifecycle is
-          # failed` and the header chain ran ~6,000 blocks ahead of the verified
-          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # differs. On dual its body tip wedged: the v2 coordinator logged
+          # "accepted block apply lost terminal observation; apply lifecycle is
+          # failed" and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Using the configured P2P stack cleared the stall. Do not flip
           # this host to config-managed without carrying that setting across.
           p2p_stack  = "legacy"
 
-          # Two legacy-only nodes in Singapore that each measure one experimental
-          # setting from an open PR. Each is pinned to the build it runs, because
-          # its hand-written config enables a setting that main does not have yet:
-          # a main build would refuse that config and fail to start. A fleet deploy
-          # therefore reinstalls the pinned build and restarts the node; to change
-          # the build, update the pin. Remove the pin (use "${REF}") once the PR
-          # merges, or remove the entry when the experiment ends.
-          #
-          # asia-hedged measures `[network.block_hedge]` (#2548).
           [[nodes]]
           name       = "asia-hedged"
           ssh_string = "root@68.183.178.89"
           monitor    = { profiler_url = "http://127.0.0.1:8107" }
-          commit     = "120535dbbb74e65f4a8c57ae3f19f9a10d77afc3"
+          commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
 
-          # asia-scored measures `[network.block_source_score]` (#2558).
           [[nodes]]
           name       = "asia-scored"
           ssh_string = "root@206.189.45.15"
           monitor    = { profiler_url = "http://127.0.0.1:8108" }
-          commit     = "7506d44aefc479e3994a43368b40e4dc8b2497bf"
+          # Keep the build that supports this node's hand-written experiment config.
+          commit     = "2063d360d69ce2ffdced871c6e06bf7b0c2bf394"
           rpc_listen_addr = "127.0.0.1:8232"
           p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary
+        if: inputs.operation == 'deploy'
         working-directory: deploy/deployer
         env:
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
@@ -562,7 +556,7 @@ jobs:
           python3 deploy.py build "${args[@]}"
 
       - name: Suppress fleet watchdog alerts during deploy
-        if: ${{ !inputs.no_restart }}
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart }}
         run: |
           set -euo pipefail
 
@@ -575,7 +569,7 @@ jobs:
         # predates suppression are still covered. The compatibility checker reports
         # this marker with every probe and the fleet watchdog's compatibility lane
         # honors it for at most 20 minutes; no service restart is needed.
-        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        if: ${{ inputs.operation == 'deploy' && !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
         run: |
           set -euo pipefail
 
@@ -605,6 +599,7 @@ jobs:
           fi
 
       - name: Install profiler and prepare trace files
+        if: inputs.operation == 'deploy'
         # Verify retention before adding trace_dir. If installation fails, a node
         # without trace files keeps its original config; deployment can continue.
         # It also adds `expose_peer_addresses = true` to a config that does not set
@@ -635,6 +630,7 @@ jobs:
             || echo "::warning::fleet peer names could not be set on every node; see the step log" >&2
 
       - name: Deploy fleet
+        if: inputs.operation == 'deploy'
         working-directory: deploy/deployer
         env:
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
@@ -657,7 +653,7 @@ jobs:
           python3 deploy.py deploy "${args[@]}"
 
       - name: Show fleet status
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         working-directory: deploy/deployer
         env:
           NODE: ${{ inputs.node }}
@@ -672,7 +668,7 @@ jobs:
           python3 deploy.py status "${args[@]}"
 
       - name: Validate deployed node startup
-        if: ${{ inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
+        if: ${{ inputs.operation == 'deploy' && inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
         env:
           NODE: ${{ inputs.node }}
         run: |
@@ -697,6 +693,7 @@ jobs:
               raise SystemExit(f"unknown node: {node_name}")
 
           values = {
+              "EXPECTED_COMMIT": node["commit"],
               "SSH_TARGET": node["ssh_string"],
               "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
               "BIN_PATH": node.get("bin_path", defaults["bin_path"]),
@@ -715,11 +712,10 @@ jobs:
           PY
           )"
 
-          expected_commit="$DEPLOY_COMMIT"
           ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
             "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
              RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
-             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
+             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$EXPECTED_COMMIT' bash -s" <<'EOF'
           set -euo pipefail
 
           # How long the node may take to answer RPC after the restart, and the
@@ -867,7 +863,7 @@ jobs:
           EOF
 
       - name: Install cluster status dashboard
-        if: always()
+        if: (inputs.operation == 'deploy' && always()) || (inputs.operation == 'dashboard' && success())
         env:
           DASHBOARD_PASSWORD: ${{ secrets.ZAKURA_STATUS_DASHBOARD_PASSWORD }}
         run: |
@@ -956,14 +952,14 @@ jobs:
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
       - name: Install profiler tunnels
-        if: always()
+        if: (inputs.operation == 'deploy' && always()) || (inputs.operation == 'dashboard' && success())
         run: |
           set -euo pipefail
           python3 deploy/profiler/fleet.py tunnels --config deploy/deployer/nodes.ci.toml \
             || echo "::warning::profiler tunnels could not be installed; see the step log" >&2
 
       - name: Install public broadcast gateway
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         run: |
           set -euo pipefail
 
@@ -1005,7 +1001,7 @@ jobs:
           echo
 
       - name: Install fleet watchdog
-        if: always()
+        if: inputs.operation == 'deploy' && always()
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}
@@ -1041,7 +1037,7 @@ jobs:
           sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
 
       - name: Fetch recent logs on failure
-        if: failure()
+        if: inputs.operation == 'deploy' && failure()
         working-directory: deploy/deployer
         env:
           NODE: ${{ inputs.node }}
@@ -1056,7 +1052,7 @@ jobs:
           python3 deploy.py logs fetch "${args[@]}" || true
 
       - name: Upload failure logs
-        if: failure()
+        if: inputs.operation == 'deploy' && failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-mainnet-deploy-logs-${{ github.run_id }}

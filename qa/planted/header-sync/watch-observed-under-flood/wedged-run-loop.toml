@@ -3,7 +3,7 @@
 # the wire flood fills its queue and the run settles with the publication
 # unread and no shutdown begun. A correct loop always has its watch arm
 # ready then, so the settled end breaks the rule.
-input = "crates/zakura-sim/tests/fixtures/header-flood-wire.bin"
+seed = "header-flood-wire"
 # Besides reactor.rs, which the patch changes, the session receiver and the
 # queues decide how fast wire events arrive and when the commit lands.
 checks = ["crates/zakura-network/src/zakura/header_sync"]

@@ -3,8 +3,12 @@
 # input handles the detached commit's tip first, so the frontier releases
 # height 1 before its stale reply frees room, and the waiting fork body
 # stays unsubmitted.
-input = "crates/zakura-sim/tests/fixtures/block-sync-capacity-frontier-first.bin"
+input = "crates/zakura-sim/tests/fixtures/slow-seeds/block-sync-capacity-frontier-first.bin"
 # Besides sequencer_task.rs, which the patch changes, the rest of block sync
 # decides whether the tip or the reply arrives first. A change there can
 # move the input off that order.
 checks = ["crates/zakura-network/src/zakura/block_sync"]
+# The patched input's capacity-release run stays long: block_sync_storage's
+# AddressSanitizer build ran it for an hour without finishing, far past
+# `--targets`' 300-second limit for one run, so no target confirms it.
+no_target = "the patched run takes over an hour under AddressSanitizer"

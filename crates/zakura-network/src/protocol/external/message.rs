@@ -27,6 +27,52 @@ use proptest_derive::Arbitrary;
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::serialization::arbitrary::datetime_full;
 
+/// A block in a `block` message, with its hash computed once when the message is made.
+///
+/// Sending a block uses its hash several times (tracking the upload, finding its checksum),
+/// and so does receiving one (matching it to a request, logging it). A block's hash is not
+/// stored in the block, so each use would otherwise hash the header again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashedBlock {
+    hash: block::Hash,
+    block: BlockHandle,
+}
+
+impl HashedBlock {
+    /// The hash of this block.
+    pub fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// Returns the block, dropping its hash.
+    pub fn into_block(self) -> BlockHandle {
+        self.block
+    }
+}
+
+impl From<BlockHandle> for HashedBlock {
+    fn from(block: BlockHandle) -> Self {
+        Self {
+            hash: block.hash(),
+            block,
+        }
+    }
+}
+
+impl From<std::sync::Arc<zakura_chain::block::Block>> for HashedBlock {
+    fn from(block: std::sync::Arc<zakura_chain::block::Block>) -> Self {
+        BlockHandle::from(block).into()
+    }
+}
+
+impl std::ops::Deref for HashedBlock {
+    type Target = BlockHandle;
+
+    fn deref(&self) -> &BlockHandle {
+        &self.block
+    }
+}
+
 /// A Bitcoin-like network message for the Zcash protocol.
 ///
 /// The Zcash network protocol is mostly inherited from Bitcoin, and a list of
@@ -231,7 +277,7 @@ pub enum Message {
             any(test, feature = "proptest-impl"),
             proptest(strategy = "any::<Arc<Block>>().prop_map(Into::into)")
         )]
-        BlockHandle,
+        HashedBlock,
     ),
 
     /// A `tx` message.

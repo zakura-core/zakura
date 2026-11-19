@@ -196,6 +196,16 @@ fn the_committed_suite_covers_the_registry() {
                 "{row:?}"
             ),
             Expect::Unimplemented => assert!(row.pending.is_some(), "{row:?}"),
+            // A native bypass runs in the droplet mutation campaign, not
+            // here, so its row names an existing patch and the reason.
+            Expect::Excluded => assert!(
+                row.pending.is_some()
+                    && row.patch.is_some_and(|patch| seed::repo_root()
+                        .join("qa/native-mutations")
+                        .join(patch)
+                        .is_file()),
+                "{row:?}"
+            ),
             other => panic!("{}: {other:?}", row.id),
         }
     }

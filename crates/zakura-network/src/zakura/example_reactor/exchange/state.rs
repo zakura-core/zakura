@@ -133,6 +133,28 @@ impl ExchangeState {
     pub(super) fn watch_opened(&mut self) {
         self.next_watch += 1;
     }
+
+    /// Panic if a download breaks a rule the state keeps: each download sits
+    /// under its range's start and holds at most its range's count of items,
+    /// each inside the range.
+    #[cfg(test)]
+    pub(super) fn assert_invariants(&self) {
+        for (start, download) in &self.downloads {
+            let range = download.range;
+            assert_eq!(*start, range.start, "a download sits under its start");
+            assert!(
+                download.items.len() <= usize::try_from(range.count).expect("a count fits usize"),
+                "{range:?} holds {} items",
+                download.items.len()
+            );
+            for (height, _) in &download.items {
+                assert!(
+                    range.start <= *height && height.0 - range.start.0 < range.count,
+                    "{range:?} holds an item at {height:?}"
+                );
+            }
+        }
+    }
 }
 
 /// Check that a pushed item at `height` follows `received`, the watch's last

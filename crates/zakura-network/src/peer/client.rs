@@ -10,6 +10,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::{
@@ -54,6 +55,10 @@ pub struct Client {
     /// The metadata for the connected peer `service`.
     pub connection_info: Arc<ConnectionInfo>,
 
+    /// This connection's process-local number in the trace files: the `connection_id`
+    /// of its block gossip rows and of the requests the peer set sends it.
+    pub(crate) connection_id: u64,
+
     /// Used to shut down the corresponding heartbeat.
     /// This is always Some except when we take it on drop.
     pub(crate) shutdown_tx: Option<oneshot::Sender<CancelHeartbeatTask>>,
@@ -87,7 +92,7 @@ pub struct Client {
 /// what [`Client::poll_ready`](Service::poll_ready) reports, does not mean a newly sent request will
 /// be written now.
 ///
-/// The [`Connection`](super::Connection) task owns the writes. Clients and the peer set only read it.
+/// The connection records block outcomes in reply order before waking their callers.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
@@ -96,7 +101,20 @@ pub(crate) struct RequestSlot {
     /// True if the connection's last block request ended unanswered, until a peer delivers a
     /// requested block on this connection.
     block_request_unanswered: Arc<AtomicBool>,
+
+    /// When the peer last announced a block and then did not deliver it to a gossip block request,
+    /// retained until a subsequent verified delivery clears it. Scored routing checks its age.
+    announced_block_missed_at: Arc<std::sync::Mutex<Option<Arc<tokio::time::Instant>>>>,
 }
+
+/// How long scored routing passes over a peer that failed to deliver an announced block,
+/// unless a subsequent delivery from that connection verifies sooner.
+///
+/// Once the node follows the tip, a peer that is passed over is rarely asked for a block, so
+/// without a limit one honest miss could keep a good peer passed over for as long as it stays
+/// connected. Ten minutes matches the delivery score's time constant. A peer that keeps missing
+/// is marked again on its next miss.
+pub(crate) const ANNOUNCED_BLOCK_MISS_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 impl RequestSlot {
     /// Records whether the connection is handling a client request (or can no longer take one).
@@ -119,6 +137,41 @@ impl RequestSlot {
     pub(crate) fn block_request_unanswered(&self) -> bool {
         self.block_request_unanswered.load(Ordering::Acquire)
     }
+
+    /// Records that the peer announced a block and then did not deliver it.
+    pub(crate) fn mark_announced_block_missed(&self) {
+        *self.missed_at() = Some(Arc::new(tokio::time::Instant::now()));
+    }
+
+    /// Clears the miss that preceded a delivery once that body has verified.
+    pub(crate) fn clear_miss_at_receipt(&self, at_receipt: &Arc<tokio::time::Instant>) {
+        let mut missed = self.missed_at();
+        if missed
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, at_receipt))
+        {
+            *missed = None;
+        }
+    }
+
+    /// Returns true if the peer announced a block and then did not deliver it within the last
+    /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and no subsequent verified delivery cleared the miss.
+    pub(crate) fn announced_block_missed(&self) -> bool {
+        self.missed_at()
+            .as_ref()
+            .is_some_and(|missed_at| missed_at.elapsed() < ANNOUNCED_BLOCK_MISS_LIFETIME)
+    }
+
+    /// Identifies the miss preceding this reply, including two misses within the same clock tick.
+    pub(crate) fn miss_at_receipt(&self) -> Option<Arc<tokio::time::Instant>> {
+        self.missed_at().clone()
+    }
+
+    fn missed_at(&self) -> std::sync::MutexGuard<'_, Option<Arc<tokio::time::Instant>>> {
+        self.announced_block_missed_at
+            .lock()
+            .expect("the missed-block mutex is never held across a panic")
+    }
 }
 
 /// A signal sent by the [`Client`] half of a peer connection,
@@ -128,11 +181,25 @@ impl RequestSlot {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CancelHeartbeatTask;
 
+/// Why the peer set chose this advertiser for a single-block request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AdvertisedBlockRequest {
+    /// The ordinary request to an announcer.
+    Primary,
+    /// A primary whose dual-stack caller can report its legacy deadline.
+    TimedPrimary(crate::BlockHedge),
+    /// The competing request to a later announcer.
+    Hedge,
+}
+
 /// A message from the `peer::Client` to the `peer::Server`.
 #[derive(Debug)]
 pub(crate) struct ClientRequest {
     /// The actual network request for the peer.
     pub request: Request,
+
+    /// Set only when routing selected a peer that advertised the requested block.
+    pub advertised_block: Option<AdvertisedBlockRequest>,
 
     /// The response `Message` channel, included because `peer::Client::call`
     /// returns a future that may be moved around before it resolves.
@@ -200,6 +267,9 @@ pub(super) struct InProgressClientRequest {
 #[derive(Debug)]
 #[must_use = "tx.send() must be called before drop"]
 pub(super) struct MustUseClientResponseSender {
+    /// Whether this response completes a request to a block advertiser.
+    pub(super) advertised_block: Option<AdvertisedBlockRequest>,
+
     /// The sender for the oneshot client response channel.
     ///
     /// `None` if `tx.send()` has been used.
@@ -243,13 +313,20 @@ impl From<ClientRequest> for InProgressClientRequest {
     fn from(client_request: ClientRequest) -> Self {
         let ClientRequest {
             request,
+            advertised_block,
             tx,
             inv_collector,
             transient_addr,
             span,
         } = client_request;
 
-        let tx = MustUseClientResponseSender::new(tx, &request, inv_collector, transient_addr);
+        let tx = MustUseClientResponseSender::new(
+            tx,
+            &request,
+            inv_collector,
+            transient_addr,
+            advertised_block,
+        );
 
         InProgressClientRequest { request, tx, span }
     }
@@ -322,8 +399,10 @@ impl MustUseClientResponseSender {
         request: &Request,
         inv_collector: Option<broadcast::Sender<InventoryChange>>,
         transient_addr: Option<PeerSocketAddr>,
+        advertised_block: Option<AdvertisedBlockRequest>,
     ) -> Self {
         Self {
+            advertised_block,
             tx: Some(tx),
             missing_inv: MissingInventoryCollector::new(request, inv_collector, transient_addr),
         }
@@ -691,6 +770,17 @@ impl Service<Request> for Client {
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        self.send_request(request, None)
+    }
+}
+
+impl Client {
+    /// Enqueue the request with the routing decision attached to this particular reply.
+    pub(super) fn send_request(
+        &mut self,
+        request: Request,
+        advertised_block: Option<AdvertisedBlockRequest>,
+    ) -> <Self as Service<Request>>::Future {
         let (tx, rx) = oneshot::channel();
         // get the current Span to propagate it to the peer connection task.
         // this allows the peer connection to enter the correct tracing context
@@ -704,6 +794,7 @@ impl Service<Request> for Client {
 
         match self.server_tx.try_send(ClientRequest {
             request,
+            advertised_block,
             tx,
             inv_collector: Some(self.inv_collector.clone()),
             transient_addr: self.connection_info.connected_addr.get_transient_addr(),

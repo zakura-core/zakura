@@ -2008,7 +2008,7 @@ fn discovery_book_records_and_replays_signed_samples() {
     };
     let sampled = books().find(|book| !book.sample.is_empty()).unwrap();
     assert!(sampled.sample.len() <= 3, "a window holds three records");
-    assert!(books().all(|book| book.actual == book.expected));
+    assert!(books().all(|book| book.failure.is_none()));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     // The property applies from the first step whose prefix reaches the

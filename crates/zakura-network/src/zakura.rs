@@ -26,6 +26,8 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub(crate) mod machine_test;
 mod node_envelope;
 mod peer_memory;
 mod regulation;
@@ -33,6 +35,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;
@@ -46,7 +49,7 @@ pub use peer_memory::*;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
 #[cfg(zakura_sim)]
-pub use regulation::{FreeSlots, SessionSlotsProbe};
+pub use regulation::{FreeSlots, SessionOwnership, SessionSlotsProbe};
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -54,6 +57,9 @@ pub use trace::{
     LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
+pub use tx_relay::{
+    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, ZakuraTxRelayConfig,
+};
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use handler::run_native_initiator_handshake_without_trace as run_native_initiator_handshake;
@@ -296,6 +302,24 @@ impl ZakuraHandshakeConnector {
             endpoint: Some(endpoint),
             #[cfg(test)]
             test_outcome: None,
+        }
+    }
+
+    /// Records in the trace where a peer connected from and which software it runs, once
+    /// its legacy connection has been upgraded to Zakura. `addr` is the address as the
+    /// node's privacy setting allows it to be written. Does nothing without a live Zakura
+    /// endpoint.
+    pub(crate) fn trace_upgraded_peer(
+        &self,
+        peer_id: &ZakuraPeerId,
+        addr: &str,
+        user_agent: &str,
+        inbound: bool,
+    ) {
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            endpoint
+                .trace()
+                .emit_peer_upgraded(peer_id, addr, user_agent, inbound);
         }
     }
 

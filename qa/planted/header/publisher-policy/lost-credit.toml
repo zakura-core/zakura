@@ -1,5 +1,6 @@
 # Sends a page without spending its credit, so the peer's grant never runs out.
-# The input's first page leaves the ledger's consumed totals behind the model's.
+# The input's first page leaves the ledger's consumed totals behind the page the
+# test committed.
 input = "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin"
 checks = [
     "crates/zakura-network/src/zakura/header_sync/v9/publisher",

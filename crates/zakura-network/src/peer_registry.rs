@@ -9,6 +9,12 @@ use std::{
 
 use zakura_chain::block;
 
+mod delivery;
+mod delivery_trace;
+
+use delivery::DeliveryEstimate;
+pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
+
 use crate::{
     peer::ConnectionInfo,
     protocol::external::types::Version,
@@ -60,6 +66,8 @@ pub(crate) struct PeerRegistry {
 struct RegistryState {
     next_legacy_generation: u64,
     active_connections: HashMap<ConnectionKey, ConnectedPeer>,
+    /// How long each active legacy connection takes to answer, for choosing block sources.
+    delivery_estimates: HashMap<ConnectionKey, DeliveryEstimate>,
     native_connections: HashMap<ZakuraPeerId, NativeConnection>,
     retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
 }
@@ -155,6 +163,7 @@ impl PeerRegistry {
             PeerRegistryUpdater {
                 registry: self.clone(),
                 key,
+                delivery_trace: DeliveryTrace::default(),
             },
         )
     }
@@ -266,11 +275,12 @@ impl PeerRegistry {
     }
 
     fn remove_connection(&self, key: &ConnectionKey) {
-        self.inner
+        let mut state = self
+            .inner
             .lock()
-            .expect("peer registry mutex is never poisoned")
-            .active_connections
-            .remove(key);
+            .expect("peer registry mutex is never poisoned");
+        state.active_connections.remove(key);
+        state.delivery_estimates.remove(key);
     }
 }
 
@@ -279,9 +289,17 @@ impl PeerRegistry {
 pub(crate) struct PeerRegistryUpdater {
     registry: PeerRegistry,
     key: ConnectionKey,
+    /// Where this connection's delivery samples are traced.
+    delivery_trace: DeliveryTrace,
 }
 
 impl PeerRegistryUpdater {
+    /// Makes this connection trace its delivery samples with `delivery_trace`.
+    pub(crate) fn with_delivery_trace(mut self, delivery_trace: DeliveryTrace) -> Self {
+        self.delivery_trace = delivery_trace;
+        self
+    }
+
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry
             .inner
@@ -305,6 +323,64 @@ impl PeerRegistryUpdater {
                 connected_peer.rtt = Some(rtt);
                 connected_peer.ping_sent_at = None;
             });
+        self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
+    }
+
+    /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
+    ///
+    /// Does nothing once the connection has closed, or for a native connection, whose blocks
+    /// are not chosen this way.
+    ///
+    /// Each recorded sample is written to the connection's delivery trace.
+    pub(crate) fn record_delivery_sample(
+        &self,
+        kind: DeliverySampleKind,
+        sample: Duration,
+        now: Instant,
+    ) {
+        if !matches!(self.key, ConnectionKey::Legacy(_)) {
+            return;
+        }
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned");
+        if !state.active_connections.contains_key(&self.key) {
+            return;
+        }
+        let estimate = state
+            .delivery_estimates
+            .entry(self.key.clone())
+            .or_default();
+        let score_before = estimate.score();
+        estimate.record(sample, now);
+        let estimate = *estimate;
+        drop(state);
+
+        let score = estimate
+            .score()
+            .expect("an estimate that just recorded a sample has a score");
+        self.delivery_trace
+            .sample(kind, sample, score_before, score, estimate.weight());
+    }
+
+    /// Traces that the peer announced a block and did not deliver it to a first request, or to a
+    /// second request when `second_request` is set. The score does not change.
+    pub(crate) fn trace_block_missed(&self, second_request: bool) {
+        self.delivery_trace.block_missed(second_request);
+    }
+
+    /// The expected time for this peer to answer a block request, from its recent answers, or
+    /// `None` before its first measured answer.
+    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+        self.registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .delivery_estimates
+            .get(&self.key)
+            .and_then(DeliveryEstimate::score)
     }
 }
 
@@ -321,6 +397,8 @@ impl Drop for PeerRegistryGuard {
     }
 }
 
+/// Returns `user_agent` with every character a peer could use to forge log or trace
+/// text removed.
 fn sanitize_subversion(user_agent: &str) -> String {
     user_agent
         .chars()
@@ -328,6 +406,21 @@ fn sanitize_subversion(user_agent: &str) -> String {
             character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '/' | ':')
         })
         .collect()
+}
+
+/// The longest user agent a trace row carries. Real ones, such as `/MagicBean:6.2.0/`,
+/// are under 30 characters; a peer may send up to 256.
+const TRACE_USER_AGENT_MAX_CHARS: usize = 64;
+
+/// Returns `user_agent` sanitized and cut to [`TRACE_USER_AGENT_MAX_CHARS`], for trace rows.
+///
+/// A peer chooses its user agent and can trigger many rows, so the cut bounds how much
+/// trace file each row it causes can take.
+pub(crate) fn trace_user_agent(user_agent: &str) -> String {
+    let mut sanitized = sanitize_subversion(user_agent);
+    // Sanitized text is ASCII, so this byte index is a character boundary.
+    sanitized.truncate(TRACE_USER_AGENT_MAX_CHARS);
+    sanitized
 }
 
 #[cfg(test)]
@@ -376,6 +469,81 @@ mod tests {
 
         registry.deregister_native_connection(&peer_id, 2);
         assert!(registry.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
+        let registry = PeerRegistry::default();
+        let (guard, updater) = registry.register_legacy(peer(1));
+        assert_eq!(updater.delivery_score(), None);
+
+        updater.record_response(Duration::from_millis(30));
+        assert_eq!(updater.delivery_score(), Some(Duration::from_millis(30)));
+
+        drop(guard);
+        assert_eq!(updater.delivery_score(), None);
+        updater.record_delivery_sample(
+            DeliverySampleKind::Block,
+            Duration::from_millis(5),
+            Instant::now(),
+        );
+        assert_eq!(
+            updater.delivery_score(),
+            None,
+            "a closed connection keeps no estimate"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_samples_and_missed_blocks_are_traced() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let registry = PeerRegistry::default();
+        let (_connection, updater) = registry.register_legacy(peer(1));
+        let updater = updater.with_delivery_trace(DeliveryTrace::new(
+            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            7,
+        ));
+
+        let now = Instant::now();
+        updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
+        updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
+        updater.trace_block_missed(true);
+        drop(updater);
+        guard.shutdown().await;
+
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("delivery_score.jsonl"))
+                .expect("delivery trace is written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+                .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["event"], "delivery_sample");
+        assert_eq!(rows[0]["connection_id"], 7);
+        assert_eq!(rows[0]["kind"], "ping");
+        assert_eq!(rows[0]["sample_ms"], 10);
+        assert!(
+            rows[0].get("score_before_ms").is_none(),
+            "the first sample has no earlier score"
+        );
+        assert_eq!(rows[0]["score_ms"], 10);
+        assert_eq!(rows[0]["weight"], 1.0);
+        assert_eq!(rows[1]["kind"], "block");
+        assert_eq!(rows[1]["sample_ms"], 30);
+        assert_eq!(rows[1]["score_before_ms"], 10);
+        assert_eq!(
+            rows[1]["score_ms"], 20,
+            "two equal-weight samples are averaged"
+        );
+        assert_eq!(rows[1]["weight"], 2.0);
+        assert_eq!(rows[2]["event"], "block_missed");
+        assert_eq!(rows[2]["connection_id"], 7);
+        assert_eq!(rows[2]["request"], "second");
+        assert!(
+            rows[2].get("score_ms").is_none(),
+            "a missed block leaves the score alone"
+        );
     }
 
     #[test]
@@ -440,5 +608,15 @@ mod tests {
             sanitize_subversion("/Magic Bean:2.1.1-1/\u{1b}[31m\n"),
             "/Magic Bean:2.1.1-1/31m"
         );
+    }
+
+    #[test]
+    fn trace_user_agent_is_sanitized_and_cut_to_its_limit() {
+        assert_eq!(trace_user_agent("/MagicBean:6.2.0/\n"), "/MagicBean:6.2.0/");
+
+        let long = format!("/{}/", "a".repeat(254));
+        let traced = trace_user_agent(&long);
+        assert_eq!(traced.len(), TRACE_USER_AGENT_MAX_CHARS);
+        assert!(long.starts_with(&traced));
     }
 }

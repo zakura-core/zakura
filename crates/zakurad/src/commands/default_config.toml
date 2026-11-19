@@ -53,6 +53,7 @@ ready_max_tip_age = "5m"
 
 [mempool]
 eviction_memory_time = "1h"
+implementation = "default"
 max_datacarrier_bytes = 83
 max_transaction_bytes = 250000
 tx_cost_limit = 80000000
@@ -97,6 +98,7 @@ network = "Mainnet"
 #   releases. Currently "legacy" on Mainnet, and "dual" everywhere else.
 p2p_stack = "default"
 peerset_initial_target_size = 100
+push_relayed_blocks = false
 unconditional_peers = []
 
 # Warm each new legacy TCP connection with a few padded pings, so that its first
@@ -110,6 +112,13 @@ max_chunk_bytes = 2097144
 max_concurrent = 16
 peer_cooldown = "1day"
 tip_quiet = "2s"
+
+# When several idle legacy peers announced a block, ask the one expected to
+# answer sooner, from its recent ping and block answer times, instead of the
+# less loaded one, and also ask a later announcer expected to deliver it
+# clearly sooner than the first.
+[network.block_download_score_and_hedge]
+enabled = false
 
 [network.zakura]
 bootstrap_peers = [

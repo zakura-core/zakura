@@ -207,11 +207,15 @@ fn the_generator_map_leaves_out_planted_harnesses() {
 /// Some prefix that each listed tag starts draws a rare scenario, so no
 /// family is stale.
 #[test]
-fn every_tag_a_draw_matches_is_a_listed_family() {
+fn every_fixed_tag_a_draw_matches_is_a_listed_family() {
     const RARE: usize = 256;
     for entry in HARNESSES
         .iter()
-        .filter(|entry| !entry.machine && entry.scenario_bytes >= 2)
+        // The handshake decoder uses byte modulo ten, so it has many aliases for
+        // each family. Its canonical selectors are checked separately below.
+        .filter(|entry| {
+            !entry.machine && entry.scenario_bytes >= 2 && entry.name != "handshake/wire"
+        })
     {
         let families = (entry.families)();
         let mut drawn: Vec<([u8; 2], String)> = Vec::with_capacity(1 << 16);
@@ -285,4 +289,42 @@ fn the_draws_reach_each_family() {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn handshake_family_selectors_cover_every_decoder_branch() {
+    use zakura_sim::harness::{handshake_wire::Wire, Subsystem};
+    // The first byte, modulo ten, selects a one-byte family. The QUIC
+    // families take two-byte tags whose first byte, 253 or 254, the decoder
+    // reserves, so those bytes alias no one-byte family.
+    const RESERVED: [u8; 2] = [253, 254];
+    let families = Wire::families();
+    assert_eq!(families.len(), 15);
+    let (single, quic) = families.split_at(10);
+    for family in quic {
+        assert_eq!(family.tag.len(), 2);
+        assert!(RESERVED.contains(&family.tag[0]), "{}", family.name);
+    }
+    for (index, family) in single.iter().enumerate() {
+        assert_eq!(family.tag, [u8::try_from(index).unwrap()]);
+        for alias in (index..=255)
+            .step_by(10)
+            .filter(|alias| !RESERVED.contains(&u8::try_from(*alias).unwrap()))
+        {
+            let mut prefix = [173; Wire::SCENARIO_BYTES];
+            prefix[0] = u8::try_from(alias).unwrap();
+            let scenario = Wire::draw(&prefix);
+            prefix[0] = family.tag[0];
+            assert_eq!(scenario, Wire::draw(&prefix));
+        }
+    }
+    let reached: BTreeSet<_> = draws(SEED, 512, families.clone())
+        .take(100)
+        .filter_map(|(family, _)| family)
+        .collect();
+    assert!(families.iter().all(|family| reached.contains(family.name)));
+    let map = generator_harnesses();
+    for harness in ["handshake/wire", "handshake/counts"] {
+        assert!(map["handshake/pending-bounded"].contains(&harness));
+    }
 }

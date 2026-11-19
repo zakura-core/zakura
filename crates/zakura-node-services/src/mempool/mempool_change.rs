@@ -1,24 +1,45 @@
 //! Defines the [`MempoolChange`] and [`MempoolChangeKind`] types used by the mempool change broadcast channel.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::broadcast;
 use zakura_chain::transaction::UnminedTxId;
 
-/// A newtype around [`broadcast::Sender<MempoolChange>`] used to
-/// subscribe to the channel without an active receiver.
+/// A handle on the [`broadcast::Sender<MempoolChange>`] used to subscribe to
+/// the channel without an active receiver.
 #[derive(Clone, Debug)]
-pub struct MempoolTxSubscriber(broadcast::Sender<MempoolChange>);
+pub struct MempoolTxSubscriber(Arc<Mutex<broadcast::Sender<MempoolChange>>>);
 
 impl MempoolTxSubscriber {
     /// Creates a new [`MempoolTxSubscriber`].
     pub fn new(sender: broadcast::Sender<MempoolChange>) -> Self {
-        Self(sender)
+        Self(Arc::new(Mutex::new(sender)))
     }
 
     /// Subscribes to the channel, returning a [`broadcast::Receiver`].
     pub fn subscribe(&self) -> broadcast::Receiver<MempoolChange> {
-        self.0.subscribe()
+        self.sender().subscribe()
+    }
+
+    /// Starts a new channel of `capacity` events for later subscribers and
+    /// returns its sender. A current subscriber's stream ends once every
+    /// sender of the old channel is dropped, after it has read what was sent
+    /// there. For a sender that lost events it cannot send again.
+    pub fn restart(&self, capacity: usize) -> broadcast::Sender<MempoolChange> {
+        let (sender, _) = broadcast::channel(capacity);
+        *self.sender() = sender.clone();
+        sender
+    }
+
+    /// The current channel's sender.
+    fn sender(&self) -> std::sync::MutexGuard<'_, broadcast::Sender<MempoolChange>> {
+        // A panic while it was held leaves the sender whole.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

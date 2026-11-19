@@ -237,6 +237,7 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 
 /// Pending work, in-flight ownership, floor, authority, and logical charges.
 #[derive(Debug)]
+#[cfg_attr(any(test, feature = "p2p-fuzz"), derive(Clone))]
 pub(in crate::zakura::block_sync) struct WorkQueueState {
     pending: BTreeMap<block::Height, WorkItem>,
     in_flight: BTreeMap<block::Height, WorkItem>,
@@ -965,10 +966,13 @@ impl WorkQueueState {
 
     /// Frontier reset: pin the floor and drop every `pending`/`in_flight` entry
     /// `> floor` (their buffers were dropped; the producer re-fills via the next
-    /// query). Releases charges as in [`Self::advance_floor`].
+    /// query). A reset that raises the floor also drops the entries at or below
+    /// it, as [`Self::advance_floor`] does. Releases charges as in
+    /// [`Self::advance_floor`].
     ///
     /// IO resets the affected request writes under the same lock first.
     pub(in crate::zakura::block_sync) fn reset_above(&mut self, floor: block::Height) -> WorkDelta {
+        let committed = self.advance_floor(floor);
         self.floor = floor;
         // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
         // note in `advance_floor` on why a full-map `retain` is too expensive here.
@@ -983,7 +987,7 @@ impl WorkQueueState {
                 .expect("last_key_value returned Some");
             released = self.add_to_total(released, item.budget.release_reserved());
         }
-        let mut revocation = false;
+        let mut revocation = committed.wake.revocation;
         while let Some((&height, _)) = self.in_flight.last_key_value() {
             if height <= floor {
                 break;
@@ -997,9 +1001,10 @@ impl WorkQueueState {
             self.settle_in_flight(item.owner, charge);
             released = self.add_to_total(released, charge);
         }
+        // `advance_floor` already settled the prefix it dropped.
         self.settle_ledger(released);
         WorkDelta {
-            released_bytes: released,
+            released_bytes: self.add_to_total(released, committed.released_bytes),
             wake: WorkWake {
                 revocation,
                 ..WorkWake::default()
@@ -1083,6 +1088,76 @@ impl WorkQueueState {
         self.reserved_bytes
     }
 
+    /// Check the height partition and the maintained ledger.
+    ///
+    /// Every queued height is above the floor. A height is pending or in
+    /// flight, never both. Pending work has no owner and holds no charge.
+    /// In-flight work has an owner, and provisional work holds no charge.
+    /// Every maintained total equals a scan of the items. A latched
+    /// [`LedgerFault`] keeps the last valid totals, so the totals are not
+    /// checked after one.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(in crate::zakura::block_sync) fn assert_invariants(&self) {
+        if let Some((height, _)) = self.pending.first_key_value() {
+            assert!(
+                *height > self.floor,
+                "pending {height:?} is not above the floor"
+            );
+        }
+        if let Some((height, _)) = self.in_flight.first_key_value() {
+            assert!(
+                *height > self.floor,
+                "in-flight {height:?} is not above the floor"
+            );
+        }
+        for (height, item) in &self.pending {
+            assert!(
+                !self.in_flight.contains_key(height),
+                "{height:?} is both pending and in flight"
+            );
+            assert!(item.owner.is_none(), "pending {height:?} has an owner");
+            assert_eq!(
+                item.budget.reserved_charge(),
+                0,
+                "pending {height:?} holds a charge"
+            );
+        }
+        for (height, item) in &self.in_flight {
+            assert!(item.owner.is_some(), "in-flight {height:?} has no owner");
+            assert!(
+                !item.provisional || !item.budget.is_reserved(),
+                "provisional {height:?} holds a charge"
+            );
+        }
+        if self.ledger_fault.is_some() {
+            return;
+        }
+        assert_eq!(
+            self.reserved_bytes,
+            self.reserved_bytes_scanned(),
+            "the reserved total matches its items"
+        );
+        let mut in_flight = ReservedTally::default();
+        let mut sessions = BTreeMap::<u64, u64>::new();
+        for item in self.in_flight.values() {
+            let charge = item.budget.reserved_charge();
+            in_flight = in_flight
+                .checked_add(charge)
+                .expect("a scan of valid charges fits");
+            if let Some(owner) = item.owner.filter(|_| charge > 0) {
+                *sessions.entry(owner.session_id).or_default() += charge;
+            }
+        }
+        assert_eq!(
+            self.in_flight_reserved, in_flight,
+            "the in-flight tally matches its items"
+        );
+        assert_eq!(
+            self.session_reserved, sessions,
+            "each session's tally matches its items"
+        );
+    }
+
     /// Ground-truth O(pending + in_flight) recomputation of [`Self::reserved_bytes`].
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn reserved_bytes_scanned(&self) -> u64 {
@@ -1151,11 +1226,9 @@ impl WorkQueueState {
 
         // The length check only decides contiguity when *every* key is above the
         // anchor, so it is gated on the lowest claimed height being `start` itself.
-        // Entries at or below the anchor otherwise inflate the count and make a
-        // sparse range look contiguous: a forward `reset_above` pins the floor and
-        // pops only the `> floor` suffix, so it leaves the whole
-        // `(old_floor, new_floor]` prefix claimed at or below the new floor. A
-        // lagging caller `floor` mirror is excluded the same way.
+        // Every entry is above the queue's own floor, but a caller `floor` ahead of
+        // it leaves entries at or below the anchor. Counting them would make a
+        // sparse range look contiguous.
         let min_claimed = match (
             self.pending.keys().next().copied(),
             self.in_flight.keys().next().copied(),

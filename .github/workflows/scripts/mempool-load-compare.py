@@ -3,7 +3,8 @@
 
 Takes the summary.json from a baseline leg and a target leg (same droplet, same
 workload, run back to back) and reports the deltas that matter for a mempool
-change: throughput, propagation latency, rejects, and backpressure.
+change: propagation latency, reach, rejects, and backpressure, with throughput
+and block timing for context.
 
 Stdlib only, mirroring deploy/deployer/deploy.py.
 
@@ -22,10 +23,15 @@ from pathlib import Path
 # ratio-scale quantities, which is every metric here.
 # (label, json path, lower_is_better, how to read it)
 COMPARISONS = (
-    ("Transactions submitted", ("throughput", "submitted"), False,
-     "Proving-bound, so treat small moves as noise."),
-    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), False,
-     "Same figure per second. A real drop shows up here and above together."),
+    # The blaster keeps a fixed number of transactions in flight and each waits
+    # for a block, so throughput follows blocks mined, which swings with mining
+    # luck. Reported for context, never graded, like confirm delay below.
+    ("Transactions submitted", ("throughput", "submitted"), None,
+     "Follows blocks mined (below). Informational, not graded."),
+    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), None,
+     "Same figure per second. Informational, not graded."),
+    ("Blocks mined in window", ("convergence", "blocks_mined"), None,
+     "Mining luck. Throughput and confirm delay follow it."),
     ("Reject rate", ("throughput", "reject_rate"), True,
      "Node rejects only. 0 -> non-zero is the most actionable regression here."),
     # Confirm delay is bounded by when the next block lands, so its percentiles
@@ -132,9 +138,9 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     lines = [
         "## Zakura mempool load: baseline vs target",
         "",
-        f"baseline `{base_meta.get('sha', 'unknown')}` "
+        f"baseline `{base_meta.get('sha', 'unknown')}` {base_meta.get('profile', 'default')} "
         f"({baseline.get('verdict', 'unknown')}) "
-        f"vs target `{target_meta.get('sha', 'unknown')}` "
+        f"vs target `{target_meta.get('sha', 'unknown')}` {target_meta.get('profile', 'default')} "
         f"({target.get('verdict', 'unknown')})",
         "",
         f"{target_meta.get('node_count', '?')} nodes | "

@@ -128,6 +128,8 @@ pub(crate) type ReadReply = Result<Option<Vec<Bytes>>, ReadError>;
 /// State every handle of one connection shares with its task.
 #[derive(Debug)]
 pub(crate) struct ConnShared {
+    #[cfg(zakura_sim)]
+    pub(crate) slot_release: std::sync::OnceLock<crate::SlotProbe>,
     /// Set once, when the connection closes.
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
     /// One slot per stream that a [`SendStream::stopped`] waits on or that
@@ -169,6 +171,8 @@ impl ConnShared {
         // one process number their connections differently.
         static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
+            #[cfg(zakura_sim)]
+            slot_release: std::sync::OnceLock::new(),
             closed: watch::Sender::new(None),
             stopped: Mutex::new(HashMap::new()),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),

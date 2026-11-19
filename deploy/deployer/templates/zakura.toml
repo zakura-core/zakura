@@ -15,7 +15,7 @@ storage_mode = "{{STORAGE_MODE}}"
 
 [rpc]
 {{RPC_BLOCK}}
-
+{{MEMPOOL_BLOCK}}
 {{METRICS_BLOCK}}
 {{HEALTH_BLOCK}}
 {{MINING_BLOCK}}

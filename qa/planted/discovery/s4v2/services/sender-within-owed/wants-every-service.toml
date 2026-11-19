@@ -1,0 +1,12 @@
+# `GetServices::wants` returns true for every service, so the node answers
+# a request for header sync alone with its discovery summary too. The
+# scenario's peer asks for header sync alone. mut-6's generator drew it
+# (seed 11, run 32, family get-header-sync-service).
+# Besides protocol.rs, which the patch changes, the rest of discovery
+# decides which summaries the node reports.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/sender-within-owed/wants-every-service.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/sender-within-owed/wants-every-service.plan.bin"

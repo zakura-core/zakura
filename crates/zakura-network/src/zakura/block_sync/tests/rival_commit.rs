@@ -221,3 +221,30 @@ async fn receive_across_rival_commit(waiting_for_decode: bool) {
     }
     reactor.abort();
 }
+
+#[tokio::test]
+async fn startup_with_divergent_tips_requests_from_the_shared_parent() {
+    let blocks = mainnet_blocks_1_to_3();
+    let finalized = Frontier::new(block::Height(0), blocks[0].header.previous_block_hash);
+    let parent = Frontier::new(block::Height(1), blocks[0].hash());
+    let selected = Frontier::new(block::Height(2), blocks[1].hash());
+    let verified = Frontier::new(block::Height(2), forked_block(&blocks[1], 42).hash());
+    let initial = committed_snapshot(1, 1, 1, finalized, verified, selected);
+    let (views, startup) =
+        committed_block_sync_startup(initial.clone(), immediate_body_download_config());
+    views.send_replace(Some(CommittedHeaderChainView::new(
+        parent,
+        initial,
+        BodyWorkEpoch::default(),
+    )));
+    let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup).unwrap();
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    assert_eq!(wiring.view.borrow().download_floor, parent.height);
+    assert_eq!(wiring.view.borrow().verified_hash, parent.hash);
+    assert_eq!(handle.local_status().tip_hash, verified.hash);
+    let BlockSyncAction::QueryNeededBlocks { from, .. } = next_action(&mut actions).await else {
+        panic!("startup queries the selected branch")
+    };
+    assert_eq!(from, selected.height);
+    reactor.abort();
+}

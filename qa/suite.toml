@@ -132,42 +132,6 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/header_authority.rs"
-test = "regenerate_authority_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed authority witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
-test = "regenerate_reset_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_hold_release.rs"
-test = "regenerate_hold_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed hold fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_peer_retirement.rs"
-test = "regenerate_retirement_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_recovery_progress.rs"
-test = "regenerate_recovery_fixtures"
-run = false
-reason = "a tool, not a test: it rewrites the committed recovery fixtures from their names"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_stale_chain.rs"
-test = "regenerate_chain_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed stale-chain witnesses from their builders"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/sync_wire.rs"
 test = "regenerate_saved_scenarios"
 run = false
@@ -202,24 +166,6 @@ file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
 test = "regenerate_planted_guard_scenarios"
 run = false
 reason = "a tool, not a test: it rewrites the planted cases' scenarios"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_chain_selected.rs"
-test = "regenerate_selection_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication_liveness.rs"
-test = "regenerate_liveness_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed liveness witnesses from their fixtures"
-
-[[ignored]]
-file = "crates/zakura-sim/tests/header_publication.rs"
-test = "regenerate_publication_witnesses"
-run = false
-reason = "a tool, not a test: it rewrites the committed publication witnesses from their builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"

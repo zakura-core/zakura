@@ -258,7 +258,7 @@ jobs:
           retention-days: 90
 
   deploy:
-    if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'
+    if: inputs.operation == 'dashboard' || (inputs.operation == 'deploy' && inputs.node != 'zakura-mac-os')
     name: "${{ inputs.operation == 'dashboard' && 'Deploy Zakura mainnet dashboard' || format('Deploy Zakura mainnet {0}', inputs.ref) }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
     timeout-minutes: 600
@@ -275,6 +275,7 @@ jobs:
 
     steps:
       - name: Validate deploy inputs
+        if: inputs.operation == 'deploy'
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
@@ -309,6 +310,7 @@ jobs:
       # Keep orchestration from this workflow revision even when deploying an old
       # release. Only the binaries come from the requested ref.
       - name: Resolve deployment commit
+        if: inputs.operation == 'deploy'
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
@@ -389,12 +391,11 @@ jobs:
 
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
-        env:
-          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
 
-          REF="$DEPLOY_COMMIT"
+          # Dashboard-only runs use the tooling checkout and never resolve a binary ref.
+          REF="${DEPLOY_COMMIT:-$GITHUB_SHA}"
           cat > nodes.ci.toml <<EOF
           [defaults]
           # Binary-only: swap the binary and restart the existing service; leave

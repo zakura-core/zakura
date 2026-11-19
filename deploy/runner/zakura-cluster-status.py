@@ -5166,17 +5166,17 @@ function renderSources() {
         + `<td class="pf-num">${o.won} (${share(o.won, o.sent)})</td><td class="pf-num">${ms(o.saved_p50_ms)}</td><td class="pf-num">${ms(o.saved_p90_ms)}</td></tr>`).join("")
     : "";
   const missedBlocks = sources.missed_blocks || {};
-  el("src-pen").innerHTML = "<tr><th>Announced block not delivered</th><th>Times</th><th>Peer delivered a block again</th><th>Passed over for, median</th><th>p90</th><th>Not yet</th><th>Disconnected</th></tr>"
+  el("src-pen").innerHTML = "<tr><th>Announced block not delivered</th><th>Times</th><th>Later block observed</th><th>Time to next block, median</th><th>p90</th><th>No later block observed</th></tr>"
     + [["first", "First request"], ["second", "Second request"]].filter(([kind]) => missedBlocks[kind]).map(([kind, label]) => {
       const m = missedBlocks[kind];
       return `<tr><td>${label}</td><td class="pf-num">${m.count}</td><td class="pf-num">${m.delivered_again}</td><td class="pf-num">${seconds(m.delivered_again_s.p50)}</td>`
-        + `<td class="pf-num">${seconds(m.delivered_again_s.p90)}</td><td class="pf-num">${m.waiting}</td><td class="pf-num">${m.closed}</td></tr>`;
+        + `<td class="pf-num">${seconds(m.delivered_again_s.p90)}</td><td class="pf-num">${m.count - m.delivered_again}</td></tr>`;
     }).join("");
   const { carried_over = 0, ...counts } = sources.samples.counts;
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   el("src-mix").textContent = total
     ? "What the scores were made of: " + Object.entries(counts).filter(([, n]) => n).map(([kind, n]) => `${share(n, total)} ${SAMPLE_LABEL[kind] || kind}`).join(", ")
-      + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples. A peer that announces a block and does not deliver it keeps its score, but is passed over for announced blocks until it delivers one.`
+      + `. A score rests on a median of ${sources.samples.weight.p50 == null ? "–" : sources.samples.weight.p50.toFixed(1)} recent samples.`
     : "No new score measurements in this window.";
   if (carried_over) el("src-mix").textContent += ` ${carried_over} ${SAMPLE_LABEL.carried_over}.`;
 }

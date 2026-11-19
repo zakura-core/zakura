@@ -167,7 +167,7 @@ TRACE_TABLES = {
     "commit_state": ("commit_start", "commit_finish"),
     "chain_tip": ("tip_published",),
     # Read only by the block source summary (`block_sources.py`), not by the stage timeline.
-    "delivery_score": ("delivery_sample",),
+    "delivery_score": ("delivery_sample", "block_missed"),
 }
 STAGE_TABLES = frozenset(TRACE_TABLES) - {"delivery_score"}
 # Rows that say a peer and this node exchanged word of a block, and which step each is:

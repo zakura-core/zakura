@@ -10,8 +10,8 @@ answers, per node, whether that is working:
   and how often second requests were sent, delivered and won;
 - `delivery_score` `delivery_sample` rows, one per sample that changed a peer's score, which show
   what the scores are made of;
-- `delivery_score` `block_missed` rows, one per announced block a peer did not deliver: block
-  routing stops preferring that peer until it delivers a block, and these show how soon it did.
+- `delivery_score` `block_missed` rows, one per announced block a peer did not deliver,
+  matched with the next observed block from the same connection.
 
 Everything is kept in memory for at most `MAX_HOURS`; a restarted profiler starts from the
 last part of each table that it reads back.
@@ -94,7 +94,6 @@ class BlockSources:
                 "score_ms": row.get("score_ms"),
                 "bytes": row.get("block_bytes"),
                 "reason": row.get("hedge_reason"),
-                "waited_ms": row.get("first_request_waited_ms"),
                 "connection": (row.get("process_trace_id"), row.get("connection_id")),
             }
             with self._lock:
@@ -106,8 +105,6 @@ class BlockSources:
                 self._when(row),
                 (row.get("process_trace_id"), row.get("connection_id")),
                 row["kind"],
-                row.get("score_before_ms"),
-                row["score_ms"],
                 row.get("weight"),
             )
             with self._lock:
@@ -168,30 +165,26 @@ def prediction_errors(requests):
 def second_request_outcomes(requests):
     """Second requests by reason: how many were sent, delivered and arrived first."""
     firsts = {}
-    for r in requests:
-        if not r["second"]:
-            earlier = firsts.get(r["block"])
-            # The block's first request is the one that started first.
-            if earlier is None or r["when"] - r["elapsed_ms"] / 1000 < earlier["when"] - earlier["elapsed_ms"] / 1000:
-                firsts[r["block"]] = r
     by_reason = collections.defaultdict(lambda: {"sent": 0, "delivered": 0, "won": 0, "saved_ms": []})
-    for r in requests:
+    # Trace rows arrive in completion order. Walk estimated start times to pair a second
+    # request with the latest preceding first request, including when a block is retried.
+    for r in sorted(requests, key=lambda r: (r["when"] - r["elapsed_ms"] / 1000, r["second"])):
         if not r["second"]:
+            firsts[r["block"]] = r
             continue
+        first = firsts.pop(r["block"], None)
         outcome = by_reason[r["reason"] or "fixed delay"]
         outcome["sent"] += 1
         if not r["delivered"]:
             continue
         outcome["delivered"] += 1
-        done = (r["waited_ms"] or 0) + r["elapsed_ms"]
-        first = firsts.get(r["block"])
         if first is None:
             continue
         if not first["delivered"]:
             outcome["won"] += 1
-        elif done < first["elapsed_ms"]:
+        elif r["when"] < first["when"]:
             outcome["won"] += 1
-            outcome["saved_ms"].append(first["elapsed_ms"] - done)
+            outcome["saved_ms"].append(round((first["when"] - r["when"]) * 1000))
     return [
         {
             "reason": reason,
@@ -207,8 +200,11 @@ def second_request_outcomes(requests):
 
 def sample_mix(samples):
     """How many samples of each kind changed scores, and how many samples a score rests on."""
-    counts = collections.Counter(s[2] for s in samples)
-    weights = [s[5] for s in samples if s[2] != "carried_over" and isinstance(s[5], (int, float))]
+    counts = collections.Counter(kind for _, _, kind, _ in samples)
+    weights = [
+        weight for _, _, kind, weight in samples
+        if kind != "carried_over" and isinstance(weight, (int, float))
+    ]
     return {
         "counts": {kind: counts.get(kind, 0) for kind in SAMPLE_KINDS},
         "weight": spread(weights),
@@ -216,40 +212,25 @@ def sample_mix(samples):
 
 
 def missed_blocks(misses, requests, samples):
-    """Announced blocks peers did not deliver, and how soon each peer delivered a block again.
-
-    After a miss, block routing stops preferring the peer until it delivers a block. A later
-    delivered block request, or a small-block score sample, on the same connection ends that.
-    A connection with no later row at all has most likely closed.
-    """
+    """Count missed blocks and time to the next observed block on the same connection."""
     delivered = collections.defaultdict(list)
-    seen = collections.defaultdict(list)
     for r in requests:
-        seen[r["connection"]].append(r["when"])
         if r["delivered"]:
             delivered[r["connection"]].append(r["when"])
     for when, connection, kind, *_ in samples:
-        seen[connection].append(when)
         if kind == "block":
             delivered[connection].append(when)
-    result = {}
-    for request in MISSED_REQUESTS:
-        delays, waiting, closed = [], 0, 0
-        for when, connection, kind in misses:
-            if kind != request:
-                continue
-            again = min((t for t in delivered[connection] if t > when), default=None)
-            if again is not None:
-                delays.append(again - when)
-            elif any(t > when for t in seen[connection]):
-                waiting += 1
-            else:
-                closed += 1
-        result[request] = {
-            "count": len(delays) + waiting + closed,
-            "delivered_again": len(delays),
-            "delivered_again_s": spread(delays),
-            "waiting": waiting,
-            "closed": closed,
+    counts = collections.Counter(kind for _, _, kind in misses)
+    delays = collections.defaultdict(list)
+    for when, connection, kind in misses:
+        again = min((t for t in delivered.get(connection, ()) if t > when), default=None)
+        if again is not None:
+            delays[kind].append(again - when)
+    return {
+        kind: {
+            "count": counts[kind],
+            "delivered_again": len(delays[kind]),
+            "delivered_again_s": spread(delays[kind]),
         }
-    return result
+        for kind in MISSED_REQUESTS
+    }

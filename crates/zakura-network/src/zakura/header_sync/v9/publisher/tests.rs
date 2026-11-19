@@ -2222,6 +2222,44 @@ fn walks_from_open_locators_spend_the_meter_at_exact_boundaries() {
     }
 }
 
+/// F-801: the meter belongs to the connection. A session reopened on the
+/// same connection shares it, so the reopen gets no fresh burst of walks.
+#[test]
+fn a_reopened_session_shares_its_connections_walk_meter() {
+    use super::state::OPEN_WALKS;
+    use crate::zakura::regulation::SharedBucket;
+
+    let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
+    let meter = SharedBucket::new(OPEN_WALKS);
+    let start = zakura_rt::time::Instant::now();
+    let session = || {
+        let mut owner = PublisherOwner::new(limits()).with_open_walks(meter.clone());
+        let mut subscriber = Subscriber::new();
+        let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
+        assert_eq!(owner.apply(&open), Ok(Applied::Live));
+        owner
+    };
+    let walk = |owner: &mut PublisherOwner| {
+        let job = owner.state.next_job::<HB>(None, start)?;
+        owner.state.finish(job.key, Output::Retry, None);
+        Some(())
+    };
+    let mut first = session();
+    for _ in 0..OPEN_WALKS.capacity {
+        assert!(walk(&mut first).is_some());
+    }
+    let mut reopened = session();
+    assert!(
+        walk(&mut reopened).is_none(),
+        "the reopen gets no fresh burst"
+    );
+    assert_eq!(
+        reopened.state.walk_due(),
+        Some(start + OPEN_WALKS.refill_interval)
+    );
+}
+
 /// A peer that reopens for walks soon meets the meter, and each `Open` the
 /// meter holds back still ends once its token returns: within one refill
 /// interval, far below a subscriber's 30 s request timeout.

@@ -8,12 +8,17 @@ use std::{
 use thiserror::Error;
 
 use crate::zakura::CloseRow;
-use zakura_chain::block::{Hash, Height};
+use zakura_chain::block::{Hash, Height, MAX_BLOCK_BYTES};
 use zakura_rt::{collections::HashMap, time::Instant};
 
-use super::wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES};
+use super::{
+    session::PEER_EXECUTION,
+    wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES},
+};
 use crate::zakura::{
-    block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES},
+    block_sync::{
+        admission::min_rate_transfer_time, config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+    },
     regulation::{
         shrink_after_peak, ClaimRefused, Claimed, Exchange, ExchangeWriter, PoolEntry,
         Reservations, ReserveRefused,
@@ -75,6 +80,19 @@ struct Pending {
     body_bytes: usize,
     max_body_bytes: u32,
     retirement_started_at: Option<Instant>,
+}
+
+impl Pending {
+    /// Body bytes this range may still send: its remaining response-byte
+    /// limit, at most one protocol-maximum body per unreceived block.
+    fn owed_body_bytes(&self) -> u64 {
+        // A range holds at most 128 heights, so the count fits.
+        let bodies = self.expected.len().saturating_sub(self.received) as u64;
+        // Received body bytes stay within the u32 response limit.
+        u64::from(self.max_body_bytes)
+            .saturating_sub(self.body_bytes as u64)
+            .min(bodies.saturating_mul(MAX_BLOCK_BYTES))
+    }
 }
 
 /// Each range owns one node pool entry and at most 128 expected hashes.
@@ -146,6 +164,46 @@ impl Requester {
     /// Live ranges whose every body arrived but whose ending has not.
     pub(super) fn pending_endings(&self) -> usize {
         self.pending_endings
+    }
+
+    /// Body bytes the peer may still send under every live range, including
+    /// one the scheduler abandoned after its timeout, up to one
+    /// protocol-maximum body: the caller needs only the next body on the
+    /// ordered stream.
+    pub(super) fn owed_body_bytes(&self) -> u64 {
+        let mut owed: u64 = 0;
+        for pending in self.ranges.values() {
+            owed = owed.saturating_add(pending.owed_body_bytes());
+            if owed >= MAX_BLOCK_BYTES {
+                return MAX_BLOCK_BYTES;
+            }
+        }
+        owed
+    }
+
+    /// Read-active time an honest server's ordered stream may spend on other
+    /// bodies before `start`'s ending.
+    ///
+    /// The server queues an ending right after its last body, but ready-order
+    /// output can put one body from each other running job between them.
+    /// Those jobs answer ranges that still owe a body, and a peer runs at most
+    /// `PEER_EXECUTION` of them. Each body takes its transfer time at the
+    /// deadline floor rate.
+    fn bodies_ahead_of_ending(&self, start: Height) -> Duration {
+        // PEER_EXECUTION is 12, so the product fits.
+        let cap = (PEER_EXECUTION as u64 - 1) * MAX_BLOCK_BYTES;
+        let mut ahead: u64 = 0;
+        for (other, pending) in &self.ranges {
+            if *other != start {
+                ahead = ahead
+                    .saturating_add(pending.owed_body_bytes().min(MAX_BLOCK_BYTES))
+                    .min(cap);
+                if ahead == cap {
+                    break;
+                }
+            }
+        }
+        min_rate_transfer_time(ahead)
     }
 
     /// Old abandoned work must not pin a height forever while other work advances.
@@ -301,8 +359,14 @@ impl Requester {
             );
         } else {
             // The ordered response must still end. Keep an earlier abandonment
-            // deadline, or start one when the last block is claimed.
-            let at = *pending.retirement_started_at.get_or_insert(now);
+            // deadline, or start one once the bodies that can precede the
+            // ending had time to arrive.
+            let ahead = self.bodies_ahead_of_ending(start);
+            let pending = self
+                .ranges
+                .get_mut(&start)
+                .expect("the claimed range is live");
+            let at = *pending.retirement_started_at.get_or_insert(now + ahead);
             self.retiring.insert((at, start));
             self.pending_endings += 1;
         }

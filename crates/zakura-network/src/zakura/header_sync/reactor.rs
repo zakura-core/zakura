@@ -1699,7 +1699,8 @@ impl HeaderSyncReactor {
         }
         // A staged page is not progress yet (#2248): a peer could drip one
         // header per deadline and hold its reservation. Progress is a
-        // prepared target, or a filled reservation that continues the round.
+        // prepared target, or a round that staged a fair share of headers
+        // since its last progress.
         let active = self
             .peer_work_queue
             .active(&peer)
@@ -1721,10 +1722,19 @@ impl HeaderSyncReactor {
                 if bounded_prefix && facts.checkpoint_prefix_ready {
                     metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
                 }
+                // The peer delivered the round. Its own deadline must not
+                // retire a prepare still running near it.
+                self.state.arm_request_deadline(
+                    peer.clone(),
+                    Instant::now(),
+                    self.startup.request_timeout,
+                );
                 self.prepare_staged_work(&peer, bounded_prefix);
             }
             PageNext::Continue { staged_tip } => {
-                self.note_request_progress(&peer, session_id);
+                if self.peer_work_queue.credit_staged_share(&peer) {
+                    self.note_request_progress(&peer, session_id);
+                }
                 self.continue_round(&peer, staged_tip);
             }
         }

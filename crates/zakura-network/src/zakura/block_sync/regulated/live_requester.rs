@@ -177,6 +177,12 @@ impl LiveRequester {
         }
     }
 
+    /// Body bytes the peer may still send under its live ranges, up to one
+    /// protocol-maximum body.
+    pub(crate) fn owed_body_bytes(&self) -> u64 {
+        self.shared.lock().owed_body_bytes()
+    }
+
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
         self.shared.lock().retirement_deadline(grace)
     }

@@ -191,6 +191,40 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
     );
 }
 
+/// A written request that times out leaves the window, but the requester
+/// still accepts its body, and that body counts as progress. So the liveness
+/// deadline keeps the body's transfer time until the range ends.
+#[tokio::test]
+async fn a_timed_out_request_keeps_its_bodys_liveness_allowance() {
+    let (mut routine, mut outbound, _pool, _connection, _) =
+        requester_routine(block::Hash([1; 32]));
+    routine.try_fill();
+    next_sent(&mut outbound).await;
+    let with_request = routine.state.window.block_liveness_deadline().unwrap();
+    let deadline = routine.state.window.outstanding.first().unwrap().deadline;
+    assert!(deadline < with_request);
+    assert!(routine.expire_due_timeouts(deadline));
+    assert!(routine.state.window.outstanding.is_empty());
+    let request_timeout = routine.config.request_timeout;
+    let allowance = |routine: &mut PeerRoutine, now| {
+        routine.state.check_block_liveness(
+            now,
+            routine.io.requester.owed_body_bytes(),
+            false,
+            request_timeout,
+        )
+    };
+    assert_eq!(
+        allowance(&mut routine, with_request - Duration::from_millis(1)),
+        LivenessDecision::Continue,
+        "the authorized body keeps its transfer time"
+    );
+    assert_eq!(
+        allowance(&mut routine, with_request),
+        LivenessDecision::Stall
+    );
+}
+
 #[tokio::test]
 async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
     let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));

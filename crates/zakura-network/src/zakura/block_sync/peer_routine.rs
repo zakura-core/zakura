@@ -439,7 +439,10 @@ impl PeerRoutine {
             // keep abandoned authorization alive or postpone request timeouts.
             let now = Instant::now();
             self.check_request_liveness(now)?;
-            if self.state.deadlines_due(now) {
+            if self
+                .state
+                .deadlines_due(now, self.io.requester.owed_body_bytes())
+            {
                 self.handle_deadlines(now)?;
             }
             self.flush_pending_status();
@@ -833,6 +836,7 @@ impl PeerRoutine {
             floor_watchdog_avoid,
             body_retry_avoid,
             retry_filter: retry_filter_deadline,
+            authorized_body_bytes: self.io.requester.owed_body_bytes(),
         });
         match earliest {
             // Floor the wait at the deadline so a far-future request still wakes
@@ -918,6 +922,7 @@ impl PeerRoutine {
     fn check_block_liveness(&mut self, now: Instant) -> Result<(), SinkReject> {
         match self.state.check_block_liveness(
             now,
+            self.io.requester.owed_body_bytes(),
             self.io.session.outbound_capacity() == 0,
             self.config.request_timeout,
         ) {

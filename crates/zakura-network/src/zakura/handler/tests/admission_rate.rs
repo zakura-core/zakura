@@ -188,8 +188,10 @@ async fn a_fresh_address_admits_while_another_is_saturated() {
 
 /// conn-30: five addresses fill their whole handshake share, 4 each, and an
 /// honest address is still admitted. A sixth address fills the inbound share
-/// of 24, and the honest address waits until an attempt ends, which the
-/// handshake deadline bounds at `control_timeout` from admission.
+/// of 24, and an honest address waits until an attempt ends, which the
+/// handshake deadline bounds at `control_timeout` from admission. Each honest
+/// attempt comes from a fresh address, since the attempts share one instant
+/// and one address gets one reserve token per refill (F-800).
 #[test]
 fn an_honest_address_admits_while_five_addresses_hold_their_share() {
     let handler = handler_with_defaults();
@@ -201,8 +203,8 @@ fn an_honest_address_admits_while_five_addresses_hold_their_share() {
         "the figures below follow from these defaults"
     );
     let mut endpoint = Endpoint::default();
-    let honest = IpAddr::from([192, 0, 2, 1]);
     for host in 0..6u8 {
+        let honest = IpAddr::from([192, 0, 2, host]);
         let ip = IpAddr::from([198, 51, 100, host]);
         for _ in 0..share {
             assert_eq!(endpoint.attempt(&handler, ip), Admit::Accept);
@@ -223,6 +225,7 @@ fn an_honest_address_admits_while_five_addresses_hold_their_share() {
         .in_flight
         .get_mut(&info.remote.ip())
         .expect("the attempt is in flight") -= 1;
+    let honest = IpAddr::from([192, 0, 2, 6]);
     assert_eq!(handler.admit(&endpoint.info(honest, false)), Admit::Accept);
     handler.finish_admission(false);
 }

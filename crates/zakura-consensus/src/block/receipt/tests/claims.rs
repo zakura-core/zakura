@@ -22,7 +22,7 @@ fn a_body_inside_its_deadline_keeps_the_order_of_its_header() {
     claim(&claims, hash(1), now);
     let competitor = order::next();
 
-    let at_the_bound = now + body_deadline(0);
+    let at_the_bound = now + CLAIM_BODY_DEADLINE;
     let order = body_order(&claims, hash(1), 0, at_the_bound);
     assert!(order < competitor);
     assert_eq!(Some(order), claims.claimed_order(hash(1)));
@@ -59,7 +59,7 @@ fn announcing_a_withheld_block_again_does_not_renew_its_claim() {
     // The body is withheld past its deadline while the header is delivered again.
     let mut late = now;
     for _ in 0..3 {
-        late += MAX_CLAIM_BODY_DEADLINE;
+        late += CLAIM_BODY_DEADLINE;
         claim(&claims, hash(1), late);
     }
     let competitor = order::next();
@@ -92,34 +92,46 @@ fn a_header_that_is_not_applied_leaves_no_claim() {
     assert!(!claims.is_claimed(hash(1)));
 
     // A later apply of the same header claims from its own arrival.
-    let later = now + MAX_CLAIM_BODY_DEADLINE;
+    let later = now + CLAIM_BODY_DEADLINE;
     claim(&claims, hash(1), later);
     let found = used(&claims, hash(1), later);
     assert_eq!(found.age, Duration::ZERO);
 }
 
 #[test]
-fn the_deadline_grows_with_body_size_up_to_the_window() {
-    const MIB: usize = 1024 * 1024;
-    assert_eq!(body_deadline(0), CLAIM_BASE_GRACE);
-    assert_eq!(
-        body_deadline(MIB),
-        CLAIM_BASE_GRACE + Duration::from_secs(1)
-    );
-    assert_eq!(body_deadline(2 * MIB), MAX_CLAIM_BODY_DEADLINE);
-    assert_eq!(body_deadline(usize::MAX), MAX_CLAIM_BODY_DEADLINE);
-
+fn small_and_full_size_bodies_get_the_same_deadline() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     claim(&claims, hash(1), now);
+    let claimed = claims
+        .claimed_order(hash(1))
+        .expect("the header was claimed");
     let competitor = order::next();
+    let just_inside = now + CLAIM_BODY_DEADLINE - Duration::from_millis(1);
+    let just_after = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
 
-    let past_the_grace = now + CLAIM_BASE_GRACE + Duration::from_millis(1);
-    assert!(body_order(&claims, hash(1), 1_000, past_the_grace) > competitor);
-    assert!(body_order(&claims, hash(1), MIB, past_the_grace) < competitor);
-
-    let past_the_window = now + MAX_CLAIM_BODY_DEADLINE + Duration::from_millis(1);
-    assert!(body_order(&claims, hash(1), 2 * MIB, past_the_window) > competitor);
+    // A 1 kB body and a 2 MB body, the largest a block can be.
+    for bytes in [1_000, 2_000_000] {
+        assert!(
+            matches!(
+                claims.resolve(hash(1), just_inside, || bytes),
+                ClaimOutcome::Used { order, .. } if order == claimed
+            ),
+            "a body of {bytes} bytes just inside the deadline takes the claimed order",
+        );
+        assert!(
+            matches!(
+                claims.resolve(hash(1), just_after, || bytes),
+                ClaimOutcome::Expired { age, .. } if age == just_after - now
+            ),
+            "a body of {bytes} bytes past the deadline loses the claim",
+        );
+        assert!(body_order(&claims, hash(1), bytes, just_inside) < competitor);
+        assert!(
+            body_order(&claims, hash(1), bytes, just_after) > competitor,
+            "a body of {bytes} bytes past the deadline is ranked by its arrival",
+        );
+    }
 }
 
 #[test]
@@ -275,7 +287,8 @@ fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
     let reserved = claims
         .claimed_order(hash(1))
         .expect("the first apply reserved it");
-    let second = claims.begin_at([(hash(1), CLAIMED)], TIP, now + CLAIM_BASE_GRACE);
+    let later = now + Duration::from_millis(500);
+    let second = claims.begin_at([(hash(1), CLAIMED)], TIP, later);
 
     // The apply that reserved the claim fails, while another apply of the header succeeds.
     drop(first);
@@ -292,9 +305,7 @@ fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
     let reserved = claims
         .claimed_order(hash(3))
         .expect("the earlier apply reserved it");
-    claims
-        .begin_at([(hash(3), CLAIMED)], TIP, now + CLAIM_BASE_GRACE)
-        .commit();
+    claims.begin_at([(hash(3), CLAIMED)], TIP, later).commit();
     earlier.commit();
     assert_eq!(used(&claims, hash(3), now).order, reserved);
 

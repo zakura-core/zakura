@@ -2786,10 +2786,10 @@ proptest! {
 
 /// The real subscriber, on an in-process session.
 fn real_subscriber() -> super::super::subscriber::Subscriber {
-    use crate::zakura::{regulation::WriterFence, CloseCause};
+    use crate::zakura::regulation::WriterFence;
     super::super::subscriber::Subscriber::new(
         HB,
-        WriterFence::new(CancellationToken::new(), CloseCause::default()),
+        WriterFence::new(CancellationToken::new()),
         &framed_channel(1).1,
     )
 }

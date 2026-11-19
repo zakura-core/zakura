@@ -349,7 +349,7 @@ impl Subscriber {
     ///
     /// The subscription holds the `Open`'s exchange until its terminal
     /// outcome, so a session that ends after the `Open` was written and
-    /// before the outcome closes the connection.
+    /// before the outcome resets the session's streams.
     pub(crate) fn open(
         &mut self,
         status: &Status,
@@ -387,7 +387,7 @@ impl Subscriber {
 
     /// Remove a subscription whose `Open` failed to send. If no byte was
     /// written, nothing else happens. If its first byte was written, the peer
-    /// may answer, so dropping the exchange closes the connection.
+    /// may answer, so dropping the exchange resets the session.
     pub(crate) fn retract(&mut self, id: u64) -> bool {
         self.state.retract(&mut self.tools.lock(), id)
     }

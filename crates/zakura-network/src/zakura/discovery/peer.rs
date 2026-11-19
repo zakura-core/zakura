@@ -243,10 +243,11 @@ impl PeerIO {
     /// Ends the session's serving and queries, closes the connection if
     /// `close` asks to, then releases the session's admission.
     ///
-    /// The state asks to close only right after the owner check. Retiring the
-    /// queries can close the connection too, so nothing here waits before the
-    /// close: a service that gained the connection after the check would
-    /// otherwise lose it. Only that close retires the session's record.
+    /// The state asks to close only right after the owner check, so nothing
+    /// here waits before the close: a service that gained the connection
+    /// after the check would otherwise lose it. Retiring the queries resets
+    /// this session if a query is unanswered, and keeps the connection. Only
+    /// the close retires the session's record.
     async fn end(self, close: Option<Close>) {
         self.session.cancel_token().cancel();
         self.queries.retire();

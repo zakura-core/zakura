@@ -32,7 +32,7 @@
 //!
 //! [`Reservations::reserve_fenced`] makes a reservation own its request's
 //! [`Exchange`]. The ending's claim ends the exchange. Dropping the map at the
-//! session's end drops the rest, and a started one closes the connection.
+//! session's end drops the rest, and a started one resets the session.
 //!
 //! # Properties and their tests
 //!
@@ -50,7 +50,7 @@
 //! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
 //! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
 //! | Refusals are exactly the violations, for any sequence | `operation_sequences_refuse_exactly_the_violations` |
-//! | The ending ends a fenced exchange; the map's drop closes a started one | `a_fenced_reservation_ends_its_exchange_with_its_ending` |
+//! | The ending ends a fenced exchange; the map's drop resets a started one's session | `a_fenced_reservation_ends_its_exchange_with_its_ending` |
 
 use std::{
     collections::BTreeMap,
@@ -240,7 +240,7 @@ struct Reservation {
     abandoned: bool,
     entry: PoolEntry,
     /// The request's exchange, if the reactor fences its writers. Dropping a
-    /// started exchange without its ending closes the connection.
+    /// started exchange without its ending resets the session.
     exchange: Option<Exchange>,
 }
 

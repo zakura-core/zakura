@@ -24,7 +24,7 @@ use crate::zakura::{
     },
     regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    CloseCause, Credit, Frame, FrameRejection, MessageRole,
+    Credit, Frame, FrameRejection, MessageRole,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -84,7 +84,7 @@ const PAGE_HEADERS: u32 = 3;
 
 /// A subscriber on an in-process session whose fence closes `connection`.
 fn fenced(connection: &CancellationToken) -> Sub {
-    let fence = WriterFence::new(connection.clone(), CloseCause::default());
+    let fence = WriterFence::new(connection.clone());
     Sub::new(HB, fence, &framed_channel(1).1)
 }
 
@@ -451,7 +451,7 @@ fn the_frame_header_check_runs_before_decode() {
     let slot = PrecheckSlot::default();
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(HB, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
     let len = frame.payload.len();
@@ -500,7 +500,7 @@ fn the_largest_credit_fits_the_receive_budget() {
     let slot = PrecheckSlot::default();
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(MAINNET, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
     let tip = Frontier::new(block::Height(1_000_000), block::Hash([1; 32]));
@@ -1402,7 +1402,7 @@ fn an_open_holds_its_exchange_until_the_outcome() {
         "the peer may answer a written Open"
     );
 
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(HB, fence.clone(), &framed_channel(1).1);
     assert!(fence.retire());
     assert_eq!(

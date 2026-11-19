@@ -922,10 +922,13 @@ async fn discovery_keeps_a_tx_relay_connection_while_the_pool_attaches_and_betwe
         .raw
         .open_stream(ZAKURA_STREAM_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION)
         .await?;
-    // Discovery retires the control's session, whose own request is still
-    // unanswered, so the writer fence closes the connection.
+    // The control's exchange times out. Discovery owns the connection alone,
+    // so it closes it.
     control.closed().await?;
-    assert_eq!(observed.cause(&control), Some("unfinished_exchange"));
+    assert_eq!(
+        observed.cause(&control),
+        Some("discovery_exchange_timed_out")
+    );
     // The control connected after the peer, so the peer's look came first;
     // a short bounded window covers scheduling.
     tokio::time::sleep(Duration::from_secs(1)).await;

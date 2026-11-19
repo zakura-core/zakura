@@ -13,8 +13,7 @@ use crate::zakura::{
     },
     framed_channel,
     machine_test::machine_target_tests,
-    regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-    CloseCause,
+    regulation::PrecheckSlot,
 };
 
 const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
@@ -42,7 +41,6 @@ struct Session {
     /// The peer's end of the stream that carries this node's queries.
     written: FramedRecv,
     connection: CancellationToken,
-    close_cause: CloseCause,
     cancel: CancellationToken,
 }
 
@@ -50,14 +48,12 @@ struct Session {
 fn session_with(pool: ReservationPool, recv: &FramedRecv) -> Session {
     let (send, written) = framed_channel(4);
     let connection = CancellationToken::new();
-    let close_cause = CloseCause::new();
-    let cancel = CancellationToken::new();
-    let fence = WriterFence::new(connection.clone(), close_cause.clone());
+    let cancel = connection.child_token();
+    let fence = WriterFence::new(cancel.clone());
     Session {
         queries: Queries::new(pool, fence, recv, send, cancel.clone()),
         written,
         connection,
-        close_cause,
         cancel,
     }
 }
@@ -422,12 +418,12 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     queries.retire();
     assert!(!connection.is_cancelled());
 
-    // Written and unanswered.
+    // Written and unanswered: the session resets, and the connection stays.
     let Session {
         queries,
         mut written,
         connection,
-        close_cause,
+        cancel,
         ..
     } = session(&pool);
     queries
@@ -436,8 +432,8 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
         .expect("the query is queued");
     written.recv().await.expect("the query is written");
     queries.retire();
-    assert!(connection.is_cancelled());
-    assert_eq!(close_cause.get_or("none"), UNFINISHED_EXCHANGE);
+    assert!(cancel.is_cancelled());
+    assert!(!connection.is_cancelled());
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
 }
 

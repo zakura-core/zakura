@@ -17,7 +17,7 @@ use crate::zakura::{
     },
     regulation::{
         ClaimRefused, Exchange, ExchangeWriter, PoolEntry, ReservationPool, ResponsePrecheck,
-        WriterFence,
+        StallClose, WriterFence,
     },
     transport::FrameWriteClaim,
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
@@ -106,6 +106,8 @@ pub(crate) struct LiveRequester {
     shared: Arc<Shared>,
     pub(crate) pool: ReservationPool,
     fence: WriterFence,
+    /// Closes the connection after a repeated stall.
+    stall: StallClose,
     /// Whether a transport reader admits responses through [`Shared`].
     transport_admits: bool,
 }
@@ -134,6 +136,7 @@ impl LiveRequester {
     pub(crate) fn new(
         pool: ReservationPool,
         fence: WriterFence,
+        stall: StallClose,
         recv: &FramedRecv,
         send: FramedSend,
     ) -> Self {
@@ -148,6 +151,7 @@ impl LiveRequester {
             shared,
             pool,
             fence,
+            stall,
             transport_admits,
         }
     }
@@ -171,17 +175,19 @@ impl LiveRequester {
         self.shared.lock().retirement_deadline(grace)
     }
 
-    /// End this connection locally before releasing any unanswered authorization.
-    pub(crate) fn check_liveness(&self, now: Instant, grace: Duration) -> Result<(), SinkReject> {
-        let requester = self.shared.lock();
-        if requester
+    /// Whether an exchange's ending is overdue at `now`: an abandoned or
+    /// fully received range waited `grace` of read-active time for it. A
+    /// peer that withholds endings stalls even while its bodies arrive.
+    pub(crate) fn endings_overdue(&self, now: Instant, grace: Duration) -> bool {
+        self.shared
+            .lock()
             .retirement_deadline(grace)
             .is_some_and(|deadline| now >= deadline)
-        {
-            self.fence.retire();
-            return Err(SinkReject::local("GetBlocks exchanges did not finish"));
-        }
-        Ok(())
+    }
+
+    /// Close the connection after its second stall.
+    pub(crate) fn close_after_repeated_stall(&self) {
+        self.stall.close();
     }
 
     pub(crate) fn blocks_retry(&self, height: block::Height) -> bool {
@@ -289,11 +295,7 @@ impl FrameWriteClaim for FencedRequest {
 #[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use super::*;
-    use crate::zakura::{
-        framed_channel,
-        regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-        CloseCause,
-    };
+    use crate::zakura::{framed_channel, regulation::PrecheckSlot, CloseCause};
     use tokio_util::sync::CancellationToken;
 
     /// The reader may queue the whole response it was asked for, and a frame
@@ -303,12 +305,13 @@ mod tests {
     fn the_transport_queue_holds_only_what_the_live_ranges_owe() {
         let pool = ReservationPool::new(2).unwrap();
         let connection = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let fence = WriterFence::new(connection.clone());
         let (session, _) = framed_channel(1);
         let (_, recv) = framed_channel(1);
         let slot = PrecheckSlot::default();
         let recv = recv.with_precheck(slot.clone());
-        let requester = LiveRequester::new(pool.clone(), fence, &recv, session);
+        let stall = StallClose::new(connection.clone(), CloseCause::default());
+        let requester = LiveRequester::new(pool.clone(), fence, stall, &recv, session);
         let reader = slot.get().expect("the requester attaches its precheck");
 
         let hash = block::Hash([7; 32]);
@@ -374,7 +377,7 @@ mod tests {
 
         let authorize_with_reservation = |reserved: Option<u32>| {
             let pool = ReservationPool::new(1).unwrap();
-            let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+            let fence = WriterFence::new(CancellationToken::new());
             let (sender, _recv) = framed_channel(1);
             let requester = LiveRequester {
                 shared: Arc::new(Shared {
@@ -383,6 +386,7 @@ mod tests {
                 }),
                 pool: pool.clone(),
                 fence,
+                stall: StallClose::new(CancellationToken::new(), CloseCause::default()),
                 transport_admits: false,
             };
             if let Some(reserved) = reserved {
@@ -420,11 +424,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_endings_close_without_peer_fault_and_keep_entries_through_reader_cleanup() {
+    fn overdue_endings_stall_and_keep_entries_through_reader_cleanup() {
         let pool = ReservationPool::new(3).unwrap();
-        let connection = CancellationToken::new();
-        let cause = CloseCause::default();
-        let fence = WriterFence::new(connection.clone(), cause.clone());
+        let session = CancellationToken::new();
+        let fence = WriterFence::new(session.clone());
         let (sender, _recv) = framed_channel(1);
         let requester = LiveRequester {
             shared: Arc::new(Shared {
@@ -433,14 +436,13 @@ mod tests {
             }),
             pool: pool.clone(),
             fence,
+            stall: StallClose::new(CancellationToken::new(), CloseCause::default()),
             transport_admits: false,
         };
         // The transport reader can retain the authorization after the routine exits.
         let reader = requester.shared.clone();
         for start in 1..=2 {
-            assert!(requester
-                .check_liveness(Instant::now(), Duration::from_secs(32))
-                .is_ok());
+            assert!(!requester.endings_overdue(Instant::now(), Duration::from_secs(32)));
             let byte = u8::try_from(start).unwrap();
             let hash = block::Hash([byte; 32]);
             let writer = requester
@@ -458,18 +460,14 @@ mod tests {
             requester.retire(block::Height(start), false);
         }
         // A full session waiting only for endings may still have them queued.
-        assert!(requester
-            .check_liveness(Instant::now(), Duration::from_secs(32))
-            .is_ok());
-        assert!(matches!(
-            requester.check_liveness(
-                Instant::now() + Duration::from_secs(33),
-                Duration::from_secs(32)
-            ),
-            Err(SinkReject::Local(_))
+        assert!(!requester.endings_overdue(Instant::now(), Duration::from_secs(32)));
+        assert!(requester.endings_overdue(
+            Instant::now() + Duration::from_secs(33),
+            Duration::from_secs(32)
         ));
-        assert!(connection.is_cancelled());
-        assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+        // The stalled session's teardown retires its fence, which resets it.
+        assert!(!requester.fence.retire());
+        assert!(session.is_cancelled(), "the session is reset");
         assert_eq!(pool.held(), 2);
         assert!(
             pool.try_entry().is_some(),

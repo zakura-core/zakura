@@ -1,7 +1,7 @@
 use super::*;
 use crate::zakura::{
-    header_sync::HeaderSyncService, transport::FramedRecv, Service, ServicePeerDirection,
-    SessionDemand, ZAKURA_CAP_HEADER_SYNC,
+    header_sync::HeaderSyncService, regulation::STALL_POLICY, transport::FramedRecv, CloseCause,
+    Service, ServicePeerDirection, SessionDemand, ZakuraConnId, ZAKURA_CAP_HEADER_SYNC,
 };
 use tokio::time;
 
@@ -262,6 +262,85 @@ fn strikes_survive_session_replacement() {
     assert!(
         !fixture.is_admitted() && replacement.is_cancelled(),
         "the replacement's first strike reaches the limit"
+    );
+}
+
+/// One header-sync session on connection `conn_id`, whose connection token
+/// and close cause the test keeps.
+struct StallSession {
+    session: CancellationToken,
+    connection: CancellationToken,
+    close_cause: CloseCause,
+}
+
+impl EvictionFixture {
+    /// Connect session `session_id` on connection `conn_id`. A repeated
+    /// `conn_id` reuses `connection` and `close_cause`.
+    fn connect_on(
+        &mut self,
+        session_id: u64,
+        conn_id: ZakuraConnId,
+        connection: &CancellationToken,
+        close_cause: &CloseCause,
+    ) -> StallSession {
+        let session = connection.child_token();
+        let (send, outbound) = framed_channel(8);
+        self._outbound = outbound;
+        self.reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_connection(
+                self.peer.clone(),
+                session_id,
+                send,
+                session.clone(),
+                connection.clone(),
+                close_cause.clone(),
+            )
+            .with_conn_id(conn_id),
+        ));
+        assert!(self.is_admitted(), "the cooldown has passed");
+        StallSession {
+            session,
+            connection: connection.clone(),
+            close_cause: close_cause.clone(),
+        }
+    }
+}
+
+/// The first stall ends only the session. A second stall on the same
+/// connection closes the connection under the stall policy. A stall on a new
+/// connection starts over.
+#[tokio::test(start_paused = true)]
+async fn a_second_stall_on_one_connection_closes_it_under_the_stall_policy() {
+    let mut fixture = eviction_fixture(1, 7);
+    fixture
+        .reactor
+        .handle_peer_disconnected(&fixture.peer.clone(), 7, "test disconnect");
+    let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let connection = CancellationToken::new();
+    let close_cause = CloseCause::new();
+
+    let first = fixture.connect_on(8, 1, &connection, &close_cause);
+    fixture.time_out_one_request(8);
+    assert!(!fixture.is_admitted());
+    assert!(first.session.is_cancelled());
+    assert!(
+        !first.connection.is_cancelled(),
+        "a first stall keeps the connection"
+    );
+
+    time::advance(cooldown).await;
+    let second = fixture.connect_on(9, 1, &connection, &close_cause);
+    fixture.time_out_one_request(9);
+    assert!(second.connection.is_cancelled());
+    assert_eq!(second.close_cause.get(), Some(STALL_POLICY));
+
+    time::advance(cooldown).await;
+    let fresh = fixture.connect_on(10, 2, &CancellationToken::new(), &CloseCause::new());
+    fixture.time_out_one_request(10);
+    assert!(fresh.session.is_cancelled());
+    assert!(
+        !fresh.connection.is_cancelled(),
+        "a new connection's first stall keeps it"
     );
 }
 

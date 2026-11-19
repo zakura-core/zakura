@@ -220,7 +220,7 @@ impl Requester {
     }
 
     /// Only for a request whose publication failed. Dropping a started exchange
-    /// through this path closes the connection via the shared writer fence.
+    /// through this path resets the session via the shared writer fence.
     pub(super) fn retract(&mut self, start: Height) {
         self.remove_range(start);
         self.reservations.retract(&start);
@@ -347,10 +347,7 @@ mod tests {
     use zakura_rt::sync::CancellationToken;
 
     use super::*;
-    use crate::zakura::{
-        regulation::{ReservationPool, WriterFence},
-        CloseCause,
-    };
+    use crate::zakura::regulation::{ReservationPool, WriterFence};
 
     /// Ranges that end after every block arrived still return the `next`
     /// map's peak capacity.
@@ -358,7 +355,7 @@ mod tests {
     fn complete_responses_shrink_the_next_hash_map() {
         const RANGES: u32 = 256;
         let slots = usize::try_from(RANGES).expect("256 fits usize");
-        let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+        let fence = WriterFence::new(CancellationToken::new());
         let pool = ReservationPool::new(slots).unwrap();
         let mut book = Requester::new(slots);
         let hash = |index: u32| {

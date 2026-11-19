@@ -276,8 +276,27 @@ pub fn run_steered<S: Subsystem>(
     sink: &mut dyn RecordSink,
     steer: Box<dyn Steer>,
 ) -> Result<(RunReport, Vec<u8>), HarnessError> {
+    let (run, bytes) = run_steered_keeping::<S>(scenario, prepared, input, sink, steer);
+    let report = run?;
+    Ok((
+        report,
+        bytes.expect("run_set_up sets the Sim up before it runs"),
+    ))
+}
+
+/// [`run_steered`], keeping the Plan bytes the steer recorded even when the
+/// run fails: a harness failure during or after the run keeps the choices
+/// made until then, which replay it. `None` if the harness never set the
+/// Sim up.
+pub(crate) fn run_steered_keeping<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (Result<RunReport, HarnessError>, Option<Vec<u8>>) {
     let mut steered = None;
-    let (report, ()) = run_set_up::<S, ()>(
+    let run = run_set_up::<S, ()>(
         scenario,
         prepared,
         input,
@@ -285,9 +304,9 @@ pub fn run_steered<S: Subsystem>(
         None,
         |sim| steered = Some(sim.steer(steer)),
         |_, _, _, _| (),
-    )?;
-    let steered = steered.expect("run_set_up sets the Sim up before it runs");
-    Ok((report, steered.bytes()))
+    )
+    .map(|(report, ())| report);
+    (run, steered.map(|steered| steered.bytes()))
 }
 
 /// [`run_prepared`], also returning what `read` takes from the harness and

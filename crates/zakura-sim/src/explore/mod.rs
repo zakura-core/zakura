@@ -119,8 +119,9 @@ pub fn run_bytes<S: Subsystem>(
 /// [`run_bytes`] with `steer` making the live picks in place of the Plan
 /// bytes, which still answer the run's draws. Also returns the input that
 /// replays the run with no steer: the zero-padded prefix, then the Plan
-/// bytes the steered run recorded ([`crate::Sim::steer`]). That is `input`
-/// itself if the harness couldn't run the scenario.
+/// bytes the steered run recorded ([`crate::Sim::steer`]), up to a harness
+/// failure if one ended it. That is `input` itself if the harness couldn't
+/// set the run up.
 pub fn run_steered_bytes<S: Subsystem>(
     input: &[u8],
     sink: &mut dyn RecordSink,
@@ -130,16 +131,16 @@ pub fn run_steered_bytes<S: Subsystem>(
     let n = input.len().min(S::SCENARIO_BYTES);
     prefix[..n].copy_from_slice(&input[..n]);
     let scenario = S::draw(&prefix);
-    let steered = harness::run_steered::<S>(
+    let (result, bytes) = harness::run_steered_keeping::<S>(
         &scenario,
         S::prepare(&scenario),
         Plan::from_fuzz(&input[n..]),
         sink,
         steer,
     );
-    let (result, replay) = match steered {
-        Ok((report, bytes)) => (Ok(report), [prefix, bytes].concat()),
-        Err(error) => (Err(error), input.to_vec()),
+    let replay = match bytes {
+        Some(bytes) => [prefix, bytes].concat(),
+        None => input.to_vec(),
     };
     (explored::<S>(&scenario, result), replay)
 }

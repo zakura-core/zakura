@@ -1,12 +1,28 @@
 //! The session reader's routing: which frames the subscriber admits before
-//! decoding, and where each admitted message goes. It holds no stream,
-//! channel, or lock.
+//! decoding, where each admitted message goes, and how often a `Status`
+//! reaches the reactor. It holds no stream, channel, or lock.
+
+use zakura_rt::time::Instant;
 
 use super::super::{
     events::Event,
-    v9::{message_type, Admitted, Ended, Headers, Status, SubscribeHeaders},
+    v9::{message_type, Admitted, Ended, Headers, Status, SubscribeHeaders, STATUS_CADENCE},
 };
-use crate::zakura::ZakuraPeerId;
+use crate::zakura::{regulation::Bucket, Cadence, ZakuraPeerId};
+
+/// The meter on the `Status` events one session sends the reactor.
+///
+/// `Status` shares its stream with subscription updates and pages, so the
+/// stream's reader forwards an exhausted `Status` instead of parking. This
+/// meter bounds the reactor's work instead: two events back to back, then
+/// one per row refill interval. A conformant sender's `Status` frames come
+/// at least one send interval, two refill intervals, apart, so each finds a
+/// token. A `Status` that finds none waits, and a newer one replaces it,
+/// because the reactor keeps only each peer's latest.
+const STATUS_EVENTS: Cadence = Cadence {
+    capacity: 2,
+    ..STATUS_CADENCE
+};
 
 /// A decoded message that passed every check at the trust boundary. A page
 /// or outcome carries the token its subscriber returned on admission.
@@ -26,31 +42,43 @@ pub(super) enum PeerOutput {
     Apply(SubscribeHeaders),
     /// Send the event to the reactor.
     Forward(Event),
+    /// Nothing yet: a `Status` waits for the meter. See
+    /// [`PeerState::status_due_at`].
+    Hold,
 }
 
-/// One session reader's routing state: the session it reads.
+/// One session reader's routing state: the session it reads, and its
+/// `Status` meter.
 #[derive(Debug)]
 pub(super) struct PeerState {
     peer: ZakuraPeerId,
     session_id: u64,
+    /// Made full at the first `Status`.
+    status_meter: Option<Bucket>,
+    /// The latest `Status` the meter held back.
+    held_status: Option<Status>,
 }
 
 impl PeerState {
     /// The routing state of session `session_id` with `peer`.
     pub(super) fn new(peer: ZakuraPeerId, session_id: u64) -> Self {
-        Self { peer, session_id }
+        Self {
+            peer,
+            session_id,
+            status_meter: None,
+            held_status: None,
+        }
     }
 
-    /// Route one admitted message.
-    pub(super) fn on_input(&self, input: PeerInput) -> PeerOutput {
+    /// Route one admitted message that arrived at `now`.
+    pub(super) fn on_input(&mut self, input: PeerInput, now: Instant) -> PeerOutput {
         let peer = self.peer.clone();
         let session_id = self.session_id;
         match input {
-            PeerInput::Status(status) => PeerOutput::Forward(Event::Status {
-                peer,
-                session_id,
-                status,
-            }),
+            PeerInput::Status(status) => {
+                self.held_status = Some(status);
+                self.release_status(now).unwrap_or(PeerOutput::Hold)
+            }
             PeerInput::Update(update) => PeerOutput::Apply(update),
             PeerInput::Page { page, admitted } => PeerOutput::Forward(Event::Page {
                 peer,
@@ -65,6 +93,31 @@ impl PeerState {
             }),
         }
     }
+
+    /// When the held `Status` may go, if one is held.
+    pub(super) fn status_due_at(&self) -> Option<Instant> {
+        self.held_status.as_ref()?;
+        self.status_meter.as_ref().map(Bucket::next_token_at)
+    }
+
+    /// The held `Status`'s event, if one is held and the meter has a token at
+    /// `now`.
+    pub(super) fn release_status(&mut self, now: Instant) -> Option<PeerOutput> {
+        self.held_status.as_ref()?;
+        let meter = self
+            .status_meter
+            .get_or_insert_with(|| Bucket::new(STATUS_EVENTS, now));
+        meter.refill(now);
+        if !meter.take() {
+            return None;
+        }
+        let status = self.held_status.take()?;
+        Some(PeerOutput::Forward(Event::Status {
+            peer: self.peer.clone(),
+            session_id: self.session_id,
+            status,
+        }))
+    }
 }
 
 /// Whether the subscriber checks a frame of `message_type` against its
@@ -74,4 +127,86 @@ pub(super) fn admits_before_decode(message_type: u16) -> bool {
         message_type,
         message_type::HEADERS | message_type::HEADERS_OUTCOME
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::zakura::header_sync::{config::REGTEST_HEADER_BYTES, v9::test_support::status};
+
+    fn status_at(height: u32) -> Status {
+        let target = zakura_header_chain::Frontier::new(
+            zakura_chain::block::Height(height),
+            zakura_chain::block::Hash([u8::try_from(height % 256).unwrap(); 32]),
+        );
+        status::<REGTEST_HEADER_BYTES>(target)
+    }
+
+    fn forwarded_height(output: PeerOutput) -> u32 {
+        match output {
+            PeerOutput::Forward(Event::Status { status, .. }) => status.selected_tip_height.0,
+            other => panic!("expected a Status event, got {other:?}"),
+        }
+    }
+
+    /// hsync-19: a `Status` flood reaches the reactor at most
+    /// `2 + elapsed / 500 ms` times, each released at its exact token
+    /// boundary, and the reactor gets the latest value.
+    #[test]
+    fn a_status_flood_reaches_the_reactor_at_the_meter_rate() {
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let mut state = PeerState::new(peer, 1);
+        let start = Instant::now();
+        let mut forwarded = Vec::new();
+        for height in 1..=100 {
+            match state.on_input(PeerInput::Status(status_at(height)), start) {
+                PeerOutput::Hold => {}
+                output => forwarded.push(forwarded_height(output)),
+            }
+        }
+        assert_eq!(forwarded, [1, 2]);
+        let refill = STATUS_EVENTS.refill_interval;
+        assert_eq!(state.status_due_at(), Some(start + refill));
+        assert!(state
+            .release_status(start + refill - Duration::from_nanos(1))
+            .is_none());
+        let released = state
+            .release_status(start + refill)
+            .expect("a token returned");
+        assert_eq!(forwarded_height(released), 100, "the latest Status goes");
+        assert_eq!(state.status_due_at(), None, "nothing is held");
+
+        // Keep flooding for ten seconds: at most one event per refill.
+        let mut events = 3u32;
+        let mut height = 100;
+        let mut now = start + refill;
+        while now < start + Duration::from_secs(10) {
+            now += Duration::from_millis(10);
+            height += 1;
+            if !matches!(
+                state.on_input(PeerInput::Status(status_at(height)), now),
+                PeerOutput::Hold
+            ) {
+                events += 1;
+            }
+            let elapsed = u32::try_from((now - start).as_nanos() / refill.as_nanos()).unwrap();
+            assert!(events <= STATUS_EVENTS.capacity + elapsed);
+        }
+        assert_eq!(events, STATUS_EVENTS.capacity + 20);
+    }
+
+    /// A sender at the row's send interval never waits.
+    #[test]
+    fn a_conformant_status_sender_is_never_held() {
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let mut state = PeerState::new(peer, 1);
+        let start = Instant::now();
+        for second in 0..100 {
+            let now = start + STATUS_CADENCE.send_interval * second;
+            let output = state.on_input(PeerInput::Status(status_at(second + 1)), now);
+            assert_eq!(forwarded_height(output), second + 1);
+        }
+    }
 }

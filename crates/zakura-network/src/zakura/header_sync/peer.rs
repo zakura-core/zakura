@@ -5,7 +5,7 @@
 //! publisher task the reader watches.
 
 use zakura_chain::{block, parameters::Network};
-use zakura_rt::{sync::CancellationToken, task::JoinHandle};
+use zakura_rt::{sync::CancellationToken, task::JoinHandle, time::Instant};
 
 use super::{
     events::HeaderSyncHandle,
@@ -23,9 +23,11 @@ use state::{admits_before_decode, PeerInput, PeerOutput, PeerState};
 ///
 /// It decodes each frame, applies each `SubscribeHeaders` update to this
 /// session's publisher in stream order, and admits each page and outcome
-/// through the session's subscriber before the reactor sees it. A frame that
-/// breaks a rule ends the session as a protocol violation. The reader also
-/// ends with the publisher task, and re-raises the task's panic.
+/// through the session's subscriber before the reactor sees it. It forwards
+/// each `Status` when the session's `Status` meter allows, keeping only the
+/// latest one waiting. A frame that breaks a rule ends the session as a
+/// protocol violation. The reader also ends with the publisher task, and
+/// re-raises the task's panic.
 pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     handle: HeaderSyncHandle,
     session: PeerSession,
@@ -34,9 +36,10 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
-    let state = PeerState::new(session.peer_id().clone(), session.session_id());
+    let mut state = PeerState::new(session.peer_id().clone(), session.session_id());
     loop {
-        let frame = zakura_rt::select! {
+        let status_due = state.status_due_at();
+        let output = zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
             ended = &mut publishing => {
@@ -47,13 +50,23 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                 }
                 return Ok(());
             }
+            () = zakura_rt::time::sleep_until(status_due.unwrap_or_else(Instant::now)),
+                if status_due.is_some() =>
+            {
+                match state.release_status(Instant::now()) {
+                    Some(output) => output,
+                    None => continue,
+                }
+            }
             frame = recv.recv() => match frame {
-                Some(frame) => frame,
+                Some(frame) => {
+                    let input = admit::<HEADER_BYTES>(&handle, &session, frame)?;
+                    state.on_input(input, Instant::now())
+                }
                 None => return Ok(()),
             },
         };
-        let input = admit::<HEADER_BYTES>(&handle, &session, frame)?;
-        match state.on_input(input) {
+        match output {
             PeerOutput::Apply(update) => {
                 publisher
                     .apply(&update)
@@ -69,6 +82,7 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                     }
                 }
             }
+            PeerOutput::Hold => {}
         }
     }
 }

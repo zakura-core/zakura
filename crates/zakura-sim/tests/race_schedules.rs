@@ -379,10 +379,7 @@ fn changed_code_replay_reports_divergence() {
             [Options(6), Options(1), Pick(3), Pick(5)],
         ),
         (MissedNotify::NAME, [Pick(3), Options(1), Pick(3), Pick(5)]),
-        (
-            TimerCancel::NAME,
-            [Pick(5), Options(1), Pick(2), Options(3)],
-        ),
+        (TimerCancel::NAME, [Pick(4), Options(1), Pick(2), Pick(2)]),
         (AbBa::NAME, [Options(5), Options(1), Pick(3), Options(6)]),
         (
             AbortWithoutJoin::NAME,

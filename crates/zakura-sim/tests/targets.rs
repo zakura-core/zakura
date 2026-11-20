@@ -280,13 +280,31 @@ const SLOW_FAMILIES: [&str; 3] = [
     "block-sync/storage/decoded-input-stall",
 ];
 
+/// How many generated Plans [`inputs`] runs on a harness with no scenario
+/// families, such as a machine's op tapes.
+const PLANS_WITHOUT_FAMILIES: usize = 8;
+
+/// The longest generated Plan [`inputs`] runs, cut to a target's
+/// `-max_len`.
+const PLAN_BYTES: usize = 256;
+
 /// `entry`'s inputs, named: the empty input, which runs the default scenario
 /// under the empty Plan, then each scenario family's tag under the empty
-/// Plan, but the [`SLOW_FAMILIES`]. The harnesses' seeds live in the QA
-/// store, which a repository test doesn't read.
-fn inputs(entry: &HarnessEntry) -> Vec<(String, Vec<u8>)> {
+/// Plan, but the [`SLOW_FAMILIES`]. A harness with no families runs the
+/// first [`PLANS_WITHOUT_FAMILIES`] generated Plans instead, each at most
+/// `max_len` bytes. The harnesses' seeds live in the QA store, which a
+/// repository test doesn't read.
+fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
     let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
-    for family in (entry.families)() {
+    let families = (entry.families)();
+    if families.is_empty() {
+        let plans =
+            zakura_sim::seed::draws::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
+        for (index, plan) in plans.into_iter().enumerate() {
+            inputs.push((format!("{} plan {index}", entry.name), plan));
+        }
+    }
+    for family in families {
         let name = format!("{}/{}", entry.name, family.name);
         if !SLOW_FAMILIES.contains(&name.as_str()) {
             inputs.push((name, family.tag));
@@ -310,7 +328,7 @@ fn every_declared_target_runs_inputs_that_apply_its_properties() {
     let mut mismatched = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
-        let inputs = inputs(entry);
+        let inputs = inputs(entry, max_len(&target.args).unwrap_or(PLAN_BYTES));
         if let Some(max) = max_len(&target.args) {
             for (name, input) in &inputs {
                 assert!(

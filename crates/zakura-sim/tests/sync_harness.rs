@@ -17,10 +17,11 @@ use std::{
     process::{Command, Output},
 };
 
-use support::{inputs, plan_search::first_plan};
+use support::inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+    explore::generate::ReachSearch,
     harness::{
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncScenario, SyncStorage},
@@ -236,60 +237,49 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
     }
 }
 
-/// How many Plans [`stale_body_input`] searches.
-const STALE_BODY_PLANS: usize = 16;
+/// How many runs [`stale_body_input`]'s search may take. #2604's seed
+/// search found its Plan within its first nine runs, so 64 leaves a margin
+/// of seven times that.
+const STALE_BODY_RUNS: u64 = 64;
 
-/// Checks that `input` fills the stale-body input's role, or returns why it
-/// falls short. Its run must hold every property, apply
-/// `sync/header-reorg-retires-block-work`, and have the sequencer refuse an
-/// older epoch's body after it applied a newer one. That refused body is
-/// the one `accept-stale-scope-bodies.patch` buffers instead.
-fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
-    let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
-    let scenario = SyncStorage::draw(prefix);
-    let ports = SyncStorage::prepare(&scenario);
-    let mut sink = MemorySink::default();
-    let report = run_prepared::<SyncStorage>(
-        &scenario,
-        ports.clone(),
-        Plan::from_fuzz(plan),
-        &mut sink,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(violation) = &report.end.violation {
-        return Err(format!("the run violated {violation:?}"));
-    }
-    if let Some(violated) = report
-        .properties
-        .iter()
-        .find(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
-    {
-        return Err(format!("{} was violated", violated.property));
-    }
+/// Whether `report`'s run fills the stale-body input's role: it violates
+/// no property, applies `sync/header-reorg-retires-block-work`, and has the
+/// sequencer refuse a body of an older epoch than the one it applied. That
+/// refused body is the one `accept-stale-scope-bodies.patch` buffers
+/// instead.
+fn refuses_a_stale_body(report: &RunReport) -> Option<()> {
+    let violated = report.end.violation.is_some()
+        || report
+            .properties
+            .iter()
+            .any(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }));
     let applied = report.properties.iter().any(|property| {
         property.property == HEADER_REORG_RETIRES_BLOCK_WORK
             && matches!(property.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
     });
-    if !applied {
-        return Err(format!("{HEADER_REORG_RETIRES_BLOCK_WORK} never applied"));
-    }
-    if !ports.cross.borrow().saw_stale_body_refused {
-        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
-    }
-    Ok(())
+    let refused = report.log.entries().iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::BlockSync {
+                event: BlockSyncFact::StaleScope { body, scope_epoch },
+                ..
+            } if body.owner.body_work_epoch.zip(*scope_epoch).is_some_and(|(own, applied)| own < applied)
+        )
+    });
+    (!violated && applied && refused).then_some(())
 }
 
-/// The saved `reorg` scenario's tag, then the first of
-/// [`STALE_BODY_PLANS`] Plans, each up to 16 KiB, whose input passes
-/// [`stale_body_shortfall`]. Planted cases of
-/// `sync/header-reorg-retires-block-work` need that input.
+/// The saved `reorg` scenario's tag, then the Plan of the first of
+/// [`STALE_BODY_RUNS`] search runs that [`refuses_a_stale_body`]. Planted
+/// cases of `sync/header-reorg-retires-block-work` need that input.
 fn stale_body_input() -> Vec<u8> {
-    let tag = SavedSync::Reorg.tag();
-    let plan = first_plan("reorg stale body", STALE_BODY_PLANS, 16_384, |plan| {
-        stale_body_shortfall(&[&tag[..], plan].concat())
-    });
-    [&tag[..], &plan].concat()
+    let search = ReachSearch {
+        prefix: SavedSync::Reorg.tag().to_vec(),
+        max_bytes: 16_384,
+        steer: None,
+        ..ReachSearch::new(support::REACH_SEED, STALE_BODY_RUNS)
+    };
+    support::reaches_with(SyncStorage::NAME, &search, refuses_a_stale_body).input
 }
 
 /// A Plan exists under which the saved `reorg` scenario makes the sequencer

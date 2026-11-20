@@ -3,6 +3,7 @@
 //! check rejects a seed that doesn't fit its harness, witnesses or set.
 //! Every seed here is built in code and written to a temporary store: the
 //! real seeds live in the Space, which repository tests don't read.
+#![cfg(zakura_sim)]
 
 use std::fs;
 

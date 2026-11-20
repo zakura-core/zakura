@@ -56,9 +56,9 @@ use crate::{
     },
     types::MetaAddr,
     zakura::{
-        P2pV2Upgrade, P2pV2UpgradeAccept, P2pV2UpgradeInit, P2pV2UpgradeReject,
-        ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, ZakuraProtocolError,
-        P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
+        advertised_key_list, P2pV2Upgrade, P2pV2UpgradeAccept, P2pV2UpgradeInit,
+        P2pV2UpgradeReject, ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId,
+        ZakuraProtocolError, P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
     BannedIps, BoxError, Config, MisbehaviorReporter, PeerSocketAddr, UnconditionalPeers,
@@ -1120,9 +1120,9 @@ where
         return Ok(outcome);
     }
 
-    // Our own iroh dial hints. Without a live Zakura endpoint we cannot upgrade,
+    // Our own key list and dial hints. Without a live Zakura endpoint we cannot upgrade,
     // so we stay on the legacy connection.
-    let Some((local_node_id, local_direct_addresses)) = connector.local_iroh_hints().await else {
+    let Some((local_node_keys, local_direct_addresses)) = connector.local_iroh_hints().await else {
         return Ok(neutral_upgrade_fallback());
     };
 
@@ -1144,7 +1144,7 @@ where
             &connector,
             &upgrade_config,
             nonces,
-            local_node_id,
+            local_node_keys,
             local_direct_addresses,
             ResponderRegistrationWait::Production,
         )
@@ -1155,7 +1155,7 @@ where
             &connector,
             &upgrade_config,
             nonces,
-            local_node_id,
+            local_node_keys,
             local_direct_addresses,
         )
         .await?
@@ -1285,7 +1285,7 @@ async fn run_initiator_upgrade<PeerTransport>(
     connector: &ZakuraHandshakeConnector,
     config: &ZakuraHandshakeConfig,
     nonces: ZakuraLegacyNonces,
-    local_node_id: Vec<u8>,
+    local_node_keys: Vec<u8>,
     local_direct_addresses: Vec<Vec<u8>>,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
 where
@@ -1305,7 +1305,7 @@ where
         local_zebra_nonce: nonces.local_zebra_nonce,
         remote_zebra_nonce: nonces.remote_zebra_nonce,
         upgrade_nonce,
-        iroh_node_id: local_node_id,
+        node_keys: local_node_keys,
         iroh_direct_addresses: local_direct_addresses,
         iroh_relay_hint: None,
         max_control_frame_bytes: config.max_control_frame_bytes,
@@ -1329,19 +1329,19 @@ where
         return Ok(neutral_upgrade_fallback());
     }
 
-    let Ok(peer_id) = ZakuraPeerId::new(accept.iroh_node_id.clone()) else {
+    // The accept selected a protocol version this node speaks, so its
+    // identity bytes are a key list. The responder's node id is the list's
+    // hash.
+    let Some(remote_keys) = advertised_key_list(&accept.node_keys) else {
         return Ok(neutral_upgrade_fallback());
     };
+    let peer_id = ZakuraPeerId::from_node_id(remote_keys.node_id());
 
     // Dial the responder's Zakura endpoint over QUIC and wait for the local
     // supervisor to register a usable outbound handle before dropping the
     // legacy connection.
     let handoff = connector
-        .spawn_zakura_dial_to_hints_and_wait(
-            &peer_id,
-            &accept.iroh_node_id,
-            &accept.iroh_direct_addresses,
-        )
+        .spawn_zakura_dial_to_hints_and_wait(&remote_keys, &accept.iroh_direct_addresses)
         .await;
     match handoff {
         crate::zakura::ZakuraNativeHandoff::Registered(conn_id) => {
@@ -1389,7 +1389,7 @@ async fn run_responder_upgrade<PeerTransport>(
     connector: &ZakuraHandshakeConnector,
     config: &ZakuraHandshakeConfig,
     nonces: ZakuraLegacyNonces,
-    local_node_id: Vec<u8>,
+    local_node_keys: Vec<u8>,
     local_direct_addresses: Vec<Vec<u8>>,
     registration_wait: ResponderRegistrationWait,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
@@ -1413,6 +1413,15 @@ where
         }
     };
 
+    // The init offered a protocol version this node speaks, so its identity
+    // bytes are a key list. The initiator's node id is the list's hash, and
+    // that is the id its native connection registers under.
+    let Some(remote_keys) = advertised_key_list(&init.node_keys) else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
+    let peer_id = ZakuraPeerId::from_node_id(remote_keys.node_id());
+
     let mut responder_upgrade_nonce = [0u8; 32];
     rand_10::rng().fill_bytes(&mut responder_upgrade_nonce);
 
@@ -1427,7 +1436,7 @@ where
         responder_upgrade_nonce,
         local_zebra_nonce: nonces.local_zebra_nonce,
         remote_zebra_nonce: nonces.remote_zebra_nonce,
-        iroh_node_id: local_node_id,
+        node_keys: local_node_keys,
         iroh_direct_addresses: local_direct_addresses,
         iroh_relay_hint: None,
         max_control_frame_bytes: config.max_control_frame_bytes,
@@ -1438,10 +1447,6 @@ where
         return Ok(neutral_upgrade_fallback());
     };
     peer_conn.send(Message::P2pV2Upgrade(accept_bytes)).await?;
-
-    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
-        return Ok(neutral_upgrade_fallback());
-    };
 
     // The peer dials our advertised Zakura endpoint over QUIC after receiving
     // `Accept`, and our iroh router registers that inbound connection

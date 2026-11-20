@@ -673,7 +673,6 @@ impl ZakuraTestNodeBuilder {
         if let Some(observer) = self.transport_observer {
             handler = handler.with_transport_observer(observer);
         }
-        let handler = handler.with_local_node_id(endpoint.local_id());
         endpoint.serve(handler.clone())?;
         let quic = endpoint;
         let endpoint = if let (Some(header_handle), Some(block_handle), Some((shutdown, actions))) =

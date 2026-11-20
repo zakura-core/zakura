@@ -124,7 +124,7 @@ fn record_with_services(
 ) -> ZakuraNodeRecord {
     ZakuraNodeRecord::sign(
         ZakuraNodeRecordBody {
-            node_id: signer.public(),
+            keys: signer.key_list().clone(),
             direct_addrs: vec![socket(address)],
             services,
             zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
@@ -428,7 +428,7 @@ impl BookDriver {
                 self.sample = sample.iter().map(signed_bytes).collect();
                 assert!(sample.len() <= limit.min(SAMPLE_WINDOW), "{BOOK_PROPERTY}");
                 let ids: HashSet<NodeId> =
-                    sample.iter().map(|record| record.body.node_id).collect();
+                    sample.iter().map(|record| record.body.node_id()).collect();
                 assert_eq!(
                     ids.len(),
                     sample.len(),
@@ -436,7 +436,7 @@ impl BookDriver {
                 );
                 // A sample discloses only live, vouched records, as stored.
                 for record in &sample {
-                    let node_id = record.body.node_id;
+                    let node_id = record.body.node_id();
                     let tracked = self
                         .tracked
                         .get(&node_id)

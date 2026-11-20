@@ -333,14 +333,12 @@ async fn registered_reconnects_keep_their_cadence_charge() -> Result<(), BoxErro
         ZakuraHandshakeConfig::for_network(&Network::Mainnet),
         limits.clone(),
     )
-    .with_local_node_id(server.local_id())
     .with_transport_observer(actions.clone());
     server.serve(handler)?;
     let address = LocalEndpointFactory::node_addr(&server).await;
     let client = LocalEndpointFactory::with_limits(&limits)
         .endpoint(0x2_5004)
         .await?;
-    let peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
     let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
 
     let started = Instant::now();
@@ -354,8 +352,13 @@ async fn registered_reconnects_keep_their_cadence_charge() -> Result<(), BoxErro
         {
             Ok(connection) => {
                 entries += 1;
-                run_native_initiator_handshake_without_trace(&connection, &limits, &config, &peer)
-                    .await?;
+                run_native_initiator_handshake_without_trace(
+                    &connection,
+                    &limits,
+                    &config,
+                    address.id,
+                )
+                .await?;
                 connection.close(0u32.into(), b"reconnect");
             }
             Err(zakura_quic::ConnectError::Refused) => {}

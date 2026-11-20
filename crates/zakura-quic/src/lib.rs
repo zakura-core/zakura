@@ -21,10 +21,12 @@ mod key_list;
 mod tls;
 
 pub use key::{
-    KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError, KEY_LENGTH,
+    ForeignKeyList, KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError,
+    KEY_LENGTH,
 };
 pub use key_list::{
     KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS, MAX_NODE_KEY_LIST_BYTES,
+    MIN_NODE_KEY_LIST_BYTES, NODE_KEY_ENTRY_BYTES,
 };
 pub use tls::TlsConfigError;
 

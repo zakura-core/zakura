@@ -541,6 +541,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                                 self.shared.config.handshake_timeout(),
                                 pending,
                                 acceptor,
+                                self.shared.keys.clone(),
                             ),
                         );
                     }
@@ -696,7 +697,7 @@ mod tests {
     async fn the_rebind_window_starts_when_the_replacement_is_installed() {
         let secret = NodeSecretKey::generate();
         let shared = Arc::new(Shared {
-            id: secret.public(),
+            keys: Arc::new(secret.key_list().clone()),
             key: secret.public_key(),
             config: QuicConfig::default(),
             max_bidi_streams: 16,

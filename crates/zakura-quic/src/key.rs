@@ -16,6 +16,8 @@ use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
 
+use crate::NodeKeyList;
+
 /// Length of an Ed25519 public key or secret seed, in bytes.
 pub const KEY_LENGTH: usize = 32;
 
@@ -85,7 +87,7 @@ impl NodeKey {
     /// The node ID of a node whose only key is this one: the ID of the
     /// one-entry [`NodeKeyList`](crate::NodeKeyList) holding it.
     pub fn node_id(&self) -> NodeId {
-        crate::NodeKeyList::single(*self).node_id()
+        NodeKeyList::single(*self).node_id()
     }
 
     /// Verifies `signature` over `message` (ID-6).
@@ -232,8 +234,8 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds only the seed, its public key and that key's node ID, and
-/// zeroizes the seed on drop.
+/// It holds the seed, its public key and the key list that names the node,
+/// and zeroizes the seed on drop.
 /// [`sign`](Self::sign) expands the seed for each signature, and `ring` does
 /// not zeroize that expanded key when the call returns. `Debug` and `Display`
 /// never show the seed, and it has no `Serialize` impl.
@@ -241,8 +243,8 @@ pub struct SignatureError;
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
     public: NodeKey,
-    /// The node ID of a node whose only key is `public`.
-    id: NodeId,
+    /// The keys the node is known by. `public` is the Ed25519 key among them.
+    keys: NodeKeyList,
 }
 
 impl Drop for NodeSecretKey {
@@ -265,7 +267,7 @@ impl NodeSecretKey {
         Self {
             seed: *seed,
             public,
-            id: public.node_id(),
+            keys: NodeKeyList::single(public),
         }
     }
 
@@ -292,10 +294,29 @@ impl NodeSecretKey {
         text
     }
 
-    /// Returns the node ID of a node whose only key is this one: the ID of
-    /// the one-entry key list holding [`Self::public_key`].
+    /// Returns the node's ID: the hash of [`Self::key_list`].
     pub fn public(&self) -> NodeId {
-        self.id
+        self.keys.node_id()
+    }
+
+    /// Returns the keys the node is known by. Unless
+    /// [`Self::with_key_list`] replaced it, this is the one-entry list
+    /// holding [`Self::public_key`].
+    pub fn key_list(&self) -> &NodeKeyList {
+        &self.keys
+    }
+
+    /// Names the node by `keys` instead of the one-entry list, which changes
+    /// its node ID. `keys` must hold this key as its Ed25519 entry.
+    ///
+    /// The other entries are opaque here: the node proves only its Ed25519
+    /// key, and a peer accepts the rest of the list by its hash.
+    pub fn with_key_list(mut self, keys: NodeKeyList) -> Result<Self, ForeignKeyList> {
+        if keys.ed25519() != Some(self.public) {
+            return Err(ForeignKeyList);
+        }
+        self.keys = keys;
+        Ok(self)
     }
 
     /// Returns the Ed25519 public key.
@@ -312,6 +333,12 @@ impl NodeSecretKey {
             .expect("ring's Ed25519 signatures are 64 bytes")
     }
 }
+
+/// A key list that does not hold the secret key's public key as its Ed25519
+/// entry, so the secret key cannot prove it is the node the list names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the key list does not hold this secret key's Ed25519 public key")]
+pub struct ForeignKeyList;
 
 /// Expands `seed` into an Ed25519 key pair, per RFC 8032.
 fn expand(seed: &[u8; KEY_LENGTH]) -> Ed25519KeyPair {

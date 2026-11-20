@@ -1065,19 +1065,20 @@ impl ZakuraEndpoint {
         super::ZakuraHandshakeConnector::new_with_endpoint(self.clone())
     }
 
-    /// Returns our local Zakura dial hints (node id, and direct addresses
-    /// each encoded as a `SocketAddr` string) for the legacy upgrade prelude.
+    /// Returns our local Zakura dial hints (encoded key list, and direct
+    /// addresses each encoded as a `SocketAddr` string) for the legacy
+    /// upgrade prelude.
     ///
     /// Direct addresses are capped at [`MAX_IROH_DIRECT_ADDRESSES`](super::MAX_IROH_DIRECT_ADDRESSES)
     /// so the encoded prelude stays within its bounded hint limits.
     pub(crate) async fn local_upgrade_hints(&self) -> (Vec<u8>, Vec<Vec<u8>>) {
-        let node_id = self.quic.local_id().as_bytes().to_vec();
+        let node_keys = self.quic.local_keys().encode();
         let direct_addresses = local_direct_addrs(&self.quic)
             .into_iter()
             .take(super::MAX_IROH_DIRECT_ADDRESSES)
             .map(|addr| addr.to_string().into_bytes())
             .collect();
-        (node_id, direct_addresses)
+        (node_keys, direct_addresses)
     }
 
     /// Returns the active supervisor handle.
@@ -3147,8 +3148,6 @@ pub struct ZakuraProtocolHandler {
     /// Node-wide owners of raw frames, unfunded output, and request workers.
     resources: NodeResources,
     shutdown: CancellationToken,
-    // Bound endpoint identity, used for connection collision handling.
-    local_node_id: Option<NodeId>,
     /// Receives this handler's transport events.
     #[cfg(any(test, zakura_sim))]
     transport_observer: Option<Arc<dyn super::TransportObserver>>,
@@ -3261,7 +3260,6 @@ impl ZakuraProtocolHandler {
             resources,
             shutdown: CancellationToken::new(),
             limits,
-            local_node_id: None,
             #[cfg(any(test, zakura_sim))]
             transport_observer: None,
         }
@@ -3498,12 +3496,6 @@ impl ZakuraProtocolHandler {
         }
     }
 
-    /// Attach the bound endpoint's identity for connection collision handling.
-    pub fn with_local_node_id(mut self, local_node_id: NodeId) -> Self {
-        self.local_node_id = Some(local_node_id);
-        self
-    }
-
     /// Moves an inbound connection from the transport's pending count into
     /// this handler's own accounting (zakura-quic ADM-7).
     ///
@@ -3604,7 +3596,7 @@ impl ZakuraProtocolHandler {
         // Charge inbound peers to the IP admitted before the handshake, which
         // later paths and migrations never change.
         let remote_ip = Some(connection.admitted_ip());
-        let local_node_id = self.local_node_id.unwrap_or(remote_node_id);
+        let local_node_id = connection.local_keys().node_id();
         let direction = ServicePeerDirection::Inbound;
         let result = self
             .register_and_serve(
@@ -3807,10 +3799,9 @@ impl ZakuraProtocolHandler {
         )
         .await?;
         let hello = ZakuraControlHello::decode(&hello_bytes)?;
-        let remote_key = connection.remote_key();
         let expected = ZakuraControlValidation {
             local: &handshake_config,
-            authenticated_remote_key: remote_key.as_bytes(),
+            authenticated_remote_key: connection.remote_key(),
             selected_zakura_protocol: negotiated_zakura_protocol(connection)?,
             handshake_path: ZakuraHandshakePath::Native,
             remote_role: ZakuraControlRole::Initiator,
@@ -3834,6 +3825,7 @@ impl ZakuraProtocolHandler {
             accepted_capabilities: hello.capabilities & handshake_config.supported_capabilities,
             accepted_channels: hello.required_channels & handshake_config.supported_channels,
             accepted_limits,
+            node_keys: connection.local_keys().encode(),
         };
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
         conn.trace_handshake(
@@ -5876,8 +5868,7 @@ async fn spawn_zakura_endpoint_inner(
         limits.clone(),
         registry,
         trace,
-    )
-    .with_local_node_id(local_node_id);
+    );
     handler.set_header_sync_enabled(header_sync_ready);
     if handler.trace.is_enabled() {
         let trace = handler.trace.clone();
@@ -6027,6 +6018,7 @@ fn upgrade_hint(node_addr: &NodeAddr) -> NodeAddr {
     direct.dedup();
     NodeAddr {
         id: node_addr.id,
+        key: node_addr.key,
         direct,
     }
 }
@@ -6153,7 +6145,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     );
     let alpns = supported_p2p_v2_alpns();
     let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
-    // The node this dial is for. The connection layer refuses any other key.
+    // The node this dial is for. The control handshake refuses any other.
     let remote_node_id = node_addr.id;
     let dial = async {
         match kind {
@@ -6195,7 +6187,6 @@ pub(crate) async fn serve_reported_native_dial_connection(
         &peer_id,
     );
     let local_node_id = endpoint.local_node_id();
-    let local_peer_id = ZakuraPeerId::from_node_id(local_node_id);
     let (negotiated, capability_epoch) = {
         let _handshake = sim_chain!(endpoint.handler
             .claim_pending_handshake(false)
@@ -6230,7 +6221,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             &connection,
             limits,
             &handshake_config,
-            &local_peer_id,
+            remote_node_id,
             &endpoint.handler.trace,
             &conn,
         )
@@ -6299,20 +6290,21 @@ pub(crate) async fn run_native_initiator_handshake_without_trace(
     connection: &Connection,
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
-    local_peer_id: &ZakuraPeerId,
+    dialed: NodeId,
 ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
     run_native_initiator_handshake(
         connection,
         limits,
         handshake_config,
-        local_peer_id,
+        dialed,
         &ZakuraTrace::noop(),
         &ZakuraConnTrace::placeholder(),
     )
     .await
 }
 
-/// Runs the initiator's control exchange within one `control_timeout`.
+/// Runs the initiator's control exchange within one `control_timeout`, and
+/// fails with an identity mismatch unless the responder is the node `dialed`.
 ///
 /// The responder applies the same overall deadline. Without it, a responder
 /// that paces each step holds this dial's pending-handshake permit for one
@@ -6321,7 +6313,7 @@ async fn run_native_initiator_handshake(
     connection: &Connection,
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
-    local_peer_id: &ZakuraPeerId,
+    dialed: NodeId,
     trace: &ZakuraTrace,
     conn: &ZakuraConnTrace,
 ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
@@ -6331,7 +6323,7 @@ async fn run_native_initiator_handshake(
             connection,
             limits,
             handshake_config,
-            local_peer_id,
+            dialed,
             trace,
             conn,
         ),
@@ -6344,7 +6336,7 @@ async fn run_native_initiator_control_steps(
     connection: &Connection,
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
-    local_peer_id: &ZakuraPeerId,
+    dialed: NodeId,
     _trace: &ZakuraTrace,
     conn: &ZakuraConnTrace,
 ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
@@ -6369,7 +6361,7 @@ async fn run_native_initiator_control_steps(
         role: ZakuraControlRole::Initiator,
         network_id: handshake_config.network_id,
         chain_id: handshake_config.chain_id,
-        iroh_node_id: local_peer_id.as_bytes().to_vec(),
+        node_keys: connection.local_keys().encode(),
         peer_nonce: local_nonce,
         initiator_upgrade_nonce: [0; 32],
         responder_upgrade_nonce: [0; 32],
@@ -6395,6 +6387,12 @@ async fn run_native_initiator_control_steps(
         &limits.initial_limits(),
         handshake_config,
     )?;
+    // TLS proved the responder's key, and for a dial that named only a node
+    // ID it accepted any key. The ack's key list is what ties that key to a
+    // node ID, so this is the check that the dial reached the node it was for.
+    if ack.responder_node_id(connection.remote_key())? != dialed {
+        return Err(ZakuraValidationError::IdentityMismatch.into());
+    }
     conn.trace_handshake(
         "control.succeeded",
         "initiator",
@@ -10623,20 +10621,18 @@ mod tests {
         .await?
         .expect("v2_p2p is enabled in test config");
 
-        // The Accept the attacker would advertise: a real 32-byte node id
-        // (so `node_addr_from_hints` builds a `NodeAddr` and the dial spawns)
+        // The Accept the attacker would advertise: a real key list (so
+        // `node_addr_from_hints` builds a `NodeAddr` and the dial spawns)
         // pointing at an unreachable address that never registers.
-        let node_id = LocalEndpointFactory::secret_key(0x0BAD_C0DE)
-            .public()
-            .as_bytes()
-            .to_vec();
-        let peer_id = ZakuraPeerId::new(node_id.clone()).expect("32-byte node id is valid");
+        let keys = LocalEndpointFactory::secret_key(0x0BAD_C0DE)
+            .key_list()
+            .clone();
         let direct_addresses = vec![b"192.0.2.1:1".to_vec()];
 
         let connector =
             crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
         let handoff = connector
-            .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
+            .spawn_zakura_dial_to_hints_and_wait(&keys, &direct_addresses)
             .await;
 
         assert!(
@@ -12461,7 +12457,6 @@ mod tests {
         let limits = ZakuraLocalLimits::from_config(&Config::default());
         let mut config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         config.supported_capabilities = ZAKURA_CAP_HEADER_SYNC;
-        let local_peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
 
         // Each round acks the hello on a fresh control stream with `extra`
         // added to the offer.
@@ -12470,7 +12465,7 @@ mod tests {
                 &client_conn,
                 &limits,
                 &config,
-                &local_peer,
+                server.local_id(),
             );
             let respond = async {
                 let (mut send, mut recv) =
@@ -12492,6 +12487,7 @@ mod tests {
                     accepted_capabilities: hello.capabilities | extra,
                     accepted_channels: 0,
                     accepted_limits: hello.initial_limits,
+                    node_keys: server.local_keys().encode(),
                 };
                 write_control_payload(&mut send, &ack.encode()?, Duration::from_secs(2)).await?;
                 Ok::<_, BoxError>(send)
@@ -12547,13 +12543,12 @@ mod tests {
         let mut limits = ZakuraLocalLimits::from_config(&Config::default());
         limits.control_timeout = Duration::from_secs(1);
         let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
 
         let handshake = run_native_initiator_handshake_without_trace(
             &client_conn,
             &limits,
             &config,
-            &local_peer,
+            server.local_id(),
         );
         let respond = async {
             let (mut send, mut recv) = stream_rx.recv().await.ok_or("missing control stream")?;
@@ -12574,6 +12569,7 @@ mod tests {
                 accepted_capabilities: hello.capabilities,
                 accepted_channels: 0,
                 accepted_limits: hello.initial_limits,
+                node_keys: server.local_keys().encode(),
             }
             .encode()?;
             let mut len = Vec::with_capacity(CONTROL_LENGTH_BYTES);
@@ -14752,8 +14748,7 @@ mod tests {
                 Network::Mainnet,
                 ZakuraHandshakeConfig::for_network(&Network::Mainnet),
                 limits.clone(),
-            )
-            .with_local_node_id(server.local_id());
+            );
             server.serve(CaptureAccepted {
                 handler,
                 accepted: accepted_tx,
@@ -14781,8 +14776,13 @@ mod tests {
             let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
             let peer = ZakuraPeerId::new(second.local_id().as_bytes().to_vec())?;
             // Complete the second connection's control handshake first.
-            run_native_initiator_handshake_without_trace(&second_conn, &limits, &config, &peer)
-                .await?;
+            run_native_initiator_handshake_without_trace(
+                &second_conn,
+                &limits,
+                &config,
+                server.local_id(),
+            )
+            .await?;
             while supervisor.registered_ids().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -14797,9 +14797,13 @@ mod tests {
                 "the registered connection must consume the IP slot"
             );
             // Duplicate admission can close the transport before the client reads the ack.
-            let _ =
-                run_native_initiator_handshake_without_trace(&first_conn, &limits, &config, &peer)
-                    .await;
+            let _ = run_native_initiator_handshake_without_trace(
+                &first_conn,
+                &limits,
+                &config,
+                server.local_id(),
+            )
+            .await;
             assert!(matches!(first_conn.closed().await,
                 zakura_quic::ConnectionError::ApplicationClosed(close)
                     if close.error_code == VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL)
@@ -14816,12 +14820,11 @@ mod tests {
                 .endpoint(885)
                 .await?;
             let third_conn = third.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?;
-            let third_peer = ZakuraPeerId::new(third.local_id().as_bytes().to_vec())?;
             run_native_initiator_handshake_without_trace(
                 &third_conn,
                 &limits,
                 &config,
-                &third_peer,
+                server.local_id(),
             )
             .await?;
             while supervisor.registered_ids().await.len() < 2 {
@@ -14834,13 +14837,12 @@ mod tests {
             // A full IP with no handshake in flight still gets one QUIC
             // handshake, in case it is a registered node redialing.
             // Registration then rejects the new identity.
-            let fourth_peer = ZakuraPeerId::new(fourth.local_id().as_bytes().to_vec())?;
             let rejected = match fourth.connect(server_addr, &[P2P_V2_ALPN]).await {
                 Ok(fourth_conn) => run_native_initiator_handshake_without_trace(
                     &fourth_conn,
                     &limits,
                     &config,
-                    &fourth_peer,
+                    server.local_id(),
                 )
                 .await
                 .is_err(),
@@ -14943,8 +14945,7 @@ mod tests {
             Network::Mainnet,
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
-        )
-        .with_local_node_id(server_ep.local_id());
+        );
         server_ep.serve(handler)?;
         // The factory binds IPv4 loopback only, so both clients share one source
         // IP (127.0.0.1) -- the single-source-IP shape of the finding.
@@ -14968,26 +14969,20 @@ mod tests {
             Ok((endpoint, connection))
         }
         async fn run_handshake(
-            endpoint: &QuicEndpoint,
+            server: NodeId,
             connection: &Connection,
             limits: &ZakuraLocalLimits,
         ) -> Result<(), BoxError> {
             let config = ZakuraHandshakeConfig::for_network(&Config::default().network);
-            let local_peer_id = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
-            run_native_initiator_handshake_without_trace(
-                connection,
-                limits,
-                &config,
-                &local_peer_id,
-            )
-            .await?;
+            run_native_initiator_handshake_without_trace(connection, limits, &config, server)
+                .await?;
             Ok(())
         }
 
         // First identity registers and claims the only per-IP slot. Hold the
         // endpoint/connection so the peer stays registered for the second dial.
         let (_ep1, _conn1) = connect_native(&server_addr, 881, &limits).await?;
-        run_handshake(&_ep1, &_conn1, &limits).await?;
+        run_handshake(server_addr.id, &_conn1, &limits).await?;
         let mut first_registered = 0;
         for _ in 0..200 {
             first_registered = supervisor.registered_ids().await.len();
@@ -15009,7 +15004,7 @@ mod tests {
         // this identity registered and one source IP could exhaust the global
         // budget.)
         let rejected = match connect_native(&server_addr, 882, &limits).await {
-            Ok((endpoint, connection)) => run_handshake(&endpoint, &connection, &limits)
+            Ok((_endpoint, connection)) => run_handshake(server_addr.id, &connection, &limits)
                 .await
                 .is_err(),
             Err(error) => matches!(
@@ -15780,8 +15775,7 @@ mod tests {
             Network::Mainnet,
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
-        )
-        .with_local_node_id(server_ep.local_id());
+        );
         server_ep.serve(handler)?;
         let server_addr = LocalEndpointFactory::node_addr(&server_ep).await;
 

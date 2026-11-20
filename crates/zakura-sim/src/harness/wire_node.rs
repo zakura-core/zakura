@@ -317,7 +317,6 @@ impl WireEndpoint {
                 Arc::new(registry),
                 ZakuraTrace::noop(),
             )
-            .with_local_node_id(quic.local_id())
             .with_transport_observer(observer);
             quic.serve(handler.clone()).expect("the node serves");
             let endpoint = ZakuraEndpoint::new(quic, handler);

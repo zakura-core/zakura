@@ -1358,12 +1358,12 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 38751881472
+        peer_memory_budget_bytes = 38753870592
         "#,
     )
     .unwrap();
     // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
-    // connections of 141,937,353 bytes.
+    // connections of 141,945,123 bytes.
     assert_eq!(
         config.zakura.budgeted_max_connections(&config.network),
         Ok(256)
@@ -1786,7 +1786,9 @@ fn zakura_secret_key_text_forms_keep_their_node_id() {
     // RFC 8032 §7.1 test 1: the seed and the public key it derives.
     const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
-    const NODE_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    // The node ID of the one-entry key list that holds that public key,
+    // `d75a98...511a`.
+    const NODE_ID: &str = "b596e1f72ff13a26526121761aaa59cdc0b0414ec5673ffcf40e45613c624ce5";
 
     let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
     let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");

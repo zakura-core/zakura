@@ -445,7 +445,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
     let mut peer_conn = Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
 
     // A valid `Init` that passes the responder's static, nonce, and protocol
-    // validation, claiming a real 32-byte iroh identity the attacker never
+    // validation, claiming a real key list whose node the attacker never
     // brings online over native QUIC.
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -459,7 +459,9 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
         local_zebra_nonce: nonces.remote_zebra_nonce,
         remote_zebra_nonce: nonces.local_zebra_nonce,
         upgrade_nonce: [9u8; 32],
-        iroh_node_id: vec![7u8; 32],
+        node_keys: zakura_quic::NodeSecretKey::from_bytes(&[7; 32])
+            .key_list()
+            .encode(),
         iroh_direct_addresses: vec![b"192.0.2.1:1".to_vec()],
         iroh_relay_hint: None,
         max_control_frame_bytes: config.max_control_frame_bytes,
@@ -732,7 +734,7 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         Codec::builder().for_network(&network).finish(),
     );
 
-    // The responder accepts with a real iroh node id at an RFC 5737 TEST-NET-1
+    // The responder accepts with a real key list at an RFC 5737 TEST-NET-1
     // address, so the initiator's native dial never registers.
     let responder_connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
     let responder = run_responder_upgrade(
@@ -740,10 +742,7 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         &responder_connector,
         &config,
         responder_nonces,
-        zakura_quic::NodeSecretKey::generate()
-            .public()
-            .as_bytes()
-            .to_vec(),
+        zakura_quic::NodeSecretKey::generate().key_list().encode(),
         vec![b"192.0.2.1:1".to_vec()],
         ResponderRegistrationWait::Production,
     );

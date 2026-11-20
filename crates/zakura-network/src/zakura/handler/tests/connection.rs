@@ -42,7 +42,6 @@ pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
     let remote_id = address.id;
     let local_id = client.local_id();
     let connection = timeout(deadline, client.connect(address, &[alpn])).await??;
-    let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
     let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::without_peer(1);
     let negotiated = timeout(
@@ -51,7 +50,7 @@ pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
             &connection,
             &limits,
             &handler.current_handshake_config(),
-            &local_peer,
+            remote_id,
             &ZakuraTrace::noop(),
             &conn,
         ),

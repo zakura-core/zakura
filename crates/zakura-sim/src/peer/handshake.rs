@@ -181,7 +181,7 @@ pub(crate) async fn initiate(
         role: ZakuraControlRole::Initiator,
         network_id: local.config.network_id,
         chain_id: local.config.chain_id,
-        iroh_node_id: local_id.as_bytes().to_vec(),
+        node_keys: local_id.as_bytes().to_vec(),
         peer_nonce,
         initiator_upgrade_nonce: [0; 32],
         responder_upgrade_nonce: [0; 32],

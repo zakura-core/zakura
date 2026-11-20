@@ -8,7 +8,7 @@ use std::{
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
-use zakura_quic::{NodeId, KEY_LENGTH};
+use zakura_quic::{NodeId, NodeKey, NodeKeyList, KEY_LENGTH, MAX_NODE_KEY_LIST_BYTES};
 use zakura_rt::collections::HashMap;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
@@ -46,12 +46,14 @@ pub const PRELUDE_VERSION: u16 = 1;
 
 /// The control handshake encoding version this implementation writes.
 ///
+/// Version 2 added the responder's key list to the control ack.
+///
 /// It is the minimum version a peer's control hello and ack must carry. Control
 /// messages are append-only: a later release adds fields after the fields this
 /// version knows and raises the version, and this release parses its known prefix
 /// and ignores the rest. A change that an older release cannot parse that way is a
 /// hard break and needs a new Zakura protocol version and ALPN.
-pub const CONTROL_VERSION: u16 = 1;
+pub const CONTROL_VERSION: u16 = 2;
 
 /// The first Zakura wire protocol version.
 pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
@@ -105,6 +107,10 @@ pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 16 * 1024;
 
 /// Maximum encoded Iroh node id length accepted in Zakura handshakes.
 pub const MAX_IROH_NODE_ID_BYTES: usize = 128;
+
+/// Maximum length of the encoded key list a handshake message carries: the
+/// longest list there is.
+pub const MAX_NODE_KEYS_BYTES: usize = MAX_NODE_KEY_LIST_BYTES;
 
 /// Maximum number of direct Iroh address hints in the legacy prelude.
 pub const MAX_IROH_DIRECT_ADDRESSES: usize = 8;
@@ -178,8 +184,7 @@ impl ZakuraPeerId {
     /// Creates the peer id of a native peer from its node ID, such as the one
     /// the TLS handshake proved for a connection.
     ///
-    /// The peer id keeps `node_id`, so [`Self::node_id`] returns it without
-    /// checking the key again.
+    /// The peer id keeps `node_id`, so [`Self::node_id`] returns it directly.
     pub fn from_node_id(node_id: NodeId) -> Self {
         Self {
             bytes: node_id.as_bytes().to_vec(),
@@ -192,17 +197,14 @@ impl ZakuraPeerId {
         &self.bytes
     }
 
-    /// Returns the node ID these bytes encode, or `None` when they aren't a
-    /// valid node ID, such as a legacy peer's address-derived id.
-    ///
-    /// A peer id built by [`Self::from_node_id`] returns its node ID directly.
-    /// Otherwise this runs the full key check of [`NodeId::from_bytes`].
+    /// Returns the node ID these bytes are, or `None` when they aren't 32
+    /// bytes, such as a legacy peer's address-derived id.
     pub fn node_id(&self) -> Option<NodeId> {
         if let Some(node_id) = self.node_id {
             return Some(node_id);
         }
         let bytes: &[u8; KEY_LENGTH] = self.bytes.as_slice().try_into().ok()?;
-        NodeId::from_bytes(bytes).ok()
+        Some(NodeId::from_bytes(bytes))
     }
 
     /// Returns a stable fixed-width identity for scheduler and state ownership.
@@ -601,8 +603,10 @@ pub struct P2pV2UpgradeInit {
     pub remote_zebra_nonce: Nonce,
     /// Fresh nonce for transcript binding.
     pub upgrade_nonce: [u8; 32],
-    /// Expected Iroh identity for this side.
-    pub iroh_node_id: Vec<u8>,
+    /// This side's encoded key list. The codec keeps the bytes as they
+    /// are: a release from before key lists sends its 32-byte key here, and
+    /// that must not make the prelude malformed.
+    pub node_keys: Vec<u8>,
     /// Direct Iroh dial hints.
     pub iroh_direct_addresses: Vec<Vec<u8>>,
     /// Optional relay hint.
@@ -627,7 +631,7 @@ impl P2pV2UpgradeInit {
                 network_id: self.network_id,
                 chain_id: self.chain_id,
                 capabilities: self.capabilities,
-                iroh_node_id: &self.iroh_node_id,
+                node_keys: &self.node_keys,
                 iroh_direct_addresses: &self.iroh_direct_addresses,
                 iroh_relay_hint: self.iroh_relay_hint.as_deref(),
                 max_control_frame_bytes: self.max_control_frame_bytes,
@@ -657,7 +661,7 @@ impl P2pV2UpgradeInit {
         writer.write_u64::<LittleEndian>(self.local_zebra_nonce.0)?;
         writer.write_u64::<LittleEndian>(self.remote_zebra_nonce.0)?;
         writer.write_all(&self.upgrade_nonce)?;
-        write_bounded_bytes(writer, &self.iroh_node_id, MAX_IROH_NODE_ID_BYTES)?;
+        write_bounded_bytes(writer, &self.node_keys, MAX_NODE_KEYS_BYTES)?;
         write_bounded_bytes_list(
             writer,
             &self.iroh_direct_addresses,
@@ -688,7 +692,7 @@ impl P2pV2UpgradeInit {
         let remote_zebra_nonce = Nonce(reader.read_u64::<LittleEndian>()?);
         let mut upgrade_nonce = [0; 32];
         reader.read_exact(&mut upgrade_nonce)?;
-        let iroh_node_id = read_bounded_bytes(reader, MAX_IROH_NODE_ID_BYTES)?;
+        let node_keys = read_bounded_bytes(reader, MAX_NODE_KEYS_BYTES)?;
         let iroh_direct_addresses = read_bounded_bytes_list(
             reader,
             MAX_IROH_DIRECT_ADDRESSES,
@@ -709,7 +713,7 @@ impl P2pV2UpgradeInit {
             local_zebra_nonce,
             remote_zebra_nonce,
             upgrade_nonce,
-            iroh_node_id,
+            node_keys,
             iroh_direct_addresses,
             iroh_relay_hint,
             max_control_frame_bytes,
@@ -741,8 +745,10 @@ pub struct P2pV2UpgradeAccept {
     pub local_zebra_nonce: Nonce,
     /// The nonce this side received in the remote legacy `version`.
     pub remote_zebra_nonce: Nonce,
-    /// Expected Iroh identity for this side.
-    pub iroh_node_id: Vec<u8>,
+    /// This side's encoded key list. The codec keeps the bytes as they
+    /// are: a release from before key lists sends its 32-byte key here, and
+    /// that must not make the prelude malformed.
+    pub node_keys: Vec<u8>,
     /// Direct Iroh dial hints.
     pub iroh_direct_addresses: Vec<Vec<u8>>,
     /// Optional relay hint.
@@ -768,7 +774,7 @@ impl P2pV2UpgradeAccept {
                 network_id: self.network_id,
                 chain_id: self.chain_id,
                 capabilities: self.capabilities,
-                iroh_node_id: &self.iroh_node_id,
+                node_keys: &self.node_keys,
                 iroh_direct_addresses: &self.iroh_direct_addresses,
                 iroh_relay_hint: self.iroh_relay_hint.as_deref(),
                 max_control_frame_bytes: self.max_control_frame_bytes,
@@ -808,7 +814,7 @@ impl P2pV2UpgradeAccept {
         writer.write_all(&self.responder_upgrade_nonce)?;
         writer.write_u64::<LittleEndian>(self.local_zebra_nonce.0)?;
         writer.write_u64::<LittleEndian>(self.remote_zebra_nonce.0)?;
-        write_bounded_bytes(writer, &self.iroh_node_id, MAX_IROH_NODE_ID_BYTES)?;
+        write_bounded_bytes(writer, &self.node_keys, MAX_NODE_KEYS_BYTES)?;
         write_bounded_bytes_list(
             writer,
             &self.iroh_direct_addresses,
@@ -840,7 +846,7 @@ impl P2pV2UpgradeAccept {
         reader.read_exact(&mut responder_upgrade_nonce)?;
         let local_zebra_nonce = Nonce(reader.read_u64::<LittleEndian>()?);
         let remote_zebra_nonce = Nonce(reader.read_u64::<LittleEndian>()?);
-        let iroh_node_id = read_bounded_bytes(reader, MAX_IROH_NODE_ID_BYTES)?;
+        let node_keys = read_bounded_bytes(reader, MAX_NODE_KEYS_BYTES)?;
         let iroh_direct_addresses = read_bounded_bytes_list(
             reader,
             MAX_IROH_DIRECT_ADDRESSES,
@@ -861,7 +867,7 @@ impl P2pV2UpgradeAccept {
             responder_upgrade_nonce,
             local_zebra_nonce,
             remote_zebra_nonce,
-            iroh_node_id,
+            node_keys,
             iroh_direct_addresses,
             iroh_relay_hint,
             max_control_frame_bytes,
@@ -990,8 +996,9 @@ pub struct ZakuraControlHello {
     pub network_id: ZakuraNetworkId,
     /// Local genesis block hash.
     pub chain_id: [u8; 32],
-    /// Authenticated Iroh node id this peer claims.
-    pub iroh_node_id: Vec<u8>,
+    /// The sender's encoded key list. Its hash is the sender's node ID, and
+    /// it must hold the key the sender proved in the TLS handshake.
+    pub node_keys: Vec<u8>,
     /// Fresh nonce for this control exchange.
     pub peer_nonce: [u8; 32],
     /// Initiator upgrade nonce, or zeroes for native handshakes.
@@ -1019,7 +1026,7 @@ impl ZakuraControlHello {
         bytes.write_u8(self.role.code())?;
         bytes.write_u32::<LittleEndian>(self.network_id.code())?;
         bytes.write_all(&self.chain_id)?;
-        write_bounded_bytes(&mut bytes, &self.iroh_node_id, MAX_IROH_NODE_ID_BYTES)?;
+        write_bounded_bytes(&mut bytes, &self.node_keys, MAX_NODE_KEYS_BYTES)?;
         bytes.write_all(&self.peer_nonce)?;
         bytes.write_all(&self.initiator_upgrade_nonce)?;
         bytes.write_all(&self.responder_upgrade_nonce)?;
@@ -1057,7 +1064,7 @@ impl ZakuraControlHello {
         let network_id = ZakuraNetworkId::from_u32(reader.read_u32::<LittleEndian>()?)?;
         let mut chain_id = [0; 32];
         reader.read_exact(&mut chain_id)?;
-        let iroh_node_id = read_bounded_bytes(&mut reader, MAX_IROH_NODE_ID_BYTES)?;
+        let node_keys = read_bounded_bytes(&mut reader, MAX_NODE_KEYS_BYTES)?;
         let mut peer_nonce = [0; 32];
         reader.read_exact(&mut peer_nonce)?;
         let mut initiator_upgrade_nonce = [0; 32];
@@ -1078,7 +1085,7 @@ impl ZakuraControlHello {
             role,
             network_id,
             chain_id,
-            iroh_node_id,
+            node_keys,
             peer_nonce,
             initiator_upgrade_nonce,
             responder_upgrade_nonce,
@@ -1090,19 +1097,15 @@ impl ZakuraControlHello {
     }
 
     /// Validates the hello as [`Self::validate`] does, and returns the node
-    /// ID it names.
+    /// ID it names: the hash of its key list.
     ///
     /// This is where a responder learns who its peer is: TLS proved a key,
-    /// and a valid hello names the node that key belongs to.
+    /// and a valid hello carries a key list that holds it.
     pub fn validated_node_id(
         &self,
         expected: &ZakuraControlValidation<'_>,
     ) -> Result<NodeId, ZakuraValidationError> {
-        self.validate(expected)?;
-        ZakuraPeerId::new(self.iroh_node_id.clone())
-            .ok()
-            .and_then(|peer_id| peer_id.node_id())
-            .ok_or(ZakuraValidationError::IdentityMismatch)
+        self.validated_keys(expected).map(|keys| keys.node_id())
     }
 
     /// Validates a peer hello against the key TLS proved and local policy.
@@ -1110,6 +1113,14 @@ impl ZakuraControlHello {
         &self,
         expected: &ZakuraControlValidation<'_>,
     ) -> Result<(), ZakuraValidationError> {
+        self.validated_keys(expected).map(drop)
+    }
+
+    /// Checks the hello and returns its key list.
+    fn validated_keys(
+        &self,
+        expected: &ZakuraControlValidation<'_>,
+    ) -> Result<NodeKeyList, ZakuraValidationError> {
         if self.magic != CONTROL_HELLO_MAGIC {
             return Err(ZakuraValidationError::MalformedControl);
         }
@@ -1131,9 +1142,7 @@ impl ZakuraControlHello {
         if self.chain_id != expected.local.chain_id {
             return Err(ZakuraValidationError::WrongChain);
         }
-        if self.iroh_node_id.as_slice() != expected.authenticated_remote_key {
-            return Err(ZakuraValidationError::IdentityMismatch);
-        }
+        let keys = proven_key_list(&self.node_keys, expected.authenticated_remote_key)?;
         if self.capabilities & expected.local.required_capabilities
             != expected.local.required_capabilities
         {
@@ -1168,8 +1177,42 @@ impl ZakuraControlHello {
             }
         }
 
-        Ok(())
+        Ok(keys)
     }
+}
+
+/// Decodes the key list a peer advertised in a legacy upgrade prelude, if
+/// this release can connect to the node it names: the list is well formed
+/// and holds an Ed25519 key, which is what a native dial proves.
+///
+/// The prelude codec keeps these bytes as they are, because a release from
+/// before key lists sends its 32-byte key here. Call this only once the
+/// protocol version is selected, which such a release never reaches.
+pub fn advertised_key_list(node_keys: &[u8]) -> Option<NodeKeyList> {
+    NodeKeyList::decode(node_keys)
+        .ok()
+        .filter(|keys| keys.ed25519().is_some())
+}
+
+/// Decodes the key list a peer sent and checks that it holds `proven`, the
+/// Ed25519 key the peer proved in the TLS handshake.
+///
+/// The peer's node ID is the list's hash. Only the Ed25519 entry is proven:
+/// this release cannot check entries of other tags, and accepts them as part
+/// of the name the peer chose. A list that is malformed is
+/// [`MalformedControl`](ZakuraValidationError::MalformedControl). A list with
+/// no Ed25519 entry, or with another node's, is an
+/// [`IdentityMismatch`](ZakuraValidationError::IdentityMismatch).
+pub fn proven_key_list(
+    node_keys: &[u8],
+    proven: NodeKey,
+) -> Result<NodeKeyList, ZakuraValidationError> {
+    let keys =
+        NodeKeyList::decode(node_keys).map_err(|_| ZakuraValidationError::MalformedControl)?;
+    if keys.ed25519() != Some(proven) {
+        return Err(ZakuraValidationError::IdentityMismatch);
+    }
+    Ok(keys)
 }
 
 /// Inputs needed to validate a Zakura control hello.
@@ -1177,9 +1220,9 @@ impl ZakuraControlHello {
 pub struct ZakuraControlValidation<'a> {
     /// Local Zakura policy.
     pub local: &'a ZakuraHandshakeConfig,
-    /// The key the peer proved in the TLS handshake. The hello's identity
-    /// must name it.
-    pub authenticated_remote_key: &'a [u8],
+    /// The key the peer proved in the TLS handshake. The hello's key list
+    /// must hold it.
+    pub authenticated_remote_key: NodeKey,
     /// Selected Zakura protocol.
     pub selected_zakura_protocol: u16,
     /// Native or upgraded handshake path.
@@ -1213,6 +1256,10 @@ pub struct ZakuraControlAck {
     pub accepted_channels: u64,
     /// Accepted resource limits.
     pub accepted_limits: ZakuraAcceptedLimits,
+    /// The responder's encoded key list. Its hash is the responder's node
+    /// ID, and it must hold the key the responder proved in the TLS
+    /// handshake.
+    pub node_keys: Vec<u8>,
 }
 
 impl ZakuraControlAck {
@@ -1227,6 +1274,7 @@ impl ZakuraControlAck {
         bytes.write_u64::<LittleEndian>(self.accepted_capabilities)?;
         bytes.write_u64::<LittleEndian>(self.accepted_channels)?;
         self.accepted_limits.encode_to(&mut bytes)?;
+        write_bounded_bytes(&mut bytes, &self.node_keys, MAX_NODE_KEYS_BYTES)?;
         if bytes.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(ZakuraProtocolError::OversizedPayload {
                 actual: bytes.len(),
@@ -1259,6 +1307,7 @@ impl ZakuraControlAck {
         let accepted_capabilities = reader.read_u64::<LittleEndian>()?;
         let accepted_channels = reader.read_u64::<LittleEndian>()?;
         let accepted_limits = ZakuraAcceptedLimits::decode_from(&mut reader)?;
+        let node_keys = read_bounded_bytes(&mut reader, MAX_NODE_KEYS_BYTES)?;
 
         Ok(Self {
             magic,
@@ -1269,7 +1318,19 @@ impl ZakuraControlAck {
             accepted_capabilities,
             accepted_channels,
             accepted_limits,
+            node_keys,
         })
+    }
+
+    /// Returns the node ID of the responder that sent this ack: the hash of
+    /// its key list, which must hold `proven`, the key the responder proved
+    /// in the TLS handshake.
+    ///
+    /// The initiator dialed a node ID, and TLS can only prove a key. This is
+    /// where it learns which node answered, so it must compare the result
+    /// with the ID it dialed.
+    pub fn responder_node_id(&self, proven: NodeKey) -> Result<NodeId, ZakuraValidationError> {
+        proven_key_list(&self.node_keys, proven).map(|keys| keys.node_id())
     }
 
     /// Validates this acknowledgement against the exact control exchange.
@@ -1630,7 +1691,7 @@ struct PreludeStaticFields<'a> {
     network_id: ZakuraNetworkId,
     chain_id: [u8; 32],
     capabilities: u64,
-    iroh_node_id: &'a [u8],
+    node_keys: &'a [u8],
     iroh_direct_addresses: &'a [Vec<u8>],
     iroh_relay_hint: Option<&'a [u8]>,
     max_control_frame_bytes: u32,
@@ -1654,7 +1715,7 @@ fn validate_prelude_static_fields(
         return Err(ZakuraRejectReason::MissingRequiredCapability);
     }
     validate_peer_hints(
-        prelude.iroh_node_id,
+        prelude.node_keys,
         prelude.iroh_direct_addresses,
         prelude.iroh_relay_hint,
     )
@@ -1681,11 +1742,11 @@ fn validate_peer_nonce_labels(
 }
 
 fn validate_peer_hints(
-    iroh_node_id: &[u8],
+    node_keys: &[u8],
     iroh_direct_addresses: &[Vec<u8>],
     iroh_relay_hint: Option<&[u8]>,
 ) -> Result<(), ZakuraProtocolError> {
-    validate_bounded_bytes(iroh_node_id, MAX_IROH_NODE_ID_BYTES, "iroh node id")?;
+    validate_bounded_bytes(node_keys, MAX_NODE_KEYS_BYTES, "node keys")?;
     if iroh_direct_addresses.len() > MAX_IROH_DIRECT_ADDRESSES {
         return Err(ZakuraProtocolError::OversizedPayload {
             actual: iroh_direct_addresses.len(),
@@ -1960,7 +2021,7 @@ mod tests {
             local_zebra_nonce: nonces().remote_zebra_nonce,
             remote_zebra_nonce: nonces().local_zebra_nonce,
             upgrade_nonce: [1; 32],
-            iroh_node_id: vec![7; 32],
+            node_keys: vec![7; 32],
             iroh_direct_addresses: vec![b"127.0.0.1:0".to_vec()],
             iroh_relay_hint: None,
             max_control_frame_bytes: 1024,
@@ -1981,7 +2042,7 @@ mod tests {
             responder_upgrade_nonce: [2; 32],
             local_zebra_nonce: nonces().remote_zebra_nonce,
             remote_zebra_nonce: nonces().local_zebra_nonce,
-            iroh_node_id: vec![8; 32],
+            node_keys: vec![8; 32],
             iroh_direct_addresses: vec![b"127.0.0.1:1".to_vec()],
             iroh_relay_hint: None,
             max_control_frame_bytes: 1024,
@@ -2214,8 +2275,8 @@ mod tests {
     #[test]
     fn a_valid_hello_names_the_node_whose_key_tls_proved() {
         let local = local_config();
-        let peer = zakura_quic::NodeSecretKey::from_bytes(&[9; 32]).public();
-        let other = zakura_quic::NodeSecretKey::from_bytes(&[10; 32]).public();
+        let peer = test_secret(9);
+        let other = test_secret(10);
         let hello = ZakuraControlHello {
             magic: CONTROL_HELLO_MAGIC,
             control_version: CONTROL_VERSION,
@@ -2224,7 +2285,7 @@ mod tests {
             role: ZakuraControlRole::Initiator,
             network_id: local.network_id,
             chain_id: local.chain_id,
-            iroh_node_id: peer.as_bytes().to_vec(),
+            node_keys: peer.key_list().encode(),
             peer_nonce: [3; 32],
             initiator_upgrade_nonce: [0; 32],
             responder_upgrade_nonce: [0; 32],
@@ -2239,11 +2300,10 @@ mod tests {
                 idle_timeout_millis: 1000,
             },
         };
-        let proved = |key: &zakura_quic::NodeId| {
-            let key = *key.as_bytes();
+        let proved = |key: NodeKey| {
             hello.validated_node_id(&ZakuraControlValidation {
                 local: &local,
-                authenticated_remote_key: &key,
+                authenticated_remote_key: key,
                 selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
                 handshake_path: ZakuraHandshakePath::Native,
                 remote_role: ZakuraControlRole::Initiator,
@@ -2253,9 +2313,9 @@ mod tests {
             })
         };
 
-        assert_eq!(proved(&peer), Ok(peer));
+        assert_eq!(proved(peer.public_key()), Ok(peer.public()));
         assert_eq!(
-            proved(&other),
+            proved(other.public_key()),
             Err(ZakuraValidationError::IdentityMismatch),
             "a hello can't name a node whose key the peer didn't prove"
         );
@@ -2272,7 +2332,7 @@ mod tests {
             role: ZakuraControlRole::Initiator,
             network_id: local.network_id,
             chain_id: local.chain_id,
-            iroh_node_id: vec![7; 32],
+            node_keys: test_secret(7).key_list().encode(),
             peer_nonce: [3; 32],
             initiator_upgrade_nonce: [1; 32],
             responder_upgrade_nonce: [2; 32],
@@ -2289,7 +2349,7 @@ mod tests {
         };
         let expected = ZakuraControlValidation {
             local: &local,
-            authenticated_remote_key: &[7; 32],
+            authenticated_remote_key: test_secret(7).public_key(),
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             remote_role: ZakuraControlRole::Initiator,
@@ -2303,7 +2363,7 @@ mod tests {
         assert_eq!(decoded.validate(&expected), Ok(()));
 
         let mut wrong_identity = decoded.clone();
-        wrong_identity.iroh_node_id = vec![8; 32];
+        wrong_identity.node_keys = test_secret(8).key_list().encode();
         assert_eq!(
             wrong_identity.validate(&expected),
             Err(ZakuraValidationError::IdentityMismatch)
@@ -2340,6 +2400,7 @@ mod tests {
             magic: CONTROL_ACK_MAGIC,
             control_version: CONTROL_VERSION,
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            node_keys: test_secret(7).key_list().encode(),
             peer_nonce: [2; 32],
             remote_peer_nonce: [1; 32],
             accepted_capabilities: 0,
@@ -2382,7 +2443,7 @@ mod tests {
                 max_frame_bytes: requested_limits.max_frame_bytes + 1,
                 ..requested_limits
             },
-            ..ack
+            ..ack.clone()
         };
         assert_eq!(
             malicious_ack.validate(
@@ -2510,6 +2571,7 @@ mod tests {
             magic: CONTROL_ACK_MAGIC,
             control_version: CONTROL_VERSION,
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            node_keys: test_secret(7).key_list().encode(),
             peer_nonce: [2; 32],
             remote_peer_nonce: [1; 32],
             accepted_capabilities: offered,
@@ -2629,7 +2691,7 @@ mod tests {
             Err(ZakuraProtocolError::OversizedPayload { .. })
         ));
         let mut oversized = control_hello();
-        oversized.iroh_node_id = vec![1; MAX_IROH_NODE_ID_BYTES + 1];
+        oversized.node_keys = vec![1; MAX_NODE_KEYS_BYTES + 1];
         assert!(oversized.encode().is_err());
         let encoded = control_hello().encode().expect("a hello encodes");
         assert!(encoded.len() <= MAX_CONTROL_PAYLOAD_BYTES);
@@ -2776,7 +2838,7 @@ mod tests {
             role: ZakuraControlRole::Initiator,
             network_id: local.network_id,
             chain_id: local.chain_id,
-            iroh_node_id: vec![7; 32],
+            node_keys: test_secret(7).key_list().encode(),
             peer_nonce: [3; 32],
             initiator_upgrade_nonce: [1; 32],
             responder_upgrade_nonce: [2; 32],
@@ -2793,11 +2855,17 @@ mod tests {
         }
     }
 
+    /// A test node's secret key.
+    fn test_secret(seed: u8) -> zakura_quic::NodeSecretKey {
+        zakura_quic::NodeSecretKey::from_bytes(&[seed; 32])
+    }
+
     fn control_ack() -> ZakuraControlAck {
         ZakuraControlAck {
             magic: CONTROL_ACK_MAGIC,
             control_version: CONTROL_VERSION,
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            node_keys: test_secret(7).key_list().encode(),
             peer_nonce: [2; 32],
             remote_peer_nonce: [1; 32],
             accepted_capabilities: 0,
@@ -3074,7 +3142,7 @@ mod tests {
         assert_eq!(decoded, hello);
         let expected = ZakuraControlValidation {
             local: &local,
-            authenticated_remote_key: &[7; 32],
+            authenticated_remote_key: test_secret(7).public_key(),
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             remote_role: ZakuraControlRole::Initiator,
@@ -3142,19 +3210,18 @@ mod tests {
         assert_eq!(from_bytes.node_id(), Some(node_id));
     }
 
-    /// Peer id bytes that aren't a valid node ID have no node ID.
+    /// A node ID is any 32 bytes, so peer id bytes of another length have
+    /// no node ID.
     #[test]
-    fn peer_id_without_a_valid_key_has_no_node_id() {
-        let not_a_point = (0..=u8::MAX)
-            .map(|byte| [byte; 32])
-            .find(|bytes| NodeId::from_bytes(bytes).is_err())
-            .expect("some repeated byte is not a curve point");
-        let not_a_point =
-            ZakuraPeerId::new(not_a_point.to_vec()).expect("32 bytes is a valid peer id");
+    fn a_peer_id_of_another_length_has_no_node_id() {
+        let any_32_bytes = ZakuraPeerId::new(vec![0xff; 32]).expect("32 bytes is a valid peer id");
         let legacy =
             ZakuraPeerId::new(vec![1, 2, 3]).expect("a short legacy id is a valid peer id");
 
-        assert_eq!(not_a_point.node_id(), None);
+        assert_eq!(
+            any_32_bytes.node_id(),
+            Some(NodeId::from_bytes(&[0xff; 32]))
+        );
         assert_eq!(legacy.node_id(), None);
     }
 }

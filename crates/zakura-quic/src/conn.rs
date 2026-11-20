@@ -18,6 +18,7 @@ use zakura_rt::{
 use crate::{
     driver::{ConnCmd, ConnRef, ConnShared},
     key::{NodeId, NodeKey},
+    key_list::NodeKeyList,
     stream::{RecvStream, SendStream},
 };
 
@@ -283,6 +284,8 @@ pub struct Conn {
     admitted_at: Instant,
     source_validated: bool,
     alpn: Arc<[u8]>,
+    /// The keys this end of the connection is known by.
+    local_keys: Arc<NodeKeyList>,
 }
 
 impl fmt::Debug for Conn {
@@ -302,6 +305,7 @@ impl Conn {
     pub(crate) fn new(
         inner: ConnRef,
         remote_key: NodeKey,
+        local_keys: Arc<NodeKeyList>,
         admitted_addr: SocketAddr,
         admitted_at: Instant,
         source_validated: bool,
@@ -314,7 +318,14 @@ impl Conn {
             admitted_at,
             source_validated,
             alpn: alpn.into(),
+            local_keys,
         }
+    }
+
+    /// The keys the local node is known by: the list whose hash is its node
+    /// ID. An application that tells the peer who it is sends this list.
+    pub fn local_keys(&self) -> &NodeKeyList {
+        &self.local_keys
     }
 
     /// The Ed25519 key the peer proved in the TLS handshake (TLS-8).

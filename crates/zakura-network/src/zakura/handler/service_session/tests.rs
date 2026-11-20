@@ -268,7 +268,7 @@ impl Fixture {
         let (client_tx, client_sessions) = mpsc::channel(2);
         let (server_sibling_tx, server_siblings) = mpsc::channel(1);
         let (client_sibling_tx, client_siblings) = mpsc::channel(1);
-        let handler = |sessions, siblings, endpoint: QuicEndpoint, fail_reservation| {
+        let handler = |sessions, siblings, fail_reservation| {
             ZakuraProtocolHandler::new_with_registry(
                 ZakuraSupervisorHandle::new(16),
                 Network::Mainnet,
@@ -293,19 +293,16 @@ impl Fixture {
                     .unwrap(),
                 ),
             )
-            .with_local_node_id(endpoint.local_id())
         };
         let server_opens = i_open_collision_winner(&server.local_id(), &client.local_id());
         let server_handler = handler(
             server_tx,
             server_sibling_tx,
-            server.clone(),
             fail_first_reservation && server_opens,
         );
         let client_handler = handler(
             client_tx,
             client_sibling_tx,
-            client.clone(),
             fail_first_reservation && !server_opens,
         );
         server.serve(server_handler)?;

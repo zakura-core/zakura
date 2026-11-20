@@ -89,7 +89,6 @@ impl<A: StreamConformance> LayoutNode<A> {
             limits.clone(),
             Arc::new(ServiceRegistry::new(services)?),
         )
-        .with_local_node_id(endpoint.local_id())
         .with_transport_observer(exited.clone());
         endpoint.serve(handler.clone())?;
         Ok(Self {

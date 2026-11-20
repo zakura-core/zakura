@@ -268,8 +268,7 @@ impl HoldingNode {
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
             Arc::new(ServiceRegistry::new(services)?),
-        )
-        .with_local_node_id(quic.local_id());
+        );
         quic.serve(handler.clone())?;
         Ok(Self {
             endpoint: ZakuraEndpoint::from_parts(quic, supervisor, handler.clone()),

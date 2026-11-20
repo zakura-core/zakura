@@ -73,12 +73,12 @@ impl HostilePeer {
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
+        let victim_id = victim_addr.id;
 
         let connection = endpoint.connect(victim_addr, &[P2P_V2_ALPN]).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
-        let local_peer_id = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
-        run_native_initiator_handshake(&connection, &limits, &config, &local_peer_id).await?;
+        run_native_initiator_handshake(&connection, &limits, &config, victim_id).await?;
 
         Ok(Self {
             endpoint,

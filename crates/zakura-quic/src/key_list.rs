@@ -16,7 +16,11 @@ pub const MAX_NODE_KEYS: usize = 4;
 pub const ED25519_KEY_TAG: u16 = 1;
 
 /// Length of one encoded entry: a 2-byte tag and a 32-byte value.
-const ENTRY_BYTES: usize = 2 + KEY_LENGTH;
+pub const NODE_KEY_ENTRY_BYTES: usize = 2 + KEY_LENGTH;
+const ENTRY_BYTES: usize = NODE_KEY_ENTRY_BYTES;
+
+/// Length of the shortest encoded key list: the count byte and one entry.
+pub const MIN_NODE_KEY_LIST_BYTES: usize = 1 + ENTRY_BYTES;
 
 /// Length of the longest encoded key list: the count byte and
 /// [`MAX_NODE_KEYS`] entries.
@@ -60,13 +64,30 @@ pub enum KeyListError {
 pub struct NodeKeyList {
     /// `(tag, value)` in increasing tag order, 1 to [`MAX_NODE_KEYS`] of them.
     entries: Vec<(u16, [u8; KEY_LENGTH])>,
+    /// The hash of the encoded entries, computed once at construction. Code
+    /// that handles many records reads a node's ID far more often than it
+    /// builds a list.
+    id: NodeId,
 }
 
 impl NodeKeyList {
     /// The list of a node whose only key is the Ed25519 key `key`.
     pub fn single(key: NodeKey) -> Self {
+        Self::from_checked(vec![(ED25519_KEY_TAG, *key.as_bytes())])
+    }
+
+    /// Wraps entries that already satisfy every rule of
+    /// [`Self::from_entries`], and derives their node ID.
+    fn from_checked(entries: Vec<(u16, [u8; KEY_LENGTH])>) -> Self {
+        let hash = Params::new()
+            .hash_length(KEY_LENGTH)
+            .personal(NODE_ID_PERSONALISATION)
+            .hash(&encode(&entries));
+        let mut digest = [0; KEY_LENGTH];
+        digest.copy_from_slice(hash.as_bytes());
         Self {
-            entries: vec![(ED25519_KEY_TAG, *key.as_bytes())],
+            entries,
+            id: NodeId::from_bytes(&digest),
         }
     }
 
@@ -91,7 +112,7 @@ impl NodeKeyList {
                 return Err(KeyListError::InvalidEd25519Key);
             }
         }
-        Ok(Self { entries })
+        Ok(Self::from_checked(entries))
     }
 
     /// Decodes a list from exactly `bytes`.
@@ -116,14 +137,12 @@ impl NodeKeyList {
 
     /// The list's canonical bytes, which [`Self::decode`] reads back.
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + self.entries.len() * ENTRY_BYTES);
-        // At most `MAX_NODE_KEYS` entries, so the count fits a byte.
-        bytes.push(self.entries.len() as u8);
-        for (tag, value) in &self.entries {
-            bytes.extend_from_slice(&tag.to_le_bytes());
-            bytes.extend_from_slice(value);
-        }
-        bytes
+        encode(&self.entries)
+    }
+
+    /// The length of [`Self::encode`]'s bytes.
+    pub fn encoded_len(&self) -> usize {
+        1 + self.entries.len() * ENTRY_BYTES
     }
 
     /// The node's Ed25519 key, if the list has one.
@@ -141,14 +160,20 @@ impl NodeKeyList {
     /// encoded list (ID-9). Entries this release doesn't understand are
     /// hashed too, so every release derives the same ID from the same list.
     pub fn node_id(&self) -> NodeId {
-        let hash = Params::new()
-            .hash_length(KEY_LENGTH)
-            .personal(NODE_ID_PERSONALISATION)
-            .hash(&self.encode());
-        let mut digest = [0; KEY_LENGTH];
-        digest.copy_from_slice(hash.as_bytes());
-        NodeId::from_bytes(&digest)
+        self.id
     }
+}
+
+/// Encodes entries as a count byte, then each tag and value.
+fn encode(entries: &[(u16, [u8; KEY_LENGTH])]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + entries.len() * ENTRY_BYTES);
+    // A list holds at most `MAX_NODE_KEYS` entries, so the count fits a byte.
+    bytes.push(entries.len() as u8);
+    for (tag, value) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
+    bytes
 }
 
 #[cfg(test)]

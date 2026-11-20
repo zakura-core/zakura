@@ -39,7 +39,7 @@ fn record(exchange: u32) -> ZakuraNodeRecord {
     // The codec does not verify signatures.
     ZakuraNodeRecord {
         body: ZakuraNodeRecordBody {
-            node_id: NodeSecretKey::from_bytes(&[4; 32]).public(),
+            keys: NodeSecretKey::from_bytes(&[4; 32]).key_list().clone(),
             direct_addrs: Vec::new(),
             services: Vec::new(),
             zakura_protocol_min: 1,
@@ -81,7 +81,7 @@ impl StreamConformance for DiscoveryConformance {
                 wanted_services: wanted(exchange),
             }),
             MSG_DISCOVERY_SERVICES => DiscoveryMessage::Services(Services {
-                node_id: record(exchange).body.node_id,
+                node_id: record(exchange).body.node_id(),
                 expires_at_unix_secs: u64::from(exchange),
                 summaries: Vec::new(),
             }),

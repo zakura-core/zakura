@@ -154,7 +154,7 @@ mod tests {
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
         let connection = client.connect(server_addr, &[ALPN]).await?;
-        assert_eq!(connection.remote_key(), server.local_id().key());
+        assert_eq!(connection.remote_key(), server.local_key());
 
         connection.close(0u32.into(), b"done");
         client.shutdown().await;

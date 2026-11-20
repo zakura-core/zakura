@@ -61,9 +61,8 @@ impl RawLayoutPeer {
         .await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         config.supported_capabilities = capabilities;
-        let local = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
         within("handshake", async {
-            run_native_initiator_handshake_without_trace(&connection, limits, &config, &local)
+            run_native_initiator_handshake_without_trace(&connection, limits, &config, victim_id)
                 .await?;
             Ok(())
         })

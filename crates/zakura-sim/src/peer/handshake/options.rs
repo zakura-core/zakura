@@ -98,7 +98,7 @@ impl ControlFault {
             Self::Role => hello.role = ZakuraControlRole::Responder,
             Self::Network => hello.network_id = ZakuraNetworkId::Mainnet,
             Self::Chain => hello.chain_id[0] ^= 1,
-            Self::Identity => hello.iroh_node_id[0] ^= 1,
+            Self::Identity => hello.node_keys[0] ^= 1,
             Self::RequiredChannel => hello.required_channels = u64::MAX,
             Self::FrameLimit => hello.initial_limits.max_frame_bytes = 0,
             Self::MessageLimit => hello.initial_limits.max_message_bytes = 0,

@@ -1506,6 +1506,11 @@ async fn a_small_transaction_reaches_the_window_at_once_and_the_rest_after_the_d
         observed_node(120, TestPool::new(Held::default()), cools(), 64).await?;
     let mut peers = Vec::with_capacity(PEERS);
     for n in 0..PEERS {
+        // The node refuses a handshake once one host has started more than
+        // its limit refills. One dial per refill never reaches that limit,
+        // however fast this machine dials.
+        tokio::time::sleep(crate::zakura::transport::node_handshake_cadence().refill_interval)
+            .await;
         let mut peer = RawRelay::connect(&victim, 1_200 + u64::try_from(n)?).await?;
         peer.start().await?;
         peers.push(peer);

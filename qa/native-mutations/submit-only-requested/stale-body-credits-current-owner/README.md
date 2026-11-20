@@ -15,13 +15,11 @@ reservation, and the body reaches the sequencer under the current owner.
 ## Witness
 
 The witness is the `block_table` test
-`the_stale_request_body_input_holds_receiver_work_authorized`. It runs
-the seed `block-sync-stale-request-body`, which
-a seeded random search on the remote host found. The input resets the
-chain to a fork from height 8 once the node submits its third body, while
-two mirrors serve. One routine judges an old-chain body for height 14
-after the other routine's fork request reserved height 14, while the first
-routine's old request is still local. The test asserts that order. The
+`a_stale_request_body_holds_receiver_work_authorized`. It searches
+generated Plans of the reset-mid-flight scenario, which resets the chain to
+a fork while two mirrors serve, for a run in which one routine judges an
+old-chain body after the other routine's fork request reserved that
+body's height, while the first routine's old request is still local. The
 patch credits that body to the fork request.
 
 `block-sync/s6v3/block/receiver-work-authorized` judges the body when it

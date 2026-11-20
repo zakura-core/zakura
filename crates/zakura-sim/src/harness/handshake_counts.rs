@@ -239,6 +239,9 @@ fn operations(input: &[u8]) -> Vec<u8> {
         1 => {
             for slot in 0..26 {
                 let host = slot % 4 + (slot / 12) * 8;
+                // Eight addresses would reach the node's reserve, which
+                // admits one attempt per address.
+                operations.extend([7, NODE_REFILL_MS, 0]);
                 operations.extend([0, slot, host, 2, slot, 0]);
             }
             for slot in 26..34 {

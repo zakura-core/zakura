@@ -56,14 +56,18 @@ impl AnnouncementClaims {
             header.seen_at,
         );
         // A `block` message can record a legacy reservation later than a header claim, so the
-        // body takes the earlier usable order. If neither is usable, metrics report the header
-        // claim's outcome when there is no legacy one, and the legacy one otherwise.
-        match (announced.claimed_order(), header.claimed_order()) {
-            (Some(legacy), Some(header_order)) if header_order < legacy => header,
-            (Some(_), _) => announced,
-            (None, Some(_)) => header,
-            (None, None) if announced == Unclaimed => header,
-            (None, None) => announced,
+        // body takes the earlier usable order. A usable claim ranks ahead of a failed one, and
+        // a failed one ahead of none, so metrics report a failure when no claim is usable. On a
+        // tie the legacy claim is reported.
+        let rank = |claim: &ClaimOutcome| match claim {
+            Used { order, .. } => (0, *order),
+            Expired { .. } | Voided { .. } => (1, 0),
+            Unclaimed => (2, 0),
+        };
+        if rank(&header) < rank(&announced) {
+            header
+        } else {
+            announced
         }
     }
 }

@@ -13,6 +13,7 @@ use std::{
 
 use super::*;
 use crate::{
+    peer::BlockAnnouncements,
     peer_set::ActiveConnectionCounter,
     protocol::external::{BlockReservation, HashedBlock},
     zakura::{
@@ -1400,17 +1401,9 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
 /// decode, does not reach it.
 #[tokio::test(start_paused = true)]
 async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
-    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = received.clone();
-    let (hook, announced) = recording_hook();
-    // The hook reports odd orders as near the tip.
-    let hook = hook.with_block_messages(
-        || unreachable!("only the codec reserves"),
-        move |hash, height, reservation: BlockReservation| {
-            recorded.lock().unwrap().push((hash, height, reservation));
-            reservation.order % 2 == 1
-        },
-    );
+    let node = RecordingNode::default();
+    let (announced, received) = (node.announced.clone(), node.received.clone());
+    let hook = BlockAnnouncementHook::new(node);
     let mut connection = hook.for_connection();
     let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
@@ -1490,15 +1483,45 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
     assert_eq!(orders().len(), 6, "a new window allows more block messages");
 }
 
+/// A node that records the blocks it is told about, and reports the `block` messages with odd
+/// orders as near the tip.
+#[derive(Clone, Default)]
+struct RecordingNode {
+    announced: Arc<std::sync::Mutex<Vec<block::Hash>>>,
+    received: Arc<std::sync::Mutex<Vec<(block::Hash, Option<block::Height>, BlockReservation)>>>,
+}
+
+impl BlockAnnouncements for RecordingNode {
+    fn announced(&self, hash: block::Hash) {
+        self.announced.lock().unwrap().push(hash);
+    }
+
+    fn block_started(&self) -> Option<BlockReservation> {
+        unreachable!("only the codec reserves")
+    }
+
+    fn block_received(
+        &self,
+        hash: block::Hash,
+        height: Option<block::Height>,
+        reservation: BlockReservation,
+    ) -> bool {
+        self.received
+            .lock()
+            .unwrap()
+            .push((hash, height, reservation));
+        reservation.order % 2 == 1
+    }
+}
+
 /// A hook that records the hashes it is called with.
 fn recording_hook() -> (
     BlockAnnouncementHook,
     Arc<std::sync::Mutex<Vec<block::Hash>>>,
 ) {
-    let announced = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = announced.clone();
-    let hook = BlockAnnouncementHook::new(move |hash| recorded.lock().unwrap().push(hash));
-    (hook, announced)
+    let node = RecordingNode::default();
+    let announced = node.announced.clone();
+    (BlockAnnouncementHook::new(node), announced)
 }
 
 /// A body request contradicts only the requested blocks' earlier announcements.

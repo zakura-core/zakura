@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::time::Instant;
+
 use super::*;
 use crate::protocol::external::InventoryHash;
 
@@ -16,8 +18,13 @@ const TIP: block::Height = block::Height(7);
 fn reserving_codec() -> (Codec, Arc<AtomicU64>) {
     let reserved = Arc::new(AtomicU64::new(0));
     let counter = reserved.clone();
-    let reserve: ReserveBlockOrder =
-        Arc::new(move || Some((FIRST_ORDER + counter.fetch_add(1, Ordering::Relaxed), TIP)));
+    let reserve: ReserveBlockOrder = Arc::new(move || {
+        Some(BlockReservation {
+            order: FIRST_ORDER + counter.fetch_add(1, Ordering::Relaxed),
+            verified_tip: TIP,
+            started_at: Instant::now(),
+        })
+    });
     let mut codec = Codec::builder()
         .with_block_order_reservation(Some(reserve))
         .finish();

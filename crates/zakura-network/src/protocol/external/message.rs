@@ -29,14 +29,14 @@ use proptest_derive::Arbitrary;
 use zakura_chain::serialization::arbitrary::datetime_full;
 
 /// A place in the node's block receipt order, reserved when a received `block` message started
-/// arriving. See [`crate::BlockAnnouncementHook::with_block_messages`].
+/// arriving. See [`crate::BlockAnnouncements::block_started`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockReservation {
     /// The receipt order the node reserved.
     pub order: u64,
     /// The node's verified tip when the order was reserved.
     pub verified_tip: block::Height,
-    /// When the message's header was read.
+    /// When the order was reserved, which is when the message's header was read.
     pub started_at: Instant,
 }
 

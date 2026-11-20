@@ -225,45 +225,50 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
-/// Claims receipt order in `announcement_claims` for each block a legacy peer newly announces,
-/// or starts sending in a `block` message, so legacy-only blocks follow the same equal-work rule
-/// as blocks whose headers arrive first.
+/// Claims receipt order in `claims` for each block a legacy peer newly announces, or starts
+/// sending in a `block` message, so legacy-only blocks follow the same equal-work rule as blocks
+/// whose headers arrive first.
 ///
 /// The best chain tip stands in for header sync's verified tip, which a node without native
 /// header sync never reports.
-fn legacy_block_announcement_hook(
-    announcement_claims: zakura_consensus::AnnouncementClaims,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-) -> zakura_network::BlockAnnouncementHook {
-    let block_message_claims = announcement_claims.clone();
-    let reserving_tip = latest_chain_tip.clone();
-    zakura_network::BlockAnnouncementHook::new(move |hash| {
+struct LegacyBlockClaims<Tip> {
+    claims: zakura_consensus::AnnouncementClaims,
+    latest_chain_tip: Tip,
+}
+
+impl<Tip: ChainTip + Send + Sync> zakura_network::BlockAnnouncements for LegacyBlockClaims<Tip> {
+    fn announced(&self, hash: block::Hash) {
         // Before the first block is committed there is no tip to place a claim above.
-        if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
-            announcement_claims.note_announcement(hash, verified_tip);
+        if let Some(verified_tip) = self.latest_chain_tip.best_tip_height() {
+            self.claims.note_announcement(hash, verified_tip);
         }
-    })
-    .with_block_messages(
-        // The tip is read at the message start, so a rival committed while this block
-        // arrives does not move it out of the claim window.
-        move || {
-            reserving_tip.best_tip_height().map(|verified_tip| {
-                (
-                    zakura_consensus::AnnouncementClaims::reserve_order(),
-                    verified_tip,
-                )
-            })
-        },
-        move |hash, height, reservation| {
-            block_message_claims.note_block_message(
-                hash,
-                height,
-                reservation.order,
-                reservation.verified_tip,
-                reservation.started_at,
-            )
-        },
-    )
+    }
+
+    fn block_started(&self) -> Option<zakura_network::BlockReservation> {
+        // The tip is read at the message start, so a rival committed while this block arrives
+        // does not move it out of the claim window.
+        let verified_tip = self.latest_chain_tip.best_tip_height()?;
+        Some(zakura_network::BlockReservation {
+            order: zakura_consensus::AnnouncementClaims::reserve_order(),
+            verified_tip,
+            started_at: tokio::time::Instant::now(),
+        })
+    }
+
+    fn block_received(
+        &self,
+        hash: block::Hash,
+        height: Option<block::Height>,
+        reservation: zakura_network::BlockReservation,
+    ) -> bool {
+        self.claims.note_block_message(
+            hash,
+            height,
+            reservation.order,
+            reservation.verified_tip,
+            reservation.started_at,
+        )
+    }
 }
 
 /// The tasks spawned by the `start` command, which are all aborted when this is dropped.
@@ -791,10 +796,10 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
-                legacy_block_announcement_hook(
-                    announcement_claims.clone(),
-                    latest_chain_tip.clone(),
-                ),
+                zakura_network::BlockAnnouncementHook::new(LegacyBlockClaims {
+                    claims: announcement_claims.clone(),
+                    latest_chain_tip: latest_chain_tip.clone(),
+                }),
             )
             .await
             .map_err(|error| eyre!(error))?;

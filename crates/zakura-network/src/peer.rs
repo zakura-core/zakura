@@ -27,8 +27,8 @@ pub(crate) use client::tests::ReceiveRequestAttempt;
 pub(crate) use handshake::register_inventory_status;
 
 pub(crate) use announced_blocks::AnnouncedBlocks;
-pub use block_announcement_hook::BlockAnnouncementHook;
 pub(crate) use block_announcement_hook::ConnectionAnnouncements;
+pub use block_announcement_hook::{BlockAnnouncementHook, BlockAnnouncements};
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 

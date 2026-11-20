@@ -14,7 +14,6 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
 use indexmap::IndexMap;
-use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder};
 
 use zakura_chain::{
@@ -283,9 +282,9 @@ pub struct Builder {
     reserve_block_order: Option<ReserveBlockOrder>,
 }
 
-/// Reserves a place in the node's block receipt order, returning the order and the node's
-/// verified tip, or `None` if the node cannot rank blocks yet.
-pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> Option<(u64, block::Height)> + Send + Sync>;
+/// Reserves a place in the node's block receipt order, or returns `None` if the node does not
+/// reserve one for this message.
+pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> Option<BlockReservation> + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -740,13 +739,7 @@ impl Decoder for Codec {
                     // Reserve before waiting for the body, so a rival announced while this
                     // block arrives ranks behind it.
                     let reservation = match &self.builder.reserve_block_order {
-                        Some(reserve) if command == *BLOCK_COMMAND => {
-                            reserve().map(|(order, verified_tip)| BlockReservation {
-                                order,
-                                verified_tip,
-                                started_at: Instant::now(),
-                            })
-                        }
+                        Some(reserve) if command == *BLOCK_COMMAND => reserve(),
                         _ => None,
                     };
 

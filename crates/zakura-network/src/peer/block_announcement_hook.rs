@@ -22,67 +22,51 @@ const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 4;
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
 const ANNOUNCEMENT_WINDOW: Duration = Duration::from_secs(2);
 
-/// Called with the hash of each block a legacy peer announces in a single-block `inv`, and,
-/// if set up with [`BlockAnnouncementHook::with_block_messages`], for each `block` message.
+/// What the node does with the blocks legacy peers announce or start sending.
 ///
-/// A multi-block `inv` is a reply to a query, not an announcement, so it is not passed on. The
-/// default hook does nothing.
-#[derive(Clone, Default)]
-pub struct BlockAnnouncementHook {
-    announced: Option<Arc<dyn Fn(block::Hash) + Send + Sync>>,
-    block_messages: Option<BlockMessageHook>,
+/// Every method runs on a connection's inbound path, so it must return quickly.
+pub trait BlockAnnouncements: Send + Sync {
+    /// A legacy peer announced the block `hash` in a single-block `inv`.
+    ///
+    /// A multi-block `inv` is a reply to a query, not an announcement, so it is not passed on.
+    fn announced(&self, hash: block::Hash);
+
+    /// The header of a `block` message was read, before any of its body was waited for.
+    ///
+    /// Returns the place the node reserves for the block, or `None` if the node cannot rank
+    /// blocks yet. Every `block` message reserves, whether it was requested or pushed.
+    fn block_started(&self) -> Option<BlockReservation>;
+
+    /// The `block` message that reserved `reservation` passed its checksum and decoded to the
+    /// block `hash` at coinbase `height`. A message that fails either is not passed on, so its
+    /// reservation goes unused.
+    ///
+    /// Returns whether the block was near enough to the tip to need a claim. The calls that
+    /// return `true` share each connection's announcement allowance.
+    fn block_received(
+        &self,
+        hash: block::Hash,
+        height: Option<block::Height>,
+        reservation: BlockReservation,
+    ) -> bool;
 }
 
-/// The hook's calls for received `block` messages.
-#[derive(Clone)]
-struct BlockMessageHook {
-    reserve: ReserveBlockOrder,
-    received:
-        Arc<dyn Fn(block::Hash, Option<block::Height>, BlockReservation) -> bool + Send + Sync>,
-}
+/// The node's [`BlockAnnouncements`], shared by every legacy connection. The default hook does
+/// nothing.
+#[derive(Clone, Default)]
+pub struct BlockAnnouncementHook(Option<Arc<dyn BlockAnnouncements>>);
 
 impl BlockAnnouncementHook {
-    /// A hook that calls `hook` for each announced block hash.
-    ///
-    /// `hook` runs on the connection's inbound path, so it must return quickly.
-    pub fn new(hook: impl Fn(block::Hash) + Send + Sync + 'static) -> Self {
-        Self {
-            announced: Some(Arc::new(hook)),
-            block_messages: None,
-        }
-    }
-
-    /// Also calls `reserve` when the header of each received `block` message is read, and
-    /// `received` with the block's hash, coinbase height and that reservation once the whole
-    /// message has passed its checksum and decoded. A message that fails either is not passed
-    /// on, so its reservation goes unused.
-    ///
-    /// `reserve` returns the reserved order and the node's verified tip, or `None` if the node
-    /// cannot rank blocks yet. `received` returns whether the block was near enough to the tip
-    /// to need a claim. Every `block` message reserves, whether it was requested or pushed, but
-    /// the calls to `received` that return `true` share each connection's announcement
-    /// allowance. Both run on the connection's inbound path, so they must return quickly.
-    pub fn with_block_messages(
-        mut self,
-        reserve: impl Fn() -> Option<(u64, block::Height)> + Send + Sync + 'static,
-        received: impl Fn(block::Hash, Option<block::Height>, BlockReservation) -> bool
-            + Send
-            + Sync
-            + 'static,
-    ) -> Self {
-        self.block_messages = Some(BlockMessageHook {
-            reserve: Arc::new(reserve),
-            received: Arc::new(received),
-        });
-        self
+    /// A hook that passes announced and received blocks to `node`.
+    pub fn new(node: impl BlockAnnouncements + 'static) -> Self {
+        Self(Some(Arc::new(node)))
     }
 
     /// The function a connection's codec calls when a `block` message starts arriving, if this
-    /// hook wants them.
+    /// hook is set.
     pub(crate) fn block_order_reservation(&self) -> Option<ReserveBlockOrder> {
-        self.block_messages
-            .as_ref()
-            .map(|block_messages| block_messages.reserve.clone())
+        let node = self.0.clone()?;
+        Some(Arc::new(move || node.block_started()))
     }
 
     /// This hook as one connection uses it, limited per connection.
@@ -96,9 +80,8 @@ impl BlockAnnouncementHook {
 
 impl fmt::Debug for BlockAnnouncementHook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BlockAnnouncementHook")
-            .field("announced", &self.announced.is_some())
-            .field("block_messages", &self.block_messages.is_some())
+        f.debug_tuple("BlockAnnouncementHook")
+            .field(&self.0.is_some())
             .finish()
     }
 }
@@ -121,11 +104,11 @@ impl ConnectionAnnouncements {
     /// Passes the announced block `hash` to the hook, unless this connection has used its
     /// share of the current window.
     pub(crate) fn announce(&mut self, hash: block::Hash) {
-        let Some(hook) = &self.hook.announced else {
+        let Some(node) = &self.hook.0 else {
             return;
         };
         self.window.call(Instant::now(), || {
-            hook(hash);
+            node.announced(hash);
             true
         });
     }
@@ -139,11 +122,11 @@ impl ConnectionAnnouncements {
         height: Option<block::Height>,
         reservation: BlockReservation,
     ) {
-        let Some(block_messages) = &self.hook.block_messages else {
+        let Some(node) = &self.hook.0 else {
             return;
         };
         self.window.call(Instant::now(), || {
-            (block_messages.received)(hash, height, reservation)
+            node.block_received(hash, height, reservation)
         });
     }
 }

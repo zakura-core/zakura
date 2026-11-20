@@ -712,14 +712,20 @@ async fn run_discovery_pipe(
     sink: DiscoverySink,
 ) -> Result<(), SinkReject> {
     let cancel = sink.session.cancel_token();
+    let mut reading = None;
     // A cancelled session drops its pending work, including a wait for a
     // verification slot, so it neither holds the slot queue nor imports after
     // its session ends.
-    zakura_rt::select! {
+    let read = zakura_rt::select! {
         biased;
         _ = cancel.cancelled() => Ok(()),
-        read = read_discovery_messages(pipe, recv, &sink) => read,
-    }
+        read = read_discovery_messages(pipe, recv, &sink, &mut reading) => read,
+    };
+    // Dropping the queued frames and the sink can yield. The hold outlasts
+    // them, so a close can't settle before the caller records this reject.
+    drop(sink);
+    drop(reading);
+    read
 }
 
 /// Reads frames until the stream ends, and traces the violation that ends it
@@ -728,9 +734,9 @@ async fn read_discovery_messages(
     pipe: &mut Pipe<DsLocal, DsEnv>,
     mut recv: FramedRecv,
     sink: &DiscoverySink,
+    reading: &mut Option<SettlingHold>,
 ) -> Result<(), SinkReject> {
-    let mut reading = None;
-    while let Some(frame) = next_frame(&mut recv, &mut reading, &sink.queries).await {
+    while let Some(frame) = next_frame(&mut recv, reading, &sink.queries).await {
         let message_type = frame.message_type;
         if let Err((stage, reject)) = read_frame(pipe, frame, sink).await {
             if let SinkReject::Protocol(error) = &reject {

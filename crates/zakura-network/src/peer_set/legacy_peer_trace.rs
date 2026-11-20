@@ -76,8 +76,8 @@ pub(super) struct SecondRequestChoice {
     pub(super) reason: SecondRequestReason,
     /// The number of idle peers, other than the first one, that had announced the block.
     pub(super) candidates: usize,
-    /// The chosen peer's expected answer time for the block, if it has been measured.
-    pub(super) score: Option<Duration>,
+    /// The chosen peer's expected answer time for this block. Only measured peers qualify.
+    pub(super) score: Duration,
     /// The first peer's expected answer time for the block, from its measurements when it was
     /// asked.
     pub(super) first_score: Duration,
@@ -310,7 +310,7 @@ impl LegacyPeerTrace {
             BlockRequestRoute::Hedge(choice) => (
                 "hedge",
                 Some(choice.candidates),
-                choice.score,
+                Some(choice.score),
                 None,
                 Some(choice),
             ),
@@ -629,7 +629,7 @@ mod tests {
                 first_request_waited: Duration::from_millis(70),
                 reason: SecondRequestReason::Predicted,
                 candidates: 2,
-                score: Some(Duration::from_millis(50)),
+                score: Duration::from_millis(50),
                 first_score: Duration::from_millis(230),
                 block_bytes: Some(1_500_000),
             }),

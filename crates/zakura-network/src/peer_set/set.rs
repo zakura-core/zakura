@@ -1746,7 +1746,8 @@ where
         let block_bytes = first.block_size.read_for_routing(cx);
         let first_score = first.estimate.expected(block_bytes)?;
         *next_decision = next_decision_after(first.at, first_score, considered_at, *next_decision);
-        let candidates: Vec<_> = self
+        let mut candidates = 0;
+        let best = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
             .filter(|addr| Some(**addr) != first_peer)
@@ -1757,8 +1758,9 @@ where
                     svc.second_request_score(cx, block_bytes, next_decision)?,
                 ))
             })
-            .collect();
-        let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {
+            .inspect(|_| candidates += 1)
+            .min_by_key(|(_, score)| *score);
+        let Some((peer, score)) = best else {
             metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
             return None;
         };
@@ -1770,8 +1772,8 @@ where
         let choice = SecondRequestChoice {
             first_request_waited,
             reason,
-            candidates: candidates.len(),
-            score: Some(score),
+            candidates,
+            score,
             first_score,
             block_bytes,
         };

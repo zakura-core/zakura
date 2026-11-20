@@ -28,13 +28,15 @@ use zakura_sim::{
         session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
     },
     harness::{
+        block_node::policy::Trigger,
         run_prepared,
-        sync::SyncPorts,
+        sync::{SyncAction, SyncPorts, SyncStep},
         sync_wire::{SavedWire, SyncWire, CURATED, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
     seed::{self, SeedSet},
+    witness::{witness_prepared, Expect},
     MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -568,6 +570,69 @@ fn a_saturating_service_starves_no_other_on_its_connection() {
             outcome(&report, property)
         );
     }
+}
+
+/// How many blocks [`small_bodies`]'s mirrors serve at the start.
+const SMALL_BODY_BLOCKS: u32 = 320;
+
+/// Each body's size in [`small_bodies`]: far under the 64 KiB a stream
+/// writes ahead of quinn-proto, so some 30 bodies can queue on one stream.
+const SMALL_BODY_BYTES: u32 = 2_000;
+
+/// How many times [`small_bodies`] grows the mirrors' chain by one block.
+const SMALL_BODY_GROWS: u64 = 24;
+
+/// zakura#2365: [`SavedWire::Saturated`]'s windows and links, with
+/// [`SMALL_BODY_BLOCKS`] bodies of [`SMALL_BODY_BYTES`] in place of its
+/// eight large ones. Every 250 ms from the first second, the mirrors' chain
+/// grows by one block, so each mirror writes header-sync frames while its
+/// block-sync stream keeps small bodies queued.
+fn small_bodies() -> <SyncWire as Subsystem>::Scenario {
+    let mut scenario = SavedWire::Saturated.scenario();
+    scenario.sync.blocks = SMALL_BODY_BLOCKS;
+    scenario.sync.body_bytes = SMALL_BODY_BYTES;
+    // Room to sync every block and then drain, with QUIC's per-datagram
+    // steps for some 700 KB of bodies.
+    scenario.sync.steps = Some(800_000);
+    scenario
+        .sync
+        .control
+        .extend((0..SMALL_BODY_GROWS).map(|grow| SyncStep {
+            action: SyncAction::Grow { len: 1 },
+            when: Some(Trigger::VirtualTime(1_000 + 250 * grow)),
+        }));
+    scenario
+}
+
+/// zakura#2365: a header-sync frame a mirror writes while its block-sync
+/// stream keeps many small bodies queued reaches the node within
+/// [`SEND_ISOLATED`]'s bound, with its trigger history.
+///
+/// quinn-proto offers a reopened send window to the most recently blocked
+/// stream first. So a frame that blocks before block sync's could wait
+/// behind every body block sync keeps queuing. It doesn't: on the droplet,
+/// the longest wait is 48,240 bytes, 24 bodies of 2,001, against a bound of
+/// 67,685, and no wait passes one 64 KiB send window.
+#[test]
+fn a_frame_behind_many_small_bodies_waits_within_one_send_window() {
+    let scenario = small_bodies();
+    let ports = SyncWire::prepare(&scenario);
+    let mut sink = MemorySink::default();
+    if let Err(error) = witness_prepared::<SyncWire>(
+        &scenario,
+        ports.clone(),
+        Plan::from_fuzz(&[]),
+        SEND_ISOLATED,
+        Expect::Holds,
+        &mut sink,
+    ) {
+        panic!("{SEND_ISOLATED}: {error}");
+    }
+    // The saturated scenario's own growth comes on top of the timed ones.
+    let tip = ports.mirror_tip();
+    let grows = u32::try_from(SMALL_BODY_GROWS).expect("a few grows");
+    assert_eq!(tip.height.0, SMALL_BODY_BLOCKS + STALL_GROWTH + grows);
+    assert_eq!(ports.tips(), (tip, tip));
 }
 
 /// fuzz-13's combined actions: each curated combination of a chain change

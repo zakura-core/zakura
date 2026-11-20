@@ -142,9 +142,14 @@ where
             // about one send window later. The longest wait counts one body,
             // 500,001 bytes against a bound of 565,578, because the node
             // counts a frame's whole payload when it reads the frame's
-            // header. Frames under 64 KiB can queue several to a stream; no
-            // run shows whether a frame that blocks before them waits behind
-            // them all.
+            // header.
+            // Frames under 64 KiB can queue several to a stream (#2365).
+            // With 2,000-byte bodies and the chain growing every 250 ms, a
+            // header-sync frame waits at most 48,240 bytes, 24 bodies,
+            // against a bound of 67,685. No wait passes one send window, so
+            // the frame doesn't wait behind every body block sync queues
+            // (`tests/sync_wire.rs`,
+            // `a_frame_behind_many_small_bodies_waits_within_one_send_window`).
             status: Status::Draft,
             check: check_send_isolated::<S>,
             witness: Some(TriggerHistory::View(written_under_saturation::<S>)),

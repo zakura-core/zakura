@@ -628,7 +628,10 @@ impl RelayPeer {
                 addr: peer_addr(self.index, 0),
                 shared_id: conn.shared_id(),
             };
-            let local = Local::regtest(None, self.records.clone());
+            // The node takes the lower of both sides' idle timeouts, so the
+            // peer offers the one its QUIC config has.
+            let local = Local::regtest(None, self.records.clone())
+                .with_idle_timeout_secs(IDLE_TIMEOUT_SECS);
             match handshake::initiate(&conn, quic.local_id(), ZAKURA_CAP_TX_RELAY, &local, remote)
                 .await
             {

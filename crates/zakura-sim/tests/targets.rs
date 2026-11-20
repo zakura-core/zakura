@@ -75,6 +75,10 @@ fn manifest() -> String {
 /// fills, which only the slow-set capacity-release seeds
 /// reach. Those run too long for a fuzz input, so they are outside the
 /// corpus, and their own tests apply the property.
+///
+/// `tx-relay/stalled-peers-parked` applies only after a parked peer's
+/// readmission, three virtual minutes in. That witness runs too long for a
+/// fuzz input, and `tests/tx_relay_wire.rs` applies the property.
 const UNAPPLIED: &[(&str, &[&str])] = &[
     (
         "block_sync_storage",
@@ -256,6 +260,36 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "session/connection-shares-bound",
             "session/credit-isolated",
             "session/send-isolated",
+        ],
+    ),
+    (
+        "tx_relay_wire",
+        &[
+            "tx-relay/s10v1/get-txs/long-payload-closes",
+            "tx-relay/s10v1/get-txs/over-margin-closes",
+            "tx-relay/s10v1/get-txs/reserved-flags-closes",
+            "tx-relay/s10v1/get-txs/short-payload-closes",
+            "tx-relay/s10v1/hello/cadence-never-closes",
+            "tx-relay/s10v1/hello/long-payload-closes",
+            "tx-relay/s10v1/hello/reserved-flags-closes",
+            "tx-relay/s10v1/hello/short-payload-closes",
+            "tx-relay/s10v1/not-found/bad-content-closes",
+            "tx-relay/s10v1/not-found/long-payload-closes",
+            "tx-relay/s10v1/not-found/over-owed-closes",
+            "tx-relay/s10v1/not-found/reserved-flags-closes",
+            "tx-relay/s10v1/not-found/short-payload-closes",
+            "tx-relay/s10v1/undeclared-type-closes",
+            "tx-relay/s9v1/inv/long-payload-closes",
+            "tx-relay/s9v1/inv/over-rate-closes",
+            "tx-relay/s9v1/inv/reserved-flags-closes",
+            "tx-relay/s9v1/inv/short-payload-closes",
+            "tx-relay/s9v1/tx/long-payload-closes",
+            "tx-relay/s9v1/tx/over-owed-closes",
+            "tx-relay/s9v1/tx/reserved-flags-closes",
+            "tx-relay/s9v1/tx/short-payload-closes",
+            "tx-relay/s9v1/tx/unsolicited-closes",
+            "tx-relay/s9v1/undeclared-type-closes",
+            "tx-relay/stalled-peers-parked",
         ],
     ),
 ];

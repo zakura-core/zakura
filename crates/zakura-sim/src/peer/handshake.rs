@@ -44,6 +44,13 @@ impl Local {
             limits: ZakuraLocalLimits::from_config(&config),
         }
     }
+
+    /// Offers the idle timeout a QUIC idle timeout of `secs` gives, in
+    /// place of the default's.
+    pub(crate) fn with_idle_timeout_secs(mut self, secs: u32) -> Self {
+        self.limits.quic_idle_timeout = std::time::Duration::from_secs(secs.into());
+        self
+    }
 }
 
 /// A fresh nonce, drawn from the `Plan` in the calling task.

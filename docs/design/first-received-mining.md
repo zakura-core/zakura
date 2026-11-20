@@ -107,7 +107,7 @@ Inside the deadline that gain carries little risk. Under arrival order, a
 miner that sat on a body could lose the tie to any block found meanwhile. With
 a claim it keeps the tie everywhere except at the node that mined the other
 block, and until it releases the body it is the only miner building on its own
-block. Two seconds is 2.7% of the 75 second target block interval. Bodies that
+block. Two seconds is 8% of the 25 second target block interval. Bodies that
 bunch just under the deadline in the claim-age histogram would show this in
 use.
 

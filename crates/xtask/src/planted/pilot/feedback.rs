@@ -95,7 +95,7 @@ pub(super) fn read(repo_root: &Path, registry: &Registry) -> Result<(Vec<u8>, Li
 /// so the pins only check that the case still names the same one.
 ///
 /// Fails on a case listed twice, one with no planted patch, one whose
-/// property isn't its planted case's, a typed case, a seed the registry
+/// property isn't its planted case's, a typed or search case, a seed the registry
 /// lacks or rejects, a target that isn't a fuzz target, and a target that
 /// runs another harness than the case's seed.
 pub(super) fn resolve(
@@ -132,7 +132,7 @@ pub(super) fn resolve(
             .into());
         }
         let Witness::Seed(seed) = &found.witness else {
-            return Err(format!("{id}: a typed case has no seed for a target to run").into());
+            return Err(format!("{id}: only a seed case has a seed for a target to run").into());
         };
         let harness = match targets.get(&entry.target) {
             None => {

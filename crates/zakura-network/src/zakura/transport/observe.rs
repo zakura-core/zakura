@@ -258,6 +258,29 @@ pub enum TransportEvent {
         /// The frame's position among this stream's reads.
         seq: u64,
     },
+    /// The service's receive handle returned the frame, which stays funded
+    /// until the handle releases it.
+    FrameHeld {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+        /// The frame's wire bytes, header included, before its gate clamps
+        /// them.
+        bytes: u64,
+    },
+    /// The service's receive handle released the frame it returned last: its
+    /// next receive started, or the handle dropped.
+    FrameReleased {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+    },
     /// A regulation table changed state. It's reported inside the lock that
     /// applies the change, before the lock is released.
     Regulated {
@@ -583,6 +606,26 @@ impl StreamTap {
             conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq: self.reading(),
+        });
+    }
+
+    /// Reports `FrameHeld` for the frame numbered `seq`, of `bytes` wire
+    /// bytes.
+    pub(crate) fn frame_held(&self, seq: u64, bytes: u64) {
+        self.conn.emit(TransportEvent::FrameHeld {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            seq,
+            bytes,
+        });
+    }
+
+    /// Reports `FrameReleased` for the frame numbered `seq`.
+    pub(crate) fn frame_released(&self, seq: u64) {
+        self.conn.emit(TransportEvent::FrameReleased {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            seq,
         });
     }
 

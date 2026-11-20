@@ -500,3 +500,45 @@ fn the_binary_lists_a_harness_properties() {
         2
     );
 }
+
+/// `zakura-sim properties --untriggered` prints only the properties that
+/// register no trigger-history check, which `cargo xtask planted` judges
+/// by their outcome alone. The step loop's own properties are among them.
+#[test]
+fn the_binary_lists_a_harness_untriggered_properties() {
+    let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .args([
+            "properties",
+            "--sim",
+            "header-sync/storage",
+            "--untriggered",
+        ])
+        .output()
+        .expect("the binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let listed: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let entry = zakura_sim::harness::find("header-sync/storage").unwrap();
+    assert_eq!(listed, (entry.untriggered)());
+    for id in ["sim/no-task-panic", "sim/no-livelock"] {
+        assert!(listed.iter().any(|listed| listed == id), "{id}: {listed:?}");
+    }
+    // Header sync's own properties register their trigger histories.
+    let registered = (entry.properties)();
+    assert!(registered.len() > listed.len(), "{listed:?}");
+    assert!(listed
+        .iter()
+        .all(|id| registered.iter().any(|property| &property.id == id)));
+    assert_eq!(
+        zakura_sim(&[
+            Path::new("properties"),
+            Path::new("--sim"),
+            Path::new("header-sync/storage"),
+            Path::new("--all")
+        ]),
+        2
+    );
+}

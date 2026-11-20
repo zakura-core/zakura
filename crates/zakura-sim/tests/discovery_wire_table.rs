@@ -92,9 +92,8 @@ fn the_harness_registers_the_generated_discovery_ids() {
     // then three per row. Discovery's own guards: over-margin on 2 request
     // rows, unsolicited on 2 response rows, over-owed on peers, bad content
     // on 5 rows, cadence on 3 rows, conformant-never-closes, the 7 sender
-    // IDs, and services' sender-within-owed. Peers' sender-within-owed has
-    // no case yet (#2267).
-    assert_eq!(planted, 16 + 22, "{ids:?}");
+    // IDs, and both rows' sender-within-owed.
+    assert_eq!(planted, 16 + 23, "{ids:?}");
     // Another family's ID with the same template and row has no case here.
     assert!(!has_planted_case("header-sync/s5v9/undeclared-type-closes"));
     assert!(!has_planted_case("discovery/s5v9/undeclared-type-closes"));

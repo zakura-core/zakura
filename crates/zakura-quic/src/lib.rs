@@ -6,7 +6,7 @@
 //! comments cite requirement IDs such as `ADM-3`.
 //!
 //! The crate provides:
-//! - node identity types ([`NodeId`], [`NodeSecretKey`], [`NodeAddr`]);
+//! - node identity types ([`NodeId`], [`NodeKey`], [`NodeSecretKey`], [`NodeAddr`]);
 //! - the TLS raw-public-key profile Iroh 1.1 uses;
 //! - [`QuicEndpoint`], which binds UDP sockets, admits connection attempts
 //!   before the handshake, dials, and shuts down in order;
@@ -19,7 +19,9 @@
 mod key;
 mod tls;
 
-pub use key::{KeyParsingError, NodeAddr, NodeId, NodeSecretKey, SignatureError, KEY_LENGTH};
+pub use key::{
+    KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError, KEY_LENGTH,
+};
 pub use tls::TlsConfigError;
 
 mod config;

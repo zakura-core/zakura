@@ -68,7 +68,7 @@ impl std::fmt::Debug for Ed25519SigningKey {
 
 impl Ed25519SigningKey {
     fn spki(&self) -> SubjectPublicKeyInfoDer<'static> {
-        super::ed25519_spki(&self.0.public())
+        super::ed25519_spki(&self.0.public_key())
     }
 }
 

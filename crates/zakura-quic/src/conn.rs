@@ -17,7 +17,7 @@ use zakura_rt::{
 
 use crate::{
     driver::{ConnCmd, ConnRef, ConnShared},
-    key::NodeId,
+    key::{NodeId, NodeKey},
     stream::{RecvStream, SendStream},
 };
 
@@ -319,6 +319,11 @@ impl Conn {
     /// The peer's node ID, proven by the TLS handshake (TLS-8).
     pub fn remote_id(&self) -> NodeId {
         self.remote_id
+    }
+
+    /// The Ed25519 key the peer proved in the TLS handshake (TLS-8).
+    pub fn remote_key(&self) -> NodeKey {
+        self.remote_id.key()
     }
 
     /// The IP admitted at accept or dial time. It never changes (PATH-4).

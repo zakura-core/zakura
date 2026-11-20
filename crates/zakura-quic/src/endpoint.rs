@@ -581,7 +581,7 @@ impl QuicEndpoint {
             .claim_dial_slots(targets.len(), ceiling)
             .ok_or(ConnectError::ConnectionLimit)?;
 
-        let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
+        let crypto = Arc::new(shared.tls.client_config(addr.id.key(), alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();

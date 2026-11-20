@@ -5,7 +5,7 @@
 //!
 //! One change: Iroh decoded the expected server identity from a synthetic
 //! server name. Zakura builds one verifier per dial that holds the expected
-//! [`NodeId`] in memory (TLS-6), so no name encoding is needed.
+//! [`NodeKey`] in memory (TLS-6), so no name encoding is needed.
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -19,7 +19,7 @@ use rustls_pki_types::{
     SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
 };
 
-use crate::key::NodeId;
+use crate::key::NodeKey;
 
 /// TLS 1.3 is the only version (TLS-1).
 pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
@@ -30,14 +30,14 @@ const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms 
     mapping: &[(SignatureScheme::ED25519, &[&ED25519_STRICT])],
 };
 
-/// Accepts the server only if its raw public key equals the dialed node ID (TLS-7).
+/// Accepts the server only if its raw public key equals the dialed node's key (TLS-7).
 #[derive(Debug)]
 pub(crate) struct ServerCertificateVerifier {
-    expected: NodeId,
+    expected: NodeKey,
 }
 
 impl ServerCertificateVerifier {
-    pub(crate) fn new(expected: NodeId) -> Self {
+    pub(crate) fn new(expected: NodeKey) -> Self {
         Self { expected }
     }
 }
@@ -130,7 +130,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
                 CertificateError::UnknownIssuer,
             ));
         }
-        if super::node_id_from_spki(end_entity.as_ref()).is_none() {
+        if super::node_key_from_spki(end_entity.as_ref()).is_none() {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::BadEncoding,
             ));
@@ -187,7 +187,7 @@ impl SignatureVerificationAlgorithm for Ed25519Strict {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        let key = NodeId::try_from(public_key).map_err(|_| InvalidSignature)?;
+        let key = NodeKey::try_from(public_key).map_err(|_| InvalidSignature)?;
         key.verify_strict(message, signature)
             .map_err(|_| InvalidSignature)
     }

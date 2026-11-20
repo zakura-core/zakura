@@ -200,6 +200,9 @@ pub struct RelayEvidence {
     pub peers: usize,
     /// Each property's state, by ID.
     pub facts: BTreeMap<&'static str, Fact>,
+    /// The largest of each count any session reported, so a witness that
+    /// misses its bound says how close it came.
+    pub peak: Peak,
     /// The sessions, by the hook's number.
     sessions: BTreeMap<u64, Session>,
     /// Peers a park refused or parked, by index.
@@ -212,6 +215,24 @@ pub struct RelayEvidence {
     log_read: usize,
     /// Each tap connection's scripted peer, from its registration.
     conn_peers: BTreeMap<u64, usize>,
+}
+
+/// The largest counts any session reported.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Peak {
+    /// Ids reserving, requested or awaiting a verdict, with what ended
+    /// sessions left.
+    pub requests: usize,
+    /// Requests whose answers the IO has not started.
+    pub serving: usize,
+    /// Ids pending or waiting.
+    pub held: usize,
+    /// Ids in the skip set.
+    pub known: usize,
+    /// Sessions that opened.
+    pub sessions: usize,
+    /// Sessions a park ended.
+    pub parks: usize,
 }
 
 /// The evidence the hook, the pool, the peers and the checks share. Each
@@ -294,6 +315,7 @@ impl RelayEvidence {
                 parked,
             } => {
                 let index = self.peer_index(&peer);
+                self.peak.sessions += 1;
                 if parked {
                     self.parked.extend(index);
                 }
@@ -410,6 +432,7 @@ impl RelayEvidence {
                 cooling,
             } => self.submitted(session, requested, body, size, cooling),
             SimEffect::Park => {
+                self.peak.parks += 1;
                 let state = self.session(session);
                 let (readmitted, peer) = (state.readmitted, state.peer);
                 self.parked.extend(peer);
@@ -492,6 +515,12 @@ impl RelayEvidence {
         self.session(session).state = state;
         let mut checks = Vec::new();
         let requests = state.in_flight + state.unsettled;
+        let held = state.pending.max(state.waiting);
+        let peak = &mut self.peak;
+        peak.requests = peak.requests.max(requests);
+        peak.serving = peak.serving.max(state.serving);
+        peak.held = peak.held.max(held);
+        peak.known = peak.known.max(state.known);
         checks.push((
             REQUESTS_WITHIN_LIMIT,
             requests >= MAX_REQUESTS_PER_PEER,
@@ -510,7 +539,6 @@ impl RelayEvidence {
             state.serving > MAX_SERVES,
             format!("{} requests held unanswered", state.serving),
         ));
-        let held = state.pending.max(state.waiting);
         checks.push((
             PENDING_WITHIN_BOUND,
             held >= PENDING_PER_PEER,

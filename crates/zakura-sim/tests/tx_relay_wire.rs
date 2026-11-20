@@ -157,11 +157,16 @@ fn holds_in_its_witness(id: &str) {
         .unwrap_or_else(|| panic!("{id} has a witness"));
     let (report, evidence) = run(&witness());
     assert!(held(&report, id), "{id}: {:?}", outcome(&report, id));
-    let triggered = lock(&evidence)
-        .facts
-        .get(id)
-        .is_some_and(|fact| fact.triggered);
-    assert!(triggered, "{id}: its witness never reached its trigger");
+    let (triggered, peak) = {
+        let evidence = lock(&evidence);
+        let triggered = evidence.facts.get(id).is_some_and(|fact| fact.triggered);
+        (triggered, evidence.peak)
+    };
+    assert!(
+        triggered,
+        "{id}: its witness never reached its trigger; peak {peak:?}, end {:?}",
+        report.end
+    );
     assert_eq!(violated(&report), Vec::<String>::new(), "{id}");
 }
 

@@ -1277,7 +1277,12 @@ impl RelayPeer {
                 if !hello {
                     return Some(true);
                 }
-                let id = self.fresh(connection);
+                // An id the node announced, which it serves, so its first
+                // request is still unanswered when the second arrives.
+                let id = match session.announced.front() {
+                    Some(id) => *id,
+                    None => self.fresh(connection),
+                };
                 (Vec::new(), vec![ask(id), ask(id)])
             }
             RelayStep::TooManyRequests => {

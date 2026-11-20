@@ -825,7 +825,18 @@ const _: () = assert!(
 /// past any scenario.
 pub const NEUTRAL_WITNESSES: [(&str, Prefix); 5] = [
     ("tx-relay: id requested twice", || {
-        row_prefix(Answer::Serve, HelloMode::First, &[RelayStep::RequestTwice])
+        // A body of this node's, announced to the peer first, asked for
+        // twice in one write.
+        composed_prefix(
+            0x10,
+            ROW_PEERS,
+            0,
+            &[
+                (0, RelayStep::Wait { secs: 10 }),
+                (0, RelayStep::RequestTwice),
+            ],
+        )
+        .expect("the witness fits its grammar")
     }),
     ("tx-relay: too many requests", || {
         // Twenty bodies of this node's, announced to the peer first.

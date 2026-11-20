@@ -11,13 +11,15 @@ use super::{
     requester::{CompletedRange, Requester, ResponseError},
     wire::{decode_control, Control, Range, RULES},
 };
+use crate::zakura::CloseRow;
 use crate::zakura::{
     block_sync::{
         config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncStatus, MSG_BS_BLOCK,
+        MSG_BS_GET_BLOCKS, MSG_BS_STATUS,
     },
     regulation::{
         ClaimRefused, Exchange, ExchangeWriter, PoolEntry, ReservationPool, ResponsePrecheck,
-        WriterFence,
+        StallClose, WriterFence,
     },
     transport::FrameWriteClaim,
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
@@ -98,7 +100,11 @@ pub(crate) enum Authorization {
     Block(block::Height),
     /// The ending already consumed its reservation.
     Ended(CompletedRange),
-    /// A local incompatibility, not a protocol fault.
+    /// A body that answers a live exchange from another chain, such as a
+    /// peer's answer after a fork (#2303). It is a local incompatibility, not
+    /// a protocol fault: the fence has already reset the session, and the
+    /// connection stays. A body with no live exchange fails the precheck as
+    /// unsolicited instead.
     IncompatibleHeader,
 }
 
@@ -106,6 +112,8 @@ pub(crate) struct LiveRequester {
     shared: Arc<Shared>,
     pub(crate) pool: ReservationPool,
     fence: WriterFence,
+    /// Closes the connection after a repeated stall.
+    stall: StallClose,
     /// Whether a transport reader admits responses through [`Shared`].
     transport_admits: bool,
 }
@@ -134,6 +142,7 @@ impl LiveRequester {
     pub(crate) fn new(
         pool: ReservationPool,
         fence: WriterFence,
+        stall: StallClose,
         recv: &FramedRecv,
         send: FramedSend,
     ) -> Self {
@@ -148,6 +157,7 @@ impl LiveRequester {
             shared,
             pool,
             fence,
+            stall,
             transport_admits,
         }
     }
@@ -167,21 +177,29 @@ impl LiveRequester {
         }
     }
 
+    /// Body bytes the peer may still send under its live ranges, up to one
+    /// protocol-maximum body.
+    pub(crate) fn owed_body_bytes(&self) -> u64 {
+        self.shared.lock().owed_body_bytes()
+    }
+
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
         self.shared.lock().retirement_deadline(grace)
     }
 
-    /// End this connection locally before releasing any unanswered authorization.
-    pub(crate) fn check_liveness(&self, now: Instant, grace: Duration) -> Result<(), SinkReject> {
-        let requester = self.shared.lock();
-        if requester
+    /// Whether an exchange's ending is overdue at `now`: an abandoned or
+    /// fully received range waited `grace` of read-active time for it. A
+    /// peer that withholds endings stalls even while its bodies arrive.
+    pub(crate) fn endings_overdue(&self, now: Instant, grace: Duration) -> bool {
+        self.shared
+            .lock()
             .retirement_deadline(grace)
             .is_some_and(|deadline| now >= deadline)
-        {
-            self.fence.retire();
-            return Err(SinkReject::local("GetBlocks exchanges did not finish"));
-        }
-        Ok(())
+    }
+
+    /// Close the connection after its second stall.
+    pub(crate) fn close_after_repeated_stall(&self) {
+        self.stall.close();
     }
 
     pub(crate) fn blocks_retry(&self, height: block::Height) -> bool {
@@ -225,22 +243,35 @@ impl LiveRequester {
                 .lock()
                 .take_admitted(frame.message_type, frame.payload.len());
         }
-        let rule = MessageRule::find(RULES, frame.message_type)
-            .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
-        if frame.flags != 0
-            || frame.payload.len() < rule.payload.min()
+        let rule = MessageRule::find(RULES, frame.message_type).ok_or_else(|| {
+            SinkReject::protocol(CloseRow::BSYNC_CLOSE_2, "unknown GetBlocks message")
+        })?;
+        let envelope = if frame.flags != 0 {
+            Some(CloseRow::BSYNC_CLOSE_3)
+        } else if frame.payload.len() < rule.payload.min()
             || frame.payload.len() > rule.payload.max()
-            || frame.payload.first().copied().map(u16::from) != Some(frame.message_type)
         {
-            return Err(SinkReject::protocol("invalid GetBlocks frame envelope"));
+            Some(CloseRow::BSYNC_CLOSE_4)
+        } else if frame.payload.first().copied().map(u16::from) != Some(frame.message_type) {
+            Some(CloseRow::BSYNC_CLOSE_5)
+        } else {
+            None
+        };
+        if let Some(row) = envelope {
+            return Err(SinkReject::protocol(
+                row,
+                "invalid GetBlocks frame envelope",
+            ));
         }
         if frame.message_type == u16::from(MSG_BS_BLOCK) {
             self.shared
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
-                .map_err(|error| SinkReject::protocol(error.frame_rejection()))?;
+                .map_err(|error| {
+                    SinkReject::protocol(error.close_row(), error.frame_rejection())
+                })?;
             let header = block::Header::zcash_deserialize_from_slice(&mut &frame.payload[1..])
-                .map_err(SinkReject::protocol)?;
+                .map_err(|error| SinkReject::protocol(CloseRow::BSYNC_CLOSE_13, error))?;
             let result = self
                 .shared
                 .lock()
@@ -251,21 +282,34 @@ impl LiveRequester {
                     self.fence.retire();
                     Ok(Authorization::IncompatibleHeader)
                 }
-                Err(error) => Err(SinkReject::protocol(error)),
+                Err(error) => Err(SinkReject::protocol(error.close_row(), error)),
             };
         }
         Ok(
-            match decode_control(&frame.payload).map_err(SinkReject::protocol)? {
+            match decode_control(&frame.payload).map_err(|error| {
+                SinkReject::protocol(control_decode_row(frame.message_type), error)
+            })? {
                 Control::Status(status) => Authorization::Status(status),
                 Control::GetBlocks(range) => Authorization::GetBlocks(range),
                 Control::End(ending) => Authorization::Ended(
                     self.shared
                         .lock()
                         .finish(ending)
-                        .map_err(SinkReject::protocol)?,
+                        .map_err(|error| SinkReject::protocol(error.close_row(), error))?,
                 ),
             },
         )
+    }
+}
+
+/// The row a control frame of `message_type` breaks when it fails decode.
+fn control_decode_row(message_type: u16) -> CloseRow {
+    if message_type == u16::from(MSG_BS_STATUS) {
+        CloseRow::BSYNC_CLOSE_6
+    } else if message_type == u16::from(MSG_BS_GET_BLOCKS) {
+        CloseRow::BSYNC_CLOSE_7
+    } else {
+        CloseRow::BSYNC_CLOSE_11
     }
 }
 
@@ -289,11 +333,7 @@ impl FrameWriteClaim for FencedRequest {
 #[cfg(all(test, not(zakura_sim)))]
 mod tests {
     use super::*;
-    use crate::zakura::{
-        framed_channel,
-        regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-        CloseCause,
-    };
+    use crate::zakura::{framed_channel, regulation::PrecheckSlot, CloseCause};
     use tokio_util::sync::CancellationToken;
 
     /// The reader may queue the whole response it was asked for, and a frame
@@ -303,12 +343,13 @@ mod tests {
     fn the_transport_queue_holds_only_what_the_live_ranges_owe() {
         let pool = ReservationPool::new(2).unwrap();
         let connection = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let fence = WriterFence::new(connection.clone());
         let (session, _) = framed_channel(1);
         let (_, recv) = framed_channel(1);
         let slot = PrecheckSlot::default();
         let recv = recv.with_precheck(slot.clone());
-        let requester = LiveRequester::new(pool.clone(), fence, &recv, session);
+        let stall = StallClose::new(connection.clone(), CloseCause::default());
+        let requester = LiveRequester::new(pool.clone(), fence, stall, &recv, session);
         let reader = slot.get().expect("the requester attaches its precheck");
 
         let hash = block::Hash([7; 32]);
@@ -357,6 +398,36 @@ mod tests {
         assert!(!connection.is_cancelled());
     }
 
+    /// An envelope fault names its block-sync row: an undeclared type breaks
+    /// `bsync-close-2`, and a set flag breaks `bsync-close-3`.
+    #[test]
+    fn envelope_faults_name_their_rows() {
+        let (sender, _recv) = framed_channel(1);
+        let requester = LiveRequester {
+            shared: Arc::new(Shared {
+                requester: Mutex::new(Requester::new(1)),
+                _session: sender,
+            }),
+            pool: ReservationPool::new(1).unwrap(),
+            fence: WriterFence::new(CancellationToken::new()),
+            stall: StallClose::new(CancellationToken::new(), CloseCause::default()),
+            transport_admits: false,
+        };
+        let row = |message_type: u16, flags: u16| match requester.authorize(&Frame {
+            message_type,
+            flags,
+            payload: vec![MSG_BS_STATUS],
+        }) {
+            Err(SinkReject::Protocol(row, _)) => Some(row),
+            _ => None,
+        };
+        assert_eq!(row(99, 0), Some(CloseRow::BSYNC_CLOSE_2));
+        assert_eq!(
+            row(u16::from(MSG_BS_STATUS), 1),
+            Some(CloseRow::BSYNC_CLOSE_3)
+        );
+    }
+
     /// A peer fault needs certainty: bytes past what this session asked for, or a
     /// response with nothing owed. A body that exactly uses its reservation passes.
     #[test]
@@ -374,7 +445,7 @@ mod tests {
 
         let authorize_with_reservation = |reserved: Option<u32>| {
             let pool = ReservationPool::new(1).unwrap();
-            let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+            let fence = WriterFence::new(CancellationToken::new());
             let (sender, _recv) = framed_channel(1);
             let requester = LiveRequester {
                 shared: Arc::new(Shared {
@@ -383,6 +454,7 @@ mod tests {
                 }),
                 pool: pool.clone(),
                 fence,
+                stall: StallClose::new(CancellationToken::new(), CloseCause::default()),
                 transport_admits: false,
             };
             if let Some(reserved) = reserved {
@@ -409,22 +481,19 @@ mod tests {
             authorize_with_reservation(Some(body_bytes)),
             Ok(Authorization::Block(block::Height(1)))
         ));
-        assert!(matches!(
-            authorize_with_reservation(Some(body_bytes - 1)),
-            Err(SinkReject::Protocol(_))
-        ));
-        assert!(matches!(
-            authorize_with_reservation(None),
-            Err(SinkReject::Protocol(_))
-        ));
+        let row = |reserved| match authorize_with_reservation(reserved) {
+            Err(SinkReject::Protocol(row, _)) => Some(row),
+            _ => None,
+        };
+        assert_eq!(row(Some(body_bytes - 1)), Some(CloseRow::BSYNC_CLOSE_14));
+        assert_eq!(row(None), Some(CloseRow::REG_CLOSE_6));
     }
 
     #[test]
-    fn missing_endings_close_without_peer_fault_and_keep_entries_through_reader_cleanup() {
+    fn overdue_endings_stall_and_keep_entries_through_reader_cleanup() {
         let pool = ReservationPool::new(3).unwrap();
-        let connection = CancellationToken::new();
-        let cause = CloseCause::default();
-        let fence = WriterFence::new(connection.clone(), cause.clone());
+        let session = CancellationToken::new();
+        let fence = WriterFence::new(session.clone());
         let (sender, _recv) = framed_channel(1);
         let requester = LiveRequester {
             shared: Arc::new(Shared {
@@ -433,14 +502,13 @@ mod tests {
             }),
             pool: pool.clone(),
             fence,
+            stall: StallClose::new(CancellationToken::new(), CloseCause::default()),
             transport_admits: false,
         };
         // The transport reader can retain the authorization after the routine exits.
         let reader = requester.shared.clone();
         for start in 1..=2 {
-            assert!(requester
-                .check_liveness(Instant::now(), Duration::from_secs(32))
-                .is_ok());
+            assert!(!requester.endings_overdue(Instant::now(), Duration::from_secs(32)));
             let byte = u8::try_from(start).unwrap();
             let hash = block::Hash([byte; 32]);
             let writer = requester
@@ -458,18 +526,14 @@ mod tests {
             requester.retire(block::Height(start), false);
         }
         // A full session waiting only for endings may still have them queued.
-        assert!(requester
-            .check_liveness(Instant::now(), Duration::from_secs(32))
-            .is_ok());
-        assert!(matches!(
-            requester.check_liveness(
-                Instant::now() + Duration::from_secs(33),
-                Duration::from_secs(32)
-            ),
-            Err(SinkReject::Local(_))
+        assert!(!requester.endings_overdue(Instant::now(), Duration::from_secs(32)));
+        assert!(requester.endings_overdue(
+            Instant::now() + Duration::from_secs(33),
+            Duration::from_secs(32)
         ));
-        assert!(connection.is_cancelled());
-        assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+        // The stalled session's teardown retires its fence, which resets it.
+        assert!(!requester.fence.retire());
+        assert!(session.is_cancelled(), "the session is reset");
         assert_eq!(pool.held(), 2);
         assert!(
             pool.try_entry().is_some(),

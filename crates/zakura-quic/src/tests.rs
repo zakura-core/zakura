@@ -1422,7 +1422,8 @@ async fn set_limits_raises_the_stream_limit() {
 }
 
 /// API-9: the load snapshot counts delivered stream bytes and the peer's
-/// open streams without a round trip to the connection task.
+/// open streams without a round trip to the connection task, and carries
+/// the smoothed round-trip time an `RttReader` reads.
 #[tokio::test]
 async fn load_reports_delivered_bytes_and_open_streams() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1439,6 +1440,8 @@ async fn load_reports_delivered_bytes_and_open_streams() {
                 assert!(load.frame_rx.stream > 0);
                 assert_eq!(load.queue_drops, 0);
                 assert_eq!(load.queued_datagram_bytes, 0);
+                let rtt = inbound.rtt_reader().rtt().expect("the connection is open");
+                assert!(!rtt.is_zero());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -89,8 +89,9 @@ pub const FIXTURE_HORIZON: std::time::Duration = std::time::Duration::from_secs(
 pub const LATE_PAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(29);
 
 /// When the late-page fixture lets A's held prepare go, in virtual
-/// milliseconds: past the deadline the late page rearmed, 30 seconds after
-/// a page that comes 29 seconds after a start within the first second.
+/// milliseconds: past the deadline the late page's prepare rearms, 30
+/// seconds after a page that comes 29 seconds after a start within the
+/// first second.
 const LATE_PAGE_PREPARE_MS: u64 = 70_000;
 
 /// [`FIXTURE_HORIZON`] for the late-page fixture, past its prepare's
@@ -352,6 +353,9 @@ impl RecoveryFixture {
             },
             controls,
             weights: Default::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 }
@@ -399,6 +403,9 @@ fn departure_recovery() -> StorageScenario {
             step(TAKER, ControlAction::Recover, None),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -466,10 +473,10 @@ pub enum LivenessScenario {
     },
     /// The timeout fixture with A's first page held [`LATE_PAGE_DELAY`] on
     /// its way to the node, so it arrives a second before the deadline its
-    /// round's start armed and rearms it, and the run's clock crosses the
-    /// first deadline with the round still live. A's prepare is held past
-    /// the rearmed deadline, so production retires A's round 30 seconds
-    /// after the page, and the cached pass hands the target to B.
+    /// round's start armed. The page completes the round, so its prepare's
+    /// dispatch rearms the deadline. A's prepare is held past that
+    /// deadline, so production retires A's round there, and the cached pass
+    /// then hands the target to B.
     LatePage,
     /// The serving-read fixture: the node at A3 serving `mirror-0` at A1,
     /// its only peer, which subscribes to it. The publisher's first page
@@ -844,6 +851,9 @@ fn level() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -884,6 +894,9 @@ fn serving(then: Allow, mirror: u32) -> StorageScenario {
             when: Some(Trigger::Submitted(Select::nth(OpKind::Read, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1010,6 +1023,9 @@ fn departure(stage: Stage, by: Departs) -> StorageScenario {
         },
         controls,
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1037,6 +1053,9 @@ fn held(kind: OpKind) -> StorageScenario {
             when: Some(Trigger::Submitted(Select::nth(kind, 1))),
         }],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1504,15 +1523,18 @@ impl Subsystem for Liveness {
         let retirement = scenario
             .roles()
             .map_or_else(RetirementEvidence::default, RetirementEvidence::armed);
-        let delayed_page = (*scenario == LivenessScenario::LatePage).then(|| DelayedPage {
-            mirror: OWNER.to_owned(),
-            by: LATE_PAGE_DELAY,
-        });
+        let delayed_pages = (*scenario == LivenessScenario::LatePage)
+            .then(|| DelayedPage {
+                mirror: OWNER.to_owned(),
+                by: LATE_PAGE_DELAY,
+            })
+            .into_iter()
+            .collect();
         let ports = Ports {
             hold_wake: HoldWakeEvidence::armed(),
             publication: PublicationEvidence::armed(scenario.arming()),
             retirement,
-            delayed_page,
+            delayed_pages,
             finishes: false,
             ..Storage::prepare(&scenario.storage())
         };

@@ -174,14 +174,14 @@ fn peer_frames(report: &RunReport) -> Vec<(u64, String, &'static str)> {
         .collect()
 }
 
-/// The causes the node closed connections with.
+/// The labels of the causes the node closed connections with.
 fn closes(report: &RunReport) -> Vec<String> {
     report
         .log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
-            Observation::ConnectionClosed { cause, .. } => Some(cause.clone()),
+            Observation::ConnectionClosed { cause, .. } => Some(cause.label().to_owned()),
             _ => None,
         })
         .collect()
@@ -583,16 +583,13 @@ fn a_peer_holds_an_answer_and_asks_on_its_own() {
 }
 
 /// A peer that holds an answer past the node's 2 s initial wait times the
-/// exchange out. Without the peer's `Hello`, the node closes with
-/// `discovery_exchange_timed_out`. Without its `Peers`, the node's
-/// `GetPeers` exchange is still open when the session retires its queries,
-/// so the writer fence closes first, with `unfinished_exchange`.
+/// exchange out, and the node closes with `discovery_exchange_timed_out`.
+/// Without its `Peers`, the node's `GetPeers` exchange is still open when
+/// the session retires its queries, so the writer fence resets only the
+/// session, and the timeout still names the close.
 #[test]
 fn a_held_answer_times_the_exchange_out() {
-    for (answer, cause) in [
-        (Answer::Hello, "discovery_exchange_timed_out"),
-        (Answer::Peers, "unfinished_exchange"),
-    ] {
+    for answer in [Answer::Hello, Answer::Peers] {
         let peers = [discovering(
             PeerSpec::dialing(),
             DiscoveryScript {
@@ -605,6 +602,10 @@ fn a_held_answer_times_the_exchange_out() {
         )];
         let report = run_peers(Vec::new(), &peers);
         assert_eq!(report.end.harness, None, "{answer:?}: {:?}", report.end);
-        assert_eq!(closes(&report), [cause], "{answer:?}");
+        assert_eq!(
+            closes(&report),
+            ["discovery_exchange_timed_out"],
+            "{answer:?}"
+        );
     }
 }

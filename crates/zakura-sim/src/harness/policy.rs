@@ -187,8 +187,10 @@ pub enum Trigger<K> {
     /// The header node under test's reactor handled the end of a session
     /// from this peer, as its tap reports: once per session that ends.
     /// Unlike [`Trigger::Closed`], which counts the connection closing, it
-    /// holds only once the reactor has acted on the departure. Never holds
-    /// without a tap.
+    /// holds only once the reactor has acted on the departure, and a
+    /// session reset that keeps the connection counts too. The block-sync
+    /// node under test counts its routine's last snapshot for a session.
+    /// Never holds without a tap.
     SessionEnded(String),
     /// The header node under test's reactor retired a round from this peer,
     /// as its tap reports: once per retirement, whatever its reason. It

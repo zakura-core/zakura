@@ -8,7 +8,7 @@ use zakura_header_chain::{
     VerifiedGeneration,
 };
 use zakura_network::zakura::{
-    observe::{HeaderRequestTerminal, HeaderTargetPhase, RequestRef},
+    observe::{HeaderRequestTerminal, HeaderTargetPhase, RequestRef, ReservationPurpose},
     HeaderTargetPurpose, ServicePeerDirection, SessionOrigin,
 };
 
@@ -850,8 +850,9 @@ fn a_departed_sessions_read_counts_for_nothing() {
 
 /// Each of the three events production arms a round's deadline with
 /// records the next arm of the owner's round: its start as arm 0, then each
-/// staged page and its apply's dispatch. A later arm of the round answers an
-/// earlier one, which `header-sync/peer-retirement-progress` reads.
+/// continuation's reservation and its apply's dispatch. A page that only
+/// stages headers records no arm (#2248). A later arm of the round answers
+/// an earlier one, which `header-sync/peer-retirement-progress` reads.
 #[test]
 fn every_arm_event_records_the_next_arm() {
     let staged = ReactorEvent::PageStaged {
@@ -868,11 +869,20 @@ fn every_arm_event_records_the_next_arm() {
         stored: Vec::new(),
         staged_total: 0,
     };
+    let continued = ReactorEvent::ReservationOpened {
+        reservation: 2,
+        peer: mirror(),
+        purpose: ReservationPurpose::Ordinary,
+        headers: 1,
+        request: Some(request(ordinary(1), 1)),
+    };
     let (facts, _) = hand_offs(
         &[
             started(ordinary(1)),
             staged.clone(),
+            continued.clone(),
             staged,
+            continued,
             dispatched(5, true, ordinary(1)),
         ],
         |_, _| {},

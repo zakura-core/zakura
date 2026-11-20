@@ -209,13 +209,24 @@ async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
 #[tokio::test]
 async fn session_cancellation_before_funding_returns_the_take_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
-    fixture.routine.io.session.cancel_token().cancel();
-    let before = fixture.next_request_id();
+    let sender = fixture.routine.io.session.request_sender();
+    let routine = &mut fixture.routine;
+    let now = Instant::now();
+    let limits = routine.state.fill_limits(&routine.config, now).unwrap();
+    let capacity = routine.io.acquire_request_capacity(&sender).unwrap();
+    let request_id = routine.state.allocate_request_id().unwrap();
+    let TakenWork {
+        download_floor,
+        request,
+    } = routine.select_work(&limits, request_id, now).unwrap();
+    // The session ends after the fence opened the exchange, so only funding
+    // sees the cancellation.
+    routine.io.session.cancel_token().cancel();
 
-    let report = fixture.routine.try_fill();
+    let refusal = routine.io.fund(request, download_floor).err();
 
-    assert_eq!(report.stop, FillStop::Cancelled);
-    assert_eq!(fixture.next_request_id(), before + 1);
+    assert_eq!(refusal, Some(FillStop::Cancelled));
+    drop(capacity);
     fixture.assert_settled(0);
 }
 
@@ -455,17 +466,17 @@ async fn fence_retirement_before_publication_rolls_back_funding() {
     fixture.assert_settled(0);
 }
 
-/// Session cancellation wins after funding: the work claim refuses publication
-/// under the queue lock.
+/// Session cancellation wins after funding: the fence holds the session
+/// token, so it refuses publication before the work claim runs.
 #[tokio::test]
-async fn session_cancellation_before_publication_refuses_the_claim() {
+async fn session_cancellation_before_publication_refuses_at_the_fence() {
     let mut fixture = fixture(1, &[1]);
 
     let outcome = publish_after(&mut fixture, |routine, _, _| {
         routine.io.session.cancel_token().cancel();
     });
 
-    assert!(matches!(outcome, PublishOutcome::ClaimRefused));
+    assert!(matches!(outcome, PublishOutcome::FenceRefused));
     fixture.routine.io.requester.retire(block::Height(1), true);
     fixture.assert_settled(0);
 }

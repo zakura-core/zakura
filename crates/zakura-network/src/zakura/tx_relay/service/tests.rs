@@ -209,6 +209,7 @@ impl Session {
             Some(peer_ip()),
             io,
             CancellationToken::new(),
+            None,
         );
         routine.read_pool();
         routine.after_step();
@@ -306,7 +307,10 @@ async fn an_id_requested_again_while_its_job_waits_closes_the_peer() {
     session.deliver(TxRelayMessage::GetTxs(id)).await;
     assert!(!session.cancel.is_cancelled());
     session.deliver(TxRelayMessage::GetTxs(id)).await;
-    assert_eq!(session.cause.get(), Some("tx-relay: id requested twice"));
+    assert_eq!(
+        session.cause.get().map(CloseOutcome::label),
+        Some("tx-relay: id requested twice")
+    );
 }
 
 /// Applies `session`'s pool calls as its routine does, up to and including
@@ -430,7 +434,7 @@ fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
             .await
             .expect("the verdict arrives");
 
-            let cause = session.cause.get();
+            let cause = session.cause.get().map(CloseOutcome::label);
             if listed {
                 assert_eq!(cause, None, "an unconditional supplier is never charged");
             } else {

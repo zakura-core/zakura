@@ -105,6 +105,9 @@ fn worked_example(policy: Policy) -> StorageScenario {
         policy,
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -446,7 +449,10 @@ enum Probe {
     AcquireHold,
     /// Submit an acquire, let it complete, then drop the call unread.
     AbandonAcquire,
-    /// After 31 s, acquire and release, which sweeps idle leases.
+    /// After 61 s, acquire and release, which sweeps idle leases. A serve's
+    /// read can complete as late as the requester's 30 s deadline, whose
+    /// stall ends the session, so no later serve sweeps. 61 s is past the
+    /// lease's 30 s idle limit after that read.
     SweepLate,
     /// Prepare `len` fixture headers on genesis.
     Prepare {
@@ -572,7 +578,7 @@ async fn probe(
             drop(call);
         }
         Probe::SweepLate => {
-            zakura_rt::time::sleep(Duration::from_secs(31)).await;
+            zakura_rt::time::sleep(Duration::from_secs(61)).await;
             let path = acquired(acquire().await);
             port.release_header_path(path)
                 .await
@@ -686,6 +692,9 @@ fn node_at_a3(
         },
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -1247,6 +1256,9 @@ fn a_deferring_clock_keeps_the_fork_fixture_unsettled() {
                 disruptions: Vec::new(),
             },
             controls: Vec::new(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         },
         probe: Probe::Idle,
         utc_origin: Some(genesis - 3 * 60 * 60),

@@ -45,7 +45,7 @@ use super::{
 };
 use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender},
-    CloseCause, Service, ZakuraConnId, ZakuraPeerId,
+    CloseCause, CloseOutcome, NeutralCause, Service, ZakuraConnId, ZakuraPeerId,
 };
 
 /// One session's [`PeerState`], shared by its reader and its writer.
@@ -244,18 +244,24 @@ impl PeerIO {
     /// Ends the session's serving and queries, closes the connection if
     /// `close` asks to, then releases the session's admission.
     ///
-    /// The state asks to close only right after the owner check. Retiring the
-    /// queries can close the connection too, so nothing here waits before the
-    /// close: a service that gained the connection after the check would
-    /// otherwise lose it. Only that close retires the session's record.
+    /// The state asks to close only right after the owner check, so nothing
+    /// here waits before the close: a service that gained the connection
+    /// after the check would otherwise lose it. Retiring the queries resets
+    /// this session if a query is unanswered, and keeps the connection. Only
+    /// the close retires the session's record.
     async fn end(self, close: Option<Close>) {
         self.session.cancel_token().cancel();
         self.queries.retire();
         if let Some(Close { reason }) = close {
             self.charge(SessionCharge::Retire);
             self.close_cause.record(match reason {
-                CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
-                CloseReason::ExchangeComplete => "discovery_exchange_complete",
+                CloseReason::ExchangeTimedOut => {
+                    CloseOutcome::neutral(NeutralCause::Timeout, "discovery_exchange_timed_out")
+                }
+                CloseReason::ExchangeComplete => CloseOutcome::neutral(
+                    NeutralCause::LocalCancellation,
+                    "discovery_exchange_complete",
+                ),
             });
             self.connection_cancel.cancel();
         }

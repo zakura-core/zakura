@@ -18,8 +18,8 @@ use zakura_rt::{
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, LocalRole, Peer,
-    PeerStreamSession, Pipe, ReactorBudget, Service, ServiceAdmissionDecision,
+    CloseCause, CloseOutcome, CloseRow, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle,
+    LocalRole, Peer, PeerStreamSession, Pipe, ReactorBudget, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
     ZakuraConnId, ZakuraPeerId, ZakuraTrace, DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES,
     ZAKURA_CAP_DISCOVERY,
@@ -146,9 +146,15 @@ struct DiscoverySessionRecord {
 }
 
 /// Consecutive failed sessions on one `(peer, connection)` before discovery
-/// retires it. Generous: an honest peer completes the exchange on the first
-/// session, and a fresh connection always starts a fresh record.
-const MAX_DISCOVERY_SESSION_FAILURES: u32 = 3;
+/// retires it, as the shared stall rule (`regulation::stall`) counts: the
+/// first failed session ends alone, and the second seals discovery on the
+/// connection. An honest peer completes the exchange on the first session,
+/// and a fresh connection always starts a fresh record.
+///
+/// Discovery seals rather than closes: a session also fails when this node
+/// cancels it, so its failures are not the peer's alone. Ending a failed
+/// session resets its streams and keeps the connection.
+const MAX_DISCOVERY_SESSION_FAILURES: u32 = 2;
 
 /// Discovery's session records, one per `(peer, connection)`.
 ///
@@ -487,7 +493,7 @@ impl Service for DiscoveryService {
             admit_peer_id,
             || {},
             move || {
-                panic_close_cause.record("service_panic");
+                panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
                 panic_service_cancel.cancel();
                 panic_connection_cancel.cancel();
             },
@@ -605,7 +611,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
-        WriterFence::new(connection_cancel.clone(), close_cause.clone()),
+        WriterFence::new(service_cancel.clone()),
         &recv,
         discovery_session.send.clone(),
         service_cancel.clone(),
@@ -636,6 +642,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         let read = run_discovery_pipe(&mut pipe, recv, sink, &mut reading).await;
         handle_pipe_exit(
             "discovery",
+            (ZAKURA_STREAM_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION),
             &reject_connection_cancel,
             &reject_close_cause,
             read,
@@ -643,7 +650,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         drop(reading);
     };
     let on_panic = move || {
-        panic_close_cause.record("service_panic");
+        panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
         panic_connection_cancel.cancel();
     };
     // Let the returned handle drop to detach the supervised reader task; the
@@ -681,7 +688,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         peer_id,
         || {},
         move || {
-            close_cause.record("service_panic");
+            close_cause.record(CloseOutcome::SERVICE_PANIC);
             service_cancel.cancel();
             connection_cancel.cancel();
         },
@@ -744,7 +751,7 @@ async fn read_discovery_messages(
     while let Some(frame) = next_frame(&mut recv, reading, &sink.queries).await {
         let message_type = frame.message_type;
         if let Err((stage, reject)) = read_frame(pipe, frame, sink).await {
-            if let SinkReject::Protocol(error) = &reject {
+            if let SinkReject::Protocol(_, error) = &reject {
                 sink.trace_violation(message_type, stage, error);
             }
             return Err(reject);
@@ -791,7 +798,12 @@ async fn read_frame(
     let answer = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
-        .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?
+        .map_err(|error| {
+            (
+                ViolationStage::Claim,
+                SinkReject::protocol(error.close_row(), error),
+            )
+        })?
         .map(|claimed| TracedAnswer::claimed(claimed, sink));
     if let Flow::Reject(reject) = pipe.run_one(frame) {
         return Err((ViolationStage::Decode, reject));
@@ -800,11 +812,13 @@ async fn read_frame(
         return Ok(());
     };
     if let Some(answer) = &answer {
-        answer
-            .claimed
-            .admitted()
-            .check(&message)
-            .map_err(|error| (ViolationStage::Answer, SinkReject::protocol(error)))?;
+        answer.claimed.admitted().check(&message).map_err(|error| {
+            let row = match message {
+                DiscoveryMessage::Peers { .. } => CloseRow::DISCO_CLOSE_13,
+                _ => CloseRow::DISCO_CLOSE_15,
+            };
+            (ViolationStage::Answer, SinkReject::protocol(row, error))
+        })?;
     }
     sink.handle_message(message, answer)
         .await
@@ -894,18 +908,18 @@ impl DiscoverySink {
                 .serving
                 .get_peers
                 .admit(query)
-                .map_err(SinkReject::protocol)?,
+                .map_err(|error| SinkReject::protocol(error.close_row(), error))?,
             DiscoveryMessage::Peers { records } => {
                 self.handle
                     .import_session_peer_records(&self.key, records, self.peer_node_id)
                     .await
-                    .map_err(SinkReject::protocol)?;
+                    .map_err(|error| SinkReject::protocol(CloseRow::DISCO_CLOSE_17, error))?;
             }
             DiscoveryMessage::GetServices(query) => self
                 .serving
                 .get_services
                 .admit(query)
-                .map_err(SinkReject::protocol)?,
+                .map_err(|error| SinkReject::protocol(error.close_row(), error))?,
             DiscoveryMessage::Services(services) => self.handle_services(services).await?,
         }
         if let Some(mut answer) = answer {
@@ -918,13 +932,14 @@ impl DiscoverySink {
     async fn handle_services(&self, services: Services) -> Result<(), SinkReject> {
         if services.node_id != self.peer_node_id {
             return Err(SinkReject::protocol(
+                CloseRow::DISCO_CLOSE_16,
                 "Zakura discovery SERVICES authored by a different node id",
             ));
         }
         self.handle
             .import_session_services(&self.key, services, self.peer_node_id)
             .await
-            .map_err(SinkReject::protocol)?;
+            .map_err(|error| SinkReject::protocol(CloseRow::DISCO_CLOSE_16, error))?;
         Ok(())
     }
 
@@ -941,7 +956,9 @@ impl DiscoverySink {
                 RecordVerdict::Drop => {
                     tracing::debug!(?error, "dropped Zakura discovery hello");
                 }
-                RecordVerdict::Disconnect => return Err(SinkReject::protocol(error)),
+                RecordVerdict::Disconnect => {
+                    return Err(SinkReject::protocol(error.close_row(), error))
+                }
             }
         }
         self.state.record_hello();
@@ -1742,7 +1759,7 @@ mod tests {
         let (_unused, recv) = framed_channel(1);
         Queries::new(
             reservation_pool(),
-            WriterFence::new(CancellationToken::new(), CloseCause::new()),
+            WriterFence::new(CancellationToken::new()),
             &recv,
             send.clone(),
             cancel.clone(),
@@ -1895,7 +1912,7 @@ mod tests {
 
         assert!(matches!(
             sink.handle_hello(forged).await,
-            Err(SinkReject::Protocol(_))
+            Err(SinkReject::Protocol(..))
         ));
         assert!(!sink.state.progress().hello);
 
@@ -2171,7 +2188,7 @@ mod tests {
         });
         to_sink.send(empty_peers()?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // The answer to a `GetPeers` with limit 1 carries two records.
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -2198,7 +2215,7 @@ mod tests {
             .send(discovery_frame(DiscoveryMessage::Peers { records })?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
         for seed in [58u8, 59] {
             let node_id = NodeSecretKey::from_bytes(&[seed; 32]).public();
             assert_eq!(handle.record_for(node_id).await, None, "nothing imports");
@@ -2259,7 +2276,7 @@ mod tests {
             })?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         capture.flush().await;
         let reader = capture.reader()?;
@@ -2339,7 +2356,7 @@ mod tests {
         let (to_sink, reader) = spawn_reader(sink);
         to_sink.send(discovery_frame(services(Vec::new()))?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // Answered once, then a second answer.
         let (sink, mut sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
@@ -2356,7 +2373,7 @@ mod tests {
             .await?;
         to_sink.send(discovery_frame(services(Vec::new()))?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
 
         // A summary the wanted list does not name.
         let (sink, mut sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
@@ -2372,7 +2389,7 @@ mod tests {
             .send(discovery_frame(services(vec![discovery_summary]))?)
             .await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol(..))));
         Ok(())
     }
 
@@ -2483,6 +2500,242 @@ mod tests {
             "the cancelled hello took no verification slot"
         );
         assert_eq!(handle.record_for(peer_node_id).await, None);
+        Ok(())
+    }
+
+    /// How a drained discovery session ends.
+    #[derive(Clone, Copy, Debug)]
+    enum SessionExit {
+        /// The remote closes the connection, so the transport cancels its token.
+        PeerDisconnect,
+        /// The session's writer panics in its connection-owner check.
+        WriterPanic,
+        /// The local node parks the session, and the connection ends later.
+        LocalCancel,
+    }
+
+    /// Every node-wide discovery resource the drain test reads.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DiscoveryLevels {
+        session_records: usize,
+        admitted_inbound: usize,
+        query_entries: usize,
+        /// Node output bytes, node execution slots, and running and waiting
+        /// jobs, for `GetPeers` then `GetServices`.
+        serve: [(u64, usize, (usize, usize)); 2],
+        free_verify_slots: usize,
+    }
+
+    fn discovery_levels(service: &DiscoveryService) -> DiscoveryLevels {
+        DiscoveryLevels {
+            session_records: service
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned")
+                .records
+                .len(),
+            admitted_inbound: service.handle.peer_snapshot().inbound_peers,
+            query_entries: service.query_pool.held(),
+            serve: service.serving.rows().map(|row| {
+                (
+                    row.node_output_held(),
+                    row.node_execution_held(),
+                    row.active_and_waiting(),
+                )
+            }),
+            free_verify_slots: service.handle.free_verification_slots(),
+        }
+    }
+
+    /// Waits up to five seconds for `service` to reach `expected`, and
+    /// returns the levels it reached.
+    async fn settled_levels(
+        service: &DiscoveryService,
+        expected: DiscoveryLevels,
+    ) -> DiscoveryLevels {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while discovery_levels(service) != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        discovery_levels(service)
+    }
+
+    /// An owner check that panics for one peer and owns no other connection.
+    #[derive(Debug)]
+    struct PanickingOwner {
+        peer: ZakuraPeerId,
+    }
+
+    impl Service for PanickingOwner {
+        fn name(&self) -> &'static str {
+            "test-panicking-owner"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            &[]
+        }
+
+        fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, _: ZakuraConnId) -> bool {
+            assert_ne!(peer, &self.peer, "the owner check panics for this peer");
+            false
+        }
+
+        fn add_peer(&self, _peer: Peer) {}
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
+
+    /// disco-17 `teardown-releases`: after a session ends by peer disconnect,
+    /// writer panic or local cancellation, and its connection ends, every
+    /// node-wide discovery resource returns to its pre-session baseline.
+    ///
+    /// Each session holds one session record, one admitted inbound slot, two
+    /// query-pool entries for its unanswered `GetPeers` and `GetServices`, and
+    /// the output bytes of one unwritten `Services` answer. Its peer's `Hello`
+    /// waits for a verification slot. The baseline is zero of each and every
+    /// verification slot free. A local cancellation drains everything but the
+    /// session record, which keeps the connection's failure count until the
+    /// connection ends.
+    #[tokio::test(start_paused = true)]
+    async fn every_discovery_resource_returns_to_baseline_after_each_exit(
+    ) -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[80u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let panicking_secret = NodeSecretKey::from_bytes(&[82u8; 32]);
+        service.set_connection_owners(vec![Arc::new(PanickingOwner {
+            peer: ZakuraPeerId::new(panicking_secret.public().as_bytes().to_vec())?,
+        })]);
+        let baseline = discovery_levels(&service);
+        assert_eq!(baseline.session_records, 0);
+        assert_eq!(baseline.query_entries, 0);
+        assert!(baseline.free_verify_slots > 0);
+
+        for (seed, exit) in [
+            (81u8, SessionExit::PeerDisconnect),
+            (82, SessionExit::WriterPanic),
+            (83, SessionExit::LocalCancel),
+        ] {
+            let peer_secret = NodeSecretKey::from_bytes(&[seed; 32]);
+            let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+            connected_tx.send_replace(vec![peer_id.clone()]);
+
+            // The local Hello, GetPeers and GetServices fill the stream, so
+            // the peer's queries stay unanswered and the local answer unwritten.
+            let connection_cancel = CancellationToken::new();
+            let (peer_send, service_recv) = framed_channel(16);
+            let (service_send, peer_recv) = framed_channel(3);
+            let local_output = service_send.clone();
+            let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
+            let peer = Peer::new(
+                peer_id.clone(),
+                None,
+                ZAKURA_CAP_DISCOVERY,
+                streams,
+                connection_cancel.clone(),
+            );
+            let service_cancel = peer.service_cancel_token();
+            let close_cause = peer.close_cause_reader();
+            service.add_peer(peer);
+            wait_for_discovery_inbound_peers(&handle, 1).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while local_output.capacity() > 0 || service.query_pool.held() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the local exchange fills the stream with two live queries");
+
+            let held = handle.hold_verify_slots();
+            peer_send
+                .send(discovery_frame(DiscoveryMessage::GetServices(
+                    GetServices {
+                        wanted_services: Vec::new(),
+                    },
+                ))?)
+                .await?;
+            peer_send
+                .send(discovery_frame(DiscoveryMessage::Hello {
+                    record: signed_discovery_record(&peer_secret, &handshake)?,
+                })?)
+                .await?;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while service.serving.rows()[1].node_output_held() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the unwritten Services answer holds node output");
+            let live = discovery_levels(&service);
+            assert_eq!(
+                (
+                    live.session_records,
+                    live.admitted_inbound,
+                    live.query_entries
+                ),
+                (1, 1, 2),
+                "{exit:?}: the live session holds its record, slot and queries"
+            );
+
+            match exit {
+                SessionExit::PeerDisconnect => {
+                    drop((peer_send, peer_recv));
+                    connection_cancel.cancel();
+                }
+                SessionExit::WriterPanic => {
+                    tokio::time::timeout(
+                        DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + Duration::from_secs(1),
+                        connection_cancel.cancelled(),
+                    )
+                    .await
+                    .expect("the writer panics at its owner check after the initial timeout");
+                    assert_eq!(close_cause.get(), Some(CloseOutcome::SERVICE_PANIC));
+                    drop((peer_send, peer_recv));
+                }
+                SessionExit::LocalCancel => {
+                    service_cancel.cancel();
+                    let parked = DiscoveryLevels {
+                        session_records: 1,
+                        free_verify_slots: 0,
+                        ..baseline
+                    };
+                    assert_eq!(
+                        settled_levels(&service, parked).await,
+                        parked,
+                        "a parked session releases all but its record"
+                    );
+                    assert!(!connection_cancel.is_cancelled());
+                    drop((peer_send, peer_recv));
+                    connection_cancel.cancel();
+                }
+            }
+            // The registry removes the peer from each service once its
+            // connection ends.
+            service.remove_peer(&peer_id, 0);
+            drop(held);
+            connected_tx.send_replace(Vec::new());
+            assert_eq!(
+                settled_levels(&service, baseline).await,
+                baseline,
+                "{exit:?}: every discovery resource returns to its baseline"
+            );
+        }
         Ok(())
     }
 
@@ -2846,8 +3099,8 @@ mod tests {
         }
     }
 
-    /// A record retires at its third failure, and only its connection's end
-    /// lets the peer open a session there again.
+    /// A record retires at its second failure, as the stall rule counts, and
+    /// only its connection's end lets the peer open a session there again.
     #[test]
     fn the_bound_failure_retires_a_record_until_its_connection_ends() {
         let peer = ZakuraPeerId::new(vec![82; 32]).expect("test peer id is within bounds");
@@ -2856,10 +3109,9 @@ mod tests {
         assert!(states.open(&key(1)));
         assert_eq!(states.record_failure(&key(1)), SessionFailure::Counted);
         assert!(states.open(&key(2)));
-        assert_eq!(states.record_failure(&key(2)), SessionFailure::Counted);
         assert_eq!(
             states.record_failure(&key(2)),
-            SessionFailure::Retired { attempts: 3 }
+            SessionFailure::Retired { attempts: 2 }
         );
         assert!(!states.open(&key(3)));
         states.remove_connection(&peer, 4);
@@ -4044,7 +4296,7 @@ mod tests {
         let (_unused, recv) = framed_channel(1);
         io.queries = Queries::new(
             reservation_pool(),
-            WriterFence::new(io.connection_cancel.clone(), io.close_cause.clone()),
+            WriterFence::new(io.connection_cancel.clone()),
             &recv,
             io.session.send.clone(),
             io.session.cancel_token(),

@@ -911,7 +911,10 @@ header hashes expected by live ranges. A block that does not match the next expe
 one live range MUST retire the connection as a local incompatibility, without a peer-fault report or
 penalty. Height-only requests do not commit the publisher to the requester's chain. The receiver
 MUST retain the exchange fences until connection cleanup and requeue unreceived work. Local waits
-for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits MUST NOT
+for decode or sequencer capacity MUST pause the ending deadline. After a range's last body, its
+ending deadline MUST first allow the floor-rate transfer time of the bodies that ready-order output
+can put before the ending: one per other running job, from ranges that still owe a body, at most
+`PEER_EXECUTION - 1` maximum-size bodies. Crediting local waits MUST NOT
 release reservations or excuse a withheld ending while the reader remains active. It SHOULD briefly
 avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across
 reconnects, without delaying other suppliers. Invalid framing, excess response bytes, and invalid
@@ -987,7 +990,8 @@ before v5 carries 32 bytes of `0xFF` as its digest, as ZIP 239 defines for inven
 ```text
 MAX_TX_BYTES      = 2,000,000 bytes
 MAX_INV_ENTRIES   = 1,024
-MAX_SERVES        = 16        requests this node serves at once, sent in its Hello
+MAX_SERVES        = 16        requests this node serves at once, sent in its Hello, and the
+                              most it asks of one peer at once
 ```
 
 | Message | Stream | Payload | Rule | Breach |
@@ -1052,8 +1056,16 @@ charge.
     about 70 KB, which with 64 KiB of write-ahead keeps it within the allowance.
   - on_empty = close the connection (`ordered_byte_rate_overrun`), row 2
 - **Capacity**
-  - requester: at most 5 ids requested or awaiting a verdict per peer, and the node-wide 500
-    undecided transactions the pool core holds
+  - requester: ids requested or awaiting a verdict per peer within a window that starts at 5,
+    grows by one on each admitted body while full, up to what the peer's `Hello` serves, and
+    halves when requests miss their deadlines. Its requests also stay within 10,000,000 announced
+    bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
+    the node-wide 500 undecided transactions the pool core holds
+  - requester's pending ids: at most 8,000 per session. Past 256 in a session, an id is taken
+    while sessions hold fewer than 64,000 pending records, or, if no session holds it yet, fewer
+    than 128,000, all provisional. A record counts until its session drops it. Ids a session
+    keeps before its `Hello` or the go count only against its own 8,000. The rest is dropped,
+    never a violation
   - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each
     request waits on its data writer as an id, and the writer builds the body from the pool as it
     is when it reaches it, so the data stream's output share bounds the bytes queued to the peer,

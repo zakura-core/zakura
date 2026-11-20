@@ -383,8 +383,7 @@ impl Mirror {
             .expect("the core publishes when it starts");
         let untimed = |snapshot: &PoolSnapshot| {
             snapshot
-                .transactions
-                .iter()
+                .transactions()
                 .cloned()
                 .map(|mut tx| {
                     tx.time = None;
@@ -469,9 +468,9 @@ impl Mirror {
     fn submit(&mut self, held: usize) {
         let (tx, reservation) = self.held.remove(held);
         let body = self.txs[tx].real.transaction.clone();
-        let (waiter, step) = self
-            .reference
-            .submit(reservation.id(), body.clone(), Instant::now());
+        let (waiter, step) =
+            self.reference
+                .submit(reservation.id(), body.clone(), None, Instant::now());
         let handle = self.handle.clone();
         let task = tokio::spawn(async move {
             handle

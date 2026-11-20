@@ -34,9 +34,10 @@ pub(crate) const SEND_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The receiver's bucket for each row with a cadence.
 ///
-/// The capacity covers a connection-wide outage (see [`Cadence::min_capacity`]),
-/// so the bucket observes bursts; exhaustion is recorded and the frame still
-/// reaches the handler.
+/// The capacity covers a connection-wide outage (see [`Cadence::min_capacity`]).
+/// Every discovery row is paced, so on an empty bucket the stream's reader
+/// waits for the next token instead of forwarding the frame. The wait never
+/// closes the connection.
 const CADENCE: Cadence = Cadence {
     capacity: Cadence::min_capacity(SEND_INTERVAL),
     refill_interval: Duration::from_secs(7),

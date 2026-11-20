@@ -1,4 +1,5 @@
 pub(super) mod gauge_recorder;
+mod progress;
 mod query_lifecycle;
 mod retention;
 
@@ -1296,6 +1297,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -1322,6 +1324,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -1431,12 +1434,13 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
     let mut window = download_window();
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    let deadline = window.block_liveness_deadline().unwrap();
 
     assert_eq!(
-        window.check_liveness(now + timeout - Duration::from_millis(1)),
+        window.check_liveness(deadline - Duration::from_millis(1)),
         LivenessOutcome::Ok
     );
-    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
 }
 
 /// The defensive `Disarm` arm in `check_liveness`: a block-liveness deadline that exists
@@ -1451,10 +1455,10 @@ fn block_liveness_disarms_a_deadline_set_without_a_request() {
 
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
 
-    window.block_liveness_deadline = Some(now);
+    window.liveness_base_deadline = Some(now);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
     window.clear_liveness_if_idle();
-    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.block_liveness_deadline(), None);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
 }
 
@@ -1489,6 +1493,152 @@ fn short_response_charges_one_reliability_failure_per_request_not_per_height() {
     );
 }
 
+/// The liveness deadline is the 32 s allowance plus the outstanding bytes'
+/// transfer time at 256 KiB/s. A 2 MB body adds 7.629 s, so a peer that
+/// delivers one every 39.6 s keeps its session.
+#[test]
+fn block_liveness_deadline_adds_transfer_time_at_the_minimum_rate() {
+    let allowance = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    assert_eq!(allowance, Duration::from_secs(32));
+    let body = |height| {
+        let mut request = window_request(height);
+        request.max_response_bytes = 2_000_000;
+        assert_eq!(request.request.estimated_bytes, 1);
+        request
+    };
+    let transfer = admission::min_rate_transfer_time(2_000_000);
+    let mut now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(body(1));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(now + allowance + transfer)
+    );
+
+    // A second request in the same episode adds no time: the next accepted
+    // body is at most one maximum body away on the ordered stream.
+    window.outstanding.push(body(2));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(now + allowance + transfer)
+    );
+
+    // Slow, continuous progress: one body just inside each deadline.
+    for height in 3..8 {
+        let deadline = window.block_liveness_deadline().unwrap();
+        now = deadline - Duration::from_millis(1);
+        assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+        let key = window.outstanding.first_key().unwrap();
+        window.outstanding.remove(key);
+        window.outstanding.push(body(height));
+        window.note_block_progress(now, allowance);
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(now + allowance + transfer)
+        );
+    }
+}
+
+/// Re-issuing one returned body without delivering it keeps the episode's
+/// deadline. The scheduler estimate equals the authorization here, so only
+/// the episode anchor separates this rule from charging each issue again.
+#[test]
+fn recycling_one_authorization_cannot_move_the_liveness_deadline() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let deadline = start + base + admission::min_rate_transfer_time(2_000_000);
+    let body = || {
+        let mut request = window_request(1);
+        request.request.estimated_bytes = 2_000_000;
+        request.request.expected_blocks[0].estimated_bytes = 2_000_000;
+        request.max_response_bytes = 2_000_000;
+        request
+    };
+    let mut window = download_window();
+    let mut key = window.outstanding.push(body());
+    window.arm_liveness(start, base);
+    assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    for second in 1..=8 {
+        window.outstanding.remove(key).unwrap();
+        key = window.outstanding.push(body());
+        window.arm_liveness(start + Duration::from_secs(second), base);
+        assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    }
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
+}
+
+/// A silent peer that keeps taking new requests still parks one maximum body
+/// after its episode's base: each new authorization adds no time.
+#[test]
+fn a_silent_peer_cannot_extend_liveness_with_new_requests() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let deadline = start + base + admission::min_rate_transfer_time(block::MAX_BLOCK_BYTES);
+    let range = |height| {
+        let mut range = window_request_range(height, 16);
+        range.max_response_bytes = MAX_BS_RESPONSE_BYTES;
+        range
+    };
+    let mut window = download_window();
+    let mut key = window.outstanding.push(range(1));
+    window.arm_liveness(start, base);
+    assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    // The peer takes a replacement before each earlier request expires, so
+    // two 32 MiB authorizations are always live.
+    for issue in 1..5 {
+        let next = window.outstanding.push(range(1 + 16 * issue));
+        window.arm_liveness(start + Duration::from_secs(8 * u64::from(issue)), base);
+        window.outstanding.remove(key).unwrap();
+        key = next;
+        assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    }
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
+}
+
+#[test]
+fn replacing_a_returned_range_cannot_carry_forward_its_transfer_time() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let transfer = admission::min_rate_transfer_time(2_000_000);
+    let mut window = download_window();
+    let range = |height| {
+        let mut range = window_request_range(height, 2);
+        range.max_response_bytes = 2_000_000;
+        range
+    };
+    let mut key = window.outstanding.push(range(1));
+    window.arm_liveness(start, base);
+    for second in 1..=4 {
+        // Remove the range the peer returned unavailable, then replace its
+        // still-wanted work. The old authorization adds no time to the new one.
+        window.outstanding.remove(key).unwrap();
+        assert_eq!(window.block_liveness_deadline(), Some(start + base));
+        key = window.outstanding.push(range(1));
+        window.arm_liveness(start + Duration::from_secs(second), base);
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(start + base + transfer)
+        );
+    }
+
+    // A second range can be live concurrently. A received body consumes the
+    // first range's byte allowance even when its scheduler estimate was tiny.
+    let mut second = window_request_range(3, 2);
+    second.max_response_bytes = 1_000_000;
+    window.outstanding.push(second);
+    window.arm_liveness(start + Duration::from_secs(5), base);
+    let accepted_at = start + transfer;
+    window.outstanding.record_body_bytes(key, 1_500_000);
+    assert!(window.outstanding.mark_received(key, block::Height(1)));
+    window.note_block_progress(accepted_at, base);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(accepted_at + base + admission::min_rate_transfer_time(1_500_000))
+    );
+}
+
 #[test]
 fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
@@ -1501,7 +1651,10 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
         now += timeout - Duration::from_millis(1);
         assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
         window.note_block_progress(now, timeout);
-        assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(now + timeout + admission::min_rate_transfer_time(1))
+        );
     }
 }
 
@@ -1516,7 +1669,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
-    assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+    assert_eq!(window.block_liveness_deadline(), Some(now + timeout));
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
 }
 
@@ -1531,7 +1684,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
-    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.block_liveness_deadline(), None);
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
 }
 
@@ -1577,7 +1730,10 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     window.outstanding.push(window_request(2));
     window.arm_liveness(resumed, timeout);
 
-    assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(resumed + timeout + admission::min_rate_transfer_time(1))
+    );
 }
 
 #[test]
@@ -1668,15 +1824,16 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
 
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    let deadline = window.block_liveness_deadline().unwrap();
     assert_eq!(
-        window.check_liveness(now + timeout),
+        window.check_liveness(deadline),
         LivenessOutcome::Park,
         "the deadline has expired: without backpressure this disconnects",
     );
 
     // Under local backpressure the routine extends instead of disconnecting.
-    let extended_at = now + timeout;
-    window.extend_liveness_deadline(extended_at, timeout);
+    let extended_at = deadline;
+    window.extend_liveness_deadline(timeout);
     assert_eq!(window.check_liveness(extended_at), LivenessOutcome::Ok);
 
     // The extension is bounded: once it too expires (congestion did not clear and no
@@ -4381,7 +4538,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 #[tokio::test]
 async fn block_liveness_parks_silent_peer_and_traces_reason() {
     // The first no-progress deadline parks the peer for its cooldown. Its
-    // unended request then closes the connection (see `WriterFence`).
+    // unended request resets the session and keeps the connection (see
+    // `regulation::stall`).
     let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
@@ -4459,8 +4617,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     .await
     .expect("silent active peer is parked by block-progress liveness");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     capture.flush().await;
@@ -4602,8 +4760,8 @@ async fn check_cold_probe_deadline(expired: bool) {
     .await
     .expect("an unproven peer is still parked at its liveness deadline");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     reactor_task.abort();
@@ -4941,7 +5099,15 @@ impl TestSequencer {
     ) -> AcceptOutcome {
         let facts = self.payloads.insert(body);
         let result = self.policy.accept_buffered_body(
-            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+            owner,
+            source,
+            height,
+            hash,
+            previous,
+            facts,
+            bytes,
+            estimate,
+            super::events::BlockSupplier { peer, conn_id: 0 },
         );
         if matches!(result, AcceptOutcome::Redundant { .. }) {
             self.payloads.release(facts.id);
@@ -7309,6 +7475,7 @@ fn outstanding_three_block_range() -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -7686,6 +7853,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     };
@@ -10680,6 +10848,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         if let BlockSyncAction::Misbehavior {
             peer: action_peer,
             reason,
+            ..
         } = action
         {
             assert_ne!(
@@ -12180,7 +12349,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 }
 
 #[tokio::test]
-async fn mismatched_header_retires_the_connection_without_a_fault_report() {
+async fn mismatched_header_retires_the_session_without_a_fault_report() {
     let (tip_tx, handle, mut actions, reactor_task) =
         spawn_genesis_reactor(immediate_body_download_config());
     let service = BlockSyncService::new_with_handle_for_test(
@@ -12254,9 +12423,17 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
 
     // Height-only requests do not commit the supplier to our chain, so this is
     // a local incompatibility rather than a peer fault.
-    tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
-        .await
-        .expect("a header that does not match the next expected hash retires the connection");
+    await_until(
+        "a mismatched header retires the session",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("a header that does not match the next expected hash retires the session");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "retiring the session keeps the connection"
+    );
     while let Ok(action) = actions.try_recv() {
         assert!(
             !matches!(action, BlockSyncAction::Misbehavior { .. }),
@@ -12454,8 +12631,16 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
     // fails the test (the peer was not scored).
     let scored = loop {
-        if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+        if let BlockSyncAction::Misbehavior {
+            peer,
+            conn_id,
+            reason,
+        } = next_action(&mut actions).await
+        {
             assert_eq!(peer, bad_peer);
+            // The verdict names the supplying registration, which the helper
+            // gives connection ID 0.
+            assert_eq!(conn_id, Some(0));
             assert_eq!(
                 reason,
                 BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
@@ -13926,6 +14111,7 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     while action_sender.capacity() > 0 {
         action_sender
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14378,6 +14564,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14507,6 +14694,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14870,7 +15058,9 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     // The violation is still recorded as a best-effort `Misbehavior` action.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+            if let BlockSyncAction::Misbehavior { peer, reason, .. } =
+                next_action(&mut actions).await
+            {
                 if peer == probe && reason == BlockSyncMisbehavior::InvalidBlock {
                     break;
                 }

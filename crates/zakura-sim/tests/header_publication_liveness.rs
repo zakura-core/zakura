@@ -8,7 +8,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{fs, process::Command, time::Duration};
 
 use support::inputs;
 use zakura_scheduler::SimInstant;
@@ -335,8 +335,9 @@ fn the_facts_repeat_a_a_and_a_b_a() {
     assert!(first == again && again == last, "plan A, then B, then A");
 }
 
-/// The committed typed witnesses the bypasses run on, by name.
-fn committed_witnesses() -> [(&'static str, LivenessScenario); 3] {
+/// The typed witnesses the bypasses run on, by name. The QA store holds
+/// each as `fixtures/header-publication-<name>.json`.
+fn typed_witnesses() -> [(&'static str, LivenessScenario); 3] {
     [
         ("live-quiet-reset", LivenessScenario::QuietReset),
         ("status-startup", LivenessScenario::StatusStartup),
@@ -344,44 +345,30 @@ fn committed_witnesses() -> [(&'static str, LivenessScenario); 3] {
     ]
 }
 
-/// The committed fixture `header-publication-<name>.<extension>`.
-fn fixture(name: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("header-publication-{name}.{extension}"))
-}
-
-/// Each committed witness is its fixture, as JSON, and holds
-/// and applies under the empty Plan.
+/// Each typed witness holds and applies under the empty Plan.
 #[test]
-fn the_committed_witnesses_match_their_fixtures() {
-    for (name, scenario) in committed_witnesses() {
-        let committed: LivenessScenario = serde_json::from_str(
-            &fs::read_to_string(fixture(name, "json"))
-                .unwrap_or_else(|error| panic!("{name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(committed, scenario, "{name}");
+fn every_typed_witness_holds_and_applies() {
+    for (_, scenario) in typed_witnesses() {
         let (report, _) = run_reading(scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert_holds_and_applies(scenario, &report);
     }
 }
 
-/// `record --witness` judges each committed witness as `cargo xtask
-/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
+/// `record --witness` judges each typed witness as `cargo xtask planted`
+/// runs it, expecting a hold, and `replay` reruns the trace Exact
 /// in a fresh process.
 #[test]
-fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
+fn every_typed_witness_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
             .args(args)
             .output()
             .expect("the binary runs")
     };
-    for (name, _) in committed_witnesses() {
+    for (name, scenario) in typed_witnesses() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let trace = dir.path().join("trace");
-        let scenario = fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+        let scenario = serde_json::to_string(&scenario).expect("scenarios serialize");
         let recorded = zakura_sim(&[
             "record",
             "--sim",

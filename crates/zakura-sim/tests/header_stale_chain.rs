@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
+use std::{cell::RefCell, fs, process::Command, rc::Rc};
 
 use support::inputs;
 use zakura_sim::NaReason;
@@ -477,38 +477,20 @@ fn each_witness_takes_the_path_it_names() {
     }
 }
 
-/// The witnesses `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-chain-<name>.json`.
+/// The witnesses `cargo xtask planted` runs as typed cases. The QA store
+/// holds each as `fixtures/header-chain-<name>.json`.
 /// Each runs under the empty Plan.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 2] {
+fn typed_witnesses() -> [(&'static str, StorageScenario); 2] {
     [
         ("fork-stale-apply", fork_stale_apply()),
         ("pre-reset-commit", pre_reset_commit()),
     ]
 }
 
-/// The committed fixture `header-chain-<name>.<extension>`.
-fn fixture(name: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("header-chain-{name}.{extension}"))
-}
-
-/// Each committed witness is its builder's scenario, as JSON, and holds
-/// and applies under the empty Plan.
+/// Each typed witness holds and applies under the empty Plan.
 #[test]
-fn the_committed_witnesses_match_their_builders() {
-    for (name, scenario) in committed_witnesses() {
-        let committed: StorageScenario = serde_json::from_str(
-            &fs::read_to_string(fixture(name, "json"))
-                .unwrap_or_else(|error| panic!("{name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            serde_json::to_value(&committed).expect("scenarios serialize"),
-            serde_json::to_value(&scenario).expect("scenarios serialize"),
-            "{name}"
-        );
+fn every_typed_witness_holds_and_applies() {
+    for (name, scenario) in typed_witnesses() {
         let (report, _) = run(&scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
@@ -542,21 +524,21 @@ fn the_chain_witness_repeats_a_a_and_a_b_a() {
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
 }
 
-/// `record --witness` judges each committed witness as `cargo xtask
-/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
+/// `record --witness` judges each typed witness as `cargo xtask planted`
+/// runs it, expecting a hold, and `replay` reruns the trace Exact
 /// in a fresh process.
 #[test]
-fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
+fn every_typed_witness_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
             .args(args)
             .output()
             .expect("the binary runs")
     };
-    for (name, _) in committed_witnesses() {
+    for (name, scenario) in typed_witnesses() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let trace = dir.path().join("trace");
-        let scenario = fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+        let scenario = serde_json::to_string(&scenario).expect("scenarios serialize");
         let recorded = zakura_sim(&[
             "record",
             "--sim",

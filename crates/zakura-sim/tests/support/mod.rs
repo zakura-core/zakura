@@ -4,6 +4,7 @@
 
 pub mod feed;
 pub mod prepare_fault;
+pub mod qa_store;
 pub mod script;
 pub mod steer;
 

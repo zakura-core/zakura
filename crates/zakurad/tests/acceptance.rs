@@ -4240,6 +4240,26 @@ async fn zcashd_compat_transparent_tx_confirms() -> Result<()> {
     common::zcashd_compat::tx_flow::transparent_tx_confirms().await
 }
 
+/// Submits a signed parent and child through Zakura, then mines them.
+///
+/// See [`common::zcashd_compat::tx_flow::parent_and_child`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_parent_and_child_submitted_to_zakura() -> Result<()> {
+    use common::zcashd_compat::tx_flow::{parent_and_child, SubmitPath};
+    parent_and_child(SubmitPath::Zakura).await
+}
+
+/// Has zcashd advertise a signed parent and child to Zakura, then mines them.
+///
+/// See [`common::zcashd_compat::tx_flow::parent_and_child`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_parent_and_child_advertised_by_zcashd() -> Result<()> {
+    use common::zcashd_compat::tx_flow::{parent_and_child, SubmitPath};
+    parent_and_child(SubmitPath::ZcashdAdvert).await
+}
+
 /// Verifies that zakurad shuts down cleanly while supervising a running zcashd.
 ///
 /// See [`common::zcashd_compat::resilience::zakurad_clean_shutdown`] for details.

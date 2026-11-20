@@ -74,6 +74,18 @@ The last two need a node build that writes the `delivery_score` trace table.
 The summary is kept in memory, so a restarted profiler rebuilds it from what
 it reads back of each table.
 
+**Waiting for a local submission.** Before requesting a peer's copy, inbound
+gossip can wait up to five seconds for the same block's local submission to
+commit. Each completed wait writes `local_submission_wait_finished` to
+`commit_state.jsonl`, with `hash`, `elapsed_us`, and `outcome` (`committed`,
+`failed`, or `unresolved`). Join it to peer request rows by block hash and
+`process_trace_id`; `ts` uses the same clock as the other trace tables. A committed
+outcome skips the peer request; failure and timeout return to the ordinary state
+lookup and download path. Cancellation before an outcome emits no completed-wait
+row. These rows are available in the raw trace, not the propagation API.
+The metrics endpoint also exports `gossip.local_submission.waited` and the
+`gossip.local_submission.wait.duration_seconds` histogram, labelled by outcome.
+
 ## Staying out of the node's way
 
 - Parsing, storage and serving run at idle scheduling priority and idle I/O

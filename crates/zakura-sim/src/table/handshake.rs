@@ -1,6 +1,6 @@
 //! Control-handshake labels keyed to production's validation errors.
 
-use zakura_network::zakura::ZakuraValidationError;
+use zakura_network::zakura::{CloseOutcome, CloseRow, NeutralCause, ZakuraValidationError};
 
 /// Maps every production validation error to its stable oracle label.
 pub fn validation_label(error: ZakuraValidationError) -> &'static str {
@@ -731,9 +731,10 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     );
                 }
             }
-            // Registration, a local refusal after TLS, and a cancelled
-            // admission refund the attempt.
-            "registered" | "refused" | "cancelled" => window.refund(now),
+            // A local refusal after TLS and a cancelled admission refund the
+            // attempt. The node's bucket refuses as "node-exhausted", which
+            // no address's charges need to earn.
+            "refused" | "cancelled" => window.refund(now),
             "exhausted" if !rate && !window.refusal_earned(now) => {
                 return cx.violated(
                     "an address with a token is never exhausted",
@@ -1662,11 +1663,11 @@ fn check_prelude<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             }
         }
         if let Observation::ConnectionClosed { connection, cause } = obs {
-            if claim.ends_with("-resets") && crate::model::is_fault_cause(cause)
+            if claim.ends_with("-resets") && cause.is_fault()
                 && cx.log.entries().iter().any(|entry| matches!(&entry.obs,
                     Observation::Transport { connection: Some(judged_connection), event: TransportFact::PreludeJudged { rejection: Some(rejection), .. }, .. }
                     if judged_connection == connection && rejection == label)) {
-                return cx.violated("a reset-only prelude never charges a fault", cause);
+                return cx.violated("a reset-only prelude never charges a fault", cause.to_string());
             }
         }
     }
@@ -1691,15 +1692,25 @@ fn prelude_effect(key: &ObligationKey, obs: &Observation) -> bool {
             if key.subject == Subject::Owner(format!("reset/{shared_id}/{quic_stream}"))
                 && *code == if claim == "bad-magic-resets" { 2 } else { 5 });
     }
-    let expected = match claim {
-        "undersized-cap-closes" => "undersized_frame_cap",
-        "unexpected-request-id-closes" => "unexpected_request_id",
-        "request-without-id-closes" => "request_without_id",
-        "ineligible-opener-closes" => "unexpected_stream",
-        _ => return false,
+    let Observation::ConnectionClosed { connection, cause } = obs else {
+        return false;
     };
-    matches!(obs, Observation::ConnectionClosed { connection, cause }
-        if key.subject == Subject::Owner(format!("close/{connection}")) && cause == expected)
+    if key.subject != Subject::Owner(format!("close/{connection}")) {
+        return false;
+    }
+    match claim {
+        "undersized-cap-closes" => cause.row() == Some(CloseRow::CONN_CLOSE_16),
+        "unexpected-request-id-closes" => cause.row() == Some(CloseRow::CONN_CLOSE_14),
+        "request-without-id-closes" => cause.row() == Some(CloseRow::CONN_CLOSE_15),
+        "ineligible-opener-closes" => matches!(
+            cause,
+            CloseOutcome::Neutral {
+                cause: NeutralCause::IncompatibleConfiguration,
+                ..
+            }
+        ),
+        _ => false,
+    }
 }
 
 /// Checks worker installation against this fixture's offered capabilities and layouts.

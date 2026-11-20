@@ -1,23 +1,25 @@
 //! fuzz-12 item 7: each action and overlap the fuzz-12 controls added, as a
-//! generator-3 seed, `header-storage-w-*` in `zakura_sim::seed`, so the
-//! fuzzer can draw it. Each seed is a witness scenario's canonical prefix
-//! and 1,024 Plan bytes, and its run shows the overlap it's named for in the
-//! facts it logs, not only that the run ended.
+//! witness scenario, `header-storage-w-*`. A search over Plans for each
+//! scenario finds a run that shows the overlap it's named for in the facts
+//! it logs, not only that the run ended. The seeds in `zakura_sim::seed`
+//! start a fuzz campaign from the same scenarios.
 #![cfg(zakura_sim)]
+
+mod support;
 
 use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync_progress::BOUNDED_ADVERSARY_PROGRESS,
-    explore::{classify, ExploreOutcome},
+    explore::{classify, generate::ReachSearch, ExploreOutcome},
     harness::{
         self,
         header_node::policy::OpKind,
-        header_sync::{storage_witnesses, Storage},
+        header_sync::{grammar, storage_witnesses, Storage},
         Subsystem,
     },
     observe::{StorageFact, StoragePoint, StorageRequest, StorageResult},
-    seed, NullSink, Observation, RunReport,
+    NullSink, Observation, RunReport,
 };
 
 /// The overlap a witness seed's run shows.
@@ -404,31 +406,42 @@ fn shows(stem: &str) -> Shows {
     }
 }
 
-/// Each witness seed's run through the registered harness ends clean, and
-/// shows the overlap it's named for. Every witness has a seed.
+/// How many Plans the search may run for one witness. The two release
+/// faults' search took the most, 478 runs, when this was set, so 2,000
+/// leaves a margin of four times that.
+const WITNESS_RUNS: u64 = 2_000;
+
+/// The longest Plan the search draws: a seed's slice length.
+const WITNESS_PLAN_BYTES: usize = 1_024;
+
+/// For each witness scenario, a search over Plans finds a run that shows
+/// the overlap it's named for, and that run ends clean with nothing leaked.
 #[test]
-fn witness_seeds_show_their_overlaps() {
+fn witness_scenarios_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
-    let seeds: Vec<_> = seed::all()
-        .into_iter()
-        .filter(|seed| seed.name.starts_with("header-storage-w-"))
-        .collect();
+    let scenarios = storage_witnesses::witness_scenarios();
     // 15 named witnesses, 10 faults, 5 recovery classes and hdr-13's two
     // owed recoveries.
-    assert_eq!(seeds.len(), 32);
-    for seed in seeds {
-        let stem = &seed.name;
-        let shows = shows(stem);
-        let run = (entry.run_bytes)(seed.input(), &mut NullSink, None);
-        let report = run
-            .report()
-            .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));
+    assert_eq!(scenarios.len(), 32);
+    for (stem, scenario) in scenarios {
+        let shows = shows(&stem);
+        let search = ReachSearch {
+            prefix: grammar::input(&scenario, &[])
+                .unwrap_or_else(|error| panic!("{stem}: {error}")),
+            max_bytes: WITNESS_PLAN_BYTES,
+            steer: None,
+            ..ReachSearch::new(support::REACH_SEED, WITNESS_RUNS)
+        };
+        let reached = support::reaches_with(Storage::NAME, &search, move |report: &RunReport| {
+            shows.in_run(report).then_some(())
+        });
+        let run = (entry.run_bytes)(&reached.input, &mut NullSink, None);
         assert_eq!(
             classify(entry, &run).outcome,
             ExploreOutcome::Clean,
-            "{stem}"
+            "{stem}: run {}",
+            reached.run
         );
-        assert_eq!(run.leaked(), 0, "{stem}");
-        assert!(shows.in_run(report), "{stem} doesn't show {shows:?}");
+        assert_eq!(run.leaked(), 0, "{stem}: run {}", reached.run);
     }
 }

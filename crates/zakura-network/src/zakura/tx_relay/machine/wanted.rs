@@ -13,7 +13,6 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use indexmap::IndexSet;
 use zakura_chain::transaction::UnminedTxId;
 use zakura_rt::collections::HashMap;
 
@@ -61,8 +60,9 @@ pub(crate) struct Entry {
     /// asked for it again while the entry lives. Past [`TRIED_PER_ENTRY`]
     /// only a peer with no session is forgotten, so the set holds at most
     /// one more than the larger of that cap and the most peers connected at
-    /// once.
-    pub(crate) tried: IndexSet<PeerKey>,
+    /// once. A list, not a set: it is short, and an empty one costs
+    /// nothing.
+    pub(crate) tried: Vec<PeerKey>,
 }
 
 /// The pool answered `NoRoom`, so nobody claims until `until`. After that
@@ -156,7 +156,7 @@ impl WantedIds {
                 retry_delay: None,
                 requeued_at: None,
                 waits_for_other: false,
-                tried: IndexSet::new(),
+                tried: Vec::new(),
                 order: {
                     *order = order.saturating_add(1);
                     *order
@@ -463,16 +463,18 @@ impl WantedIds {
         else {
             return;
         };
-        if !entry.tried.contains(&peer) && entry.tried.len() >= TRIED_PER_ENTRY {
+        if entry.tried.contains(&peer) {
+            return;
+        }
+        if entry.tried.len() >= TRIED_PER_ENTRY {
             if let Some(gone) = entry.tried.iter().position(|tried| !connected(tried)) {
-                entry.tried.shift_remove_index(gone);
+                entry.tried.remove(gone);
             }
         }
-        if entry.tried.insert(peer) {
-            // The peer's other references to the entry go when their
-            // routines read this.
-            self.note(id);
-        }
+        entry.tried.push(peer);
+        // The peer's other references to the entry go when their routines
+        // read this.
+        self.note(id);
     }
 
     /// Whether `peer` tried `id` in `generation`.

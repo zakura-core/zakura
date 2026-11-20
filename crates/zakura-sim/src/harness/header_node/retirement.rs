@@ -47,9 +47,12 @@
 //!   taker already holds the target, and storage never stalls its read.
 //!
 //! - **Timeout**, armed with the hand-off. The check keeps each ordinary
-//!   round's request deadline itself, from the three events that arm it in
-//!   production: the round's `Started`, each `PageStaged` on it, and its
-//!   apply's `Dispatched`, which follows a successful prepare. Each arm of
+//!   round's request deadline itself, from the four events that arm it in
+//!   production: the round's `Started`, each continuation's
+//!   `ReservationOpened`, which follows a page that filled the round's
+//!   reservation, its prepare's `Dispatched`, which follows the round's
+//!   last page, and its apply's `Dispatched`, which follows a successful
+//!   prepare. Each arm of
 //!   the owner's round, once ready, is a [`HandoffFact::Armed`]. One made
 //!   while the fixture held obliges, and its obligation the request timeout
 //!   after it expires (see the property). The round's next arm answers it,
@@ -531,6 +534,9 @@ impl Retirement {
             ReactorEvent::Dispatched { call, op } => match op {
                 PortCall::Prepare { peer, owner, .. } => {
                     self.dispatched(*call, peer, owner, false);
+                    // The peer delivered the round, so its prepare gets a
+                    // fresh deadline.
+                    self.arm(owner, true);
                 }
                 PortCall::Apply { peer, owner, .. } => {
                     let session = (peer.clone(), owner.session_id());
@@ -559,7 +565,16 @@ impl Retirement {
                 }
                 PortCall::VctContext { .. } => {}
             },
-            ReactorEvent::PageStaged { request, .. } => self.arm(&request.owner, true),
+            // A page that continues the round rearms its deadline, and the
+            // continuation's reservation follows at once. A page that only
+            // stages headers rearms nothing (#2248). Production rearms a
+            // continuation only after the round staged a fair share since
+            // its last progress (F-198). An arm production skipped only
+            // loosens the bound.
+            ReactorEvent::ReservationOpened {
+                request: Some(request),
+                ..
+            } => self.arm(&request.owner, true),
             ReactorEvent::Retired { request, .. }
                 if matches!(request.owner, HeaderSyncWorkOwner::Header(_)) =>
             {

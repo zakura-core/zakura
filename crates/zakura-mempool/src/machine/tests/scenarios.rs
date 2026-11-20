@@ -17,7 +17,7 @@ use zakura_node_services::mempool::port::{
 use super::{build, paying, started, twin, verified, Bench, TestVerifyError, Tx, START};
 use crate::{
     config::Config,
-    machine::{Effect, JobId, Limits, Outcome, Step, WaiterId},
+    machine::{Effect, JobId, Limits, Outcome, Step, WaiterId, RETRY_GAP},
     storage::{
         ExactTipRejectionError, NonStandardTransactionError, RejectionError,
         SameEffectsChainRejectionError, SameEffectsTipRejectionError,
@@ -516,6 +516,50 @@ fn an_undecided_id_is_not_fetched_twice() {
     assert!(matches!(bench.reserve(&tx).0, Err(Unreserved::Pending)));
 }
 
+/// The ids `reserve` would refuse without a slot are known to a caller that
+/// asks first: pooled, undecided, waiting after a reset, or rejected.
+#[test]
+fn the_ids_a_reservation_would_refuse_are_known() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 5);
+    let mut bench = Bench::new();
+    bench.admit(&txs[0]);
+    bench.reserved(&txs[1]);
+    let (_, job) = bench.start(&txs[2]);
+    bench.fail(
+        job,
+        ExactTipRejectionError::FailedVerification(TestVerifyError),
+        Charge::None,
+    );
+    let ids = |txs: &[Tx]| {
+        txs.iter()
+            .map(Tx::id)
+            .collect::<zakura_rt::collections::HashSet<_>>()
+    };
+    assert_eq!(
+        bench.machine.known_ids(ids(&txs), bench.at()),
+        ids(&txs[..3])
+    );
+
+    // A reset puts the pooled one back in line to be verified again.
+    let readmitting = Bench::with(
+        Config::default(),
+        Limits {
+            pending: 1,
+            readmitting: 1,
+        },
+    );
+    let mut bench = readmitting;
+    bench.admit(&txs[3]);
+    bench.admit(&txs[4]);
+    bench.reset();
+    assert_eq!(bench.machine.queued_count(), 1);
+    assert_eq!(
+        bench.machine.known_ids(ids(&txs[3..]), bench.at()),
+        ids(&txs[3..])
+    );
+}
+
 /// A fetch that is still out when its admission ends keeps its slot: a
 /// decoded body is still on its way. Its caller gets the admission's verdict
 /// when it comes back.
@@ -887,6 +931,225 @@ fn inputs_that_arrive_one_at_a_time_earn_one_check_after_the_wait() {
     assert!(bench.reserve(&child).0.is_ok());
 }
 
+/// A child that spends one output that never exists and an output of each
+/// of `parents`, which are not in the pool yet. The verifier reports every
+/// spend of such a child as missing.
+fn child_of_many(runner: &mut TestRunner, parents: usize) -> (Vec<Tx>, Tx, Vec<OutPoint>) {
+    let parents = unrelated(runner, parents);
+    let mut spends = vec![coin(0xb0)];
+    spends.extend(parents.iter().map(|parent| parent.outpoint(0)));
+    let child = build(runner, &spends, 1, None);
+    (parents, child, spends)
+}
+
+/// Admits `parent` and returns the jobs its admission started.
+fn admit_parent(bench: &mut Bench, parent: &Tx) -> Vec<JobId> {
+    let (_, job) = bench.start(parent);
+    started(&bench.pass(job, parent))
+}
+
+/// Arriving parents run a parked transaction again at once at most
+/// `MAX_MEMPOOL_ANCESTORS` times per tip, however many it names, and later
+/// arrivals at most once per `RETRY_GAP`. A block gives it its retries back.
+#[test]
+fn arriving_parents_run_a_parked_transaction_again_at_most_twice() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 5);
+    let mut bench = Bench::new();
+    let (waiter, job) = bench.start(&child);
+    assert!(bench.missing(job, spends.clone()).is_empty());
+
+    for parent in &parents[..2] {
+        let rerun = admit_parent(&mut bench, parent);
+        assert_eq!(rerun.len(), 1, "an arriving parent runs the child again");
+        assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    }
+    for parent in &parents[2..4] {
+        assert!(
+            admit_parent(&mut bench, parent).is_empty(),
+            "the child's retries are used up"
+        );
+    }
+    // Arrivals past the cap wait, and run it once together after the gap.
+    let rerun = started(&bench.tick(RETRY_GAP - Duration::from_millis(1)));
+    assert!(rerun.is_empty(), "not before the gap");
+    let rerun = started(&bench.tick(Duration::from_millis(1)));
+    assert_eq!(rerun.len(), 1, "both waiting arrivals run it once");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+
+    // A block mines a parent, which runs the child again and gives it its
+    // retries back.
+    let rerun = started(&bench.grow(&[&parents[0]]));
+    assert_eq!(rerun.len(), 1);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[4]);
+    assert_eq!(rerun.len(), 1, "the block gave the child its retries back");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+
+    let step = bench.tick(T_PARK);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+    assert_eq!(bench.machine.slots_in_use(), 0);
+}
+
+/// A parent that arrives while the child is checked counts as a retry too.
+/// One the cap holds back is owed: when the wait ends the child gets one
+/// last check instead of the missing inputs it last saw being cached.
+#[test]
+fn a_parent_the_cap_holds_back_earns_one_last_check() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 3);
+    let mut bench = Bench::new();
+    let (waiter, mut job) = bench.start(&child);
+    for parent in &parents[..2] {
+        bench.admit(parent);
+        let rerun = started(&bench.missing(job, spends.clone()));
+        assert_eq!(rerun.len(), 1, "a parent that arrived during the check");
+        job = rerun[0];
+    }
+    bench.admit(&parents[2]);
+    assert!(
+        bench.missing(job, spends.clone()).is_empty(),
+        "the cap holds the third arrival back"
+    );
+
+    let step = bench.tick(T_PARK);
+    assert!(step.verdict(waiter).is_none());
+    let last = started(&step);
+    assert_eq!(last.len(), 1, "one last check");
+    let step = bench.missing(last[0], vec![coin(0xb0)]);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+}
+
+/// A child of two parents, in a pool that holds two transactions, whose
+/// first parent spends both its immediate retries. The child parks at
+/// `parks_at` with `give_up`, its first parent enters then, is pushed out by
+/// two richer transactions, and enters again under other authorizing data at
+/// `again_at`. Returns the parents and the bench.
+fn one_parent_spends_the_retries(
+    parks_at: Duration,
+    give_up: Option<Duration>,
+    again_at: Duration,
+) -> (Vec<Tx>, Bench) {
+    let mut runner = TestRunner::deterministic();
+    let parents = unrelated(&mut runner, 2);
+    let spends: Vec<OutPoint> = parents.iter().map(|parent| parent.outpoint(0)).collect();
+    let child = build(&mut runner, &spends, 1, None);
+    let fillers = unrelated(&mut runner, 2);
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: parents[0].real.cost() + fillers[0].real.cost(),
+            ..Config::default()
+        },
+        Limits::default(),
+    );
+    bench.now = parks_at;
+    let reservation = bench.reserved(&child);
+    let (_, step) = bench.submit_until(reservation, &child, give_up);
+    assert!(bench.missing(started(&step)[0], spends.clone()).is_empty());
+
+    let first = paying(&parents[0], 500_000);
+    let rerun = admit_parent(&mut bench, &first);
+    assert_eq!(rerun.len(), 1, "the first parent runs the child again");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    bench.admit(&paying(&fillers[0], 100_000_000));
+    bench.admit(&paying(&fillers[1], 200_000_000));
+    assert!(!bench.machine.pooled_ids().contains(&first.id()));
+
+    bench.now = again_at;
+    let rerun = admit_parent(&mut bench, &paying(&twin(&parents[0]), 300_000_000));
+    assert_eq!(rerun.len(), 1, "its return spends the second retry");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    (parents, bench)
+}
+
+/// A parent that is evicted and enters again can spend the child's retries,
+/// but cannot keep its other parent from running it: that arrival runs it
+/// within `RETRY_GAP`, well before a peer's deadline.
+#[test]
+fn a_parent_that_enters_again_cannot_hold_the_child_back() {
+    let (parents, mut bench) = one_parent_spends_the_retries(Duration::ZERO, None, Duration::ZERO);
+    assert!(
+        admit_parent(&mut bench, &paying(&parents[1], 400_000_000)).is_empty(),
+        "past the cap, the other parent waits"
+    );
+    let rerun = started(&bench.tick(RETRY_GAP));
+    assert_eq!(
+        rerun.len(),
+        1,
+        "the other parent runs the child after the gap"
+    );
+}
+
+/// Past the cap, the gap runs from when the last check started, not from
+/// when its answer came back: a parent that arrived during a slow check
+/// still runs the child `RETRY_GAP` after that check began.
+#[test]
+fn the_retry_gap_runs_from_the_start_of_the_last_check() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 3);
+    let mut bench = Bench::new();
+    let (_, job) = bench.start(&child);
+    assert!(bench.missing(job, spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[0]);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[1]);
+
+    // The last parent arrives a second into the second retry, whose answer
+    // comes back four seconds in.
+    bench.now += Duration::from_secs(1);
+    bench.admit(&parents[2]);
+    bench.now += Duration::from_secs(3);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let step = bench.tick(RETRY_GAP - Duration::from_secs(4));
+    assert_eq!(started(&step).len(), 1, "a gap after the check started");
+}
+
+/// A parent held back past the cap spends the child's last check at once
+/// when the submitter's 73 s deadline comes by both the gap's end and the
+/// wait's end. In the first case the child parks at 15 s, so its wait ends
+/// at 75 s, its second retry runs at 65 s, and its other parent arrives at
+/// 66 s, when the gap would end at 75 s. In the second the child parks at
+/// 13 s, so its wait ends at 73 s too, its second retry runs at 69 s, and
+/// its other parent arrives at 70 s.
+#[test]
+fn a_held_parent_spends_the_last_check_before_the_deadline() {
+    for (parks_at, again_at) in [(15, 65), (13, 69)] {
+        let (parents, mut bench) = one_parent_spends_the_retries(
+            Duration::from_secs(parks_at),
+            Some(Duration::from_secs(73)),
+            Duration::from_secs(again_at),
+        );
+        bench.now = Duration::from_secs(again_at + 1);
+        let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
+        assert_eq!(
+            rerun.len(),
+            1,
+            "the last check runs before 73 s, parked at {parks_at} s"
+        );
+    }
+}
+
+/// A parent held back past the cap waits for the wait's end when that comes
+/// before the submitter's deadline, and the last check then runs with every
+/// parent that has arrived. Here the child parks at 10 s, so its wait ends at
+/// 70 s, before its 73 s deadline. Its second retry runs at 64 s, and its
+/// other parent arrives at 65 s, when the gap would end at 74 s.
+#[test]
+fn a_held_parent_waits_for_a_wait_that_ends_before_the_deadline() {
+    let (parents, mut bench) = one_parent_spends_the_retries(
+        Duration::from_secs(10),
+        Some(Duration::from_secs(73)),
+        Duration::from_secs(64),
+    );
+    bench.now = Duration::from_secs(65);
+    assert!(
+        admit_parent(&mut bench, &paying(&parents[1], 400_000_000)).is_empty(),
+        "a later check would miss a parent that comes back meanwhile"
+    );
+    let last = started(&bench.tick(Duration::from_secs(5)));
+    assert_eq!(last.len(), 1, "the wait's end at 70 s gives the last check");
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,
@@ -947,6 +1210,78 @@ fn an_older_time_from_a_caller_does_not_turn_the_clock_back() {
     bench.now = Duration::from_secs(2);
     let step = bench.pass(job, &txs[2]);
     assert!(matches!(step.verdict(waiter), Some(Verdict::Admitted)));
+}
+
+/// A parked transaction ends at its submitter's deadline, as a timeout,
+/// even though its own wait for a parent runs longer, and caches nothing.
+/// Its wait for a parent still wins a tie, with today's cached
+/// missing-input answer.
+#[test]
+fn a_submitters_deadline_ends_a_parked_admission() {
+    let mut runner = TestRunner::deterministic();
+    let (parent, child) = family(&mut runner);
+    let mut bench = Bench::new();
+
+    // The fetch took 15 s, and the adapter stops waiting at 73 s.
+    bench.now = Duration::from_secs(15);
+    let reservation = bench.reserved(&child);
+    let (waiter, step) = bench.submit_until(reservation, &child, Some(Duration::from_secs(73)));
+    let job = started(&step)[0];
+    assert!(bench.missing(job, vec![parent.outpoint(0)]).is_empty());
+
+    let step = bench.tick(Duration::from_secs(58));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert_eq!(step.changes, vec![Change::Refused(child.id())]);
+    assert_eq!(bench.machine.slots_in_use(), 0);
+    assert!(bench.reserve(&child).0.is_ok(), "a timeout caches nothing");
+
+    // A deadline at the same time as the end of the wait for a parent.
+    let mut bench = Bench::new();
+    let reservation = bench.reserved(&child);
+    let (waiter, step) = bench.submit_until(reservation, &child, Some(T_PARK));
+    let job = started(&step)[0];
+    bench.missing(job, vec![parent.outpoint(0)]);
+    let step = bench.tick(T_PARK);
+    assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
+}
+
+/// A verification ends at its submitter's deadline when that comes before
+/// its own limit, and a body that arrives after the deadline is not
+/// verified at all.
+#[test]
+fn a_submitters_deadline_ends_a_verification_and_a_late_body() {
+    let mut runner = TestRunner::deterministic();
+    let txs = unrelated(&mut runner, 2);
+    let mut bench = Bench::new();
+    let reservation = bench.reserved(&txs[0]);
+    let (waiter, step) = bench.submit_until(reservation, &txs[0], Some(Duration::from_secs(10)));
+    let job = started(&step)[0];
+    let step = bench.tick(Duration::from_secs(10));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert!(step
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Cancel(cancelled) if *cancelled == job)));
+    assert!(
+        bench.pass(job, &txs[0]).is_empty(),
+        "the late pass is ignored"
+    );
+
+    let reservation = bench.reserved(&txs[1]);
+    bench.now = Duration::from_secs(80);
+    let (waiter, step) = bench.submit_until(reservation, &txs[1], Some(Duration::from_secs(73)));
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+    ));
+    assert!(started(&step).is_empty());
+    assert_eq!(bench.machine.slots_in_use(), 0);
 }
 
 // Chain events.

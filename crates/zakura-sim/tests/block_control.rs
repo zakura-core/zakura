@@ -6,7 +6,10 @@
 mod support;
 
 use support::{inputs, picks};
-use zakura_network::zakura::BlockSyncMessage;
+use zakura_network::zakura::{
+    BlockSyncMessage, CloseOutcome, CloseRow, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_BLOCK_SYNC,
+};
 use zakura_sim::{
     harness::{
         block_node::{
@@ -460,8 +463,8 @@ fn the_probe_gets_the_range_it_asks_for() {
 }
 
 /// An ending for a range nobody asked for breaks the stream-6 table: the
-/// node's stream reader refuses it, the probe's connection closes with
-/// `ordered_read_rejected`, and a step gated on that closure runs. The
+/// node's stream reader refuses it, the probe's connection closes with the
+/// fault `reg-close-6`, and a step gated on that closure runs. The
 /// mirror's link stays open, and the node still converges.
 #[test]
 fn an_unsolicited_probe_ending_closes_only_the_probe() {
@@ -500,7 +503,14 @@ fn an_unsolicited_probe_ending_closes_only_the_probe() {
             .find(|link| link.peer == PROBE)
             .expect("the probe links");
         assert!(probe.is_closed());
-        assert_eq!(probe.cause.get(), Some("ordered_read_rejected"));
+        assert_eq!(
+            probe.cause.get(),
+            Some(CloseOutcome::fault(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                CloseRow::REG_CLOSE_6,
+            ))
+        );
         let mirror = links
             .iter()
             .find(|link| link.peer == "mirror-0")

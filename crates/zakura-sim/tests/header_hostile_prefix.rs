@@ -867,18 +867,18 @@ fn every_recovery_ends_within_its_window() {
 /// A source's own cooldown of the node, after a prefix that held the
 /// node's serving storage, isn't the node refusing its source. The node is
 /// at A8 and the source behind at A2. Every read lease the node takes to
-/// serve it is held, so the source times out three requests and drops the
-/// node, and the recover comes at that drop. Recovery's first relink is
-/// refused, and it waits a cooldown before the next, which is admitted, so
-/// it never ends unreached, under 8 plans. Nothing is owed, since the node
-/// holds the heaviest chain.
+/// serve it is held, so the source's first request times out, which ends
+/// its session with the node, and the recover comes at that end. Recovery's
+/// first relink is refused, and it waits a cooldown before the next, which
+/// is admitted, so it never ends unreached, under 8 plans. Nothing is owed,
+/// since the node holds the heaviest chain.
 #[test]
 fn a_source_cooling_down_on_the_node_isnt_unreached() {
     let mut scenario = StorageScenario {
         node: Chain::main(8),
-        ..storage_witnesses::recovering(vec![storage_witnesses::recover(Some(Trigger::Closed(
-            storage_witnesses::SOURCE.to_owned(),
-        )))])
+        ..storage_witnesses::recovering(vec![storage_witnesses::recover(Some(
+            Trigger::SessionEnded(storage_witnesses::SOURCE.to_owned()),
+        ))])
     };
     scenario.mirrors[0].chain = Chain::main(2);
     scenario.policy.holds.push(storage_witnesses::hold(

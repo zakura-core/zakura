@@ -13,6 +13,7 @@ use zakura_rt::collections::HashMap;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
 
+use super::transport::{CloseOutcome, CloseRow, NeutralCause};
 use crate::{protocol::external::types::Nonce, VersionMessage};
 
 /// The Zcash command used for Zakura upgrade prelude messages.
@@ -1324,6 +1325,28 @@ impl PreludeRejection {
             Self::RequestWithoutId => "request_without_id",
             Self::UndersizedFrameCap => "undersized_frame_cap",
             Self::IneligibleOpener => "unexpected_stream",
+        }
+    }
+
+    /// The close outcome for a refusal of `prelude` that closes the connection.
+    ///
+    /// A request ID on a persistent stream, a request stream without one and a
+    /// frame cap with no room for a payload are faults. An ineligible opener
+    /// is neutral: the layouts disagree on who opens the stream. The other
+    /// refusals reset the stream and close nothing.
+    pub(crate) fn close_outcome(self, prelude: &StreamPrelude) -> CloseOutcome {
+        let fault = |row| CloseOutcome::fault(prelude.stream_kind, prelude.stream_version, row);
+        match self {
+            Self::UnexpectedRequestId => fault(CloseRow::CONN_CLOSE_14),
+            Self::RequestWithoutId => fault(CloseRow::CONN_CLOSE_15),
+            Self::UndersizedFrameCap => fault(CloseRow::CONN_CLOSE_16),
+            Self::BadPrelude
+            | Self::UnknownKind
+            | Self::UnnegotiatedCapability
+            | Self::UnselectedVersion
+            | Self::IneligibleOpener => {
+                CloseOutcome::neutral(NeutralCause::IncompatibleConfiguration, self.reason())
+            }
         }
     }
 }

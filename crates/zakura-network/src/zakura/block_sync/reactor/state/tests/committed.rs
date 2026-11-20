@@ -316,6 +316,7 @@ fn only_misbehavior_reports_are_optional_actions() {
         );
     }
     let misbehavior = BlockSyncAction::Misbehavior {
+        conn_id: None,
         peer: ZakuraPeerId::new(vec![1; 32]).expect("the test peer id is within bounds"),
         reason: crate::zakura::block_sync::BlockSyncMisbehavior::InvalidBlock,
     };

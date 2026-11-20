@@ -60,15 +60,15 @@ use super::peer_memory::{
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
-use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
+use super::regulation::{parks_on_exhaustion, CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
-    worker_framed_channel, AdmittedFrame, CompatResponseGrant, ConnectionResources, FrameGate,
-    FrameGrant, FramedWorkerRecv, HandshakeCounts, IpAdmission, NodeResources,
-    OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase,
-    ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout, StreamResources,
-    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
+    ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, IpAdmission,
+    NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound,
+    OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout,
+    StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -96,7 +96,8 @@ use crate::{
         ZakuraServiceId, ZakuraUpgradeDialStart, ZakuraValidationError, CONTROL_ACK_MAGIC,
         CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
         STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -669,7 +670,8 @@ pub struct ZakuraLocalLimits {
     /// Stream prelude read timeout.
     pub prelude_timeout: Duration,
     /// Control handshake deadline: it bounds each read and write, and the
-    /// whole exchange in both directions.
+    /// whole exchange in both directions. A responder measures it from the
+    /// QUIC admission, so TLS and the control exchange share it.
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
@@ -1704,8 +1706,13 @@ static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
+    /// Each peer's current registration generation.
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     ip_slots: IpSlots,
+    /// The [`admission_host`] each live registration charged in `ip_slots`.
+    /// A replaced registration keeps its charge until its own cleanup
+    /// deregisters it, because its connection still runs until then.
+    ip_charges: HashMap<ZakuraConnId, IpAddr>,
     next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
     next_registration_id: ZakuraConnId,
@@ -1718,27 +1725,35 @@ struct ZakuraPeerConnectionEntry {
     conn_id: ZakuraConnId,
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
+    /// The connection's close outcome, which a tampered body records.
+    close_cause: CloseCause,
     registered_at: Instant,
-    /// The [`admission_host`] this connection is charged to, if its IP is
-    /// known.
-    host: Option<IpAddr>,
 }
 
 impl ZakuraSupervisorState {
-    fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
-        if let Some(remote_ip) = remote_ip {
-            self.ip_slots.add_registered(remote_ip);
+    /// The [`admission_host`] that `conn_id` is charged to, if its IP is known.
+    fn host(&self, conn_id: ZakuraConnId) -> Option<IpAddr> {
+        self.ip_charges.get(&conn_id).copied()
+    }
+
+    /// Charges registration `conn_id` to `host` until [`Self::release_ip`].
+    fn charge_ip(&mut self, conn_id: ZakuraConnId, host: Option<IpAddr>) {
+        if let Some(host) = host {
+            self.ip_charges.insert(conn_id, host);
+            self.ip_slots.add_registered(host);
         }
     }
 
-    fn decrement_ip(&mut self, remote_ip: Option<IpAddr>) {
-        if let Some(remote_ip) = remote_ip {
-            self.ip_slots.remove_registered(remote_ip);
+    /// Returns the per-IP charge of registration `conn_id`, whether or not it
+    /// is still its peer's current generation. A second call releases nothing.
+    fn release_ip(&mut self, conn_id: ZakuraConnId) {
+        if let Some(host) = self.ip_charges.remove(&conn_id) {
+            self.ip_slots.remove_registered(host);
         }
     }
 
-    /// Checks that the per-IP registered totals match the active peer
-    /// registrations with known IPs, in debug builds.
+    /// Checks, in debug builds, that the per-IP registered totals match the
+    /// live registrations with known IPs.
     ///
     /// Simulator builds skip it. Its `IpSlots` lock is a scheduler point
     /// there, so a debug-only lock would give debug and release builds
@@ -1747,11 +1762,8 @@ impl ZakuraSupervisorState {
     fn debug_assert_accounting(&self) {
         debug_assert_eq!(
             self.ip_slots.registered_total(),
-            self.active_by_peer
-                .values()
-                .filter(|entry| entry.host.is_some())
-                .count(),
-            "Zakura per-IP registered totals must match active peer registrations with known IPs",
+            self.ip_charges.len(),
+            "Zakura per-IP registered totals must match live registrations with known IPs",
         );
     }
 
@@ -1919,6 +1931,7 @@ impl ZakuraSupervisorHandle {
                 [6; TRANSCRIPT_HASH_BYTES],
                 handle,
                 CancellationToken::new(),
+                CloseCause::new(),
                 super::ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -1950,6 +1963,7 @@ impl ZakuraSupervisorHandle {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 ip_slots: ip_slots.clone(),
+                ip_charges: HashMap::new(),
                 next_handoff_id: 1,
                 max_connections_per_ip,
                 next_registration_id: 1,
@@ -2060,33 +2074,37 @@ impl ZakuraSupervisorHandle {
     pub async fn enforce_block_sync_misbehavior(
         &self,
         peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
         reason: &crate::zakura::BlockSyncMisbehavior,
     ) -> bool {
         if !reason.proves_tampered_body() {
             return false;
         }
-        let token = {
+        let disconnected = {
             let state = self.inner.lock().await;
             state
                 .active_by_peer
                 .get(peer_id)
-                .map(|entry| entry.disconnect_token.clone())
+                .filter(|entry| entry.conn_id == conn_id && !entry.disconnect_token.is_cancelled())
+                .is_some_and(|entry| {
+                    entry.close_cause.record(CloseOutcome::fault(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        CloseRow::BSYNC_CLOSE_18,
+                    ));
+                    entry.disconnect_token.cancel();
+                    true
+                })
         };
-        // Count only connections this call closes, not a peer that already left
-        // or a connection that is already shutting down.
-        let disconnected = token.is_some_and(|token| {
-            let already_closing = token.is_cancelled();
-            token.cancel();
-            !already_closing
-        });
         if disconnected {
             metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
         }
         info!(
             ?peer_id,
+            conn_id,
             ?reason,
             disconnected,
-            "disconnecting Zakura peer that served a tampered block body"
+            "recorded tampered block body verdict for Zakura connection"
         );
         disconnected
     }
@@ -2118,6 +2136,7 @@ impl ZakuraSupervisorHandle {
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
         disconnect_token: CancellationToken,
+        close_cause: CloseCause,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         // Discovery matches the registered IP against advertised addresses,
@@ -2136,7 +2155,7 @@ impl ZakuraSupervisorHandle {
         let same_ip_duplicate_redial = state
             .active_by_peer
             .get(&peer_id)
-            .is_some_and(|entry| entry.host == host);
+            .is_some_and(|entry| state.host(entry.conn_id) == host);
         if let Some(host) = host {
             if !state.ip_slots.counts().can_register(
                 host,
@@ -2167,15 +2186,17 @@ impl ZakuraSupervisorHandle {
                     conn_id,
                     outbound_handle,
                     disconnect_token,
+                    close_cause,
                     registered_at: Instant::now(),
-                    host,
                 };
+                // The replaced registration keeps its per-IP charge until its
+                // own cleanup guard deregisters it, because its connection
+                // still runs until then.
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
-                    state.decrement_ip(old_entry.host);
                     old_entry.disconnect_token.cancel();
                     metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
-                state.increment_ip(host);
+                state.charge_ip(conn_id, host);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
@@ -2235,21 +2256,20 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Releases registration `conn_id`'s per-IP charge, and removes it from
+    /// `peer_id`'s current generation if it still is that generation.
     async fn deregister(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let mut state = self.inner.lock().await;
-        let Some(entry) = state.active_by_peer.get(peer_id) else {
-            state.debug_assert_accounting();
-            return;
-        };
-        if entry.conn_id != conn_id {
+        state.release_ip(conn_id);
+        if state
+            .active_by_peer
+            .get(peer_id)
+            .is_none_or(|entry| entry.conn_id != conn_id)
+        {
             state.debug_assert_accounting();
             return;
         }
-        let entry = state
-            .active_by_peer
-            .remove(peer_id)
-            .expect("peer entry exists because it was just checked");
-        state.decrement_ip(entry.host);
+        state.active_by_peer.remove(peer_id);
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
@@ -2306,6 +2326,10 @@ enum ZakuraRegistration {
     Rejected(ZakuraRejectReason),
 }
 
+/// Ends one registration when its connection ends: it cancels the connection,
+/// removes its service admissions and deregisters it. Deregistration returns
+/// the registration's per-IP charge even after a replacement took its peer's
+/// current generation.
 #[derive(Debug)]
 struct RegisteredPeerCleanupGuard {
     supervisor: ZakuraSupervisorHandle,
@@ -2465,15 +2489,23 @@ struct StreamWorkerContext {
     stream_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
+    /// The stream kind and version a fault on this stream names.
+    kind_version: (u16, u16),
 }
 
 impl StreamWorkerContext {
+    /// The stream kind and version a fault on this stream names.
+    fn stream(&self) -> (u16, u16) {
+        self.kind_version
+    }
+
     /// Credit a pause in which this reader waited for its own handler.
     fn credit_read_pause(&self, paused: Duration) {
         let (Some(cadence), Some(rules)) = (&self.cadence, self.messages) else {
             return;
         };
-        if paused.is_zero() {
+        // A reader that enforces cadence has a wall-clock dispatch budget.
+        if cadence.parks || paused.is_zero() {
             return;
         }
         cadence
@@ -2481,6 +2513,38 @@ impl StreamWorkerContext {
             .lock()
             .expect("Zakura cadence bucket mutex is never poisoned")
             .credit_pause(cadence.layout, rules, paused);
+    }
+
+    /// Wait until the cadence bucket of `frame`'s row holds a token, and take
+    /// it. Returns `false` if the stream or its connection was cancelled
+    /// first; the wait itself never closes anything.
+    ///
+    /// Call this only for a frame that [`admit_inbound_message`] parked. The
+    /// frame keeps its receive grant while it waits, and pays exactly one
+    /// token. The wait earns no pause credit, so it never refills the bucket
+    /// it waits on.
+    async fn park_for_cadence(&self, frame: &Frame) -> bool {
+        let (Some(cadence), Some(rules)) = (&self.cadence, self.messages) else {
+            return true;
+        };
+        let rule = MessageRule::find(rules, frame.message_type)
+            .expect("the frame filter admits only rows of the stream's table");
+        loop {
+            let taken = cadence
+                .buckets
+                .lock()
+                .expect("Zakura cadence bucket mutex is never poisoned")
+                .take_parked(cadence.layout, rule);
+            let Err(next_token) = taken else {
+                return true;
+            };
+            zakura_rt::select! {
+                biased;
+                _ = self.connection_token.cancelled() => return false,
+                _ = self.stream_token.cancelled() => return false,
+                () = zakura_rt::time::sleep_until(next_token) => {}
+            }
+        }
     }
 }
 
@@ -2829,6 +2893,9 @@ pub(crate) enum InboundMessageAdmission {
     Throttled,
     /// A metered row overran its connection's byte bucket.
     ByteRateOverrun,
+    /// The row's cadence bucket is empty, and the stream's reader waits for
+    /// a token before it forwards the frame. See [`parks_on_exhaustion`].
+    Park,
 }
 
 fn admit_inbound_message(
@@ -2863,12 +2930,17 @@ fn admit_inbound_message(
         return admit_tabled_message(
             frame,
             rules,
+            cadence.parks,
             |rule, payload_len| {
-                cadence
+                let mut buckets = cadence
                     .buckets
                     .lock()
-                    .expect("Zakura cadence bucket mutex is never poisoned")
-                    .charge_frame(cadence.layout, rule, payload_len)
+                    .expect("Zakura cadence bucket mutex is never poisoned");
+                if cadence.parks {
+                    buckets.charge_dispatch(cadence.layout, rule)
+                } else {
+                    buckets.charge_frame(cadence.layout, rule, payload_len)
+                }
             },
             || {
                 context.conn.trace_rate_limit(
@@ -2924,7 +2996,8 @@ fn admit_inbound_message(
 /// frame's row and charges the row's bucket through `charge`, with the
 /// frame's payload length. If a metered row's frame overran its byte bucket,
 /// it calls `overrun` and refuses the frame. If the bucket was empty, it
-/// calls `exhausted`, and an empty bucket doesn't refuse the frame.
+/// calls `exhausted`. An empty bucket never refuses the frame: it parks the
+/// frame if the stream's reader `parks`, and admits it otherwise.
 ///
 /// # Panics
 ///
@@ -2933,6 +3006,7 @@ fn admit_inbound_message(
 pub(crate) fn admit_tabled_message(
     frame: &Frame,
     rules: &[MessageRule],
+    parks: bool,
     charge: impl FnOnce(&MessageRule, usize) -> CadenceCharge,
     overrun: impl FnOnce(),
     exhausted: impl FnOnce(),
@@ -2947,9 +3021,13 @@ pub(crate) fn admit_tabled_message(
         return InboundMessageAdmission::ByteRateOverrun;
     }
     // A sibling stream can keep the connection alive during an unbounded
-    // transport stall. Exhaustion cannot prove a sender violation.
+    // transport stall. Exhaustion cannot prove a sender violation, so it
+    // waits or passes, and never closes.
     if charge == CadenceCharge::Exhausted {
         exhausted();
+        if parks {
+            return InboundMessageAdmission::Park;
+        }
     }
     InboundMessageAdmission::Admit
 }
@@ -2959,19 +3037,19 @@ impl InboundMessageAdmission {
     /// `None` if it admits the frame.
     pub(crate) fn ordered_error(self) -> Option<ZakuraHandlerError> {
         match self {
-            InboundMessageAdmission::Admit => None,
+            InboundMessageAdmission::Admit | InboundMessageAdmission::Park => None,
             InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
             InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
             InboundMessageAdmission::ByteRateOverrun => Some(ZakuraHandlerError::ByteRateOverrun),
         }
     }
 
-    /// The close cause the ordered stream reader records for this result,
-    /// or `None` if it admits the frame.
+    /// The close outcome the reader of the `(kind, version)` ordered stream
+    /// records for this result, or `None` if it admits the frame.
     #[cfg(any(test, zakura_sim))]
-    pub(crate) fn ordered_close_cause(self) -> Option<&'static str> {
+    pub(crate) fn ordered_close_outcome(self, stream: (u16, u16)) -> Option<CloseOutcome> {
         self.ordered_error()
-            .map(|error| read_close_cause(ReadPath::Ordered, &error))
+            .map(|error| read_close_outcome(ReadPath::Ordered, stream, &error))
     }
 }
 
@@ -3332,18 +3410,15 @@ impl ZakuraProtocolHandler {
         self
     }
 
-    /// Returns an inbound attempt's cadence token. `action` names the reason in
-    /// the sim's cadence observation.
-    fn refund_cadence(&self, remote: SocketAddr, validated: bool, action: &'static str) {
+    /// Return both cadence charges for an admission cancelled before TLS.
+    fn refund_cadence(&self, remote: SocketAddr, validated: bool) {
         let mut counts = self.supervisor.ip_slots.counts();
         counts.refund_cadence(remote.ip(), validated, Instant::now());
         #[cfg(any(test, zakura_sim))]
         let hosts = counts.cadence_hosts(validated);
         drop(counts);
         #[cfg(any(test, zakura_sim))]
-        self.observe_handshake_cadence(remote, validated, action, hosts);
-        #[cfg(not(any(test, zakura_sim)))]
-        let _ = action;
+        self.observe_handshake_cadence(remote, validated, "cancelled", hosts);
     }
 
     /// Reports a handshake cadence decision for `remote`. The caller reads
@@ -3673,9 +3748,15 @@ impl ZakuraProtocolHandler {
         };
         let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
-        // The overall deadline bounds peers that pace each control step.
+        // One deadline from admission bounds the whole handshake: the control
+        // exchange gets what TLS left of `control_timeout`, so a peer that
+        // paces each stage holds the slot for `control_timeout` at most.
+        let remaining = self
+            .limits
+            .control_timeout
+            .saturating_sub(connection.admitted_at().elapsed());
         let result = match timeout(
-            self.limits.control_timeout,
+            remaining,
             self.run_native_responder_handshake(connection, remote_peer_id, conn),
         )
         .await
@@ -3895,7 +3976,10 @@ impl ZakuraProtocolHandler {
                 "closing Zakura peer because negotiated ordered streams exceed max-open-streams"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
-            close_cause.record("resource_ordered_streams");
+            close_cause.record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "resource_ordered_streams",
+            ));
             connection_token.cancel();
         } else if !negotiated_ordered_streams.is_empty()
             && usize::from(limits.max_inbound_queue_depth)
@@ -3907,7 +3991,10 @@ impl ZakuraProtocolHandler {
                 "closing Zakura peer because inbound queue depth cannot be split across ordered streams"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
-            close_cause.record("resource_queue_split");
+            close_cause.record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "resource_queue_split",
+            ));
             connection_token.cancel();
         }
         let queue_split_stream_count = negotiated_ordered_streams.len().max(ordered_streams.len());
@@ -3981,7 +4068,10 @@ impl ZakuraProtocolHandler {
                             VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
                             b"ordered stream setup",
                         );
-                        close_cause.record("stream_setup_failed");
+                        close_cause.record(CloseOutcome::neutral(
+                            NeutralCause::IoFailure,
+                            "stream_setup_failed",
+                        ));
                         connection_token.cancel();
                         break;
                     }
@@ -3995,18 +4085,19 @@ impl ZakuraProtocolHandler {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
-                let admitted_capabilities =
-                    self.registry
-                        .add_escalated_peer(Peer::new_with_service_streams(
-                            conn_id,
-                            peer_id.clone(),
-                            remote_ip,
-                            opened_capabilities,
-                            context.direction,
-                            std::mem::take(&mut service_streams),
-                            connection_token.clone(),
-                            close_cause.clone(),
-                        ));
+                let admitted_capabilities = self.registry.add_escalated_peer(
+                    Peer::new_with_service_streams(
+                        conn_id,
+                        peer_id.clone(),
+                        remote_ip,
+                        opened_capabilities,
+                        context.direction,
+                        std::mem::take(&mut service_streams),
+                        connection_token.clone(),
+                        close_cause.clone(),
+                    )
+                    .with_rtt_reader(Some(connection.rtt_reader())),
+                );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
@@ -4039,7 +4130,8 @@ impl ZakuraProtocolHandler {
                 } => pending_sessions.expire(Instant::now()),
                 _ = freshness_reaper(freshness_rx.clone(), limits.idle_timeout), if run_freshness_reaper => {
                     connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"idle");
-                    close_cause.record("idle_timeout");
+                    close_cause
+                        .record(CloseOutcome::neutral(NeutralCause::Timeout, "idle_timeout"));
                     break;
                 }
                 Some(exited) = session_exit_rx.recv() => {
@@ -4125,7 +4217,8 @@ impl ZakuraProtocolHandler {
                                     service_streams,
                                     connection_token.clone(),
                                     close_cause.clone(),
-                                ),
+                                )
+                                .with_rtt_reader(Some(connection.rtt_reader())),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
@@ -4188,7 +4281,10 @@ impl ZakuraProtocolHandler {
                                 stream_kind = kind,
                                 "closing peer after unexpected ordered stream"
                             );
-                            close_cause.record("unexpected_stream");
+                            close_cause.record(CloseOutcome::neutral(
+                                NeutralCause::IncompatibleConfiguration,
+                                "unexpected_stream",
+                            ));
                             connection_token.cancel();
                             continue;
                         };
@@ -4249,7 +4345,8 @@ impl ZakuraProtocolHandler {
                                 service_streams,
                                 connection_token.clone(),
                                 close_cause.clone(),
-                            ),
+                            )
+                            .with_rtt_reader(Some(connection.rtt_reader())),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                     }
@@ -4277,14 +4374,20 @@ impl ZakuraProtocolHandler {
                         }
                         Err(error) => {
                             debug!(?error, "Zakura connection stopped accepting streams");
-                            close_cause.record("accept_failed");
+                            close_cause.record(CloseOutcome::neutral(
+                                NeutralCause::IoFailure,
+                                "accept_failed",
+                            ));
                             break;
                         }
                     }
                 }
                 outbound = outbound_rx.recv() => {
                     let Some(outbound) = outbound else {
-                        close_cause.record("outbound_closed");
+                        close_cause.record(CloseOutcome::neutral(
+                            NeutralCause::LocalCancellation,
+                            "outbound_closed",
+                        ));
                         break;
                     };
                     match outbound {
@@ -4337,7 +4440,10 @@ impl ZakuraProtocolHandler {
                                         VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE),
                                         b"malformed response",
                                     );
-                                    close_cause.record("bad_response");
+                                    close_cause.record(CloseOutcome::neutral(
+                                        NeutralCause::IoFailure,
+                                        "bad_response",
+                                    ));
                                     connection_token.cancel();
                                     let _ = completion.send(Err(error));
                                 }
@@ -4620,7 +4726,7 @@ impl ZakuraProtocolHandler {
                 debug!("rejecting non-request Zakura stream with request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let rejection = super::handshake::PreludeRejection::UnexpectedRequestId;
-                close_cause.record(rejection.reason());
+                close_cause.record(rejection.close_outcome(&prelude));
                 #[cfg(any(test, zakura_sim))]
                 report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
@@ -4637,7 +4743,7 @@ impl ZakuraProtocolHandler {
                 debug!("rejecting Zakura request stream without request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let rejection = super::handshake::PreludeRejection::RequestWithoutId;
-                close_cause.record(rejection.reason());
+                close_cause.record(rejection.close_outcome(&prelude));
                 #[cfg(any(test, zakura_sim))]
                 report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
@@ -4655,7 +4761,7 @@ impl ZakuraProtocolHandler {
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let rejection = super::handshake::PreludeRejection::UndersizedFrameCap;
-                close_cause.record(rejection.reason());
+                close_cause.record(rejection.close_outcome(&prelude));
                 #[cfg(any(test, zakura_sim))]
                 report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
@@ -4678,7 +4784,7 @@ impl ZakuraProtocolHandler {
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let rejection = super::handshake::PreludeRejection::IneligibleOpener;
-                close_cause.record(rejection.reason());
+                close_cause.record(rejection.close_outcome(&prelude));
                 #[cfg(any(test, zakura_sim))]
                 report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
@@ -4797,6 +4903,7 @@ impl ZakuraProtocolHandler {
             stream_token,
             close_cause: admission.close_cause.clone(),
             freshness_tx: admission.freshness_tx.clone(),
+            kind_version: (stream.kind, stream.version),
         };
 
         if let Some((layout, wire_id)) = session {
@@ -4812,7 +4919,11 @@ impl ZakuraProtocolHandler {
                 Ok(None) => None,
                 Err(error) => {
                     debug!(?error, "rejecting mismatched service session");
-                    admission.close_cause.record("invalid_service_session");
+                    admission.close_cause.record(CloseOutcome::fault(
+                        prelude.stream_kind,
+                        prelude.stream_version,
+                        CloseRow::CONN_CLOSE_17,
+                    ));
                     admission.connection_token.cancel();
                     None
                 }
@@ -4907,6 +5018,7 @@ impl ZakuraProtocolHandler {
                 context.transcript_hash,
                 outbound_handle,
                 connection_token.clone(),
+                close_cause.clone(),
                 context.accepted_capabilities,
             )
             .await;
@@ -4933,18 +5045,8 @@ impl ZakuraProtocolHandler {
                 .await;
         }
         // A registered connection now counts as registered in `ip_slots`.
+        // It keeps its cadence token, so reconnecting costs a token.
         drop(context.control_handshake);
-        // Registration refunds the attempt's cadence token, even when a local
-        // capability change closes the connection below.
-        if matches!(registration, ZakuraRegistration::Registered { .. })
-            && context.direction == ServicePeerDirection::Inbound
-        {
-            self.refund_cadence(
-                connection.admitted_addr(),
-                connection.source_validated(),
-                "registered",
-            );
-        }
         if let ZakuraRegistration::Registered {
             conn_id,
             peer_id,
@@ -5180,6 +5282,7 @@ impl Acceptor for ZakuraProtocolHandler {
                 super::HandshakeCadenceAdmission::Admit => "admitted",
                 super::HandshakeCadenceAdmission::Exhausted => "exhausted",
                 super::HandshakeCadenceAdmission::Capacity => "capacity",
+                super::HandshakeCadenceAdmission::NodeExhausted => "node-exhausted",
             },
             hosts,
         );
@@ -5191,12 +5294,17 @@ impl Acceptor for ZakuraProtocolHandler {
                 "zakura.p2p.conn.retried.cadence",
                 "zakura.p2p.conn.rejected.cadence",
             ),
+            super::HandshakeCadenceAdmission::NodeExhausted => retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.node_cadence",
+                "zakura.p2p.conn.rejected.node_cadence",
+            ),
         }
     }
 
     fn cancel_admission(&self, incoming: &IncomingInfo) {
         self.finish_admission(false);
-        self.refund_cadence(incoming.remote, incoming.validated, "cancelled");
+        self.refund_cadence(incoming.remote, incoming.validated);
     }
 
     fn finish_admission(&self, handed_off: bool) {
@@ -5219,13 +5327,8 @@ impl Acceptor for ZakuraProtocolHandler {
         let handler = self.clone();
         let claim = handler.claim_inbound(&connection, true);
         if claim.is_err() {
+            // TLS already ran. Return the pending slot and keep both rate charges.
             handler.finish_admission(false);
-            // Dials took the room during TLS, so the refusal is local.
-            handler.refund_cadence(
-                connection.admitted_addr(),
-                connection.source_validated(),
-                "refused",
-            );
         }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
@@ -6394,7 +6497,7 @@ async fn persistent_stream_worker_with_policy(
     // Reading and forwarding may both block. Keep them independent of writes
     // so waiting for inbound channel space cannot stall an outgoing response.
     // A dedicated reader also preserves partial frame reads across outbound writes.
-    let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
+    let (close_tx, mut close_rx) = mpsc::channel::<(u32, CloseOutcome)>(1);
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
@@ -6412,6 +6515,10 @@ async fn persistent_stream_worker_with_policy(
             _ = inbound_tx.closed() => reader_context.precheck.start(),
         }
         reader_context.credit_read_pause(waiting_since.elapsed());
+        let paced_dispatch = reader_context
+            .cadence
+            .as_ref()
+            .is_some_and(|scope| scope.parks);
         loop {
             let frame = zakura_rt::select! {
                 biased;
@@ -6441,26 +6548,53 @@ async fn persistent_stream_worker_with_policy(
                     // While the reader waited for raw capacity, the peer kept
                     // sending into transport buffers, as during a queue wait below.
                     reader_context.credit_read_pause(admitted.grant.waited());
-                    match admit_inbound_message(&admitted.frame, &reader_context, stream_kind)
-                        .ordered_error()
+                    // Charge paced work only when it has a service slot. A token
+                    // taken before a full-queue wait could outlive its burst.
+                    let slot = if paced_dispatch {
+                        zakura_rt::select! {
+                            biased;
+                            _ = reader_context.connection_token.cancelled() => break,
+                            _ = reader_context.stream_token.cancelled() => break,
+                            slot = inbound_tx.reserve() => slot.ok(),
+                        }
+                    } else {
+                        None
+                    };
+                    let admission =
+                        admit_inbound_message(&admitted.frame, &reader_context, stream_kind);
+                    // A parked frame holds back the rest of this stream, so QUIC
+                    // flow control slows the sender. Cancellation ends the wait.
+                    if admission == InboundMessageAdmission::Park
+                        && !reader_context.park_for_cadence(&admitted.frame).await
                     {
+                        break;
+                    }
+                    match admission.ordered_error() {
                         None => {
+                            if paced_dispatch && slot.is_none() {
+                                continue;
+                            }
                             #[cfg(any(test, zakura_sim))]
                             if let Some(tap) = reader_context.precheck.tap() {
                                 tap.queue_tag();
                             }
                             let waiting_since = Instant::now();
-                            let forwarded = zakura_rt::select! {
-                                biased;
-                                _ = reader_context.connection_token.cancelled() => break,
-                                _ = reader_context.stream_token.cancelled() => break,
-                                result = inbound_tx.send(admitted) => result,
+                            let forwarded = if let Some(slot) = slot {
+                                slot.send(admitted);
+                                true
+                            } else {
+                                zakura_rt::select! {
+                                    biased;
+                                    _ = reader_context.connection_token.cancelled() => break,
+                                    _ = reader_context.stream_token.cancelled() => break,
+                                    result = inbound_tx.send(admitted) => result.is_ok(),
+                                }
                             };
                             // While this reader waited for its own handler, the
                             // peer kept sending into transport buffers. Credit the
                             // pause so the buffered burst never counts against it.
                             reader_context.credit_read_pause(waiting_since.elapsed());
-                            if forwarded.is_err() {
+                            if !forwarded {
                                 #[cfg(any(test, zakura_sim))]
                                 if let Some(tap) = reader_context.precheck.tap() {
                                     tap.unqueue_tag();
@@ -6501,24 +6635,21 @@ async fn persistent_stream_worker_with_policy(
                     error
                 }
             };
-            // Any error is terminal. `Closed` is a clean peer-initiated close;
-            // every other error must disconnect the peer, under the cause
-            // `read_close_cause` gives it. Forward the error first so the main
-            // loop can map it to a reset code, then cancel the connection
-            // ourselves so the disconnect is guaranteed even if the main loop
-            // tore the worker down for a stopped outbound write before
-            // processing it.
-            let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
-            if !must_disconnect && !reader_context.stream_token.is_cancelled() {
-                if let Some(cause) = &reader_failure_cause {
-                    // Publish the cause before waking either the service EOF or
-                    // the sibling worker's cancellation path.
-                    cause.record(OrderedStreamFailure::RemoteClose);
+            let close = ordered_read_close(reader_context.stream(), &error);
+            let session_failure = match error {
+                ZakuraHandlerError::Closed => Some(OrderedStreamFailure::RemoteClose),
+                ZakuraHandlerError::Timeout(_) => Some(OrderedStreamFailure::ReadTimeout),
+                _ => None,
+            };
+            // Publish before the drop guard cancels the session or the service sees EOF.
+            if !reader_context.stream_token.is_cancelled() {
+                if let (Some(cause), Some(failure)) = (&reader_failure_cause, session_failure) {
+                    cause.record(failure);
                 }
             }
-            let cause = read_close_cause(ReadPath::Ordered, &error);
-            let _ = error_tx.send(error).await;
-            if must_disconnect {
+            if let Some((code, cause)) = close {
+                // The reader also closes the connection if the writer is blocked.
+                let _ = close_tx.send((code, cause)).await;
                 reader_context.close_cause.record(cause);
                 reader_context.connection_token.cancel();
             }
@@ -6611,7 +6742,10 @@ async fn persistent_stream_worker_with_policy(
                             }
                             debug!(stream_kind, stream_id = context.stream_id, ?error, "closing Zakura ordered stream writer");
                             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                            context.close_cause.record("ordered_write_error");
+                            context.close_cause.record(CloseOutcome::neutral(
+                                NeutralCause::IoFailure,
+                                "ordered_write_error",
+                            ));
                             context.connection_token.cancel();
                             break;
                         }
@@ -6621,17 +6755,15 @@ async fn persistent_stream_worker_with_policy(
                     }
                 }
             }
-            error = error_rx.recv() => {
-                if let Some(error) = error {
-                    if let Some((code, cause)) = ordered_read_close(&error) {
-                        // The reader already emitted any oversize-desync diagnostic.
-                        if code == ZAKURA_CLOSE_BAD_PRELUDE {
-                            debug!(?error, "closing Zakura stream worker");
-                        }
-                        let _ = send.reset(VarInt::from_u32(code));
-                        context.close_cause.record(cause);
-                        context.connection_token.cancel();
+            close = close_rx.recv() => {
+                if let Some((code, cause)) = close {
+                    // The reader already emitted any oversize-desync diagnostic.
+                    if code == ZAKURA_CLOSE_BAD_PRELUDE {
+                        debug!(?cause, "closing Zakura stream worker");
                     }
+                    let _ = send.reset(VarInt::from_u32(code));
+                    context.close_cause.record(cause);
+                    context.connection_token.cancel();
                 }
                 break;
             }
@@ -6653,18 +6785,21 @@ async fn persistent_stream_worker_with_policy(
 }
 
 /// How the ordered worker closes on an error its reader forwarded: the
-/// stream's reset code and the close cause to record. `None` is a clean
-/// close, which resets and records nothing.
-fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)> {
+/// stream's reset code and the connection close cause to record. A clean
+/// close or a frame timeout ends only the session.
+fn ordered_read_close(
+    stream: (u16, u16),
+    error: &ZakuraHandlerError,
+) -> Option<(u32, CloseOutcome)> {
     let code = match error {
-        ZakuraHandlerError::Closed => return None,
+        ZakuraHandlerError::Closed | ZakuraHandlerError::Timeout(_) => return None,
         ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
         ZakuraHandlerError::RateLimited | ZakuraHandlerError::ByteRateOverrun => {
             ZAKURA_CLOSE_RATE_LIMIT
         }
         _ => ZAKURA_CLOSE_BAD_PRELUDE,
     };
-    Some((code, read_close_cause(ReadPath::Ordered, error)))
+    Some((code, read_close_outcome(ReadPath::Ordered, stream, error)))
 }
 
 /// The frame reader that hit a read error.
@@ -6676,35 +6811,34 @@ enum ReadPath {
     Request,
 }
 
-/// The close cause for a frame-read error on `path`.
+/// The close outcome for a frame-read error on `path`, on the `(kind,
+/// version)` stream.
 ///
-/// Only the `*_read_rejected` causes are peer faults: the frame broke its
-/// stream's table or frame cap, or ended before its declared length. Timeout
-/// and transport causes are neutral, and every unlisted error (such as `Io`)
-/// is transport. A request stream that closes before its request frame ends is
-/// transport too. The ordered path never records `Closed`, which is a clean close.
-///
-/// The ordered reader and its worker race to record one error, and
-/// [`CloseCause`] keeps the first writer, so both record through this. That
-/// includes the reader's admission failures, which keep their own causes.
-fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str {
+/// A broken frame rule or truncated payload assigns a fault. A rate limit
+/// or transport failure assigns a neutral cause. The ordered reader handles
+/// an orderly end and both readers handle frame timeouts before this mapping.
+fn read_close_outcome(
+    path: ReadPath,
+    (kind, version): (u16, u16),
+    error: &ZakuraHandlerError,
+) -> CloseOutcome {
     use zakura_quic::ReadExactError::FinishedEarly;
     use ZakuraHandlerError::*;
 
-    let rejected = matches!(
-        error,
-        RejectedFrame { .. } | OversizeFrame { .. } | QuicRead(FinishedEarly(_))
-    );
+    let fault = |row| CloseOutcome::fault(kind, version, row);
     match (path, error) {
-        (ReadPath::Ordered, Oversize) => "ordered_oversize",
-        (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
-        (ReadPath::Ordered, ByteRateOverrun) => "ordered_byte_rate_overrun",
-        (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
-        (ReadPath::Request, _) if rejected => "request_read_rejected",
-        (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
-        (ReadPath::Request, Timeout(_)) => "request_read_timeout",
-        (ReadPath::Ordered, _) => "ordered_read_transport",
-        (ReadPath::Request, _) => "request_read_transport",
+        (_, RejectedFrame { rejection, .. }) => fault(rejection.close_row()),
+        (_, OversizeFrame { .. }) => fault(CloseRow::REG_CLOSE_1),
+        (_, QuicRead(FinishedEarly(_)))
+        | (ReadPath::Ordered, Oversize)
+        | (ReadPath::Ordered, ByteRateOverrun) => fault(CloseRow::CONN_CLOSE_18),
+        (ReadPath::Ordered, RateLimited) => CloseOutcome::ORDERED_RATE_LIMITED,
+        (ReadPath::Ordered, _) => {
+            CloseOutcome::neutral(NeutralCause::IoFailure, "ordered_read_transport")
+        }
+        (ReadPath::Request, _) => {
+            CloseOutcome::neutral(NeutralCause::IoFailure, "request_read_transport")
+        }
     }
 }
 
@@ -6744,7 +6878,11 @@ async fn request_stream_worker(
 ) {
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-        context.close_cause.record("request_without_id");
+        context.close_cause.record(CloseOutcome::fault(
+            prelude.stream_kind,
+            prelude.stream_version,
+            CloseRow::CONN_CLOSE_15,
+        ));
         context.connection_token.cancel();
         return;
     };
@@ -6768,15 +6906,22 @@ async fn request_stream_worker(
     // The raw frame stays funded until its service's call ends.
     let (frame, raw_grant) = match frame {
         Ok(AdmittedFrame { frame, grant }) => (frame, grant),
+        Err(ZakuraHandlerError::Timeout(_)) => {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+            return;
+        }
         Err(error) => {
             debug!(
                 ?error,
                 "closing Zakura request stream with invalid request frame"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context
-                .close_cause
-                .record(read_close_cause(ReadPath::Request, &error));
+            context.close_cause.record(read_close_outcome(
+                ReadPath::Request,
+                context.stream(),
+                &error,
+            ));
             context.connection_token.cancel();
             return;
         }
@@ -6785,9 +6930,19 @@ async fn request_stream_worker(
     let _ = context.freshness_tx.send(Instant::now());
     match admit_inbound_message(&frame, &context, prelude.stream_kind) {
         InboundMessageAdmission::Admit => {}
+        InboundMessageAdmission::Park => {
+            // The raw frame keeps its grant while the request waits.
+            if !context.park_for_cadence(&frame).await {
+                return;
+            }
+        }
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-            context.close_cause.record("request_oversize");
+            context.close_cause.record(CloseOutcome::fault(
+                prelude.stream_kind,
+                prelude.stream_version,
+                CloseRow::CONN_CLOSE_22,
+            ));
             context.connection_token.cancel();
             return;
         }
@@ -6795,7 +6950,11 @@ async fn request_stream_worker(
             // The layout keeps metered rows off request streams, so this is
             // unreachable today. Close as a persistent reader would.
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-            context.close_cause.record("request_byte_rate_overrun");
+            context.close_cause.record(CloseOutcome::fault(
+                prelude.stream_kind,
+                prelude.stream_version,
+                CloseRow::CONN_CLOSE_18,
+            ));
             context.connection_token.cancel();
             return;
         }
@@ -6844,14 +7003,18 @@ async fn request_stream_worker(
         output = context.resources.output.admit(bound.bytes) => output,
         stop = &mut stopped => {
             if stop.is_ok() {
-                if let Err(SinkReject::Protocol(error)) =
+                if let Err(SinkReject::Protocol(row, error)) =
                     registry.check_request(prelude.stream_kind, &frame)
                 {
                     debug!(
                         ?error,
                         "Zakura inbound sink rejected a stopped protocol-invalid request"
                     );
-                    context.close_cause.record("request_protocol_reject");
+                    context.close_cause.record(CloseOutcome::fault(
+                        prelude.stream_kind,
+                        prelude.stream_version,
+                        row,
+                    ));
                     context.connection_token.cancel();
                 }
             }
@@ -6880,13 +7043,17 @@ async fn request_stream_worker(
     drop(raw_grant);
     let response_frames = match response {
         Ok(frames) => frames,
-        Err(SinkReject::Protocol(error)) => {
+        Err(SinkReject::Protocol(row, error)) => {
             debug!(
                 ?error,
                 "Zakura inbound sink rejected protocol-invalid request"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.close_cause.record("request_protocol_reject");
+            context.close_cause.record(CloseOutcome::fault(
+                prelude.stream_kind,
+                prelude.stream_version,
+                row,
+            ));
             context.connection_token.cancel();
             return;
         }
@@ -8439,6 +8606,9 @@ struct CadenceScope {
     buckets: SharedCadenceBuckets,
     /// The primary stream kind of the stream's layout, which keys its buckets.
     layout: u16,
+    /// Whether the stream's reader waits for a token when a bucket is empty.
+    /// See [`parks_on_exhaustion`].
+    parks: bool,
 }
 
 /// The cadence scope for `stream` in `layout`, if the stream has a table.
@@ -8447,9 +8617,10 @@ fn cadence_scope(
     stream: Stream,
     layout: u16,
 ) -> Option<CadenceScope> {
-    stream.messages.map(|_| CadenceScope {
+    stream.messages.map(|rules| CadenceScope {
         buckets: buckets.cadence.clone(),
         layout,
+        parks: parks_on_exhaustion(rules),
     })
 }
 
@@ -8659,13 +8830,16 @@ impl ZakuraHandlerError {
 
 #[cfg(all(test, not(zakura_sim)))]
 mod tests {
+    mod admission_rate;
     mod bounded_decoding;
+    mod cadence_park;
     pub(super) mod connection;
     mod frame_lifetime;
     #[cfg(not(zakura_sim))]
     mod handshake_cost;
     mod quic_progress;
     mod read_close_cause;
+    mod teardown;
     mod transport_observer;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;
@@ -9316,6 +9490,7 @@ mod tests {
                 [6; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer_id.clone(), outbound_tx),
                 CancellationToken::new(),
+                CloseCause::new(),
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -9403,6 +9578,7 @@ mod tests {
                     [0; TRANSCRIPT_HASH_BYTES],
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
                     CancellationToken::new(),
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP,
                 )
                 .await,
@@ -9444,6 +9620,7 @@ mod tests {
                     transcript_hash,
                     outbound_handle,
                     token,
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -9498,7 +9675,7 @@ mod tests {
                 .get(&peer)
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
-            assert_eq!(entry.host, Some(remote_ip));
+            assert_eq!(state.host(entry.conn_id), Some(remote_ip));
             assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }
@@ -9931,7 +10108,7 @@ mod tests {
         supervisor: &ZakuraSupervisorHandle,
         peer: ZakuraPeerId,
         disconnect_token: CancellationToken,
-    ) {
+    ) -> ZakuraConnId {
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
         let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
         let registration = supervisor
@@ -9942,14 +10119,12 @@ mod tests {
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 outbound_handle,
                 disconnect_token,
+                CloseCause::new(),
                 ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
             )
             .await;
 
-        assert!(
-            matches!(registration, ZakuraRegistration::Registered { .. }),
-            "test peer should register once"
-        );
+        registered_conn_id(registration)
     }
 
     async fn register_test_peer_with_hash_and_ip(
@@ -9970,6 +10145,7 @@ mod tests {
                 transcript_hash,
                 outbound_handle,
                 disconnect_token,
+                CloseCause::new(),
                 ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
             )
             .await
@@ -10876,6 +11052,108 @@ mod tests {
         Ok(())
     }
 
+    /// A header-sync frame read that times out ends the session as a stall,
+    /// not a disconnect. The first stall leaves the connection up. A second
+    /// read timeout on the same connection closes it under the stall policy.
+    #[tokio::test(start_paused = true)]
+    async fn header_sync_read_timeouts_follow_the_stall_rule() -> Result<(), BoxError> {
+        use crate::zakura::regulation::STALL_POLICY;
+
+        let shutdown = CancellationToken::new();
+        let mut startup = header_sync_startup(shutdown.clone());
+        let cooldown = startup.config.unproductive_peer_cooldown;
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let snapshot = zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized: anchor,
+                header_best: anchor,
+                verified_best: anchor,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                anchor.hash,
+            ),
+            oldest_retained_height: anchor.height,
+            alarms: Default::default(),
+        };
+        let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+        startup.committed_snapshots = Some(snapshot_rx);
+        let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
+        let service = HeaderSyncService::new(header_sync);
+        let peer = test_peer(19);
+        let conn_id = test_conn_id();
+        let connection_cancel = CancellationToken::new();
+        let close_cause = CloseCause::new();
+
+        for session_id in [7, 8] {
+            let (inbound_tx, inbound_rx) = crate::zakura::framed_channel(8);
+            let failure = OrderedStreamFailureCause::default();
+            let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(8);
+            let streams = HashMap::from([(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ServiceStream::new(
+                    session_id,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                    inbound_rx.with_failure_cause(failure.clone()),
+                    outbound_tx,
+                    connection_cancel.child_token(),
+                ),
+            )]);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_HEADER_SYNC,
+                ServicePeerDirection::Inbound,
+                streams,
+                connection_cancel.clone(),
+                close_cause.clone(),
+            ));
+            tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+                .await?
+                .ok_or("the admitted session sends its status")?;
+
+            let open_now = || {
+                matches!(
+                    service.session_demand(
+                        conn_id,
+                        &peer,
+                        ZAKURA_CAP_HEADER_SYNC,
+                        ServicePeerDirection::Inbound,
+                    ),
+                    SessionDemand::OpenNow
+                )
+            };
+            assert!(open_now());
+            // The transport reader records the timeout, then ends the stream.
+            failure.record(OrderedStreamFailure::ReadTimeout);
+            drop(inbound_tx);
+            // The stall starts the readmission cooldown, which a plain
+            // disconnect would not.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while open_now() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            if session_id == 7 {
+                assert!(!connection_cancel.is_cancelled());
+                assert_eq!(close_cause.get(), None);
+                tokio::time::advance(cooldown).await;
+            }
+        }
+        assert!(connection_cancel.is_cancelled());
+        assert_eq!(close_cause.get(), Some(STALL_POLICY));
+
+        shutdown.cancel();
+        reactor_task.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn supervisor_disconnect_peer_cancels_registered_token() -> Result<(), BoxError> {
         let supervisor = ZakuraSupervisorHandle::new(4);
@@ -10916,6 +11194,7 @@ mod tests {
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
                     token,
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -10986,6 +11265,7 @@ mod tests {
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
                     token,
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -11048,6 +11328,7 @@ mod tests {
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
                     CancellationToken::new(),
+                    CloseCause::new(),
                     ZAKURA_CAP_DISCOVERY,
                 )
                 .await
@@ -11115,6 +11396,7 @@ mod tests {
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
                     token,
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -11264,11 +11546,12 @@ mod tests {
         for (index, (reason, disconnects)) in cases.into_iter().enumerate() {
             let peer = test_peer(u8::try_from(index + 20).expect("the case count fits in u8"));
             let disconnect_token = CancellationToken::new();
-            register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
+            let conn_id =
+                register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
 
             assert_eq!(
                 supervisor
-                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .enforce_block_sync_misbehavior(&peer, conn_id, &reason)
                     .await,
                 disconnects,
                 "{reason:?}"
@@ -11277,7 +11560,7 @@ mod tests {
             if disconnects {
                 assert!(
                     !supervisor
-                        .enforce_block_sync_misbehavior(&peer, &reason)
+                        .enforce_block_sync_misbehavior(&peer, conn_id, &reason)
                         .await,
                     "a connection already closing is not closed again: {reason:?}"
                 );
@@ -11287,10 +11570,81 @@ mod tests {
             !supervisor
                 .enforce_block_sync_misbehavior(
                     &test_peer(250),
+                    0,
                     &mismatch(BodyCommitmentKind::AuthDataRoot)
                 )
                 .await,
             "a peer that already left has nothing to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_block_verdict_matches_the_supplying_registration() {
+        use crate::zakura::BlockSyncMisbehavior;
+        use zakura_header_chain::{BodyCommitmentKind, BodyPayloadMismatch, EvidenceId, SourceId};
+
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let peer = test_peer(26);
+        let reason = BlockSyncMisbehavior::BodyPayloadMismatch(BodyPayloadMismatch {
+            evidence: EvidenceId::from_digest([1; 32]),
+            requested: block::Hash([2; 32]),
+            delivered: block::Hash([2; 32]),
+            kind: BodyCommitmentKind::AuthDataRoot,
+            source: SourceId::from_digest([3; 32]),
+        });
+        let supplier_cancel = CancellationToken::new();
+        let supplier = register_test_peer(&supervisor, peer.clone(), supplier_cancel.clone()).await;
+
+        let replacement_cancel = CancellationToken::new();
+        let replacement_cause = CloseCause::new();
+        let (outbound, _outbound_recv) = mpsc::channel(1);
+        let replacement = registered_conn_id(
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    None,
+                    [0; TRANSCRIPT_HASH_BYTES],
+                    ZakuraPeerHandle::new_for_tests(peer.clone(), outbound),
+                    replacement_cancel.clone(),
+                    replacement_cause.clone(),
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                )
+                .await,
+        );
+        assert!(supplier_cancel.is_cancelled());
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, supplier, &reason)
+                .await
+        );
+        assert!(!replacement_cancel.is_cancelled());
+        assert_eq!(replacement_cause.get(), None);
+        assert_eq!(supervisor.outbound_peer_handles().await.len(), 1);
+
+        assert!(
+            supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
+        );
+        assert_eq!(
+            replacement_cause.get(),
+            Some(CloseOutcome::fault(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                CloseRow::BSYNC_CLOSE_18,
+            ))
+        );
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
+        );
+        supervisor.deregister(&peer, replacement).await;
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(&peer, replacement, &reason)
+                .await
         );
     }
 
@@ -11379,6 +11733,7 @@ mod tests {
             stream_token: stream_cancel.clone(),
             close_cause: CloseCause::new(),
             freshness_tx,
+            kind_version: (stream.kind, stream.version),
         };
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
@@ -11586,6 +11941,7 @@ mod tests {
             stream_token: stream_token.clone(),
             close_cause: CloseCause::new(),
             freshness_tx,
+            kind_version: (stream.kind, stream.version),
         };
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
@@ -11795,6 +12151,7 @@ mod tests {
                 stream_token: connection_token.child_token(),
                 close_cause: CloseCause::new(),
                 freshness_tx: freshness_tx.clone(),
+                kind_version: (stream.kind, stream.version),
             };
             let prelude = StreamPrelude {
                 magic: STREAM_PRELUDE_MAGIC,
@@ -12234,6 +12591,8 @@ mod tests {
         let buckets = MessageRateBuckets::new();
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
         let stream = Stream {
+            kind: 900,
+            version: 1,
             messages,
             ..Stream::PERSISTENT
         };
@@ -12258,6 +12617,7 @@ mod tests {
             stream_token: cancel.child_token(),
             close_cause: CloseCause::new(),
             freshness_tx,
+            kind_version: (stream.kind, stream.version),
         }
     }
 
@@ -12296,8 +12656,11 @@ mod tests {
             InboundMessageAdmission::ByteRateOverrun
         );
         assert_eq!(
-            ordered_read_close(&ZakuraHandlerError::ByteRateOverrun),
-            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_byte_rate_overrun"))
+            ordered_read_close((900, 1), &ZakuraHandlerError::ByteRateOverrun),
+            Some((
+                ZAKURA_CLOSE_RATE_LIMIT,
+                CloseOutcome::fault(900, 1, CloseRow::CONN_CLOSE_18)
+            ))
         );
     }
 
@@ -14509,6 +14872,7 @@ mod tests {
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
                     CancellationToken::new(),
+                    CloseCause::new(),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -14689,6 +15053,7 @@ mod tests {
                 [1; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer, outbound_tx),
                 CancellationToken::new(),
+                CloseCause::new(),
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -14744,8 +15109,8 @@ mod tests {
     /// addresses, earns the spoofed sources a stateless Retry, never a
     /// refusal, and leaves a validated Initial from the victim its own
     /// cadence (zakura#2337 review).
-    #[test]
-    fn spoofed_initials_never_lock_out_a_validated_source() {
+    #[tokio::test(start_paused = true)]
+    async fn spoofed_initials_never_lock_out_a_validated_source() {
         let victim: IpAddr = "203.0.113.9".parse().expect("test ip parses");
         let limits = ZakuraLocalLimits::from_config(&Config::default());
         let handler = ZakuraProtocolHandler::new(
@@ -14788,7 +15153,11 @@ mod tests {
             }
         }
         let fresh: IpAddr = "198.51.100.3".parse().expect("test ip parses");
-        assert_eq!(spoof(fresh), Admit::Retry, "the unvalidated ledger is full");
+        assert_eq!(
+            spoof(fresh),
+            Admit::Retry,
+            "the unvalidated node bucket and ledger are spent"
+        );
         assert_eq!(handler.admit(&attempt(fresh, true)), Admit::Accept);
         handler.finish_admission(false);
     }
@@ -14844,6 +15213,7 @@ mod tests {
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
                 token,
+                CloseCause::new(),
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await
@@ -15244,17 +15614,14 @@ mod tests {
         Ok(())
     }
 
-    /// Dials can take the room an inbound attempt saw at admission while its
-    /// TLS runs. The node then refuses the attempt itself, so the attempt's
-    /// cadence token returns to its address.
+    /// An inbound claim can lose its slot while TLS runs. The refusal returns
+    /// the pending permit and keeps both charges for the completed TLS start.
     #[tokio::test]
-    async fn a_local_refusal_after_tls_returns_the_cadence_token() -> Result<(), BoxError> {
+    async fn a_local_refusal_after_tls_keeps_both_cadence_charges() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
-        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
-        limits.max_connections = 4;
-        limits.max_pending_handshakes = 4;
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
         let handler = ZakuraProtocolHandler::new(
-            ZakuraSupervisorHandle::new(1),
+            ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
             Network::Mainnet,
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
@@ -15281,49 +15648,46 @@ mod tests {
         let inbound = timeout(Duration::from_secs(10), connection_rx.recv())
             .await?
             .expect("the capture acceptor sends the accepted connection");
-        let ip = inbound.admitted_ip();
+        tokio::time::pause();
         let validated = inbound.source_validated();
-        let max_hosts = limits
-            .max_connections
-            .saturating_add(limits.max_pending_handshakes);
-        let charge = |handler: &ZakuraProtocolHandler| {
-            handler.supervisor.ip_slots.counts().admit_cadence(
-                ip,
-                validated,
-                handler.supervisor.max_connections_per_ip,
-                max_hosts,
-                Instant::now(),
-            )
+        let incoming = IncomingInfo {
+            remote: inbound.admitted_addr(),
+            validated,
+            pending_total: 0,
+            pending_from_ip: 0,
         };
 
-        // `admit` reserved the transport and took the address's one token.
-        assert!(handler
-            .supervisor
-            .ip_slots
-            .counts()
-            .claim_transport(limits.max_pending_handshakes));
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Admit
-        );
-        // Dials then took the inbound share.
-        assert_eq!(limits.max_inbound_connections(), 3);
+        assert_eq!(handler.admit(&incoming), Admit::Accept);
+        handler.cancel_admission(&incoming);
+        assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
+        // Account for the captured TLS start as the real acceptor would.
+        assert_eq!(handler.admit(&incoming), Admit::Accept);
         let dials = handler
             .inbound_admission
             .clone()
-            .try_acquire_many_owned(3)
+            .try_acquire_many_owned(u32::try_from(limits.max_inbound_connections())?)
             .expect("the test holds free permits");
-
-        timeout(Duration::from_secs(10), handler.handle(inbound)).await?;
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Admit
-        );
-        assert_eq!(
-            charge(&handler),
-            crate::zakura::HandshakeCadenceAdmission::Exhausted
-        );
+        let refusal = handler.handle(inbound);
+        assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
         drop(dials);
+
+        for _ in 1..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+            assert_eq!(handler.admit(&incoming), Admit::Accept);
+            handler.finish_admission(false);
+        }
+        assert_ne!(handler.admit(&incoming), Admit::Accept);
+        // The node's bucket kept all 16 charges, so 8 tokens remain. They
+        // are its reserve, where each other address gets one.
+        let other_host = |host: u8| IncomingInfo {
+            remote: std::net::SocketAddr::from(([198, 51, 100, host], 8234)),
+            ..incoming
+        };
+        for host in 0..8 {
+            assert_eq!(handler.admit(&other_host(host)), Admit::Accept);
+            handler.finish_admission(false);
+        }
+        assert_ne!(handler.admit(&other_host(8)), Admit::Accept);
+        timeout(Duration::from_secs(10), refusal).await?;
         Ok(())
     }
 

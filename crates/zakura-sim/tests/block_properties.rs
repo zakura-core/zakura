@@ -19,7 +19,10 @@ use std::{
 
 use support::inputs;
 use tempfile::TempDir;
-use zakura_network::zakura::{block_sync_observe::Holder, BlockSyncMessage, MSG_BS_BLOCK};
+use zakura_network::zakura::{
+    block_sync_observe::Holder, BlockSyncMessage, CloseOutcome, CloseRow, MSG_BS_BLOCK,
+    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+};
 use zakura_sim::{
     harness::{
         block_node::{
@@ -773,7 +776,15 @@ fn a_serving_overflow_closes_the_flooding_peer() {
             .iter()
             .find(|link| link.peer == PROBE)
             .expect("the probe links");
-        assert_eq!(probe.cause.get(), Some("service_protocol_reject"));
+        // The serving refuses the request past its limit (`reg-close-5`).
+        assert_eq!(
+            probe.cause.get(),
+            Some(CloseOutcome::fault(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                CloseRow::REG_CLOSE_5,
+            ))
+        );
         let reads: BTreeSet<_> = submissions(&report)
             .into_iter()
             .filter(|(_, request, _)| matches!(request, StorageRequest::ReadRange { .. }))

@@ -110,6 +110,7 @@ impl Fixture {
             .clone();
         while sender
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: ZakuraPeerId::new(vec![1; 32]).expect("the test peer ID has its length"),
                 reason: BlockSyncMisbehavior::MalformedMessage,
             })

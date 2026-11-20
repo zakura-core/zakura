@@ -497,11 +497,22 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(_) => warn!("timed out retrying header-chain body availability"),
                 }
             }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
-                supervisor
-                    .enforce_block_sync_misbehavior(&peer, &reason)
-                    .await;
+            BlockSyncAction::Misbehavior {
+                peer,
+                conn_id,
+                reason,
+            } => {
+                debug!(
+                    ?peer,
+                    ?conn_id,
+                    ?reason,
+                    "recorded Zakura block-sync peer violation"
+                );
+                if let Some(conn_id) = conn_id {
+                    supervisor
+                        .enforce_block_sync_misbehavior(&peer, conn_id, &reason)
+                        .await;
+                }
             }
             BlockSyncAction::QueryNeededBlocks {
                 query_id,

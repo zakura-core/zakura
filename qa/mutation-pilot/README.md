@@ -190,9 +190,9 @@ and `sync_wire`. Each passes the protocol-state collector, and each harness
 logs the observations the collector reads. The joint-run droplet's
 `cargo xtask planted --targets` confirms each case's seed through its target.
 `discovery_wire` has none in the list: #2604 removed its one seed case, and
-#2639 re-evaluates it. `block_sync_storage` has none in the list: a generated
-run takes about 96 seconds, so a 600-second
-campaign runs a handful of inputs.
+issue #2639 re-evaluates it. `block_sync_storage` has none in the list: a
+generated run takes about 96 seconds, so a 600-second campaign runs a handful
+of inputs.
 
 `cargo xtask planted pilot feedback` builds the runner tree's simulator to
 list the QA store's seeds, then reads the list and checks each case: its patch

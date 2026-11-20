@@ -1985,6 +1985,12 @@ where
 
         let response = match chain_error {
             Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(source)
+                if submission == MinedBlockSubmission::TrustedBlock
+                    && source.is_verification_unavailable() =>
+            {
+                SubmitBlockErrorResponse::Inconclusive
+            }
             Ok(RouterError::Block { source })
                 if matches!(
                     source.as_ref(),
@@ -2014,8 +2020,10 @@ where
             // if mining pools really need it.
             Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
 
-            // This match arm is currently unreachable, but if future changes add extra error types,
-            // we want to turn them into `Rejected`.
+            // A closed verifier buffer can fail readiness without returning a block verdict.
+            Err(_) if submission == MinedBlockSubmission::TrustedBlock => {
+                SubmitBlockErrorResponse::Inconclusive
+            }
             Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
         };
 

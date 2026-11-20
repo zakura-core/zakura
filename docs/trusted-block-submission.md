@@ -94,7 +94,7 @@ HTTP 200 has a plain-text body:
 | `rejected` | Local validation rejected the block. |
 | `duplicate` | The node already committed a block with this header hash. This does not say whether the submitted body matches it. |
 | `duplicate-inconclusive` | A submission with this header hash is still in flight. |
-| `inconclusive` | Acceptance could not be established; the caller may retry. |
+| `inconclusive` | The node could not establish acceptance. The caller may retry, including when the verifier is unavailable or its state lookup fails. |
 
 Acceptance does not certify best-chain selection or delivery to any peer.
 Validation has a 60-second deadline, which is under the target block spacing. A

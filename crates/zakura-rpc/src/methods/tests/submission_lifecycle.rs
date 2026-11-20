@@ -1,4 +1,4 @@
-//! Duplicate verdicts for trusted submissions, settled against the committed block.
+//! Trusted submission outcomes, pending-body withdrawal, and duplicate resolution.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -92,6 +92,115 @@ async fn duplicate_whose_other_copy_never_commits_is_withdrawn_at_the_deadline()
         resolve_duplicate(None).await,
         (Some(DuplicateBody::Unconfirmed), false)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn trusted_rpc_withdraws_on_verifier_unavailability_and_accepts_a_retry() {
+    use crate::tests::test_rpc::TestRpcImpl;
+    use zakura_chain::{chain_tip::NoChainTip, parameters::Network};
+    use zakura_consensus::{RouterError, VerifyBlockError, VerifyCheckpointError};
+    use zakura_test::mock_service::MockService;
+
+    let hash = Network::Mainnet.genesis_hash();
+    let mut verifier: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let mempool: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let (events, mut early) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
+        Network::Mainnet,
+        Default::default(),
+        false,
+        "test",
+        "test",
+        tower::buffer::Buffer::new(mempool, 1),
+        tower::service_fn(move |req| async move {
+            assert_eq!(req, zakura_state::Request::KnownBlock(hash));
+            Ok(zakura_state::Response::KnownBlock(None))
+        }),
+        tower::service_fn(|req| async move {
+            assert!(matches!(req, ReadRequest::BlockInfo(_)));
+            Ok(ReadResponse::BlockInfo(Some(Default::default())))
+        }),
+        verifier.clone(),
+        Default::default(),
+        NoChainTip,
+        Default::default(),
+        tokio::sync::watch::channel(None).1,
+        Some(events),
+    );
+    let pending = rpc.gbt.pending_blocks();
+    let errors: [tower::BoxError; 6] = [
+        RouterError::from(VerifyBlockError::Depth {
+            source: "parent lookup failed".into(),
+            hash,
+        })
+        .into(),
+        RouterError::from(VerifyCheckpointError::Tip("state unavailable".into())).into(),
+        RouterError::from(VerifyCheckpointError::CommitCheckpointVerified(
+            "checkpoint storage unavailable".into(),
+        ))
+        .into(),
+        RouterError::from(VerifyBlockError::Transaction(
+            zakura_consensus::error::TransactionError::StateUnavailable(
+                "transaction verifier state unavailable".into(),
+            ),
+        ))
+        .into(),
+        RouterError::from(VerifyBlockError::Commit(
+            zakura_state::CommitBlockError::HeaderChainError {
+                error: "header store unavailable".into(),
+            },
+        ))
+        .into(),
+        "verifier buffer closed".into(),
+    ];
+    for result in errors.into_iter().map(Err).chain([Ok(hash)]) {
+        let rpc = rpc.clone();
+        let response = tokio::spawn(async move {
+            rpc.submit_trusted_block(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES)
+                .await
+        });
+        let request = verifier
+            .expect_request_that(|req| matches!(req, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        let event = tokio::time::timeout(Duration::from_secs(1), early.recv())
+            .await
+            .expect("early relay starts before verification completes")
+            .expect("relay channel is open");
+        let permit = event.pending.send_permit();
+        let accepted = result.is_ok();
+        request.respond(result);
+        let Ok(response) = response.await.unwrap() else {
+            panic!("a complete request returns a verdict")
+        };
+        assert_eq!(
+            crate::server::trusted_block::outcome(&response),
+            if accepted { "accepted" } else { "inconclusive" }
+        );
+        assert_eq!(permit.try_start_write(|| ()).is_some(), accepted);
+        assert!(pending.resolution(hash).is_none());
+    }
+    queue.abort();
+}
+
+#[test]
+fn a_failed_header_attribution_still_rejects_the_exact_invalid_submission() {
+    use crate::tests::test_rpc::TestRpcImpl;
+    use zakura_chain::parameters::Network;
+    use zakura_consensus::{BlockError, RouterError, VerifyBlockError};
+
+    let hash = Network::Mainnet.genesis_hash();
+    let error = VerifyBlockError::AuthDataUnconfirmed {
+        parent: hash,
+        source: Box::new(BlockError::DuplicateTransaction.into()),
+    };
+    let response = TestRpcImpl::mined_block_response(
+        Err(RouterError::from(error).into()),
+        hash,
+        zakura_chain::block::Height(1),
+        MinedBlockSubmission::TrustedBlock,
+    )
+    .unwrap();
+    assert_eq!(crate::server::trusted_block::outcome(&response), "rejected");
 }
 
 /// Both an in-flight hash and an unavailable hash lookup suppress early peer access.

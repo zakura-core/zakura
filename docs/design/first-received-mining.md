@@ -48,7 +48,9 @@ The reservation is called a claim. Four rules define it:
   receipt order at submission, like any other body. A rival's earlier claim at
   the same height is ignored from that moment, for every mined block that is
   still verifying or has verified, until the verified tip passes that height or
-  the node mines more than two blocks above it. If
+  the node mines more than two blocks above it. If an overlapping peer delivery
+  commits the identical body, the local submission keeps this protection and
+  still reports a duplicate. If
   the submitted block fails verification, rival bodies that arrive afterwards
   take their claims again. A rival body that arrived while it was verifying
   keeps its arrival order.

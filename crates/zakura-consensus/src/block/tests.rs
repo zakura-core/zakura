@@ -36,6 +36,7 @@ use crate::{block::check::subsidy_is_valid, transaction};
 
 use super::*;
 
+mod mined_duplicates;
 mod nsm_fees;
 
 fn prepared_test_verifier(

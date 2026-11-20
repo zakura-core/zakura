@@ -19,9 +19,12 @@
 mod claims;
 mod order;
 mod registry;
+mod writes;
 
 #[cfg(test)]
 mod tests;
 
+pub(in crate::block) use claims::CLAIM_BODY_DEADLINE;
 pub use claims::{AnnouncementClaims, PendingClaims};
 pub(in crate::block) use registry::ReceiptRegistry;
+pub(in crate::block) use writes::ConcurrentWrites;

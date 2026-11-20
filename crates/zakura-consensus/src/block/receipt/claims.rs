@@ -21,7 +21,7 @@ use super::order;
 /// hops their delivery time is mostly round trips, not transfer. The value is an estimate of
 /// honest delivery, to be revisited against the `sync.block.announcement_claim.age.seconds`
 /// histogram.
-pub(super) const CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
+pub(in crate::block) const CLAIM_BODY_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How far above the verified tip a header can be and still get a claim.
 ///

@@ -64,6 +64,7 @@ pub struct SemanticBlockVerifier<S, V> {
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
     receipt_orders: receipt::ReceiptRegistry,
+    concurrent_writes: receipt::ConcurrentWrites,
 }
 
 /// Block verification errors.
@@ -413,6 +414,7 @@ where
             transaction_verifier,
             prepared_candidates: Default::default(),
             receipt_orders: Default::default(),
+            concurrent_writes: Default::default(),
         }
     }
 
@@ -448,18 +450,23 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
+        let submission = request
+            .is_mined_commit()
+            .then(|| self.concurrent_writes.submit(hash, &block));
         let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         // Marked before this call returns, so a rival body that arrives next already finds it.
-        let mined_record = match (&receipt, block.coinbase_height()) {
-            (Some(receipt), Some(height)) if request.is_mined_commit() => {
-                Some(self.receipt_orders.mark_mined(hash, height, receipt.order))
-            }
+        let mined_record = match (submission, &receipt, block.coinbase_height()) {
+            (Some(submission), Some(receipt), Some(height)) => Some((
+                self.receipt_orders.mark_mined(hash, height, receipt.order),
+                submission,
+            )),
             _ => None,
         };
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let concurrent_writes = self.concurrent_writes.clone();
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
@@ -467,6 +474,7 @@ where
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
             let mut auth_data_root = None;
+            let mut saw_pending_commit = false;
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -498,6 +506,8 @@ where
                         zs::Response::KnownBlock(Some(
                             location @ (zs::KnownBlock::WriteChannel | zs::KnownBlock::Queue),
                         )) => {
+                            // The writer can outlive the peer request that submitted this hash.
+                            saw_pending_commit = true;
                             if tokio::time::Instant::now() >= pending_commit_deadline {
                                 return Err(BlockError::AlreadyInChain(hash, location).into());
                             }
@@ -904,14 +914,28 @@ where
                     .await;
                 }
 
-                commit_prepared_block(&mut state_service, prepared_block, mined).await
+                commit_prepared_block(
+                    &mut state_service,
+                    prepared_block,
+                    mined,
+                    Some(&concurrent_writes),
+                )
+                .await
             }
             .await;
 
-            // A mined block that failed, or whose request was dropped, releases its record
-            // with this guard, which puts a rival's earlier claim back in force.
-            if let (Ok(_), Some(mined_record)) = (&result, mined_record) {
-                mined_record.keep();
+            // A duplicate describes this request. A racing peer may have committed the mined body.
+            if let Some((mined, submission)) = mined_record {
+                let duplicate = result
+                    .as_ref()
+                    .is_err_and(|error| error.is_duplicate_request());
+                if result.is_ok()
+                    || (duplicate
+                        && (saw_pending_commit || submission.saw_peer_write())
+                        && committed_mined_body(state_service.clone(), hash, request.block()).await)
+                {
+                    mined.keep();
+                }
             }
 
             match result {
@@ -989,7 +1013,7 @@ where
         admission.authorize_optimistic_relay();
     }
 
-    commit_prepared_block(state_service, prepared_block, Some(admission.clone()))
+    commit_prepared_block(state_service, prepared_block, Some(admission.clone()), None)
         .await
         .map(Some)
 }
@@ -1059,10 +1083,37 @@ where
     }
 }
 
+/// Confirms that state committed the exact locally submitted body. A competing writer can
+/// outlive its caller or still be pending when state answers the local request as a duplicate.
+async fn committed_mined_body<S>(state: S, hash: block::Hash, submitted: BlockHandle) -> bool
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let confirm = async {
+        if !matches!(
+            state
+                .clone()
+                .oneshot(zs::Request::AwaitBlockInfo(hash))
+                .await,
+            Ok(zs::Response::BlockInfo(Some(_)))
+        ) {
+            return false;
+        }
+        matches!(state.oneshot(zs::Request::AnyChainBlock(hash.into())).await,
+            Ok(zs::Response::Block(Some(committed))) if committed == submitted)
+    };
+    // Any rival claim older than this submission expires within one body deadline.
+    tokio::time::timeout(receipt::CLAIM_BODY_DEADLINE, confirm)
+        .await
+        .unwrap_or(false)
+}
+
 async fn commit_prepared_block<S>(
     state_service: &mut S,
     prepared_block: zs::SemanticallyVerifiedBlock,
     admission: Option<zs::BlockAdmission>,
+    concurrent_writes: Option<&receipt::ConcurrentWrites>,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -1081,6 +1132,9 @@ where
             .record(ready_start.elapsed().as_secs_f64());
     }
 
+    let _peer_write = concurrent_writes
+        .filter(|_| !is_mined_commit)
+        .map(|writes| writes.write(hash, &prepared_block.block));
     let request = match admission {
         Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
             block: prepared_block,

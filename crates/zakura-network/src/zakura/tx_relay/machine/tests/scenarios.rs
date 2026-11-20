@@ -15,8 +15,8 @@ use crate::zakura::tx_relay::machine::{
     session::{Timer, Timers},
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, INITIAL_WINDOW, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_PER_PEER, RANK_INTERVAL,
-    RETRY_FIRST, TRIED_PER_ENTRY,
+    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP, PENDING_PER_PEER,
+    RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -569,6 +569,36 @@ fn a_full_pending_set_counts_new_announcements_as_overflow() {
     let id = bench.id(2);
     bench.inv(honest, &[id]);
     assert!(bench.reserved(id), "another peer's id is not delayed");
+}
+
+/// An id whose only holder ended while its body waits for a verdict has no
+/// holder left, so a later announcement of it is its first source, taken
+/// past a full pending cap. If the verdict then leaves it undecided, the
+/// node still has a source for it.
+#[test]
+fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
+    let mut bench = Bench::new();
+    let script = script_len();
+    let per = u32::try_from(PENDING_PER_PEER).expect("fits");
+    let pool: Vec<UnminedTxId> = (0..per).map(|n| body(n + 1_000, script).id()).collect();
+    // A session past its share, then sessions that fill the cap.
+    let late = bench.join(1);
+    bench.inv(late, &pool[..300]);
+    let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
+    for peer in 2..=fillers + 1 {
+        let session = bench.join(peer);
+        bench.inv(session, &pool);
+    }
+    let supplier = bench.join(fillers + 2);
+    let waiter = bench.supply(supplier, 0);
+    let id = bench.id(0);
+    bench.end(supplier);
+
+    bench.inv(late, &[id]);
+    assert!(holds(&bench, late, id), "a first source past the full cap");
+    bench.verdict(waiter, Verdict::LocalFault(LocalFault::VerifyTimeout));
+    let wanted = bench.machine.wanted().entry(id).is_some();
+    assert!(wanted && holds(&bench, late, id), "the node keeps a source");
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest

@@ -1129,7 +1129,13 @@ impl PeerMachine {
             if pool.holds(&id) || size > MAX_TX_BYTES {
                 continue;
             }
-            let current = shared.wanted.entry(id).map(|entry| entry.generation);
+            let entry = shared.wanted.entry(id);
+            let current = entry.map(|entry| entry.generation);
+            // No session holds it, though a claim may: the body of a session
+            // that ended can still wait for its verdict. Such an id has no
+            // source left if that verdict leaves it undecided, so it is a
+            // first source. The claim still stops a second fetch meanwhile.
+            let first = entry.is_none_or(|entry| entry.holders == 0);
             // A peer that tried this entry is not asked again, however often
             // it announces the id, until the entry ends.
             if current.is_some_and(|generation| shared.wanted.has_tried(state.peer, id, generation))
@@ -1149,7 +1155,7 @@ impl PeerMachine {
             if already || busy || !taken.insert(id) {
                 continue;
             }
-            fresh.push((id, size, current.is_none()));
+            fresh.push((id, size, first));
         }
         // Each id's room is decided before the table changes, so an id that
         // does not fit leaves no holder behind. See `PENDING_CAP` for the

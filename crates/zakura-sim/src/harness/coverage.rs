@@ -311,13 +311,13 @@ const fn handshake_guard(
 const TX_RELAY_WITNESSES: &str = "tests/tx_relay_wire.rs";
 
 /// A `tx-relay` domain property's row: its witness test runs its named
-/// prefix, and the production patch under
-/// `qa/native-mutations/tx-relay/<patch>/` makes that test fail.
-const fn tx_relay(property: &'static str, test: &'static str, patch: &'static str) -> Coverage {
+/// prefix, and its bypass test feeds the oracle the hook history of a node
+/// that breaks it.
+const fn tx_relay(property: &'static str, test: &'static str, bypass: &'static str) -> Coverage {
     Coverage {
         property,
         passing: passes(TX_RELAY_WITNESSES, test),
-        bypass: Bypass::Native(patch),
+        bypass: Bypass::Test(sim_test(TX_RELAY_WITNESSES, bypass)),
     }
 }
 
@@ -1652,57 +1652,57 @@ pub static COVERAGE: &[Coverage] = &[
     tx_relay(
         crate::domain::tx_relay::REQUESTS_WITHIN_LIMIT,
         "requests_within_limit_holds_in_its_witness",
-        "tx-relay/requests-past-limit/requests-past-limit.patch",
+        "requests_within_limit_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::SERVING_WITHIN_LIMIT,
         "serving_within_limit_holds_in_its_witness",
-        "tx-relay/serving-past-limit/serving-past-limit.patch",
+        "serving_within_limit_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::PENDING_WITHIN_BOUND,
         "pending_within_bound_holds_in_its_witness",
-        "tx-relay/pending-past-bound/pending-past-bound.patch",
+        "pending_within_bound_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::SKIP_SET_WITHIN_BOUND,
         "skip_set_within_bound_holds_in_its_witness",
-        "tx-relay/skip-set-past-bound/skip-set-past-bound.patch",
+        "skip_set_within_bound_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::REQUESTED_BODIES_ONLY,
         "requested_bodies_only_holds_in_its_witness",
-        "tx-relay/submit-wrong-id/submit-wrong-id.patch",
+        "requested_bodies_only_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::COOLING_BODIES_DROPPED,
         "cooling_bodies_dropped_holds_in_its_witness",
-        "tx-relay/submit-while-cooling/submit-while-cooling.patch",
+        "cooling_bodies_dropped_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::STALLED_PEERS_PARKED,
         "stalled_peers_parked_holds_in_its_witness",
-        "tx-relay/close-without-park/close-without-park.patch",
+        "stalled_peers_parked_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::HELLO_FIRST,
         "hello_first_holds_in_its_witness",
-        "tx-relay/ask-before-hello/ask-before-hello.patch",
+        "hello_first_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::NO_PROBE,
         "no_probe_holds_in_its_witness",
-        "tx-relay/serve-unannounced/serve-unannounced.patch",
+        "no_probe_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::ANNOUNCE_AFTER_ADMISSION,
         "announce_after_admission_holds_in_its_witness",
-        "tx-relay/announce-to-supplier/announce-to-supplier.patch",
+        "announce_after_admission_breaks_in_its_bypass",
     ),
     tx_relay(
         crate::domain::tx_relay::FAULT_CLOSE_NAMES_A_BROKEN_ROW,
         "fault_close_names_a_broken_row_holds_in_its_witness",
-        "tx-relay/wrong-size-row/wrong-size-row.patch",
+        "fault_close_names_a_broken_row_breaks_in_its_bypass",
     ),
     tx_relay_table("tx-relay/s9v1/conformant-never-closes"),
     tx_relay_table("tx-relay/s9v1/undeclared-type-closes"),

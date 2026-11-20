@@ -3,7 +3,9 @@
 //! close table closes the connection in its witness, and its honest twin,
 //! which keeps the rule the witness breaks, runs without a fault close.
 //! Each reachable neutral close of the table closes in its own witness.
-//! Every generated ID fails on a scripted history that bypasses its rule.
+//! Every generated ID fails on a scripted history that bypasses its rule,
+//! and each domain property fails on the hook history of a node that
+//! breaks it.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -11,10 +13,17 @@ mod support;
 use std::{collections::BTreeSet, sync::Arc};
 
 use support::script::{run_under, Node, OBSERVED};
-use zakura_network::zakura::{tx_relay_sim::TX_RELAY_STREAMS, CloseOutcome, CloseRow};
+use zakura_chain::transaction::{self, UnminedTxId};
+use zakura_network::zakura::{
+    tx_relay_sim::{
+        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_REQUESTS_PER_PEER, MAX_SERVES,
+        PENDING_PER_PEER, TX_RELAY_STREAMS,
+    },
+    CloseOutcome, CloseRow, ZakuraPeerId,
+};
 use zakura_sim::{
     domain::tx_relay::{
-        lock, SharedRelay, ANNOUNCE_AFTER_ADMISSION, COOLING_BODIES_DROPPED,
+        lock, RelayEvidence, SharedRelay, ANNOUNCE_AFTER_ADMISSION, COOLING_BODIES_DROPPED,
         FAULT_CLOSE_NAMES_A_BROKEN_ROW, HELLO_FIRST, IDS, NO_PROBE, PENDING_WITHIN_BOUND,
         REQUESTED_BODIES_ONLY, REQUESTS_WITHIN_LIMIT, SERVING_WITHIN_LIMIT, SKIP_SET_WITHIN_BOUND,
         STALLED_PEERS_PARKED,
@@ -30,7 +39,7 @@ use zakura_sim::{
     model::Label,
     peer::tx_relay::{header_fault, Answer, HeaderFault, HelloMode, RelayRow, RelayStep},
     table::{generated_trigger, GeneratedId, Template},
-    NullSink, Observation, Outcome, PlanInput, PropertyOutcome, RunReport,
+    NullSink, Observation, ObservationLog, Outcome, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Runs `prefix` under the all-defaults Plan, and returns its report and
@@ -228,6 +237,220 @@ fn announce_after_admission_holds_in_its_witness() {
 #[test]
 fn fault_close_names_a_broken_row_holds_in_its_witness() {
     holds_in_its_witness(FAULT_CLOSE_NAMES_A_BROKEN_ROW);
+}
+
+// Each domain property's bypass: the hook history a node that breaks the
+// property reports, built in code. The property must fail on it.
+
+/// The id of universe-free body `n`.
+fn tx(n: u8) -> UnminedTxId {
+    UnminedTxId::Legacy(transaction::Hash([n; 32]))
+}
+
+/// A peer ID no scripted peer has.
+fn stranger() -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![0xee; 32]).expect("a 32-byte peer ID")
+}
+
+/// Session 1 of a stranger opens, fresh or `readmitted`.
+fn opened(readmitted: bool) -> TxRelayEvent {
+    TxRelayEvent::Opened {
+        session: 1,
+        peer: stranger(),
+        readmitted,
+        parked: false,
+    }
+}
+
+/// A step of session 1 with `effects`, which leaves it holding `state`.
+fn stepped(effects: Vec<SimEffect>, state: SimState) -> TxRelayEvent {
+    TxRelayEvent::Stepped {
+        session: 1,
+        effects,
+        state,
+    }
+}
+
+/// A message from session 1's peer.
+fn received(message: Received) -> TxRelayEvent {
+    TxRelayEvent::Received {
+        session: 1,
+        message,
+    }
+}
+
+/// Feeds `events` to fresh evidence, and requires that `id`, and only
+/// `id`, fails.
+fn breaks_in_its_bypass(id: &str, events: Vec<TxRelayEvent>) {
+    let mut evidence = RelayEvidence::default();
+    for event in events {
+        evidence.step(event);
+    }
+    breaks(&evidence, id);
+}
+
+/// Requires that `id`, and only `id`, failed in `evidence`.
+fn breaks(evidence: &RelayEvidence, id: &str) {
+    let failed: Vec<&str> = evidence
+        .facts
+        .iter()
+        .filter(|(_, fact)| fact.violation.is_some())
+        .map(|(failed, _)| *failed)
+        .collect();
+    assert_eq!(failed, vec![id], "{:?}", evidence.facts);
+}
+
+/// A body of `size` bytes that session 1's peer announced and the node
+/// asked for, then submitted as `body`.
+fn submitted(body: UnminedTxId, cooling: bool) -> Vec<TxRelayEvent> {
+    vec![
+        opened(false),
+        received(Received::Hello),
+        received(Received::Inv(vec![(tx(1), 100)])),
+        stepped(vec![SimEffect::Ask(tx(1))], SimState::default()),
+        received(Received::Tx {
+            id: tx(1),
+            size: 100,
+        }),
+        stepped(
+            vec![SimEffect::Submit {
+                requested: Some(tx(1)),
+                body,
+                size: 100,
+                cooling,
+            }],
+            SimState::default(),
+        ),
+    ]
+}
+
+#[test]
+fn requests_within_limit_breaks_in_its_bypass() {
+    let state = SimState {
+        in_flight: MAX_REQUESTS_PER_PEER + 1,
+        ..SimState::default()
+    };
+    breaks_in_its_bypass(
+        REQUESTS_WITHIN_LIMIT,
+        vec![opened(false), stepped(Vec::new(), state)],
+    );
+}
+
+#[test]
+fn serving_within_limit_breaks_in_its_bypass() {
+    let state = SimState {
+        serving: MAX_SERVES + 1,
+        ..SimState::default()
+    };
+    breaks_in_its_bypass(
+        SERVING_WITHIN_LIMIT,
+        vec![opened(false), stepped(Vec::new(), state)],
+    );
+}
+
+#[test]
+fn pending_within_bound_breaks_in_its_bypass() {
+    let state = SimState {
+        pending: PENDING_PER_PEER + 1,
+        ..SimState::default()
+    };
+    breaks_in_its_bypass(
+        PENDING_WITHIN_BOUND,
+        vec![opened(false), stepped(Vec::new(), state)],
+    );
+}
+
+#[test]
+fn skip_set_within_bound_breaks_in_its_bypass() {
+    let state = SimState {
+        known: KNOWN_CAP + 1,
+        ..SimState::default()
+    };
+    breaks_in_its_bypass(
+        SKIP_SET_WITHIN_BOUND,
+        vec![opened(false), stepped(Vec::new(), state)],
+    );
+}
+
+#[test]
+fn requested_bodies_only_breaks_in_its_bypass() {
+    // The body's own id isn't the one the node asked for.
+    breaks_in_its_bypass(REQUESTED_BODIES_ONLY, submitted(tx(2), false));
+}
+
+#[test]
+fn cooling_bodies_dropped_breaks_in_its_bypass() {
+    breaks_in_its_bypass(COOLING_BODIES_DROPPED, submitted(tx(1), true));
+}
+
+#[test]
+fn stalled_peers_parked_breaks_in_its_bypass() {
+    // The session a park readmitted stalls, and the node parks it again.
+    breaks_in_its_bypass(
+        STALLED_PEERS_PARKED,
+        vec![
+            opened(true),
+            stepped(vec![SimEffect::Park], SimState::default()),
+        ],
+    );
+}
+
+#[test]
+fn hello_first_breaks_in_its_bypass() {
+    breaks_in_its_bypass(
+        HELLO_FIRST,
+        vec![
+            opened(false),
+            received(Received::Inv(vec![(tx(1), 100)])),
+            stepped(vec![SimEffect::Ask(tx(1))], SimState::default()),
+        ],
+    );
+}
+
+#[test]
+fn no_probe_breaks_in_its_bypass() {
+    // The node serves an id it never announced on the session.
+    breaks_in_its_bypass(
+        NO_PROBE,
+        vec![
+            opened(false),
+            received(Received::Hello),
+            received(Received::GetTxs(tx(1))),
+            stepped(vec![SimEffect::Serve(tx(1))], SimState::default()),
+        ],
+    );
+}
+
+#[test]
+fn announce_after_admission_breaks_in_its_bypass() {
+    // The node announces an id its pool never admitted.
+    breaks_in_its_bypass(
+        ANNOUNCE_AFTER_ADMISSION,
+        vec![
+            opened(false),
+            TxRelayEvent::InvSent {
+                session: 1,
+                entries: vec![(tx(1), 100)],
+            },
+        ],
+    );
+}
+
+#[test]
+fn fault_close_names_a_broken_row_breaks_in_its_bypass() {
+    // The node closes for a row no peer broke.
+    let mut log = ObservationLog::default();
+    log.push(Observation::ConnectionClosed {
+        connection: 1,
+        cause: CloseOutcome::fault(
+            TX_RELAY_STREAMS[0].kind,
+            TX_RELAY_STREAMS[0].version,
+            CloseRow::RELAY_CLOSE_4,
+        ),
+    });
+    let mut evidence = RelayEvidence::default();
+    evidence.read_log(&log);
+    breaks(&evidence, FAULT_CLOSE_NAMES_A_BROKEN_ROW);
 }
 
 /// Each fault row's witness closes the connection naming that row, and

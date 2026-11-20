@@ -283,6 +283,105 @@ fn a_reannounced_block_gets_a_fresh_place_behind_its_rival() {
     );
 }
 
+/// How long a legacy sighting counts.
+const SIGHTING_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
+
+/// A legacy sighting stops counting once it is older than its lifetime, even when no other
+/// block has been recorded since to remove it from the store.
+#[test]
+fn an_expired_legacy_sighting_does_not_stop_a_header_claim() {
+    let start = Instant::now();
+    let last_moment = start + SIGHTING_LIFETIME;
+
+    // While the sighting counts, a header reserves nothing and the sighting's deadline stands.
+    let claims = AnnouncementClaims::default();
+    announce(&claims, hash(1), start);
+    claim(&claims, hash(1), last_moment);
+    assert!(!claims.is_claimed(hash(1)));
+    assert_eq!(
+        claims.resolve(hash(1), Some(CLAIMED), arrival(last_moment)),
+        ClaimOutcome::Expired {
+            source: ClaimSource::Inv,
+            age: SIGHTING_LIFETIME,
+        },
+    );
+
+    // Once it has expired, the header claims its own place and deadline.
+    let claims = AnnouncementClaims::default();
+    announce(&claims, hash(1), start);
+    let header_at = last_moment + Duration::from_nanos(1);
+    claim(&claims, hash(1), header_at);
+    let header = claims
+        .claimed_order(hash(1))
+        .expect("the header makes a claim once the sighting has expired");
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, header_at + CLAIM_BODY_DEADLINE),
+        Some((ClaimSource::Header, header)),
+    );
+}
+
+/// Showing a block again gives it a fresh place only after its sighting has expired, and then
+/// without waiting for another block to be recorded.
+#[test]
+fn a_block_is_sighted_afresh_only_after_its_sighting_expires() {
+    let claims = AnnouncementClaims::default();
+    let start = Instant::now();
+    announce(&claims, hash(1), start);
+    let first = claims.announced_order(hash(1));
+
+    let last_moment = start + SIGHTING_LIFETIME;
+    announce(&claims, hash(1), last_moment);
+    assert_eq!(claims.announced_order(hash(1)), first);
+
+    let again = last_moment + Duration::from_nanos(1);
+    let rival = body_order(&claims, hash(2), again);
+    announce(&claims, hash(1), again);
+    let Some((ClaimSource::Inv, fresh)) =
+        used(&claims, hash(1), CLAIMED, again + CLAIM_BODY_DEADLINE)
+    else {
+        panic!("the block should qualify for its fresh sighting");
+    };
+    assert!(
+        rival < fresh,
+        "the fresh place is behind a body that arrived before the block was shown again",
+    );
+}
+
+/// A body that arrives after its block's sighting has expired has no claim, as if the sighting
+/// had already been removed.
+#[test]
+fn a_body_arriving_after_its_sighting_expired_has_no_claim() {
+    let claims = AnnouncementClaims::default();
+    let start = Instant::now();
+    announce(&claims, hash(1), start);
+
+    let late = start + SIGHTING_LIFETIME + Duration::from_nanos(1);
+    assert_eq!(
+        claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
+        ClaimOutcome::Unclaimed,
+    );
+}
+
+/// A header apply that starts after a legacy sighting expired and then fails leaves the block
+/// with no claim. The old sighting is still in the store, and must stay expired.
+#[test]
+fn a_failed_header_apply_does_not_revive_an_expired_legacy_sighting() {
+    let claims = AnnouncementClaims::default();
+    let start = Instant::now();
+    announce(&claims, hash(1), start);
+
+    let header_at = start + SIGHTING_LIFETIME + Duration::from_nanos(1);
+    let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, header_at);
+    assert!(claims.is_claimed(hash(1)));
+    drop(pending);
+
+    assert!(!claims.is_claimed(hash(1)));
+    assert_eq!(
+        claims.resolve(hash(1), Some(CLAIMED), arrival(header_at)),
+        ClaimOutcome::Unclaimed,
+    );
+}
+
 #[test]
 fn a_full_inv_store_refuses_new_blocks_until_old_entries_expire() {
     let claims = AnnouncementClaims::default();

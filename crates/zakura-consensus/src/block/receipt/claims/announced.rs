@@ -1,7 +1,8 @@
 //! The first legacy sighting of each block, kept briefly so its body can take that order.
 //!
 //! A legacy peer shows the node a block by sending a single-block `inv` for it, or by starting
-//! a `block` message that carries it. Whichever comes first is the block's one legacy sighting.
+//! a `block` message that carries it. Whichever comes first is the block's one legacy sighting
+//! until that sighting expires.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -30,7 +31,11 @@ use super::{super::order, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
 /// refused block is ranked by body arrival.
 pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 5_000;
 
-/// How long an announcement is kept.
+/// How long a sighting counts.
+///
+/// An older sighting is treated as absent wherever it is read, whether or not it has been
+/// removed from the store yet. So what a block can claim never depends on which other blocks
+/// happened to be sighted in the meantime.
 ///
 /// Twice the body deadline, so a body that arrives after its deadline is still counted as
 /// expired rather than unclaimed.
@@ -46,6 +51,14 @@ pub(super) struct Announcement {
     pub(super) source: ClaimSource,
 }
 
+impl Announcement {
+    /// Whether this sighting still counts at `now`: it is no older than
+    /// [`ANNOUNCEMENT_LIFETIME`].
+    fn counts_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.seen_at) <= ANNOUNCEMENT_LIFETIME
+    }
+}
+
 /// First legacy sightings by block hash, bounded by [`MAX_ANNOUNCED_BLOCKS`].
 ///
 /// A sighting carries no height, so it expires by age rather than by the verified tip.
@@ -53,9 +66,10 @@ pub(super) struct Announcement {
 pub(super) struct Announcements(HashMap<block::Hash, Announcement>);
 
 impl Announcements {
-    /// Records `hash` as first sighted at `now` through `source`, unless it already has a
-    /// sighting. A held sighting is never renewed or moved, whichever kind of message repeats
-    /// it, so a peer cannot keep a withheld block's place fresh by showing it again.
+    /// Records `hash` as first sighted at `now` through `source`, unless it has a sighting
+    /// that still counts. Such a sighting is never renewed or moved, whichever kind of message
+    /// repeats it, so a peer cannot keep a withheld block's place fresh by showing it again.
+    /// Once the sighting has expired, the block is sighted afresh, with a new and later order.
     ///
     /// Returns `false` if the store is full of unexpired sightings and refused `hash`.
     pub(super) fn note(
@@ -65,12 +79,10 @@ impl Announcements {
         source: ClaimSource,
         now: Instant,
     ) -> bool {
-        if self.0.contains_key(&hash) {
+        if self.get(hash, now).is_some() {
             return true;
         }
-        self.0.retain(|_, announced| {
-            now.saturating_duration_since(announced.seen_at) <= ANNOUNCEMENT_LIFETIME
-        });
+        self.0.retain(|_, announced| announced.counts_at(now));
         if self.0.len() >= MAX_ANNOUNCED_BLOCKS {
             return false;
         }
@@ -86,9 +98,19 @@ impl Announcements {
         true
     }
 
-    /// The first legacy sighting of `hash`, if one is held.
-    pub(super) fn get(&self, hash: block::Hash) -> Option<Announcement> {
-        self.0.get(&hash).copied()
+    /// The legacy sighting of `hash` that counts at `now`, if there is one. An expired
+    /// sighting is not returned, even while it is still in the store.
+    pub(super) fn get(&self, hash: block::Hash, now: Instant) -> Option<Announcement> {
+        self.0
+            .get(&hash)
+            .copied()
+            .filter(|announced| announced.counts_at(now))
+    }
+
+    /// The order of the sighting stored for `hash`, expired or not.
+    #[cfg(test)]
+    pub(super) fn stored_order(&self, hash: block::Hash) -> Option<u64> {
+        self.0.get(&hash).map(|announced| announced.order)
     }
 
     /// Discards a legacy sighting saved while this hash's header apply was pending.

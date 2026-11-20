@@ -99,9 +99,13 @@ The reservation is called a claim. Six rules define it:
   or below it get no claim and are ranked by arrival until the tip passes it
   again.
 
-  The legacy store holds 5,000 blocks. Entries older than 4 seconds, twice the
-  body deadline, are dropped when a new block is recorded, so a late body is
-  still counted as expired. A store full of newer entries refuses new blocks.
+  The legacy store holds 5,000 blocks. An entry counts for 4 seconds, twice
+  the body deadline, so a late body is still counted as expired. An older
+  entry is ignored wherever it is read, whether or not it has been removed
+  yet, so what a block can claim does not depend on which other blocks were
+  recorded in the meantime. After that the block can be recorded afresh, by a
+  legacy peer or by a native header apply, with a new and later order. A store
+  full of newer entries refuses new blocks.
   Each legacy connection passes at most 3 blocks per 2 seconds to the store,
   whether it announced them or sent their headers, leaving room for both
   blocks in a tip race and one more. A block it shows again in the same 2

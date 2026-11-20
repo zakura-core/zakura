@@ -7,9 +7,10 @@
 //! admits its header, when a legacy peer sends the first `inv` for it, or when the block header
 //! at the start of a legacy `block` message carrying it arrives.
 //!
-//! A block can hold both a native header claim and one legacy sighting. Repeating either
-//! preserves its original order and deadline. Reading a claim does not consume it, so a failed
-//! delivery cannot take that order from a later valid body.
+//! Whichever of these is recorded first sets the block's order and deadline for as long as it
+//! is held, and announcing the block again, by the same route or another, does not move them.
+//! Reading a claim does not consume it, so a failed delivery cannot take that order from a later
+//! valid body.
 //!
 //! - `claims`: the claim table header sync and legacy peers write, the body deadline, and the
 //!   blocks this node mined, which outrank rivals' claims at their heights.

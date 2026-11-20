@@ -26,7 +26,7 @@ impl AnnouncementClaims {
                 header.order,
                 header.seen_at,
             )
-        } else if let Some((height, legacy)) = height.zip(table.announced.get(hash)) {
+        } else if let Some((height, legacy)) = height.zip(table.announced.get(hash, arrival.time)) {
             if height < table.floor || !in_claim_window(height, legacy.tip_at_announcement) {
                 return Unclaimed;
             }

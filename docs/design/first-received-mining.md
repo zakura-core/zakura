@@ -77,19 +77,19 @@ The reservation is called a claim. Six rules define it:
   record is made before the message's checksum is checked, which changes
   nothing: an `inv` proves no more than a header does, and only a fully
   verified block with that hash can use the place in an equal-work tie.
-- **Each block keeps its first claim of each kind, and neither is renewed.** A
-  header claim, once made, is never replaced or renewed by delivering the
-  header again. A block has one legacy record, made by whichever came first
-  of its `inv` and the block header of a `block` message carrying it. An
-  accepted header ignores later legacy records. While a header apply is
-  pending, the first later legacy record is saved with its original order,
-  time and observed tip. It becomes usable if every apply fails and is
-  discarded if any succeeds. Announcing or sending the block again keeps the
-  original record, so a peer that withholds a block cannot keep its claim
-  fresh by showing it again. Reading a claim does not use it up, so an invalid
-  body under the same hash cannot take it. A body whose block holds both takes
-  the earlier order among those still in force, so a legacy record never makes
-  the outcome worse than the header claim alone.
+- **The first recorded sighting sets the order and the two-second deadline.**
+  A legacy `inv`, the header of a legacy `block` message, and a native header
+  apply all follow this rule. While the first record is held, switching paths
+  cannot give the body a later deadline. If the body misses that deadline, it
+  takes its own arrival order. For example, a native header received 1.5 seconds
+  after an `inv` cannot give a body delivered at 2.1 seconds announcement credit.
+  Reading a claim does not use it up.
+
+  A native header apply is provisional. If it started first and a legacy
+  sighting arrives during the apply, the node saves that sighting with its own
+  order, time and observed tip. It becomes the first remaining sighting only
+  if every covering apply fails. If any succeeds, the node discards the saved
+  sighting and keeps the original header deadline.
 
   The header table holds 64 claims. When it is full it refuses new claims and
   never drops old ones. A claim is removed when no apply covering it

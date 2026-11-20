@@ -128,7 +128,7 @@ impl ClaimTable {
         let floor = self.floor;
         self.by_hash.retain(|hash, claim| {
             if claim.height < floor {
-                self.announced.discard_after_header(*hash, claim.order);
+                self.announced.discard_header_fallback(*hash);
                 return false;
             }
             true
@@ -150,8 +150,8 @@ impl ClaimTable {
 /// Header sync creates claims with [`AnnouncementClaims::begin`], legacy block `inv`s with
 /// [`AnnouncementClaims::note_announcement`], legacy `block` messages with
 /// [`AnnouncementClaims::note_block_header`], and the block verifier reads them by block hash,
-/// so every body transport follows the same rule. A block has at most one header claim and one
-/// legacy sighting, and neither is renewed or moved once made.
+/// so every body transport follows the same rule. The first held sighting sets the order
+/// and deadline. A provisional header releases its place if every covering apply fails.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
@@ -204,6 +204,10 @@ impl AnnouncementClaims {
                     claim.applies = claim.applies.saturating_add(1);
                     covered.push(hash);
                 }
+                continue;
+            }
+            // A held legacy sighting already set the order and deadline for this hash.
+            if table.announced.get(hash).is_some() {
                 continue;
             }
             if table.by_hash.len() >= MAX_ANNOUNCEMENT_CLAIMS {
@@ -402,8 +406,7 @@ impl PendingClaims {
             claim.applies = claim.applies.saturating_sub(1);
             claim.accepted |= accepted;
             if accepted {
-                let header_order = claim.order;
-                table.announced.discard_after_header(hash, header_order);
+                table.announced.discard_header_fallback(hash);
             } else if claim.applies == 0 && !claim.accepted {
                 table.by_hash.remove(&hash);
             }

@@ -8,8 +8,7 @@ use super::super::order::BodyArrival;
 use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
-    /// Gives a body the earliest usable reservation for its hash, without consuming it.
-    /// If all eligible claims failed, report the first one's outcome for metrics.
+    /// Checks the first held reservation for this hash against the body arrival.
     pub(in crate::block::receipt) fn resolve(
         &self,
         hash: block::Hash,
@@ -19,54 +18,38 @@ impl AnnouncementClaims {
         use ClaimOutcome::{Expired, Unclaimed, Used, Voided};
 
         let table = self.table();
-        let classify = |source, height, order, seen_at| {
-            if order >= arrival.order {
+        // A legacy sighting coexists with a header only while waiting for its apply to fail.
+        let (source, height, order, seen_at) = if let Some(header) = table.by_hash.get(&hash) {
+            (
+                ClaimSource::Header,
+                header.height,
+                header.order,
+                header.seen_at,
+            )
+        } else if let Some((height, legacy)) = height.zip(table.announced.get(hash)) {
+            if height < table.floor || !in_claim_window(height, legacy.tip_at_announcement) {
                 return Unclaimed;
             }
-            let Some(age) = arrival.time.checked_duration_since(seen_at) else {
-                return Unclaimed;
-            };
-            let voided = table.mined.iter().any(|(mined_hash, mined)| {
-                *mined_hash != hash && mined.height == height && order < mined.order
-            });
-            if voided {
-                Voided { source, age }
-            } else if age > CLAIM_BODY_DEADLINE {
-                Expired { source, age }
-            } else {
-                Used { source, order, age }
-            }
+            (legacy.source, height, legacy.order, legacy.seen_at)
+        } else {
+            return Unclaimed;
         };
 
-        let header = table.by_hash.get(&hash);
-        // A legacy sighting made during an earlier header apply is usable only if every apply
-        // fails.
-        let legacy = height
-            .zip(table.announced.get(hash))
-            .filter(|(height, legacy)| {
-                header.is_none_or(|header| legacy.order < header.order)
-                    && *height >= table.floor
-                    && in_claim_window(*height, legacy.tip_at_announcement)
-            })
-            .map_or(Unclaimed, |(height, legacy)| {
-                classify(legacy.source, height, legacy.order, legacy.seen_at)
-            });
-        if matches!(legacy, Used { .. }) {
-            return legacy;
+        if order >= arrival.order {
+            return Unclaimed;
         }
-
-        let Some(header) = header else {
-            return legacy;
+        let Some(age) = arrival.time.checked_duration_since(seen_at) else {
+            return Unclaimed;
         };
-        let header = classify(
-            ClaimSource::Header,
-            header.height,
-            header.order,
-            header.seen_at,
-        );
-        match (legacy, header) {
-            (_, Used { .. }) | (Unclaimed, _) => header,
-            _ => legacy,
+        let voided = table.mined.iter().any(|(mined_hash, mined)| {
+            *mined_hash != hash && mined.height == height && order < mined.order
+        });
+        if voided {
+            Voided { source, age }
+        } else if age > CLAIM_BODY_DEADLINE {
+            Expired { source, age }
+        } else {
+            Used { source, order, age }
         }
     }
 }

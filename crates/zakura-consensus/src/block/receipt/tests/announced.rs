@@ -95,38 +95,42 @@ fn advancing_the_tip_cannot_make_an_out_of_range_announcement_eligible() {
 }
 
 #[test]
-fn the_earlier_of_a_header_claim_and_an_inv_wins() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    let later = now + Duration::from_millis(500);
+fn switching_announcement_paths_keeps_the_first_order_and_deadline() {
+    use ClaimSource::{BlockMessage, Header, Inv};
 
-    // The inv arrives before the header.
-    announce(&claims, hash(1), now);
-    claim(&claims, hash(1), later);
-    let inv = claims
-        .announced_order(hash(1))
-        .expect("the inv is recorded");
-    assert!(
-        inv < claims
-            .claimed_order(hash(1))
-            .expect("the header is claimed")
-    );
-    assert_eq!(
-        used(&claims, hash(1), CLAIMED, later),
-        Some((ClaimSource::Inv, inv))
-    );
+    let first_at = Instant::now();
+    let later = first_at + Duration::from_millis(1_500);
+    let deadline = first_at + CLAIM_BODY_DEADLINE;
 
-    // The header arrives before the inv, which then records nothing.
-    claim(&claims, hash(2), now);
-    announce(&claims, hash(2), later);
-    let header = claims
-        .claimed_order(hash(2))
-        .expect("the header is claimed");
-    assert_eq!(claims.announced_order(hash(2)), None);
-    assert_eq!(
-        used(&claims, hash(2), CLAIMED, later),
-        Some((ClaimSource::Header, header))
-    );
+    for (first, second) in [
+        (Inv, Header),
+        (Header, Inv),
+        (BlockMessage, Header),
+        (Header, BlockMessage),
+        (Inv, BlockMessage),
+        (BlockMessage, Inv),
+    ] {
+        let claims = AnnouncementClaims::default();
+        let sight = |source, at| match source {
+            Header => claim(&claims, hash(1), at),
+            Inv => announce(&claims, hash(1), at),
+            BlockMessage => claims.note_block_header_at(hash(1), TIP, at),
+        };
+        sight(first, first_at);
+        let original = used(&claims, hash(1), CLAIMED, first_at).unwrap();
+        assert_eq!(original.0, first);
+        sight(second, later);
+        assert_eq!(used(&claims, hash(1), CLAIMED, deadline), Some(original));
+        let late = deadline + Duration::from_nanos(1);
+        assert_eq!(
+            claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
+            ClaimOutcome::Expired {
+                source: first,
+                age: late - first_at
+            },
+            "{first:?} followed by {second:?}",
+        );
+    }
 }
 
 #[test]
@@ -197,44 +201,31 @@ fn advancing_past_a_pending_header_discards_its_fallback() {
 }
 
 #[test]
-fn an_expired_inv_does_not_cost_a_later_header_claim_its_deadline() {
+fn a_later_header_cannot_revive_a_legacy_claim_voided_by_local_mining() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     announce(&claims, hash(1), now);
-    let header_at = now + Duration::from_millis(1_500);
-    claim(&claims, hash(1), header_at);
-    let header = claims
-        .claimed_order(hash(1))
-        .expect("the header is claimed");
-
-    let inv_expired = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
-    assert_eq!(
-        used(&claims, hash(1), CLAIMED, inv_expired),
-        Some((ClaimSource::Header, header))
-    );
-
-    // Once both expire, the metrics report the first announcement.
-    let both_expired = header_at + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    let _mined = claims.mark_mined(hash(2), CLAIMED, order::next());
+    claim(&claims, hash(1), now);
     assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), arrival(both_expired)),
-        ClaimOutcome::Expired { source: ClaimSource::Inv, age, .. } if age == both_expired - now
+        claims.resolve(hash(1), Some(CLAIMED), arrival(now)),
+        ClaimOutcome::Voided {
+            source: ClaimSource::Inv,
+            ..
+        }
     ));
 }
 
 #[test]
-fn a_voided_inv_falls_back_to_a_header_received_after_local_mining() {
+fn a_later_header_cannot_move_a_legacy_sighting_into_the_height_window() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     announce(&claims, hash(1), now);
-    let mined_order = order::next();
-    let _mined = claims.mark_mined(hash(2), CLAIMED, mined_order);
-    claim(&claims, hash(1), now);
-    let header_order = claims.claimed_order(hash(1)).unwrap();
-
-    assert!(mined_order < header_order);
+    let height = block::Height(TIP.0 + 3);
+    claims.begin_at([(hash(1), height)], CLAIMED, now).commit();
     assert_eq!(
-        used(&claims, hash(1), CLAIMED, now),
-        Some((ClaimSource::Header, header_order))
+        claims.resolve(hash(1), Some(height), arrival(now)),
+        ClaimOutcome::Unclaimed,
     );
 }
 

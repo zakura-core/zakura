@@ -6,11 +6,12 @@
 mod support;
 
 use zakura_sim::harness::header_sync::storage_witnesses::{
-    competing_mirrors, header_apply, reply_hold,
+    self as storage_witnesses, competing_mirrors, header_apply, reply_hold,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
     thread,
 };
 
@@ -37,9 +38,9 @@ use zakura_sim::{
             policy::{Allow, Hold as HeaderHold, Trigger as HeaderTrigger},
             Policy as HeaderPolicy,
         },
-        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario},
+        header_sync::{grammar, HeaderWire, Storage as HeaderStorage, StorageScenario},
         run_harness,
-        wire_plans::act_scenario,
+        wire_plans::{act_scenario, SavedPlan},
         HarnessError, Subsystem,
     },
     model::Label,
@@ -511,13 +512,281 @@ where
     }
 }
 
-/// The input of the seed named `stem`, a full fuzz input the harness draws
-/// its scenario from.
-fn seed(stem: &str) -> Vec<u8> {
-    zakura_sim::seed::find(stem)
-        .unwrap_or_else(|| panic!("{stem} is registered"))
-        .input()
-        .to_vec()
+/// `scenario`'s `header-sync/storage` fuzz input: its canonical prefix, then
+/// `plan`.
+fn storage_input(name: &str, scenario: &StorageScenario, plan: &[u8]) -> Vec<u8> {
+    grammar::input(scenario, plan).unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
+/// The states a `header-sync/storage` run of `input` hits, from one run with
+/// the collector.
+fn collected(input: &[u8]) -> BTreeSet<StateFeature> {
+    let entry = zakura_sim::harness::find(HeaderStorage::NAME).unwrap();
+    let counters = counters();
+    let mut collecting = Feedback::new(counters, collector).start();
+    let run = (entry.run_bytes)(input, &mut zakura_sim::NullSink, Some(&mut collecting));
+    report(run.result);
+    let decoder = decoder();
+    counters
+        .hits()
+        .into_iter()
+        .filter_map(|feature| decoder.get(&feature).copied())
+        .collect()
+}
+
+/// Whether `states` shows each required row in `rows`.
+fn shows_rows(states: &BTreeSet<StateFeature>, rows: &[&str]) -> bool {
+    rows.iter().all(|state| {
+        REQUIRED.iter().any(|row| match row.coverage {
+            Coverage::Collected { shows, .. } => row.state == *state && states.iter().any(shows),
+            _ => false,
+        })
+    })
+}
+
+/// The fork-work labels `states` hits.
+fn fork_work(states: &BTreeSet<StateFeature>) -> Vec<ForkState> {
+    states
+        .iter()
+        .filter_map(|state| match state {
+            StateFeature::Fork(
+                fork @ (ForkState::StrongerWork | ForkState::WeakerWork | ForkState::EqualWork),
+            ) => Some(*fork),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `states` hits every hold stage of `op`'s held `part`.
+fn every_hold_stage(
+    states: &BTreeSet<StateFeature>,
+    op: Operation,
+    part: zakura_sim::explore::state::HeldPart,
+) -> bool {
+    zakura_sim::explore::state::HoldStage::ALL
+        .iter()
+        .all(|&stage| states.contains(&StateFeature::Hold { op, part, stage }))
+}
+
+/// What a searched witness's run must show beyond its [`OWN`] rows.
+type Needs = fn(&BTreeSet<StateFeature>) -> bool;
+
+/// The `header-sync/storage` witnesses a search finds a Plan for: each
+/// one's name, scenario, and what its run must show beyond its [`OWN`]
+/// rows. The fork witnesses hit only their own fork-work label, and the
+/// hold witnesses hit every stage of their hold.
+fn searched() -> Vec<(&'static str, StorageScenario, Needs)> {
+    use zakura_sim::explore::state::HeldPart;
+    let any: Needs = |_| true;
+    vec![
+        (LOCATOR_DROPPED, storage_witnesses::dropped_locator(), any),
+        (APPLY_AT_CLOSE, storage_witnesses::apply_at_close(), any),
+        (COMPETING_MIRRORS, competing_mirrors(), any),
+        (
+            "header-storage-w-hold-succeeds",
+            StorageScenario::holds(),
+            |states| every_hold_stage(states, Operation::ReadHeaderPath, HeldPart::Completion),
+        ),
+        ("header-storage-w-reply-hold", reply_hold(), |states| {
+            every_hold_stage(states, Operation::ApplyHeaderTarget, HeldPart::Reply)
+        }),
+        (
+            "header-storage-w-equal-forks",
+            storage_witnesses::equal_forks(),
+            |states| fork_work(states) == [ForkState::EqualWork],
+        ),
+        // The five-header branch is prepared first, so the three-header
+        // one is weaker unweighted and stronger at weight 2.
+        (
+            "header-storage-w-longer-fork",
+            storage_witnesses::longer_fork(),
+            |states| fork_work(states) == [ForkState::WeakerWork],
+        ),
+        (
+            "header-storage-w-weighted-fork",
+            storage_witnesses::weighted_fork(),
+            |states| fork_work(states) == [ForkState::StrongerWork],
+        ),
+        (
+            "header-storage-w-peer-lease-denied",
+            storage_witnesses::peer_lease_denied(),
+            any,
+        ),
+        (
+            "header-storage-w-stop-storage",
+            storage_witnesses::stop_with_held_apply(),
+            any,
+        ),
+        (
+            "header-storage-w-recover-closes",
+            recovery("closes"),
+            any,
+        ),
+    ]
+}
+
+/// The recovery witness scenario of `class`.
+fn recovery(class: &str) -> StorageScenario {
+    storage_witnesses::recovery_witnesses()
+        .into_iter()
+        .find(|(name, _)| *name == class)
+        .unwrap_or_else(|| panic!("no recovery witness {class}"))
+        .1
+}
+
+/// The Plans a storage witness search tries, in order: 1 KiB slices of one
+/// stream of drawn byte inputs. The stream holds about 32 KiB.
+fn search_plans() -> &'static [Vec<u8>] {
+    static PLANS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    PLANS.get_or_init(|| {
+        support::byte_inputs(64, 1_024)
+            .concat()
+            .chunks_exact(1_024)
+            .map(<[u8]>::to_vec)
+            .collect()
+    })
+}
+
+/// Each [`searched`] witness's input: its scenario under the first
+/// [`search_plans`] Plan whose run shows the witness's [`OWN`] rows and
+/// [`Needs`]. The witnesses search in parallel, once per test process.
+fn found() -> &'static BTreeMap<&'static str, Vec<u8>> {
+    static FOUND: OnceLock<BTreeMap<&'static str, Vec<u8>>> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        thread::scope(|scope| {
+            let searches: Vec<_> = searched()
+                .into_iter()
+                .map(|(name, scenario, needs)| {
+                    scope.spawn(move || {
+                        let rows = own_rows(name);
+                        let input = search_plans()
+                            .iter()
+                            .map(|plan| storage_input(name, &scenario, plan))
+                            .find(|input| {
+                                let states = collected(input);
+                                shows_rows(&states, rows) && needs(&states)
+                            })
+                            .unwrap_or_else(|| panic!("{name}: no searched Plan shows its rows"));
+                        (name, input)
+                    })
+                })
+                .collect();
+            searches
+                .into_iter()
+                .map(|search| search.join().expect("the search runs"))
+                .collect()
+        })
+    })
+}
+
+/// The input [`found`] holds for `name`.
+fn found_input(name: &str) -> Vec<u8> {
+    found()
+        .get(name)
+        .unwrap_or_else(|| panic!("{name} is searched"))
+        .clone()
+}
+
+/// The rows [`OWN`] commits `name`'s witness to, or none.
+fn own_rows(name: &str) -> &'static [&'static str] {
+    OWN.iter()
+        .find(|(own, _)| *own == name)
+        .map_or(&[], |(_, rows)| rows)
+}
+
+/// The locator-dropped witness's name.
+const LOCATOR_DROPPED: &str = "header storage locator dropped at its timeout";
+
+/// The apply-at-close witness's name.
+const APPLY_AT_CLOSE: &str = "header storage apply pending at close";
+
+/// The competing-mirrors witness's name.
+const COMPETING_MIRRORS: &str = "header storage competing mirrors";
+
+/// Each drawn witness that shows the rows it's committed for on its own
+/// run, so another witness can't stand in for it.
+const OWN: [(&str, &[&str]); 14] = [
+    (LOCATOR_DROPPED, &["completion after cancellation request"]),
+    (APPLY_AT_CLOSE, &["completion after owner retirement"]),
+    (
+        COMPETING_MIRRORS,
+        &["two distinct peer offers", "shared ancestor", "selected winner"],
+    ),
+    (
+        "header-storage-w-hold-succeeds",
+        &["operation kind × blocked × release × resumed operation"],
+    ),
+    (
+        "header-storage-w-equal-forks",
+        &["stronger, weaker or equal work"],
+    ),
+    (
+        "header-storage-w-longer-fork",
+        &["stronger, weaker or equal work"],
+    ),
+    (
+        "header-storage-w-weighted-fork",
+        &["stronger, weaker or equal work"],
+    ),
+    (
+        "header-storage-w-peer-lease-denied",
+        &["exactly limit", "attempted over-limit and denied"],
+    ),
+    (
+        "header-storage-w-recover-closes",
+        &["conditions established"],
+    ),
+    (
+        "header-storage-w-stop-storage",
+        &["external acknowledgement"],
+    ),
+    ("header-wire-reopen", &["stream replacement"]),
+    (
+        "header-wire-old-page-after-reopen",
+        &["old-session traffic delivered"],
+    ),
+    (
+        "header-wire-outcome-crossing",
+        &["conformant crossed updates"],
+    ),
+    ("header-storage-w-reply-hold", &[]),
+];
+
+/// The fuzz-12 item 7 witnesses no search finds: each action and overlap
+/// the fuzz-12 controls added, under [`plan`]. Each is named
+/// `header-storage-w-<name>`.
+fn planned_witnesses() -> Vec<(String, StorageScenario)> {
+    let mut all: Vec<(String, StorageScenario)> = [
+        ("reset-locator", storage_witnesses::reset_held_locator()),
+        ("reset-prepare", storage_witnesses::reset_held_prepare()),
+        ("reset-apply", storage_witnesses::reset_held_apply()),
+        ("reset-reply", storage_witnesses::reset_reply_hold()),
+        ("reconsider", storage_witnesses::invalidate_reconsider()),
+        ("release", storage_witnesses::release_after_apply()),
+        ("reply-after-shutdown", storage_witnesses::reply_after_shutdown()),
+        ("reply-after-close", storage_witnesses::reply_after_close()),
+    ]
+    .into_iter()
+    .map(|(name, scenario)| (format!("header-storage-w-{name}"), scenario))
+    .collect();
+    for (kind, allow, outcome, after) in storage_witnesses::fault_witnesses() {
+        all.push((
+            storage_witnesses::fault_stem(kind, outcome),
+            storage_witnesses::fault_witness(kind, allow, after),
+        ));
+    }
+    for (prefix, classes) in [
+        ("recover", storage_witnesses::recovery_witnesses()),
+        ("owed", storage_witnesses::owed_recovery_witnesses()),
+    ] {
+        for (class, scenario) in classes {
+            let name = format!("header-storage-w-{prefix}-{}", class.replace(' ', "-"));
+            if !OWN.iter().any(|(own, _)| *own == name) {
+                all.push((name, scenario));
+            }
+        }
+    }
+    all
 }
 
 /// Plan bytes after a scenario prefix, the same on every call.
@@ -568,21 +837,6 @@ fn witnesses() -> Vec<Witness> {
             relink_while_applying(),
             plan(),
         ),
-        drawn(
-            "header-sync/storage",
-            "header storage locator dropped at its timeout",
-            seed("header-storage-locator-dropped"),
-        ),
-        drawn(
-            "header-sync/storage",
-            "header storage apply pending at close",
-            seed("header-storage-apply-at-close"),
-        ),
-        drawn(
-            "header-sync/storage",
-            "header storage competing mirrors",
-            seed("header-storage-competing-mirrors"),
-        ),
         explicit::<HeaderWire>(
             "header wire status burst",
             act_scenario(Act::StatusBurst),
@@ -601,19 +855,17 @@ fn witnesses() -> Vec<Witness> {
         StorageScenario::grow(),
         grow_to_drain_plan(),
     ));
-    // fuzz-12 item 7's witness seeds.
-    for witness in zakura_sim::seed::all() {
-        if witness.name.starts_with("header-storage-w-") {
-            all.push(drawn(
-                "header-sync/storage",
-                &witness.name,
-                witness.input().to_vec(),
-            ));
-        }
+    // The searched witnesses, then fuzz-12 item 7's other witnesses.
+    for (name, input) in found() {
+        all.push(drawn(HeaderStorage::NAME, name, input.clone()));
     }
-    // fuzz-13's saved Plans, each run from its seed.
-    for stem in FUZZ_13_SEEDS {
-        all.push(drawn("header-sync/wire", stem, seed(stem)));
+    for (name, scenario) in planned_witnesses() {
+        let input = storage_input(&name, &scenario, &plan());
+        all.push(drawn(HeaderStorage::NAME, &name, input));
+    }
+    // fuzz-13's saved Plans, each its tag under the empty Plan.
+    for (name, saved) in FUZZ_13_PLANS {
+        all.push(drawn(HeaderWire::NAME, name, saved.tag().to_vec()));
     }
     // Competing mirrors under more plans, which also reach a reorg.
     for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
@@ -626,11 +878,11 @@ fn witnesses() -> Vec<Witness> {
     all
 }
 
-/// fuzz-13's `header-sync/wire` seeds.
-const FUZZ_13_SEEDS: [&str; 3] = [
-    "header-wire-reopen",
-    "header-wire-old-page-after-reopen",
-    "header-wire-outcome-crossing",
+/// fuzz-13's `header-sync/wire` saved Plans, by witness name.
+const FUZZ_13_PLANS: [(&str, SavedPlan); 3] = [
+    ("header-wire-reopen", SavedPlan::Reopen),
+    ("header-wire-old-page-after-reopen", SavedPlan::OldPageAfterReopen),
+    ("header-wire-outcome-crossing", SavedPlan::Act(Act::OutcomeCrossing)),
 ];
 
 /// The no-hold passing control: [`StorageScenario::grow`] under a Plan whose
@@ -754,71 +1006,15 @@ fn every_collected_state_has_a_witness() {
         });
         assert_eq!(lost, None, "{}: no caller to lose", witness.name);
     }
-    // Each drawn header storage seed shows the rows it's committed for on
-    // its own run, so another witness can't stand in for it.
-    let own = [
-        (
-            "header storage locator dropped at its timeout",
-            &["completion after cancellation request"][..],
-        ),
-        (
-            "header storage apply pending at close",
-            &["completion after owner retirement"][..],
-        ),
-        (
-            "header storage competing mirrors",
-            &[
-                "two distinct peer offers",
-                "shared ancestor",
-                "selected winner",
-            ][..],
-        ),
-        (
-            "header-storage-w-hold-succeeds",
-            &["operation kind × blocked × release × resumed operation"][..],
-        ),
-        (
-            "header-storage-w-equal-forks",
-            &["stronger, weaker or equal work"][..],
-        ),
-        (
-            "header-storage-w-longer-fork",
-            &["stronger, weaker or equal work"][..],
-        ),
-        (
-            "header-storage-w-weighted-fork",
-            &["stronger, weaker or equal work"][..],
-        ),
-        (
-            "header-storage-w-peer-lease-denied",
-            &["exactly limit", "attempted over-limit and denied"][..],
-        ),
-        (
-            "header-storage-w-recover-closes",
-            &["conditions established"][..],
-        ),
-        (
-            "header-storage-w-stop-storage",
-            &["external acknowledgement"][..],
-        ),
-        ("header-wire-reopen", &["stream replacement"][..]),
-        (
-            "header-wire-old-page-after-reopen",
-            &["old-session traffic delivered"][..],
-        ),
-        (
-            "header-wire-outcome-crossing",
-            &["conformant crossed updates"][..],
-        ),
-    ];
-    for (name, rows) in own {
+    // Each [`OWN`] witness shows its rows on its own run.
+    for (name, rows) in OWN {
         let (witness, states) = witnesses
             .iter()
             .zip(&reached)
             .find(|(witness, _)| witness.name == name)
             .unwrap_or_else(|| panic!("no witness {name}"));
         assert!(witness.drawn, "{name}");
-        for state in rows {
+        for state in rows.iter() {
             let row = REQUIRED.iter().find(|row| row.state == *state).unwrap();
             let Coverage::Collected { shows, drawn, .. } = row.coverage else {
                 panic!("{state} is collected");
@@ -909,14 +1105,14 @@ fn fuzz_12_features_have_their_witnesses() {
     }
 }
 
-/// The weighted-fork seed prepares the five-header branch again after the
-/// three-header one, and that retry earns no reverse label: the seed hits
+/// The weighted-fork witness prepares the five-header branch again after the
+/// three-header one, and that retry earns no reverse label: the witness hits
 /// only [`ForkState::StrongerWork`], as the test above checks.
 #[test]
 fn a_retried_prepare_earns_no_fork_work() {
     let entry = zakura_sim::harness::find("header-sync/storage").unwrap();
     let run = (entry.run_bytes)(
-        &seed("header-storage-w-weighted-fork"),
+        &found_input("header-storage-w-weighted-fork"),
         &mut zakura_sim::NullSink,
         None,
     );

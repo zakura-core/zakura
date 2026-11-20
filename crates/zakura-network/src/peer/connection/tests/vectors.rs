@@ -2210,11 +2210,7 @@ async fn queued_and_active_primaries_observe_only_their_own_block() {
             advertised,
         });
         attempt
-            .dispatch_if_needed(
-                Some("127.0.0.1:8233".parse().unwrap()),
-                Some(estimate),
-                || (),
-            )
+            .dispatch_if_needed(Some("127.0.0.1:8233".parse().unwrap()), estimate, || ())
             .unwrap();
         let size = attempt.first_dispatch().unwrap().block_size;
         let mut frame = BytesMut::new();
@@ -2436,17 +2432,21 @@ async fn request_slot_records_unanswered_block_requests() {
 /// Only a dual-stack deadline that interrupts a written advertiser request counts as a miss.
 #[tokio::test(start_paused = true)]
 async fn legacy_deadline_charges_only_a_written_advertised_request() {
-    for written in [false, true] {
+    for (written, advertised) in [(false, true), (true, true), (true, false)] {
         let (mut peer_tx, peer_rx) = mpsc::channel(4);
         let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
         let slot = connection.request_slot.clone();
         let task = tokio::spawn(connection.run(peer_rx));
         let (tx, block) = response_vectors();
         let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        if !advertised {
+            // The dual-stack deadline still tracks the fallback write with hedging closed.
+            attempt.close();
+        }
         let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
         request.block_request = Some(crate::peer::BlockRequestKind::TrackedPrimary {
             attempt: attempt.clone(),
-            advertised: true,
+            advertised,
         });
         if written {
             client_tx.send(request).await.unwrap();
@@ -2478,7 +2478,8 @@ async fn legacy_deadline_charges_only_a_written_advertised_request() {
             );
         }
         settle().await;
-        assert_eq!(slot.announced_block_missed(), written);
+        assert_eq!(attempt.timed_out_after_write(), written);
+        assert_eq!(slot.announced_block_missed(), written && advertised);
         assert!(!slot.block_request_unanswered());
         task.abort();
     }
@@ -3491,7 +3492,7 @@ async fn a_large_verified_block_clears_a_miss_and_keeps_the_expected_answer_time
         "a verified large block clears the miss like any other block"
     );
     assert_eq!(
-        delivery_samples.delivery_score(),
+        delivery_samples.delivery_estimate().round_trip(),
         Some(Duration::from_millis(30)),
         "a five-second download of a large block does not raise the expected answer time"
     );
@@ -3548,7 +3549,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent hashes");
     settle().await;
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
 
     // A transaction answer is not either: the peer chooses how many transactions it announces.
     let (request, response) = client_request(Request::TransactionsById([txid].into()));
@@ -3564,7 +3565,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent the transaction");
     settle().await;
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
 
     // A block answer 10 ms after the request is.
     let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
@@ -3583,7 +3584,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         panic!("expected a block response");
     };
     let (received, _) = blocks[0].available().unwrap();
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
     tokio::time::advance(Duration::from_secs(1)).await;
     let other_body: BlockHandle = Arc::new(block::Block {
         header: block.header.clone(),
@@ -3593,14 +3594,14 @@ async fn block_answers_are_timed_as_delivery_samples() {
     assert_eq!(received.hash(), other_body.hash());
     received.record_verified_copy(&other_body);
     assert_eq!(
-        delivery_samples.delivery_score(),
+        delivery_samples.delivery_estimate().round_trip(),
         None,
         "an equal header does not confirm the body"
     );
     received.record_verified_copy(&block.into());
     received.record_verified();
     assert_eq!(
-        delivery_samples.delivery_score(),
+        delivery_samples.delivery_estimate().round_trip(),
         Some(Duration::from_millis(10))
     );
 

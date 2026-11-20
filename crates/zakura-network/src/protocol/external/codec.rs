@@ -278,6 +278,14 @@ impl InboundBlockSize {
             Some(RequestedBlockSize { hash, bytes });
     }
 
+    /// Capture the request that owns this frame, even if the connection later retries it.
+    fn snapshot(&self) -> Option<RequestedBlockSize> {
+        self.0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .clone()
+    }
+
     /// Stop observing this request when the connection becomes idle.
     pub(crate) fn clear(&self) {
         self.0
@@ -754,11 +762,7 @@ impl Decoder for Codec {
                         command,
                         checksum,
                         requested_size: if command == *BLOCK_COMMAND {
-                            self.inbound_block_size
-                                .0
-                                .lock()
-                                .expect("block size lock is never poisoned")
-                                .clone()
+                            self.inbound_block_size.snapshot()
                         } else {
                             None
                         },

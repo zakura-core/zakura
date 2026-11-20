@@ -1652,9 +1652,9 @@ where
                 if let Some(super::BlockRequestKind::TrackedPrimary { attempt, .. }) =
                     &tx.block_request
                 {
-                    attempt.legacy_request_written();
+                    let reply_size = attempt.legacy_request_written();
                     if let (Handler::BlocksByHash { pending_hashes, .. }, Some(bytes)) =
-                        (&handler, attempt.pending_reply_size())
+                        (&handler, reply_size)
                     {
                         // A tracked primary requests exactly one hash.
                         let hash = pending_hashes

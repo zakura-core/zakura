@@ -109,8 +109,8 @@ impl DeliveryTrace {
             kind: label(kind),
             sample_ms: saturating_millis(sample),
             wire_bytes: kind.wire_bytes(),
-            score_before_ms: before.score().map(saturating_millis),
-            score_ms: after.score().map(saturating_millis),
+            score_before_ms: before.round_trip().map(saturating_millis),
+            score_ms: after.round_trip().map(saturating_millis),
             weight: two_decimals(after.weight()),
             expected_ms: large_block
                 .then(|| before.expected(kind.wire_bytes()))

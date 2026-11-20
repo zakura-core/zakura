@@ -378,13 +378,6 @@ impl BlockGossipPeer {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
 
-    /// The expected time for this peer to answer a block request, from its recent answers.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
-        self.registry
-            .as_ref()
-            .and_then(PeerRegistryUpdater::delivery_score)
-    }
-
     /// What is known about how long this peer takes to deliver a block: its round trip and its
     /// record on large blocks. Empty for a peer with no measured answers.
     pub(crate) fn delivery_estimate(&self) -> DeliveryEstimate {

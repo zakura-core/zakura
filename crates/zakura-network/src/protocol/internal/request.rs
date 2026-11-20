@@ -132,23 +132,20 @@ impl BlockHedge {
         self.started + Self::WINDOW
     }
 
-    /// The size destination for the first peer, while a second request could still be sent.
-    pub(crate) fn pending_reply_size(&self) -> Option<Arc<OnceLock<u64>>> {
-        let state = self.state();
-        if !state.can_dispatch_hedge(self.started.elapsed()) {
-            return None;
-        }
-        Some(state.first.as_ref()?.block_size.clone())
-    }
-
     /// Publish the dual-stack deadline before the legacy future is dropped.
     pub(crate) fn legacy_timeout(&self) {
         self.state().legacy_timed_out = true;
     }
 
-    pub(crate) fn legacy_request_written(&self) {
+    /// Records the write for deadline accounting. While a second request can still be sent,
+    /// returns the destination for the first reply's size.
+    pub(crate) fn legacy_request_written(&self) -> Option<Arc<OnceLock<u64>>> {
         let mut state = self.state();
         state.legacy_written_before_timeout = !state.legacy_timed_out;
+        if !state.can_dispatch_hedge(self.started.elapsed()) {
+            return None;
+        }
+        Some(state.first.as_ref()?.block_size.clone())
     }
 
     pub(crate) fn timed_out_after_write(&self) -> bool {
@@ -159,12 +156,11 @@ impl BlockHedge {
     /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
     /// The closure only enqueues work in a ready service or reserved channel slot.
     ///
-    /// `estimate` is what a legacy `peer`'s expected answer time is worked out from. Without it,
-    /// or if the peer has no measured answers, the download gets no second request.
+    /// A first peer with no measured round trip gets no second request.
     pub(crate) fn dispatch_if_needed<T>(
         &self,
         peer: Option<PeerSocketAddr>,
-        estimate: Option<DeliveryEstimate>,
+        estimate: DeliveryEstimate,
         dispatch: impl FnOnce() -> T,
     ) -> Result<T, crate::BoxError> {
         let mut state = self.state();
@@ -174,8 +170,9 @@ impl BlockHedge {
         if state.satisfied {
             return Err("block already delivered".into());
         }
-        let estimate = estimate.unwrap_or_default();
-        if state.first.is_none() && estimate.score().is_none() && state.hedge == HedgeDispatch::Open
+        if state.first.is_none()
+            && estimate.round_trip().is_none()
+            && state.hedge == HedgeDispatch::Open
         {
             metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
             // The first dispatch fixes the estimate used by every later comparison.

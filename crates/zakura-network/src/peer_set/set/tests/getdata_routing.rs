@@ -1528,7 +1528,7 @@ async fn an_announcer_that_does_not_deliver_its_block_is_not_preferred_next() {
         .expect("connection is open");
     assert!(response.await.is_err(), "the peer did not have the block");
     assert_eq!(
-        missing_score.delivery_score(),
+        missing_score.delivery_estimate().round_trip(),
         Some(Duration::from_millis(10)),
         "a missed block leaves the score alone"
     );
@@ -1620,7 +1620,7 @@ async fn an_announcer_that_does_not_deliver_a_second_request_is_not_preferred_ne
         .expect("connection is open");
     assert!(second.await.is_err(), "the peer did not have the block");
     assert_eq!(
-        near_score.delivery_score(),
+        near_score.delivery_estimate().round_trip(),
         Some(Duration::from_millis(10)),
         "a missed block leaves the score alone"
     );

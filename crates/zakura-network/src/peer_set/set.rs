@@ -1179,24 +1179,24 @@ where
         (nth(idxs.index(0)), nth(idxs.index(1)))
     }
 
-    /// The expected time for the ready peer `key` to answer a block request, if measured.
-    fn delivery_score(&self, key: &D::Key) -> Option<Duration> {
+    /// The measured round-trip time for the ready peer `key`.
+    fn round_trip(&self, key: &D::Key) -> Option<Duration> {
         self.ready_services
             .get(key)
-            .and_then(|svc| svc.block_gossip.delivery_score())
+            .and_then(|svc| svc.block_gossip.delivery_estimate().round_trip())
     }
 
     /// Draws two random peers from `peers` and returns the one expected to answer sooner.
     ///
     /// A peer whose answers have not been measured loses to one whose have. If neither has
     /// been measured, the first drawn wins, which is already a random choice.
-    fn select_p2c_peer_by_delivery_score(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
+    fn select_p2c_peer_by_round_trip(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
         match peers.len() {
             0 => None,
             1 => peers.iter().next().copied(),
             len => {
                 let (a, b) = Self::sample_two(peers, len);
-                let selected = match (self.delivery_score(&a), self.delivery_score(&b)) {
+                let selected = match (self.round_trip(&a), self.round_trip(&b)) {
                     (Some(a_score), Some(b_score)) if b_score < a_score => b,
                     (None, Some(_)) => b,
                     _ => a,
@@ -1235,7 +1235,7 @@ where
             .collect();
 
         let peer = if self.block_download_score_and_hedge {
-            self.select_p2c_peer_by_delivery_score(&preferred_advertisers)
+            self.select_p2c_peer_by_round_trip(&preferred_advertisers)
         } else {
             self.select_p2c_peer_from_list(&preferred_advertisers)
         }
@@ -1243,10 +1243,10 @@ where
 
         let choice = BlockSourceChoice {
             candidates: preferred_advertisers.len(),
-            score: self.delivery_score(&peer),
+            score: self.round_trip(&peer),
             best_score: preferred_advertisers
                 .iter()
-                .filter_map(|key| self.delivery_score(key))
+                .filter_map(|key| self.round_trip(key))
                 .min(),
         };
         if choice.candidates >= 2 {
@@ -1290,9 +1290,8 @@ where
                     attempt: attempt.clone(),
                     advertised,
                 };
-                attempt.dispatch_if_needed(Some(peer), Some(estimate), || {
-                    svc.call_routed(req, Some(route))
-                })
+                attempt
+                    .dispatch_if_needed(Some(peer), estimate, || svc.call_routed(req, Some(route)))
             }
             None => Ok(svc.call_routed(req, advertised.then_some(BlockRequestKind::Primary))),
         };

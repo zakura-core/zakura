@@ -165,7 +165,7 @@ impl DeliveryEstimate {
     }
 
     /// The peer's round trip, or `None` when none has been measured yet.
-    pub(crate) fn score(&self) -> Option<Duration> {
+    pub(crate) fn round_trip(&self) -> Option<Duration> {
         self.round_trip.value().map(duration_from_secs)
     }
 
@@ -185,7 +185,7 @@ impl DeliveryEstimate {
     pub(crate) fn expected(&self, wire_bytes: Option<u64>) -> Option<Duration> {
         let large = wire_bytes.filter(|wire_bytes| *wire_bytes > ROUND_TRIP_REPLY_BYTES);
         let Some(wire_bytes) = large else {
-            return self.score();
+            return self.round_trip();
         };
         let slowdown = self.large_block_slowdown().unwrap_or(1.0);
         let trips = (round_trips(wire_bytes) * slowdown).max(1.0);
@@ -257,7 +257,7 @@ mod tests {
         estimate.record(block(LARGE), before * 3, now);
 
         assert_eq!(
-            estimate.score(),
+            estimate.round_trip(),
             Some(ms(100)),
             "the round trip is unchanged"
         );
@@ -278,14 +278,14 @@ mod tests {
         let (mut estimate, now) = measured();
         estimate.record(block(LARGE), Duration::from_secs(5), now);
         assert_eq!(estimate.expected(None), Some(ms(100)));
-        assert_eq!(estimate.expected(None), estimate.score());
+        assert_eq!(estimate.expected(None), estimate.round_trip());
     }
 
     #[test]
     fn a_peer_measured_only_on_large_blocks_has_no_expectation() {
         let mut estimate = DeliveryEstimate::default();
         estimate.record(block(LARGE), Duration::from_secs(2), Instant::now());
-        assert_eq!(estimate.score(), None);
+        assert_eq!(estimate.round_trip(), None);
         assert_eq!(estimate.expected(None), None);
         assert_eq!(estimate.expected(Some(LARGE)), None);
         assert_eq!(
@@ -343,7 +343,7 @@ mod tests {
         let mut delayed = DeliveryEstimate::default();
         delayed.record(PING, ms(10), late);
         delayed.record(PING, ms(200), early);
-        assert_eq!(delayed.score(), chronological.score());
+        assert_eq!(delayed.round_trip(), chronological.round_trip());
         assert_eq!(delayed.weight(), chronological.weight());
     }
 
@@ -364,14 +364,14 @@ mod tests {
 
     #[test]
     fn no_samples_means_no_score() {
-        assert_eq!(DeliveryEstimate::default().score(), None);
+        assert_eq!(DeliveryEstimate::default().round_trip(), None);
     }
 
     #[test]
     fn the_first_sample_sets_the_score() {
         let mut estimate = DeliveryEstimate::default();
         estimate.record(PING, ms(40), Instant::now());
-        assert_eq!(estimate.score(), Some(ms(40)));
+        assert_eq!(estimate.round_trip(), Some(ms(40)));
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         let mut estimate = DeliveryEstimate::default();
         estimate.record(PING, ms(40), now);
         estimate.record(PING, ms(80), now);
-        assert_eq!(estimate.score(), Some(ms(60)));
+        assert_eq!(estimate.round_trip(), Some(ms(60)));
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
         estimate.record(PING, ms(400), start);
         estimate.record(PING, ms(20), start + TIME_CONSTANT * 3);
 
-        let score = estimate.score().expect("measured");
+        let score = estimate.round_trip().expect("measured");
         assert!(
             score < ms(40),
             "a sample three time constants old barely counts: {score:?}"

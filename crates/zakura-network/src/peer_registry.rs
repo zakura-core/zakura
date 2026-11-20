@@ -385,12 +385,6 @@ impl PeerRegistryUpdater {
         self.delivery_trace.block_missed(second_request);
     }
 
-    /// The expected time for this peer to answer a block request, from its recent answers, or
-    /// `None` before its first measured answer.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
-        self.delivery_estimate().score()
-    }
-
     /// What is known about how long this peer takes to deliver a block: its round trip and its
     /// record on large blocks. Empty before its first measured answer.
     pub(crate) fn delivery_estimate(&self) -> DeliveryEstimate {
@@ -496,20 +490,23 @@ mod tests {
     fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
         let registry = PeerRegistry::default();
         let (guard, updater) = registry.register_legacy(peer(1));
-        assert_eq!(updater.delivery_score(), None);
+        assert_eq!(updater.delivery_estimate().round_trip(), None);
 
         updater.record_response(Duration::from_millis(30));
-        assert_eq!(updater.delivery_score(), Some(Duration::from_millis(30)));
+        assert_eq!(
+            updater.delivery_estimate().round_trip(),
+            Some(Duration::from_millis(30))
+        );
 
         drop(guard);
-        assert_eq!(updater.delivery_score(), None);
+        assert_eq!(updater.delivery_estimate().round_trip(), None);
         updater.record_delivery_sample(
             DeliverySampleKind::Block { wire_bytes: 1_700 },
             Duration::from_millis(5),
             Instant::now(),
         );
         assert_eq!(
-            updater.delivery_score(),
+            updater.delivery_estimate().round_trip(),
             None,
             "a closed connection keeps no estimate"
         );
@@ -593,7 +590,7 @@ mod tests {
 
         updater.record_delivery_sample(block(1_200_000), Duration::from_secs(4), now);
         assert_eq!(
-            updater.delivery_score(),
+            updater.delivery_estimate().round_trip(),
             None,
             "a large block alone does not give a peer an expected answer time"
         );
@@ -605,7 +602,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            updater.delivery_score(),
+            updater.delivery_estimate().round_trip(),
             Some(Duration::from_millis(20)),
             "a block of exactly the size limit counts like a ping"
         );
@@ -616,7 +613,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            updater.delivery_score(),
+            updater.delivery_estimate().round_trip(),
             Some(Duration::from_millis(20)),
             "a slow download of a block over the size limit does not raise the expected answer time"
         );

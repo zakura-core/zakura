@@ -126,7 +126,9 @@ def classify(delta_pct: float | None, lower_is_better: bool, baseline=None, targ
             # Moving off a clean baseline in the bad direction.
             return "WORSE" if lower_is_better else "better"
         return "="
-    if abs(delta_pct) < NOISE_FLOOR_PCT:
+    # Rounded so a delta that is exactly the floor, such as a share falling
+    # from 1.0 to 0.9, isn't read as just under it by float error.
+    if round(abs(delta_pct), 9) < NOISE_FLOOR_PCT:
         return "="
     improved = (delta_pct < 0) if lower_is_better else (delta_pct > 0)
     return "better" if improved else "WORSE"

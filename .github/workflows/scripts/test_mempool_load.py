@@ -1293,6 +1293,15 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "=")
         self.assertEqual(compare.gate(baseline, target, rows), ("pass", []))
 
+    def test_a_reach_drop_of_exactly_the_floor_is_graded(self):
+        # 100/100 to 90/100 is a 10% drop, which float error puts just under
+        # the floor unless the grade rounds it.
+        baseline = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 100})
+        target = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 90})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "WORSE")
+        self.assertEqual(compare.gate(baseline, target, rows)[0], "fail")
+
     def test_zero_baseline_does_not_produce_infinity(self):
         baseline = self.leg(propagation={"txids_on_all_nodes": 0})
         rows = compare.build_rows(baseline, self.leg())

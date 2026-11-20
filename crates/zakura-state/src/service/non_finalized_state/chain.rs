@@ -738,6 +738,19 @@ impl Chain {
         })
     }
 
+    /// Returns the [`transaction::Hash`] of the transaction at `location`,
+    /// if a block in this chain contains it.
+    pub fn transaction_hash_by_loc(
+        &self,
+        location: TransactionLocation,
+    ) -> Option<transaction::Hash> {
+        self.blocks
+            .get(&location.height)?
+            .transaction_hashes
+            .get(location.index.as_usize())
+            .copied()
+    }
+
     /// Returns the [`transaction::Hash`]es in the block with `hash_or_height`,
     /// if it exists in this chain.
     ///

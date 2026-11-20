@@ -10,9 +10,9 @@ use zakura_chain::block;
 
 /// The most announcements one connection hands to the hook in each [`ANNOUNCEMENT_WINDOW`].
 ///
-/// An honest peer announces about one block per window, or two when blocks race at the tip.
-/// The limit bounds one peer's share of whatever the hook records.
-const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 2;
+/// Four calls leave room for both blocks in a tip race and for repeated or bunched
+/// announcements, while bounding one connection's share of the hook's work.
+const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 4;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
 const ANNOUNCEMENT_WINDOW: Duration = Duration::from_secs(2);

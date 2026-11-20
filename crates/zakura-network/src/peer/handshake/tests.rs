@@ -1350,7 +1350,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
     assert_eq!(*announced.lock().unwrap(), [blocks[0]]);
 }
 
-/// One connection hands the hook at most two announcements per 2 second window, and each
+/// One connection hands the hook at most four announcements per two-second window, and each
 /// connection has its own allowance.
 #[tokio::test(start_paused = true)]
 async fn the_block_announcement_hook_is_limited_per_connection() {
@@ -1370,27 +1370,27 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
     };
     let count = || announced.lock().unwrap().len();
 
-    for byte in 1..=3 {
+    for byte in 1..=5 {
         announce(&mut connection, byte).expect("passed through");
     }
     assert_eq!(
         count(),
-        2,
-        "the third announcement in the window is dropped"
+        4,
+        "the fifth announcement in the window does not reach the hook"
     );
 
-    announce(&mut hook.for_connection(), 4).expect("passed through");
-    assert_eq!(count(), 3, "another connection has its own allowance");
+    announce(&mut hook.for_connection(), 6).expect("passed through");
+    assert_eq!(count(), 5, "another connection has its own allowance");
 
     tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
-    announce(&mut connection, 5).expect("passed through");
-    assert_eq!(count(), 3, "the window has not ended");
+    announce(&mut connection, 7).expect("passed through");
+    assert_eq!(count(), 5, "the window has not ended");
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    announce(&mut connection, 6).expect("passed through");
-    announce(&mut connection, 7).expect("passed through");
-    announce(&mut connection, 8).expect("passed through");
-    assert_eq!(count(), 5, "a new window allows two more");
+    for byte in 8..=12 {
+        announce(&mut connection, byte).expect("passed through");
+    }
+    assert_eq!(count(), 9, "a new window allows four more announcements");
 }
 
 /// A hook that records the hashes it is called with.

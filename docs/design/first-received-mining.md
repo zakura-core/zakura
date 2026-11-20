@@ -66,11 +66,12 @@ The reservation is called a claim. Five rules define it:
   The `inv` store holds 512 blocks. Entries older than 4 seconds, twice the
   body deadline, are dropped when a new block is recorded, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 2 `inv`s per 2 seconds to the store,
-  so one peer cannot fill it, and a sustained flood can at worst return blocks
-  to arrival order. A block announced again after its entry was dropped counts
-  as newly announced, which gives a withholder nothing it could not get by
-  announcing late.
+  Each legacy connection passes at most 4 `inv`s per 2 seconds to the store,
+  leaving room for both blocks in a tip race and for repeated or bunched
+  announcements. One connection cannot fill the store. A sustained flood can
+  at worst return blocks to arrival order. An announcement after its entry was
+  dropped counts as a new sighting, which gives a withholder nothing it could
+  not get by announcing late.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.

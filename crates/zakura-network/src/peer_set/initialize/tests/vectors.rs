@@ -2752,6 +2752,10 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
 /// Test the listener reserves one inbound slot for a configured zcashd-compat peer,
 /// matching native and IPv4-mapped address representations canonically.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     let _init_guard = zakura_test::init();
 
@@ -2761,9 +2765,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     }
 
     let public_ip = Ipv4Addr::LOCALHOST;
-    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
-        return;
-    };
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
 
     let success_stay_open_inbound_handshaker =
@@ -2865,6 +2867,10 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
 
 /// Test the listener does not add zcashd-compat peers to the recent-IP throttle.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     let _init_guard = zakura_test::init();
 
@@ -2873,9 +2879,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         return;
     }
 
-    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
-        return;
-    };
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
     let success_disconnect_inbound_handshaker =
         service_fn(|req: HandshakeRequest<TcpStream>| async move {
             let HandshakeRequest {
@@ -3511,6 +3515,10 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
 
 /// Test bans are applied before the zcashd-compat reserved slot.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     let _init_guard = zakura_test::init();
 
@@ -3519,9 +3527,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         return;
     }
 
-    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
-        return;
-    };
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
     let unreachable_inbound_handshaker = service_fn(|_| async {
         unreachable!("banned zcashd-compat peer should never reach the handshaker")
     });

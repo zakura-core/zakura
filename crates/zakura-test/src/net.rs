@@ -130,21 +130,3 @@ pub fn random_known_port() -> u16 {
 pub fn random_unallocated_port() -> u16 {
     0
 }
-
-/// Returns a second IPv4 loopback address, `127.0.0.2`, if this machine can
-/// bind it.
-///
-/// Linux routes all of `127.0.0.0/8` to the loopback interface. macOS binds
-/// only `127.0.0.1` unless an alias is configured, so a test that needs two
-/// loopback hosts can't run there. Such a test returns early on `None`.
-#[allow(clippy::print_stderr)]
-pub fn second_loopback_ip() -> Option<std::net::Ipv4Addr> {
-    let ip = std::net::Ipv4Addr::new(127, 0, 0, 2);
-    if let Err(error) = std::net::UdpSocket::bind((ip, 0)) {
-        // This message is captured by the test runner, use
-        // `cargo test -- --nocapture` to see it.
-        eprintln!("Skipping a test that needs a second loopback address: binding {ip}: {error}");
-        return None;
-    }
-    Some(ip)
-}

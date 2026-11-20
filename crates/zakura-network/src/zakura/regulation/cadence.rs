@@ -14,7 +14,8 @@
 //! A [`MessageRole::Metered`] row is charged by payload bytes instead, in a
 //! [`ByteBucket`] that belongs to the connection as the cadence buckets do.
 //! Its depth already covers every byte a conformant sender can have buffered,
-//! so an overrun is a violation and closes the connection.
+//! so an overrun is a violation and closes the connection. It starts at the
+//! sender's opening allowance, so a reconnect buys no more than that.
 //!
 //! Rows without a cadence or a byte rate charge nothing. Commitments bound
 //! requests, and reservations bound responses.
@@ -37,6 +38,7 @@
 //! | A byte bucket pays its depth back to back, then refills at its rate | `a_byte_bucket_pays_its_depth_then_refills_at_its_rate` |
 //! | A metered row overruns only past the receiver's depth | `a_metered_row_overruns_only_past_the_receivers_depth` |
 //! | A conformant sender that stalls and resumes is never cut off | `a_sender_that_stalls_and_resumes_never_overruns_the_receiver` |
+//! | A receiver's byte bucket starts at the opening allowance from its epoch | `a_receivers_byte_bucket_starts_at_the_opening_allowance` |
 //! | Reopening sessions on one connection buys no bytes | `reopening_sessions_on_one_connection_buys_no_bytes` |
 //! | A charge reports a low bucket below a quarter of its capacity | `a_charge_reports_a_low_bucket_below_a_quarter_of_capacity` |
 
@@ -73,7 +75,9 @@ pub(crate) enum CadenceCharge {
 /// Payload bytes earned at a fixed rate, up to a depth.
 ///
 /// The sender pays one for each metered frame before handing it on, and the
-/// receiver charges one for each metered frame it reads. Both start full.
+/// receiver charges one for each metered frame it reads. The sender's starts
+/// full. The receiver's starts at the sender's depth, earned from an epoch
+/// no later than the sender's could start. See [`Self::receiver`].
 #[derive(Clone, Debug)]
 pub(crate) struct ByteBucket {
     depth: u64,
@@ -94,13 +98,30 @@ impl ByteBucket {
     }
 
     /// A receiver's bucket for `rate` on a connection whose stream receive
-    /// window is `receive_window`. See [`ByteRate::receiver_depth`].
-    pub(crate) fn receiver(rate: ByteRate, receive_window: u64, now: Instant) -> Self {
-        Self::new(
-            rate.receiver_depth(receive_window),
-            rate.receiver_bytes_per_second(),
-            now,
-        )
+    /// window is `receive_window`, refilled to `now` from `epoch`. See
+    /// [`ByteRate::receiver_depth`].
+    ///
+    /// It holds the opening allowance at `epoch`, not its depth. A conformant
+    /// sender's bucket starts at that allowance no earlier than `epoch`, so
+    /// until this bucket first fills it has paid at most the allowance plus
+    /// its rate times the time since, which this bucket covers. Once full,
+    /// the depth covers the rest. So a fresh connection buys only the
+    /// allowance.
+    pub(crate) fn receiver(
+        rate: ByteRate,
+        receive_window: u64,
+        epoch: Instant,
+        now: Instant,
+    ) -> Self {
+        let depth = rate.receiver_depth(receive_window);
+        let mut bucket = Self {
+            depth,
+            bytes_per_second: rate.receiver_bytes_per_second(),
+            tokens: u64::from(rate.opening_allowance).min(depth),
+            last_refill: epoch.min(now),
+        };
+        bucket.refill(now);
+        bucket
     }
 
     fn new(depth: u64, bytes_per_second: u64, now: Instant) -> Self {
@@ -383,15 +404,19 @@ impl CadenceLedger {
 ///
 /// Created with the connection. Retiring a session or reopening a stream in
 /// the same connection does not refill them. A reconnect gets fresh buckets;
-/// connection admission bounds reconnects.
+/// connection admission bounds reconnects, and a byte bucket starts at its
+/// row's opening allowance, so a reconnect buys no more than that.
 #[derive(Debug)]
 pub(crate) struct CadenceBuckets<C: Clock = RealClock> {
     ledger: CadenceLedger,
-    /// The byte bucket of each metered row, made full on first use.
+    /// The byte bucket of each metered row, made on first use as
+    /// [`ByteBucket::receiver`] says.
     bytes: HashMap<CadenceKey, ByteBucket>,
     /// The stream receive window this node granted on the connection, which
     /// deepens each byte bucket.
     receive_window: u64,
+    /// The epoch each byte bucket earns from. See [`Self::with_metered_epoch`].
+    metered_epoch: Instant,
     clock: C,
 }
 
@@ -402,11 +427,13 @@ impl Default for CadenceBuckets<RealClock> {
 }
 
 impl<C: Clock> CadenceBuckets<C> {
+    /// Buckets read through `clock`, whose byte buckets earn from now.
     pub(crate) fn new(clock: C) -> Self {
         Self {
             ledger: CadenceLedger::default(),
             bytes: HashMap::new(),
             receive_window: 0,
+            metered_epoch: clock.now(),
             clock,
         }
     }
@@ -415,6 +442,14 @@ impl<C: Clock> CadenceBuckets<C> {
     /// `receive_window`, read when the connection starts.
     pub(crate) fn with_receive_window(mut self, receive_window: u64) -> Self {
         self.receive_window = receive_window;
+        self
+    }
+
+    /// These buckets with byte buckets that earn from `epoch`: an instant no
+    /// later than the peer could first pay for a metered frame on this
+    /// connection, so no later than it could read this node's handshake.
+    pub(crate) fn with_metered_epoch(mut self, epoch: Instant) -> Self {
+        self.metered_epoch = epoch;
         self
     }
 
@@ -478,14 +513,14 @@ impl<C: Clock> CadenceBuckets<C> {
         payload_len: usize,
     ) -> CadenceCharge {
         let now = self.clock.now();
-        let receive_window = self.receive_window;
+        let (receive_window, epoch) = (self.receive_window, self.metered_epoch);
         let bucket = self
             .bytes
             .entry(CadenceKey {
                 layout,
                 message_type,
             })
-            .or_insert_with(|| ByteBucket::receiver(rate, receive_window, now));
+            .or_insert_with(|| ByteBucket::receiver(rate, receive_window, epoch, now));
         // Widening usize to u64 is lossless on supported targets.
         if bucket.try_pay(payload_len as u64, now) {
             return CadenceCharge::Admit;

@@ -74,3 +74,47 @@ pub fn advances(report: &RunReport) -> Vec<u128> {
         .map(|ns| ns.parse().expect("advance-time picks name an instant"))
         .collect()
 }
+
+/// The search seed [`reaches`] draws from. A test needs a state reached,
+/// not a particular input, so every test shares one seed.
+pub const REACH_SEED: u64 = 0;
+
+/// The first run, of at most `runs` from `generate`'s search on `harness`
+/// with cycled draws and a PCT schedule, for which `overlap` returns
+/// `Some`. Fails the test if none does within `runs` runs.
+///
+/// A test uses this in place of a pinned input: the search finds the
+/// overlap again on every build, so a production change that moves a fixed
+/// input off the overlap fails here instead of passing without the overlap.
+pub fn reaches<T, F>(
+    harness: &str,
+    overlap: F,
+    runs: u64,
+) -> zakura_sim::explore::generate::Reached<T>
+where
+    T: Send + 'static,
+    F: Fn(&RunReport) -> Option<T> + Clone + Send + 'static,
+{
+    reaches_with(
+        harness,
+        &zakura_sim::explore::generate::ReachSearch::new(REACH_SEED, runs),
+        overlap,
+    )
+}
+
+/// [`reaches`] under `search`, for a test that builds its scenario in code
+/// or steers the schedule toward its overlap.
+pub fn reaches_with<T, F>(
+    harness: &str,
+    search: &zakura_sim::explore::generate::ReachSearch,
+    overlap: F,
+) -> zakura_sim::explore::generate::Reached<T>
+where
+    T: Send + 'static,
+    F: Fn(&RunReport) -> Option<T> + Clone + Send + 'static,
+{
+    let entry = zakura_sim::harness::find(harness)
+        .unwrap_or_else(|error| panic!("{harness} isn't a registered harness: {error}"));
+    zakura_sim::explore::generate::reach(entry, search, overlap)
+        .unwrap_or_else(|| panic!("no run of {} on {harness} reached the overlap", search.runs))
+}

@@ -168,8 +168,13 @@ session needs. A reactor uses them instead of writing its own.
   queued or being written. One lock orders the fence's retirement and each
   writer's first byte. A request whose first byte was not written is skipped.
   A request whose first byte was written, and whose response has not ended,
-  closes the connection, because no receiver remains for the answer. The
-  close records `unfinished_exchange` and assigns the peer no fault.
+  resets the session, because no receiver remains for the answer. Every
+  member stream resets with `ZAKURA_CLOSE_NEUTRAL`, the peer gets no fault,
+  and the connection and its other services keep running.
+- `StallClose` closes a connection after its second stall. Each family ends a
+  stalled session first and parks its service on that connection. A second
+  stall on the same connection closes it with the neutral `stall_policy`
+  cause.
 
 The table owns each session's fence and retires it under the table lock before
 it replaces or removes the entry. `Reservations::reserve_fenced` makes each

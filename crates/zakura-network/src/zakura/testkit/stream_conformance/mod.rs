@@ -43,11 +43,12 @@
 //! | P2 | `limit` requests re-sent at each ending never fault; `2 × limit` at once are served and never fault; one more disconnects. Subscriptions keep the same margin over `max_live`. |
 //! | P3 | Sustained conformant exchanges and subscriptions never fault. |
 //! | P4 | Two peers that saturate each other's serving and pushing both finish their downloads. |
-//! | P5 | Ending one member retires the session, siblings stay usable, and the layout reopens; a started exchange or subscription closes the connection instead. |
+//! | P5 | Ending one member retires the session, siblings stay usable, and the layout reopens; a started exchange or subscription resets the whole session the same way. |
 //! | P6 | Paused siblings up to the supported count do not stop the layout; after connection credit runs out and returns, the original exchanges complete. |
 //! | P7 | A stream at a version the peers did not negotiate is refused, and the connection stays usable. |
 //! | P8 | A reset mid-frame retires only the session; a FIN mid-payload closes the connection; a stalled frame ends at the read deadline. |
 //! | P9 | `Close` ends a subscription, and other control messages progress, while its pages sit unread and every execution slot and output byte is held. |
+//! | P10 | A first stall with a started exchange resets only the session: its reservations return, a sibling keeps exchanging, and the layout reopens. A second stall on the connection closes it under the stall policy. |
 
 mod layout;
 mod node;
@@ -176,6 +177,12 @@ macro_rules! stream_conformance_suite {
             async fn p9_close_progresses_while_pages_and_execution_are_blocked(
             ) -> Result<(), $crate::BoxError> {
                 properties::close_progresses::<$adapter>(&$layout).await
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn p10_a_first_stall_resets_the_session_and_a_second_closes(
+            ) -> Result<(), $crate::BoxError> {
+                properties::repeated_stall::<$adapter>(&$layout).await
             }
         }
     };

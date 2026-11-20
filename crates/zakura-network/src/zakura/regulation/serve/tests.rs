@@ -1282,7 +1282,7 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
             .await
             .unwrap();
         assert!(cancel.is_cancelled());
-        assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+        assert_eq!(close_cause.get(), Some(CloseOutcome::SERVICE_PANIC));
         settle().await;
         assert_eq!(serve.open(), 0);
         let mut records = Vec::new();
@@ -1341,7 +1341,7 @@ async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
     tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
         .await
         .unwrap();
-    assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+    assert_eq!(close_cause.get(), Some(CloseOutcome::SERVICE_PANIC));
     assert_eq!(serve.open(), 0);
 }
 

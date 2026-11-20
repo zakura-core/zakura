@@ -24,10 +24,10 @@ use zakura_network::{
             RegtestMessage, SubscribeHeaders,
         },
         wire_codec::{decode_frame, encode_frame},
-        zakura_protocol_for_alpn, AuxSchema, Credit, FullStateFrontiers, HeaderEntry,
-        HeaderSyncService, HeaderSyncStartup, MessageRule, Peer, Service, ServicePeerDirection,
-        ServiceRegistry, SessionStep, StreamPrelude, TransportEvent, TransportObserver,
-        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint,
+        zakura_protocol_for_alpn, AuxSchema, CloseOutcome, CloseRow, Credit, FullStateFrontiers,
+        HeaderEntry, HeaderSyncService, HeaderSyncStartup, MessageRule, NeutralCause, Peer,
+        Service, ServicePeerDirection, ServiceRegistry, SessionStep, StreamPrelude, TransportEvent,
+        TransportObserver, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint,
         ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
         ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
         CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES,
@@ -960,14 +960,17 @@ fn partial_frames_reach_only_their_stage() {
         assert_eq!(reads(&events, quic_stream), expected[..stages], "{case}");
         let closes = closes(&events);
         assert!(
-            ["ordered_read_timeout", "idle_timeout"]
-                .iter()
-                .any(|cause| closes
-                    == [TransportEvent::CloseDecided {
-                        remote: peer_addr(),
-                        conn_id: Some(conn_id),
-                        cause: Some(cause),
-                    }]),
+            matches!(
+                closes[..],
+                [TransportEvent::CloseDecided {
+                    remote,
+                    conn_id: Some(closed),
+                    cause: Some(CloseOutcome::Neutral {
+                        cause: NeutralCause::Timeout,
+                        ..
+                    }),
+                }] if remote == peer_addr() && closed == conn_id
+            ),
             "{case}: the timeout is neutral: {closes:?}"
         );
         wire.finish();
@@ -1012,7 +1015,11 @@ fn close_is_observed_before_teardown() {
         vec![TransportEvent::CloseDecided {
             remote: peer_addr(),
             conn_id: Some(conn_id),
-            cause: Some("ordered_read_rejected"),
+            cause: Some(CloseOutcome::fault(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                CloseRow::REG_CLOSE_1,
+            )),
         }],
         "the close is decided while teardown is held"
     );

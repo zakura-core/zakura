@@ -54,8 +54,8 @@ use crate::{
         resume_task_panic,
         transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
-        Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
-        Stream, ZakuraConnId, ZakuraPeerId,
+        CloseOutcome, CloseRow, Frame, FrameGuard, FramedRecv, FramedSend, NeutralCause, Peer,
+        Service, SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId,
     },
 };
 
@@ -353,7 +353,7 @@ struct Closer {
 
 impl Closer {
     /// Records `reason`, if nothing came first, and closes the connection.
-    fn close(&self, reason: &'static str) {
+    fn close(&self, reason: CloseOutcome) {
         self.close_cause.record(reason);
         self.conn_cancel.cancel();
     }
@@ -828,7 +828,7 @@ impl Routine {
             wake.notify_one();
         }
         for (close, reason) in closes {
-            close.close(close_reason(reason));
+            close.close(close_outcome(reason));
         }
         for effect in effects {
             self.effect(effect);
@@ -907,8 +907,7 @@ impl Routine {
                 true
             }
             Err(_) => {
-                // Row 3 of the close table.
-                self.io.close.close("tx-relay: malformed frame");
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
                 false
             }
         }
@@ -1138,7 +1137,7 @@ impl Routine {
             }
             RelayEffect::Close { session, reason } => {
                 if session == self.machine.session() {
-                    self.io.close.close(close_reason(reason));
+                    self.io.close.close(close_outcome(reason));
                 }
             }
             // Ending the session leaves the connection, and its other
@@ -1452,7 +1451,7 @@ fn ended_result(
         wake.notify_one();
     }
     for (close, reason) in closes {
-        close.close(close_reason(reason));
+        close.close(close_outcome(reason));
     }
 }
 
@@ -1498,19 +1497,51 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
     }
 }
 
-/// The recorded cause for a close the machine asked for, as the close
+/// A fault of `row` on the `tx-relay` session, which its first stream
+/// names.
+fn fault(row: CloseRow) -> CloseOutcome {
+    let [primary, _] = TX_RELAY_STREAMS;
+    CloseOutcome::fault(primary.kind, primary.version, row)
+}
+
+/// The recorded outcome for a close the machine asked for, as the close
 /// table's row for it gives.
-fn close_reason(reason: CloseReason) -> &'static str {
+///
+/// A request past the `Hello`'s limit, or for an id already outstanding,
+/// depends on when this node's writer freed the earlier request's place,
+/// which no peer sees, so those closes stay neutral. So do the pool's
+/// verdicts on a body, which a conformant peer can relay.
+fn close_outcome(reason: CloseReason) -> CloseOutcome {
+    use NeutralCause::{LocalCancellation, ResourceRefusal, StallPolicy};
     match reason {
-        CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",
-        CloseReason::Violation(Violation::RequestedTwice) => "tx-relay: id requested twice",
-        CloseReason::Violation(Violation::TooManyRequests) => "tx-relay: too many requests",
-        CloseReason::Violation(_) => "tx-relay: protocol violation",
-        CloseReason::Ban => "tx-relay: banned transaction",
-        CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",
-        CloseReason::CooldownsFull => "tx-relay: cooldown table full",
-        CloseReason::Unresponsive => "tx-relay: unanswered request",
-        CloseReason::StoppedReading => "tx-relay: peer stopped reading",
+        CloseReason::Violation(violation) => match violation {
+            Violation::HelloTwice => fault(CloseRow::RELAY_CLOSE_4),
+            Violation::BadHello => fault(CloseRow::RELAY_CLOSE_5),
+            Violation::NoHelloFirst => fault(CloseRow::RELAY_CLOSE_6),
+            Violation::Unrequested => fault(CloseRow::RELAY_CLOSE_9),
+            Violation::WrongSize => fault(CloseRow::RELAY_CLOSE_10),
+            Violation::WrongId => fault(CloseRow::RELAY_CLOSE_11),
+            Violation::Undecodable => fault(CloseRow::RELAY_CLOSE_12),
+            Violation::RequestedTwice => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: id requested twice")
+            }
+            Violation::TooManyRequests => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: too many requests")
+            }
+        },
+        CloseReason::Ban => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: banned transaction")
+        }
+        CloseReason::RepeatedCooldown => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: repeated cooldown")
+        }
+        CloseReason::CooldownsFull => {
+            CloseOutcome::neutral(ResourceRefusal, "tx-relay: cooldown table full")
+        }
+        CloseReason::Unresponsive => CloseOutcome::stall_policy("tx-relay: unanswered request"),
+        CloseReason::StoppedReading => {
+            CloseOutcome::neutral(StallPolicy, "tx-relay: peer stopped reading")
+        }
     }
 }
 

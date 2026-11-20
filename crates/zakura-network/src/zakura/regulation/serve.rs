@@ -99,6 +99,8 @@ use std::{future::Future, sync::Arc};
 
 use futures::future::Either;
 use thiserror::Error;
+
+use crate::zakura::{CloseOutcome, CloseRow};
 use zakura_rt::sync::{
     atomic::{AtomicU32, Ordering},
     mpsc, watch, CancellationToken, Mutex, PoisonError,
@@ -193,6 +195,15 @@ pub(crate) enum ServeViolation {
         /// The highest limit this node advertised on the connection.
         limit: u32,
     },
+}
+
+impl ServeViolation {
+    /// The regulation close-spec row this violation breaks.
+    pub(crate) fn close_row(&self) -> CloseRow {
+        match self {
+            Self::OverCommitted { .. } => CloseRow::REG_CLOSE_5,
+        }
+    }
 }
 
 /// How a session's writer orders the frames of different responses.
@@ -590,7 +601,7 @@ impl ServingTasks {
         let connection = self.connection.clone();
         let close_cause = self.close_cause.clone();
         move || {
-            close_cause.record("service_panic");
+            close_cause.record(CloseOutcome::SERVICE_PANIC);
             cancel.cancel();
             connection.cancel();
         }

@@ -7,6 +7,7 @@
 //! transitions take the current time as an argument.
 
 use std::{
+    collections::BTreeSet,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -19,6 +20,16 @@ use zakura_rt::{
 
 use super::{DiscoveryDialResult, ZAKURA_DISCOVERY_DIAL_INTERVAL};
 use crate::zakura::{admission_host, canonical_ip, discovery::ZakuraDiscoveryDialCandidate};
+
+/// The most `(node, IP)` backoff entries the dialer keeps (disco-23).
+///
+/// Only this node's own failed dials add entries, so the dial rate and an
+/// entry's lifetime bound the count. That bound is far above this cap, so
+/// a failure past the cap evicts the entry with the earliest `retry_at`.
+/// Eviction is harmless: it shortens one backoff for a node ID that an
+/// attacker can replace anyway. The cap keeps the map and its index under
+/// 16 MiB; `dial_history_stays_under_its_memory_budget` derives both figures.
+pub(super) const MAX_DIAL_BACKOFF_ENTRIES: usize = 1 << 15;
 
 /// The identity of one candidate dial attempt.
 ///
@@ -169,6 +180,9 @@ pub(super) struct CandidateDialerState {
     /// The number of in-flight attempts that reserved each admission host.
     in_flight_by_ip: HashMap<IpAddr, usize>,
     backoff_by_node_ip: HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    /// The keys of `backoff_by_node_ip`, earliest `retry_at` first. Pruning
+    /// and cap eviction take entries from its front.
+    backoff_by_retry_at: BTreeSet<(Instant, NodeId, IpAddr)>,
     /// The earliest time the next round may start, or `None` before the
     /// first round. Each round starts one dial interval after the last, and
     /// a local limit pushes it to one interval after the limit: the limit
@@ -188,6 +202,7 @@ impl CandidateDialerState {
             in_flight: HashMap::default(),
             in_flight_by_ip: HashMap::default(),
             backoff_by_node_ip: HashMap::default(),
+            backoff_by_retry_at: BTreeSet::new(),
             next_round: None,
             next_sequence: 0,
         }
@@ -201,8 +216,12 @@ impl CandidateDialerState {
     /// dial interval after `now`.
     pub(super) fn begin_round(&mut self, now: Instant) -> bool {
         let retention = self.backoff_max;
-        self.backoff_by_node_ip
-            .retain(|_, backoff| now.saturating_duration_since(backoff.retry_at) <= retention);
+        while let Some(&(retry_at, node_id, ip)) = self.backoff_by_retry_at.first() {
+            if now.saturating_duration_since(retry_at) <= retention {
+                break;
+            }
+            self.remove_backoff(node_id, ip);
+        }
 
         if self.next_round.is_some_and(|next_round| now < next_round) {
             return false;
@@ -383,6 +402,49 @@ impl CandidateDialerState {
                 .all(|backoff| backoff.failure_count > 0),
             "discovery/dial-attempts: a backoff entry counts no failure"
         );
+        let indexed: BTreeSet<_> = self
+            .backoff_by_node_ip
+            .iter()
+            .map(|(&(node_id, ip), backoff)| (backoff.retry_at, node_id, ip))
+            .collect();
+        assert!(
+            self.backoff_by_retry_at == indexed,
+            "discovery/dial-attempts: the retry index disagrees with the backoff entries"
+        );
+        assert!(
+            self.backoff_by_node_ip.len() <= MAX_DIAL_BACKOFF_ENTRIES,
+            "discovery/dial-attempts: {} backoff entries above the cap",
+            self.backoff_by_node_ip.len()
+        );
+    }
+
+    /// The number of `(node, IP)` backoff entries.
+    #[cfg(test)]
+    pub(super) fn backoff_len(&self) -> usize {
+        self.backoff_by_node_ip.len()
+    }
+
+    /// Removes the backoff entry for `node_id` at `ip`, if any.
+    fn remove_backoff(&mut self, node_id: NodeId, ip: IpAddr) {
+        if let Some(backoff) = self.backoff_by_node_ip.remove(&(node_id, ip)) {
+            self.backoff_by_retry_at
+                .remove(&(backoff.retry_at, node_id, ip));
+        }
+    }
+
+    /// Stores `backoff` for `node_id` at `ip`. A new entry past
+    /// [`MAX_DIAL_BACKOFF_ENTRIES`] first evicts the entry with the earliest
+    /// `retry_at`.
+    fn insert_backoff(&mut self, node_id: NodeId, ip: IpAddr, backoff: DiscoveryIpBackoff) {
+        self.remove_backoff(node_id, ip);
+        if self.backoff_by_node_ip.len() >= MAX_DIAL_BACKOFF_ENTRIES {
+            if let Some(&(_, evicted_node, evicted_ip)) = self.backoff_by_retry_at.first() {
+                self.remove_backoff(evicted_node, evicted_ip);
+            }
+        }
+        self.backoff_by_retry_at
+            .insert((backoff.retry_at, node_id, ip));
+        self.backoff_by_node_ip.insert((node_id, ip), backoff);
     }
 
     fn apply_backoff(
@@ -401,8 +463,7 @@ impl CandidateDialerState {
             | DiscoveryDialResult::ConnectedElsewhere
             | DiscoveryDialResult::ShortLivedRegistered => {
                 if let Some(admitted_ip) = admitted_ip {
-                    self.backoff_by_node_ip
-                        .remove(&(node_id, canonical_ip(admitted_ip)));
+                    self.remove_backoff(node_id, canonical_ip(admitted_ip));
                 }
             }
             // The ALPN mismatch floor applies to the node, not to each address: an
@@ -418,8 +479,9 @@ impl CandidateDialerState {
                         self.backoff_base,
                         self.backoff_max,
                     );
-                    self.backoff_by_node_ip.insert(
-                        (node_id, *ip),
+                    self.insert_backoff(
+                        node_id,
+                        *ip,
                         DiscoveryIpBackoff {
                             failure_count,
                             retry_at: now + wait,
@@ -454,4 +516,85 @@ fn discovery_ip_dial_backoff(
     dial_backoff_base
         .saturating_mul(1u32 << shift)
         .min(dial_backoff_max)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::*;
+    use crate::zakura::{
+        discovery::protocol::DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+    };
+
+    /// The memory the dial history may hold.
+    const DIAL_HISTORY_BUDGET_BYTES: usize = 16 << 20;
+
+    /// disco-23 `dial-history-bounded`.
+    ///
+    /// Only this node's failed dials add entries. A round dials at most the
+    /// connection table's worth of addresses, since discovery's dial ceiling
+    /// sits below it, and rounds start at least one dial interval apart. An
+    /// entry's `retry_at` is at most the maximum backoff out, and
+    /// `begin_round` prunes it the maximum backoff after that. So the
+    /// uncapped history holds at most one table of addresses per round over
+    /// two maximum backoffs and one interval. That figure is far above the
+    /// cap, so the cap sets the history's size, and the cap's map and retry
+    /// index fit the budget.
+    #[test]
+    fn dial_history_stays_under_its_memory_budget() {
+        let interval = ZAKURA_DISCOVERY_DIAL_INTERVAL.as_millis();
+        let lifetime = 2 * DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX.as_millis() + interval;
+        // Each round in the lifetime, and the attempts in flight when it
+        // starts, add at most one table of addresses.
+        let rounds = usize::try_from(lifetime / interval + 1).expect("the round count fits usize");
+        let uncapped = rounds * DEFAULT_ZAKURA_MAX_CONNECTIONS;
+
+        // hashbrown keeps a power-of-two bucket count at most 7/8 full, and
+        // one control byte per bucket.
+        let map_slot = size_of::<((NodeId, IpAddr), DiscoveryIpBackoff)>() + 1;
+        let map_bytes = |entries: usize| (entries * 8 / 7).next_power_of_two() * map_slot;
+        // std's B-tree nodes hold 5 to 11 keys, except the root, and an
+        // internal node also holds 12 child pointers. Internal nodes have at
+        // least 6 children, so they number at most a fifth of the leaves.
+        let key = size_of::<(Instant, NodeId, IpAddr)>();
+        let node = 16 + 11 * key + 12 * size_of::<usize>();
+        let index_bytes = |entries: usize| {
+            let leaves = entries.div_ceil(5);
+            (leaves + leaves.div_ceil(5)) * node
+        };
+        let history_bytes = |entries: usize| map_bytes(entries) + index_bytes(entries);
+
+        assert!(
+            history_bytes(uncapped) > DIAL_HISTORY_BUDGET_BYTES,
+            "the uncapped history fits the budget, so the cap is unneeded"
+        );
+        let entries = uncapped.min(MAX_DIAL_BACKOFF_ENTRIES);
+        assert!(
+            history_bytes(entries) <= DIAL_HISTORY_BUDGET_BYTES,
+            "{entries} entries take {} bytes, above the {DIAL_HISTORY_BUDGET_BYTES}-byte budget",
+            history_bytes(entries)
+        );
+    }
+
+    /// disco-25 `dials-per-destination`.
+    ///
+    /// A round reserves a dial to a destination's admission host only while
+    /// that host's connections and dials in flight stay below the per-IP
+    /// cap, and rounds start at least one dial interval apart. So one
+    /// destination receives at most the per-IP cap of new dials per
+    /// interval: 16 per second. That is at most the node's whole discovery
+    /// dial rate, one connection table of addresses per interval.
+    #[test]
+    fn one_destination_receives_at_most_the_node_dial_rate() {
+        /// The row's figure: discovery dials per second to one destination.
+        const DIALS_PER_SECOND: u128 = 16;
+        let interval_ms = ZAKURA_DISCOVERY_DIAL_INTERVAL.as_millis();
+        // Widening usize to u128 is lossless.
+        let per_destination = DEFAULT_ZAKURA_MAX_CONNS_PER_IP as u128 * 1_000 / interval_ms;
+        let node_wide = DEFAULT_ZAKURA_MAX_CONNECTIONS as u128 * 1_000 / interval_ms;
+        assert!(per_destination <= DIALS_PER_SECOND);
+        assert!(per_destination <= node_wide);
+    }
 }

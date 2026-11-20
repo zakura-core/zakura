@@ -485,6 +485,14 @@ fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), St
     Ok(())
 }
 
+/// True if `reason` cites an issue: a `#` followed by a digit.
+fn cites_an_issue(reason: &str) -> bool {
+    reason
+        .split('#')
+        .skip(1)
+        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 #[test]
 fn every_coverage_witness_exists_and_runs_where_it_says() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -526,14 +534,18 @@ fn every_coverage_witness_exists_and_runs_where_it_says() {
                 );
                 vec![row.passing.witness()]
             }
-            Bypass::Pending(_) => {
+            Bypass::Pending(reason) => {
                 let statuses: Vec<_> = HARNESSES
                     .iter()
                     .filter_map(|entry| entry.status(row.property))
                     .collect();
+                // An active property's bypass is pending only while an
+                // issue tracks its removed planted case.
                 assert!(
-                    !statuses.is_empty() && statuses.iter().all(|status| *status == Status::Draft),
-                    "{}: only a draft's bypass is pending, not {statuses:?}'s",
+                    !statuses.is_empty()
+                        && (statuses.iter().all(|status| *status == Status::Draft)
+                            || cites_an_issue(reason)),
+                    "{}: only a draft's bypass, or one citing an issue, is pending, not {statuses:?}'s",
                     row.property
                 );
                 vec![row.passing.witness()]

@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::zakura::CloseRow;
+
 use super::{MessageRole, MessageRule};
 use crate::zakura::{regulation::ResponsePrecheck, FRAME_HEADER_BYTES};
 
@@ -45,6 +47,18 @@ pub enum FrameRejection {
 }
 
 impl FrameRejection {
+    /// The regulation close-spec row this rejection breaks.
+    pub fn close_row(self) -> CloseRow {
+        match self {
+            Self::UnknownMessageType => CloseRow::REG_CLOSE_2,
+            Self::ReservedFlags => CloseRow::REG_CLOSE_3,
+            Self::PayloadTooShort { .. } => CloseRow::REG_CLOSE_4,
+            Self::Unsolicited => CloseRow::REG_CLOSE_6,
+            Self::AboveReservation { .. } => CloseRow::REG_CLOSE_7,
+            Self::AboveOwed { .. } => CloseRow::REG_CLOSE_8,
+        }
+    }
+
     /// Stable metric and trace label.
     pub fn label(self) -> &'static str {
         match self {

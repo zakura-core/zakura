@@ -1,5 +1,4 @@
-//! Frame-read errors record a close cause that tells peer faults from
-//! timeouts and transport loss, without changing resets or metrics.
+//! Frame-read failures distinguish service stalls from connection closes.
 
 use std::{
     collections::BTreeMap,
@@ -22,6 +21,16 @@ const STALL: Duration = Duration::from_millis(300);
 /// A message type no row of [`RULES`] declares.
 const UNKNOWN_TYPE: u16 = 99;
 
+/// A fault of `row` on the test stream, kind 900 at version 1.
+fn fault(row: CloseRow) -> CloseOutcome {
+    CloseOutcome::fault(900, 1, row)
+}
+
+/// A neutral transport failure at `detail`.
+fn transport(detail: &'static str) -> CloseOutcome {
+    CloseOutcome::neutral(NeutralCause::IoFailure, detail)
+}
+
 /// How a peer breaks a frame read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Case {
@@ -31,7 +40,7 @@ enum Case {
     OversizeFrame,
     /// End the stream with a FIN partway through a payload.
     FinishedEarly,
-    /// Send half a header, then go silent.
+    /// Start a funded payload, then go silent.
     Timeout,
     /// Lose the connection after a frame header.
     Transport,
@@ -52,22 +61,24 @@ impl Case {
         Self::RateLimited,
     ];
 
-    /// The cause the node must record for this case on an ordered stream.
-    fn ordered_cause(self) -> &'static str {
+    /// The outcome the node must record for this case on an ordered stream.
+    fn ordered_cause(self) -> Option<CloseOutcome> {
         match self {
-            Self::Rejected | Self::OversizeFrame | Self::FinishedEarly => "ordered_read_rejected",
-            Self::Timeout => "ordered_read_timeout",
-            Self::Transport => "ordered_read_transport",
-            Self::AdmissionOversize => "ordered_oversize",
-            Self::RateLimited => "ordered_rate_limited",
+            Self::Rejected => fault(CloseRow::REG_CLOSE_2),
+            Self::OversizeFrame => fault(CloseRow::REG_CLOSE_1),
+            Self::FinishedEarly | Self::AdmissionOversize => fault(CloseRow::CONN_CLOSE_18),
+            Self::Timeout => return None,
+            Self::Transport => transport("ordered_read_transport"),
+            Self::RateLimited => CloseOutcome::ORDERED_RATE_LIMITED,
         }
+        .into()
     }
 }
 
 /// What the node did after a read error.
 #[derive(Debug)]
 struct Outcome {
-    cause: &'static str,
+    cause: Option<CloseOutcome>,
     /// The reset code the peer read, or `None` when the connection was gone.
     reset: Option<u32>,
     cancelled: bool,
@@ -141,6 +152,38 @@ impl Link {
         let _ = timeout(TEST_TIMEOUT, self.client.shutdown()).await;
         let _ = timeout(TEST_TIMEOUT, self.server.shutdown()).await;
     }
+
+    /// Exchange a frame with a sibling worker on the existing QUIC connection.
+    pub(super) async fn check_sibling(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<(), BoxError> {
+        let (_peer_send, mut peer_recv, send, recv) = self.open(&status(2)).await?;
+        let mut context = tabled_context(Some(RULES), 128);
+        context.connection_token = cancel.clone();
+        context.stream_token = cancel.child_token();
+        context.kind_version = (901, 1);
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: 901,
+            stream_version: 1,
+            request_id: None,
+            max_frame_bytes: 1024,
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let _worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            persistent_stream_worker(send, recv, prelude, context, inbound_tx, outbound_rx, 1),
+        ));
+        let admitted = timeout(TEST_TIMEOUT, inbound_rx.recv())
+            .await?
+            .ok_or("sibling EOF")?;
+        outbound_tx.try_send(admitted.frame)?;
+        let mut echoed = [0; FRAME_HEADER_BYTES + 4];
+        timeout(TEST_TIMEOUT, peer_recv.read_exact(&mut echoed)).await??;
+        assert_eq!(echoed.as_slice(), status(2));
+        Ok(())
+    }
 }
 
 /// Read the reset code the node sent on the peer's receive half.
@@ -171,13 +214,16 @@ async fn run_ordered(case: Case) -> Result<Outcome, BoxError> {
     }
     let close_cause = context.close_cause.clone();
     let cancel = context.connection_token.clone();
+    let session = context.stream_token.clone();
+    let gate = context.resources.raw.clone();
+    let failure = OrderedStreamFailureCause::default();
 
     let bytes = match case {
         Case::Rejected => header(UNKNOWN_TYPE, 4),
         // The test context's frame cap is 1024 bytes.
         Case::OversizeFrame => header(1, 2048),
         Case::FinishedEarly => [header(message_type::STATUS, 4), vec![0; 2]].concat(),
-        Case::Timeout => header(message_type::STATUS, 4)[..3].to_vec(),
+        Case::Timeout => [header(message_type::STATUS, 4), vec![0; 2]].concat(),
         Case::Transport => [status(1), header(message_type::STATUS, 4)].concat(),
         Case::AdmissionOversize => [header(1, 16), vec![0; 16]].concat(),
         Case::RateLimited => [header(1, 4), vec![0; 4], header(1, 4), vec![0; 4]].concat(),
@@ -193,9 +239,27 @@ async fn run_ordered(case: Case) -> Result<Outcome, BoxError> {
     let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
     let (_outbound_tx, outbound_rx) = worker_framed_channel(1);
     let mut worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
-        persistent_stream_worker(send, recv, prelude, context, inbound_tx, outbound_rx, 1),
+        persistent_stream_worker_with_policy(
+            send,
+            recv,
+            prelude,
+            context,
+            inbound_tx,
+            outbound_rx,
+            1,
+            Some(failure.clone()),
+            None,
+        ),
     ));
     match case {
+        Case::Timeout => {
+            timeout(STALL, async {
+                while gate.try_admit(gate.capacity()).is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+        }
         Case::FinishedEarly => peer_send.finish()?,
         Case::Transport => {
             // The complete frame proves the trailing header arrived with it.
@@ -213,10 +277,16 @@ async fn run_ordered(case: Case) -> Result<Outcome, BoxError> {
     } else {
         Some(read_reset(&mut peer_recv).await?)
     };
+    if case == Case::Timeout {
+        assert!(session.is_cancelled());
+        assert_eq!(failure.get(), Some(OrderedStreamFailure::ReadTimeout));
+        assert!(gate.try_admit(gate.capacity()).is_some());
+        link.check_sibling(&cancel).await?;
+    }
     drop(inbound_rx);
     link.close().await;
     Ok(Outcome {
-        cause: close_cause.get_or("unset"),
+        cause: close_cause.get(),
         reset,
         cancelled: cancel.is_cancelled(),
     })
@@ -227,7 +297,7 @@ async fn run_ordered(case: Case) -> Result<Outcome, BoxError> {
 enum RequestCase {
     /// Send a response row as the request.
     Rejected,
-    /// Send nothing after the prelude.
+    /// Start a funded request payload, then go silent.
     Silent,
     /// Reset the stream after the prelude.
     Reset,
@@ -244,8 +314,10 @@ async fn run_request(case: RequestCase) -> Result<Outcome, BoxError> {
         max_frame_bytes: 1024,
     };
     let mut bytes = prelude.encode()?;
-    if case == RequestCase::Rejected {
-        bytes.extend(header(message_type::PART, 4));
+    match case {
+        RequestCase::Rejected => bytes.extend(header(message_type::PART, 4)),
+        RequestCase::Silent => bytes.extend([header(message_type::GET, 4), vec![0; 2]].concat()),
+        RequestCase::Reset => {}
     }
     let (mut peer_send, mut peer_recv, send, mut recv) = link.open(&bytes).await?;
     read_stream_prelude(&mut recv, TEST_TIMEOUT).await?;
@@ -258,39 +330,63 @@ async fn run_request(case: RequestCase) -> Result<Outcome, BoxError> {
     }
     let close_cause = context.close_cause.clone();
     let cancel = context.connection_token.clone();
-    timeout(
-        TEST_TIMEOUT,
-        request_stream_worker(
-            send,
-            recv,
-            prelude,
-            context,
-            Arc::new(ServiceRegistry::new(vec![])?),
-        ),
-    )
-    .await?;
+    let gate = context.resources.raw.clone();
+    let worker = tokio::spawn(request_stream_worker(
+        send,
+        recv,
+        prelude,
+        context,
+        Arc::new(ServiceRegistry::new(vec![])?),
+    ));
+    if case == RequestCase::Silent {
+        // The header funds the payload, so the gate holds its bytes.
+        timeout(TEST_TIMEOUT, async {
+            while gate.try_admit(gate.capacity()).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+    }
+    timeout(TEST_TIMEOUT, worker).await??;
     let reset = read_reset(&mut peer_recv).await?;
+    if case == RequestCase::Silent {
+        assert!(gate.try_admit(gate.capacity()).is_some());
+        link.check_sibling(&cancel).await?;
+    }
     link.close().await;
     Ok(Outcome {
-        cause: close_cause.get_or("unset"),
+        cause: close_cause.get(),
         reset: Some(reset),
         cancelled: cancel.is_cancelled(),
     })
 }
 
 #[test]
-fn read_close_cause_maps_each_error() {
+fn read_close_outcome_maps_each_error() {
     use zakura_quic::{ConnectionError, ReadError, ReadExactError};
 
     let lost = || ReadExactError::ReadError(ReadError::ConnectionLost(ConnectionError::TimedOut));
-    let cases: Vec<(ZakuraHandlerError, &str, &str)> = vec![
+    let ordered_transport = transport("ordered_read_transport");
+    let request_transport = transport("request_read_transport");
+    let cases: Vec<(ZakuraHandlerError, CloseOutcome, CloseOutcome)> = vec![
         (
             ZakuraHandlerError::RejectedFrame {
                 message_type: UNKNOWN_TYPE,
                 rejection: FrameRejection::UnknownMessageType,
             },
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::REG_CLOSE_2),
+            fault(CloseRow::REG_CLOSE_2),
+        ),
+        (
+            ZakuraHandlerError::RejectedFrame {
+                message_type: message_type::PART,
+                rejection: FrameRejection::AboveOwed {
+                    frames: 0,
+                    bytes: 0,
+                },
+            },
+            fault(CloseRow::REG_CLOSE_8),
+            fault(CloseRow::REG_CLOSE_8),
         ),
         (
             ZakuraHandlerError::OversizeFrame {
@@ -298,54 +394,59 @@ fn read_close_cause_maps_each_error() {
                 frame_len: 2056,
                 max_frame_bytes: 1024,
             },
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::REG_CLOSE_1),
+            fault(CloseRow::REG_CLOSE_1),
         ),
         (
             ZakuraHandlerError::QuicRead(ReadExactError::FinishedEarly(2)),
-            "ordered_read_rejected",
-            "request_read_rejected",
+            fault(CloseRow::CONN_CLOSE_18),
+            fault(CloseRow::CONN_CLOSE_18),
         ),
         (
-            ZakuraHandlerError::Timeout("frame header"),
-            "ordered_read_timeout",
-            "request_read_timeout",
+            ZakuraHandlerError::Oversize,
+            fault(CloseRow::CONN_CLOSE_18),
+            request_transport,
         ),
         (
-            ZakuraHandlerError::Timeout("frame payload"),
-            "ordered_read_timeout",
-            "request_read_timeout",
+            ZakuraHandlerError::ByteRateOverrun,
+            fault(CloseRow::CONN_CLOSE_18),
+            request_transport,
+        ),
+        (
+            ZakuraHandlerError::RateLimited,
+            CloseOutcome::ORDERED_RATE_LIMITED,
+            request_transport,
         ),
         (
             ZakuraHandlerError::QuicRead(lost()),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
         (
             ZakuraHandlerError::QuicRead(ReadExactError::ReadError(ReadError::ClosedStream)),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
         (
             ZakuraHandlerError::Io(std::io::Error::other("local buffer")),
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
-        // The ordered path never records `Closed`; see `read_close_cause`.
+        // The ordered path never records `Closed`; see `read_close_outcome`.
         (
             ZakuraHandlerError::Closed,
-            "ordered_read_transport",
-            "request_read_transport",
+            ordered_transport,
+            request_transport,
         ),
     ];
     for (error, ordered, request) in &cases {
         assert_eq!(
-            read_close_cause(ReadPath::Ordered, error),
+            read_close_outcome(ReadPath::Ordered, (900, 1), error),
             *ordered,
             "{error:?}"
         );
         assert_eq!(
-            read_close_cause(ReadPath::Request, error),
+            read_close_outcome(ReadPath::Request, (900, 1), error),
             *request,
             "{error:?}"
         );
@@ -356,22 +457,17 @@ fn read_close_cause_maps_each_error() {
 async fn ordered_reader_records_rejection_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for case in [Case::Rejected, Case::OversizeFrame, Case::FinishedEarly] {
-        assert_eq!(
-            run_ordered(case).await?.cause,
-            "ordered_read_rejected",
-            "{case:?}"
-        );
+        let cause = run_ordered(case).await?.cause;
+        assert_eq!(cause, case.ordered_cause(), "{case:?}");
+        assert!(cause.is_some_and(CloseOutcome::is_fault), "{case:?}");
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn ordered_reader_records_timeout_cause() -> Result<(), BoxError> {
+async fn ordered_read_timeout_releases_frame_and_keeps_sibling() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    assert_eq!(
-        run_ordered(Case::Timeout).await?.cause,
-        "ordered_read_timeout"
-    );
+    assert_eq!(run_ordered(Case::Timeout).await?.cause, None);
     Ok(())
 }
 
@@ -380,7 +476,7 @@ async fn ordered_reader_records_transport_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     assert_eq!(
         run_ordered(Case::Transport).await?.cause,
-        "ordered_read_transport"
+        Some(transport("ordered_read_transport"))
     );
     Ok(())
 }
@@ -389,9 +485,12 @@ async fn ordered_reader_records_transport_cause() -> Result<(), BoxError> {
 async fn request_reader_records_each_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for (case, cause) in [
-        (RequestCase::Rejected, "request_read_rejected"),
-        (RequestCase::Silent, "request_read_timeout"),
-        (RequestCase::Reset, "request_read_transport"),
+        (RequestCase::Rejected, Some(fault(CloseRow::REG_CLOSE_2))),
+        (RequestCase::Silent, None),
+        (
+            RequestCase::Reset,
+            Some(transport("request_read_transport")),
+        ),
     ] {
         assert_eq!(run_request(case).await?.cause, cause, "{case:?}");
     }
@@ -431,35 +530,35 @@ fn ordered_worker_closes_each_forwarded_error() {
     let cases = [
         (
             ZakuraHandlerError::Oversize,
-            Some((ZAKURA_CLOSE_OVERSIZE, "ordered_oversize")),
+            Some((ZAKURA_CLOSE_OVERSIZE, fault(CloseRow::CONN_CLOSE_18))),
         ),
         (
             ZakuraHandlerError::RateLimited,
-            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_rate_limited")),
+            Some((ZAKURA_CLOSE_RATE_LIMIT, CloseOutcome::ORDERED_RATE_LIMITED)),
         ),
         (
             ZakuraHandlerError::RejectedFrame {
                 message_type: UNKNOWN_TYPE,
                 rejection: FrameRejection::UnknownMessageType,
             },
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_rejected")),
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, fault(CloseRow::REG_CLOSE_2))),
         ),
-        (
-            ZakuraHandlerError::Timeout("frame header"),
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_timeout")),
-        ),
+        (ZakuraHandlerError::Timeout("frame header"), None),
         (
             ZakuraHandlerError::QuicRead(lost()),
-            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_transport")),
+            Some((
+                ZAKURA_CLOSE_BAD_PRELUDE,
+                transport("ordered_read_transport"),
+            )),
         ),
         (ZakuraHandlerError::Closed, None),
     ];
     for (error, close) in &cases {
-        assert_eq!(ordered_read_close(error), *close, "{error:?}");
+        assert_eq!(ordered_read_close((900, 1), error), *close, "{error:?}");
     }
 }
 
-/// Read errors reset and cancel as on `main`. This pins the current-thread
+/// Connection errors preserve their reset codes. This pins the current-thread
 /// ordering of the ordered path: the reader cancels the connection before the
 /// worker resumes, so the worker's biased select takes that cancellation and
 /// the peer reads the neutral reset. On a multi-thread runtime the worker can
@@ -473,7 +572,7 @@ async fn read_errors_keep_reset_codes() -> Result<(), BoxError> {
         // A lost connection carries no stream reset to observe.
         let expected = (case != Case::Transport).then_some(ZAKURA_CLOSE_NEUTRAL);
         assert_eq!(outcome.reset, expected, "{case:?}");
-        assert!(outcome.cancelled, "{case:?}");
+        assert_eq!(outcome.cancelled, case != Case::Timeout, "{case:?}");
     }
     for case in [
         RequestCase::Rejected,
@@ -481,8 +580,14 @@ async fn read_errors_keep_reset_codes() -> Result<(), BoxError> {
         RequestCase::Reset,
     ] {
         let outcome = run_request(case).await?;
-        assert_eq!(outcome.reset, Some(ZAKURA_CLOSE_BAD_PRELUDE), "{case:?}");
-        assert!(outcome.cancelled, "{case:?}");
+        let stalled = case == RequestCase::Silent;
+        let code = if stalled {
+            ZAKURA_CLOSE_NEUTRAL
+        } else {
+            ZAKURA_CLOSE_BAD_PRELUDE
+        };
+        assert_eq!(outcome.reset, Some(code), "{case:?}");
+        assert_eq!(outcome.cancelled, !stalled, "{case:?}");
     }
     Ok(())
 }
@@ -555,27 +660,27 @@ impl metrics::Recorder for CounterRecorder {
 #[test]
 fn read_close_causes_stay_trace_compatible() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
-    // Each new cause keeps the old prefix and lands in the same row field.
+    // A neutral read close keeps its old label, and a fault traces its row,
+    // in the same row field.
     let mut causes: Vec<_> = Case::ORDERED
         .iter()
         .filter(|case| !matches!(case, Case::AdmissionOversize | Case::RateLimited))
-        .map(|case| case.ordered_cause())
+        .filter_map(|case| case.ordered_cause())
         .collect();
-    causes.extend([
-        "request_read_rejected",
-        "request_read_timeout",
-        "request_read_transport",
-    ]);
+    causes.push(transport("request_read_transport"));
     for cause in causes {
-        assert!(
-            cause.starts_with("ordered_read_") || cause.starts_with("request_read_"),
-            "{cause}"
-        );
+        match cause {
+            CloseOutcome::Fault { row, .. } => assert_eq!(cause.label(), row.id()),
+            CloseOutcome::Neutral { detail, .. } => assert!(
+                detail.starts_with("ordered_read_") || detail.starts_with("request_read_"),
+                "{cause}"
+            ),
+        }
         let row = serde_json::to_value(
-            ConnectionTraceEvent::new("closed.neutral", 1, None).reason(cause),
+            ConnectionTraceEvent::new("closed.neutral", 1, None).reason(cause.label()),
         )?;
         assert_eq!(row["event"], "closed.neutral");
-        assert_eq!(row["reason"], cause);
+        assert_eq!(row["reason"], cause.label());
     }
 
     // The read paths emit the same counters, under the same labels.

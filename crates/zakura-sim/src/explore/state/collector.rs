@@ -25,7 +25,7 @@ use crate::{
     check::{Phase, StepCtx},
     end::RunEnd,
     explore::feedback::{Collect, FeatureMap},
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{
         BlockSyncFact, HeaderCheckFact, ReactorCall, ReactorFact, ReactorPurpose, StorageFact,
         StoragePoint, StorageRequest, StorageResult, StreamId, TransitionFact, TransportFact,
@@ -505,7 +505,7 @@ impl StateCollector {
             Observation::ConnectionClosed { connection, cause } => {
                 self.closed.insert(*connection);
                 if let Some(&(row, label)) = self.last_judged.get(connection) {
-                    let stage = match is_fault_cause(cause) {
+                    let stage = match cause.is_fault() {
                         true => FrameStage::FaultCloseAfter,
                         false => FrameStage::OtherCloseAfter,
                     };

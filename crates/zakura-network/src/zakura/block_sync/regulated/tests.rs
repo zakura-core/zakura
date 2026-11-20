@@ -15,7 +15,7 @@ use crate::zakura::{
     framed_channel,
     regulation::{ServeCapacity, ServeLimits},
     wire_codec::{decode_frame, encode_frame, WireMessage},
-    Frame, ZakuraPeerId,
+    CloseOutcome, Frame, ZakuraPeerId,
 };
 
 #[derive(Debug)]
@@ -712,7 +712,7 @@ async fn live_serving_panic_closes_the_connection_without_downloads() {
     tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
         .await
         .unwrap();
-    assert_eq!(live.close_cause.get_or("cancelled"), "service_panic");
+    assert_eq!(live.close_cause.get(), Some(CloseOutcome::SERVICE_PANIC));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

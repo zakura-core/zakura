@@ -1847,7 +1847,11 @@ impl ReactorIO {
         // channel here was the backpressure stall that delayed request timeouts and
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
-        let action = BlockSyncAction::Misbehavior { peer, reason };
+        let action = BlockSyncAction::Misbehavior {
+            peer,
+            conn_id: None,
+            reason,
+        };
         if self.dispatch_action(action).is_err() {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }

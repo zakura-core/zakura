@@ -2,6 +2,7 @@ use zakura_node_services::block_memory::DecodedBlockPool;
 use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
 use super::{
+    admission::min_rate_transfer_time,
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
@@ -533,11 +534,13 @@ pub(super) struct DownloadWindow {
     cwnd_unit: CwndUnit,
     /// Request-count cap used while byte-cwnd has no fresh BDP sample.
     pub(super) startup_request_cap: usize,
-    /// Deadline by which an active peer must send another accepted full block.
-    pub(super) block_liveness_deadline: Option<Instant>,
-    /// Whether the current no-progress episode already spent its one congestion
-    /// grace. Block progress and disarm start a new episode.
-    liveness_grace_used: bool,
+    /// The episode's start plus its fixed allowance. The liveness deadline adds
+    /// the transfer time of the next owed body, so returned and completed
+    /// ranges stop counting at once. See [`Self::block_liveness_deadline`].
+    pub(super) liveness_base_deadline: Option<Instant>,
+    /// The congestion grace the current no-progress episode spent, if any.
+    /// Block progress and disarm start a new episode.
+    liveness_grace: Option<Duration>,
     /// Last time this peer was sent a block-body request.
     pub(super) last_request_at: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -567,8 +570,8 @@ impl DownloadWindow {
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
                 .unwrap_or(usize::MAX)
                 .max(1),
-            block_liveness_deadline: None,
-            liveness_grace_used: false,
+            liveness_base_deadline: None,
+            liveness_grace: None,
             last_request_at: None,
             last_block_at: None,
             requests_without_block_progress: 0,
@@ -875,26 +878,57 @@ impl DownloadWindow {
         }
     }
 
-    pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+    /// Count the request just issued. Only the first request starts the episode.
+    pub(super) fn arm_liveness(&mut self, now: Instant, allowance: Duration) {
         self.outstanding.charge_last_for_liveness();
         self.last_request_at = Some(now);
         self.requests_without_block_progress =
             self.requests_without_block_progress.saturating_add(1);
-        if self.block_liveness_deadline.is_none() {
-            self.block_liveness_deadline = Some(now + timeout);
-        }
+        self.liveness_base_deadline.get_or_insert(now + allowance);
     }
 
-    pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
+    /// The deadline by which the peer must send another accepted body: the
+    /// episode's base, plus the next owed body at
+    /// [`DEADLINE_MIN_BYTES_PER_SEC`](super::admission::DEADLINE_MIN_BYTES_PER_SEC),
+    /// plus any spent congestion grace.
+    ///
+    /// Responses share one ordered stream, so the next accepted body is at
+    /// most one protocol-maximum body away. Later owed bodies add no time, so
+    /// a silent peer cannot hold its episode open by taking new requests.
+    ///
+    /// Without the requester's figure, only `outstanding` counts. See
+    /// [`Self::block_liveness_deadline_owing`].
+    pub(super) fn block_liveness_deadline(&self) -> Option<Instant> {
+        self.block_liveness_deadline_owing(0)
+    }
+
+    /// [`Self::block_liveness_deadline`] where the peer still owes
+    /// `authorized` body bytes under its live response authorizations.
+    ///
+    /// A request that timed out leaves `outstanding`, but the requester still
+    /// accepts its body, and that body counts as progress. So the next body's
+    /// transfer time comes from the authorizations. Each outstanding request
+    /// is also authorized, so `outstanding` only covers a caller with no
+    /// requester.
+    pub(super) fn block_liveness_deadline_owing(&self, authorized: u64) -> Option<Instant> {
+        let next_body = self
+            .outstanding
+            .transfer_bytes()
+            .max(authorized)
+            .min(block::MAX_BLOCK_BYTES);
+        self.liveness_base_deadline.map(|base| {
+            base + min_rate_transfer_time(next_body) + self.liveness_grace.unwrap_or_default()
+        })
+    }
+
+    /// Start a new episode after an accepted body. Its deadline is
+    /// `allowance` plus the next owed body's transfer time.
+    pub(super) fn note_block_progress(&mut self, now: Instant, allowance: Duration) {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
         self.outstanding.clear_liveness_charges();
-        self.liveness_grace_used = false;
-        self.block_liveness_deadline = if self.outstanding.is_empty() {
-            None
-        } else {
-            Some(now + timeout)
-        };
+        self.liveness_grace = None;
+        self.liveness_base_deadline = (!self.outstanding.is_empty()).then(|| now + allowance);
     }
 
     pub(super) fn disarm_liveness_after_progress_if_idle(&mut self) {
@@ -916,8 +950,8 @@ impl DownloadWindow {
 
     /// End the no-progress episode, so the next one may spend a fresh grace.
     fn disarm_liveness(&mut self) {
-        self.block_liveness_deadline = None;
-        self.liveness_grace_used = false;
+        self.liveness_base_deadline = None;
+        self.liveness_grace = None;
     }
 
     /// Clear the probe streak after we return requests on our own initiative,
@@ -950,18 +984,24 @@ impl DownloadWindow {
     /// Give a briefly congested writer time to deliver our queued request before
     /// parking the peer for not answering it. This spends the episode's one grace;
     /// the caller bounds its length.
-    pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
-        self.block_liveness_deadline = Some(now + timeout);
-        self.liveness_grace_used = true;
+    pub(super) fn extend_liveness_deadline(&mut self, timeout: Duration) {
+        self.liveness_grace = Some(timeout);
     }
 
     /// Whether the current no-progress episode has not yet spent its grace.
     pub(super) fn liveness_grace_available(&self) -> bool {
-        !self.liveness_grace_used
+        self.liveness_grace.is_none()
     }
 
+    #[cfg(test)]
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
-        match self.block_liveness_deadline {
+        self.check_liveness_owing(now, 0)
+    }
+
+    /// Judge the liveness deadline at `now`, where the peer still owes
+    /// `authorized` body bytes; see [`Self::block_liveness_deadline_owing`].
+    pub(super) fn check_liveness_owing(&self, now: Instant, authorized: u64) -> LivenessOutcome {
+        match self.block_liveness_deadline_owing(authorized) {
             None => LivenessOutcome::Ok,
             // Defensive: a deadline that exists with no recorded request was never armed by
             // `arm_liveness` (which always sets `last_request_at`), so it was not actually
@@ -1028,6 +1068,8 @@ pub(super) enum WriteOutcome {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    /// The response-byte cap authorized when the request was issued.
+    pub(super) max_response_bytes: u32,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
@@ -1042,6 +1084,22 @@ pub(super) struct DeliverySnapshot {
 }
 
 impl OutstandingBlockRange {
+    /// Maximum serialized body bytes this request can still deliver: its
+    /// remaining response-byte authorization, capped by its remaining bodies at
+    /// the protocol's maximum body size.
+    pub(super) fn transfer_bytes(&self) -> u64 {
+        let remaining = self
+            .request
+            .expected_blocks
+            .len()
+            .saturating_sub(self.received.len());
+        // A request has at most MAX_BS_BLOCKS_PER_REQUEST heights, so the count fits.
+        let remaining = remaining as u64;
+        u64::from(self.max_response_bytes)
+            .saturating_sub(self.delivered_bytes)
+            .min(remaining * block::MAX_BLOCK_BYTES)
+    }
+
     /// Size estimates still reserved for unreceived heights.
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.request

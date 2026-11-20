@@ -83,7 +83,7 @@ use super::{
     lane::{sim_build_failure, BuildFailure},
     patched_files,
     pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
-    planted_layout, provenance, remove_worktree,
+    planted_layout, provenance, remove_worktree, require_plain_relative,
     seeds::{self, Registry},
     CaseFile, PLANTED_DIR, PROFILE, SHARED,
 };
@@ -149,7 +149,7 @@ const POLL: Duration = Duration::from_millis(50);
 pub(super) enum WitnessSpec {
     /// A retained planted case's seed or typed scenario.
     Planted {
-        /// The case file, relative to the repository root.
+        /// The case file, relative to the QA store's root.
         planted: PathBuf,
     },
     /// A seed of the simulator's registry, which names its harness.
@@ -769,7 +769,7 @@ fn watched(repo_root: &Path, store: &Path, case: &LoopCase) -> Result<Vec<PathBu
     match &case.witness {
         WitnessSpec::Planted { planted } => {
             watched.push(planted.clone());
-            let file: CaseFile = toml::from_str(&fs::read_to_string(store.join(planted))?)?;
+            let file = planted_case(store, planted)?;
             if let Some(name) = &file.seed {
                 watched.push(seeds::input_path(name));
             }
@@ -1634,6 +1634,26 @@ impl Runner {
     }
 }
 
+/// The planted case file `planted` under `store`, the QA store's root. The
+/// case file and a typed case's scenario and Plan file must be plain
+/// relative paths, as the planted loader requires, so that no case reads a
+/// file outside the store.
+fn planted_case(store: &Path, planted: &Path) -> Result<CaseFile, BoxError> {
+    require_plain_relative(Path::new("a planted witness"), planted)?;
+    let path = store.join(planted);
+    let file: CaseFile = toml::from_str(
+        &fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Some(typed) = &file.typed {
+        require_plain_relative(&path, &typed.scenario)?;
+        if let Some(plan) = typed.plan_file()? {
+            require_plain_relative(&path, plan.path())?;
+        }
+    }
+    Ok(file)
+}
+
 /// How the runner runs `witness` for `property`, reading a planted case
 /// from `tree`, the QA store's root. A seed's run waits for the registry ([`resolve_seeds`]).
 fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnable, BoxError> {
@@ -1644,11 +1664,7 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
     match witness {
         WitnessSpec::Planted { planted } => {
             let path = tree.join(planted);
-            let file: CaseFile = toml::from_str(
-                &fs::read_to_string(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?,
-            )
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+            let file = planted_case(tree, planted)?;
             match (file.seed, file.typed) {
                 (Some(name), None) => Ok(seed(&name)),
                 (None, Some(typed)) => {

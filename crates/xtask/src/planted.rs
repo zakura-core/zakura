@@ -1025,14 +1025,7 @@ fn cases(store: &Path) -> Result<Vec<Case>, BoxError> {
             };
             let files = witness.files();
             for path in files.iter().chain(&checks) {
-                if !is_plain_relative(path) {
-                    return Err(format!(
-                        "{}: {} isn't a plain path relative to its root",
-                        case_file.display(),
-                        path.display()
-                    )
-                    .into());
-                }
+                require_plain_relative(&case_file, path)?;
             }
             if no_target
                 .as_deref()
@@ -1052,6 +1045,22 @@ fn cases(store: &Path) -> Result<Vec<Case>, BoxError> {
             })
         })
         .collect()
+}
+
+/// An error unless `path`, which `case_file` names, is plain and relative
+/// ([`is_plain_relative`]), so that joining it to a root stays under that
+/// root.
+fn require_plain_relative(case_file: &Path, path: &Path) -> Result<(), BoxError> {
+    if is_plain_relative(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {} isn't a plain path relative to its root",
+            case_file.display(),
+            path.display()
+        )
+        .into())
+    }
 }
 
 /// True if `path` is non-empty and made only of ordinary names, so that it

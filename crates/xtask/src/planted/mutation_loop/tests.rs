@@ -25,9 +25,9 @@ use super::{
         Lanes, OnUnpatched, PropertyFinding, Search, Searched, Unpatched, UnpatchedCheck,
         UnpatchedRun,
     },
-    merge_alone, parse_flags, planted_cases, selects, summarize, test_executables, triage,
-    BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant, Report,
-    Runner, Slot, WitnessSpec,
+    merge_alone, parse_flags, planted_case, planted_cases, selects, summarize, test_executables,
+    triage, BaselineReport, BuildIdentity, CaseReport, GenerateFlags, ListedCase, LoopCase, Mutant,
+    Report, Runner, Slot, WitnessSpec,
 };
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
@@ -3270,4 +3270,35 @@ fn a_kills_follow_ups_count_the_baselines_own_runs() {
     assert_eq!(baseline(Some(30_000)).per_run(), Duration::from_millis(20));
     assert_eq!(baseline(None).per_run(), Duration::ZERO);
     assert_eq!(baseline(Some(0)).per_run(), Duration::ZERO);
+}
+
+/// A planted case file, or a typed case's scenario or Plan file, given as an
+/// absolute path or one that climbs out with `..` is refused before the
+/// loop reads it, as the planted loader refuses it.
+#[test]
+fn planted_case_paths_stay_in_the_store() {
+    let store = tempfile::tempdir().unwrap();
+    let typed = |scenario: &str, plan: &str| {
+        format!("[typed]\nharness = \"h\"\nscenario = \"{scenario}\"\nplan = \"{plan}\"\n")
+    };
+    let refused = |planted: &str| {
+        let Err(error) = planted_case(store.path(), Path::new(planted)) else {
+            panic!("{planted}: the loop read the case");
+        };
+        let error = error.to_string();
+        assert!(error.contains("isn't a plain path"), "{planted}: {error}");
+    };
+    for (name, case) in [
+        ("absolute-scenario", typed("/etc/hostname", "p.bin")),
+        ("climbing-scenario", typed("../s.json", "p.bin")),
+        ("absolute-plan", typed("s.json", "/p.bin")),
+        ("climbing-plan", typed("s.json", "x/../../p.bin")),
+    ] {
+        fs::write(store.path().join(format!("{name}.toml")), case).unwrap();
+        refused(&format!("{name}.toml"));
+    }
+    refused("/etc/case.toml");
+    refused("../case.toml");
+    fs::write(store.path().join("plain.toml"), typed("s.json", "p.bin")).unwrap();
+    assert!(planted_case(store.path(), Path::new("plain.toml")).is_ok());
 }

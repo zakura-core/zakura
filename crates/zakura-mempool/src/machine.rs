@@ -221,9 +221,11 @@ struct Admission<E> {
     missing_error: Option<E>,
     /// Whether the one check allowed after that wait ended has been used.
     last_check_used: bool,
-    /// Runs since the tip changed because a transaction entered the pool.
-    /// See [`MAX_PARENT_RETRIES`].
-    parent_retries: usize,
+    /// The parents whose entry into the pool ran it again since the tip
+    /// changed, at most [`MAX_PARENT_RETRIES`]. One that leaves and enters
+    /// again, as an evicted parent can, was already there for a check, so
+    /// it runs nothing and costs no retry.
+    retried_for: Vec<transaction::Hash>,
     /// Whether a parent arrived that the cap did not let run it again. If
     /// so, the wait ends with the one last check rather than the missing
     /// inputs it last saw.
@@ -466,7 +468,7 @@ impl<E: VerifyError> MempoolState<E> {
                 missing_since: None,
                 missing_error: None,
                 last_check_used: false,
-                parent_retries: 0,
+                retried_for: Vec::new(),
                 retry_owed: false,
                 give_up: None,
                 after_reset: false,
@@ -1045,7 +1047,7 @@ impl<E: VerifyError> MempoolState<E> {
                     );
                 }
                 assert!(
-                    admission.parent_retries <= MAX_PARENT_RETRIES,
+                    admission.retried_for.len() <= MAX_PARENT_RETRIES,
                     "pool/parent-retries: a transaction was run again past its cap"
                 );
             }
@@ -1281,32 +1283,39 @@ impl<E: VerifyError> MempoolState<E> {
                 // One of the missing outputs became available after this job
                 // started looking. Its admission has already been announced, so
                 // nothing would wake this transaction. It runs again at once.
-                let arrived = missing
+                let arrived: Vec<transaction::Hash> = missing
                     .iter()
-                    .any(|outpoint| self.arrived_since(outpoint, started_at));
+                    .filter(|outpoint| self.arrived_since(outpoint, started_at))
+                    .map(|outpoint| outpoint.hash)
+                    .collect();
                 let admission = self.admission_at(key);
                 admission.missing_error = Some(error.clone());
                 let since = *admission.missing_since.get_or_insert(now);
                 let wait_over = since + T_PARK <= now;
                 // After the wait, an input that arrived during this check earns
                 // one more check and no more.
-                let last_check = wait_over && arrived && !admission.last_check_used;
+                let last_check = wait_over && !arrived.is_empty() && !admission.last_check_used;
                 if last_check {
                     admission.last_check_used = true;
                 }
-                let retry = arrived && !wait_over && admission.parent_retries < MAX_PARENT_RETRIES;
-                if retry {
-                    admission.parent_retries += 1;
+                let new_parent = arrived
+                    .iter()
+                    .find(|parent| !admission.retried_for.contains(parent))
+                    .filter(|_| !wait_over && admission.retried_for.len() < MAX_PARENT_RETRIES);
+                let retry = new_parent.is_some();
+                if let Some(parent) = new_parent {
+                    admission.retried_for.push(*parent);
                 }
                 if retry || last_check {
                     self.start_admission(key);
                     return;
                 }
-                if arrived && !wait_over {
-                    // The cap held it back. It parks below.
+                if !arrived.is_empty() && !wait_over {
+                    // The cap, or a parent it already ran for, held it
+                    // back. It parks below.
                     admission.retry_owed = true;
                 }
-                if wait_over && arrived {
+                if wait_over && !arrived.is_empty() {
                     // There is no check left to give, and this answer is
                     // already out of date.
                     self.fail_locally(key, LocalFault::VerifyTimeout);
@@ -1420,7 +1429,7 @@ impl<E: VerifyError> MempoolState<E> {
                     missing_since: None,
                     missing_error: None,
                     last_check_used: false,
-                    parent_retries: 0,
+                    retried_for: Vec::new(),
                     retry_owed: false,
                     give_up: None,
                     after_reset: true,
@@ -1511,7 +1520,8 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Runs again every admission parked on `parent`, which just entered the
-    /// pool, that has a retry left. One without is owed a last check.
+    /// pool, that has a retry left and has not been run for `parent`
+    /// already. Any other is owed a last check.
     fn wake_for_arrival(&mut self, parent: transaction::Hash) {
         let mut woken = Vec::new();
         for (key, admission) in &mut self.admissions {
@@ -1521,8 +1531,10 @@ impl<E: VerifyError> MempoolState<E> {
             if !on.contains(&parent) {
                 continue;
             }
-            if admission.parent_retries < MAX_PARENT_RETRIES {
-                admission.parent_retries += 1;
+            if !admission.retried_for.contains(&parent)
+                && admission.retried_for.len() < MAX_PARENT_RETRIES
+            {
+                admission.retried_for.push(parent);
                 woken.push(*key);
             } else {
                 admission.retry_owed = true;
@@ -1714,7 +1726,7 @@ impl<E: VerifyError> MempoolState<E> {
         // A block changes which parents are still unmined, and a reset sends
         // pooled parents back through admission.
         for admission in self.admissions.values_mut() {
-            admission.parent_retries = 0;
+            admission.retried_for.clear();
         }
         self.has_tip = true;
         self.switch();

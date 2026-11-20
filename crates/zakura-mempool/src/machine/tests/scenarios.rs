@@ -1014,6 +1014,47 @@ fn a_parent_the_cap_holds_back_earns_one_last_check() {
     assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
 }
 
+/// A parent that is evicted and enters again was in the pool for the check
+/// its first entry earned, so it costs the child no retry, and the child's
+/// other parent still runs it.
+#[test]
+fn a_parent_that_enters_again_costs_no_retry() {
+    let mut runner = TestRunner::deterministic();
+    let parents = unrelated(&mut runner, 2);
+    let spends: Vec<OutPoint> = parents.iter().map(|parent| parent.outpoint(0)).collect();
+    let child = build(&mut runner, &spends, 1, None);
+    let fillers = unrelated(&mut runner, 2);
+    // The pool holds two transactions, and evicts the one that pays least.
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: parents[0].real.cost() + fillers[0].real.cost(),
+            ..Config::default()
+        },
+        Limits::default(),
+    );
+    let (_, job) = bench.start(&child);
+    assert!(bench.missing(job, spends.clone()).is_empty());
+
+    let first = paying(&parents[0], 500_000);
+    let rerun = admit_parent(&mut bench, &first);
+    assert_eq!(rerun.len(), 1, "the first parent runs the child again");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+
+    // Two richer transactions push the first parent out, and it comes back
+    // under other authorizing data.
+    bench.admit(&paying(&fillers[0], 100_000_000));
+    bench.admit(&paying(&fillers[1], 200_000_000));
+    assert!(!bench.machine.pooled_ids().contains(&first.id()));
+    let again = paying(&twin(&parents[0]), 300_000_000);
+    assert!(
+        admit_parent(&mut bench, &again).is_empty(),
+        "nothing changed for the child since its last check"
+    );
+
+    let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
+    assert_eq!(rerun.len(), 1, "the other parent still runs the child");
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

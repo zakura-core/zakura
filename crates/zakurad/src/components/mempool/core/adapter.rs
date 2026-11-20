@@ -18,7 +18,7 @@
 //! request, for its reservation, its fetch and its verdict.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -242,31 +242,45 @@ async fn peer_batch(
     else {
         return Ok(Response::Queued(Vec::new()));
     };
+    let mut unknown: VecDeque<Gossip> = fresh
+        .into_iter()
+        .filter(|item| !known.contains(&item.id()))
+        .collect();
     // The rest take their peer's slots now, in one pass, as today's pool
     // queues a batch at once: at most the peer's limit of them, and the rest
     // are dropped without asking the core. Slots that free up while the
     // batch is worked on take nothing more from it.
-    let held: Vec<(Gossip, PeerSlot)> = fresh
-        .into_iter()
-        .filter(|item| !known.contains(&item.id()))
-        .filter_map(|item| match PeerSlot::take(&shared, &source) {
-            Some(slot) => Some((item, slot)),
-            None => {
-                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                None
-            }
-        })
+    let slots: Vec<PeerSlot> = (0..unknown.len())
+        .map_while(|_| PeerSlot::take(&shared, &source))
         .collect();
-    for (item, slot) in held {
-        let _ = queue(
-            shared.clone(),
-            item,
-            Some(source.clone()),
-            Some(slot),
-            deadline,
-        )
-        .await;
+    for slot in slots {
+        while let Some(item) = unknown.pop_front() {
+            match shared.handle.reserve(item.id(), deadline).await {
+                Ok(Ok(reservation)) => {
+                    // A peer's batch is not answered per item.
+                    drop(start(
+                        shared.clone(),
+                        reservation,
+                        item,
+                        Some(source.clone()),
+                        Some(slot),
+                        deadline,
+                    ));
+                    break;
+                }
+                // Someone else, such as tx-relay, reserved it after the
+                // lookup, so it was known after all and passes its slot on.
+                Ok(Err(Unreserved::Pending | Unreserved::Pooled | Unreserved::Rejected(_))) => {}
+                Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    let _ = timed_out();
+                    break;
+                }
+            }
+        }
     }
+    metrics::counter!("mempool.full_queue.per_peer.total")
+        .increment(u64::try_from(unknown.len()).unwrap_or(u64::MAX));
     Ok(Response::Queued(Vec::new()))
 }
 
@@ -503,6 +517,19 @@ async fn queue(
         Ok(Err(refused)) => return first_stage_refusal(refused),
         Err(_elapsed) => return Err(timed_out()),
     };
+    Ok(start(shared, reservation, item, from, slot, deadline))
+}
+
+/// Starts the task that brings `item` in under `reservation` and answers
+/// its second stage. See [`queue`].
+fn start(
+    shared: Arc<Shared>,
+    reservation: Reservation,
+    item: Gossip,
+    from: Option<QueueSource>,
+    slot: Option<PeerSlot>,
+    deadline: tokio::time::Instant,
+) -> Receiver {
     metrics::counter!("mempool.queued.transactions.total").increment(1);
     let (answer, receiver) = oneshot::channel();
     tokio::spawn(async move {
@@ -513,7 +540,7 @@ async fn queue(
         drop(slot);
         let _ = answer.send(result);
     });
-    Ok(receiver)
+    receiver
 }
 
 /// One undecided transaction counted against a peer, from its reservation
@@ -1651,12 +1678,12 @@ mod tests {
         };
         let _ = reply.send(Default::default());
         // Its bodies are queued one after another. Each within the peer's
-        // limit reserves, and the core says it is already pooled.
+        // limit reserves, and the core says it has no room.
         for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
             let Some(PoolCommand::Reserve { reply, .. }) = inbox.next().await else {
                 panic!("each body within the peer's limit reserves");
             };
-            let _ = reply.send(Err(Unreserved::Pooled));
+            let _ = reply.send(Err(Unreserved::NoRoom));
         }
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), request)
             .await
@@ -1827,11 +1854,11 @@ mod tests {
         drop(unpolled);
     }
 
-    /// An id the core already knows, such as one tx-relay reserved straight
-    /// through the pool handle, takes none of a peer's slots: the batch asks
-    /// the core once, skips it, and fetches five new ids.
+    /// An id tx-relay reserves after the batch's lookup missed it takes none
+    /// of the peer's slots: its refused reservation passes the slot to the
+    /// next id, so the peer still fetches five new ids.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_id_the_core_already_knows_takes_none_of_the_batch() {
+    async fn an_id_reserved_elsewhere_after_the_lookup_takes_none_of_the_batch() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand, ReservationId};
 
         let (handle, mut inbox) = pool_port();
@@ -1850,11 +1877,15 @@ mod tests {
         let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
             panic!("the batch asks which ids the core knows");
         };
-        let _ = reply.send([elsewhere].into_iter().collect());
+        let _ = reply.send(Default::default());
         let mut reserved = Vec::new();
         while let Ok(Some(PoolCommand::Reserve { tx_id, reply })) =
             tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
         {
+            if tx_id == elsewhere {
+                let _ = reply.send(Err(Unreserved::Pending));
+                continue;
+            }
             let reservation = ReservationId(u64::from(tx_id.mined_id().0[0]));
             let _ = reply.send(Ok(inbox.grant(reservation, tx_id, Default::default())));
             reserved.push(tx_id);
@@ -1865,8 +1896,9 @@ mod tests {
     }
 
     /// A peer's batch takes at most the peer's limit of ids, in one pass, as
-    /// today's pool queues a batch at once: even when each fetch ends at
-    /// once and frees its slot, the rest of the batch is not worked through.
+    /// today's pool queues a batch at once: even when each reservation fails
+    /// at once and frees its slot, the rest of the batch is not worked
+    /// through.
     #[tokio::test(flavor = "current_thread")]
     async fn a_peer_batch_takes_at_most_five_ids_however_fast_they_finish() {
         use zakura_node_services::mempool::port::{pool_port, PoolCommand};
@@ -1895,7 +1927,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
         {
             reserved += 1;
-            let _ = reply.send(Err(Unreserved::Pooled));
+            let _ = reply.send(Err(Unreserved::NoRoom));
         }
         assert_eq!(reserved, MAX_INBOUND_CONCURRENCY_PER_PEER, "only five");
         let _ = request.await;

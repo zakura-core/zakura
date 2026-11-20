@@ -157,6 +157,13 @@ impl NodeId {
     pub fn key(&self) -> NodeKey {
         self.0
     }
+
+    /// Verifies `signature` over `message` with this node ID's key.
+    ///
+    /// Uses the same checks and errors as [`NodeKey::verify_strict`].
+    pub fn verify_strict(&self, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
+        self.key().verify_strict(message, signature)
+    }
 }
 
 impl From<NodeKey> for NodeId {
@@ -411,10 +418,13 @@ mod tests {
     #[test]
     fn rfc8032_vector_derives_and_verifies() {
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
-        assert_eq!(secret.public().to_string(), RFC8032_PUBLIC);
+        let id = secret.public();
+        assert_eq!(id.to_string(), RFC8032_PUBLIC);
         let sig = secret.sign(b"");
         assert_eq!(hex::encode(sig), RFC8032_SIG);
-        secret.public().key().verify_strict(b"", &sig).unwrap();
+        id.key().verify_strict(b"", &sig).unwrap();
+        id.verify_strict(b"", &sig).unwrap();
+        assert_eq!(id.verify_strict(b"different", &sig), Err(SignatureError));
     }
 
     #[test]

@@ -24,10 +24,12 @@ struct Expected {
 }
 
 /// The scenario families the sweep skips, as `harness/family`: each run
-/// takes minutes, too long for the sweep.
-const SLOW_FAMILIES: [&str; 3] = [
+/// takes minutes, too long for the sweep. `capacity-release` alone ran
+/// 330 s on the droplet.
+const SLOW_FAMILIES: [&str; 4] = [
     "block-sync/storage/stuck-floor",
     "block-sync/storage/above-window",
+    "block-sync/storage/capacity-release",
     "block-sync/storage/decoded-input-stall",
 ];
 

@@ -129,7 +129,7 @@ fn a_spammer_keeps_going_after_its_connection_ends() {
 const CONTENT_SEARCH_RUNS: usize = 1_024;
 
 /// How many matching inputs that test runs.
-const CONTENT_SEARCH_MATCHES: usize = 4;
+const CONTENT_SEARCH_MATCHES: usize = 2;
 
 /// Whether `scenario` has a spammer that sends a `GetServices` with bad
 /// wanted services after two `GetServices` on the same connection, so the

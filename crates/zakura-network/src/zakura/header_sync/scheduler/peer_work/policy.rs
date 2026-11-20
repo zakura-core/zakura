@@ -131,14 +131,7 @@ impl AdvertisedHeaderTarget {
 
     /// Compare claimed suffix work only when both snapshots use the same anchor.
     pub fn claimed_work_order(&self, local: &EngineSnapshot) -> Option<Ordering> {
-        let local_anchor = local.frontiers.finalized;
-        (self.status.work_anchor_height == local_anchor.height
-            && self.status.work_anchor_hash == local_anchor.hash)
-            .then(|| {
-                self.status
-                    .suffix_cumulative_work
-                    .cmp(&local.header_best_score.suffix_work.as_u256())
-            })
+        claimed_work_order(&self.status, local)
     }
 
     /// Whether this status names a different target that can actually serve a request.
@@ -342,7 +335,28 @@ pub(in crate::zakura::header_sync) enum PeerWorkPriority {
     Normal,
 }
 
+/// Compare `status`'s claimed suffix work with `local`'s only when both use
+/// the same anchor.
+fn claimed_work_order(status: &Status, local: &EngineSnapshot) -> Option<Ordering> {
+    let local_anchor = local.frontiers.finalized;
+    (status.work_anchor_height == local_anchor.height
+        && status.work_anchor_hash == local_anchor.hash)
+        .then(|| {
+            status
+                .suffix_cumulative_work
+                .cmp(&local.header_best_score.suffix_work.as_u256())
+        })
+}
+
 impl PeerWorkPriority {
+    /// The priority of an offer of `status` at `local`.
+    pub(in crate::zakura::header_sync) fn of_status(
+        status: &Status,
+        local: &EngineSnapshot,
+    ) -> Self {
+        Self::from_work_order(claimed_work_order(status, local))
+    }
+
     pub(in crate::zakura::header_sync) fn from_work_order(order: Option<Ordering>) -> Self {
         match order {
             Some(Ordering::Less) => Self::LowerComparableWork,

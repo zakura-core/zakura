@@ -113,11 +113,20 @@ pub(super) struct ReactorState {
     /// The last place handed out in the ordinary-offer rotation. See
     /// [`PeerSchedule::turn`].
     last_turn: u64,
-    /// The earliest turn of an idle offer held back because another peer owns
-    /// its target, by target. See [`Self::overtakes_waiting`].
-    waiting_for_target: HashMap<block::Hash, u64>,
-    /// The earliest turn of an idle offer held back by full staging slots.
-    waiting_for_slot: Option<u64>,
+    /// The earliest place of an idle offer held back because another peer
+    /// owns its target, by target. See [`Self::overtakes_waiting`].
+    waiting_for_target: HashMap<block::Hash, OfferPlace>,
+    /// The earliest place of an idle offer held back by full staging slots.
+    waiting_for_slot: Option<OfferPlace>,
+}
+
+/// An offer's place in the cached pass: offers that claim less work than the
+/// node's own come after the rest ([`PeerWorkPriority`]), and the rotation
+/// ([`PeerSchedule::turn`]) orders each priority.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct OfferPlace {
+    priority: std::cmp::Reverse<PeerWorkPriority>,
+    turn: u64,
 }
 
 impl ReactorState {
@@ -250,20 +259,38 @@ impl ReactorState {
         }
     }
 
-    /// Note that `peer`'s idle offer waits because another peer owns
-    /// `target`.
-    pub(super) fn note_waiting_for_target(&mut self, peer: &ZakuraPeerId, target: block::Hash) {
-        if let Some(turn) = self.peers.get(peer).map(|schedule| schedule.turn) {
-            let earliest = self.waiting_for_target.entry(target).or_insert(turn);
-            *earliest = (*earliest).min(turn);
+    /// The place in the cached pass of `peer`'s offer at `priority`.
+    fn place(&self, peer: &ZakuraPeerId, priority: PeerWorkPriority) -> Option<OfferPlace> {
+        self.peers.get(peer).map(|schedule| OfferPlace {
+            priority: std::cmp::Reverse(priority),
+            turn: schedule.turn,
+        })
+    }
+
+    /// Note that `peer`'s idle offer at `priority` waits because another peer
+    /// owns `target`.
+    pub(super) fn note_waiting_for_target(
+        &mut self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) {
+        if let Some(place) = self.place(peer, priority) {
+            let earliest = self.waiting_for_target.entry(target).or_insert(place);
+            *earliest = (*earliest).min(place);
         }
     }
 
-    /// Note that `peer`'s idle offer waits for a staging slot or for header
-    /// room, which every offer shares like a slot.
-    pub(super) fn note_waiting_for_slot(&mut self, peer: &ZakuraPeerId) {
-        if let Some(turn) = self.peers.get(peer).map(|schedule| schedule.turn) {
-            self.waiting_for_slot = Some(self.waiting_for_slot.map_or(turn, |slot| slot.min(turn)));
+    /// Note that `peer`'s idle offer at `priority` waits for a staging slot or
+    /// for header room, which every offer shares like a slot.
+    pub(super) fn note_waiting_for_slot(
+        &mut self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+    ) {
+        if let Some(place) = self.place(peer, priority) {
+            self.waiting_for_slot =
+                Some(self.waiting_for_slot.map_or(place, |slot| slot.min(place)));
         }
     }
 
@@ -274,24 +301,42 @@ impl ReactorState {
         self.waiting_for_slot = None;
     }
 
-    /// Whether `peer`'s fresh offer of `target` would take a turn ahead of an
-    /// earlier idle offer that waits for the same target or for a slot.
+    /// Whether `peer`'s fresh offer of `target` at `priority` would stage
+    /// ahead of an idle offer that waits for the same target or for a slot and
+    /// comes earlier in the cached pass.
     ///
     /// Between passes, an offer can stage only on its own status. While a
     /// pass waits for its refill, a status that arrives just after a target or
     /// slot frees would otherwise stage ahead of the offers the pass owes it
     /// to. Ownership bounds the target entries by the staging slots, and a
     /// stale entry only makes a fresh status wait for the next pass.
-    pub(super) fn overtakes_waiting(&self, peer: &ZakuraPeerId, target: block::Hash) -> bool {
-        let Some(turn) = self.peers.get(peer).map(|schedule| schedule.turn) else {
-            return false;
-        };
-        self.waiting_for_target
-            .get(&target)
-            .is_some_and(|earliest| *earliest < turn)
-            || self
-                .waiting_for_slot
-                .is_some_and(|earliest| earliest < turn)
+    pub(super) fn overtakes_waiting(
+        &self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) -> bool {
+        self.overtakes_waiting_for_target(peer, priority, target)
+            || self.place(peer, priority).is_some_and(|place| {
+                self.waiting_for_slot
+                    .is_some_and(|earliest| earliest < place)
+            })
+    }
+
+    /// Whether `peer`'s fresh offer of `target` at `priority` would stage
+    /// ahead of an idle offer that waits for the same target and comes
+    /// earlier in the cached pass. See [`Self::overtakes_waiting`].
+    pub(super) fn overtakes_waiting_for_target(
+        &self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) -> bool {
+        self.place(peer, priority).is_some_and(|place| {
+            self.waiting_for_target
+                .get(&target)
+                .is_some_and(|earliest| *earliest < place)
+        })
     }
 
     /// Spend `peer`'s offer.
@@ -361,9 +406,8 @@ impl ReactorState {
         self.last_scheduling_opportunity = Some(opportunity);
     }
 
-    /// The unspent offers of peers without work, in cached-pass order: the
-    /// rotation ([`PeerSchedule::turn`]), with offers that claim less work
-    /// than the node's own after the rest ([`PeerWorkPriority`]).
+    /// The unspent offers of peers without work, with their priorities, in
+    /// cached-pass order ([`OfferPlace`]).
     ///
     /// `session_id` names each admitted peer's session.
     pub(super) fn cached_offers(
@@ -371,7 +415,7 @@ impl ReactorState {
         local: &zakura_header_chain::EngineSnapshot,
         has_work: impl Fn(&ZakuraPeerId) -> bool,
         session_id: impl Fn(&ZakuraPeerId) -> u64,
-    ) -> Vec<(ZakuraPeerId, AdvertisedHeaderTarget)> {
+    ) -> Vec<(ZakuraPeerId, PeerWorkPriority, AdvertisedHeaderTarget)> {
         let mut offers: Vec<_> = self
             .peers
             .iter()
@@ -384,19 +428,17 @@ impl ReactorState {
                     status: status.clone(),
                 };
                 let priority = PeerWorkPriority::from_work_order(target.claimed_work_order(local));
-                Some((priority, schedule.turn, peer.clone(), target))
+                let place = OfferPlace {
+                    priority: std::cmp::Reverse(priority),
+                    turn: schedule.turn,
+                };
+                Some((place, peer.clone(), priority, target))
             })
             .collect();
-        offers.sort_unstable_by(
-            |(left_priority, left_turn, ..), (right_priority, right_turn, ..)| {
-                right_priority
-                    .cmp(left_priority)
-                    .then_with(|| left_turn.cmp(right_turn))
-            },
-        );
+        offers.sort_unstable_by_key(|(place, ..)| *place);
         offers
             .into_iter()
-            .map(|(_, _, peer, target)| (peer, target))
+            .map(|(_, peer, priority, target)| (peer, priority, target))
             .collect()
     }
 

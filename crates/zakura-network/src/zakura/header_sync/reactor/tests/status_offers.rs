@@ -2815,3 +2815,115 @@ async fn a_later_offer_waits_behind_an_earlier_offer_held_for_header_room() {
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &honest, honest_target);
 }
+
+/// F-832: unstarted work takes a peer's new target in place, so it can stage
+/// that target ahead of an earlier offer as an idle peer's offer can. While
+/// the cached pass waits for its refill, a later peer whose unstarted work
+/// would take a freed target waits for that pass, and its new status
+/// supersedes the unstarted work.
+///
+/// This fails if the deferred pass's guard skips peers with unstarted work.
+#[tokio::test(start_paused = true)]
+async fn later_unstarted_work_does_not_take_a_freed_target_ahead_of_an_earlier_offer() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let target = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &owner, target);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "the owner holds the target");
+
+    // A later peer stages another target, and its locator read stays open.
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    let alternate = block::Hash([0x43; 32]);
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, alternate));
+    expect_locator_query(&mut actions, &late, alternate);
+
+    // The owner leaves with the pass budget spent, and the later peer moves
+    // to the freed target before the deferred pass runs.
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.schedule_cached_statuses();
+    assert!(
+        reactor.state.cached_pass_deferred,
+        "the pass waits for its refill"
+    );
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the later peer's unstarted work doesn't take the target ahead of the honest offer"
+    );
+    assert!(
+        reactor.peer_work_queue.awaiting_target(&late).is_none(),
+        "the new status supersedes the unstarted work"
+    );
+
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, target);
+}
+
+/// F-831: the cached pass serves offers that claim less work than the node's
+/// own after the rest, so a wait record keeps the waiting offer's priority
+/// with its turn. While the pass waits for its refill, an earlier peer's
+/// fresh offer that claims less work waits behind a later offer that
+/// doesn't.
+///
+/// This fails if a wait record compares turns alone.
+#[tokio::test(start_paused = true)]
+async fn an_earlier_lower_work_offer_waits_behind_a_later_offer_the_pass_serves_first() {
+    let mut startup = startup(CancellationToken::new());
+    let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    // The node's own work sits between the two claims.
+    snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+        zakura_header_chain::SuffixWork::new(zakura_chain::work::difficulty::U256::from(5_u8)),
+        snapshot.frontiers.header_best.hash,
+    );
+    let (_snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let target = block::Hash([0x42; 32]);
+    let normal = Status {
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(10_u8),
+        ..status_for(&snapshot, target)
+    };
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (lower, _lower_outbound) = connect(&mut reactor, 0x20);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    reactor.handle_status(owner.clone(), 0, normal.clone());
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &owner, target);
+    reactor.handle_status(honest.clone(), 0, normal);
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "the owner holds the target");
+
+    // The owner leaves with the pass budget spent, and the earlier peer's
+    // lower claim arrives before the deferred pass runs.
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.schedule_cached_statuses();
+    assert!(
+        reactor.state.cached_pass_deferred,
+        "the pass waits for its refill"
+    );
+    reactor.handle_status(lower.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the lower claim doesn't stage ahead of the offer the pass serves first"
+    );
+
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, target);
+}

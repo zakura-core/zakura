@@ -1,105 +1,64 @@
 //! Resolve a block body's native header and legacy announcement claims at receipt time.
 
-use std::{cell::LazyCell, time::Duration};
+use std::time::Duration;
 
 use tokio::time::Instant;
 use zakura_chain::block;
 
-use super::{in_claim_window, AnnouncementClaims, ClaimTable, CLAIM_BODY_DEADLINE};
+use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
-    /// Resolves the claims held for `hash` against a body arriving at `now`, whose coinbase
-    /// `height` places an announcement and whose serialized size `bytes` gives for the claim
-    /// metrics.
-    ///
-    /// A block can hold a header claim and an announcement. The body takes the earlier order of
-    /// those still in force, so a second claim never makes the outcome worse than the first
-    /// alone. If neither is in force, the outcome reports the earlier one.
-    ///
-    /// Resolving does not use a claim up, so an invalid body under the same hash cannot take it
-    /// from the real one. `bytes` is called only for a claimed block, after the table lock is
-    /// released, because sizing a block walks its transactions.
+    /// Gives a body the earliest usable reservation for its hash, without consuming it.
+    /// If all eligible claims failed, report the first one's outcome for metrics.
     pub(in crate::block::receipt) fn resolve(
         &self,
         hash: block::Hash,
         height: Option<block::Height>,
         now: Instant,
-        bytes: impl FnOnce() -> usize,
     ) -> ClaimOutcome {
-        let candidates = self.table().candidates(hash, height);
-        let bytes = LazyCell::new(bytes);
-        candidates
-            .into_iter()
-            .flatten()
-            .map(|claim| (claim.order, claim.classify(now, *bytes)))
-            .min_by_key(|(order, outcome)| (outcome.claimed_order().is_none(), *order))
-            .map_or(ClaimOutcome::Unclaimed, |(_, outcome)| outcome)
-    }
-}
+        use ClaimOutcome::{Expired, Unclaimed, Used, Voided};
 
-impl ClaimTable {
-    /// Snapshots both eligible claims and the local mining decision under the same lock.
-    fn candidates(
-        &self,
-        hash: block::Hash,
-        height: Option<block::Height>,
-    ) -> [Option<Candidate>; 2] {
-        let candidate = |source, height, order, seen_at| Candidate {
-            source,
-            order,
-            seen_at,
-            voided: self.mined.iter().any(|(mined_hash, mined)| {
+        let table = self.table();
+        let classify = |source, height, order, seen_at| {
+            let age = now.saturating_duration_since(seen_at);
+            let voided = table.mined.iter().any(|(mined_hash, mined)| {
                 *mined_hash != hash && mined.height == height && order < mined.order
-            }),
+            });
+            if voided {
+                Voided { source, age }
+            } else if age > CLAIM_BODY_DEADLINE {
+                Expired { source, age }
+            } else {
+                Used { source, order, age }
+            }
         };
 
-        let header = self.by_hash.get(&hash).map(|claim| {
-            candidate(
-                ClaimSource::Header,
-                claim.height,
-                claim.order,
-                claim.seen_at,
-            )
-        });
-        let inv = height.and_then(|height| {
-            let announcement = self.announced.get(hash)?;
-            if height < self.floor || !in_claim_window(height, announcement.tip_at_announcement) {
-                return None;
-            }
-            Some(candidate(
-                ClaimSource::Inv,
-                height,
-                announcement.order,
-                announcement.seen_at,
-            ))
-        });
-        [header, inv]
-    }
-}
+        // A legacy announcement is only recorded while the hash has no header claim.
+        // When both are present the legacy reservation therefore has the earlier order.
+        let inv = height
+            .zip(table.announced.get(hash))
+            .filter(|(height, inv)| {
+                *height >= table.floor && in_claim_window(*height, inv.tip_at_announcement)
+            })
+            .map_or(Unclaimed, |(height, inv)| {
+                classify(ClaimSource::Inv, height, inv.order, inv.seen_at)
+            });
+        if matches!(inv, Used { .. }) {
+            return inv;
+        }
 
-/// A reservation on this block's receipt order at the instant its body arrived.
-struct Candidate {
-    source: ClaimSource,
-    order: u64,
-    seen_at: Instant,
-    voided: bool,
-}
-
-impl Candidate {
-    fn classify(self, now: Instant, bytes: usize) -> ClaimOutcome {
-        let age = now.saturating_duration_since(self.seen_at);
-        let source = self.source;
-        if self.voided {
-            ClaimOutcome::Voided { source, age, bytes }
-        } else if age > CLAIM_BODY_DEADLINE {
-            ClaimOutcome::Expired { source, age, bytes }
-        } else {
-            ClaimOutcome::Used {
-                source,
-                order: self.order,
-                age,
-                bytes,
-            }
+        let Some(header) = table.by_hash.get(&hash) else {
+            return inv;
+        };
+        let header = classify(
+            ClaimSource::Header,
+            header.height,
+            header.order,
+            header.seen_at,
+        );
+        match (inv, header) {
+            (_, Used { .. }) | (Unclaimed, _) => header,
+            _ => inv,
         }
     }
 }
@@ -132,21 +91,12 @@ pub(in crate::block::receipt) enum ClaimOutcome {
         source: ClaimSource,
         order: u64,
         age: Duration,
-        bytes: usize,
     },
     /// The body arrived after its deadline and is ranked by its arrival.
-    Expired {
-        source: ClaimSource,
-        age: Duration,
-        bytes: usize,
-    },
+    Expired { source: ClaimSource, age: Duration },
     /// A block this node mined at the claim's height outranks it, so the body is ranked by its
     /// arrival.
-    Voided {
-        source: ClaimSource,
-        age: Duration,
-        bytes: usize,
-    },
+    Voided { source: ClaimSource, age: Duration },
 }
 
 impl ClaimOutcome {
@@ -158,18 +108,21 @@ impl ClaimOutcome {
         }
     }
 
-    /// Records this outcome for the body of `hash`, which was given `order`.
-    pub(in crate::block::receipt) fn record(&self, hash: block::Hash, order: u64) {
+    /// Records metrics for a newly tracked receipt. Only a held claim needs the body's size.
+    pub(in crate::block::receipt) fn record(
+        &self,
+        hash: block::Hash,
+        order: u64,
+        body_size: impl FnOnce() -> usize,
+    ) {
         let (outcome, claim) = match *self {
             Self::Unclaimed => ("none", None),
-            Self::Used {
-                source, age, bytes, ..
-            } => ("used", Some((source, age, bytes))),
-            Self::Expired { source, age, bytes } => ("expired", Some((source, age, bytes))),
-            Self::Voided { source, age, bytes } => ("voided", Some((source, age, bytes))),
+            Self::Used { source, age, .. } => ("used", Some((source, age))),
+            Self::Expired { source, age } => ("expired", Some((source, age))),
+            Self::Voided { source, age } => ("voided", Some((source, age))),
         };
-        let size = claim.map_or("none", |(_, _, bytes)| size_label(bytes));
-        let source = claim.map_or("none", |(source, _, _)| source.label());
+        let size = claim.map_or("none", |_| size_label(body_size()));
+        let source = claim.map_or("none", |(source, _)| source.label());
         metrics::counter!(
             "sync.block.announcement_claim",
             "outcome" => outcome,
@@ -177,7 +130,7 @@ impl ClaimOutcome {
             "source" => source,
         )
         .increment(1);
-        if let Some((_, age, _)) = claim {
+        if let Some((_, age)) = claim {
             metrics::histogram!(
                 "sync.block.announcement_claim.age.seconds",
                 "size" => size,

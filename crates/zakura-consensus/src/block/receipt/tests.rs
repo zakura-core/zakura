@@ -49,10 +49,10 @@ fn announce(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) {
     claims.note_announcement_at(hash, TIP, now);
 }
 
-/// The order a body of `hash` with `bytes` serialized bytes gets when it arrives at `now`.
-fn body_order(claims: &AnnouncementClaims, hash: block::Hash, bytes: usize, now: Instant) -> u64 {
+/// The order a body of `hash` gets when it arrives at `now`.
+fn body_order(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> u64 {
     claims
-        .resolve(hash, Some(CLAIMED), now, || bytes)
+        .resolve(hash, Some(CLAIMED), now)
         .claimed_order()
         .unwrap_or_else(order::next)
 }

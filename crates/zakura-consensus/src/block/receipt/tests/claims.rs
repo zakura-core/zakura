@@ -2,9 +2,9 @@
 
 use super::*;
 
-/// What a body of `hash` with no size finds when it arrives at `now` inside its deadline.
+/// What a body of `hash` finds when it arrives at `now` inside its deadline.
 fn used(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> Used {
-    match claims.resolve(hash, Some(CLAIMED), now, || 0) {
+    match claims.resolve(hash, Some(CLAIMED), now) {
         ClaimOutcome::Used { order, age, .. } => Used { order, age },
         outcome => panic!("expected a used claim, found {outcome:?}"),
     }
@@ -23,11 +23,11 @@ fn a_body_inside_its_deadline_keeps_the_order_of_its_header() {
     let competitor = order::next();
 
     let at_the_bound = now + CLAIM_BODY_DEADLINE;
-    let order = body_order(&claims, hash(1), 0, at_the_bound);
+    let order = body_order(&claims, hash(1), at_the_bound);
     assert!(order < competitor);
     assert_eq!(Some(order), claims.claimed_order(hash(1)));
     assert!(
-        body_order(&claims, hash(2), 0, now) > competitor,
+        body_order(&claims, hash(2), now) > competitor,
         "a claim only reserves priority for the hash it was made for",
     );
 }
@@ -64,7 +64,7 @@ fn announcing_a_withheld_block_again_does_not_renew_its_claim() {
     }
     let competitor = order::next();
     assert!(
-        body_order(&claims, hash(1), 2_000_000, late) > competitor,
+        body_order(&claims, hash(1), late) > competitor,
         "a withheld body is ranked by its arrival",
     );
 }
@@ -77,11 +77,11 @@ fn a_body_arriving_during_its_header_apply_takes_the_reserved_order() {
     let rival_during_apply = order::next();
 
     // The block's own body arrives before the header chain has accepted its header.
-    let during = body_order(&claims, hash(1), 0, now);
+    let during = body_order(&claims, hash(1), now);
     assert!(during < rival_during_apply);
 
     pending.commit();
-    assert_eq!(body_order(&claims, hash(1), 0, now), during);
+    assert_eq!(body_order(&claims, hash(1), now), during);
 }
 
 #[test]
@@ -100,37 +100,27 @@ fn a_header_that_is_not_applied_leaves_no_claim() {
 
 #[test]
 fn small_and_full_size_bodies_get_the_same_deadline() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    claim(&claims, hash(1), now);
-    let claimed = claims
-        .claimed_order(hash(1))
-        .expect("the header was claimed");
-    let competitor = order::next();
-    let just_inside = now + CLAIM_BODY_DEADLINE - Duration::from_millis(1);
-    let just_after = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_TESTNET_141042_BYTES};
 
-    // A 1 kB body and a 2 MB body, the largest a block can be.
-    for bytes in [1_000, 2_000_000] {
-        assert!(
-            matches!(
-                claims.resolve(hash(1), Some(CLAIMED), just_inside, || bytes),
-                ClaimOutcome::Used { order, .. } if order == claimed
-            ),
-            "a body of {bytes} bytes just inside the deadline takes the claimed order",
-        );
-        assert!(
-            matches!(
-                claims.resolve(hash(1), Some(CLAIMED), just_after, || bytes),
-                ClaimOutcome::Expired { age, .. } if age == just_after - now
-            ),
-            "a body of {bytes} bytes past the deadline loses the claim",
-        );
-        assert!(body_order(&claims, hash(1), bytes, just_inside) < competitor);
-        assert!(
-            body_order(&claims, hash(1), bytes, just_after) > competitor,
-            "a body of {bytes} bytes past the deadline is ranked by its arrival",
-        );
+    let now = Instant::now();
+    for bytes in [&*BLOCK_MAINNET_1_BYTES, &*BLOCK_TESTNET_141042_BYTES] {
+        let block: Block = bytes.zcash_deserialize_into().unwrap();
+        let hash = block.hash();
+        let height = block
+            .coinbase_height()
+            .expect("both fixtures have a coinbase height");
+        let claims = AnnouncementClaims::default();
+        claims
+            .begin_at([(hash, height)], height.previous().unwrap(), now)
+            .commit();
+        let reserved = claims.claimed_order(hash).unwrap();
+        let registry = ReceiptRegistry::new(claims);
+        let body = BlockHandle::from(Arc::new(block));
+
+        let deadline = now + CLAIM_BODY_DEADLINE;
+        assert_eq!(registry.register_at(hash, &body, deadline).order, reserved);
+        let late = deadline + Duration::from_millis(1);
+        assert!(registry.register_at(hash, &body, late).order > reserved);
     }
 }
 
@@ -227,18 +217,18 @@ fn a_mined_block_outranks_an_earlier_claim_at_its_height() {
     let mined_order = order::next();
     let mined = claims.mark_mined(hash(3), CLAIMED, mined_order);
     assert!(
-        body_order(&claims, hash(1), 0, now) > mined_order,
+        body_order(&claims, hash(1), now) > mined_order,
         "a rival announced first does not displace the mined block",
     );
     assert_eq!(
-        body_order(&claims, hash(2), 0, now),
+        body_order(&claims, hash(2), now),
         above,
         "a claim at another height is honoured",
     );
 
     // The mined block failed verification, so the rival's claim is back in force.
     drop(mined);
-    assert_eq!(body_order(&claims, hash(1), 0, now), rival);
+    assert_eq!(body_order(&claims, hash(1), now), rival);
 }
 
 #[test]
@@ -248,7 +238,7 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), now, || 0),
+            claims.resolve(hash(1), Some(CLAIMED), now),
             ClaimOutcome::Voided { .. }
         )
     };
@@ -269,6 +259,31 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     assert!(voided());
     drop(higher);
     assert!(voided());
+}
+
+#[test]
+fn recording_metrics_sizes_only_bodies_with_a_claim() {
+    use ClaimOutcome::{Expired, Unclaimed, Used, Voided};
+
+    let source = ClaimSource::Inv;
+    let age = Duration::from_millis(500);
+    for outcome in [
+        Unclaimed,
+        Used {
+            order: 1,
+            source,
+            age,
+        },
+        Expired { source, age },
+        Voided { source, age },
+    ] {
+        let mut sizes = 0;
+        outcome.record(hash(1), 1, || {
+            sizes += 1;
+            100_000
+        });
+        assert_eq!(sizes, usize::from(outcome != Unclaimed), "{outcome:?}");
+    }
 }
 
 #[test]
@@ -326,7 +341,7 @@ fn mined_block_records_end_once_the_node_mines_well_above_them() {
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), now, || 0),
+            claims.resolve(hash(1), Some(CLAIMED), now),
             ClaimOutcome::Voided { .. }
         )
     };

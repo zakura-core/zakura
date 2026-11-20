@@ -1,16 +1,12 @@
 //! Receipt priority for concurrent deliveries of complete blocks.
 //!
-//! A block's receipt order is normally drawn when its complete body reaches the verifier. A block
-//! announced first, by native header sync admitting its header by a legacy peer's first `inv`, or by the start
-//! of a legacy block transfer, can instead keep the order reserved for that announcement, provided its body follows
-//! within a deadline that is the same for every block size. That stops a small body from
-//! overtaking a larger one announced earlier.
+//! A complete body that reaches the verifier normally draws a new order. A native header,
+//! a single-block legacy inventory announcement, or the start of a legacy block transfer can
+//! reserve an earlier place. The verifier picks the earliest eligible reservation still within
+//! its deadline. Reading a claim leaves it available to other bodies under the same hash.
 //!
-//! The verifier compares the eligible header, inventory and block-transfer claims together. Reading a claim does not
-//! consume it, so a failed delivery cannot take that order from a later valid body.
-//!
-//! - `claims`: the claim table header sync and legacy `inv`s write, the body deadline, and the
-//!   blocks this node mined, which outrank rivals' claims at their heights.
+//! - `claims`: header, inventory and transfer reservations, their deadline, and locally mined
+//!   blocks that outrank earlier claims at their height.
 //! - `registry`: the receipts the verifier gives bodies, shared by overlapping deliveries and
 //!   resolved against the claims.
 //! - `order`: the process-wide order both draw from, so claims and receipts compare.

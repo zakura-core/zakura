@@ -12,7 +12,7 @@ use zakura_quic::NodeId;
 
 use super::replay::*;
 use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
-use super::state::{CandidateAddress, CandidateDialerState};
+use super::state::{CandidateAddress, CandidateDialerState, MAX_DIAL_BACKOFF_ENTRIES};
 use super::*;
 use crate::zakura::{canonical_ip, machine_test::machine_target_tests};
 
@@ -270,6 +270,70 @@ async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
         second_attempt,
     );
     assert!(!state.is_backed_off(failing_node, ip, second_attempt + Duration::from_secs(60)));
+}
+
+/// disco-23: a failure past the cap evicts the entry with the earliest
+/// `retry_at`, ties broken by node and then IP, and keeps the rest.
+#[tokio::test(start_paused = true)]
+async fn a_full_dial_history_evicts_the_earliest_retry() {
+    let node = node_id(1);
+    let start = Instant::now();
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let ips_per_attempt = 8;
+    let ip = |index: usize| {
+        IpAddr::from(std::net::Ipv4Addr::from(
+            u32::try_from(index).expect("the test index fits u32"),
+        ))
+    };
+    // Each attempt fails a millisecond after the last, so earlier attempts
+    // retry earlier.
+    let attempts = MAX_DIAL_BACKOFF_ENTRIES / ips_per_attempt;
+    for attempt in 0..attempts {
+        let ips: Vec<_> = (0..ips_per_attempt)
+            .map(|offset| ip(attempt * ips_per_attempt + offset))
+            .collect();
+        let failed_at = start + Duration::from_millis(u64::try_from(attempt).expect("fits u64"));
+        settle(
+            &mut state,
+            node,
+            &ips,
+            None,
+            DiscoveryDialResult::Failed,
+            failed_at,
+        );
+    }
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+
+    let late = start + Duration::from_secs(1);
+    let newest = ip(MAX_DIAL_BACKOFF_ENTRIES);
+    settle(
+        &mut state,
+        node,
+        &[newest],
+        None,
+        DiscoveryDialResult::Failed,
+        late,
+    );
+    state.assert_invariants();
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+    assert!(state.is_backed_off(node, newest, late));
+    assert!(
+        !state.is_backed_off(node, ip(0), late),
+        "the earliest retry left"
+    );
+    assert!(state.is_backed_off(node, ip(1), late));
+
+    // A repeat failure updates its entry in place and evicts nothing.
+    settle(
+        &mut state,
+        node,
+        &[newest],
+        None,
+        DiscoveryDialResult::Failed,
+        late,
+    );
+    assert_eq!(state.backoff_len(), MAX_DIAL_BACKOFF_ENTRIES);
+    assert!(state.is_backed_off(node, ip(1), late));
 }
 
 // V12 F-305587: an ALPN mismatch from one stale address used to put every
@@ -1560,4 +1624,99 @@ async fn a_round_dials_every_ip_of_a_slash_64() {
             "2001:db8:a:b::2".parse().expect("test address parses"),
         ]
     );
+}
+
+/// disco-17 `teardown-releases`: after a dial attempt ends by peer
+/// disconnect, worker panic or local cancellation, the dialer holds no
+/// attempt and no per-IP reservation.
+///
+/// Each attempt reserves one count on `DIAL_IP`. The baseline is no attempt
+/// in flight and no reservation; `assert_invariants` checks that the per-IP
+/// map holds exactly the in-flight attempts' reservations, so it is empty.
+#[tokio::test]
+async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9221)
+        .spawn()
+        .await
+        .unwrap();
+    let mut io = CandidateDialerIO {
+        endpoint: node.endpoint(),
+        discovery: node.discovery(),
+        limits: node.limits().clone(),
+        sought_services: Vec::new(),
+        trace: node.endpoint().trace(),
+        workers: FuturesUnordered::new(),
+    };
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let reserved = |state: &CandidateDialerState| {
+        state.assert_invariants();
+        (
+            state.in_flight_node_ids().len(),
+            state.in_flight_dials_to(DIAL_IP),
+        )
+    };
+    assert_eq!(reserved(&state), (0, 0));
+
+    // Peer disconnect: the attempt's peer registers on its own dial, then
+    // leaves before the registration turns healthy.
+    let attempt = state.record_attempt(node_id(21), vec![DIAL_IP]).unwrap();
+    let (registered_tx, registered_rx) = watch::channel(vec![peer_id(21)]);
+    let (_admitted_tx, admitted_addr_rx) = oneshot::channel();
+    let (registration_tx, registration_rx) = oneshot::channel();
+    registration_tx.send(DialRegistration::Registered).unwrap();
+    let dial = AbortOnDropHandle::new(zakura_rt::task::spawn(std::future::pending()));
+    io.workers.push(DiscoveryDialWorker::spawn(
+        attempt,
+        DialWatch {
+            attempt,
+            peer_id: peer_id(21),
+            registered: registered_rx,
+            dial,
+            admitted_addr_rx,
+            admitted_addr: None,
+            registration_rx,
+            own_registration: None,
+            registration: PeerRegistration::Absent,
+            trace: ZakuraTrace::default(),
+        }
+        .run(),
+    ));
+    assert_eq!(reserved(&state), (1, 1));
+    // The worker must see the registration before it ends.
+    zakura_rt::time::sleep(Duration::from_millis(50)).await;
+    registered_tx.send_replace(Vec::new());
+    let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), io.workers.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
+    io.settle(&mut state, completed, outcome).await;
+    assert_eq!(reserved(&state), (0, 0), "a disconnected peer's attempt");
+
+    // Worker panic: the join owner settles the attempt as a failure.
+    let attempt = state.record_attempt(node_id(22), vec![DIAL_IP]).unwrap();
+    io.workers.push(DiscoveryDialWorker::spawn(attempt, async {
+        panic!("test dial worker panic")
+    }));
+    assert_eq!(reserved(&state), (1, 1));
+    let (completed, outcome) = zakura_rt::time::timeout(Duration::from_secs(5), io.workers.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.phase, DialPhase::WorkerPanicked);
+    io.settle(&mut state, completed, outcome).await;
+    assert_eq!(reserved(&state), (0, 0), "a panicked worker's attempt");
+
+    // Local cancellation: dialer shutdown aborts and joins the worker.
+    let attempt = state.record_attempt(node_id(23), vec![DIAL_IP]).unwrap();
+    io.workers
+        .push(DiscoveryDialWorker::spawn(attempt, std::future::pending()));
+    assert_eq!(reserved(&state), (1, 1));
+    zakura_rt::time::timeout(Duration::from_secs(5), io.shutdown(&mut state))
+        .await
+        .unwrap();
+    assert_eq!(reserved(&state), (0, 0), "a cancelled worker's attempt");
+
+    drop(io);
+    node.shutdown().await;
 }

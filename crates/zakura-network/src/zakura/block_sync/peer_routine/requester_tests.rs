@@ -191,6 +191,40 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
     );
 }
 
+/// A written request that times out leaves the window, but the requester
+/// still accepts its body, and that body counts as progress. So the liveness
+/// deadline keeps the body's transfer time until the range ends.
+#[tokio::test]
+async fn a_timed_out_request_keeps_its_bodys_liveness_allowance() {
+    let (mut routine, mut outbound, _pool, _connection, _) =
+        requester_routine(block::Hash([1; 32]));
+    routine.try_fill();
+    next_sent(&mut outbound).await;
+    let with_request = routine.state.window.block_liveness_deadline().unwrap();
+    let deadline = routine.state.window.outstanding.first().unwrap().deadline;
+    assert!(deadline < with_request);
+    assert!(routine.expire_due_timeouts(deadline));
+    assert!(routine.state.window.outstanding.is_empty());
+    let request_timeout = routine.config.request_timeout;
+    let allowance = |routine: &mut PeerRoutine, now| {
+        routine.state.check_block_liveness(
+            now,
+            routine.io.requester.owed_body_bytes(),
+            false,
+            request_timeout,
+        )
+    };
+    assert_eq!(
+        allowance(&mut routine, with_request - Duration::from_millis(1)),
+        LivenessDecision::Continue,
+        "the authorized body keeps its transfer time"
+    );
+    assert_eq!(
+        allowance(&mut routine, with_request),
+        LivenessDecision::Stall
+    );
+}
+
 #[tokio::test]
 async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
     let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
@@ -236,7 +270,11 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         .unwrap_err();
     assert!(matches!(error, SinkReject::Local(_)));
     assert!(error.to_string().contains("next expected header"));
-    assert!(connection.is_cancelled());
+    assert!(routine.io.session.cancel_token().is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "an unexpected header resets only the session"
+    );
     assert_eq!(
         pool.held(),
         1,
@@ -269,6 +307,57 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
     ));
 }
 
+/// zakura-core/zakura#2303: the chain forks below a written request, so the
+/// routine abandons it, and the peer honestly answers it from its new best
+/// chain. The answer is neutral: the body never reaches the sequencer, the
+/// peer is charged nothing, only the session resets, and the height returns
+/// to scheduling under the new branch.
+#[tokio::test]
+async fn a_fork_answer_to_an_abandoned_request_resets_only_the_session() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, pool, connection, mut events) =
+        requester_routine(block::Hash([1; 32]));
+    let (bodies, mut received) = mpsc::channel(1);
+    routine.io.sequencer_input = bodies;
+    routine.try_fill();
+    next_sent(&mut outbound).await;
+    routine.io.work.reset_above(block::Height(0));
+    routine.gc_obsolete_outstanding();
+    assert!(routine.state.window.outstanding.is_empty());
+    routine.io.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(1),
+            block.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    while events.try_recv().is_ok() {}
+
+    let error = try_deliver(&mut routine, BlockSyncMessage::Block(block.clone()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, SinkReject::Local(_)));
+    assert!(
+        received.try_recv().is_err(),
+        "the mismatched body never reaches verification"
+    );
+    assert!(routine.io.session.cancel_token().is_cancelled());
+    assert!(!connection.is_cancelled(), "the connection stays");
+    assert!(!std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. })));
+    let work = routine.io.work.clone();
+    drop(routine);
+    assert_eq!(pool.held(), 0);
+    assert_eq!(
+        work.item_for_height(block::Height(1)).map(|item| item.hash),
+        Some(block.hash()),
+        "the new branch's height waits for scheduling"
+    );
+    assert!(work.pending_contains(block::Height(1)));
+}
+
 #[tokio::test]
 async fn invalid_ending_keeps_the_written_exchange_fenced() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
@@ -280,11 +369,13 @@ async fn invalid_ending_keeps_the_written_exchange_fenced() {
     };
     assert!(try_deliver(&mut routine, ending).await.is_err());
     assert_eq!(pool.held(), 1);
+    let session = routine.io.session.cancel_token();
     drop(routine);
     assert!(
-        connection.is_cancelled(),
-        "dropping an unanswered written exchange closes its connection"
+        session.is_cancelled(),
+        "dropping an unanswered written exchange resets its session"
     );
+    assert!(!connection.is_cancelled());
 }
 
 #[tokio::test]
@@ -447,7 +538,7 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
         let error = try_deliver(&mut routine, BlockSyncMessage::Block(Arc::new(junk)))
             .await
             .unwrap_err();
-        assert!(matches!(error, SinkReject::Protocol(_)), "{error}");
+        assert!(matches!(error, SinkReject::Protocol(..)), "{error}");
         assert!(
             bodies.try_recv().is_err(),
             "junk never reaches the sequencer"
@@ -522,7 +613,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         .state
         .window
         .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
-    assert!(routine.state.window.block_liveness_deadline.is_none());
+    assert!(routine.state.window.block_liveness_deadline().is_none());
     routine.state.retry_avoid.clear();
     let deadline = routine
         .io
@@ -539,11 +630,14 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         routine.handle_deadlines(deadline),
         Err(SinkReject::Local(_))
     ));
-    assert!(connection.is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "a first stall parks the session and keeps the connection"
+    );
     assert_eq!(
         pool.held(),
         1,
-        "closing does not release live authorization early"
+        "ending the session does not release live authorization early"
     );
     drop(routine);
     assert_eq!(pool.held(), 0);
@@ -582,7 +676,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         pool.try_entry().is_none(),
         "all peers retain an unended exchange"
     );
-    for (routine, outbound, connection) in peers {
+    for (mut routine, outbound, connection) in peers {
         let grace = routine.config.effective_liveness_timeout();
         let deadline = routine
             .io
@@ -596,7 +690,10 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
             routine.check_request_liveness(deadline),
             Err(SinkReject::Local(_))
         ));
-        assert!(connection.is_cancelled());
+        assert!(
+            !connection.is_cancelled(),
+            "a first stall parks the session and keeps the connection"
+        );
         drop(routine);
         drop(outbound);
     }
@@ -714,7 +811,10 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
         futures::poll!(&mut running),
         std::task::Poll::Ready(Err(SinkReject::Local(_)))
     ));
-    assert!(connection.is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "a first stall ends the session and keeps the connection"
+    );
     assert_eq!(pool.held(), 0);
 }
 
@@ -905,7 +1005,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
             .outstanding
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
-    routine.state.window.block_liveness_deadline = None;
+    routine.state.window.liveness_base_deadline = None;
     time::advance(retirement.saturating_duration_since(time::Instant::now())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
@@ -926,7 +1026,10 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
         futures::poll!(&mut running),
         std::task::Poll::Ready(Err(SinkReject::Local(_)))
     ));
-    assert!(connection.is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "a first stall ends the session and keeps the connection"
+    );
 }
 
 /// A body is refused before it claims anything when no live range expects it,
@@ -941,7 +1044,7 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
     routine.io.sequencer_input = bodies;
     assert!(matches!(
         try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
-        Err(SinkReject::Protocol(_))
+        Err(SinkReject::Protocol(..))
     ));
     assert!(received.try_recv().is_err());
     assert_eq!(pool.held(), 0);
@@ -960,7 +1063,7 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
         assert_eq!(result.is_ok(), accepted, "{limit}-byte limit: {result:?}");
         assert_eq!(received.try_recv().is_ok(), accepted);
         if !accepted {
-            assert!(matches!(result, Err(SinkReject::Protocol(_))));
+            assert!(matches!(result, Err(SinkReject::Protocol(..))));
             assert_eq!(
                 routine.io.requester.unreceived_expected(16),
                 [(block::Height(1), block.hash())],
@@ -993,13 +1096,17 @@ async fn a_local_failure_after_a_claim_keeps_the_reservation_consumed() {
     assert_eq!(pool.held(), 1, "the ending still owns the reservation");
     assert!(!connection.is_cancelled());
     // The claim advanced past this header, so a resend matches no next header.
-    // That closes the connection without a peer fault.
+    // That resets the session without a peer fault.
     let resent = try_deliver(&mut routine, BlockSyncMessage::Block(block))
         .await
         .unwrap_err();
     assert!(matches!(resent, SinkReject::Local(_)));
     assert!(resent.to_string().contains("next expected header"));
-    assert!(connection.is_cancelled());
+    assert!(routine.io.session.cancel_token().is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "an unexpected header resets only the session"
+    );
     assert_eq!(pool.held(), 1);
     let work = routine.io.work.clone();
     drop(routine);
@@ -1021,7 +1128,7 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     let error = try_deliver(&mut routine, BlockSyncMessage::Block(block))
         .await
         .unwrap_err();
-    assert!(matches!(error, SinkReject::Protocol(_)), "{error:?}");
+    assert!(matches!(error, SinkReject::Protocol(..)), "{error:?}");
     assert!(error.to_string().contains("coinbase height"));
     assert!(received.try_recv().is_err());
 }
@@ -1211,7 +1318,10 @@ async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
         routine.check_request_liveness(deadline),
         Err(SinkReject::Local(_))
     ));
-    assert!(connection.is_cancelled());
+    assert!(
+        !connection.is_cancelled(),
+        "a first stall ends the session and keeps the connection"
+    );
     drop(routine);
     assert_eq!(pool.held(), 0, "retirement returns every reservation");
 }

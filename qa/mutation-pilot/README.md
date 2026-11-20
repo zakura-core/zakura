@@ -185,12 +185,13 @@ sanitizer, the empty corpus above, and each target's extra libFuzzer flags
 from `qa/suite.toml`. Confirmation gets 300 seconds per child. To extend the
 list, add a `[[case]]`.
 
-The cases run on `header_sync_storage`, `header_sync_wire`, `sync_storage`,
-`sync_wire` and `discovery_wire`. Each passes the protocol-state collector,
-and each harness logs the observations the collector reads. The joint-run
-droplet's `cargo xtask planted --targets` confirms each case's seed through
-its target. `discovery_wire` has one seed case. `block_sync_storage` has
-none in the list: a generated run takes about 96 seconds, so a 600-second
+The cases run on `header_sync_storage`, `header_sync_wire`, `sync_storage`
+and `sync_wire`. Each passes the protocol-state collector, and each harness
+logs the observations the collector reads. The joint-run droplet's
+`cargo xtask planted --targets` confirms each case's seed through its target.
+`discovery_wire` has none in the list: #2604 removed its one seed case, and
+#2639 re-evaluates it. `block_sync_storage` has none in the list: a generated
+run takes about 96 seconds, so a 600-second
 campaign runs a handful of inputs.
 
 `cargo xtask planted pilot feedback` builds the runner tree's simulator to
@@ -260,14 +261,14 @@ whatever its class. A campaign's unique
 abstract states are the distinct protocol-state features its runs hit, in
 either arm. The report sets no discovery threshold.
 
-A full run takes 300 campaigns: per seed and arm, one original campaign for
-each of five targets and one mutant campaign for each of ten cases. At
-600 seconds each, that's 50 hours of campaign time, less the time that
+A full run takes 260 campaigns: per seed and arm, one original campaign for
+each of four targets and one mutant campaign for each of nine cases. At
+600 seconds each, that's about 43 hours of campaign time, less the time that
 mutant campaigns stop early at a finding. Run it only on a remote campaign
 host. One invocation per target, with `--only` naming each of the target's
 cases, keeps every case's seeds and arms in one report, and runs each
 original campaign once. Each invocation needs its own `--out` and `--work`.
-Five invocations run in parallel, one core per campaign. The longest, a
+Four invocations run in parallel, one core per campaign. The longest, a
 target with three cases, runs 80 campaigns, about 13 hours.
 
 ### Re-deriving a report

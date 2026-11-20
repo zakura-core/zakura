@@ -6,6 +6,8 @@
 //! [`HeaderSyncReactor::schedule_cached_statuses`] afterwards, as the reactor
 //! loop does after every event.
 
+use std::time::Duration;
+
 use super::{
     aux_fallback::{answer_locator, connect, end, fallback_reactor, next_update, pruned_status},
     *,
@@ -50,6 +52,29 @@ fn an_unanswered_close_drops_the_session_at_the_request_timeout() {
             !answered
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_close_starts_its_timeout_after_the_full_write() {
+    let (mut reactor, mut actions, snapshot) = fallback_reactor();
+    let (peer, mut outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x53; 32]);
+    reactor.handle_status(peer.clone(), 0, pruned_status(&snapshot, target));
+    answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    reactor.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
+    let session = reactor.sessions[&peer].session.clone();
+    let timeout = reactor.startup.request_timeout;
+
+    tokio::time::advance(timeout).await;
+    reactor.retire_unanswered_closes(Instant::now());
+    assert!(!session.cancel_token().is_cancelled());
+    assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
+    tokio::time::advance(timeout - Duration::from_millis(1)).await;
+    reactor.retire_unanswered_closes(Instant::now());
+    assert!(!session.cancel_token().is_cancelled());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    reactor.retire_unanswered_closes(Instant::now());
+    assert!(session.cancel_token().is_cancelled());
 }
 
 /// A subscription that stopped at a committed prefix stays open for the next

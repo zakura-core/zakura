@@ -314,13 +314,12 @@ fn a_node_side_commit_is_adopted_after_its_publication() {
     }
 }
 
-/// Under 16 `Flood` steps, the node admits every flooding session. Once the
-/// wire queue fills, each turn's top-of-turn take leaves it non-empty, so
-/// it's ready when the `select!` competes with the watch, in at least 98% of
-/// turns, with at least 100 ready turns in a row. The lifecycle queue isn't
-/// loaded.
+/// Under 16 `Flood` steps, the node admits every flooding session. Each
+/// session's reader meters `Status` at 2 events plus one per 500 ms, so the
+/// flood can't keep the wire queue loaded: it isn't ready in 98% of 100
+/// turns after it fills. The lifecycle queue isn't loaded either.
 #[test]
-fn a_wire_flood_keeps_the_events_queue_loaded() {
+fn the_status_meter_keeps_a_wire_flood_from_loading_the_events_queue() {
     let wire = Loaded {
         fill: 32,
         share: 98,
@@ -335,7 +334,7 @@ fn a_wire_flood_keeps_the_events_queue_loaded() {
         let (_, view) = run(&flooded(ControlAction::Flood), input);
         let facts = facts(&view);
         let load = load(&facts, EventQueue::Wire);
-        assert!(wire.met_by(&load), "{load:?}");
+        assert!(!wire.met_by(&load), "{load:?}");
         let other = self::load(&facts, EventQueue::Lifecycle);
         assert!(!lifecycle.met_by(&other), "{other:?}");
         let cooldowns = view.faults.cooldowns().facts();

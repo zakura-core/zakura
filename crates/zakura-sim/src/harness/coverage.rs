@@ -55,7 +55,8 @@ pub enum Bypass {
     /// bound to this property in `cases.json`. The droplet mutation campaign runs it.
     Native(&'static str),
     /// No bug can violate the property yet: its check is missing what the
-    /// reason names. Only a `Draft` property names one.
+    /// reason names. Only a `Draft` property names one, unless the reason
+    /// cites the issue that tracks the property's removed planted case.
     Pending(&'static str),
 }
 
@@ -206,6 +207,10 @@ const fn header_unreachable(
         bypass: HEADER_BYPASS,
     }
 }
+
+/// The bypass of a property whose planted case #2604 removed, because its
+/// patch no longer applied or its input no longer reached the bug.
+const REMOVED_BY_2604: &str = "#2604 removed its planted case; #2639 re-evaluates it";
 
 /// The scripted bypass that violates every header-sync generated ID.
 const HEADER_BYPASS: Bypass = Bypass::Test(sim_test(
@@ -628,7 +633,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/handshake.rs",
             "fast_fail_handshakes_exhaust_the_address_cadence",
         ),
-        bypass: Bypass::Planted("bypass-cadence-admission"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: "handshake/cadence-never-refuses-conformant",
@@ -636,7 +641,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/handshake.rs",
             "sixteen_conformant_dialers_share_an_address_cadence",
         ),
-        bypass: Bypass::Planted("refuse-funded-attempt"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: "session/renegotiation-covers-inflight-handshakes",
@@ -652,7 +657,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/handshake.rs",
             "slow_control_steps_share_one_deadline",
         ),
-        bypass: Bypass::Planted("no-overall-deadline"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
@@ -735,7 +740,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/replay_exact.rs",
             "discovery_book_records_and_replays_signed_samples",
         ),
-        bypass: Bypass::Planted("skip-book-eviction"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: "discovery/session-installation",
@@ -764,7 +769,7 @@ pub static COVERAGE: &[Coverage] = &[
             DISCOVERY_WITNESSES,
             "late_response_admitted_applies_in_its_saved_plan",
         ),
-        bypass: Bypass::Planted("revoke-on-timeout"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: super::header_sync::OPERATION_IDS,
@@ -861,18 +866,10 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("score-corrupted"),
     },
     Coverage {
-        property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
-        passing: passes(
-            "tests/header_flood_watch.rs",
-            "the_flood_seeds_hold_their_watch_rules",
-        ),
-        bypass: Bypass::Planted("watch-check-revert"),
-    },
-    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",
-            "the_flood_seeds_hold_their_watch_rules",
+            "the_flood_seed_holds_its_watch_rule",
         ),
         bypass: Bypass::Planted("watch-check-revert"),
     },
@@ -882,7 +879,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/header_release_wake.rs",
             "the_release_wake_input_holds_capacity_release_wakes",
         ),
-        bypass: Bypass::Planted("missed-release-wake"),
+        bypass: Bypass::Planted("refill-adds-nothing"),
     },
     Coverage {
         property: super::super::domain::header_sync::HOLD_RELEASE_WAKES,
@@ -1034,10 +1031,9 @@ pub static COVERAGE: &[Coverage] = &[
         EVERY,
         "pacing-floors-cut",
     ),
-    header_caught(
+    header(
         "header-sync/s5v9/subscribe-headers/sender-within-live",
         EVERY,
-        "open-repeated",
     ),
     header_caught(
         "header-sync/s5v9/subscribe-headers/sender-within-credit",
@@ -1079,11 +1075,7 @@ pub static COVERAGE: &[Coverage] = &[
         STATUS,
         "work-anchor-unchecked",
     ),
-    header_caught(
-        "header-sync/s5v9/status/cadence-never-closes",
-        STATUS,
-        "exhausted-cadence-throttled",
-    ),
+    header("header-sync/s5v9/status/cadence-never-closes", STATUS),
     header_caught(
         "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
         SUBSCRIBE,
@@ -1140,11 +1132,7 @@ pub static COVERAGE: &[Coverage] = &[
         HEADERS,
         "unsolicited-skipped",
     ),
-    header_caught(
-        "header-sync/s5v9/headers/bad-content-closes",
-        HEADERS,
-        "unlinked-page-dropped",
-    ),
+    header("header-sync/s5v9/headers/bad-content-closes", HEADERS),
     header_caught(
         "header-sync/s5v9/headers-outcome/reserved-flags-closes",
         OUTCOME,
@@ -1213,7 +1201,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/hello/cadence-never-closes",
         HELLO_ACTS,
-        Bypass::Planted("close-on-empty-hello-bucket"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-peers/reserved-flags-closes",
@@ -1233,17 +1221,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/over-margin-closes",
         GET_PEERS_ACTS,
-        Bypass::Planted("admit-past-margin"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-peers/bad-content-closes",
         GET_PEERS_ACTS,
-        Bypass::Planted("drop-refused-get-peers"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-peers/cadence-never-closes",
         GET_PEERS_ACTS,
-        Bypass::Planted("close-on-empty-get-peers-bucket"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/peers/reserved-flags-closes",
@@ -1293,17 +1281,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/over-margin-closes",
         GET_SERVICES_ACTS,
-        Bypass::Planted("admit-past-margin"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-services/bad-content-closes",
         GET_SERVICES_ACTS,
-        Bypass::Planted("drop-refused-get-services"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-services/cadence-never-closes",
         GET_SERVICES_ACTS,
-        Bypass::Planted("close-on-empty-get-services-bucket"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/services/reserved-flags-closes",
@@ -1328,7 +1316,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/services/bad-content-closes",
         SERVICES_ACTS,
-        Bypass::Planted("skip-services-node-id"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/hello/sender-cadence",
@@ -1348,7 +1336,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/sender-ends-once",
         GET_PEERS_ACTS,
-        Bypass::Planted("answer-peers-twice"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/get-services/sender-within-limit",
@@ -1363,7 +1351,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/services/sender-ends-once",
         GET_SERVICES_ACTS,
-        Bypass::Planted("answer-services-twice"),
+        Bypass::Pending(REMOVED_BY_2604),
     ),
     discovery(
         "discovery/s4v2/peers/sender-within-owed",
@@ -1408,7 +1396,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/header_recovery_progress.rs",
             "the_committed_fixtures_match_their_names",
         ),
-        bypass: Bypass::Planted("stalled-successor"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     Coverage {
         property: crate::domain::header_sync_progress::HONEST_PROGRESS,
@@ -1416,7 +1404,7 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/header_wire_progress.rs",
             "the_progress_fixture_holds_honest_progress",
         ),
-        bypass: Bypass::Planted("skipped-apply"),
+        bypass: Bypass::Pending(REMOVED_BY_2604),
     },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its seed unpatched as a

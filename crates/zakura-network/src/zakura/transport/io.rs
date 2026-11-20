@@ -24,6 +24,7 @@ use std::sync::{Arc, OnceLock};
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OrderedStreamFailure {
     RemoteClose,
+    ReadTimeout,
     WriteTimeout,
 }
 
@@ -131,6 +132,11 @@ impl FramedRecv {
     /// Failure of any member, retained through session cancellation for service policy.
     pub(crate) fn failure(&self) -> Option<OrderedStreamFailure> {
         self.failure_cause.as_ref().and_then(|cause| cause.get())
+    }
+
+    /// Share the failure record with a service's teardown hook.
+    pub(crate) fn failure_cause(&self) -> Option<OrderedStreamFailureCause> {
+        self.failure_cause.clone()
     }
 
     /// Stop new ingress while preserving frames already in the bounded queue.

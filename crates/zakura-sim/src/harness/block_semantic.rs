@@ -63,13 +63,16 @@ fn every(kind: BlockKind) -> Select {
     }
 }
 
-/// Relinks `peer` once its connection closes, as a reset closes it.
+/// Relinks `peer` once its session ends, as a reset ends it. A fork's
+/// answer resets only the block-sync session, and production's transport
+/// then reopens it. The in-memory link can't reopen a session, so the
+/// harness links the peer again.
 fn relink(peer: &str) -> ControlStep {
     ControlStep {
         action: ControlAction::Relink {
             peer: peer.to_owned(),
         },
-        when: Some(Trigger::Closed(peer.to_owned())),
+        when: Some(Trigger::SessionEnded(peer.to_owned())),
     }
 }
 

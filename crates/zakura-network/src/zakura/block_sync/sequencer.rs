@@ -16,6 +16,8 @@
 //! Keeping the Sequencer free of download-side state is what lets it run on its
 //! own serial task ([`super::sequencer_task`]), off the reactor's thread.
 
+use super::events::BlockSupplier;
+
 use super::{admission::DESERIALIZED_MEM_FACTOR, events::BlockApplyToken, reorder::*, state::*, *};
 
 /// A received body draining contiguously toward the verified tip, awaiting (or
@@ -44,7 +46,7 @@ pub(super) struct ApplyingBlock {
     pub(super) submitted: bool,
     /// The peer that delivered this body, used to attribute an apply rejection
     /// for misbehavior scoring.
-    pub(super) source_peer: ZakuraPeerId,
+    pub(super) supplier: BlockSupplier,
 }
 
 /// Outcome of offering a received body to the commit pipeline.
@@ -618,7 +620,7 @@ impl Sequencer {
         mut body: BodyFacts,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
-        source_peer: ZakuraPeerId,
+        supplier: BlockSupplier,
     ) -> AcceptOutcome {
         if self.already_retains(height, hash) {
             return AcceptOutcome::Redundant {
@@ -645,7 +647,7 @@ impl Sequencer {
             body,
             bytes,
             admitted_estimate_bytes,
-            source_peer,
+            supplier,
         ) {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
             ReorderInsertResult::Duplicate => AcceptOutcome::Redundant {
@@ -707,7 +709,7 @@ impl Sequencer {
                     bytes: drained.bytes,
                     admitted_estimate_bytes: drained.admitted_estimate_bytes,
                     submitted: false,
-                    source_peer: drained.source_peer,
+                    supplier: drained.supplier,
                 },
             );
             // New bodies enter `applying` unsubmitted, so only the total grows.

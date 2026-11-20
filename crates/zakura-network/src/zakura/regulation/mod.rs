@@ -10,8 +10,10 @@
 //! - [`SessionCapacity`] bounds a service's sessions from reservation through
 //!   the last owner.
 //! - [`SessionTable`] holds each peer's current session, and its
-//!   [`WriterFence`] closes the connection rather than orphan a started
+//!   [`WriterFence`] resets the session rather than orphan a started
 //!   exchange.
+//! - [`StallClose`] closes a connection after a repeated stall, under the
+//!   shared stall rule in `stall`.
 //! - [`Subscriptions`] and [`PublicationLedger`] hold the two sides of a
 //!   subscription: renewable credit, ordered updates, the cursor history,
 //!   and tombstones for crossed updates.
@@ -38,7 +40,7 @@
 //! | [`CadenceSender`] | One unwritten frame per row | Runtime owner. Its hold decision is a pure function of its inputs. |
 //! | [`SessionCapacity`] | Direction and setup slots, through the last owner | Runtime owner. `service_session::state` never holds its reservation. |
 //! | [`SessionTable`] | Each peer's current session | Value-only map, held under its reactor's lock. |
-//! | [`WriterFence`] | Started exchanges | Runtime owner. It closes the connection rather than orphan one. |
+//! | [`WriterFence`] | Started exchanges | Runtime owner. It resets the session rather than orphan one. |
 //! | [`Subscriptions`] | Renewable credit and ordered updates | Value state, except each table's tap. |
 //! | [`Publications`] | Live and closing slots, cursor history, tombstones | Mixed. Header subscriber work moves its permits out in delivery slot 2. |
 //! | [`TerminalPermit`] | The reserved terminal queue access of one subscription | Runtime owner, held through the terminal's write. |
@@ -51,8 +53,8 @@
 
 mod cadence;
 pub(crate) use cadence::{
-    Bucket, ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender,
-    MeteredReady, MeteredSender, RowSend,
+    parks_on_exhaustion, Bucket, ByteBucket, CadenceBuckets, CadenceCharge, CadenceSendError,
+    CadenceSender, MeteredReady, MeteredSender, RowSend, SharedBucket,
 };
 
 mod serve;
@@ -94,15 +96,16 @@ pub(crate) use subscription::{
     TerminalPermit, Totals, Update,
 };
 
+mod stall;
+pub(crate) use stall::{StallClose, STALL_POLICY};
+
 mod slots;
 pub(crate) use slots::{
     OutputByteBudget, OutputGrant, SlotBudget, SlotPermit, WeakOutputByteBudget,
 };
 
 mod writer_fence;
-pub(crate) use writer_fence::{
-    Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
-};
+pub(crate) use writer_fence::{Exchange, ExchangeWriter, FencedSendError, WriterFence};
 
 #[cfg(any(test, zakura_sim, feature = "p2p-fuzz"))]
 pub(crate) mod test_family;

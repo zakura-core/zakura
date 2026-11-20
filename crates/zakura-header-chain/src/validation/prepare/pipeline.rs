@@ -1,7 +1,12 @@
-use chrono::{Duration, Timelike};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use chrono::{DateTime, Duration, Timelike, Utc};
 #[cfg(not(zakura_sim))]
 use rayon::prelude::*;
-use zakura_chain::parameters::Network;
+use zakura_chain::{block, parameters::Network, work::equihash};
 
 use super::super::{
     infer_height, validate_commitment_structure, validate_compact_target,
@@ -110,6 +115,23 @@ pub fn prepare_headers(
     rules: &HeaderRules,
     clock: &dyn Clock,
 ) -> Result<PreparedHeaderBatch, HeaderFailure> {
+    prepare_headers_checking_solutions(input, parent_frontier, rules, clock, &|header| {
+        rules.pow_policy.validate_solution(header)
+    })
+}
+
+/// Checks one header's Equihash solution.
+pub(super) type SolutionCheck<'a> =
+    &'a (dyn Fn(&block::Header) -> Result<(), equihash::Error> + Sync);
+
+/// [`prepare_headers`], with `solution_check` as the Equihash check.
+pub(super) fn prepare_headers_checking_solutions(
+    input: HeaderBatchInput<'_>,
+    parent_frontier: crate::Frontier,
+    rules: &HeaderRules,
+    clock: &dyn Clock,
+    solution_check: SolutionCheck<'_>,
+) -> Result<PreparedHeaderBatch, HeaderFailure> {
     // Batch nonempty and within the per-transition header limit.
     if input.headers.is_empty() {
         return Err(HeaderFailure::Empty);
@@ -150,66 +172,49 @@ pub fn prepare_headers(
         })
         .collect::<Result<_, HeaderFailure>>()?;
 
-    let context_free: Vec<_> = input
-        .headers
-        .each()
-        .zip(&hashes)
-        .zip(&heights)
-        .enumerate()
-        .map(|(offset, ((header, hash), height))| {
-            // Height-dependent commitment interpretation.
-            validate_commitment_structure(header, &rules.network, *height)
-                .map_err(|error| invalid(offset, HeaderRule::CommitmentStructure, error))?;
-
-            // Compact target canonical encoding and network limit.
-            let target = validate_compact_target(header, &rules.network)
-                .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
-
-            // Hash-to-target filter, unless authenticated custom policy waives PoW.
-            if !rules.pow_policy.is_authenticated_custom_waiver() {
-                validate_hash_filter(*hash, target)
-                    .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
-            }
-
-            // Equihash solution under the authenticated proof-of-work policy.
-            rules
-                .pow_policy
-                .validate_solution(header)
-                .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
-
-            // Accept current timestamps; assign an exact deadline to future ones.
-            let canonical_header_time = header
-                .time
-                .with_nanosecond(0)
-                .ok_or(HeaderFailure::ClockRange)?;
-            let validation = if canonical_header_time > future_limit {
-                HeaderValidationState::DeferredUntil(
-                    canonical_header_time
-                        .checked_sub_signed(Duration::hours(2))
-                        .ok_or(HeaderFailure::ClockRange)?,
-                )
-            } else {
-                HeaderValidationState::Valid
-            };
-
-            // Exact per-block work from the compact target.
-            let block_work = header
-                .difficulty_threshold
-                .to_work()
-                .ok_or_else(|| invalid(offset, HeaderRule::Work, "invalid compact target"))?;
-
-            Ok(PreparedHeader {
-                header: header.clone(),
-                hash: *hash,
-                height: *height,
-                block_work,
-                validation,
-            })
-        })
-        .collect();
+    // Context-free checks, one batch of headers at a time. Once a header
+    // fails, no header at a higher offset starts, and the batches after it
+    // never run. So Equihash runs on at most one batch of headers at or after
+    // the first failure. Every header below a failure still runs, so the
+    // verdict is the lowest failing offset, as in a run over every header.
+    let width = batch_width();
+    let first_failure = AtomicUsize::new(usize::MAX);
     let mut prepared = Vec::with_capacity(input.headers.len());
-    for prepared_header in context_free {
-        prepared.push(prepared_header?);
+    for (index, batch) in input.headers.chunks(width).enumerate() {
+        // The batch limit bounds the offsets, so neither sum overflows.
+        let start = index * width;
+        let end = start + batch.len();
+        let results: Vec<_> = batch
+            .each()
+            .zip(&hashes[start..end])
+            .zip(&heights[start..end])
+            .enumerate()
+            .map(|(index, ((header, hash), height))| {
+                let offset = start + index;
+                if offset > first_failure.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let result = prepare_header(
+                    offset,
+                    header,
+                    *hash,
+                    *height,
+                    rules,
+                    future_limit,
+                    solution_check,
+                );
+                if result.is_err() {
+                    first_failure.fetch_min(offset, Ordering::Relaxed);
+                }
+                Some(result)
+            })
+            .collect();
+        for result in results {
+            let Some(result) = result else {
+                unreachable!("a header skips only above a failure, which returns first");
+            };
+            prepared.push(result?);
+        }
     }
 
     // Seal the batch to the parent, network policy, and trust-anchor digest.
@@ -226,4 +231,80 @@ pub fn prepare_headers(
         evidence,
     )
     .map_err(|error| invalid(0, HeaderRule::ValidationLease, error))
+}
+
+/// Headers per rayon thread in one batch. Each batch ends in a join, and a
+/// thread the OS deschedules stalls it. On a loaded 24-thread host, a full
+/// valid Mainnet page took about twice as long at 1 header per thread, and
+/// within about 5% of a single batch at 16.
+#[cfg(not(zakura_sim))]
+const HEADERS_PER_THREAD: usize = 16;
+
+/// The headers whose context-free checks run at once: [`HEADERS_PER_THREAD`]
+/// per rayon thread, or one in the simulator build, which runs them in order.
+pub(super) fn batch_width() -> usize {
+    #[cfg(not(zakura_sim))]
+    return rayon::current_num_threads()
+        .max(1)
+        .saturating_mul(HEADERS_PER_THREAD);
+    #[cfg(zakura_sim)]
+    return 1;
+}
+
+/// Runs the context-free checks of the header at `offset`, cheapest first,
+/// and builds its prepared form.
+fn prepare_header(
+    offset: usize,
+    header: &Arc<block::Header>,
+    hash: block::Hash,
+    height: block::Height,
+    rules: &HeaderRules,
+    future_limit: DateTime<Utc>,
+    solution_check: SolutionCheck<'_>,
+) -> Result<PreparedHeader, HeaderFailure> {
+    // Height-dependent commitment interpretation.
+    validate_commitment_structure(header, &rules.network, height)
+        .map_err(|error| invalid(offset, HeaderRule::CommitmentStructure, error))?;
+
+    // Compact target canonical encoding and network limit.
+    let target = validate_compact_target(header, &rules.network)
+        .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
+
+    // Hash-to-target filter, unless authenticated custom policy waives PoW.
+    if !rules.pow_policy.is_authenticated_custom_waiver() {
+        validate_hash_filter(hash, target)
+            .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
+    }
+
+    // Equihash solution under the authenticated proof-of-work policy.
+    solution_check(header).map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
+
+    // Accept current timestamps; assign an exact deadline to future ones.
+    let canonical_header_time = header
+        .time
+        .with_nanosecond(0)
+        .ok_or(HeaderFailure::ClockRange)?;
+    let validation = if canonical_header_time > future_limit {
+        HeaderValidationState::DeferredUntil(
+            canonical_header_time
+                .checked_sub_signed(Duration::hours(2))
+                .ok_or(HeaderFailure::ClockRange)?,
+        )
+    } else {
+        HeaderValidationState::Valid
+    };
+
+    // Exact per-block work from the compact target.
+    let block_work = header
+        .difficulty_threshold
+        .to_work()
+        .ok_or_else(|| invalid(offset, HeaderRule::Work, "invalid compact target"))?;
+
+    Ok(PreparedHeader {
+        header: header.clone(),
+        hash,
+        height,
+        block_work,
+        validation,
+    })
 }

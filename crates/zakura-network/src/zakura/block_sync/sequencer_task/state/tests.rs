@@ -122,7 +122,10 @@ fn received(block: &Arc<block::Block>, height: u32, epoch: u64) -> ReceivedBody 
         },
         bytes: 100,
         admitted_estimate_bytes: None,
-        peer: peer(),
+        supplier: BlockSupplier {
+            peer: peer(),
+            conn_id: 7,
+        },
     }
 }
 
@@ -601,9 +604,13 @@ fn observed_evidence(action: &SequencerEvidence) -> Option<ExpectedEvidence> {
             Some(ExpectedEvidence::BodyUnavailable(failure.hash))
         }
         SequencerEvidence::Misbehavior {
+            supplier,
             reason: BlockSyncMisbehavior::BodyPayloadMismatch(mismatch),
-            ..
-        } => Some(ExpectedEvidence::TamperedBody(mismatch.requested)),
+        } => {
+            // The driver disconnects only the connection that supplied the body.
+            assert_eq!(supplier.conn_id, 7, "{EVIDENCE_PROPERTY}");
+            Some(ExpectedEvidence::TamperedBody(mismatch.requested))
+        }
         _ => None,
     }
 }
@@ -709,9 +716,9 @@ fn run_required_evidence(
                         matches!(
                             action,
                             SequencerEvidence::Misbehavior {
+                                supplier,
                                 reason: BlockSyncMisbehavior::ConsensusBodyInvalid(invalid),
-                                ..
-                            } if invalid.hash == accepted.hash
+                            } if invalid.hash == accepted.hash && supplier.conn_id == 7
                         ),
                         "{EVIDENCE_PROPERTY}: unexpected replaceable action {:?}",
                         action

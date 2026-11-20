@@ -591,12 +591,12 @@ fn a_simulator_target_neither_excluded_nor_mapped_fails() {
 fn an_ignored_test_the_suite_doesnt_list_fails() {
     let mut suite = committed();
     remove(&mut suite.ignored, |row| {
-        row.file == "crates/zakura-sim/tests/header_wire_lifecycle.rs"
-            && row.test == "regenerate_saved_plans"
+        row.file == "crates/zakura-sim/tests/header_wire_witness.rs"
+            && row.test == "regenerate_planted_scenarios"
     });
     assert_problem(
         &problems(&suite),
-        "crates/zakura-sim/tests/header_wire_lifecycle.rs::regenerate_saved_plans is ignored",
+        "crates/zakura-sim/tests/header_wire_witness.rs::regenerate_planted_scenarios is ignored",
     );
 }
 

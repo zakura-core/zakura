@@ -50,12 +50,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{pct::Pct, Bucket, Classified, ExploreOutcome, ExploreRun, Worker};
+use super::{feedback::Feedback, pct::Pct, Bucket, Classified, ExploreOutcome, ExploreRun, Worker};
 use crate::{
     check::PropertyOutcome,
     harness::{HarnessEntry, ScenarioFamily, HARNESSES},
     record::EndRecord,
     trace::{end_records, meta::hex},
+    RunReport, Steer,
 };
 
 /// The file [`generate`] writes its report to, in its output directory.
@@ -605,6 +606,114 @@ pub fn generate(
         format!("{text}\n").as_bytes(),
     )?;
     Ok(report)
+}
+
+/// Makes a run's live picks from its drawn input, as [`Pct::for_input`]
+/// does.
+pub type MakeSteer = fn(&[u8]) -> Box<dyn Steer>;
+
+/// What [`reach`] searches.
+#[derive(Clone)]
+pub struct ReachSearch {
+    /// The seed of [`draws_with`].
+    pub seed: u64,
+    /// How many inputs to draw at most.
+    pub runs: u64,
+    /// The longest input to draw.
+    pub max_bytes: usize,
+    /// How each run's scenario family is drawn.
+    pub draw_policy: DrawPolicy,
+    /// Bytes put before each drawn input, for a test that builds its
+    /// scenario in code and searches only the Plan, which the drawn input
+    /// then is. Empty for none.
+    pub prefix: Vec<u8>,
+    /// What makes each run's live picks, built from the drawn input, or
+    /// `None` for the input's Plan bytes.
+    pub steer: Option<MakeSteer>,
+    /// A collector that runs beside each unsteered run, so an overlap can
+    /// read the features the run reached from its counters. `None` for
+    /// none.
+    pub feedback: Option<Feedback>,
+}
+
+impl ReachSearch {
+    /// `runs` of [`generate`]'s draws for `seed`, cycled, under a PCT
+    /// schedule ([`Schedule::Pct`]).
+    pub fn new(seed: u64, runs: u64) -> Self {
+        ReachSearch {
+            seed,
+            runs,
+            max_bytes: DEFAULT_MAX_BYTES,
+            draw_policy: DrawPolicy::Cycle,
+            prefix: Vec::new(),
+            steer: Some(Pct::for_input),
+            feedback: None,
+        }
+    }
+}
+
+/// The run [`reach`] found.
+#[derive(Clone, Debug)]
+pub struct Reached<T> {
+    /// The run's index in the draw order.
+    pub run: u64,
+    /// The input that replays the run with no steer.
+    pub input: Vec<u8>,
+    /// What the overlap returned for the run.
+    pub found: T,
+}
+
+/// Runs `search`'s draws on `entry`'s harness until `overlap` returns
+/// `Some` for a run's report. Returns that run, or `None` if none of
+/// `search.runs` runs showed the overlap.
+///
+/// A test that needs a state reached, rather than a violation found, uses
+/// this in place of a pinned input: the search finds its input again on
+/// every build, so a change in production's schedule can't silently move
+/// the run off the state.
+///
+/// # Panics
+///
+/// If `search` steers a harness that has no steered run, as a machine has
+/// none, or both steers and collects, which no worker run does.
+pub fn reach<T, F>(
+    entry: &'static HarnessEntry,
+    search: &ReachSearch,
+    overlap: F,
+) -> Option<Reached<T>>
+where
+    T: Send + 'static,
+    F: Fn(&RunReport) -> Option<T> + Clone + Send + 'static,
+{
+    assert!(
+        search.steer.is_none() || search.feedback.is_none(),
+        "a steered run runs no collector"
+    );
+    let _hold = end_records::hold();
+    let mut worker = Worker::new();
+    let drawn = draws_with(
+        search.seed,
+        search.max_bytes,
+        (entry.families)(),
+        search.draw_policy,
+    );
+    for (run, (_, mut input)) in (0..search.runs).zip(drawn) {
+        input.splice(0..0, search.prefix.iter().copied());
+        let overlap = overlap.clone();
+        let then = move |replay: &[u8], run: &ExploreRun, _: &Classified| {
+            run.report()
+                .and_then(overlap)
+                .map(|found| (replay.to_vec(), found))
+        };
+        let found = match search.steer {
+            Some(steer) => worker.explore_steered(entry, &input, steer, then),
+            None => worker.explore_with(entry, &input, search.feedback, then),
+        };
+        if let Some((input, found)) = found {
+            return Some(Reached { run, input, found });
+        }
+    }
+    None
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it to

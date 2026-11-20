@@ -12,14 +12,14 @@ mod support;
 use std::collections::BTreeMap;
 
 use support::inputs;
-use zakura_network::zakura::v9::RegtestMessage;
+use zakura_network::zakura::{v9::RegtestMessage, CloseOutcome};
 use zakura_sim::{
     harness::{
         header_node::{Chain, Policy},
         header_sync::{HeaderWire, WireScenario},
         run_prepared, HarnessError, LinkEntry, LinkSpec, NetScenario, Subsystem,
     },
-    model::{is_fault_cause, FrameModel, Label, ReaderEnd},
+    model::{FrameModel, Label, ReaderEnd},
     observe::{TransitionFact, TransportFact},
     peer::{
         adversary::{Act, AdversarySpec, ContentRule, CursorField, Row, CROSSING_LINK_MS},
@@ -378,7 +378,7 @@ fn judged_and_read(report: &RunReport, frame: &Sent) -> (Option<usize>, Option<u
 }
 
 /// The first close cause `report` decided on `connection`.
-fn close_cause(report: &RunReport, connection: u64) -> Option<String> {
+fn close_cause(report: &RunReport, connection: u64) -> Option<CloseOutcome> {
     report
         .log
         .entries()
@@ -387,7 +387,7 @@ fn close_cause(report: &RunReport, connection: u64) -> Option<String> {
             Observation::ConnectionClosed {
                 connection: c,
                 cause,
-            } if *c == connection => Some(cause.clone()),
+            } if *c == connection => Some(*cause),
             _ => None,
         })
 }
@@ -469,13 +469,23 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
     let cause = close_cause(&report, frame.connection);
     if frame.label == Label::Conformant {
         assert!(
-            cause.as_deref().is_none_or(|cause| !is_fault_cause(cause)),
+            cause.is_none_or(|cause| !cause.is_fault()),
             "{act:?}: a conformant peer was closed with {cause:?}"
         );
     } else {
         // Header sync's content consequence is a fault close too.
         let cause = cause.unwrap_or_else(|| panic!("{act:?}: no close"));
-        assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
+        assert!(
+            matches!(
+                cause,
+                CloseOutcome::Fault {
+                    kind: 5,
+                    version: 9,
+                    ..
+                }
+            ),
+            "{act:?}: closed with {cause}"
+        );
     }
     if act == Act::OutcomeCrossing {
         crossed(&report, &frame);
@@ -599,7 +609,7 @@ fn the_reader_rejects_before_the_payload() {
         let checked = check(act, true, Plan::from_fuzz(&[]));
         let cause = close_cause(&checked.report, checked.frame.connection)
             .unwrap_or_else(|| panic!("{act:?}: no close"));
-        assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
+        assert!(cause.is_fault(), "{act:?}: closed with {cause}");
     }
 }
 
@@ -700,7 +710,7 @@ fn second_open_is_tolerated_and_third_is_not() {
             "the close came only after the third Open was judged"
         );
         let cause = close_cause(&report, third.connection).expect("the third closed");
-        assert!(is_fault_cause(&cause), "{cause}");
+        assert!(cause.is_fault(), "{cause}");
         for id in [
             "header-sync/s5v9/conformant-never-closes",
             "header-sync/s5v9/subscribe-headers/over-live-closes",

@@ -38,7 +38,6 @@ header_sync_storage = ["-len_control=0"]
 header_sync_wire = ["-len_control=0"]
 sync_storage = ["-len_control=0"]
 sync_wire = ["-len_control=0"]
-discovery_wire = ["-len_control=0"]
 
 [confirmation]
 # The wire harnesses run to their step budget, so a confirmation child gets
@@ -114,15 +113,6 @@ case = "session/stalled-service-isolated/close-on-block-stall"
 property = "session/stalled-service-isolated"
 target = "sync_wire"
 fault_class = "liveness"
-
-# discovery_wire: its only planted case with a fuzz input. Its other cases
-# are typed scenarios.
-
-[[case]]
-case = "discovery/late-response-admitted/revoke-on-timeout"
-property = "discovery/late-response-admitted"
-target = "discovery_wire"
-fault_class = "stale-result"
 
 # block_sync_storage has twelve input cases but none here: a generated run
 # takes about 96 s and 7 GB (qa/suite.toml), so a 600-second campaign runs

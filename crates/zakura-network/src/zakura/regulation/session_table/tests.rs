@@ -4,28 +4,22 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::{
-    framed_channel,
-    regulation::{FencedSendError, UNFINISHED_EXCHANGE},
-    CloseCause, Frame, FramedRecv, FramedSend,
-};
+use crate::zakura::{framed_channel, regulation::FencedSendError, Frame, FramedRecv, FramedSend};
 
 fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).unwrap()
 }
 
-/// One connection: its token and close cause.
+/// One connection's token.
 #[derive(Clone)]
 struct Connection {
     cancel: CancellationToken,
-    cause: CloseCause,
 }
 
 impl Connection {
     fn new() -> Self {
         Self {
             cancel: CancellationToken::new(),
-            cause: CloseCause::new(),
         }
     }
 
@@ -36,14 +30,15 @@ impl Connection {
         session_id: u64,
     ) -> (Current<u64>, FramedSend, FramedRecv) {
         let (send, recv) = framed_channel(4);
+        let cancel = self.cancel.child_token();
         (
             Current {
                 key: SessionKey {
                     conn_id,
                     session_id,
                 },
-                cancel: self.cancel.child_token(),
-                fence: WriterFence::new(self.cancel.clone(), self.cause.clone()),
+                fence: WriterFence::new(cancel.clone()),
+                cancel,
                 session: session_id,
             },
             send,
@@ -228,13 +223,16 @@ async fn replacement_fences_the_old_publication_and_queued_first_write() {
     }
 }
 
+/// A replacement on the same connection resets an old session whose
+/// exchange started, even after the request's write finished. The connection
+/// stays, and the new session runs.
 #[tokio::test]
-async fn replacement_closes_a_started_exchange_even_after_its_write_finished() {
+async fn replacement_resets_a_started_exchange_even_after_its_write_finished() {
     let table = SessionTable::default();
     let peer = peer(72);
     let connection = Connection::new();
     let (old, old_send, mut old_output) = connection.session(1, 1);
-    let old_fence = old.fence.clone();
+    let (old_fence, old_cancel) = (old.fence.clone(), old.cancel.clone());
     table.replace(peer.clone(), old);
     let exchange = old_fence.open().unwrap();
     old_send
@@ -248,19 +246,12 @@ async fn replacement_closes_a_started_exchange_even_after_its_write_finished() {
     let new_cancel = new.cancel.clone();
     assert!(matches!(
         table.replace(peer.clone(), new),
-        Replacement::Refused
+        Replacement::Replaced(_)
     ));
-    assert!(connection.cancel.is_cancelled());
-    assert_eq!(connection.cause.get_or("unset"), UNFINISHED_EXCHANGE);
-    assert!(
-        new_cancel.is_cancelled(),
-        "the refused session is cancelled"
-    );
-    assert_eq!(
-        table.get(&peer).map(|(_, session)| session),
-        Some(1),
-        "the old session stays until its own teardown"
-    );
+    assert!(old_cancel.is_cancelled(), "the old session is reset");
+    assert!(!connection.cancel.is_cancelled());
+    assert!(!new_cancel.is_cancelled(), "the new session runs");
+    assert_eq!(table.get(&peer).map(|(_, session)| session), Some(2));
     drop(exchange);
 }
 
@@ -291,7 +282,7 @@ async fn an_ended_exchange_or_a_new_connection_allows_replacement() {
             table.replace(peer.clone(), new),
             Replacement::Replaced(_)
         ));
-        assert_eq!(old_connection.cancel.is_cancelled(), !ended);
+        assert!(!old_connection.cancel.is_cancelled());
         assert!(!next_connection.cancel.is_cancelled());
         assert!(new_fence.open().is_some());
     }
@@ -317,7 +308,7 @@ async fn removing_a_session_fences_its_writers_before_erasing_it() {
         assert!(removed.cancel.is_cancelled());
         assert!(table.get(&peer).is_none());
         assert!(fence.open().is_none());
-        assert_eq!(connection.cancel.is_cancelled(), started);
+        assert!(!connection.cancel.is_cancelled());
         if !started {
             drop(send);
             assert_eq!(output.recv().await, None, "the queued request is skipped");
@@ -351,17 +342,16 @@ fn op() -> impl Strategy<Value = Op> {
 /// What the model expects of one session.
 struct ModelSession {
     key: SessionKey,
-    conn: usize,
     fence: WriterFence,
+    cancel: CancellationToken,
     /// Started exchanges without an ending.
     started: Vec<crate::zakura::regulation::Exchange>,
 }
 
 proptest! {
     /// After every step: at most one session per peer, a stale key removes
-    /// nothing, every replaced or removed session's fence is retired, and a
-    /// replacement on the same connection is refused exactly when the old
-    /// session had a started exchange without an ending.
+    /// nothing, every replaced or removed session's fence is retired and its
+    /// session cancelled, and no connection closes.
     #[test]
     fn operation_sequences_keep_one_fenced_session_per_peer(
         ops in prop::collection::vec(op(), 1..64),
@@ -377,38 +367,22 @@ proptest! {
             match op {
                 Op::Replace { peer, conn } => {
                     let (peer, conn) = (usize::from(peer), usize::from(conn));
-                    if connections[conn].cancel.is_cancelled() {
-                        continue;
-                    }
                     // Connection ids are distinct per connection.
                     let conn_id = u64::try_from(conn).unwrap() + 1;
                     let (session, _, _) = connections[conn].session(conn_id, next_session);
                     next_session += 1;
-                    let (key, fence) = (session.key, session.fence.clone());
-                    let expect_refused = current[peer].as_ref().is_some_and(|old| {
-                        old.conn == conn && !old.started.is_empty()
-                    });
-                    let outcome = table.replace(peers[peer].clone(), session);
-                    prop_assert_eq!(matches!(outcome, Replacement::Refused), expect_refused);
-                    match outcome {
-                        Replacement::Refused => {
-                            prop_assert!(connections[conn].cancel.is_cancelled());
-                        }
+                    let (key, fence, cancel) =
+                        (session.key, session.fence.clone(), session.cancel.clone());
+                    match table.replace(peers[peer].clone(), session) {
                         Replacement::Inserted => prop_assert!(current[peer].is_none()),
-                        Replacement::Replaced(_) => {
+                        Replacement::Replaced(replaced) => {
                             let old = current[peer].take().expect("the table replaced a session");
-                            if !old.started.is_empty() {
-                                prop_assert!(connections[old.conn].cancel.is_cancelled());
-                            }
+                            prop_assert!(replaced.cancel.is_cancelled());
                             stale_keys[peer].push(old.key);
                             retired.push(old.fence);
                         }
                     }
-                    if expect_refused {
-                        retired.push(fence);
-                    } else {
-                        current[peer] = Some(ModelSession { key, conn, fence, started: Vec::new() });
-                    }
+                    current[peer] = Some(ModelSession { key, fence, cancel, started: Vec::new() });
                 }
                 Op::Remove { peer, stale } => {
                     let peer = usize::from(peer);
@@ -422,9 +396,7 @@ proptest! {
                     prop_assert_eq!(removed.is_some(), !stale);
                     if !stale {
                         let old = current[peer].take().expect("the key named the current session");
-                        if !old.started.is_empty() {
-                            prop_assert!(connections[old.conn].cancel.is_cancelled());
-                        }
+                        prop_assert!(old.cancel.is_cancelled());
                         stale_keys[peer].push(old.key);
                         retired.push(old.fence);
                     }
@@ -454,6 +426,9 @@ proptest! {
             }
             for fence in &retired {
                 prop_assert!(fence.open().is_none(), "a retired fence opens nothing");
+            }
+            for connection in &connections {
+                prop_assert!(!connection.cancel.is_cancelled(), "no session end closes a connection");
             }
         }
     }

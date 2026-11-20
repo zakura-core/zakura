@@ -19,7 +19,7 @@ use zakura_network::{
     },
     Config,
 };
-use zakura_quic::{Conn, NodeId, RecvStream, SendStream};
+use zakura_quic::{Conn, RecvStream, SendStream};
 
 /// The peer's side of a handshake: the network config it validates against
 /// and the limits it offers, both production's on Regtest.
@@ -162,11 +162,10 @@ async fn read_control(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
 }
 
 /// Runs the initiator's side on `conn`: sends a hello offering
-/// `capabilities` from `local_id`, then reads and validates the ack, nonce
-/// echo included. Returns the mask the ack accepted.
+/// `capabilities` under this endpoint's key list, then reads and validates
+/// the ack, nonce echo included. Returns the mask the ack accepted.
 pub(crate) async fn initiate(
     conn: &Conn,
-    local_id: NodeId,
     capabilities: u64,
     local: &Local,
     remote: Remote,
@@ -181,7 +180,7 @@ pub(crate) async fn initiate(
         role: ZakuraControlRole::Initiator,
         network_id: local.config.network_id,
         chain_id: local.config.chain_id,
-        node_keys: local_id.as_bytes().to_vec(),
+        node_keys: conn.local_keys().encode(),
         peer_nonce,
         initiator_upgrade_nonce: [0; 32],
         responder_upgrade_nonce: [0; 32],
@@ -243,7 +242,7 @@ pub(crate) async fn respond(
     hello
         .validate(&ZakuraControlValidation {
             local: &local.config,
-            authenticated_remote_key: conn.remote_key().as_bytes(),
+            authenticated_remote_key: conn.remote_key(),
             selected_zakura_protocol: protocol,
             handshake_path: ZakuraHandshakePath::Native,
             remote_role: ZakuraControlRole::Initiator,
@@ -261,6 +260,7 @@ pub(crate) async fn respond(
         magic: CONTROL_ACK_MAGIC,
         control_version: CONTROL_VERSION,
         selected_zakura_protocol: protocol,
+        node_keys: conn.local_keys().encode(),
         peer_nonce: nonce(),
         remote_peer_nonce: echoed,
         accepted_capabilities: accepted,

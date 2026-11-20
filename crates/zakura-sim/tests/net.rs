@@ -36,7 +36,7 @@ use zakura_sim::{
 use support::{advances, picks};
 
 /// The ALPN both endpoints speak.
-const ALPN: &[u8] = b"p2p-v2/3";
+const ALPN: &[u8] = b"p2p-v2/4";
 
 /// What the client sends and the server echoes.
 const PAYLOAD: &[u8] = b"m5 net payload!";

@@ -163,7 +163,9 @@ impl WireNode {
     ) {
         let script = spec.handshake.clone().unwrap_or_default();
         let remote = spec.address(index, 0);
-        let target = NodeAddr::with_addrs(
+        // The node dials the peer by its key, as it does for a configured
+        // key or a discovery record, so TLS refuses any other node.
+        let target = NodeAddr::for_key(
             SeededInputs::node_key(
                 self.endpoint.seed,
                 key_index(
@@ -173,7 +175,7 @@ impl WireNode {
                         .unwrap_or(index),
                 ),
             )
-            .public(),
+            .public_key(),
             [remote],
         );
         self.endpoint
@@ -344,8 +346,8 @@ impl WireEndpoint {
     /// peer's address.
     pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
         let remote = peer_addr(index, 0);
-        let target = NodeAddr::with_addrs(
-            SeededInputs::node_key(self.seed, key_index(index)).public(),
+        let target = NodeAddr::for_key(
+            SeededInputs::node_key(self.seed, key_index(index)).public_key(),
             [remote],
         );
         self.spawn_dial(sim, remote, target, listening, None);

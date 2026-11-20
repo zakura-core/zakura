@@ -7,6 +7,7 @@ use zakura_network::zakura::{
     StreamPrelude, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraHandshakePath,
     ZakuraNetworkId,
 };
+use zakura_quic::NodeSecretKey;
 
 /// One control field to corrupt. Each variant reaches a distinct production guard.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +99,11 @@ impl ControlFault {
             Self::Role => hello.role = ZakuraControlRole::Responder,
             Self::Network => hello.network_id = ZakuraNetworkId::Mainnet,
             Self::Chain => hello.chain_id[0] ^= 1,
-            Self::Identity => hello.node_keys[0] ^= 1,
+            // Another node's well-formed key list, so the fault is the
+            // identity and not the encoding.
+            Self::Identity => {
+                hello.node_keys = NodeSecretKey::from_bytes(&[0x3f; 32]).key_list().encode()
+            }
             Self::RequiredChannel => hello.required_channels = u64::MAX,
             Self::FrameLimit => hello.initial_limits.max_frame_bytes = 0,
             Self::MessageLimit => hello.initial_limits.max_message_bytes = 0,

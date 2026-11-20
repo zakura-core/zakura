@@ -1591,7 +1591,6 @@ impl PeerTask {
             };
             let Ok(negotiated) = handshake::initiate(
                 &conn,
-                quic.local_id(),
                 self.spec.capabilities,
                 local,
                 Remote {

@@ -35,7 +35,7 @@ use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Statu
 const MAX_STEPS: usize = 200_000;
 
 /// The ALPN both endpoints speak.
-const ALPN: &[u8] = b"p2p-v2/3";
+const ALPN: &[u8] = b"p2p-v2/4";
 
 /// What the client sends and the server echoes.
 const PAYLOAD: &[u8] = b"m3 replay payload!";

@@ -1055,7 +1055,9 @@ charge.
 - **Capacity**
   - requester: ids requested or awaiting a verdict per peer within a window that starts at 5,
     grows by one on each admitted body while full, up to what the peer's `Hello` serves, and
-    halves when requests miss their deadlines. Its requests also stay within 10,000,000 announced
+    halves when requests miss their deadlines. A `NotFound` for a fetch that still holds its
+    reservation, or any verdict but an admission, takes one off a window above 5, so each slot a
+    peer holds above 5 costs an admitted body. Its requests also stay within 10,000,000 announced
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
   - requester's pending ids: at most 8,000 per session. Past 256 in a session, an id is taken

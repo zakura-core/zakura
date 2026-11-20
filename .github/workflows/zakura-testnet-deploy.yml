@@ -98,6 +98,16 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref }}
 
+      # The fleet config is rendered by this workflow's own deployer, since an
+      # older deploy ref's deploy.py may not have `ci-overrides`.
+      - name: Checkout this workflow's deployer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: .workflow-deployer
+          sparse-checkout: deploy/deployer
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
@@ -163,7 +173,7 @@ jobs:
 
           # deploy.py's `ci_overrides` says what each input renders and
           # which need one explicit node.
-          defaults_overrides="$(python3 deploy.py ci-overrides \
+          defaults_overrides="$(python3 "${GITHUB_WORKSPACE}/.workflow-deployer/deploy/deployer/deploy.py" ci-overrides \
             --node "${NODE}" \
             --p2p-stack "${P2P_STACK}" \
             --fleet-p2p-stack dual \

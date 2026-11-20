@@ -247,6 +247,25 @@ struct Admission<E> {
     after_reset: bool,
 }
 
+impl<E> Admission<E> {
+    /// Holds back a parent that arrived past the cap until [`RETRY_GAP`]
+    /// after its latest check started, or says it runs now: once that gap
+    /// has passed, or when the gap would end at or after its submitter's
+    /// deadline, which spends its one last check while there is still time.
+    fn hold_arrival(&mut self, now: Instant) -> bool {
+        let gap_end = self.ran_at + RETRY_GAP;
+        if gap_end <= now {
+            return true;
+        }
+        if !self.last_check_used && self.give_up.is_some_and(|at| gap_end >= at) {
+            self.last_check_used = true;
+            return true;
+        }
+        self.retry_at = Some(gap_end);
+        false
+    }
+}
+
 /// What the machine keeps about a pooled transaction, whose body is in
 /// storage.
 #[derive(Clone, Debug)]
@@ -1325,15 +1344,9 @@ impl<E: VerifyError> MempoolState<E> {
                     self.start_admission(key);
                     return;
                 }
-                if arrived && !wait_over {
-                    // Past the cap, it runs again a gap after this check
-                    // started, which a slow check may already have passed.
-                    let at = admission.ran_at + RETRY_GAP;
-                    if at <= now {
-                        self.start_admission(key);
-                        return;
-                    }
-                    admission.retry_at = Some(at);
+                if arrived && !wait_over && admission.hold_arrival(now) {
+                    self.start_admission(key);
+                    return;
                 }
                 if wait_over && arrived {
                     // There is no check left to give, and this answer is
@@ -1543,7 +1556,8 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Runs again every admission parked on `parent`, which just entered the
-    /// pool, that has a retry left. Any other runs again by [`RETRY_GAP`].
+    /// pool, that has a retry left. Any other is held, see
+    /// [`Admission::hold_arrival`].
     fn wake_for_arrival(&mut self, parent: transaction::Hash) {
         let now = self.now;
         let mut woken = Vec::new();
@@ -1554,14 +1568,11 @@ impl<E: VerifyError> MempoolState<E> {
             if !on.contains(&parent) {
                 continue;
             }
-            let gap_end = admission.ran_at + RETRY_GAP;
             if admission.parent_retries < MAX_PARENT_RETRIES {
                 admission.parent_retries += 1;
                 woken.push(*key);
-            } else if gap_end <= now {
+            } else if admission.hold_arrival(now) {
                 woken.push(*key);
-            } else {
-                admission.retry_at = Some(gap_end);
             }
         }
         for key in woken {

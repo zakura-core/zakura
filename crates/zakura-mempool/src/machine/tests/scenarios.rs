@@ -1158,6 +1158,44 @@ fn the_retry_gap_runs_from_the_start_of_the_last_check() {
     assert_eq!(started(&step).len(), 1, "a gap after the check started");
 }
 
+/// A parent held back past the cap whose gap would end after the
+/// submitter's deadline spends the child's last check at once. Here the
+/// child parks at 15 s with a 73 s deadline, a returning parent spends its
+/// second retry at 65 s, and its other parent arrives at 66 s, when the gap
+/// would end at 75 s.
+#[test]
+fn a_held_parent_spends_the_last_check_before_the_deadline() {
+    let mut runner = TestRunner::deterministic();
+    let parents = unrelated(&mut runner, 2);
+    let spends: Vec<OutPoint> = parents.iter().map(|parent| parent.outpoint(0)).collect();
+    let child = build(&mut runner, &spends, 1, None);
+    let fillers = unrelated(&mut runner, 2);
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: parents[0].real.cost() + fillers[0].real.cost(),
+            ..Config::default()
+        },
+        Limits::default(),
+    );
+    bench.now = Duration::from_secs(15);
+    let reservation = bench.reserved(&child);
+    let (_, step) = bench.submit_until(reservation, &child, Some(Duration::from_secs(73)));
+    assert!(bench.missing(started(&step)[0], spends.clone()).is_empty());
+
+    bench.now = Duration::from_secs(20);
+    let rerun = admit_parent(&mut bench, &paying(&parents[0], 500_000));
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    bench.admit(&paying(&fillers[0], 100_000_000));
+    bench.admit(&paying(&fillers[1], 200_000_000));
+    bench.now = Duration::from_secs(65);
+    let rerun = admit_parent(&mut bench, &paying(&twin(&parents[0]), 300_000_000));
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+
+    bench.now = Duration::from_secs(66);
+    let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
+    assert_eq!(rerun.len(), 1, "the last check runs before 73 s");
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

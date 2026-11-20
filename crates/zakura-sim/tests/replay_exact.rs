@@ -3,12 +3,18 @@
 //! (traces.md, Replay).
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     cell::Cell,
     path::Path,
     process::Command,
     sync::OnceLock,
     time::{Duration, Instant},
+};
+use support::machine_tapes::{
+    DECODED_RETENTION, HEADER_REACTOR_POLICY, PUBLISHER_POLICY, REACTOR_POLICY, WORK_FUNDING,
+    WORK_OWNERSHIP,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1352,13 +1358,6 @@ fn a_foreign_storage_failure_replays_exactly() {
     assert!(report.verified(), "{report:?}");
 }
 
-/// `block/work-ownership`'s op tape: two owners take, publish and receive
-/// heights, then return them.
-const WORK_OWNERSHIP: [u8; 40] = [
-    0, 0, 0, 9, 1, 0, 0, 1, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 9, 1, 0, 0, 1, 2, 1, 0, 0, 5, 0, 0, 0,
-    4, 1, 0, 0, 5, 1, 0, 0,
-];
-
 /// `block/work-ownership`'s op tape.
 fn work_input() -> Vec<u8> {
     WORK_OWNERSHIP.to_vec()
@@ -1481,41 +1480,6 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
         })
     ));
 }
-
-/// `block/work-funding`'s op tape: it retains a receipt through a reset,
-/// then admits, publishes and returns a replacement. zakura-network's
-/// funding tests replay the same bytes as their machine target's witness.
-const WORK_FUNDING: [u8; 56] = [
-    0, 0, 1, 99, 1, 0, 9, 3, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 17, 0, 0,
-    0, 0, 0, 1, 99, 1, 0, 9, 3, 2, 1, 0, 0, 3, 1, 0, 0, 12, 0, 0, 1, 11, 0, 0, 0,
-];
-
-/// `block/decoded-retention`'s op tape. Each op is `[opcode, source slot,
-/// destination slot, pool]`, and the opcode modulo 7 picks admit, clone,
-/// retain header, retain transaction, drop, nothing or close. Pools 0 and 1
-/// hold three blocks each, and pool 2 holds two.
-const DECODED_RETENTION: [u8; 80] = [
-    0, 0, 0, 0, // admit into slot 0 from pool 0
-    0, 0, 4, 1, // admit into slot 4 from pool 1
-    1, 0, 3, 0, // clone slot 0 into slot 3
-    2, 0, 1, 0, // retain slot 0's header in slot 1
-    3, 0, 2, 0, // retain slot 0's transaction in slot 2
-    4, 0, 0, 0, // drop slot 0
-    5, 1, 0, 2, // nothing
-    4, 3, 0, 0, // drop slot 3
-    4, 1, 0, 0, // drop slot 1
-    6, 0, 0, 2, // close pool 2
-    5, 2, 0, 1, // nothing
-    4, 2, 0, 0, // drop slot 2
-    4, 4, 0, 0, // drop slot 4
-    0, 0, 0, 2, // admit from pool 2, which is closed
-    0, 0, 0, 0, // admit into slot 0 from pool 0
-    0, 0, 1, 0, // admit into slot 1 from pool 0
-    0, 0, 2, 0, // admit into slot 2 from pool 0, its third block
-    0, 0, 3, 0, // admit a fourth block from pool 0, past its limit
-    5, 0, 0, 1, // nothing
-    6, 0, 0, 0, // close pool 0
-];
 
 /// `block/work-funding`'s op tape.
 fn funding_input() -> Vec<u8> {
@@ -1779,26 +1743,6 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
     assert!(report.end.is_none());
 }
 
-/// `header/publisher-policy`'s op tape, the publisher machine's `WITNESS`
-/// in `publisher/machine/tests.rs`: open, grant, read a page, close, end,
-/// take and write the outcome, then a stale page.
-const PUBLISHER_POLICY: [u8; 32] = [
-    0, 0, 4, 35, 10, 0, 0, 0, 15, 0, 0, 0, 8, 0, 0, 0, 23, 0, 0, 0, 24, 0, 0, 0, 25, 0, 0, 0, 15,
-    0, 0, 128,
-];
-
-/// `header/reactor-policy`'s op tape, the reactor machine's `WITNESS` in
-/// `reactor/machine_tests.rs`: two admissions, reads started and refused,
-/// stale completions, a close refused, retried and expired, a cached pass, a
-/// resource stall, a commit, a repair and its stall, refresh stalls and a
-/// rotation.
-const HEADER_REACTOR_POLICY: [u8; 104] = [
-    0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 2, 3, 0, 0, 0,
-    4, 0, 0, 0, 4, 1, 0, 0, 7, 0, 0, 1, 6, 0, 232, 3, 8, 0, 0, 0, 7, 0, 1, 1, 6, 0, 136, 19, 8, 0,
-    0, 0, 9, 0, 0, 0, 10, 2, 0, 0, 11, 3, 0, 0, 13, 0, 0, 0, 14, 0, 0, 0, 15, 0, 0, 0, 6, 0, 96,
-    234, 15, 0, 0, 0, 15, 0, 0, 0, 12, 0, 0, 0,
-];
-
 /// `header/reactor-policy`'s op tape.
 fn reactor_input() -> Vec<u8> {
     HEADER_REACTOR_POLICY.to_vec()
@@ -1916,13 +1860,6 @@ fn reactor_machine_preserves_empty_and_short_inputs() {
             .verified());
     }
 }
-
-/// `block/reactor-policy`'s op tape that offers, refuses and retries
-/// queries across refills and committed views.
-const REACTOR_POLICY: [u8; 60] = [
-    0, 0, 1, 200, 0, 8, 2, 200, 7, 0, 200, 0, 3, 0, 0, 0, 1, 0, 0, 1, 6, 2, 1, 0, 6, 3, 0, 0, 5, 0,
-    1, 0, 1, 0, 0, 0, 0, 0, 1, 200, 2, 0, 1, 0, 7, 0, 200, 0, 3, 0, 0, 0, 4, 0, 30, 0, 6, 0, 3, 0,
-];
 
 /// `block/reactor-policy`'s op tape.
 fn block_reactor_input() -> Vec<u8> {

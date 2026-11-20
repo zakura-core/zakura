@@ -8,6 +8,8 @@
 //! committed tables and seeds, and the status each run's evidence gets.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -312,8 +314,9 @@ fn fixed_race(fixture: Which) -> Vec<u8> {
 
 /// `entry`'s inputs, named: the empty input, which runs the default scenario
 /// under the empty Plan, then each scenario family's tag under the empty
-/// Plan, but the [`SLOW_FAMILIES`]. A machine runs the first
-/// [`PLANS_WITHOUT_FAMILIES`] generated op tapes as well, each at most
+/// Plan, but the [`SLOW_FAMILIES`]. A machine runs its written op tapes
+/// ([`support::machine_tapes`]) and the first [`PLANS_WITHOUT_FAMILIES`]
+/// generated ones, each at most
 /// `max_len` bytes, and `fixtures/all` runs each race fixture's fix
 /// ([`fixed_race`]). The harnesses' seeds live in the QA store, which a
 /// repository test doesn't read.
@@ -321,8 +324,10 @@ fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
     let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
     let families = (entry.families)();
     if entry.machine {
-        let plans =
-            zakura_sim::seed::draws::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
+        for (name, tape) in support::machine_tapes::tapes(entry.name) {
+            inputs.push((format!("{} {name}", entry.name), tape));
+        }
+        let plans = support::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
         for (index, plan) in plans.into_iter().enumerate() {
             inputs.push((format!("{} plan {index}", entry.name), plan));
         }
@@ -357,6 +362,8 @@ fn every_declared_target_runs_inputs_that_apply_its_properties() {
     let declared = declared_targets(&suite);
     assert!(!declared.is_empty(), "{SUITE_FILE} declares sim targets");
     let mut mismatched = Vec::new();
+    // Targets whose inputs apply none of their own properties.
+    let mut inapplicable = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
         let inputs = inputs(entry, max_len(&target.args).unwrap_or(PLAN_BYTES));
@@ -380,7 +387,9 @@ fn every_declared_target_runs_inputs_that_apply_its_properties() {
             })
             .collect();
         let (applied, mut unapplied) = own_applicability(entry, &reached);
-        assert!(!applied.is_empty(), "{}", target.name);
+        if applied.is_empty() {
+            inapplicable.push(target.name.clone());
+        }
         unapplied.sort();
         if unapplied != unapplied_allowed(&target.name) {
             mismatched.push(format!("(\"{}\", &{unapplied:?}),", target.name));
@@ -404,6 +413,10 @@ fn every_declared_target_runs_inputs_that_apply_its_properties() {
             );
         }
     }
+    assert!(
+        inapplicable.is_empty(),
+        "these targets' inputs apply none of their own properties: {inapplicable:?}"
+    );
     assert!(
         mismatched.is_empty(),
         "the inputs' unapplied own properties differ from UNAPPLIED; these entries match the inputs:\n{}",

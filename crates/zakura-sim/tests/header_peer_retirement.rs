@@ -191,8 +191,9 @@ fn every_departure_fixture_holds() {
 /// apply's dispatch), and its slot went no sooner than
 /// the request timeout after its last arm, which opened a hand-off that
 /// `mirror-1`'s locator read answered. In the late-page fixture, the late
-/// page comes [`liveness::LATE_PAGE_DELAY`] after the start, staged but not prepared,
-/// so it rearms nothing (#2248), and the slot goes at the start's deadline.
+/// page comes [`liveness::LATE_PAGE_DELAY`] after the start and completes
+/// the round, so its prepare's dispatch rearms the deadline once. The prepare
+/// stays held, and the slot goes at that deadline.
 /// Every run ends idle.
 #[test]
 fn every_timeout_fixture_holds_after_its_deadline() {
@@ -261,9 +262,10 @@ fn every_timeout_fixture_holds_after_its_deadline() {
                     last_arm >= std::time::Duration::from_secs(20),
                     "{fixture:?}: the late apply rearms: {last_arm:?}"
                 ),
-                LivenessScenario::LatePage => assert_eq!(
-                    last_arm, first_arm,
-                    "{fixture:?}: the late page, staged but not prepared, rearms nothing"
+                LivenessScenario::LatePage => assert!(
+                    last_arm
+                        >= first_arm + zakura_sim::harness::header_sync::liveness::LATE_PAGE_DELAY,
+                    "{fixture:?}: the late page's prepare rearms: {last_arm:?}"
                 ),
                 _ => {}
             }

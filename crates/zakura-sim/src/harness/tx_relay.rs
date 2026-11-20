@@ -528,7 +528,8 @@ fn answers(faults: bool) -> Vec<Answer> {
 /// - Byte 1, the peers: their count (bits 0 and 1, 1 to 4), an honest
 ///   helper peer after them (bit 2), whether each holds its two bad bodies
 ///   first (bit 3), the gap between dials (bits 4 and 5: 0, 200, 1,000 or
-///   5,000 ms), and whether the scripts may break rules (bit 7).
+///   5,000 ms), whether the helper holds the first peer's bodies in place
+///   of its own (bit 6), and whether the scripts may break rules (bit 7).
 /// - Byte 2, the answers: which one (bits 0 to 2, of the conformant ones
 ///   or of all once byte 1 lets the scripts break rules), the gap between
 ///   answers (bits 3 and 4: 0, 100, 1,000 or 3,000 ms, or 0 for an answer
@@ -602,7 +603,11 @@ pub fn composed_scenario(prefix: &[u8]) -> RelayScenario {
             .push(actions[at % actions.len()]);
     }
     if peers & 4 != 0 {
-        let holds = (count * HELD..(count + 1) * HELD).collect();
+        let holds = if peers & 0x40 != 0 {
+            (0..HELD).collect()
+        } else {
+            (count * HELD..(count + 1) * HELD).collect()
+        };
         specs.push(RelayPeerSpec {
             steps: vec![
                 RelayStep::AnnounceAll,
@@ -1005,11 +1010,12 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
             ],
         )
     }),
-    // Peer 0's bodies, admitted, go to peer 1.
+    // Peer 0 and the helper announce the same bodies. Once admitted, they
+    // go to peer 1, and not to whichever of the two didn't supply them.
     (properties::ANNOUNCE_AFTER_ADMISSION, || {
         composed_prefix(
             0,
-            1,
+            0x40 | 4 | 1,
             0,
             &[(0, RelayStep::AnnounceAll), (1, WAIT_LONG), (1, WAIT_LONG)],
         )

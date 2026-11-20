@@ -951,9 +951,19 @@ const WAIT_COOLDOWN: RelayStep = RelayStep::Wait { secs: 300 };
 /// Each domain property's named witness, in the order
 /// [`crate::domain::tx_relay::IDS`] lists them.
 pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
-    // A pool that takes 2 s to decide holds five bodies at once.
+    // A pool that takes 2 s to decide holds a window of bodies at once,
+    // while 64 more announced ids wait their turn.
     (properties::REQUESTS_WITHIN_LIMIT, || {
-        steps_prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT_LONG])
+        steps_prefix(
+            0x02,
+            0,
+            0,
+            &[
+                RelayStep::AnnounceAll,
+                RelayStep::AnnounceFake { count: 64 },
+                WAIT_LONG,
+            ],
+        )
     }),
     // Twenty-four bodies of the node's, announced, then asked for at once
     // while the peer reads nothing: sixteen wait unstarted, and the last

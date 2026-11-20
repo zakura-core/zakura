@@ -78,9 +78,9 @@ The reservation is called a claim. Five rules define it:
 - **A node keeps the block it mined.** A locally submitted block takes its
   receipt order at submission, like any other body. A rival's earlier claim at
   the same height is ignored from that moment, while the mined block is still
-  verifying and, once it has verified, for one body deadline after it was
-  submitted. Nothing longer is needed, because a claim made before the
-  submission has expired by then. If an overlapping peer delivery
+  verifying and, once it has verified, until every claim made before its
+  submission has expired. The node holds the record for twice the body
+  deadline to be sure of that. If an overlapping peer delivery
   commits the identical body, the local submission keeps this protection and
   still reports a duplicate. The verifier checks the committed forks at submission
   and confirms the exact body in state, even if the peer has stopped waiting
@@ -103,12 +103,13 @@ deadline. Inside the deadline, withholding is indistinguishable from slow
 honest delivery, so the deadline is both the delay forgiven for honest blocks
 and the most a withholder can gain.
 
-Inside the deadline that gain carries no risk of losing the tie. Under arrival
-order, a miner that sat on a body could lose to any block found meanwhile.
-With a claim it cannot, so until the deadline it is the only miner building on
-its new block. Two seconds is 2.7% of the 75 second target block interval.
-Bodies that bunch just under the deadline in the claim-age histogram would
-show this in use.
+Inside the deadline that gain carries little risk. Under arrival order, a
+miner that sat on a body could lose the tie to any block found meanwhile. With
+a claim it keeps the tie everywhere except at the node that mined the other
+block, and until it releases the body it is the only miner building on its own
+block. Two seconds is 2.7% of the 75 second target block interval. Bodies that
+bunch just under the deadline in the claim-age histogram would show this in
+use.
 
 The clock starts at the first announcement from any peer, not only from the
 block's miner. A peer that learns a block's hash can announce it to a node

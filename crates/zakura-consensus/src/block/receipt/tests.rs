@@ -17,7 +17,7 @@ use zakura_node_services::block_memory::BlockHandle;
 use super::{
     claims::{
         size_label, AnnouncementClaims, ClaimOutcome, ClaimSource, CLAIM_BODY_DEADLINE,
-        MAX_ANNOUNCED_BLOCKS, MAX_ANNOUNCEMENT_CLAIMS,
+        MAX_ANNOUNCED_BLOCKS, MAX_ANNOUNCEMENT_CLAIMS, MINED_RECORD_LIFETIME,
     },
     order,
     registry::{ReceiptGuard, ReceiptRegistry, MAX_BODIES_PER_HASH},

@@ -357,18 +357,19 @@ fn a_rival_claimed_before_a_mined_block_never_regains_its_claim() {
         .mark_mined_at(hash(3), CLAIMED, mined_order, now)
         .keep();
 
-    // The claim's last instant is also the record's, so the record still voids it there.
-    let at_the_bound = now + CLAIM_BODY_DEADLINE;
-    for arrival in [now, at_the_bound] {
+    // The record outlasts the claim's deadline, so it voids the claim to its last instant.
+    let claim_ends = now + CLAIM_BODY_DEADLINE;
+    for arrival in [now, claim_ends, now + MINED_RECORD_LIFETIME] {
         submit_another(&claims, arrival);
         assert!(matches!(
             claims.resolve(hash(1), Some(CLAIMED), arrival),
             ClaimOutcome::Voided { .. }
         ));
+        assert!(body_order(&claims, hash(1), arrival) > mined_order);
     }
 
-    // After it the record is retired, and the claim has expired on its own.
-    let late = at_the_bound + Duration::from_millis(1);
+    // Once the record is retired, the claim has long expired on its own.
+    let late = now + MINED_RECORD_LIFETIME + Duration::from_millis(1);
     submit_another(&claims, late);
     assert_eq!(claims.mined_blocks(), 0);
     assert!(matches!(
@@ -392,21 +393,42 @@ fn a_verified_mined_block_record_is_retired_only_by_its_age() {
         .commit();
     assert_eq!(claims.mined_blocks(), 1);
 
-    submit_another(&claims, now + CLAIM_BODY_DEADLINE);
-    assert_eq!(claims.mined_blocks(), 1, "kept through the deadline");
+    submit_another(&claims, now + MINED_RECORD_LIFETIME);
+    assert_eq!(claims.mined_blocks(), 1, "kept through its lifetime");
 
     submit_another(
         &claims,
-        now + CLAIM_BODY_DEADLINE + Duration::from_millis(1),
+        now + MINED_RECORD_LIFETIME + Duration::from_millis(1),
     );
     assert_eq!(claims.mined_blocks(), 0);
+}
+
+#[test]
+fn a_mined_block_record_takes_the_height_of_the_body_that_verifies() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claim(&claims, hash(1), now);
+    let voided = || {
+        matches!(
+            claims.resolve(hash(1), Some(CLAIMED), now),
+            ClaimOutcome::Voided { .. }
+        )
+    };
+
+    // Two bodies share a header hash. The first names another height and is rejected.
+    let other_height = block::Height(CLAIMED.0 + 1);
+    let rejected = claims.mark_mined(hash(3), other_height, order::next());
+    claims.mark_mined(hash(3), CLAIMED, order::next()).keep();
+    assert!(voided());
+    drop(rejected);
+    assert!(voided());
 }
 
 #[test]
 fn a_mined_block_still_verifying_keeps_its_record_whatever_its_age() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    let long_after = now + CLAIM_BODY_DEADLINE * 10;
+    let long_after = now + MINED_RECORD_LIFETIME * 10;
 
     let rejected = claims.mark_mined_at(hash(3), CLAIMED, order::next(), now);
     let verified = claims.mark_mined_at(hash(4), CLAIMED, order::next(), now);
@@ -434,7 +456,9 @@ fn a_block_mined_again_after_its_record_retired_is_recorded_anew() {
         .keep();
 
     // A rival is claimed after the first record has aged out, then the block is mined again.
-    let later = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    // While the first record was still held, the block would have joined it and kept
+    // `first_order`, and the rival's claim would have been honoured.
+    let later = now + MINED_RECORD_LIFETIME + Duration::from_millis(1);
     claim(&claims, hash(1), later);
     let rival = claims
         .claimed_order(hash(1))

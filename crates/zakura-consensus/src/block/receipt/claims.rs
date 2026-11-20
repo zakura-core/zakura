@@ -49,6 +49,15 @@ const MAX_CLAIM_HEIGHT_ABOVE_TIP: HeightDiff = 2;
 /// claim that is already in force. A refused block is ranked by body arrival.
 pub(super) const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
 
+/// How long a verified mined block's record is kept.
+///
+/// A record only voids claims with an earlier order than its own. Each of those was seen before
+/// the record was made, so it has expired once the record is older than
+/// [`CLAIM_BODY_DEADLINE`], and an expired claim is ranked by arrival just as a voided one is.
+/// The record is kept for twice that, so a body whose arrival time was read just inside a
+/// claim's deadline still finds the record, however late it looks the claim up.
+pub(super) const MINED_RECORD_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
+
 /// A place in receipt order reserved for a block when its header arrived.
 #[derive(Copy, Clone, Debug)]
 struct Claim {
@@ -118,17 +127,12 @@ impl ClaimTable {
         self.by_hash.retain(|_, claim| claim.height >= floor);
     }
 
-    /// Drops the mined blocks recorded more than [`CLAIM_BODY_DEADLINE`] before `now` that no
-    /// request is still verifying.
-    ///
-    /// A record only voids claims with an earlier order than its own. Each of those was seen
-    /// before the record was made, so once the record is older than the deadline they have all
-    /// expired, and an expired claim is ranked by arrival just as a voided one is. A record
-    /// that old therefore changes no block's order.
+    /// Drops the mined blocks recorded more than [`MINED_RECORD_LIFETIME`] before `now` that
+    /// no request is still verifying. By then no claim they could void is still in force.
     fn retire_mined(&mut self, now: Instant) {
         self.mined.retain(|_, mined| {
             mined.pending > 0
-                || now.saturating_duration_since(mined.marked_at) <= CLAIM_BODY_DEADLINE
+                || now.saturating_duration_since(mined.marked_at) <= MINED_RECORD_LIFETIME
         });
     }
 }
@@ -259,8 +263,8 @@ impl AnnouncementClaims {
     ///
     /// The record lasts while the returned guard, or any other guard for the same block, is
     /// alive. Once one of them is kept, it outlives them until it is older than
-    /// [`CLAIM_BODY_DEADLINE`], when every claim it could void has expired. It is dropped at
-    /// the next call after that.
+    /// [`MINED_RECORD_LIFETIME`], and is dropped the next time a mined block is recorded. A
+    /// block recorded again after that gets a new record, with the new `order`.
     ///
     /// `order` must already be drawn. That is what dates every claim with an earlier order
     /// before this record.

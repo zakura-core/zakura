@@ -2097,6 +2097,95 @@ fn unconditional_peers_parse_pinned_dns_names_and_roundtrip() {
         .expect_err("a pin needs both stacks");
 }
 
+/// A pin written as a key and a pin written as that key's node ID name the
+/// same node, and each is written back in the form the operator used.
+#[test]
+fn unconditional_peers_pin_by_key_or_by_node_id() {
+    let (key, _addr) = DEFAULT_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .expect("a bootstrap peer starts with its key");
+    let key: zakura_quic::NodeKey = key.parse().expect("a built-in entry holds a valid key");
+    let node_id = zakura_quic::NodeKeyList::single(key).node_id();
+    let pin = |entry: &str| -> Config {
+        toml::from_str(&format!(
+            "p2p_stack = 'dual'\nunconditional_peers = ['{entry}']"
+        ))
+        .expect("a pinned DNS name parses on a node that runs both stacks")
+    };
+
+    let by_key = pin(&format!("{key}@peer.example.com:8233"));
+    let by_id = pin(&format!("id:{node_id}@peer.example.com:8233"));
+    let pinned_node = |config: &Config| {
+        config
+            .unconditional_peers
+            .dial_names()
+            .next()
+            .expect("the entry is a dial name")
+            .node_id
+            .expect("the entry has a pin")
+    };
+    assert_eq!(pinned_node(&by_key).node_id(), node_id);
+    assert_eq!(pinned_node(&by_id).node_id(), node_id);
+    assert_eq!(pinned_node(&by_key).key(), Some(key));
+    assert_eq!(
+        pinned_node(&by_id).key(),
+        None,
+        "a node ID does not reveal the node's key"
+    );
+
+    let serialized = toml::to_string(&by_id).expect("config serializes");
+    assert!(
+        serialized.contains(&format!(
+            r#"unconditional_peers = ["id:{node_id}@peer.example.com:8233"]"#
+        )),
+        "the node ID form is kept:\n{serialized}"
+    );
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, by_id.unconditional_peers);
+}
+
+/// The discovery sequence file a release from before key lists wrote, named
+/// after the node's key, is renamed to the node ID's name once.
+#[test]
+fn legacy_discovery_sequence_file_moves_to_the_node_id_name_once() {
+    let _init_guard = zakura_test::init();
+
+    let identity_dir = tempfile::tempdir().expect("failed to create temp identity dir");
+    let config = Config {
+        identity_dir: identity_dir.path().to_owned(),
+        ..Config::default()
+    };
+    let secret_key = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]);
+    let (key, node_id) = (secret_key.public_key(), secret_key.public());
+    let legacy = identity_dir.path().join(format!(
+        "{}.{key}.zakura-discovery-sequence",
+        config.network.lowercase_name()
+    ));
+    let current = config.zakura_discovery_sequence_file(&node_id);
+    assert_ne!(legacy, current);
+
+    // A node that never wrote a sequence file has nothing to move.
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert!(!current.exists());
+
+    fs::write(&legacy, "41\n").expect("write the older release's file");
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert!(!legacy.exists());
+    assert_eq!(
+        fs::read_to_string(&current).expect("read moved file"),
+        "41\n"
+    );
+
+    // A file under the old name never replaces the one the node now writes.
+    fs::write(&legacy, "7\n").expect("write a stale file under the old name");
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert_eq!(
+        fs::read_to_string(&current).expect("read kept file"),
+        "41\n"
+    );
+    assert!(legacy.exists());
+}
+
 /// A node ID can only pin a DNS name with a port, and must be a valid node ID.
 #[test]
 fn unconditional_peers_reject_invalid_pins() {

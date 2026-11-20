@@ -4210,7 +4210,7 @@ mod tests {
     use std::{net::IpAddr, time::Duration};
 
     use rand_10::{rngs::StdRng, SeedableRng};
-    use zakura_quic::NodeSecretKey;
+    use zakura_quic::{NodeSecretKey, ED25519_KEY_TAG};
 
     use super::*;
     use crate::zakura::{
@@ -4244,6 +4244,9 @@ mod tests {
             "DisclosureKey { .. }"
         );
     }
+
+    /// A key tag this release does not know.
+    const UNREADABLE_KEY_TAG: u16 = 0x7f00;
 
     fn secret_key() -> NodeSecretKey {
         NodeSecretKey::generate()
@@ -8493,12 +8496,50 @@ mod tests {
         let mut expired = body(&signer);
         expired.expires_at_unix_secs = now - 3_600;
         let expired = ZakuraNodeRecord::sign(expired, &signer).expect("record signs");
+        // A relay passes on key lists it cannot read, so a record with no key
+        // this release can verify with is never the relay's fault.
+        let signer = secret_key();
+        let mut unverifiable = body(&signer);
+        unverifiable.keys = NodeKeyList::from_entries([(UNREADABLE_KEY_TAG, [0x44; 32])])
+            .expect("a list of one unreadable entry is well formed");
+        unverifiable.expires_at_unix_secs = now + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        let unverifiable = ZakuraNodeRecord {
+            body: unverifiable,
+            signature: [0; 64],
+        };
+        // An author whose list also holds an unreadable entry signs with its
+        // Ed25519 key, and its record is kept under the ID of the whole list.
+        let signer = secret_key();
+        let longer_list = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *signer.public_key().as_bytes()),
+            (UNREADABLE_KEY_TAG, [0x55; 32]),
+        ])
+        .expect("two entries in increasing tag order are a valid list");
+        let signer = signer
+            .with_key_list(longer_list.clone())
+            .expect("the list holds the signer's own key");
+        let mut two_keys = body(&signer);
+        two_keys.expires_at_unix_secs = now + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        let two_keys = ZakuraNodeRecord::sign(two_keys, &signer).expect("record signs");
         let outcome = handle
-            .import_peer_records([incompatible, expired, valid()], Some(relay))
+            .import_peer_records(
+                [incompatible, expired, unverifiable, valid(), two_keys],
+                Some(relay),
+            )
             .await
-            .expect("incompatible and expired records only drop");
-        assert_eq!(outcome.added, 1);
-        assert_eq!(outcome.rejected, 2);
+            .expect("incompatible, expired and unverifiable records only drop");
+        assert_eq!(outcome.added, 2);
+        assert_eq!(outcome.rejected, 3);
+        assert!(
+            handle
+                .inner
+                .lock()
+                .await
+                .book()
+                .get(&longer_list.node_id())
+                .is_some(),
+            "the record is stored under the ID of its whole key list"
+        );
 
         // An expired record with a bad signature is forged, not stale.
         let signer = secret_key();
@@ -9838,6 +9879,7 @@ mod tests {
         }
 
         let drop = [
+            DiscoveryBookError::Record(DiscoveryRecordError::NoSupportedKey),
             DiscoveryBookError::Record(DiscoveryRecordError::Expired),
             DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry),
             DiscoveryBookError::SelfRecord,

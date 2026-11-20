@@ -2401,6 +2401,81 @@ mod tests {
         assert_eq!(native.validate(&native_expected), Ok(()));
     }
 
+    /// A list with an entry this release cannot read is accepted when it holds
+    /// the key the peer proved, and the node ID covers every entry.
+    #[test]
+    fn a_key_list_with_an_unreadable_entry_names_the_node_by_the_whole_list() {
+        let secret = test_secret(7);
+        let key = secret.public_key();
+        let keys = NodeKeyList::from_entries([
+            (zakura_quic::ED25519_KEY_TAG, *key.as_bytes()),
+            (0x7f00, [0xab; 32]),
+        ])
+        .expect("two entries in increasing tag order are a valid list");
+        let encoded = keys.encode();
+
+        assert_ne!(
+            keys.node_id(),
+            secret.public(),
+            "the extra entry is part of the node's name"
+        );
+        assert_eq!(
+            proven_key_list(&encoded, key).map(|keys| keys.node_id()),
+            Ok(keys.node_id())
+        );
+        assert_eq!(advertised_key_list(&encoded), Some(keys.clone()));
+        let ack = ZakuraControlAck {
+            node_keys: encoded,
+            ..control_ack()
+        };
+        assert_eq!(ack.responder_node_id(key), Ok(keys.node_id()));
+    }
+
+    /// A peer is refused when its list lacks the key it proved, and a list
+    /// that is not well formed is told apart from one that names another node.
+    #[test]
+    fn a_key_list_without_the_proven_key_is_refused() {
+        let secret = test_secret(7);
+        let key = secret.public_key();
+
+        let another_node = test_secret(8).key_list().encode();
+        assert_eq!(
+            proven_key_list(&another_node, key),
+            Err(ZakuraValidationError::IdentityMismatch)
+        );
+
+        let no_ed25519 = NodeKeyList::from_entries([(0x7f00, [0xab; 32])])
+            .expect("a list of one unreadable entry is well formed")
+            .encode();
+        assert_eq!(
+            proven_key_list(&no_ed25519, key),
+            Err(ZakuraValidationError::IdentityMismatch),
+            "nothing in the list is proven"
+        );
+        assert_eq!(
+            advertised_key_list(&no_ed25519),
+            None,
+            "a native dial could not prove this node"
+        );
+
+        // A release from before key lists sends its bare 32-byte key.
+        let bare_key = key.as_bytes().to_vec();
+        assert_eq!(
+            proven_key_list(&bare_key, key),
+            Err(ZakuraValidationError::MalformedControl)
+        );
+        assert_eq!(advertised_key_list(&bare_key), None);
+
+        let ack = ZakuraControlAck {
+            node_keys: another_node,
+            ..control_ack()
+        };
+        assert_eq!(
+            ack.responder_node_id(key),
+            Err(ZakuraValidationError::IdentityMismatch)
+        );
+    }
+
     /// T.control.ack: an ack for another handshake's nonces cannot validate.
     #[test]
     fn control_ack_echoes_exact_peer_nonces() {

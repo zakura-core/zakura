@@ -386,16 +386,14 @@ fn discovery_node_addr_with_reserved_ip_capacity(
         }
     }
 
-    (!direct_addrs.is_empty()).then(|| {
-        (
-            NodeAddr {
-                id: candidate.node_id,
-                key: candidate.key,
-                direct: direct_addrs,
-            },
-            reserved_ips,
-        )
-    })
+    (!direct_addrs.is_empty()).then_some((
+        NodeAddr {
+            id: candidate.node_id,
+            key: candidate.key,
+            direct: direct_addrs,
+        },
+        reserved_ips,
+    ))
 }
 
 async fn run_discovery_dial_once(

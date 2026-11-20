@@ -317,7 +317,57 @@ mod tests {
             .iter()
             .chain(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS)
         {
-            parse_bootstrap_peer(peer).expect("default Zakura bootstrap peer should parse");
+            let node_addr =
+                parse_bootstrap_peer(peer).expect("default Zakura bootstrap peer should parse");
+            let (key, _addr) = peer.split_once('@').expect("the entry parsed");
+            let key: zakura_quic::NodeKey = key.parse().expect("built-in entries name a key");
+            assert_eq!(node_addr.key, Some(key), "{peer}");
+            assert_eq!(
+                node_addr.id,
+                zakura_quic::NodeKeyList::single(key).node_id(),
+                "{peer}"
+            );
+        }
+    }
+
+    /// An entry written with a key dials with that key expected in TLS. An
+    /// entry written with a node ID names the same node without its key, and
+    /// the two merge into one peer that keeps the key.
+    #[test]
+    fn bootstrap_peer_is_written_by_key_or_by_node_id() {
+        let secret = zakura_quic::NodeSecretKey::from_bytes(&[2; 32]);
+        let (key, node_id) = (secret.public_key(), secret.public());
+        let first_addr: SocketAddr = "127.0.0.1:8234".parse().expect("test address parses");
+        let second_addr: SocketAddr = "127.0.0.1:8235".parse().expect("test address parses");
+
+        let by_key = parse_bootstrap_peer(&format!("{key}@{first_addr}")).expect("key entry");
+        assert_eq!(by_key.id, node_id);
+        assert_eq!(by_key.key, Some(key));
+        let by_id = parse_bootstrap_peer(&format!("id:{node_id}@{second_addr}")).expect("id entry");
+        assert_eq!(by_id.id, node_id);
+        assert_eq!(by_id.key, None);
+        assert!(
+            parse_bootstrap_peer(&format!("{node_id}@{first_addr}"))
+                .map_or(true, |parsed| { parsed.id != node_id }),
+            "a bare value is never read as a node ID"
+        );
+
+        for entries in [
+            [
+                format!("id:{node_id}@{second_addr}"),
+                format!("{key}@{first_addr}"),
+            ],
+            [
+                format!("{key}@{first_addr}"),
+                format!("id:{node_id}@{second_addr}"),
+            ],
+        ] {
+            let local_id = zakura_quic::NodeSecretKey::from_bytes(&[1; 32]).public();
+            let grouped = grouped_remote_bootstrap_peers(entries.to_vec(), local_id);
+            assert_eq!(grouped.len(), 1);
+            assert_eq!(grouped[0].id, node_id);
+            assert_eq!(grouped[0].key, Some(key));
+            assert_eq!(grouped[0].direct.len(), 2);
         }
     }
 

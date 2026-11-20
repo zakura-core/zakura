@@ -381,19 +381,16 @@ impl ZakuraHandshakeConnector {
             }
         };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
-        // Bound to a name so the guard, which borrows `peer_id`, is dropped
-        // before `peer_id` is.
-        let handoff = match (cancel_guard, conn_id) {
-            // The peer registered, so the dial now owns a live connection.
-            (Some(cancel_guard), Some(conn_id)) => {
-                cancel_guard.disarm();
-                ZakuraNativeHandoff::Registered(conn_id)
-            }
-            (None, Some(_)) => ZakuraNativeHandoff::Duplicate,
-            // A dropped guard cancels the dial this hand-off started.
-            (_, None) => ZakuraNativeHandoff::Failed,
+        let Some(conn_id) = conn_id else {
+            // Dropping the guard cancels the dial this hand-off started.
+            return ZakuraNativeHandoff::Failed;
         };
-        handoff
+        let Some(cancel_guard) = cancel_guard else {
+            return ZakuraNativeHandoff::Duplicate;
+        };
+        // The peer registered, so the dial now owns a live connection.
+        cancel_guard.disarm();
+        ZakuraNativeHandoff::Registered(conn_id)
     }
 
     /// Wait until the upgraded peer's inbound native QUIC connection registers

@@ -180,6 +180,17 @@ impl Step {
     }
 }
 
+/// What the pool holds, for its size gauges. See
+/// [`MempoolState::pool_counts`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolCounts {
+    /// Transactions in the pool, which readers and templates see.
+    pub pooled: usize,
+    /// Transactions a reset took out of the pool that are not back yet:
+    /// waiting for a slot, or being verified again.
+    pub readmitting: usize,
+}
+
 /// The machine's limits. Production uses the port's constants. Tests use
 /// smaller ones so a short run reaches every full state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -840,6 +851,14 @@ impl<E: VerifyError> MempoolState<E> {
     /// What storage holds, for the pool's metrics.
     pub fn storage_stats(&self) -> StorageStats {
         self.storage.stats()
+    }
+
+    /// What the pool holds, for its size gauges.
+    pub fn pool_counts(&self) -> PoolCounts {
+        PoolCounts {
+            pooled: self.pool.len(),
+            readmitting: self.queue.len().saturating_add(self.readmitting),
+        }
     }
 
     /// The earliest time an input would apply a deadline, if any is set.

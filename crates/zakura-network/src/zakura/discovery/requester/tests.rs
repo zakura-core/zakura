@@ -27,7 +27,7 @@ impl Queries {
         payload_len: usize,
     ) -> Result<Option<Asked>, ClaimRefused> {
         self.claim(message_type, payload_len)
-            .map(|answer| answer.map(|answer| answer.admitted.asked.clone()))
+            .map(|claim| claim.answer().map(|answer| answer.admitted.asked.clone()))
     }
 }
 
@@ -452,6 +452,41 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
 }
 
+/// The transport reader can queue an answer just before the session retires
+/// its queries, and the reader can take it just after (#2632). The claim
+/// finds the queries retired and judges nothing, so a conformant peer's
+/// answer neither trips the queue's ledger nor counts as unsolicited.
+#[tokio::test]
+async fn an_answer_queued_before_retirement_claims_nothing() {
+    let pool = reservation_pool();
+    let slot = PrecheckSlot::default();
+    let (_peer, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let Session {
+        queries,
+        mut written,
+        ..
+    } = session_with(pool.clone(), &recv);
+    queries.send_get_peers(get_peers(1)).await.unwrap();
+    written.recv().await.expect("the query is written");
+    let precheck = slot.get().expect("the session attached its precheck");
+    precheck
+        .check(PEERS, peers_len(1))
+        .expect("the transport admits the owed answer");
+
+    queries.retire();
+    assert!(matches!(
+        queries.claim(PEERS, peers_len(1)),
+        Ok(Claim::Retired)
+    ));
+    assert_eq!(pool.held(), 0, "retiring returns every reservation");
+    assert_eq!(
+        precheck.check(PEERS, peers_len(1)),
+        Err(FrameRejection::Unsolicited),
+        "a retired session admits no further answer"
+    );
+}
+
 /// A claim ends the query's protocol authority. The answer keeps the pool
 /// entry and its kind until it settles, so a refresh cannot stack a second
 /// answer behind one that waits for verification.
@@ -469,6 +504,7 @@ async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
     let answer = queries
         .claim(PEERS, peers_len(1))
         .expect("the answer fits its query")
+        .answer()
         .expect("the frame answers a query");
     assert_eq!(pool.held(), 1, "the claimed answer keeps its pool entry");
     assert!(matches!(
@@ -553,7 +589,11 @@ async fn answers_settled_waits_for_a_claimed_answer_only() {
         .await
         .expect("an unanswered query holds nothing");
 
-    let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
+    let answer = queries
+        .claim(PEERS, peers_len(1))
+        .unwrap()
+        .answer()
+        .unwrap();
     let settled = held_settled_wait(&queries).await;
     assert_settles(settled, answer).await;
 }
@@ -577,7 +617,11 @@ async fn answers_settled_waits_for_a_frame_the_transport_queued() {
         .expect("the transport admits the owed answer");
 
     let settled = held_settled_wait(&queries).await;
-    let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
+    let answer = queries
+        .claim(PEERS, peers_len(1))
+        .unwrap()
+        .answer()
+        .unwrap();
     zakura_rt::task::yield_now().await;
     assert!(!settled.is_finished(), "the claimed answer holds the wait");
     assert_settles(settled, answer).await;

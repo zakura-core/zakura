@@ -369,12 +369,39 @@ impl ClaimedAnswer {
     }
 }
 
+/// What a frame's claim found.
+#[derive(Debug)]
+pub(super) enum Claim {
+    /// The frame answers no query.
+    NotAnswer,
+    /// The frame answers a live query. It keeps the query's resources until
+    /// it drops.
+    Answer(ClaimedAnswer),
+    /// The session retired its queries, so nothing judges the frame. The
+    /// transport reader can queue an answer just before the session ends,
+    /// and the reader can take it just after (#2632). The peer broke no rule.
+    Retired,
+}
+
+#[cfg(test)]
+impl Claim {
+    /// The claimed answer, if the frame answers a live query.
+    pub(super) fn answer(self) -> Option<ClaimedAnswer> {
+        match self {
+            Claim::Answer(answer) => Some(answer),
+            Claim::NotAnswer | Claim::Retired => None,
+        }
+    }
+}
+
 /// One session's reservations and its live queries. One lock guards both,
 /// so a claim reads what its own query asked.
 #[derive(Debug)]
 struct LiveQueries {
     reservations: Reservations<QueryKind>,
     state: QueryState,
+    /// [`Queries::retire`] replaced this session's queries.
+    retired: bool,
 }
 
 impl LiveQueries {
@@ -382,6 +409,7 @@ impl LiveQueries {
         Self {
             reservations: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
             state: QueryState::default(),
+            retired: false,
         }
     }
 }
@@ -496,19 +524,23 @@ impl Queries {
     }
 
     /// Claims the live query that a `message_type` frame of `payload_len`
-    /// bytes answers, before its payload is decoded. Returns the claimed
-    /// answer, which keeps the query's resources until it drops, or `None` if
-    /// the frame answers no query.
+    /// bytes answers, before its payload is decoded.
     pub(super) fn claim(
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
+    ) -> Result<Claim, ClaimRefused> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
-            return Ok(None);
+            return Ok(Claim::NotAnswer);
         };
-        self.claim_locked(&mut self.lock(), kind, message_type, payload_len)
-            .map(Some)
+        let live = &mut *self.lock();
+        // The transport reader charged the frame to the retired ledger, which
+        // retirement dropped, so there is nothing to take or claim.
+        if live.retired {
+            return Ok(Claim::Retired);
+        }
+        self.claim_locked(live, kind, message_type, payload_len)
+            .map(Claim::Answer)
     }
 
     /// [`Self::claim`] of a `kind` answer, with the live queries already
@@ -600,10 +632,17 @@ impl Queries {
     /// Ends the session's queries: an unwritten query is skipped, and an
     /// unanswered written query resets the session. The reservations
     /// return to the pool, even while the transport reader outlives the
-    /// session.
+    /// session. An answer the transport reader already queued claims
+    /// nothing ([`Claim::Retired`]).
     pub(super) fn retire(&self) {
         self.fence.retire();
-        let retired = std::mem::replace(&mut *self.lock(), LiveQueries::new());
+        let retired = std::mem::replace(
+            &mut *self.lock(),
+            LiveQueries {
+                retired: true,
+                ..LiveQueries::new()
+            },
+        );
         // The exchanges take the fence's lock as they drop.
         drop(retired);
     }

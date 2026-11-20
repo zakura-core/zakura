@@ -555,7 +555,7 @@ pub(super) fn run_settlement(
                     session.unwritten.retain(|unwritten| *unwritten != kind);
                     let cap = query.asked.cap().bytes;
                     match session.queries.claim(answer_type(kind), len) {
-                        Ok(Some(answer)) if len as u64 <= cap => {
+                        Ok(Claim::Answer(answer)) if len as u64 <= cap => {
                             summary.claimed += 1;
                             assert_eq!(answer.admitted().kind(), kind, "{SETTLEMENT}");
                             session.answers.push(answer);

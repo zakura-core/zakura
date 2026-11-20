@@ -32,7 +32,7 @@ use super::protocol::{
     DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
-use super::requester::{reservation_pool, ClaimedAnswer, Queries, SettlingHold};
+use super::requester::{reservation_pool, Claim, ClaimedAnswer, Queries, SettlingHold};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity, OUTPUT_BYTES};
 use super::state::DiscoverySessionKey;
 use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, ViolationStage};
@@ -795,7 +795,7 @@ async fn read_frame(
     sink: &DiscoverySink,
 ) -> Result<(), (ViolationStage, SinkReject)> {
     // An answer claims its query before its payload is decoded.
-    let answer = sink
+    let claim = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
         .map_err(|error| {
@@ -803,8 +803,13 @@ async fn read_frame(
                 ViolationStage::Claim,
                 SinkReject::protocol(error.close_row(), error),
             )
-        })?
-        .map(|claimed| TracedAnswer::claimed(claimed, sink));
+        })?;
+    let answer = match claim {
+        Claim::NotAnswer => None,
+        Claim::Answer(claimed) => Some(TracedAnswer::claimed(claimed, sink)),
+        // The session ended, so the reader drops the answer unjudged.
+        Claim::Retired => return Ok(()),
+    };
     if let Flow::Reject(reject) = pipe.run_one(frame) {
         return Err((ViolationStage::Decode, reject));
     }
@@ -3442,6 +3447,7 @@ mod tests {
         for message_type in [MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES] {
             let answer = queries
                 .claim(u16::from(message_type), 0)?
+                .answer()
                 .expect("the frame answers a live query");
             state.record_answer(answer.admitted());
         }
@@ -4077,6 +4083,7 @@ mod tests {
         queries
             .claim(u16::from(MSG_DISCOVERY_PEERS), 2)
             .expect("an empty answer fits its query")
+            .answer()
             .expect("the frame answers a query")
     }
 

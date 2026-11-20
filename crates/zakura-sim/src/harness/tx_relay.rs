@@ -90,17 +90,28 @@ pub const BAD: usize = LOCAL + MAX_LOCAL;
 /// The universe's size.
 pub const UNIVERSE: usize = BAD + 2 * MAX_PEERS;
 
-/// The universe's bodies: transparent V4 transactions of one size, each
-/// with its own output value.
+/// The lock script size of the bodies this node holds itself: past a
+/// peer's QUIC receive window, so a peer that stops reading blocks the
+/// node's writer within one body.
+const LOCAL_SCRIPT: usize = 80 * 1024;
+
+/// The universe's bodies: transparent V4 transactions, each with its own
+/// output value. The peers' and the bad bodies are of one small size, and
+/// this node's own are larger than a peer's receive window.
 pub fn universe() -> Vec<UnminedTx> {
     (0..UNIVERSE)
         .map(|index| {
             let value = 1_000 + i64::try_from(index).expect("a small universe");
+            let script = if (LOCAL..BAD).contains(&index) {
+                vec![0x51; LOCAL_SCRIPT]
+            } else {
+                vec![0x51]
+            };
             UnminedTx::from(Transaction::V4 {
                 inputs: Vec::new(),
                 outputs: vec![transparent::Output {
                     value: Amount::try_from(value).expect("a small positive value"),
-                    lock_script: transparent::Script::new(&[0x51]),
+                    lock_script: transparent::Script::new(&script),
                 }],
                 lock_time: LockTime::unlocked(),
                 expiry_height: block::Height(0),
@@ -904,9 +915,16 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
     (properties::REQUESTS_WITHIN_LIMIT, || {
         steps_prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT_LONG])
     }),
-    // Twenty bodies of the node's, announced, then asked for at once.
+    // Twenty bodies of the node's, announced, then eighteen asked for at
+    // once while the peer reads nothing: sixteen wait unstarted, and the
+    // last closes the connection.
     (properties::SERVING_WITHIN_LIMIT, || {
-        steps_prefix(0x30, 0, 0, &[WAIT_LONG, RelayStep::FetchBurst, WAIT_LONG])
+        steps_prefix(
+            0x30,
+            0x80,
+            0,
+            &[WAIT_LONG, RelayStep::TooManyRequests, WAIT_LONG],
+        )
     }),
     (properties::PENDING_WITHIN_BOUND, || {
         steps_prefix(0, 0x80, 0, &[RelayStep::FillPending, WAIT_LONG])

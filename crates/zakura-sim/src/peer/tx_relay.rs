@@ -22,7 +22,10 @@
 
 use std::{
     collections::{BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -220,10 +223,12 @@ pub enum RelayStep {
     },
     /// Unpaced `Inv`s past the node's byte bucket.
     InvFlood,
-    /// The same `GetTxs` twice in one write: row 7, neutral.
+    /// `GetTxs` for two ids the node announced, the second twice, in one
+    /// write, while the peer stops reading its data stream: row 7, neutral.
     RequestTwice,
-    /// One more `GetTxs` than the node's `Hello` serves, in one write, for
-    /// ids it announced: row 8, neutral.
+    /// Two more `GetTxs` than the node's `Hello` serves, in one write, for
+    /// ids it announced, while the peer stops reading its data stream: row
+    /// 8, neutral.
     TooManyRequests,
 }
 
@@ -355,6 +360,15 @@ pub(crate) struct RelayPeer {
     /// The node's `Inv` byte bucket depth on a connection.
     pub(crate) inv_depth: u64,
 }
+
+/// The QUIC receive windows a peer grants, the smallest QUIC allows, so a
+/// peer that stops reading its data stream blocks the node's data writer
+/// within one of the node's own bodies.
+const RECEIVE_WINDOW: u32 = 64 * 1024;
+
+/// How long a peer stops reading its data stream while it asks for a burst
+/// of bodies, so the node's answers queue unstarted.
+const READ_PAUSE: Duration = Duration::from_secs(2);
 
 /// The time since the run's start.
 fn now() -> Duration {
@@ -492,6 +506,9 @@ struct Session {
     announced: VecDeque<UnminedTxId>,
     /// Every id the node announced on it.
     told: BTreeSet<TxKey>,
+    /// Until when, in milliseconds since the run's start, its data reader
+    /// reads nothing.
+    data_paused: Arc<AtomicU64>,
 }
 
 /// One frame to write: its header, payload, label and the close-table row
@@ -580,7 +597,11 @@ impl RelayPeer {
         QuicEndpoint::bind_with(
             SeededInputs::node_key(self.seed, key_index(self.index)),
             &bind_config(peer_addr(self.index, 0)),
-            &QuicConfig::default(),
+            &QuicConfig {
+                stream_receive_window_bytes: RECEIVE_WINDOW,
+                receive_window_bytes: RECEIVE_WINDOW,
+                ..QuicConfig::default()
+            },
             self.net.clone(),
             SeededInputs::new(self.seed, key_index(self.index)).endpoint_inputs(),
         )
@@ -622,6 +643,7 @@ impl RelayPeer {
         events: &mpsc::UnboundedSender<Event>,
     ) -> Option<Session> {
         let mut writers = Vec::new();
+        let data_paused = Arc::new(AtomicU64::new(0));
         for kind in [TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND] {
             let layout = Self::stream(kind);
             let (mut send, recv) = conn.open_bi().await.ok()?;
@@ -636,7 +658,18 @@ impl RelayPeer {
             .ok()?;
             zakura_rt::task::spawn_named(
                 "peer_tx_relay",
-                read(number, kind, recv, layout.frame_cap, events.clone()),
+                read(
+                    number,
+                    kind,
+                    recv,
+                    layout.frame_cap,
+                    events.clone(),
+                    if kind == TX_RELAY_DATA_KIND {
+                        Arc::clone(&data_paused)
+                    } else {
+                        Arc::new(AtomicU64::new(0))
+                    },
+                ),
             );
             writers.push(Writer {
                 stream: StreamId {
@@ -660,6 +693,7 @@ impl RelayPeer {
             node_hellos: 0,
             announced: VecDeque::new(),
             told: BTreeSet::new(),
+            data_paused,
         })
     }
 
@@ -1277,19 +1311,26 @@ impl RelayPeer {
                 if !hello {
                     return Some(true);
                 }
-                // An id the node announced, which it serves, so its first
-                // request is still unanswered when the second arrives.
-                let id = match session.announced.front() {
-                    Some(id) => *id,
-                    None => self.fresh(connection),
-                };
-                (Vec::new(), vec![ask(id), ask(id)])
-            }
-            RelayStep::TooManyRequests => {
-                if !hello || session.announced.len() <= MAX_SERVES {
+                // Two ids the node announced, the second asked for twice
+                // while the peer reads nothing: the node's writer blocks on
+                // the first body, so the second's request is still
+                // unanswered when it comes again.
+                if session.announced.len() < 2 {
                     return Some(true);
                 }
-                let ids: Vec<UnminedTxId> = session.announced.drain(..=MAX_SERVES).collect();
+                let ids: Vec<UnminedTxId> = session.announced.drain(..2).collect();
+                pause_reads(session);
+                (Vec::new(), vec![ask(ids[0]), ask(ids[1]), ask(ids[1])])
+            }
+            RelayStep::TooManyRequests => {
+                // While the peer reads nothing, the node's writer blocks on
+                // the first body, and the rest queue unstarted: the last
+                // request is past what the node's `Hello` serves.
+                if !hello || session.announced.len() < MAX_SERVES + 2 {
+                    return Some(true);
+                }
+                let ids: Vec<UnminedTxId> = session.announced.drain(..MAX_SERVES + 2).collect();
+                pause_reads(session);
                 (Vec::new(), ids.into_iter().map(ask).collect())
             }
         };
@@ -1329,17 +1370,33 @@ fn inv_bytes(entries: usize) -> u64 {
     frame.payload.len() as u64
 }
 
+/// Stops `session`'s data reader for [`READ_PAUSE`].
+fn pause_reads(session: &Session) {
+    let until = now().saturating_add(READ_PAUSE);
+    let until = u64::try_from(until.as_millis()).unwrap_or(u64::MAX);
+    session.data_paused.store(until, Ordering::SeqCst);
+}
+
 /// Reads frames from the node on session `session`'s `kind` stream, and
-/// hands each to the peer's task, then the stream's end.
+/// hands each to the peer's task, then the stream's end. It reads nothing
+/// until `paused`, in milliseconds since the run's start, has passed.
 async fn read(
     session: u32,
     kind: u16,
     mut recv: RecvStream,
     cap: u32,
     events: mpsc::UnboundedSender<Event>,
+    paused: Arc<AtomicU64>,
 ) {
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     loop {
+        loop {
+            let until = Duration::from_millis(paused.load(Ordering::SeqCst));
+            if until <= now() {
+                break;
+            }
+            sleep_until(until).await;
+        }
         let mut header = [0; 8];
         if recv.read_exact(&mut header).await.is_err() {
             break;

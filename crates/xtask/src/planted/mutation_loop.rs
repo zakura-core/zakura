@@ -489,7 +489,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         };
         cases.extend(native_cases(&store, &dir)?);
     }
-    cases.extend(planted_cases(&store, &flags.planted, &mut std::io::stderr())?);
+    cases.extend(planted_cases(
+        &store,
+        &flags.planted,
+        &mut std::io::stderr(),
+    )?);
     let changed = flags.changed_since.as_deref().map(|rev| super::Changed {
         rev,
         store: flags.store_changed.as_deref(),

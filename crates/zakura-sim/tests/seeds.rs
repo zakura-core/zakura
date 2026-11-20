@@ -44,7 +44,6 @@ fn every_stored_seed_validates() {
     }
 }
 
-
 /// With `ZAKURA_QA_STORE` set, as the joint-run droplet's suite step sets
 /// it, each case under the store's `qa/planted/` sits beside its patch and names a property
 /// a harness reports. A seed case names a seed of any set that carries a

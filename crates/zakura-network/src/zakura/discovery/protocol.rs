@@ -13,7 +13,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
 use zakura_chain::block;
-use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey};
+use zakura_quic::{NodeAddr, NodeId, NodeKey, NodeKeyList, NodeSecretKey};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
     sync::{watch, AsyncMutex},
@@ -955,6 +955,9 @@ pub struct ZakuraDiscoveryPersistedEntry {
 pub struct ZakuraDiscoveryDialCandidate {
     /// Candidate node id.
     pub node_id: NodeId,
+    /// The candidate's Ed25519 key, which its signed record or a config
+    /// entry written with the key gives. A dial then requires it in TLS.
+    pub key: Option<NodeKey>,
     /// Direct addresses to pass to iroh for dialing.
     pub direct_addrs: Vec<SocketAddr>,
     /// Whether this candidate came from static/operator configuration.
@@ -976,7 +979,11 @@ pub(crate) enum DialAdmission {
 impl ZakuraDiscoveryDialCandidate {
     /// Converts this candidate into a dial address.
     pub fn node_addr(&self) -> NodeAddr {
-        NodeAddr::with_addrs(self.node_id, self.direct_addrs.clone())
+        NodeAddr {
+            id: self.node_id,
+            key: self.key,
+            direct: self.direct_addrs.clone(),
+        }
     }
 }
 
@@ -2440,6 +2447,7 @@ impl ZakuraDiscoveryBook {
             .entry(node_addr.id)
             .or_insert_with(|| ZakuraStaticDiscoveryCandidate {
                 node_id: node_addr.id,
+                key: None,
                 direct_addrs: Vec::new(),
                 last_seen: now,
                 last_dial_attempt: None,
@@ -2448,6 +2456,7 @@ impl ZakuraDiscoveryBook {
                 failure_count: 0,
                 alpn_backoff_until: None,
             });
+        candidate.key = candidate.key.or(node_addr.key);
         candidate.direct_addrs.extend(direct_addrs);
         candidate.direct_addrs.sort_unstable();
         candidate.direct_addrs.dedup();
@@ -3254,6 +3263,9 @@ struct DiscoveryEntryMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ZakuraStaticDiscoveryCandidate {
     node_id: NodeId,
+    /// The node's Ed25519 key, when a config entry for it was written with
+    /// the key.
+    key: Option<NodeKey>,
     direct_addrs: Vec<SocketAddr>,
     last_seen: u64,
     last_dial_attempt: Option<u64>,
@@ -3322,11 +3334,13 @@ impl DialCandidateRef<'_> {
         match self {
             Self::SignedRecord(entry) => ZakuraDiscoveryDialCandidate {
                 node_id: entry.record.body.node_id(),
+                key: entry.record.body.keys.ed25519(),
                 direct_addrs: confirmed_first(entry),
                 is_static: entry.is_static,
             },
             Self::StaticConfigured(candidate) => ZakuraDiscoveryDialCandidate {
                 node_id: candidate.node_id,
+                key: candidate.key,
                 direct_addrs: candidate.direct_addrs.clone(),
                 is_static: true,
             },
@@ -4355,6 +4369,7 @@ mod tests {
     fn candidate_for(record: &ZakuraNodeRecord, is_static: bool) -> ZakuraDiscoveryDialCandidate {
         ZakuraDiscoveryDialCandidate {
             node_id: record.body.node_id(),
+            key: record.body.keys.ed25519(),
             direct_addrs: record.body.direct_addrs.clone(),
             is_static,
         }
@@ -6276,6 +6291,7 @@ mod tests {
             ),
             vec![ZakuraDiscoveryDialCandidate {
                 node_id,
+                key: None,
                 direct_addrs: vec![loopback_addr, second_addr],
                 is_static: true,
             }]

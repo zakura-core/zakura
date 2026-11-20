@@ -25,9 +25,10 @@ pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 /// The ALPN for the zakura-quic transport (SPEC WIRE-2).
 ///
 /// Its suffix is [`ZAKURA_PROTOCOL_VERSION_CURRENT`]. Version 3 replaced the
-/// Iroh 1.x wire profile of `p2p-v2/2`, so nodes on different versions reach
-/// each other only over the legacy protocol.
-pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/3";
+/// Iroh 1.x wire profile of `p2p-v2/2`, and version 4 changed what a node ID
+/// is, so nodes on different versions reach each other only over the legacy
+/// protocol.
+pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/4";
 
 /// Magic bytes for Zakura legacy upgrade prelude messages.
 pub const PRELUDE_MAGIC: [u8; 8] = *b"ZAKURA1\0";
@@ -64,7 +65,11 @@ pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
 /// down to this one, and the negotiated ALPN selects the version. A release
 /// that adds version N+1 while it still speaks N keeps this at N, so the two
 /// cohorts keep connecting natively; a hard break raises it.
-pub const ZAKURA_PROTOCOL_VERSION_MIN_NATIVE: u16 = 3;
+///
+/// Version 4 is a hard break: a node's ID is the hash of its key list from
+/// that version on, and its Ed25519 key before it. A node that spoke both
+/// would be two different nodes to its peers.
+pub const ZAKURA_PROTOCOL_VERSION_MIN_NATIVE: u16 = 4;
 
 /// Returns the ALPN that selects a native Zakura protocol version.
 pub fn p2p_v2_alpn(version: u16) -> Vec<u8> {
@@ -96,8 +101,9 @@ pub fn zakura_protocol_for_alpn(alpn: &[u8]) -> Option<u16> {
 ///
 /// The legacy upgrade prelude advertises it, so a node on another native
 /// transport version stays on the legacy protocol instead of dialing a QUIC
-/// profile it can't speak. Version 2 was Iroh 1.x; version 3 is zakura-quic.
-pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 3;
+/// profile it can't speak. Version 2 was Iroh 1.x; version 3 is zakura-quic;
+/// version 4 names a node by the hash of its key list.
+pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 4;
 
 /// Hard cap for any legacy TCP upgrade prelude payload.
 pub const MAX_PRELUDE_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -2060,6 +2066,8 @@ mod tests {
         );
         for unsupported in [
             &b"p2p-v2/2"[..],
+            // The version before a node ID became the hash of a key list.
+            b"p2p-v2/3",
             b"p2p-v2/03",
             b"p2p-v2/",
             b"p2p-v2/99999999",

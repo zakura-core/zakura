@@ -498,7 +498,9 @@ where
                 index,
                 name: name.name,
                 port: name.port,
-                node_id: name.node_id.map(ZakuraPeerId::from_node_id),
+                node_id: name
+                    .node_id
+                    .map(|node| ZakuraPeerId::from_node_id(node.node_id())),
             };
             (Some(name), None)
         }))

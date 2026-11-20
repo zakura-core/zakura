@@ -456,7 +456,7 @@ mod tests {
         let config = ZakuraConfig {
             bootstrap_peers: node_ids
                 .iter()
-                .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+                .map(|node_id| format!("id:{node_id}@192.0.2.1:8234"))
                 .collect(),
             peer_memory_budget_bytes: budget_for(30),
             ..ZakuraConfig::default()
@@ -489,7 +489,7 @@ mod tests {
         // Extra addresses for one identity and unparsable entries don't count.
         let config = ZakuraConfig {
             bootstrap_peers: (1..=16)
-                .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
+                .map(|port| format!("id:{}@192.0.2.1:{port}", node_ids[0]))
                 .chain(["not a bootstrap peer".to_string()])
                 .collect(),
             peer_memory_budget_bytes: budget_for(30),
@@ -584,7 +584,7 @@ mod tests {
         let mut config = Config::default();
         config.zakura.bootstrap_peers = node_ids
             .iter()
-            .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+            .map(|node_id| format!("id:{node_id}@192.0.2.1:8234"))
             .collect();
         config.zakura.max_connections = 256;
         config.zakura.peer_memory_budget_bytes = budget_for(18);

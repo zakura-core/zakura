@@ -34,6 +34,7 @@ pub(super) fn candidate(
 ) -> ZakuraDiscoveryDialCandidate {
     ZakuraDiscoveryDialCandidate {
         node_id,
+        key: None,
         direct_addrs,
         is_static: false,
     }

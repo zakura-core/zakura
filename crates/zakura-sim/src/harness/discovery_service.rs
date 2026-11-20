@@ -217,7 +217,7 @@ fn bootstrap_peers(seed: [u8; 32], indexes: &[usize], peers: &[PeerSpec]) -> Vec
             let addr = peers
                 .get(index)
                 .map_or_else(|| peer_addr(index, 0), |peer| peer.listen_addr(index, 0));
-            format!("{id}@{addr}")
+            format!("id:{id}@{addr}")
         })
         .collect()
 }

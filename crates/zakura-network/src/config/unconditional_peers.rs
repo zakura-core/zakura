@@ -6,9 +6,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::zakura::ConfiguredNode;
 use ipnet::IpNet;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use zakura_quic::NodeId;
 
 use crate::{
     protocol::external::{canonical_ip, canonical_peer_addr},
@@ -71,8 +71,9 @@ pub struct UnconditionalPeerName {
     /// The port that Zakura dials at each address of the name.
     pub port: u16,
 
-    /// The node ID that the peer at the name's address must prove, if the entry pins one.
-    pub node_id: Option<NodeId>,
+    /// The node that the peer at the name's address must prove to be, if the entry pins
+    /// one: an Ed25519 public key, or `id:` and a node ID.
+    pub node_id: Option<ConfiguredNode>,
 }
 
 /// Writes the name in its config form, such as `<node id>@peer.example.com:8233`.
@@ -294,7 +295,7 @@ impl FromIterator<IpNet> for UnconditionalPeers {
 
 /// Parses a DNS name with a non-zero port, such as `peer.example.com:8233`, pinned to
 /// `node_id` if it is given.
-fn parse_name(entry: &str, node_id: Option<NodeId>) -> Option<UnconditionalPeerName> {
+fn parse_name(entry: &str, node_id: Option<ConfiguredNode>) -> Option<UnconditionalPeerName> {
     let (name, port) = entry.rsplit_once(':')?;
     let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
 

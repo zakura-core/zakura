@@ -63,7 +63,8 @@ pub use tcp_warmup::TcpWarmupConfig;
 pub use unconditional_peers::{UnconditionalPeerName, UnconditionalPeers};
 
 pub(crate) use cache_dir::{
-    default_network_identity_dir, zakura_discovery_sequence_file_path,
+    default_network_identity_dir, move_legacy_zakura_discovery_sequence_file,
+    zakura_discovery_sequence_file_path,
     zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
@@ -1046,6 +1047,34 @@ impl Config {
     /// `node_id` authored, under [`identity_dir`](Self::identity_dir).
     pub(crate) fn zakura_discovery_sequence_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
         zakura_discovery_sequence_file_path(&self.identity_dir, &self.network, node_id)
+    }
+
+    /// Moves the sequence file an older release wrote under the node's
+    /// Ed25519 `key` to [`Self::zakura_discovery_sequence_file`]'s name for
+    /// `node_id`, once. A failure is logged and the node starts its sequence
+    /// from the clock, as it does with no file.
+    pub(crate) fn move_legacy_zakura_discovery_sequence_file(
+        &self,
+        key: &zakura_quic::NodeKey,
+        node_id: &zakura_quic::NodeId,
+    ) {
+        match move_legacy_zakura_discovery_sequence_file(
+            &self.identity_dir,
+            &self.network,
+            key,
+            node_id,
+        ) {
+            Ok(true) => info!(
+                %node_id,
+                "moved the Zakura discovery sequence file to this node's new node ID"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                %node_id,
+                %error,
+                "could not move the Zakura discovery sequence file to this node's new node ID"
+            ),
+        }
     }
 
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer

@@ -388,7 +388,11 @@ fn discovery_node_addr_with_reserved_ip_capacity(
 
     (!direct_addrs.is_empty()).then(|| {
         (
-            NodeAddr::with_addrs(candidate.node_id, direct_addrs),
+            NodeAddr {
+                id: candidate.node_id,
+                key: candidate.key,
+                direct: direct_addrs,
+            },
             reserved_ips,
         )
     })

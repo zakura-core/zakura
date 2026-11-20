@@ -1030,6 +1030,7 @@ async fn dial_keeps_the_first_address_of_each_ip() {
         .expect("mapped test address parses");
     let candidate = ZakuraDiscoveryDialCandidate {
         node_id: node_id(5),
+        key: None,
         direct_addrs: vec![
             SocketAddr::new(shared, 8233),
             SocketAddr::new(shared, 8234),

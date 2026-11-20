@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod block_sync;
+mod configured_node;
 mod discovery;
 #[cfg(all(test, not(zakura_sim)))]
 mod example_reactor;
@@ -39,6 +40,7 @@ mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;
+pub use configured_node::{ConfiguredNode, ConfiguredNodeError};
 pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;

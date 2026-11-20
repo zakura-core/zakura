@@ -1,6 +1,6 @@
 //! Bootstrap and candidate dial entry points for native discovery.
 
-use std::{net::SocketAddr, str::FromStr};
+use std::net::SocketAddr;
 
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
@@ -13,8 +13,8 @@ use zakura_rt::{
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
-    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
-    DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+    ConfiguredNode, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits,
+    DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF, DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
 
 /// Spawn supervised dials for configured native bootstrap peers.
@@ -102,7 +102,7 @@ fn grouped_remote_bootstrap_peers(
     bootstrap_peers: Vec<String>,
     local_node_id: NodeId,
 ) -> Vec<NodeAddr> {
-    let mut direct_addrs_by_node = HashMap::<NodeId, Vec<SocketAddr>>::new();
+    let mut peers = HashMap::<NodeId, NodeAddr>::new();
     for entry in bootstrap_peers {
         let node_addr = match parse_bootstrap_peer(&entry) {
             Ok(node_addr) => node_addr,
@@ -115,18 +115,21 @@ fn grouped_remote_bootstrap_peers(
             tracing::debug!(?entry, "ignoring local Zakura bootstrap peer");
             continue;
         }
-        direct_addrs_by_node
+        let peer = peers
             .entry(node_addr.id)
-            .or_default()
-            .extend(node_addr.direct);
+            .or_insert_with(|| NodeAddr::new(node_addr.id));
+        // One entry written with the node's key is enough for every dial to
+        // the node to require it in TLS.
+        peer.key = peer.key.or(node_addr.key);
+        peer.direct.extend(node_addr.direct);
     }
 
-    direct_addrs_by_node
-        .into_iter()
-        .map(|(node_id, mut direct_addrs)| {
-            direct_addrs.sort_unstable();
-            direct_addrs.dedup();
-            NodeAddr::with_addrs(node_id, direct_addrs)
+    peers
+        .into_values()
+        .map(|mut peer| {
+            peer.direct.sort_unstable();
+            peer.direct.dedup();
+            peer
         })
         .collect()
 }
@@ -174,16 +177,20 @@ pub(crate) async fn native_discovery_dial(
     .await
 }
 
+/// Parses a `zakura.bootstrap_peers` entry, `<node>@<socket address>`, into
+/// the address to dial. `<node>` is an Ed25519 public key, or `id:` and a
+/// node ID (see [`ConfiguredNode`]).
 pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandlerError> {
-    let Some((node_id, direct_addr)) = entry.split_once('@') else {
+    let Some((node, direct_addr)) = entry.split_once('@') else {
         return Err(ZakuraHandlerError::InvalidBootstrapPeer);
     };
-    let node_id =
-        NodeId::from_str(node_id).map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
+    let node = node
+        .parse::<ConfiguredNode>()
+        .map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
     let direct_addr = direct_addr
         .parse::<SocketAddr>()
         .map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
-    Ok(NodeAddr::with_addrs(node_id, [direct_addr]))
+    Ok(node.node_addr([direct_addr]))
 }
 
 #[cfg(all(test, not(zakura_sim)))]
@@ -204,9 +211,9 @@ mod tests {
         let local = zakura_quic::NodeSecretKey::generate().public();
         let peers = |node_id: NodeId, count: u16| {
             (0..count)
-                .map(|port| format!("{node_id}@127.0.0.1:{}", 8233 + port))
+                .map(|port| format!("id:{node_id}@127.0.0.1:{}", 8233 + port))
                 // A repeated address counts once.
-                .chain([format!("{node_id}@127.0.0.1:8233")])
+                .chain([format!("id:{node_id}@127.0.0.1:8233")])
                 .collect::<Vec<_>>()
         };
         let reserve = |connections: usize, pending: usize| {
@@ -322,10 +329,10 @@ mod tests {
         let second_addr: SocketAddr = "127.0.0.1:8235".parse().expect("test address parses");
         let grouped = grouped_remote_bootstrap_peers(
             vec![
-                format!("{local_id}@{first_addr}"),
-                format!("{remote_id}@{first_addr}"),
-                format!("{remote_id}@{second_addr}"),
-                format!("{remote_id}@{second_addr}"),
+                format!("id:{local_id}@{first_addr}"),
+                format!("id:{remote_id}@{first_addr}"),
+                format!("id:{remote_id}@{second_addr}"),
+                format!("id:{remote_id}@{second_addr}"),
             ],
             local_id,
         );

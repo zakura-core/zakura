@@ -393,6 +393,13 @@ fn a_verified_mined_block_record_is_retired_only_by_its_age() {
         .commit();
     assert_eq!(claims.mined_blocks(), 1);
 
+    // It outlasts the deadline of every claim it can void.
+    submit_another(
+        &claims,
+        now + CLAIM_BODY_DEADLINE + Duration::from_millis(1),
+    );
+    assert_eq!(claims.mined_blocks(), 1);
+
     submit_another(&claims, now + MINED_RECORD_LIFETIME);
     assert_eq!(claims.mined_blocks(), 1, "kept through its lifetime");
 

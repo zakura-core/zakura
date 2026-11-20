@@ -55,7 +55,8 @@ pub(super) const MAX_ANNOUNCEMENT_CLAIMS: usize = 64;
 /// the record was made, so it has expired once the record is older than
 /// [`CLAIM_BODY_DEADLINE`], and an expired claim is ranked by arrival just as a voided one is.
 /// The record is kept for twice that, so a body whose arrival time was read just inside a
-/// claim's deadline still finds the record, however late it looks the claim up.
+/// claim's deadline still finds the record if it looks the claim up as much as one more
+/// deadline later.
 pub(super) const MINED_RECORD_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
 
 /// A place in receipt order reserved for a block when its header arrived.

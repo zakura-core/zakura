@@ -3222,6 +3222,7 @@ dependencies = [
 name = "zakura-quic"
 version = "1.2.0"
 dependencies = [
+ "blake2b_simd",
  "bytes",
  "curve25519-dalek",
  "futures",

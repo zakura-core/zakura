@@ -17,10 +17,14 @@
 //! through ordered message channels, so no lock guards a QUIC state machine.
 
 mod key;
+mod key_list;
 mod tls;
 
 pub use key::{
     KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError, KEY_LENGTH,
+};
+pub use key_list::{
+    KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS, MAX_NODE_KEY_LIST_BYTES,
 };
 pub use tls::TlsConfigError;
 

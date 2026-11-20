@@ -12,4 +12,3 @@ checks = [
 [typed]
 harness = "discovery/wire"
 scenario = "qa/planted/discovery/s4v2/undeclared-type-closes/drop-undeclared-type.scenario.json"
-plan = "qa/planted/discovery/s4v2/undeclared-type-closes/drop-undeclared-type.plan.bin"

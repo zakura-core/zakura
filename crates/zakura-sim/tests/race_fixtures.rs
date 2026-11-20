@@ -7,8 +7,6 @@
 
 mod support;
 
-use std::path::Path;
-
 use support::inputs;
 use zakura_sim::{
     harness::{
@@ -18,6 +16,7 @@ use zakura_sim::{
         },
         run_harness, Subsystem,
     },
+    seed,
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -139,14 +138,15 @@ fn witnessed<F: Fixture>(variant: Variant, input: &[u8]) -> WitnessScenario<Race
     }
 }
 
-/// `F`'s saved schedule's Plan bytes: `tests/fixtures/race-schedules/`'s
-/// seed for `F` after its scenario prefix, which `race_schedules.rs` checks
-/// encodes the planted race on 2 workers.
+/// `F`'s saved schedule's Plan bytes: the seed `race-schedule-<name>` after
+/// its scenario prefix, which `race_schedules.rs` checks encodes the planted
+/// race on 2 workers.
 fn saved_plan<F: Fixture>() -> Vec<u8> {
-    let name = F::NAME.trim_start_matches("race/");
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("tests/fixtures/race-schedules/{name}.bin"));
-    let input = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let name = format!("race-schedule-{}", F::NAME.trim_start_matches("race/"));
+    let input = seed::find(&name)
+        .unwrap_or_else(|| panic!("{name} is a registered seed"))
+        .input()
+        .to_vec();
     input[<Race<F> as Subsystem>::SCENARIO_BYTES..].to_vec()
 }
 

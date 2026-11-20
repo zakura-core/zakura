@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/transport/handshake_counts.rs
++++ b/crates/zakura-network/src/zakura/transport/handshake_counts.rs
+@@ -77,7 +77,7 @@
+             .entry(host)
+             .or_insert_with(|| Bucket::new(handshake_cadence(max_connections_per_ip), now));
+         bucket.refill(now);
+-        if bucket.take() {
++        if false {
+             HandshakeCadenceAdmission::Admit
+         } else {
+             HandshakeCadenceAdmission::Exhausted

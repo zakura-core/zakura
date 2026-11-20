@@ -38,6 +38,9 @@ pub enum Label {
     /// An update names an unknown key or sequence, acknowledges an unknown
     /// cursor, adds no credit, grants beyond the window, or reuses a key.
     BadCursor,
+    /// A metered row's frame is past the receiver's byte bucket for the
+    /// connection.
+    OverRate,
     /// The frame is well formed, but its content fails a family check.
     BadContent,
     /// None of the above.
@@ -46,7 +49,7 @@ pub enum Label {
 
 impl Label {
     /// Every label, in table order.
-    pub const ALL: [Label; 13] = [
+    pub const ALL: [Label; 14] = [
         Label::UndeclaredType,
         Label::ReservedFlags,
         Label::ShortPayload,
@@ -58,6 +61,7 @@ impl Label {
         Label::OverCredit,
         Label::AfterClose,
         Label::BadCursor,
+        Label::OverRate,
         Label::BadContent,
         Label::Conformant,
     ];
@@ -77,6 +81,7 @@ impl Label {
             Label::OverCredit => "over-credit",
             Label::AfterClose => "after-close",
             Label::BadCursor => "bad-cursor",
+            Label::OverRate => "over-rate",
             Label::BadContent => "bad-content",
             Label::Conformant => "conformant",
         }
@@ -84,7 +89,7 @@ impl Label {
 
     /// The label's position in the table.
     const fn bit(self) -> u16 {
-        // The enum has 13 variants, so the shift stays in range.
+        // The enum has 14 variants, so the shift stays in range.
         1 << self as u16
     }
 }

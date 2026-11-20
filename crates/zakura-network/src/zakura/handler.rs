@@ -65,10 +65,10 @@ use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
     worker_framed_channel, AdmittedFrame, CompatResponseGrant, ConnectionResources, FrameGate,
-    FrameGrant, FramedWorkerRecv, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause,
-    OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope,
-    SessionLayout, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
-    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    FrameGrant, FramedWorkerRecv, HandshakeCounts, IpAdmission, NodeResources,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase,
+    ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout, StreamResources,
+    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -406,6 +406,8 @@ pub struct ZakuraConfig {
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
     pub block_sync: ZakuraBlockSyncConfig,
+    /// `tx-relay` settings (`[network.zakura.tx_relay]`).
+    pub tx_relay: super::ZakuraTxRelayConfig,
     /// Optional private dev-network cohort tag.
     ///
     /// When set, this node only forms Zakura (v2) connections with peers
@@ -441,6 +443,7 @@ impl Default for ZakuraConfig {
             trace_peer_names: BTreeMap::new(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
+            tx_relay: super::ZakuraTxRelayConfig::default(),
             dev_network: None,
         }
     }
@@ -481,7 +484,8 @@ impl ZakuraConfig {
     ///
     /// The handshake share is the `[network.zakura.quic]` receive window. The
     /// kinds are legacy gossip (2), legacy requests (3), discovery (4), header
-    /// sync (5) and block sync (6). The compatibility exchanges and TCP ingress
+    /// sync (5) and block sync (6), and `tx-relay`'s data (9) and state (10)
+    /// when it is enabled. The compatibility exchanges and TCP ingress
     /// have their own envelope terms, so they are not kinds. Other kinds keep
     /// [`ReactorShares::from_quic`]'s share.
     pub fn reactor_shares(&self, network: &Network) -> ReactorShares {
@@ -495,17 +499,28 @@ impl ZakuraConfig {
             receive: u64::MAX,
             output: u64::MAX,
         });
+        let mut kinds = vec![
+            (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
+            (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
+            (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
+            (
+                HEADER_SYNC_STREAM_KIND,
+                super::header_sync::v9::budget(network),
+            ),
+            (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
+        ];
+        // `tx-relay`'s kinds are listed only when it runs, so a node with it
+        // off budgets exactly as before.
+        if self.tx_relay.enabled {
+            use super::tx_relay::wire::{
+                TX_RELAY_DATA_BUDGET, TX_RELAY_DATA_KIND, TX_RELAY_STATE_BUDGET,
+                TX_RELAY_STATE_KIND,
+            };
+            kinds.push((TX_RELAY_DATA_KIND, TX_RELAY_DATA_BUDGET));
+            kinds.push((TX_RELAY_STATE_KIND, TX_RELAY_STATE_BUDGET));
+        }
         ReactorShares {
-            kinds: vec![
-                (LEGACY_GOSSIP_STREAM_KIND, super::LEGACY_GOSSIP_BUDGET),
-                (LEGACY_REQUEST_STREAM_KIND, super::LEGACY_REQUESTS_BUDGET),
-                (DISCOVERY_STREAM_KIND, super::DISCOVERY_BUDGET),
-                (
-                    HEADER_SYNC_STREAM_KIND,
-                    super::header_sync::v9::budget(network),
-                ),
-                (ZAKURA_STREAM_BLOCK_SYNC, block_sync),
-            ],
+            kinds,
             ..ReactorShares::from_quic(&self.quic)
         }
     }
@@ -653,7 +668,8 @@ pub struct ZakuraLocalLimits {
     pub keep_alive_interval: Duration,
     /// Stream prelude read timeout.
     pub prelude_timeout: Duration,
-    /// Control handshake read/write timeout.
+    /// Control handshake deadline: it bounds each read and write, and the
+    /// whole exchange in both directions.
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
@@ -900,17 +916,8 @@ impl ZakuraLocalLimits {
 /// one slot, so small caps still leave dials room. A cap of 1 stays inbound's,
 /// since a node that accepts nothing can't be reached.
 fn without_outbound_reserve(cap: usize) -> usize {
-    let reserve = if cap >= 2 {
-        (cap / OUTBOUND_RESERVE_DIVISOR).max(1)
-    } else {
-        0
-    };
-    cap - reserve
+    super::transport::inbound_share(cap)
 }
-
-/// Inbound peers leave `1 / OUTBOUND_RESERVE_DIVISOR` of the connection and
-/// control-handshake caps to outbound work.
-const OUTBOUND_RESERVE_DIVISOR: usize = 4;
 
 /// Per-connection limits after negotiation and clamping.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -951,6 +958,11 @@ pub struct CustomService {
 
     /// Remote service ids to prefer when selecting outbound discovery peers.
     pub seeks: Vec<ZakuraServiceId>,
+
+    /// `tx-relay`'s live-session record, set only by
+    /// [`tx_relay_service`](super::tx_relay_service). With it, the legacy
+    /// adapter leaves each peer with a live session to `tx-relay`.
+    pub tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 impl From<CustomService> for Arc<dyn Service> {
@@ -1025,6 +1037,22 @@ pub struct ZakuraHeaderSyncDriverStartup {
 }
 
 impl ZakuraEndpoint {
+    /// Applies the production initial capability gate for a simulator witness.
+    #[cfg(zakura_sim)]
+    pub fn disable_header_sync_for_sim(&self) {
+        self.handler.set_header_sync_enabled(false);
+    }
+
+    /// Runs production capability enablement and its registered-peer reconnect pass.
+    #[cfg(zakura_sim)]
+    pub async fn enable_header_sync_for_sim(&self, epoch: u64) -> usize {
+        enable_header_sync_and_renegotiate(
+            &self.handler,
+            &self.supervisor,
+            zakura_node_services::sync_lifecycle::LifecycleEpoch::new(epoch),
+        )
+        .await
+    }
     /// Returns the local node identity used to authenticate native connections.
     pub(crate) fn local_node_id(&self) -> NodeId {
         self.quic.local_id()
@@ -1462,6 +1490,9 @@ pub struct ZakuraSupervisorHandle {
     /// The same counts the supervisor state charges, read by the QUIC acceptor.
     ip_slots: IpSlots,
     max_connections_per_ip: usize,
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    tx_relay_sessions: Option<super::TxRelaySessions>,
 }
 
 /// Connections charged to each source IP: registered connections, and inbound
@@ -1471,74 +1502,43 @@ pub struct ZakuraSupervisorHandle {
 /// A std mutex guards the counts, so the QUIC acceptor, which must not block,
 /// reads them without the supervisor's async lock (zakura-quic ADM-4).
 #[derive(Clone, Debug, Default)]
-struct IpSlots(Arc<StdMutex<IpSlotCounts>>);
-
-#[derive(Debug, Default)]
-struct IpSlotCounts {
-    registered: HashMap<IpAddr, usize>,
-    handshaking: HashMap<IpAddr, usize>,
-}
+struct IpSlots(Arc<StdMutex<HandshakeCounts>>);
 
 impl IpSlots {
-    fn counts(&self) -> MutexGuard<'_, IpSlotCounts> {
+    fn counts(&self) -> MutexGuard<'_, HandshakeCounts> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Registered connections from `ip`.
     fn registered(&self, ip: IpAddr) -> usize {
-        self.counts()
-            .registered
-            .get(&ip)
-            .copied()
-            .unwrap_or_default()
+        self.counts().registered(ip)
     }
 
-    /// Control handshakes in progress from `ip`.
-    fn handshaking(&self, ip: IpAddr) -> usize {
-        self.counts()
-            .handshaking
-            .get(&ip)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Registered connections and control handshakes from `ip`.
     #[cfg(test)]
     fn charged(&self, ip: IpAddr) -> usize {
         let counts = self.counts();
-        let registered = counts.registered.get(&ip).copied().unwrap_or_default();
-        let handshaking = counts.handshaking.get(&ip).copied().unwrap_or_default();
-        registered.saturating_add(handshaking)
+        counts.registered(ip).saturating_add(counts.handshaking(ip))
     }
 
     #[cfg(any(test, all(debug_assertions, not(zakura_sim))))]
     fn registered_total(&self) -> usize {
-        self.counts().registered.values().sum()
+        self.counts().registered_total()
     }
 
     fn add_registered(&self, ip: IpAddr) {
-        *self.counts().registered.entry(ip).or_default() += 1;
+        self.counts().add_registered(ip);
     }
 
     fn remove_registered(&self, ip: IpAddr) {
-        decrement_ip_count(&mut self.counts().registered, ip);
+        self.counts().remove_registered(ip);
     }
 
-    /// Charges a control handshake to `ip` until the guard drops.
     fn enter_handshake(&self, ip: IpAddr) -> ControlHandshakeGuard {
-        *self.counts().handshaking.entry(ip).or_default() += 1;
+        self.counts().enter_handshake(ip);
         ControlHandshakeGuard {
             slots: self.clone(),
             ip,
-        }
-    }
-}
-
-fn decrement_ip_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
-    if let Some(count) = counts.get_mut(&ip) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            counts.remove(&ip);
+            #[cfg(any(test, zakura_sim))]
+            observation: None,
         }
     }
 }
@@ -1548,11 +1548,86 @@ fn decrement_ip_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
 struct ControlHandshakeGuard {
     slots: IpSlots,
     ip: IpAddr,
+    #[cfg(any(test, zakura_sim))]
+    observation: Option<HandshakeObservation>,
+}
+
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+struct HandshakeObservation {
+    observer: Arc<dyn super::TransportObserver>,
+    remote: SocketAddr,
+    shared_id: [u8; 16],
+    started: Instant,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl HandshakeObservation {
+    fn released(&self, stage: &'static str, elapsed: Option<Duration>) {
+        self.observer.observe(super::TransportEvent::Handshake {
+            remote: self.remote,
+            shared_id: self.shared_id,
+            stage,
+            validation: None,
+            error: None,
+            elapsed,
+        });
+    }
 }
 
 impl Drop for ControlHandshakeGuard {
     fn drop(&mut self) {
-        decrement_ip_count(&mut self.slots.counts().handshaking, self.ip);
+        self.slots.counts().leave_handshake(self.ip);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observation) = &self.observation {
+            observation.released("released", Some(observation.started.elapsed()));
+        }
+    }
+}
+
+/// Releases the semaphore permits and their machine charge under the same lock.
+struct PendingHandshakeGuard {
+    slots: IpSlots,
+    shared: Option<OwnedSemaphorePermit>,
+    inbound: Option<OwnedSemaphorePermit>,
+    #[cfg(any(test, zakura_sim))]
+    observation: Option<HandshakeObservation>,
+}
+
+impl Drop for PendingHandshakeGuard {
+    fn drop(&mut self) {
+        let mut counts = self.slots.counts();
+        let inbound = self.inbound.is_some();
+        drop(self.shared.take());
+        drop(self.inbound.take());
+        counts.release_pending(inbound);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observation) = &self.observation {
+            observation.released("pending-released", None);
+        }
+    }
+}
+
+/// Releases connection permits and their machine charge under the same lock.
+struct ConnectionAdmissionGuard {
+    slots: IpSlots,
+    shared: Option<OwnedSemaphorePermit>,
+    inbound: Option<OwnedSemaphorePermit>,
+    #[cfg(any(test, zakura_sim))]
+    observation: Option<HandshakeObservation>,
+}
+
+impl Drop for ConnectionAdmissionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.slots.counts();
+        let inbound = self.inbound.is_some();
+        drop(self.shared.take());
+        drop(self.inbound.take());
+        counts.release_connection(inbound);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observation) = &self.observation {
+            observation.released("connection-released", None);
+        }
     }
 }
 
@@ -1724,6 +1799,35 @@ impl ZakuraPeerHandle {
         payload: Vec<u8>,
         started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<ResponseFrames, BoxError> {
+        self.request_frame(
+            stream_kind,
+            request_id,
+            Frame {
+                message_type,
+                flags,
+                payload,
+            },
+            started,
+            None,
+        )
+        .await
+    }
+
+    /// Hand a request to the peer once its queue has space. Reserving first lets a
+    /// competing download finish during backpressure without sending a stale request.
+    pub(super) async fn request_frame(
+        &self,
+        stream_kind: u16,
+        request_id: u64,
+        frame: Frame,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        attempt: Option<&crate::BlockHedge>,
+    ) -> Result<ResponseFrames, BoxError> {
+        let Frame {
+            message_type,
+            flags,
+            payload,
+        } = frame;
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
             stream_kind,
@@ -1734,10 +1838,15 @@ impl ZakuraPeerHandle {
             started,
             completion,
         };
-        self.sender
-            .send(frame)
+        let slot = self
+            .sender
+            .reserve()
             .await
             .map_err(|_| -> BoxError { "Zakura outbound peer queue closed".into() })?;
+        match attempt {
+            Some(attempt) => attempt.dispatch_if_needed(None, None, || slot.send(frame))?,
+            None => slot.send(frame),
+        }
         completed
             .await
             .map_err(|_| -> BoxError { "Zakura outbound completion dropped".into() })?
@@ -1852,48 +1961,24 @@ impl ZakuraSupervisorHandle {
             peer_registry,
             ip_slots,
             max_connections_per_ip,
+            tx_relay_sessions: None,
         }
     }
 
-    /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
-    /// QUIC handshakes and its control handshakes are counted. Never awaits.
-    /// Decides whether `remote_ip` may start another handshake (zakura-quic
-    /// ADM-3 rule 2), given the transport's `pending` handshakes from it.
-    fn ip_admission(
-        &self,
-        remote_ip: IpAddr,
-        pending: usize,
-        max_handshakes_per_ip: usize,
-        validated: bool,
-    ) -> IpAdmission {
-        let ip = admission_host(remote_ip);
-        let registered = self.ip_slots.registered(ip);
-        let in_flight = self.ip_slots.handshaking(ip).saturating_add(pending);
-        if in_flight >= max_handshakes_per_ip {
-            return IpAdmission::Full;
-        }
-        if registered.saturating_add(in_flight) < self.max_connections_per_ip {
-            let last_slot = in_flight.saturating_add(1) >= max_handshakes_per_ip
-                || registered.saturating_add(in_flight).saturating_add(1)
-                    >= self.max_connections_per_ip;
-            return if last_slot && !validated {
-                IpAdmission::ValidationRequired
-            } else {
-                IpAdmission::Open
-            };
-        }
-        // A full IP still gets one handshake at a time: it may be a node
-        // redialing to replace its own stale connection, which `register`
-        // allows from the same IP. `register` enforces the exact cap for
-        // everyone else, so this costs at most one handshake per full IP.
-        if registered >= self.max_connections_per_ip && in_flight == 0 {
-            return if validated {
-                IpAdmission::Open
-            } else {
-                IpAdmission::ValidationRequired
-            };
-        }
-        IpAdmission::Full
+    /// This supervisor with `tx-relay`'s live-session record, which the
+    /// legacy adapters built from it read. Set it before cloning the handle.
+    pub(crate) fn with_tx_relay_sessions(
+        mut self,
+        sessions: Option<super::TxRelaySessions>,
+    ) -> Self {
+        self.tx_relay_sessions = sessions;
+        self
+    }
+
+    /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
+    /// registered.
+    pub(crate) fn tx_relay_sessions(&self) -> Option<&super::TxRelaySessions> {
+        self.tx_relay_sessions.as_ref()
     }
 
     /// Counts an inbound control handshake against `remote_ip` until the guard
@@ -2053,9 +2138,11 @@ impl ZakuraSupervisorHandle {
             .get(&peer_id)
             .is_some_and(|entry| entry.host == host);
         if let Some(host) = host {
-            if !same_ip_duplicate_redial
-                && state.ip_slots.registered(host) >= state.max_connections_per_ip
-            {
+            if !state.ip_slots.counts().can_register(
+                host,
+                state.max_connections_per_ip,
+                same_ip_duplicate_redial,
+            ) {
                 metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
                 return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
             }
@@ -2323,6 +2410,7 @@ struct StreamAdmission<'a> {
 struct ConnectionServeContext {
     limits: ZakuraConnectionLimits,
     accepted_capabilities: u64,
+    capability_epoch: u64,
     role: &'static str,
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
@@ -2739,6 +2827,8 @@ pub(crate) enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
+    /// A metered row overran its connection's byte bucket.
+    ByteRateOverrun,
 }
 
 fn admit_inbound_message(
@@ -2773,12 +2863,22 @@ fn admit_inbound_message(
         return admit_tabled_message(
             frame,
             rules,
-            |rule| {
+            |rule, payload_len| {
                 cadence
                     .buckets
                     .lock()
                     .expect("Zakura cadence bucket mutex is never poisoned")
-                    .charge(cadence.layout, rule)
+                    .charge_frame(cadence.layout, rule, payload_len)
+            },
+            || {
+                context.conn.trace_rate_limit(
+                    "byte_rate.overrun",
+                    context.stream_id,
+                    stream_kind,
+                    Some(u64::try_from(payload_len).unwrap_or(u64::MAX)),
+                    None,
+                    None,
+                );
             },
             || {
                 context.conn.trace_rate_limit(
@@ -2821,9 +2921,10 @@ fn admit_inbound_message(
 }
 
 /// Admits `frame` on a stream with the message table `rules`. It finds the
-/// frame's row, charges the row's cadence bucket through `charge`, and calls
-/// `exhausted` if the bucket was empty. An empty bucket doesn't refuse the
-/// frame.
+/// frame's row and charges the row's bucket through `charge`, with the
+/// frame's payload length. If a metered row's frame overran its byte bucket,
+/// it calls `overrun` and refuses the frame. If the bucket was empty, it
+/// calls `exhausted`, and an empty bucket doesn't refuse the frame.
 ///
 /// # Panics
 ///
@@ -2832,14 +2933,22 @@ fn admit_inbound_message(
 pub(crate) fn admit_tabled_message(
     frame: &Frame,
     rules: &[MessageRule],
-    charge: impl FnOnce(&MessageRule) -> CadenceCharge,
+    charge: impl FnOnce(&MessageRule, usize) -> CadenceCharge,
+    overrun: impl FnOnce(),
     exhausted: impl FnOnce(),
 ) -> InboundMessageAdmission {
     let rule = MessageRule::find(rules, frame.message_type)
         .expect("the frame filter admits only rows of the stream's table");
+    let charge = charge(rule, frame.payload.len());
+    // A metered row's bucket already holds every byte a conformant sender
+    // can have buffered, so an overrun is a violation.
+    if charge == CadenceCharge::Overrun {
+        overrun();
+        return InboundMessageAdmission::ByteRateOverrun;
+    }
     // A sibling stream can keep the connection alive during an unbounded
     // transport stall. Exhaustion cannot prove a sender violation.
-    if charge(rule) == CadenceCharge::Exhausted {
+    if charge == CadenceCharge::Exhausted {
         exhausted();
     }
     InboundMessageAdmission::Admit
@@ -2853,6 +2962,7 @@ impl InboundMessageAdmission {
             InboundMessageAdmission::Admit => None,
             InboundMessageAdmission::Oversize => Some(ZakuraHandlerError::Oversize),
             InboundMessageAdmission::Throttled => Some(ZakuraHandlerError::RateLimited),
+            InboundMessageAdmission::ByteRateOverrun => Some(ZakuraHandlerError::ByteRateOverrun),
         }
     }
 
@@ -2942,6 +3052,7 @@ pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
     handshake_config: ZakuraHandshakeConfig,
     supported_capabilities: Arc<AtomicU64>,
+    capability_epoch: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
@@ -3058,6 +3169,7 @@ impl ZakuraProtocolHandler {
             supervisor,
             handshake_config,
             supported_capabilities,
+            capability_epoch: Arc::new(AtomicU64::new(0)),
             registry,
             trace,
             // Stream session IDs are local correlation generations, not wire
@@ -3081,6 +3193,16 @@ impl ZakuraProtocolHandler {
     /// before serving or dialing any connection.
     #[cfg(any(test, zakura_sim))]
     pub fn with_transport_observer(mut self, observer: Arc<dyn super::TransportObserver>) -> Self {
+        #[cfg(zakura_sim)]
+        observer.handshakes(super::HandshakeProbe::new(
+            &self.supervisor.ip_slots.0,
+            &self.pending_handshakes,
+            &self.inbound_handshakes,
+            self.limits.max_pending_handshakes,
+            self.supervisor.max_connections_per_ip,
+            (&self.admission, &self.inbound_admission),
+            self.limits.max_connections,
+        ));
         self.transport_observer = Some(observer);
         self
     }
@@ -3117,6 +3239,52 @@ impl ZakuraProtocolHandler {
                 shared_id: connection.shared_id(),
             }
         );
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn observe_control_result<T>(
+        &self,
+        connection: &Connection,
+        stage: &'static str,
+        result: &Result<T, ZakuraHandlerError>,
+    ) {
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::Handshake {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                stage,
+                validation: match result {
+                    Err(ZakuraHandlerError::Validation(error)) => Some(*error),
+                    _ => None,
+                },
+                error: result.as_ref().err().map(ToString::to_string),
+                elapsed: None,
+            }
+        );
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn handshake_observation(&self, connection: &Connection) -> Option<HandshakeObservation> {
+        self.transport_observer
+            .as_ref()
+            .map(|observer| HandshakeObservation {
+                observer: observer.clone(),
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                started: Instant::now(),
+            })
+    }
+
+    #[cfg(zakura_sim)]
+    fn observe_handshake_slot(&self, connection: &Connection) {
+        if let Some(observer) = &self.transport_observer {
+            observer.handshake_slot(
+                connection.admitted_addr(),
+                connection.shared_id(),
+                connection.slot_probe(),
+            );
+        }
     }
 
     /// Report that `connection` was refused before registration, for
@@ -3164,19 +3332,94 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    /// Returns an inbound attempt's cadence token. `action` names the reason in
+    /// the sim's cadence observation.
+    fn refund_cadence(&self, remote: SocketAddr, validated: bool, action: &'static str) {
+        let mut counts = self.supervisor.ip_slots.counts();
+        counts.refund_cadence(remote.ip(), validated, Instant::now());
+        #[cfg(any(test, zakura_sim))]
+        let hosts = counts.cadence_hosts(validated);
+        drop(counts);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(remote, validated, action, hosts);
+        #[cfg(not(any(test, zakura_sim)))]
+        let _ = action;
+    }
+
+    /// Reports a handshake cadence decision for `remote`. The caller reads
+    /// `hosts` under the `ip_slots` guard it already holds, so a tap adds no
+    /// lock and no scheduling point.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_handshake_cadence(
+        &self,
+        remote: SocketAddr,
+        validated: bool,
+        action: &'static str,
+        hosts: usize,
+    ) {
+        let cadence = super::handshake_cadence(self.supervisor.max_connections_per_ip);
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::HandshakeCadence {
+                remote,
+                validated,
+                action,
+                capacity: cadence.capacity,
+                refill_interval: cadence.refill_interval,
+                hosts,
+                host_limit: self
+                    .limits
+                    .max_connections
+                    .saturating_add(self.limits.max_pending_handshakes),
+            }
+        );
+    }
+
     fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
         let mut config = self.handshake_config;
-        config.supported_capabilities = self.supported_capabilities.load(Ordering::Relaxed);
+        config.supported_capabilities = self.supported_capabilities.load(Ordering::SeqCst);
         config
     }
 
+    fn handshake_snapshot(&self) -> (ZakuraHandshakeConfig, u64) {
+        // Read the generation first: an overlapping change makes this snapshot stale.
+        let epoch = self.capability_epoch.load(Ordering::SeqCst);
+        (self.current_handshake_config(), epoch)
+    }
+
     fn set_header_sync_enabled(&self, enabled: bool) {
-        if enabled {
+        let previous = if enabled {
             self.supported_capabilities
-                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
         } else {
             self.supported_capabilities
-                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::SeqCst)
+        };
+        // A call that leaves the mask unchanged leaves in-flight negotiations
+        // current, so it keeps their generation.
+        if (previous & ZAKURA_CAP_HEADER_SYNC != 0) == enabled {
+            return;
+        }
+        // Publish the generation before the caller snapshots registered peers.
+        // Registrations before this change enter that snapshot; later ones reject
+        // the old generation before installing services.
+        self.capability_epoch.fetch_add(1, Ordering::SeqCst);
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::CapabilitiesChanged {
+                supported: previous ^ ZAKURA_CAP_HEADER_SYNC,
+            }
+        );
+    }
+
+    #[cfg(zakura_sim)]
+    async fn pause_handshake(&self, phase: super::HandshakePhase) {
+        if let Some(pause) = self
+            .transport_observer
+            .as_ref()
+            .and_then(|observer| observer.handshake_pause())
+        {
+            pause.at(phase).await;
         }
     }
 
@@ -3186,69 +3429,87 @@ impl ZakuraProtocolHandler {
         self
     }
 
-    #[cfg(test)]
-    async fn accept_connection(&self, connection: Connection) {
-        let claim = self.claim_inbound(&connection);
-        self.serve_inbound(connection, claim).await;
-    }
-
     /// Moves an inbound connection from the transport's pending count into
     /// this handler's own accounting (zakura-quic ADM-7).
     ///
     /// `Acceptor::handle` calls this synchronously, before the transport
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
-    fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
-        let inbound = self.inbound_admission.clone().try_acquire_owned().ok()?;
-        let admission = self.admission.clone().try_acquire_owned().ok()?;
-        Some(InboundClaim {
-            _inbound: inbound,
+    fn claim_inbound(
+        &self,
+        connection: &Connection,
+        transfer: bool,
+    ) -> Result<InboundClaim, InboundRefusal> {
+        #[cfg(zakura_sim)]
+        self.observe_handshake_slot(connection);
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::Handshake {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                stage: "started",
+                validation: None,
+                error: None,
+                elapsed: None,
+            }
+        );
+        let admission = self
+            .claim_connection(true)
+            .ok_or(InboundRefusal::Admission)?;
+        let pending = self
+            .claim_pending_handshake_with_transfer(true, transfer)
+            .ok_or(InboundRefusal::PendingHandshake)?;
+        let control_handshake = self
+            .supervisor
+            .enter_control_handshake(connection.admitted_ip());
+        #[cfg(any(test, zakura_sim))]
+        let (admission, control_handshake) = {
+            let mut admission = admission;
+            let mut control_handshake = control_handshake;
+            let observation = self.handshake_observation(connection);
+            admission.observation = observation.clone();
+            control_handshake.observation = observation;
+            (admission, control_handshake)
+        };
+        Ok(InboundClaim {
+            pending,
             _admission: admission,
-            control_handshake: self
-                .supervisor
-                .enter_control_handshake(connection.admitted_ip()),
+            control_handshake,
         })
     }
 
-    async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
+    async fn serve_inbound(
+        &self,
+        connection: Connection,
+        claim: Result<InboundClaim, InboundRefusal>,
+    ) {
         let conn_id = trace_conn_id(&connection);
-        let Some(InboundClaim {
-            _inbound,
-            _admission,
-            control_handshake,
-        }) = claim
-        else {
-            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
-            #[cfg(any(test, zakura_sim))]
-            self.handshake_refused(&connection, "admission");
-            let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
-            conn.trace_connection(
-                "rejected.admission",
-                None,
-                Some("inbound"),
-                Some("admission"),
-            );
-            connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
-            return;
+        let (pending, _admission, control_handshake) = match claim {
+            Ok(InboundClaim {
+                pending,
+                _admission,
+                control_handshake,
+            }) => (pending, _admission, control_handshake),
+            Err(refusal) => {
+                self.refuse_inbound(&connection, conn_id, refusal);
+                return;
+            }
         };
 
         let remote_node_id = connection.remote_id();
         let remote_peer_id = ZakuraPeerId::from_node_id(remote_node_id);
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
 
-        let negotiated = match self
-            .run_native_responder_handshake_with_permit(&connection, &remote_peer_id, &conn)
+        let (negotiated, capability_epoch) = match self
+            .run_native_responder_handshake_with_permit(
+                &connection,
+                &remote_peer_id,
+                &conn,
+                pending,
+            )
             .await
         {
             Ok(negotiated) => negotiated,
-            Err(ZakuraHandlerError::ResourceLimit("pending handshake")) => {
-                #[cfg(any(test, zakura_sim))]
-                self.handshake_refused(
-                    &connection,
-                    ZakuraHandlerError::ResourceLimit("pending handshake"),
-                );
-                return;
-            }
             Err(error) => {
                 debug!(?error, "Zakura control handshake failed");
                 #[cfg(any(test, zakura_sim))]
@@ -3281,6 +3542,7 @@ impl ZakuraProtocolHandler {
                 ConnectionServeContext {
                     limits: conn_limits,
                     accepted_capabilities: negotiated.accepted_capabilities,
+                    capability_epoch,
                     role: "responder",
                     direction,
                     transcript_hash: native_connection_transcript_hash(
@@ -3303,41 +3565,127 @@ impl ZakuraProtocolHandler {
         }
     }
 
+    /// Closes an inbound connection whose claim found no room, and counts the
+    /// refusal under the budget that was full.
+    fn refuse_inbound(&self, connection: &Connection, conn_id: u64, refusal: InboundRefusal) {
+        let (label, error) = match refusal {
+            InboundRefusal::Admission => {
+                metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+                ("admission", ADMISSION_LIMIT)
+            }
+            InboundRefusal::PendingHandshake => {
+                metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+                ("pending_handshake", PENDING_HANDSHAKE_LIMIT)
+            }
+        };
+        #[cfg(any(test, zakura_sim))]
+        match refusal {
+            InboundRefusal::Admission => self.handshake_refused(connection, label),
+            InboundRefusal::PendingHandshake => {
+                self.handshake_refused(connection, ZakuraHandlerError::ResourceLimit(error))
+            }
+        }
+        let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
+        conn.trace_connection("rejected.admission", None, Some("inbound"), Some(label));
+        connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), error.as_bytes());
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::Handshake {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                stage: "released",
+                validation: None,
+                error: None,
+                elapsed: None,
+            }
+        );
+    }
+
+    /// Claims connection permits and their machine charge as one transition.
+    fn claim_connection(&self, inbound: bool) -> Option<ConnectionAdmissionGuard> {
+        let mut counts = self.supervisor.ip_slots.counts();
+        let inbound_permit = if inbound {
+            Some(self.inbound_admission.clone().try_acquire_owned().ok()?)
+        } else {
+            None
+        };
+        let shared = self.admission.clone().try_acquire_owned().ok()?;
+        if !counts.claim_connection(inbound, self.limits.max_connections) {
+            return None;
+        }
+        Some(ConnectionAdmissionGuard {
+            #[cfg(any(test, zakura_sim))]
+            observation: None,
+            slots: self.supervisor.ip_slots.clone(),
+            shared: Some(shared),
+            inbound: inbound_permit,
+        })
+    }
+
+    /// Charges the machine and semaphore together without an await.
+    fn claim_pending_handshake(&self, inbound: bool) -> Option<PendingHandshakeGuard> {
+        self.claim_pending_handshake_with_transfer(inbound, false)
+    }
+
+    fn claim_pending_handshake_with_transfer(
+        &self,
+        inbound: bool,
+        transfer: bool,
+    ) -> Option<PendingHandshakeGuard> {
+        let mut counts = self.supervisor.ip_slots.counts();
+        // Take the inbound share first, so a refused responder cannot hold a dial slot.
+        let inbound_permit = if inbound {
+            Some(self.inbound_handshakes.clone().try_acquire_owned().ok()?)
+        } else {
+            None
+        };
+        let shared = self.pending_handshakes.clone().try_acquire_owned().ok()?;
+        let claimed = if transfer {
+            counts.claim_transferred_pending();
+            true
+        } else {
+            counts.claim_pending(inbound, self.limits.max_pending_handshakes)
+        };
+        if !claimed {
+            return None;
+        }
+        Some(PendingHandshakeGuard {
+            #[cfg(any(test, zakura_sim))]
+            observation: None,
+            slots: self.supervisor.ip_slots.clone(),
+            shared: Some(shared),
+            inbound: inbound_permit,
+        })
+    }
+
     async fn run_native_responder_handshake_with_permit(
         &self,
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
-    ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        // The shared permit is taken only once the inbound one is held, so a
-        // refused inbound handshake never holds a slot a dial needs.
-        let permits = self
-            .inbound_handshakes
-            .clone()
-            .try_acquire_owned()
-            .ok()
-            .and_then(|inbound| {
-                let shared = self.pending_handshakes.clone().try_acquire_owned().ok()?;
-                Some((inbound, shared))
-            });
-        let Some(_handshake) = permits else {
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
-            conn.trace_connection(
-                "rejected.admission",
-                None,
-                Some("inbound"),
-                Some("pending_handshake"),
-            );
-            connection.close(
-                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
-                b"pending handshake",
-            );
-            return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
+        _handshake: PendingHandshakeGuard,
+    ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
+        #[cfg(any(test, zakura_sim))]
+        let _handshake = {
+            let mut guard = _handshake;
+            guard.observation = self.handshake_observation(connection);
+            guard
         };
         let _owner = self.resources.owners().enter(OwnerPhase::Handshake);
 
-        self.run_native_responder_handshake(connection, remote_peer_id, conn)
-            .await
+        // The overall deadline bounds peers that pace each control step.
+        let result = match timeout(
+            self.limits.control_timeout,
+            self.run_native_responder_handshake(connection, remote_peer_id, conn),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ZakuraHandlerError::Timeout("control handshake")),
+        };
+        #[cfg(any(test, zakura_sim))]
+        self.observe_control_result(connection, "hello", &result);
+        result
     }
 
     async fn run_native_responder_handshake(
@@ -3345,8 +3693,18 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
-    ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        let handshake_config = self.current_handshake_config();
+    ) -> Result<(NativeHandshakeNegotiated, u64), ZakuraHandlerError> {
+        let (handshake_config, capability_epoch) = self.handshake_snapshot();
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::HandshakeCapabilities {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                supported: handshake_config.supported_capabilities,
+            }
+        );
+        #[cfg(zakura_sim)]
+        self.pause_handshake(super::HandshakePhase::Snapshot).await;
         conn.trace_handshake(
             "control.started",
             "responder",
@@ -3397,14 +3755,17 @@ impl ZakuraProtocolHandler {
             Some(ack.selected_zakura_protocol),
             handshake_config.network_label(),
         );
-        Ok(NativeHandshakeNegotiated {
-            limits: accepted_limits,
-            accepted_capabilities: ack.accepted_capabilities,
-            #[cfg(any(test, zakura_sim))]
-            local_capabilities: handshake_config.supported_capabilities,
-            #[cfg(any(test, zakura_sim))]
-            offered_capabilities: hello.capabilities,
-        })
+        Ok((
+            NativeHandshakeNegotiated {
+                limits: accepted_limits,
+                accepted_capabilities: ack.accepted_capabilities,
+                #[cfg(any(test, zakura_sim))]
+                local_capabilities: handshake_config.supported_capabilities,
+                #[cfg(any(test, zakura_sim))]
+                offered_capabilities: hello.capabilities,
+            },
+            capability_epoch,
+        ))
     }
 
     fn accepted_limits_for(&self, remote_limits: &ZakuraInitialLimits) -> ZakuraAcceptedLimits {
@@ -3448,7 +3809,10 @@ impl ZakuraProtocolHandler {
         self.resources.report_usage(limits_owner_bound);
         #[cfg(zakura_sim)]
         if let Some(observer) = &self.transport_observer {
-            observer.connection(conn_id, connection_resources.probe(connection.load_probe()));
+            observer.connection(
+                conn_id,
+                connection_resources.probe(connection.load_probe(), &stream_sem, limits),
+            );
         }
         // Set once, for the kinds this connection negotiated (zakura-quic
         // API-9). The handshake window stays inside it for the control stream.
@@ -3461,7 +3825,9 @@ impl ZakuraProtocolHandler {
         let mut pending_sessions = PendingSessions::default();
         let mut incoming_setup: Option<BoxFuture<'static, Option<IncomingStreamSetup>>> = None;
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
-        let mut message_buckets = MessageRateBuckets::new();
+        let mut message_buckets = MessageRateBuckets::with_receive_window(u64::from(
+            self.limits.quic.stream_receive_window_bytes,
+        ));
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
@@ -3629,18 +3995,19 @@ impl ZakuraProtocolHandler {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
-                let admitted_capabilities =
-                    self.registry
-                        .add_escalated_peer(Peer::new_with_service_streams(
-                            conn_id,
-                            peer_id.clone(),
-                            remote_ip,
-                            opened_capabilities,
-                            context.direction,
-                            std::mem::take(&mut service_streams),
-                            connection_token.clone(),
-                            close_cause.clone(),
-                        ));
+                let admitted_capabilities = self.registry.add_escalated_peer(
+                    Peer::new_with_service_streams(
+                        conn_id,
+                        peer_id.clone(),
+                        remote_ip,
+                        opened_capabilities,
+                        context.direction,
+                        std::mem::take(&mut service_streams),
+                        connection_token.clone(),
+                        close_cause.clone(),
+                    )
+                    .with_rtt_reader(Some(connection.rtt_reader())),
+                );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
@@ -3759,7 +4126,8 @@ impl ZakuraProtocolHandler {
                                     service_streams,
                                     connection_token.clone(),
                                     close_cause.clone(),
-                                ),
+                                )
+                                .with_rtt_reader(Some(connection.rtt_reader())),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
@@ -3883,7 +4251,8 @@ impl ZakuraProtocolHandler {
                                 service_streams,
                                 connection_token.clone(),
                                 close_cause.clone(),
-                            ),
+                            )
+                            .with_rtt_reader(Some(connection.rtt_reader())),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                     }
@@ -4146,11 +4515,25 @@ impl ZakuraProtocolHandler {
         let is_initiator = admission.is_initiator;
         let close_cause = admission.close_cause.clone();
         let connection_token = admission.connection_token.clone();
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = close_cause.tap() {
+            tap.emit(super::TransportEvent::StreamSetupStarted {
+                conn_id: tap.conn_id(),
+                quic_stream: io.streams().0.id(),
+                rate: limits.stream_open_rate_per_second,
+            });
+        }
         Some(Box::pin(async move {
             let (send, recv) = io.streams();
             let prelude = match read_stream_prelude(recv, limits.prelude_timeout).await {
                 Ok(prelude) => prelude,
                 Err(error) => {
+                    #[cfg(any(test, zakura_sim))]
+                    report_prelude_judged(
+                        &close_cause,
+                        send,
+                        Some(super::handshake::PreludeRejection::BadPrelude),
+                    );
                     debug!(?error, "rejecting Zakura stream with bad prelude");
                     let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                     metrics::counter!("zakura.p2p.stream.rejected.prelude").increment(1);
@@ -4174,7 +4557,11 @@ impl ZakuraProtocolHandler {
                 .increment(1);
                 conn.trace_stream("rejected.unknown_kind", stream_id, Some(stream_kind));
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unknown_kind");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnknownKind;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             };
 
@@ -4197,7 +4584,11 @@ impl ZakuraProtocolHandler {
                     Some(stream_kind),
                 );
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unnegotiated_capability");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnnegotiatedCapability;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             }
 
@@ -4220,14 +4611,21 @@ impl ZakuraProtocolHandler {
                 .increment(1);
                 conn.trace_stream("rejected.unselected_version", stream_id, Some(stream_kind));
                 #[cfg(any(test, zakura_sim))]
-                report_stream_refused(&close_cause, send, &prelude, "unselected_version");
+                {
+                    let rejection = super::handshake::PreludeRejection::UnselectedVersion;
+                    report_prelude_judged(&close_cause, send, Some(rejection));
+                    report_stream_refused(&close_cause, send, &prelude, rejection.reason());
+                }
                 return None;
             }
 
             if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
                 debug!("rejecting non-request Zakura stream with request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("unexpected_request_id");
+                let rejection = super::handshake::PreludeRejection::UnexpectedRequestId;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.unexpected_request_id").increment(1);
                 conn.trace_stream(
@@ -4241,7 +4639,10 @@ impl ZakuraProtocolHandler {
             if stream.mode == StreamMode::RequestResponse && prelude.request_id.is_none() {
                 debug!("rejecting Zakura request stream without request id");
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("request_without_id");
+                let rejection = super::handshake::PreludeRejection::RequestWithoutId;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.request_without_id").increment(1);
                 conn.trace_stream("rejected.request_without_id", stream_id, Some(stream_kind));
@@ -4256,7 +4657,10 @@ impl ZakuraProtocolHandler {
                     "rejecting Zakura stream whose frame cap cannot carry a payload"
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("undersized_frame_cap");
+                let rejection = super::handshake::PreludeRejection::UndersizedFrameCap;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 metrics::counter!("zakura.p2p.stream.rejected.undersized_frame_cap").increment(1);
                 conn.trace_stream(
@@ -4276,11 +4680,16 @@ impl ZakuraProtocolHandler {
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                close_cause.record("unexpected_stream");
+                let rejection = super::handshake::PreludeRejection::IneligibleOpener;
+                close_cause.record(rejection.reason());
+                #[cfg(any(test, zakura_sim))]
+                report_prelude_judged(&close_cause, send, Some(rejection));
                 connection_token.cancel();
                 return None;
             }
 
+            #[cfg(any(test, zakura_sim))]
+            report_prelude_judged(&close_cause, send, None);
             metrics::counter!(
                 "zakura.p2p.stream.accepted",
                 "stream_kind" => stream_kind,
@@ -4509,9 +4918,78 @@ impl ZakuraProtocolHandler {
         #[cfg(any(test, zakura_sim))]
         if let ZakuraRegistration::Registered { conn_id, .. } = &registration {
             self.observe_registered(*conn_id, &close_cause, &connection);
+            transport_observe!(
+                self.transport_observer,
+                super::TransportEvent::Handshake {
+                    remote: connection.admitted_addr(),
+                    shared_id: connection.shared_id(),
+                    stage: "registered",
+                    validation: None,
+                    error: None,
+                    elapsed: None,
+                }
+            );
+        }
+        #[cfg(zakura_sim)]
+        if matches!(&registration, ZakuraRegistration::Registered { .. }) {
+            self.pause_handshake(super::HandshakePhase::Registered)
+                .await;
         }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
+        // Registration refunds the attempt's cadence token, even when a local
+        // capability change closes the connection below.
+        if matches!(registration, ZakuraRegistration::Registered { .. })
+            && context.direction == ServicePeerDirection::Inbound
+        {
+            self.refund_cadence(
+                connection.admitted_addr(),
+                connection.source_validated(),
+                "registered",
+            );
+        }
+        if let ZakuraRegistration::Registered {
+            conn_id,
+            peer_id,
+            disconnect_token,
+            ..
+        } = &registration
+        {
+            if self.capability_epoch.load(Ordering::SeqCst) != context.capability_epoch {
+                #[cfg(any(test, zakura_sim))]
+                self.registration_refused(&close_cause, &connection, "capabilities_changed");
+                connection.close(
+                    VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL),
+                    b"capabilities changed",
+                );
+                RegisteredPeerCleanupGuard::new(
+                    self.supervisor.clone(),
+                    self.registry.clone(),
+                    peer_id.clone(),
+                    *conn_id,
+                    disconnect_token.clone(),
+                )
+                .cleanup_registered_peer()
+                .await;
+                transport_observe!(
+                    self.transport_observer,
+                    super::TransportEvent::Handshake {
+                        remote: connection.admitted_addr(),
+                        shared_id: connection.shared_id(),
+                        stage: "registration-released",
+                        validation: None,
+                        error: None,
+                        elapsed: None,
+                    }
+                );
+                // A local decision closed the peer, so the dialer retries
+                // without backing off.
+                if let Some(report) = context.registration_report {
+                    let _ = report.send(DialRegistration::LocalLimit);
+                }
+                return Ok(());
+            }
+        }
         if let Some(report) = context.registration_report {
             let reported = match &registration {
                 ZakuraRegistration::Registered { .. } => Some(DialRegistration::Registered),
@@ -4606,12 +5084,20 @@ impl ZakuraProtocolHandler {
 /// budget of 32, an IP gets 4 handshakes at a time.
 const PENDING_HANDSHAKE_SHARES_PER_IP: usize = 8;
 
-/// Whether an IP may start another handshake.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IpAdmission {
-    Open,
-    ValidationRequired,
-    Full,
+/// Retries an unvalidated source, so spoofed Initials cannot fill a budget,
+/// and refuses a validated one. Counts the decision under its metric.
+fn retry_or_refuse(
+    incoming: &IncomingInfo,
+    retried: &'static str,
+    rejected: &'static str,
+) -> Admit {
+    if incoming.validated {
+        metrics::counter!(rejected).increment(1);
+        Admit::Refuse
+    } else {
+        metrics::counter!(retried).increment(1);
+        Admit::Retry
+    }
 }
 
 impl Acceptor for ZakuraProtocolHandler {
@@ -4624,55 +5110,102 @@ impl Acceptor for ZakuraProtocolHandler {
         }
         let max_handshakes_per_ip =
             (self.limits.max_pending_handshakes / PENDING_HANDSHAKE_SHARES_PER_IP).max(1);
-        if self.supervisor.ip_admission(
+        // One lock section decides every count, so no check sees another's
+        // stale value.
+        let mut counts = self.supervisor.ip_slots.counts();
+        if counts.ip_admission(
             incoming.remote.ip(),
             incoming.pending_from_ip,
             max_handshakes_per_ip,
+            self.supervisor.max_connections_per_ip,
             incoming.validated,
         ) != IpAdmission::Open
         {
             // Require validation before consuming the last slot, including
             // the redial slot, so spoofed Initials cannot fill an IP's budget.
-            if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.per_ip").increment(1);
-                return Admit::Retry;
-            }
-            metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
-            return Admit::Refuse;
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.per_ip",
+                "zakura.p2p.conn.rejected.per_ip",
+            );
         }
         // Every pending transport handshake is inbound, so it counts against
         // both the inbound share and the whole handshake budget.
-        let control_handshakes = self
-            .limits
-            .max_pending_handshakes
-            .saturating_sub(self.pending_handshakes.available_permits());
-        let inbound_control_handshakes = self
-            .limits
-            .max_inbound_handshakes()
-            .saturating_sub(self.inbound_handshakes.available_permits());
-        if incoming.pending_total.saturating_add(control_handshakes)
-            >= self.limits.max_pending_handshakes
-            || incoming
-                .pending_total
-                .saturating_add(inbound_control_handshakes)
-                >= self.limits.max_inbound_handshakes()
-        {
+        if counts.pending_full(incoming.pending_total, self.limits.max_pending_handshakes) {
             // As above: spoofed Initials could fill the budget, so an
             // unvalidated source gets a Retry instead of a refusal.
-            if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.pending_handshake").increment(1);
-                return Admit::Retry;
-            }
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
-            return Admit::Refuse;
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.pending_handshake",
+                "zakura.p2p.conn.rejected.pending_handshake",
+            );
         }
-        if self.admission.available_permits() == 0
+        if counts.connections_full(true, self.limits.max_connections)
+            || self.admission.available_permits() == 0
             || self.inbound_admission.available_permits() == 0
         {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
-        Admit::Accept
+        // The machine's transport reservations can exceed QUIC's pending
+        // count, so the claim checks the pending budget again.
+        if !counts.claim_transport(self.limits.max_pending_handshakes) {
+            return retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.pending_handshake",
+                "zakura.p2p.conn.rejected.pending_handshake",
+            );
+        }
+        // Each source validation state has its own ledger, so a spoofed
+        // Initial, which is never validated, can't take a validated source's
+        // tokens. An unvalidated source that runs out gets a stateless Retry
+        // below, which an honest peer answers with a validated Initial.
+        let cadence = counts.admit_cadence(
+            incoming.remote.ip(),
+            incoming.validated,
+            self.supervisor.max_connections_per_ip,
+            self.limits
+                .max_connections
+                .saturating_add(self.limits.max_pending_handshakes),
+            Instant::now(),
+        );
+        if cadence != super::HandshakeCadenceAdmission::Admit {
+            counts.release_transport();
+        }
+        #[cfg(any(test, zakura_sim))]
+        let hosts = counts.cadence_hosts(incoming.validated);
+        drop(counts);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handshake_cadence(
+            incoming.remote,
+            incoming.validated,
+            match cadence {
+                super::HandshakeCadenceAdmission::Admit => "admitted",
+                super::HandshakeCadenceAdmission::Exhausted => "exhausted",
+                super::HandshakeCadenceAdmission::Capacity => "capacity",
+            },
+            hosts,
+        );
+        match cadence {
+            super::HandshakeCadenceAdmission::Admit => Admit::Accept,
+            super::HandshakeCadenceAdmission::Exhausted
+            | super::HandshakeCadenceAdmission::Capacity => retry_or_refuse(
+                incoming,
+                "zakura.p2p.conn.retried.cadence",
+                "zakura.p2p.conn.rejected.cadence",
+            ),
+        }
+    }
+
+    fn cancel_admission(&self, incoming: &IncomingInfo) {
+        self.finish_admission(false);
+        self.refund_cadence(incoming.remote, incoming.validated, "cancelled");
+    }
+
+    fn finish_admission(&self, handed_off: bool) {
+        if !handed_off {
+            self.supervisor.ip_slots.counts().release_transport();
+        }
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {
@@ -4687,18 +5220,34 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
         let handler = self.clone();
-        let claim = handler.claim_inbound(&connection);
+        let claim = handler.claim_inbound(&connection, true);
+        if claim.is_err() {
+            handler.finish_admission(false);
+            // Dials took the room during TLS, so the refusal is local.
+            handler.refund_cadence(
+                connection.admitted_addr(),
+                connection.source_validated(),
+                "refused",
+            );
+        }
         Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
+}
+
+/// The budget an inbound claim found full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundRefusal {
+    /// The connection cap or its inbound share.
+    Admission,
+    /// The pending-handshake budget or its inbound share.
+    PendingHandshake,
 }
 
 /// An inbound connection's share of the connection cap and its per-IP control
 /// handshake slot, held from `Acceptor::handle` on.
 struct InboundClaim {
-    /// A slot within the inbound share (see
-    /// [`ZakuraLocalLimits::max_inbound_connections`]).
-    _inbound: OwnedSemaphorePermit,
-    _admission: OwnedSemaphorePermit,
+    pending: PendingHandshakeGuard,
+    _admission: ConnectionAdmissionGuard,
     control_handshake: ControlHandshakeGuard,
 }
 
@@ -4959,9 +5508,13 @@ async fn spawn_zakura_endpoint_inner(
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
+    // A custom kind with its own share, such as `tx-relay`'s, is counted
+    // once, with the native kinds.
+    let named_kinds = config.zakura.reactor_shares(&config.network).kinds;
     let custom_kinds: Vec<u16> = custom_services
         .iter()
         .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
+        .filter(|kind| !named_kinds.iter().any(|(named, _)| named == kind))
         .collect();
     let budgeted_max_connections = config.zakura.budgeted_max_connections_for_node(
         &config.network,
@@ -5005,7 +5558,12 @@ async fn spawn_zakura_endpoint_inner(
             peer_registry,
         ),
         None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
-    };
+    }
+    .with_tx_relay_sessions(
+        custom_services
+            .iter()
+            .find_map(|custom| custom.tx_relay_sessions.clone()),
+    );
     let tracer = config
         .zakura
         .trace_dir
@@ -5381,6 +5939,21 @@ fn native_dial_timeout(config: &QuicConfig, addrs: usize, control_timeout: Durat
 /// Report that an incoming stream with `prelude` on `send` was reset for
 /// `reason` while the connection stays open.
 #[cfg(any(test, zakura_sim))]
+fn report_prelude_judged(
+    close_cause: &CloseCause,
+    send: &SendStream,
+    rejection: Option<super::handshake::PreludeRejection>,
+) {
+    if let Some(tap) = close_cause.tap() {
+        tap.emit(super::TransportEvent::PreludeJudged {
+            conn_id: tap.conn_id(),
+            quic_stream: send.id(),
+            rejection,
+        });
+    }
+}
+
+#[cfg(any(test, zakura_sim))]
 fn report_stream_refused(
     close_cause: &CloseCause,
     send: &SendStream,
@@ -5410,7 +5983,8 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 pub(crate) enum DialRegistration {
     /// The supervisor registered the peer on this connection.
     Registered,
-    /// This node's admission limits refused to register the peer.
+    /// This node's admission limits refused to register the peer, or a local
+    /// capability change closed its registration.
     LocalLimit,
 }
 
@@ -5463,10 +6037,8 @@ pub(crate) async fn serve_reported_native_dial_connection(
 ) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
         .handler
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
+        .claim_connection(false)
+        .ok_or(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -5494,6 +6066,14 @@ pub(crate) async fn serve_reported_native_dial_connection(
         }
         Err(error) => return Err(error.into()),
     };
+    #[cfg(zakura_sim)]
+    endpoint.handler.observe_handshake_slot(&connection);
+    #[cfg(any(test, zakura_sim))]
+    let _admission = {
+        let mut guard = _admission;
+        guard.observation = endpoint.handler.handshake_observation(&connection);
+        guard
+    };
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = report.admitted_addr.send(connection.admitted_addr());
@@ -5508,21 +6088,37 @@ pub(crate) async fn serve_reported_native_dial_connection(
     );
     let local_node_id = endpoint.local_node_id();
     let local_peer_id = ZakuraPeerId::from_node_id(local_node_id);
-    let negotiated = {
-        let _handshake = sim_chain!(endpoint
-            .handler
-            .pending_handshakes
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ZakuraHandlerError::ResourceLimit("pending handshake"))
+    let (negotiated, capability_epoch) = {
+        let _handshake = sim_chain!(endpoint.handler
+            .claim_pending_handshake(false)
+            .ok_or(ZakuraHandlerError::ResourceLimit(PENDING_HANDSHAKE_LIMIT))
             => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?;
+        #[cfg(any(test, zakura_sim))]
+        let _handshake = {
+            let mut guard = _handshake;
+            guard.observation = endpoint.handler.handshake_observation(&connection);
+            guard
+        };
         let _owner = endpoint
             .handler
             .resources
             .owners()
             .enter(OwnerPhase::Handshake);
-        let handshake_config = endpoint.handler.current_handshake_config();
-        sim_chain!(run_native_initiator_handshake(
+        let (handshake_config, capability_epoch) = endpoint.handler.handshake_snapshot();
+        transport_observe!(
+            endpoint.handler.transport_observer,
+            super::TransportEvent::HandshakeCapabilities {
+                remote: connection.admitted_addr(),
+                shared_id: connection.shared_id(),
+                supported: handshake_config.supported_capabilities,
+            }
+        );
+        #[cfg(zakura_sim)]
+        endpoint
+            .handler
+            .pause_handshake(super::HandshakePhase::Snapshot)
+            .await;
+        let result = run_native_initiator_handshake(
             &connection,
             limits,
             &handshake_config,
@@ -5530,8 +6126,15 @@ pub(crate) async fn serve_reported_native_dial_connection(
             &endpoint.handler.trace,
             &conn,
         )
-        .await
-            => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?
+        .await;
+        #[cfg(any(test, zakura_sim))]
+        endpoint
+            .handler
+            .observe_control_result(&connection, "ack", &result);
+        (
+            sim_chain!(result => inspect_err(|error| endpoint.handler.handshake_refused(&connection, error)))?,
+            capability_epoch,
+        )
     };
     transport_observe!(
         endpoint.handler.transport_observer,
@@ -5558,6 +6161,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             ConnectionServeContext {
                 limits: conn_limits,
                 accepted_capabilities: negotiated.accepted_capabilities,
+                capability_epoch,
                 role: "initiator",
                 direction,
                 transcript_hash: native_connection_transcript_hash(
@@ -5599,7 +6203,35 @@ pub(crate) async fn run_native_initiator_handshake_without_trace(
     .await
 }
 
+/// Runs the initiator's control exchange within one `control_timeout`.
+///
+/// The responder applies the same overall deadline. Without it, a responder
+/// that paces each step holds this dial's pending-handshake permit for one
+/// timeout per step.
 async fn run_native_initiator_handshake(
+    connection: &Connection,
+    limits: &ZakuraLocalLimits,
+    handshake_config: &ZakuraHandshakeConfig,
+    local_peer_id: &ZakuraPeerId,
+    trace: &ZakuraTrace,
+    conn: &ZakuraConnTrace,
+) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+    timeout(
+        limits.control_timeout,
+        run_native_initiator_control_steps(
+            connection,
+            limits,
+            handshake_config,
+            local_peer_id,
+            trace,
+            conn,
+        ),
+    )
+    .await
+    .unwrap_or(Err(ZakuraHandlerError::Timeout("control handshake")))
+}
+
+async fn run_native_initiator_control_steps(
     connection: &Connection,
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
@@ -6030,7 +6662,9 @@ fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)>
     let code = match error {
         ZakuraHandlerError::Closed => return None,
         ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
-        ZakuraHandlerError::RateLimited => ZAKURA_CLOSE_RATE_LIMIT,
+        ZakuraHandlerError::RateLimited | ZakuraHandlerError::ByteRateOverrun => {
+            ZAKURA_CLOSE_RATE_LIMIT
+        }
         _ => ZAKURA_CLOSE_BAD_PRELUDE,
     };
     Some((code, read_close_cause(ReadPath::Ordered, error)))
@@ -6067,6 +6701,7 @@ fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str 
     match (path, error) {
         (ReadPath::Ordered, Oversize) => "ordered_oversize",
         (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
+        (ReadPath::Ordered, ByteRateOverrun) => "ordered_byte_rate_overrun",
         (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
         (ReadPath::Request, _) if rejected => "request_read_rejected",
         (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
@@ -6156,6 +6791,14 @@ async fn request_stream_worker(
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
             context.close_cause.record("request_oversize");
+            context.connection_token.cancel();
+            return;
+        }
+        InboundMessageAdmission::ByteRateOverrun => {
+            // The layout keeps metered rows off request streams, so this is
+            // unreachable today. Close as a persistent reader would.
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
+            context.close_cause.record("request_byte_rate_overrun");
             context.connection_token.cancel();
             return;
         }
@@ -7662,6 +8305,8 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        super::tx_relay::wire::TX_RELAY_DATA_KIND => "tx_relay_data",
+        super::tx_relay::wire::TX_RELAY_STATE_KIND => "tx_relay_state",
         _ => "unknown",
     }
 }
@@ -7762,10 +8407,20 @@ struct MessageRateBuckets<C: Clock = RealClock> {
 }
 
 impl<C: Clock + Default> MessageRateBuckets<C> {
+    /// Buckets for a connection with no stream receive window, as tests use.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_receive_window(0)
+    }
+
+    /// Buckets for a connection whose stream receive window is
+    /// `receive_window`, which deepens its byte buckets.
+    fn with_receive_window(receive_window: u64) -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
+            cadence: Arc::new(StdMutex::new(
+                CadenceBuckets::new(C::default()).with_receive_window(receive_window),
+            )),
         }
     }
 }
@@ -7929,6 +8584,9 @@ pub enum ZakuraHandlerError {
     /// The peer exceeded its per-kind inbound message rate.
     #[error("Zakura message rate exceeded")]
     RateLimited,
+    /// The peer sent a metered row past its connection's byte bucket.
+    #[error("Zakura byte rate exceeded")]
+    ByteRateOverrun,
     /// QUIC connection error.
     #[error(transparent)]
     QuicConnection(#[from] zakura_quic::ConnectionError),
@@ -7958,6 +8616,7 @@ pub enum ZakuraHandlerError {
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
 /// semaphore is full, before it sends any packet.
 const ADMISSION_LIMIT: &str = "admission";
+const PENDING_HANDSHAKE_LIMIT: &str = "pending handshake";
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
 /// cannot fit the dial under its connection ceiling, before any packet
 /// (zakura-quic ADM-12).
@@ -8006,6 +8665,8 @@ mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
     mod frame_lifetime;
+    #[cfg(not(zakura_sim))]
+    mod handshake_cost;
     mod quic_progress;
     mod read_close_cause;
     mod transport_observer;
@@ -8166,6 +8827,14 @@ mod tests {
             handler.current_handshake_config().supported_capabilities,
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         );
+        assert_eq!(handler.handshake_snapshot().1, 2, "each change bumps once");
+
+        // Repeating the current setting keeps in-flight negotiations current.
+        handler.set_header_sync_enabled(true);
+        assert_eq!(handler.handshake_snapshot().1, 2);
+        handler.set_header_sync_enabled(false);
+        handler.set_header_sync_enabled(false);
+        assert_eq!(handler.handshake_snapshot().1, 3);
     }
 
     #[test]
@@ -9536,6 +10205,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await
@@ -9973,6 +10643,7 @@ mod tests {
                 }),
                 provides: vec![service_id.clone()],
                 seeks: Vec::new(),
+                tx_relay_sessions: None,
             }],
         )
         .await?
@@ -10000,6 +10671,7 @@ mod tests {
                 }),
                 provides: Vec::new(),
                 seeks: vec![service_id],
+                tx_relay_sessions: None,
             }],
         )
         .await?
@@ -11477,6 +12149,86 @@ mod tests {
         Ok(())
     }
 
+    /// A responder that paces its ack's length and payload, each within the
+    /// per-step deadline, still fails the initiator at the overall deadline.
+    #[tokio::test]
+    async fn initiator_bounds_a_paced_ack_by_one_deadline() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(74).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::new().endpoint(75).await?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[P2P_V2_ALPN]),
+        )
+        .await??;
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.control_timeout = Duration::from_secs(1);
+        let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
+
+        let handshake = run_native_initiator_handshake_without_trace(
+            &client_conn,
+            &limits,
+            &config,
+            &local_peer,
+        );
+        let respond = async {
+            let (mut send, mut recv) = stream_rx.recv().await.ok_or("missing control stream")?;
+            let hello = ZakuraControlHello::decode(
+                &read_control_payload(
+                    &mut recv,
+                    LOCAL_MAX_CONTROL_FRAME_BYTES,
+                    Duration::from_secs(2),
+                )
+                .await?,
+            )?;
+            let ack = ZakuraControlAck {
+                magic: CONTROL_ACK_MAGIC,
+                control_version: CONTROL_VERSION,
+                selected_zakura_protocol: hello.selected_zakura_protocol,
+                peer_nonce: [9; 32],
+                remote_peer_nonce: hello.peer_nonce,
+                accepted_capabilities: hello.capabilities,
+                accepted_channels: 0,
+                accepted_limits: hello.initial_limits,
+            }
+            .encode()?;
+            let mut len = Vec::with_capacity(CONTROL_LENGTH_BYTES);
+            len.write_u32::<LittleEndian>(u32::try_from(ack.len())?)?;
+            zakura_rt::time::sleep(Duration::from_millis(600)).await;
+            send.write_all(&len).await?;
+            zakura_rt::time::sleep(Duration::from_millis(600)).await;
+            // The initiator may already have closed the stream.
+            let _ = send.write_all(&ack).await;
+            Ok::<_, BoxError>(send)
+        };
+        let (negotiated, responded) = timeout(Duration::from_secs(5), async {
+            tokio::join!(handshake, respond)
+        })
+        .await?;
+        responded?;
+        assert!(
+            matches!(
+                negotiated,
+                Err(ZakuraHandlerError::Timeout("control handshake"))
+            ),
+            "a paced ack must fail at the overall deadline; got {negotiated:?}"
+        );
+
+        client_conn.close(0u32.into(), b"done");
+        client.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
+
     /// A reader's context for one stream of the regulation test family.
     fn tabled_context(
         messages: Option<&'static [MessageRule]>,
@@ -11518,6 +12270,38 @@ mod tests {
             flags: 0,
             payload: vec![1; payload_len],
         }
+    }
+
+    #[test]
+    fn a_metered_row_past_its_byte_bucket_closes_the_connection() {
+        const METERED: MessageRule = MessageRule {
+            name: "metered",
+            message_type: 40,
+            payload: crate::zakura::PayloadLen::between(1, 512),
+            role: crate::zakura::MessageRole::Metered {
+                rate: crate::zakura::ByteRate {
+                    bytes_per_second: 1,
+                    opening_allowance: 512,
+                    sender_allowance: 512,
+                },
+            },
+        };
+        // With no receive window, the receiver's depth is the two allowances.
+        let context = tabled_context(Some(&[METERED]), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                admit_inbound_message(&probe_frame(40, 512), &context, 900),
+                InboundMessageAdmission::Admit
+            );
+        }
+        assert_eq!(
+            admit_inbound_message(&probe_frame(40, 1), &context, 900),
+            InboundMessageAdmission::ByteRateOverrun
+        );
+        assert_eq!(
+            ordered_read_close(&ZakuraHandlerError::ByteRateOverrun),
+            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_byte_rate_overrun"))
+        );
     }
 
     #[test]
@@ -12920,10 +13704,11 @@ mod tests {
             assert_eq!(assembled, response);
             match assembled {
                 Response::Blocks(blocks) => {
-                    let InventoryResponse::Available((BlockHandle::Shared(block), None)) =
-                        &blocks[0]
-                    else {
+                    let InventoryResponse::Available((block, None)) = &blocks[0] else {
                         panic!("the available block remains shared");
+                    };
+                    let BlockHandle::Shared(block) = &**block else {
+                        panic!("decoded block is shared");
                     };
                     assert!(Arc::ptr_eq(block, &decoded_block.unwrap()));
                 }
@@ -13550,15 +14335,24 @@ mod tests {
                     self.handler.admit(incoming)
                 }
 
+                fn cancel_admission(&self, incoming: &IncomingInfo) {
+                    self.handler.cancel_admission(incoming);
+                }
+
+                fn finish_admission(&self, handed_off: bool) {
+                    self.handler.finish_admission(handed_off);
+                }
+
                 fn alpns(&self) -> Vec<Vec<u8>> {
                     self.handler.alpns()
                 }
 
                 fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
+                    let serving = self.handler.handle(connection.clone());
                     let capture = self.clone();
                     Box::pin(async move {
-                        if capture.accepted.send(connection.clone()).await.is_ok() {
-                            capture.handler.accept_connection(connection).await;
+                        if capture.accepted.send(connection).await.is_ok() {
+                            serving.await;
                         }
                     })
                 }
@@ -13948,6 +14742,60 @@ mod tests {
         Ok(())
     }
 
+    /// Spoofed Initials carry unvalidated sources. Draining a victim's
+    /// unvalidated cadence, or filling the unvalidated ledger with other
+    /// addresses, earns the spoofed sources a stateless Retry, never a
+    /// refusal, and leaves a validated Initial from the victim its own
+    /// cadence (zakura#2337 review).
+    #[test]
+    fn spoofed_initials_never_lock_out_a_validated_source() {
+        let victim: IpAddr = "203.0.113.9".parse().expect("test ip parses");
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let attempt = |ip: IpAddr, validated: bool| IncomingInfo {
+            remote: SocketAddr::new(ip, 8234),
+            validated,
+            pending_total: 0,
+            pending_from_ip: 0,
+        };
+        // Each spoofed attempt fails at once and returns its transport
+        // reservation, with no cadence refund.
+        let spoof = |ip: IpAddr| {
+            let admitted = handler.admit(&attempt(ip, false));
+            if admitted == Admit::Accept {
+                handler.finish_admission(false);
+            }
+            admitted
+        };
+        for _ in 0..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+            assert_eq!(spoof(victim), Admit::Accept);
+        }
+        assert_eq!(spoof(victim), Admit::Retry);
+        assert_eq!(handler.admit(&attempt(victim, true)), Admit::Accept);
+        handler.finish_admission(false);
+
+        let ledger = limits
+            .max_connections
+            .saturating_add(limits.max_pending_handshakes);
+        for host in 0..ledger {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(
+                0x0a00_0000 + u32::try_from(host).expect("the ledger fits u32"),
+            ));
+            for _ in 0..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+                spoof(ip);
+            }
+        }
+        let fresh: IpAddr = "198.51.100.3".parse().expect("test ip parses");
+        assert_eq!(spoof(fresh), Admit::Retry, "the unvalidated ledger is full");
+        assert_eq!(handler.admit(&attempt(fresh, true)), Admit::Accept);
+        handler.finish_admission(false);
+    }
+
     #[test]
     fn last_per_ip_slot_requires_validation() {
         let ip = "203.0.113.9".parse().unwrap();
@@ -14155,38 +15003,104 @@ mod tests {
             pending_total,
             pending_from_ip: 0,
         };
-        let take = |semaphore: &Arc<Semaphore>, count: usize| {
-            semaphore
-                .clone()
-                .try_acquire_many_owned(u32::try_from(count).expect("test counts are small"))
-                .expect("the test holds free permits")
-        };
 
         // Pending transport handshakes count against the inbound share, which
         // fills before the whole budget does.
         assert_eq!(handler.admit(&attempt(true, 23)), Admit::Accept);
+        handler.finish_admission(false);
         assert_eq!(handler.admit(&attempt(true, 24)), Admit::Refuse);
         assert_eq!(handler.admit(&attempt(false, 24)), Admit::Retry);
 
         // So do inbound control handshakes, and dials keep the rest.
-        let inbound_handshakes = (
-            take(&handler.inbound_handshakes, 24),
-            take(&handler.pending_handshakes, 24),
-        );
+        let inbound_handshakes: Vec<_> = (0..24)
+            .map(|_| {
+                handler
+                    .claim_pending_handshake(true)
+                    .expect("inbound share has room")
+            })
+            .collect();
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
         assert_eq!(handler.pending_handshakes.available_permits(), 8);
         drop(inbound_handshakes);
 
         // Inbound connections stop at their share, and dials keep the rest.
-        let inbound = (
-            take(&handler.inbound_admission, 69),
-            take(&handler.admission, 69),
+        let inbound: Vec<_> = (0..69)
+            .map(|_| {
+                handler
+                    .claim_connection(true)
+                    .expect("inbound share has room")
+            })
+            .collect();
+        assert!(handler.claim_connection(true).is_none());
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().inbound_connections(),
+            69
         );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
-        let dials = take(&handler.admission, 23);
+        let dials: Vec<_> = (0..23)
+            .map(|_| {
+                handler
+                    .claim_connection(false)
+                    .expect("dial reserve has room")
+            })
+            .collect();
+        assert!(handler.claim_connection(false).is_none());
+        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 92);
         assert_eq!(handler.admission.available_permits(), 0);
         drop((inbound, dials));
+        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 0);
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().inbound_connections(),
+            0
+        );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
+    }
+
+    #[test]
+    fn pending_transport_reservations_bound_outbound_control_claims() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits,
+        );
+        for pending in 0..24 {
+            let incoming = IncomingInfo {
+                remote: SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(
+                        192,
+                        0,
+                        2,
+                        u8::try_from(pending + 1).unwrap(),
+                    )),
+                    8234,
+                ),
+                validated: true,
+                pending_total: pending,
+                pending_from_ip: 0,
+            };
+            assert_eq!(handler.admit(&incoming), Admit::Accept);
+        }
+        let dials: Vec<_> = (0..8)
+            .map(|_| handler.claim_pending_handshake(false).unwrap())
+            .collect();
+        assert!(handler.claim_pending_handshake(false).is_none());
+        let transferred = handler
+            .claim_pending_handshake_with_transfer(true, true)
+            .unwrap();
+        handler.finish_admission(true);
+        assert!(handler.claim_pending_handshake(false).is_none());
+        drop(transferred);
+        let ninth = handler.claim_pending_handshake(false).unwrap();
+        assert!(handler.claim_pending_handshake(false).is_none());
+        for _ in 0..23 {
+            handler.finish_admission(false);
+        }
+        drop((ninth, dials));
+        let counts = handler.supervisor.ip_slots.counts();
+        assert_eq!(counts.transport_pending(), 0);
+        assert_eq!(counts.pending(), 0);
     }
 
     /// Dials may use inbound's unused share, and once they fill the whole cap
@@ -14200,11 +15114,17 @@ mod tests {
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits.clone(),
         );
-        let _dials = handler
-            .admission
-            .clone()
-            .try_acquire_many_owned(u32::try_from(limits.max_connections).expect("92 fits"))
-            .expect("dials may take every slot");
+        let _dials: Vec<_> = (0..limits.max_connections)
+            .map(|_| {
+                handler
+                    .claim_connection(false)
+                    .expect("dials may take every slot")
+            })
+            .collect();
+        assert_eq!(
+            handler.supervisor.ip_slots.counts().connections(),
+            limits.max_connections
+        );
         assert_eq!(
             handler.admit(&IncomingInfo {
                 remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
@@ -14264,10 +15184,13 @@ mod tests {
         // while a dial still finds a slot.
         let claims: Vec<_> = inbound[..3]
             .iter()
-            .map(|connection| handler.claim_inbound(connection))
+            .map(|connection| handler.claim_inbound(connection, false))
             .collect();
-        assert!(claims.iter().all(Option::is_some));
-        assert!(handler.claim_inbound(&inbound[3]).is_none());
+        assert!(claims.iter().all(Result::is_ok));
+        assert!(matches!(
+            handler.claim_inbound(&inbound[3], false),
+            Err(InboundRefusal::Admission)
+        ));
         assert_eq!(handler.admission.available_permits(), 1);
         drop(claims);
         assert_eq!(handler.inbound_admission.available_permits(), 3);
@@ -14281,7 +15204,14 @@ mod tests {
                 let peer = ZakuraPeerId::new(connection.remote_id().as_bytes().to_vec())?;
                 let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&connection), &peer);
                 handler
-                    .run_native_responder_handshake_with_permit(&connection, &peer, &conn)
+                    .run_native_responder_handshake_with_permit(
+                        &connection,
+                        &peer,
+                        &conn,
+                        handler
+                            .claim_pending_handshake(true)
+                            .expect("the inbound handshake share has room"),
+                    )
                     .await
                     .map(|_| ())
             }
@@ -14300,19 +15230,103 @@ mod tests {
         assert_eq!(handler.inbound_handshakes.available_permits(), 3);
         assert_eq!(handler.pending_handshakes.available_permits(), 4);
 
-        // With the inbound share full, a responder handshake is refused
-        // without taking a shared slot.
+        // With the inbound share full, an inbound claim is refused for its
+        // pending handshake without keeping a connection or shared slot.
         let full = handler
             .inbound_handshakes
             .clone()
             .try_acquire_many_owned(3)
             .expect("the test holds free permits");
         assert!(matches!(
-            responder(inbound[4].clone()).await,
-            Err(ZakuraHandlerError::ResourceLimit("pending handshake"))
+            handler.claim_inbound(&inbound[4], false),
+            Err(InboundRefusal::PendingHandshake)
         ));
         assert_eq!(handler.pending_handshakes.available_permits(), 4);
+        assert_eq!(handler.admission.available_permits(), 4);
         drop(full);
+        Ok(())
+    }
+
+    /// Dials can take the room an inbound attempt saw at admission while its
+    /// TLS runs. The node then refuses the attempt itself, so the attempt's
+    /// cadence token returns to its address.
+    #[tokio::test]
+    async fn a_local_refusal_after_tls_returns_the_cadence_token() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 4;
+        limits.max_pending_handshakes = 4;
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(1),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let server = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0003)
+            .await?;
+        let (connection_tx, mut connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0004)
+            .await?;
+        let _client_connection = client
+            .connect(
+                LocalEndpointFactory::node_addr(&server).await,
+                &[P2P_V2_ALPN],
+            )
+            .await?;
+        let inbound = timeout(Duration::from_secs(10), connection_rx.recv())
+            .await?
+            .expect("the capture acceptor sends the accepted connection");
+        let ip = inbound.admitted_ip();
+        let validated = inbound.source_validated();
+        let max_hosts = limits
+            .max_connections
+            .saturating_add(limits.max_pending_handshakes);
+        let charge = |handler: &ZakuraProtocolHandler| {
+            handler.supervisor.ip_slots.counts().admit_cadence(
+                ip,
+                validated,
+                handler.supervisor.max_connections_per_ip,
+                max_hosts,
+                Instant::now(),
+            )
+        };
+
+        // `admit` reserved the transport and took the address's one token.
+        assert!(handler
+            .supervisor
+            .ip_slots
+            .counts()
+            .claim_transport(limits.max_pending_handshakes));
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Admit
+        );
+        // Dials then took the inbound share.
+        assert_eq!(limits.max_inbound_connections(), 3);
+        let dials = handler
+            .inbound_admission
+            .clone()
+            .try_acquire_many_owned(3)
+            .expect("the test holds free permits");
+
+        timeout(Duration::from_secs(10), handler.handle(inbound)).await?;
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Admit
+        );
+        assert_eq!(
+            charge(&handler),
+            crate::zakura::HandshakeCadenceAdmission::Exhausted
+        );
+        drop(dials);
         Ok(())
     }
 

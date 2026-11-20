@@ -1,18 +1,17 @@
 //! The `zakura-sim` command: runs registered harnesses and writes traces.
 //!
 //! ```text
-//! zakura-sim record --sim <name> --input <file> --out <dir>
+//! zakura-sim record (--sim <name> --input <file> | --seed <name>) --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable>
 //!     [--also-violates <ids>]]
-//! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
+//! zakura-sim record --sim <name> --scenario <json> [--plan|--script <file>] --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable>
 //!     [--also-violates <ids>]]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //!     [--report <file>]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
 //! zakura-sim versions --sim <name>
-//! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
-//!     [--quarantine <dir>] [--report <file>]
+//! zakura-sim seeds [--sim <name>] [--set <set>] [--out <dir>] [--report <file>]
 //! zakura-sim suite [--out <file>] [--frozen]
 //! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
 //!     [--also-violates <ids>]
@@ -23,7 +22,7 @@
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
 //! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
-//!     [--max-bytes <n>] [--exclude <file>]
+//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle] [--schedule plan|pct]
 //! zakura-sim generators
 //! ```
 //!
@@ -68,8 +67,6 @@ mod campaign;
 mod cli {
     use std::{
         fmt::Write,
-        fs::File,
-        io::Read,
         path::{Path, PathBuf},
         time::Duration,
     };
@@ -82,16 +79,19 @@ mod cli {
         },
         explore::{
             abandon_limit,
-            generate::{self, GenerateOptions, DEFAULT_MAX_BYTES, REPORT_FILE as GENERATE_FILE},
+            generate::{
+                self, DrawPolicy, GenerateOptions, Schedule, DEFAULT_MAX_BYTES,
+                REPORT_FILE as GENERATE_FILE,
+            },
             ABANDON_LIMIT_VAR,
         },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
-        seed::{self, Failed, SeedReport},
+        seed::{self, SeedSet},
         suite,
         trace::{
             self, shrink::REPORT_FILE, ConfirmStatus, Confirmation, ReplayOptions, ShrinkBudget,
-            TraceReader, CONFIRMATION_FILE, MAX_INPUT_BYTES,
+            TraceReader, CONFIRMATION_FILE,
         },
         witness::Expect,
     };
@@ -108,18 +108,17 @@ mod cli {
     pub fn usage() -> String {
         let mut text = String::from(
             "Usage:\n  \
-             zakura-sim record --sim <name> --input <file> --out <dir>\n      \
+             zakura-sim record (--sim <name> --input <file> | --seed <name>) --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable>\n      \
              [--also-violates <ids>]]\n  \
-             zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
+             zakura-sim record --sim <name> --scenario <json> [--plan|--script <file>] --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable>\n      \
              [--also-violates <ids>]]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n      \
              [--report <file>]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
-             zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
-             [--quarantine <dir>] [--report <file>]\n  \
+             zakura-sim seeds [--sim <name>] [--set <set>] [--out <dir>] [--report <file>]\n  \
              zakura-sim suite [--out <file>] [--frozen]\n  \
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
              [--also-violates <ids>]\n      \
@@ -129,14 +128,17 @@ mod cli {
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n  \
              zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
-             [--max-bytes <n>] [--exclude <file>]\n  \
+             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle]\n      \
+             [--schedule plan|pct]\n  \
              zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
         text.push_str(
             "\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
-             `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
+             `--seed` runs the named seed from `seeds`, on its own harness.\n\
+             `--scenario` and `--plan` run Plan bytes against a given scenario, and\n\
+             `--scenario` alone runs the empty Plan against it.\n\
              `--scenario` and `--script` run a scripted Plan, as JSON, against it.\n\
              The trace's meta names the Plan bytes or script by digest.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
@@ -161,13 +163,11 @@ mod cli {
              --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\
              `versions` prints the versions that fix what the harness's fuzz input means,\n\
              as KEY=VALUE lines.\n\
-             `seeds` validates the committed seeds in each --fixtures directory (default\n\
-             crates/zakura-sim/tests/fixtures) against the current generators, and lists\n\
-             each seed as admitted, quarantined or rejected. With --sim, it checks only\n\
-             that harness's seeds, and --out writes each admitted seed's full fuzz input\n\
-             there, named by its SHA-256. --quarantine writes each quarantined seed there\n\
-             with its reason. --report writes the result as JSON. It exits 1 if any\n\
-             required seed is rejected.\n\
+             `seeds` builds and validates the seeds in --set (corpus by default, or\n\
+             known-failure or slow), and lists each seed as admitted or rejected. With\n\
+             --sim, it checks only that harness's seeds, and --out writes each admitted\n\
+             seed's full fuzz input there, named by its SHA-256. --report writes the\n\
+             result as JSON. It exits 1 if any seed is rejected.\n\
              `suite` builds the full-suite manifest from qa/suite.toml, the harness\n\
              registry, the coverage manifest, the planted cases, the seeds, the fuzz\n\
              targets and the test sources, and prints its counts. --out writes it as\n\
@@ -202,6 +202,14 @@ mod cli {
              the run index that stopped it, and each property's outcome counts. With\n\
              ZAKURA_SIM_END_RECORDS set, it writes only the stopping run's end record\n\
              there. It exits 0 once the report is written, whatever the search found.\n\
+             --draws picks each run's scenario family: uniform (the default) from the\n\
+             seed and the run alone, or cycle, which visits every family, each of its\n\
+             variants and one untagged run once per block of runs. --schedule pct makes\n\
+             each run's live picks with a PCT steer the input seeds, and saves a stopping\n\
+             run's input as the bytes that replay it with no steer.\n\
+             ZAKURA_SIM_KNOWN=<id>[=<issue>],... makes every command treat each named\n\
+             Active property as Known, so a search records its violations and goes on\n\
+             past an open bug. Replaying such a trace needs the same value.\n\
              `generators` prints, as JSON, each registered property with the harnesses\n\
              that `generate` can search it on: every harness that reports it and doesn't\n\
              plant its bugs.\n",
@@ -251,6 +259,7 @@ mod cli {
     struct RecordArgs {
         sim: Option<String>,
         input: Option<PathBuf>,
+        seed: Option<String>,
         scenario: Option<String>,
         plan: Option<PathBuf>,
         script: Option<PathBuf>,
@@ -264,9 +273,18 @@ mod cli {
     #[allow(clippy::print_stdout)]
     fn record(args: Vec<String>) -> Result<(), Error> {
         let flags = parse(args)?;
-        let sim = flags
-            .sim
-            .ok_or_else(|| Error::Usage("`record` needs --sim".to_owned()))?;
+        let seed = flags.seed.as_deref().map(named_seed).transpose()?;
+        let sim = match (flags.sim, &seed) {
+            (Some(sim), Some(seed)) if sim != seed.harness => {
+                return Err(Error::Usage(format!(
+                    "the seed {} runs on {}, not {sim}",
+                    seed.name, seed.harness
+                )))
+            }
+            (Some(sim), _) => sim,
+            (None, Some(seed)) => seed.harness.clone(),
+            (None, None) => return Err(Error::Usage("`record` needs --sim or --seed".to_owned())),
+        };
         let out = flags
             .out
             .ok_or_else(|| Error::Usage("`record` needs --out".to_owned()))?;
@@ -293,38 +311,46 @@ mod cli {
             serde_json::from_str::<Value>(text)
                 .map_err(|error| Error::Usage(format!("--scenario isn't JSON: {error}")))
         };
-        let what = match (flags.input, flags.scenario, flags.plan, flags.script) {
-            (Some(path), None, None, None) => {
-                input = read(&path)?;
-                RecordInput::Input(&input)
-            }
-            (None, Some(text), Some(path), None) => {
-                scenario = parse_scenario(&text)?;
-                plan = read(&path)?;
-                RecordInput::Plan {
-                    scenario: &scenario,
-                    plan: &plan,
+        let what =
+            match (flags.input, seed, flags.scenario, flags.plan, flags.script) {
+                (Some(path), None, None, None, None) => {
+                    input = read(&path)?;
+                    RecordInput::Input(&input)
                 }
-            }
-            (None, Some(text), None, Some(path)) => {
-                scenario = parse_scenario(&text)?;
-                script =
-                    serde_json::from_slice::<zakura_sim::Plan>(&read(&path)?).map_err(|error| {
-                        Error::Failed(format!("{} isn't a Plan: {error}", path.display()))
-                    })?;
-                RecordInput::Script {
-                    scenario: &scenario,
-                    plan: &script,
-                    derived_from: None,
+                (None, Some(seed), None, None, None) => {
+                    input = seed.input().to_vec();
+                    RecordInput::Input(&input)
                 }
-            }
-            _ => {
-                return Err(Error::Usage(
-                    "`record` takes either --input, or --scenario with --plan or --script"
+                (None, None, Some(text), plan_path, None) => {
+                    scenario = parse_scenario(&text)?;
+                    // A typed scenario without --plan runs the empty Plan: every
+                    // pick and draw takes its default.
+                    plan = match plan_path {
+                        Some(path) => read(&path)?,
+                        None => Vec::new(),
+                    };
+                    RecordInput::Plan {
+                        scenario: &scenario,
+                        plan: &plan,
+                    }
+                }
+                (None, None, Some(text), None, Some(path)) => {
+                    scenario = parse_scenario(&text)?;
+                    script = serde_json::from_slice::<zakura_sim::Plan>(&read(&path)?).map_err(
+                        |error| Error::Failed(format!("{} isn't a Plan: {error}", path.display())),
+                    )?;
+                    RecordInput::Script {
+                        scenario: &scenario,
+                        plan: &script,
+                        derived_from: None,
+                    }
+                }
+                _ => return Err(Error::Usage(
+                    "`record` takes one of --input, --seed, or --scenario with an optional --plan \
+                     or a --script"
                         .to_owned(),
-                ))
-            }
-        };
+                )),
+            };
         let also_violates: Vec<String> = match (&witness, flags.also_violates) {
             (_, None) => Vec::new(),
             (Some((_, Expect::Violated)), Some(ids)) => ids.split(',').map(str::to_owned).collect(),
@@ -604,19 +630,23 @@ mod cli {
         Ok(())
     }
 
+    /// The seed named `name`, in any set.
+    fn named_seed(name: &str) -> Result<seed::Seed, Error> {
+        seed::find(name).ok_or_else(|| Error::Usage(format!("no seed is named `{name}`")))
+    }
+
     /// The flags `seeds` takes, as given.
     #[derive(Default)]
     struct SeedArgs {
         sim: Option<String>,
-        fixtures: Vec<PathBuf>,
+        set: Option<String>,
         out: Option<PathBuf>,
-        quarantine: Option<PathBuf>,
         report: Option<PathBuf>,
     }
 
-    /// `seeds`: validates the committed seeds, prints each one's result,
-    /// and writes the admitted and quarantined ones and the report where
-    /// the flags say. Fails if any required seed is rejected.
+    /// `seeds`: builds and validates the seeds in one set, prints each one's
+    /// result, and writes the admitted ones and the report where the flags
+    /// say. Fails if any seed is rejected.
     #[allow(clippy::print_stdout)]
     fn seeds(args: Vec<String>) -> Result<(), Error> {
         let mut flags = SeedArgs::default();
@@ -627,12 +657,8 @@ mod cli {
                 .ok_or_else(|| Error::Usage(format!("{flag} needs a value")))?;
             let slot_taken = match flag.as_str() {
                 "--sim" => flags.sim.replace(value).is_some(),
-                "--fixtures" => {
-                    flags.fixtures.push(value.into());
-                    false
-                }
+                "--set" => flags.set.replace(value).is_some(),
                 "--out" => flags.out.replace(value.into()).is_some(),
-                "--quarantine" => flags.quarantine.replace(value.into()).is_some(),
                 "--report" => flags.report.replace(value.into()).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
@@ -640,64 +666,54 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        if flags.sim.is_none() && (flags.out.is_some() || flags.quarantine.is_some()) {
+        if flags.sim.is_none() && flags.out.is_some() {
             return Err(Error::Usage(
-                "--out and --quarantine hold one harness's seeds, so they need --sim".to_owned(),
+                "--out holds one harness's seeds, so it needs --sim".to_owned(),
             ));
         }
         if let Some(sim) = &flags.sim {
             harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
         }
-        if flags.fixtures.is_empty() {
-            flags
-                .fixtures
-                .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
-        }
-        let report = seed::load(&flags.fixtures, flags.sim.as_deref())
-            .map_err(|error| Error::Failed(format!("listing the fixtures: {error}")))?;
+        let set = match flags.set.as_deref() {
+            None => SeedSet::Corpus,
+            Some(name) => SeedSet::parse(name).ok_or_else(|| {
+                Error::Usage(format!(
+                    "--set takes corpus, known-failure or slow, not `{name}`"
+                ))
+            })?,
+        };
+        let report = seed::load(set, flags.sim.as_deref());
         if let Some(out) = &flags.out {
             create(out)?;
             for seed in &report.admitted {
-                write(&out.join(seed.input_sha256()), &seed.input)?;
-            }
-        }
-        if let Some(quarantine) = &flags.quarantine {
-            create(quarantine)?;
-            for failed in &report.quarantined {
-                quarantine_seed(quarantine, failed)?;
+                write(&out.join(seed.input_sha256()), seed.input())?;
             }
         }
         for seed in &report.admitted {
             println!(
-                "admitted {} ({}, generator {}): {}",
-                seed.path.display(),
-                seed.sidecar.harness,
-                seed.sidecar.generator,
+                "admitted {} ({}): {}",
+                seed.name,
+                seed.harness,
                 seed.input_sha256()
             );
         }
-        for failed in &report.quarantined {
-            println!("quarantined {}: {}", failed.path.display(), failed.error);
-        }
         for failed in &report.rejected {
-            println!("rejected {}: {}", failed.path.display(), failed.error);
+            println!("rejected {}: {}", failed.seed.name, failed.error);
         }
         println!(
-            "{} admitted, {} quarantined, {} rejected, {} for other harnesses",
+            "{} admitted, {} rejected, {} for other harnesses",
             report.admitted.len(),
-            report.quarantined.len(),
             report.rejected.len(),
             report.other_harnesses
         );
         if let Some(path) = &flags.report {
-            let json = report_json(&report, flags.sim.as_deref(), &flags.fixtures)?;
-            write(path, json.as_bytes())?;
+            let json = serde_json::to_string_pretty(&report.rows(flags.sim.as_deref(), set))
+                .map_err(|error| Error::Failed(format!("serializing the report: {error}")))?;
+            write(path, format!("{json}\n").as_bytes())?;
         }
         match report.rejected.len() {
             0 => Ok(()),
-            rejected => Err(Error::Failed(format!(
-                "{rejected} required seeds failed validation"
-            ))),
+            rejected => Err(Error::Failed(format!("{rejected} seeds failed validation"))),
         }
     }
 
@@ -791,83 +807,6 @@ mod cli {
                 file.display()
             ))),
         }
-    }
-
-    /// Writes the quarantined seed's file, its sidecar and its reason into
-    /// `dir` as `<name>.bin`, `<name>.toml` and `<name>.reason`. `<name>` is
-    /// the SHA-256 of the file's SHA-256 and the sidecar's, in hex, so two
-    /// seeds with the same bytes and different sidecars, such as two `plan`
-    /// seeds with different prefixes, keep separate records.
-    ///
-    /// A seed can be quarantined before [`seed::load`] reads its file, such
-    /// as for a stale generator, so nothing has bounded the file yet. A file
-    /// over [`MAX_INPUT_BYTES`], the largest fuzz input a trace holds, isn't
-    /// read in full or copied. Its length and path stand in for its SHA-256
-    /// in `<name>`, and the reason names the limit.
-    fn quarantine_seed(dir: &Path, failed: &Failed) -> Result<(), Error> {
-        let sidecar_path = failed.path.with_extension(seed::SIDECAR_EXTENSION);
-        let bytes = read_capped(&failed.path)?;
-        let sidecar = read_capped(&sidecar_path)?;
-        let mut reason = format!("{}: {}\n", failed.path.display(), failed.error);
-        let mut digests = String::new();
-        for (path, read) in [(&failed.path, &bytes), (&sidecar_path, &sidecar)] {
-            match read {
-                Ok(bytes) => digests.push_str(&seed::sha256(bytes)),
-                Err(len) => {
-                    // A hex digest holds no `:`, so this can't match one.
-                    let _ = write!(digests, "{len}:{}:", path.display());
-                    let _ = writeln!(
-                        reason,
-                        "{} is {len} bytes, over the {MAX_INPUT_BYTES}-byte MAX_INPUT_BYTES \
-                         limit, so the quarantine holds no copy of it",
-                        path.display()
-                    );
-                }
-            }
-        }
-        let name = seed::sha256(digests.as_bytes());
-        if let Ok(bytes) = &bytes {
-            write(&dir.join(format!("{name}.{}", seed::SEED_EXTENSION)), bytes)?;
-        }
-        if let Ok(sidecar) = &sidecar {
-            write(
-                &dir.join(format!("{name}.{}", seed::SIDECAR_EXTENSION)),
-                sidecar,
-            )?;
-        }
-        write(&dir.join(format!("{name}.reason")), reason.as_bytes())
-    }
-
-    /// The file at `path` if it holds at most [`MAX_INPUT_BYTES`], or its
-    /// length if it holds more. It reads at most one byte past the limit.
-    fn read_capped(path: &Path) -> Result<Result<Vec<u8>, u64>, Error> {
-        let failed =
-            |error: std::io::Error| Error::Failed(format!("reading {}: {error}", path.display()));
-        let file = File::open(path).map_err(failed)?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(MAX_INPUT_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(failed)?;
-        // A usize always fits in a u64 on supported targets.
-        if bytes.len() as u64 <= MAX_INPUT_BYTES {
-            return Ok(Ok(bytes));
-        }
-        let len = file.metadata().map_err(failed)?.len();
-        Ok(Err(len.max(bytes.len() as u64)))
-    }
-
-    /// `seeds --report`'s JSON: [`SeedReport::rows`]. It serializes
-    /// structs rather than a `Value`, so its key order doesn't depend on
-    /// `serde_json`'s `preserve_order`.
-    fn report_json(
-        report: &SeedReport,
-        sim: Option<&str>,
-        fixtures: &[PathBuf],
-    ) -> Result<String, Error> {
-        serde_json::to_string_pretty(&report.rows(sim, fixtures))
-            .map(|json| json + "\n")
-            .map_err(|error| Error::Failed(format!("serializing the report: {error}")))
     }
 
     /// `suite`: builds the full-suite manifest, prints its counts, and
@@ -1178,8 +1117,10 @@ mod cli {
             "--out",
             "--max-bytes",
             "--exclude",
+            "--draws",
+            "--schedule",
         ];
-        let mut flags: [Option<String>; 6] = Default::default();
+        let mut flags: [Option<String>; 8] = Default::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = names
@@ -1193,7 +1134,7 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        let [sim, seed, runs, out, max_bytes, exclude] = flags;
+        let [sim, seed, runs, out, max_bytes, exclude, draws, schedule] = flags;
         let need = |value: Option<String>, flag: &str| {
             value.ok_or_else(|| Error::Usage(format!("`generate` needs {flag}")))
         };
@@ -1227,6 +1168,30 @@ mod cli {
             records: trace::end_records::dir(),
             abandon_limit: abandon_limit(std::env::var(ABANDON_LIMIT_VAR).ok().as_deref())
                 .map_err(Error::Usage)?,
+            draw_policy: match draws.as_deref() {
+                None | Some("uniform") => DrawPolicy::Uniform,
+                Some("cycle") => DrawPolicy::Cycle,
+                Some(other) => {
+                    return Err(Error::Usage(format!(
+                        "--draws: `{other}` isn't uniform or cycle"
+                    )))
+                }
+            },
+            schedule: match schedule.as_deref() {
+                None | Some("plan") => Schedule::Plan,
+                Some("pct") if entry.run_steered_bytes.is_some() => Schedule::Pct,
+                Some("pct") => {
+                    return Err(Error::Usage(format!(
+                        "--schedule pct: {} makes no picks to steer",
+                        entry.name
+                    )))
+                }
+                Some(other) => {
+                    return Err(Error::Usage(format!(
+                        "--schedule: `{other}` isn't plan or pct"
+                    )))
+                }
+            },
         };
         let report = generate::generate(entry, &options).map_err(|error| {
             Error::Failed(format!(
@@ -1264,6 +1229,7 @@ mod cli {
             let slot_taken = match flag.as_str() {
                 "--sim" => flags.sim.replace(value).is_some(),
                 "--input" => flags.input.replace(value.into()).is_some(),
+                "--seed" => flags.seed.replace(value).is_some(),
                 "--scenario" => flags.scenario.replace(value).is_some(),
                 "--plan" => flags.plan.replace(value.into()).is_some(),
                 "--script" => flags.script.replace(value.into()).is_some(),

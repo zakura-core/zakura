@@ -20,7 +20,7 @@ use crate::{seed::sha256, trace::meta::hex};
 /// The version of every record in the store: build records, snapshot
 /// indexes, manifests, attempts and end records. Bump it when a record's
 /// fields change meaning.
-pub const STORE_VERSION: u32 = 1;
+pub const STORE_VERSION: u32 = 2;
 
 /// The directory of build records.
 const BUILDS_DIR: &str = "builds";

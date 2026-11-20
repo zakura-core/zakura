@@ -105,6 +105,32 @@ fn change_log_resyncs_a_reader_that_fell_off() {
     );
 }
 
+/// After the log has dropped its oldest entries, a read from any cursor it
+/// still covers returns exactly the entries after that cursor, in order:
+/// the offset it starts at matches the entries' own positions.
+#[test]
+fn change_log_reads_start_at_the_cursor_after_eviction() {
+    let mut log = ChangeLog::default();
+    let total = u16::try_from(CHANGE_LOG_CAPACITY + 100).expect("the capacity fits the test's ids");
+    for n in 0..total {
+        log.append([Change::Added(id(n))]);
+    }
+    let last = log.last().0;
+    let oldest = last - u64::try_from(CHANGE_LOG_CAPACITY).expect("the capacity fits a u64") + 1;
+    for cursor in [oldest - 1, oldest, oldest + 1, last - 2, last - 1, last] {
+        let ChangesSince::Entries(entries) = log.since(ChangeSeq(cursor)) else {
+            panic!("a cursor at {cursor} is still on the log");
+        };
+        let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq.0).collect();
+        assert_eq!(
+            seqs,
+            ((cursor + 1)..=last).collect::<Vec<_>>(),
+            "cursor {cursor}"
+        );
+    }
+    assert_eq!(log.since(ChangeSeq(oldest - 2)), ChangesSince::Resync);
+}
+
 #[tokio::test]
 async fn a_dropped_reservation_reaches_the_core() {
     let (handle, mut inbox) = pool_port();
@@ -178,6 +204,43 @@ async fn cancelling_a_blocked_submission_frees_its_slot() {
         .expect_err("the caller was aborted")
         .is_cancelled());
     assert_eq!(inbox.released(), Some(ReservationId(7)));
+}
+
+#[tokio::test]
+async fn submitting_now_to_a_full_queue_drops_the_body_and_answers_no_room() {
+    let (handle, mut inbox) = pool_port();
+    let transaction = body(1);
+    let tx_id = transaction.id();
+    for _ in 0..COMMAND_QUEUE {
+        handle
+            .fetch_failed(
+                inbox.grant(ReservationId(9), tx_id, Default::default()),
+                far(),
+            )
+            .await;
+    }
+    let reservation = inbox.grant(ReservationId(7), tx_id, Default::default());
+    let verdict = handle.submit_now(reservation, transaction, far());
+    // The reservation went with the body before the verdict was awaited.
+    assert_eq!(inbox.released(), Some(ReservationId(7)));
+    assert!(matches!(verdict.await, Ok(Verdict::NoRoom)));
+
+    // With room, the body reaches the core and its verdict comes back.
+    while inbox.released().is_some() {}
+    for _ in 0..COMMAND_QUEUE {
+        assert!(matches!(
+            inbox.command().await,
+            Some(PoolCommand::FetchFailed(_))
+        ));
+    }
+    let transaction = body(2);
+    let reservation = inbox.grant(ReservationId(8), transaction.id(), Default::default());
+    let verdict = handle.submit_now(reservation, transaction, far());
+    let Some(PoolCommand::Submit { reply, .. }) = inbox.command().await else {
+        panic!("with room, the body reaches the core");
+    };
+    let _ = reply.send(Verdict::Admitted);
+    assert!(matches!(verdict.await, Ok(Verdict::Admitted)));
 }
 
 #[tokio::test]
@@ -289,5 +352,139 @@ fn a_snapshot_says_whether_the_pool_is_on() {
     assert!(snapshot_at(ChangeSeq(0)).active);
     let off = PoolSnapshot::inactive(tip, ChangeSeq(0));
     assert!(!off.active);
-    assert!(off.transactions.is_empty());
+    assert!(off.is_empty());
+}
+
+/// The outpoint `n` names.
+fn outpoint(n: u16) -> zakura_chain::transparent::OutPoint {
+    zakura_chain::transparent::OutPoint {
+        hash: hash(n),
+        index: 0,
+    }
+}
+
+/// A transaction that spends `outpoint(n)`, as a verifier passes it.
+fn spending(n: u16) -> zakura_chain::transaction::VerifiedUnminedTx {
+    spending_until(n, 1_000_000)
+}
+
+/// [`spending`] with expiry height `expiry`, so two can spend the same outpoint.
+fn spending_until(n: u16, expiry: u32) -> zakura_chain::transaction::VerifiedUnminedTx {
+    use zakura_chain::{
+        amount::Amount,
+        transaction::{LockTime, Transaction, VerifiedUnminedTx},
+        transparent::{Input, Script},
+    };
+    let transaction = Transaction::V4 {
+        inputs: vec![Input::PrevOut {
+            outpoint: outpoint(n),
+            unlock_script: Script::new(&[]),
+            sequence: 0,
+        }],
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(expiry),
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    };
+    VerifiedUnminedTx::new(
+        transaction.into(),
+        Amount::try_from(10_000).expect("a valid fee"),
+        0,
+        0,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .expect("the fee pays for the transaction")
+}
+
+#[test]
+fn a_snapshot_after_changes_matches_one_built_from_scratch() {
+    let tip = ChainTip {
+        hash: zakura_chain::block::Hash([0; 32]),
+        height: Height(100),
+    };
+    let [a, b, c, d] = [1, 2, 3, 4].map(spending);
+    let mined = |tx: &zakura_chain::transaction::VerifiedUnminedTx| tx.transaction.id().mined_id();
+    let before = PoolSnapshot::new(
+        tip,
+        ChangeSeq(1),
+        vec![a.clone(), b.clone()],
+        TransactionDependencies::default(),
+    );
+
+    // The step removes `a`, adds `c`, and adds `d` and evicts it again.
+    let pool = [b.clone(), c.clone()];
+    let changes = [
+        Change::Removed {
+            id: a.transaction.id(),
+            reason: super::RemovalReason::Mined,
+        },
+        Change::Added(c.transaction.id()),
+        Change::Added(d.transaction.id()),
+        Change::Removed {
+            id: d.transaction.id(),
+            reason: super::RemovalReason::Evicted,
+        },
+    ];
+    let after = before.after(
+        tip,
+        ChangeSeq(5),
+        &changes,
+        |id| pool.iter().find(|tx| mined(tx) == *id),
+        vec![mined(&c), mined(&b)],
+        TransactionDependencies::default(),
+    );
+
+    let fresh = PoolSnapshot::new(
+        tip,
+        ChangeSeq(5),
+        vec![c.clone(), b.clone()],
+        TransactionDependencies::default(),
+    );
+    assert!(after.transactions().eq(fresh.transactions()));
+    for (n, tx) in [(1, &a), (2, &b), (3, &c), (4, &d)] {
+        assert_eq!(after.spends(&outpoint(n)), fresh.spends(&outpoint(n)));
+        assert_eq!(after.transaction(&mined(tx)), fresh.transaction(&mined(tx)));
+    }
+    // The earlier snapshot still reads as it was published.
+    assert!(before.transactions().eq([&a, &b]));
+    assert!(before.spends(&outpoint(1)) && !before.spends(&outpoint(3)));
+}
+
+#[test]
+fn a_spender_replaced_in_one_step_keeps_its_outpoint_spent() {
+    let tip = ChainTip {
+        hash: zakura_chain::block::Hash([0; 32]),
+        height: Height(100),
+    };
+    let mined = |tx: &zakura_chain::transaction::VerifiedUnminedTx| tx.transaction.id().mined_id();
+    // `a` leaves and `b` arrives in one step, both spending `outpoint(1)`.
+    // Each id lands in a random place in the step's change map, so repeating
+    // the step covers both orders.
+    for _ in 0..32 {
+        let (a, b) = (spending_until(1, 1_000_000), spending_until(1, 1_000_001));
+        let before = PoolSnapshot::new(
+            tip,
+            ChangeSeq(1),
+            vec![a.clone()],
+            TransactionDependencies::default(),
+        );
+        let changes = [
+            Change::Removed {
+                id: a.transaction.id(),
+                reason: super::RemovalReason::Evicted,
+            },
+            Change::Added(b.transaction.id()),
+        ];
+        let after = before.after(
+            tip,
+            ChangeSeq(3),
+            &changes,
+            |id| (mined(&b) == *id).then_some(&b),
+            vec![mined(&b)],
+            TransactionDependencies::default(),
+        );
+        assert!(after.spends(&outpoint(1)), "b still spends the outpoint");
+        assert!(after.transaction(&mined(&a)).is_none());
+    }
 }

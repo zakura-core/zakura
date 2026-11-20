@@ -1,0 +1,20 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index 67fb071acb..dcaac56a4c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -423,7 +423,14 @@ impl HeaderSyncReactor {
+         held: Option<RetainedHeaders>,
+     ) -> StorageDispatch {
+         match self.startup.port_dispatch {
+-            PortDispatch::Direct => self.dispatch_direct_port_operation(action, held),
++            PortDispatch::Direct => {
++                // Mutation: each locator query also goes to the action
++                // channel, an external driver's queue, beside the port.
++                if matches!(action, HeaderPortOperation::QueryHeaderLocator { .. }) {
++                    let _ = self.actions.try_send(action.clone());
++                }
++                self.dispatch_direct_port_operation(action, held)
++            }
+             #[cfg(any(test, feature = "zakura-testkit"))]
+             PortDispatch::External => {
+                 // An external driver's calls hold no lease, and its results carry no

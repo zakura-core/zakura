@@ -466,3 +466,148 @@ class = "killed-by-other-rule"
 other = "discovery/s4v2/conformant-never-closes"
 stage = "property"
 reason = """Each answer spends a `GetServices` slot, so answering twice spends two. Seeds 11, 23 and 89 draw `get-services-over-margin` first, whose peer asks up to its margin, so the node closes a conformant peer and `conformant-never-closes` fails before a second `Services` reaches the rule."""
+
+# Handshake joint run at 345b53cbb (seed 11, 250 runs): the generator lanes that didn't kill by the named rule.
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-hello-magic/skip-hello-magic.patch"
+property = "handshake/hello/bad-magic-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the magic fault, and `handshake/hello/bad-magic-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-hello-protocol/skip-hello-protocol.patch"
+property = "handshake/hello/bad-protocol-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the protocol fault, and `handshake/hello/bad-protocol-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-chain-binding/skip-chain-binding.patch"
+property = "handshake/hello/wrong-chain-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the chain fault, and `handshake/hello/wrong-chain-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-required-channel/skip-required-channel.patch"
+property = "handshake/hello/missing-capability-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the required-channel fault, and `handshake/hello/missing-capability-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-native-initiator-nonce/skip-native-initiator-nonce.patch"
+property = "handshake/hello/nonzero-initiator-nonce-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the initiator-nonce fault, and `handshake/hello/nonzero-initiator-nonce-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/hello/bad-frame-limit-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `hello` about 16 times across its 19 faults. None of them drew the frame-limit fault, and `handshake/hello/bad-frame-limit-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/accept-unoffered-capability/accept-unoffered-capability.patch"
+property = "handshake/ack/unoffered-capability-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `ack` about 16 times across its 13 faults. None of them drew the unoffered-capability fault, and `handshake/ack/unoffered-capability-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-frame-limits/skip-frame-limits.patch"
+property = "handshake/ack/bad-frame-limit-refused"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `ack` about 16 times across its 13 faults. None of them drew the frame-limit fault, and `handshake/ack/bad-frame-limit-refused` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/allow-ineligible-opener/allow-ineligible-opener.patch"
+property = "handshake/prelude/ineligible-opener-closes"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """handshake/wire draws one of 15 families or no tag per run, so seed 11's 250 runs draw `prelude` about 16 times across its 9 faults. None of them drew the ineligible-opener fault, and `handshake/prelude/ineligible-opener-closes` never applies. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-release/no-closing-deadline/no-closing-deadline.patch"
+property = "handshake/hello/refusal-releases-slot"
+lane = "handshake/wire"
+class = "survived"
+stage = "generator"
+reason = """The property applies in 53 of seed 11's runs, but none refuses a handshake over `dial-reserve`'s nine-second return path, which the family draws only under transport pressure. Without that path the RTT-based drain ends inside the three-second deadline. The witness kills the mutant."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-message-limits/skip-message-limits.patch"
+property = "handshake/ack/bad-message-limit-refused"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/hello/bad-message-limit-refused"
+stage = "property"
+reason = """Hello and ack share one limits validator, so the patch skips the message limit check for both. The seed drew the other message's fault first, and `handshake/hello/bad-message-limit-refused` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-stream-limits/skip-stream-limits.patch"
+property = "handshake/hello/bad-stream-limit-refused"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/ack/bad-stream-limit-refused"
+stage = "property"
+reason = """Hello and ack share one limits validator, so the patch skips the stream limit check for both. The seed drew the other message's fault first, and `handshake/ack/bad-stream-limit-refused` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-queue-limits/skip-queue-limits.patch"
+property = "handshake/ack/bad-queue-limit-refused"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/hello/bad-queue-limit-refused"
+stage = "property"
+reason = """Hello and ack share one limits validator, so the patch skips the queue limit check for both. The seed drew the other message's fault first, and `handshake/hello/bad-queue-limit-refused` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-idle-limits/skip-idle-limits.patch"
+property = "handshake/hello/bad-idle-limit-refused"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/ack/bad-idle-limit-refused"
+stage = "property"
+reason = """Hello and ack share one limits validator, so the patch skips the idle limit check for both. The seed drew the other message's fault first, and `handshake/ack/bad-idle-limit-refused` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-table/skip-control-read-hard-cap/skip-control-read-hard-cap.patch"
+property = "handshake/ack/oversize-refused"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/hello/oversize-refused"
+stage = "property"
+reason = """Hello and ack share the control read's hard cap. The seed drew an oversize hello first, and `handshake/hello/oversize-refused` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-release/retain-quic-slot/retain-quic-slot.patch"
+property = "handshake/ack/refusal-releases-slot"
+lane = "handshake/wire"
+class = "killed-by-other-rule"
+other = "handshake/hello/refusal-releases-slot"
+stage = "property"
+reason = """The leaked QUIC slot follows any refused handshake. The seed drew a refused hello first, and `handshake/hello/refusal-releases-slot` fired. The witness kills the mutant by the named rule."""
+
+[[triage]]
+patch = "qa/native-mutations/handshake-admission/remove-inbound-reserve/remove-inbound-reserve.patch"
+property = "handshake/pending-bounded"
+lane = "handshake/counts"
+class = "killed-by-other-rule"
+other = "handshake/dial-reserve-kept"
+stage = "property"
+reason = """Without the inbound reserve, inbound handshakes take the dials' share, and `handshake/dial-reserve-kept` judges that first. The witness kills the mutant by the named rule."""

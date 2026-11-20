@@ -1,0 +1,87 @@
+{
+  "net": {
+    "seed": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "default_link": {
+      "min_delay_ms": 0,
+      "max_delay_ms": 100,
+      "reorder": true,
+      "loss_budget": 0
+    },
+    "links": [],
+    "loss_after_admission": false
+  },
+  "node": {
+    "main": 120,
+    "fork": null
+  },
+  "peers": [
+    {
+      "dialer": "peer",
+      "capabilities": 1024,
+      "bad_nonce_echo": false,
+      "script": [],
+      "honest": {
+        "chain": 50,
+        "subscribe": {
+          "start": 50,
+          "open": {
+            "objects": 1,
+            "bytes": 263
+          },
+          "grants": {
+            "held": {
+              "grant": {
+                "objects": 1,
+                "bytes": 263
+              },
+              "quiet_ms": 0
+            }
+          }
+        }
+      },
+      "adversary": {
+        "announce": true,
+        "serve": false,
+        "withhold": false
+      }
+    }
+  ],
+  "policy": {
+    "base": "success-only",
+    "bound_ms": 5000,
+    "holds": []
+  }
+}

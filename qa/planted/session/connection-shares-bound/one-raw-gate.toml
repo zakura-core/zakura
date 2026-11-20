@@ -2,7 +2,7 @@
 # every kind on the connection, so any service's received frames may fill
 # another's share. The input's block bodies fill the gate past discovery's
 # share.
-input = "crates/zakura-sim/tests/fixtures/sync-wire-saturated.bin"
+seed = "sync-wire-saturated"
 # Besides lifetime.rs, which the patch changes, the handler admits each
 # frame through its kind's gate.
 checks = ["crates/zakura-network/src/zakura/handler.rs"]

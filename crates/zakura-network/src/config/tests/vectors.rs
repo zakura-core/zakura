@@ -2702,6 +2702,18 @@ fn advert_delay_roundtrips_and_validates() {
     assert!(toml::from_str::<Config>("advert_delay = '-1s'").is_err());
 }
 
+#[test]
+fn push_relayed_blocks_defaults_off_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+    let default: Config = toml::from_str("").unwrap();
+    assert!(!default.push_relayed_blocks);
+    let config: Config = toml::from_str("push_relayed_blocks = true").unwrap();
+    assert!(config.push_relayed_blocks);
+    let serialized = toml::to_string(&config).unwrap();
+    let reloaded: Config = toml::from_str(&serialized).unwrap();
+    assert!(reloaded.push_relayed_blocks, "{serialized}");
+}
+
 /// Configs written by v1.8.5 set `advert_delay_min` and `advert_delay_max`. They still load:
 /// the maximum becomes the delay, and the minimum is ignored.
 #[test]
@@ -2796,4 +2808,28 @@ trace_peer_names = { "not-an-ip" = "us-0" }
 "#,
     )
     .is_err());
+}
+
+#[test]
+fn block_download_score_and_hedge_is_off_by_default_and_rejects_unknown_keys() {
+    let _init_guard = zakura_test::init();
+
+    assert!(!Config::default().block_download_score_and_hedge.enabled);
+    let config: Config = toml::from_str("").expect("an empty config parses");
+    assert!(!config.block_download_score_and_hedge.enabled);
+
+    let config: Config = toml::from_str("[block_download_score_and_hedge]\nenabled = true")
+        .expect("the setting parses");
+    assert!(config.block_download_score_and_hedge.enabled);
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).expect("config serializes"))
+        .expect("serialized config parses");
+    assert_eq!(
+        roundtrip.block_download_score_and_hedge,
+        config.block_download_score_and_hedge
+    );
+
+    assert!(
+        toml::from_str::<Config>("[block_download_score_and_hedge]\nenabeld = true").is_err(),
+        "a misspelled key is rejected"
+    );
 }

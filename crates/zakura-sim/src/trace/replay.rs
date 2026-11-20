@@ -3,8 +3,8 @@
 //!
 //! Replay drives the same step loop as recording. The decider answers every
 //! pick and draw from the trace and checks it first, and a [`VerifySink`]
-//! compares each record the replay emits with the recorded one. Setup's step
-//! 0 observations have no digest in the trace, so replay can't check them.
+//! compares each record the replay emits with the recorded one, setup's step
+//! 0 observations included, through the digest `init` carries.
 
 use std::{
     fmt,

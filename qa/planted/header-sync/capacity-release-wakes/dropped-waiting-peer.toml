@@ -6,7 +6,7 @@
 # doesn't break first. The harness neither closed nor relinked the waiting
 # session after the wake opened, so the end is the node's and answers
 # nothing, and the wake expires at the next quiescence.
-input = "crates/zakura-sim/tests/fixtures/header-release-wake.bin"
+seed = "header-release-wake"
 # Besides reactor.rs, which the patch changes, the queue and the offer
 # policy decide when the offer waits for room and which pass takes it back.
 # A change there can move the input off its release.

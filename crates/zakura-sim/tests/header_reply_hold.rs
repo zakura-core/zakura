@@ -8,8 +8,9 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::{inputs, storage_witnesses};
+use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::harness::header_sync::storage_witnesses;
 use zakura_sim::{
     harness::{
         header_node::policy::{OpKind, Select},

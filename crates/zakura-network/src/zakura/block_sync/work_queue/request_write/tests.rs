@@ -754,7 +754,7 @@ fn queued_expiry_racing_reset_settles_each_reservation_once() {
 }
 
 #[test]
-fn expiry_after_forward_reset_discards_committed_heights() {
+fn a_forward_reset_discards_committed_heights() {
     for received in [false, true] {
         let mut f = Fixture::new();
         let (sender, receiver) = worker_framed_channel(1);
@@ -772,21 +772,23 @@ fn expiry_after_forward_reset_discards_committed_heights() {
                     .unwrap(),
             );
         }
-        // Reset retains heights at or below its new floor. Cleanup must discard
-        // that prefix instead of offering already-committed work to another peer.
+        // A reset that raises the floor drops the committed prefix and settles its
+        // funding, so no peer is offered already-committed work.
         f.work.reset_above(block::Height(2));
-        let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
-            claim.owner(),
-            [block::Height(1), block::Height(2)],
-        );
-        assert_eq!(outcome.committed_count, 2);
-        assert_eq!(outcome.returned_count, 0);
-        assert_eq!(outcome.released_bytes, if received { 100 } else { 200 });
-
         assert_eq!(f.work.pending_len(), 0);
         assert_eq!(f.work.in_flight_len(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
         assert_eq!(f.budget.reserved(), 0);
+        if !received {
+            assert!(!claim.try_start(), "the queued frame is skipped");
+        }
+        let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
+            claim.owner(),
+            [block::Height(1), block::Height(2)],
+        );
+        assert_eq!(outcome.missing_count, 2);
+        assert_eq!(outcome.returned_count, 0);
+        assert_eq!(outcome.released_bytes, 0);
         drop(receiver);
         drop(claim);
         assert_eq!(f.work.pending_len(), 0);

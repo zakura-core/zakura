@@ -6,5 +6,5 @@
 # `teardown-submission` stop the node after header sync has finished, so
 # header sync holds no call there. The reactor and the queue decide when
 # a round prepares, so a change there can move the input off it.
-input = "crates/zakura-sim/tests/fixtures/sync-storage-teardown-headers.bin"
+seed = "sync-storage-teardown-headers"
 checks = ["crates/zakura-network/src/zakura/header_sync"]

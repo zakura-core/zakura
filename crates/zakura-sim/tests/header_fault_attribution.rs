@@ -14,7 +14,10 @@ use zakura_header_chain::{ErrorCategory, Frontier, SourceId};
 use zakura_node_services::header_chain::Port;
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{
-    harness::header_node::fault::{owed, CooldownEvidence, FaultEnd, FaultEvidence, OwedPenalty},
+    harness::header_node::{
+        ends::EndEvidence,
+        fault::{owed, CooldownEvidence, FaultEnd, FaultEvidence, OwedPenalty},
+    },
     observe::{StorageFact, StorageResult},
     storage::{Blame, HeaderStorage},
     NoChecks, Observation, Outcome, Plan, PlanInput, RunConfig, RunReport,
@@ -88,6 +91,7 @@ fn attempt(
             faults = Some(FaultEvidence::new(
                 storage.attributions(),
                 CooldownEvidence::default(),
+                EndEvidence::default(),
                 Duration::ZERO,
             ));
             sim.add_source(Box::new(storage));

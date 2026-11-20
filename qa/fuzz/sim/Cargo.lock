@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "18.0.0"
+version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -2153,6 +2153,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "serde_json",
+ "zakura-rt",
  "zakura-scheduler",
  "zakura-sim",
 ]

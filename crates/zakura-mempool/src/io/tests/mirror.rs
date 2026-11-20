@@ -383,8 +383,7 @@ impl Mirror {
             .expect("the core publishes when it starts");
         let untimed = |snapshot: &PoolSnapshot| {
             snapshot
-                .transactions
-                .iter()
+                .transactions()
                 .cloned()
                 .map(|mut tx| {
                     tx.time = None;

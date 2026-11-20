@@ -60,6 +60,78 @@ fn request() -> Frame {
     }
 }
 
+#[test]
+fn replacement_keeps_capacity_until_retired_snapshot_owners_drop() {
+    use crate::zakura::{
+        regulation::session_capacity::SessionCapacity, ServicePeerDirection, ServicePeerLimits,
+    };
+
+    let capacity = SessionCapacity::new(
+        "replacement-test",
+        &ServicePeerLimits {
+            max_inbound_peers: 2,
+            max_outbound_peers: 0,
+            max_pending_escalations: 2,
+            ..ServicePeerLimits::default()
+        },
+    );
+    let initial = capacity.free();
+    let table = SessionTable::default();
+    let peer = peer(1);
+    let mut changed = table.subscribe();
+    let session = |id| {
+        let connection = Connection::new();
+        let (current, _, _) = connection.session(id, id);
+        let resources = capacity.reserve(ServicePeerDirection::Inbound).unwrap();
+        resources.admitted();
+        Current {
+            key: current.key,
+            cancel: current.cancel,
+            fence: current.fence,
+            session: resources,
+        }
+    };
+
+    assert!(matches!(
+        table.replace(peer.clone(), session(1)),
+        Replacement::Inserted
+    ));
+    let snapshot = table.snapshot(&mut changed);
+    let worker = snapshot[0].2.clone();
+    let Replacement::Replaced(retired) = table.replace(peer.clone(), session(2)) else {
+        panic!("a different connection replaces the old session");
+    };
+    assert!(retired.cancel.is_cancelled());
+    assert_eq!(capacity.free().inbound, 0);
+    assert_eq!(capacity.free().setup, initial.setup);
+    drop(retired);
+    drop(snapshot);
+    assert_eq!(
+        capacity.free().inbound,
+        0,
+        "the retired worker still owns its slot"
+    );
+    drop(worker);
+    assert_eq!(
+        capacity.free().inbound,
+        1,
+        "retired reservation remains after its last snapshot owner drops"
+    );
+
+    let (key, current_worker) = table.get(&peer).unwrap();
+    let removed = table.remove(&peer, key).unwrap();
+    assert!(removed.cancel.is_cancelled());
+    drop(removed);
+    drop(table);
+    assert_eq!(
+        capacity.free().inbound,
+        1,
+        "the removed session still has a worker"
+    );
+    drop(current_worker);
+    assert_eq!(capacity.free(), initial);
+}
+
 #[tokio::test]
 async fn churn_coalesces_and_changes_during_reconciliation_stay_visible() {
     let table = SessionTable::default();

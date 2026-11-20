@@ -40,8 +40,8 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, Mark},
     observe::{Exit, Observation},
     record::{
-        digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
-        ViolationRecord,
+        digest, CleanupRecord, DrawRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink,
+        StepRecord, ViolationRecord,
     },
     Identity, ObservationLog, Plan, PlanInput, RecoveryOffer,
 };
@@ -113,6 +113,40 @@ pub trait TaskHold {
     /// True if `task`, which resumes at `at`, sits out the next pick. The
     /// run asks after each step's observations, once per ready task.
     fn holds(&self, task: TaskId, at: &At) -> bool;
+
+    /// False if the hold lets a task run while another task is parked on a
+    /// lock it holds, so the hold never blocks that task as well. The run
+    /// then doesn't ask [`TaskHold::holds`] about it.
+    fn holds_while_waited_on(&self) -> bool {
+        true
+    }
+}
+
+/// A tool's rule that makes some of a run's live picks in place of its
+/// Plan, such as a search for a schedule that a slow thread would make.
+/// The recovery policy and the drain still pick for themselves.
+pub trait Steer {
+    /// The index into `options` to pick, or `None` to let the Plan pick.
+    /// `log` holds every observation so far.
+    fn pick(&mut self, options: &[Identity], log: &ObservationLog) -> Option<usize>;
+}
+
+/// The bytes that replay a steered run's choices with no steer, from
+/// [`Sim::steer`]. They're complete once the run ends.
+#[derive(Debug)]
+pub struct SteeredPlan(Rc<RefCell<Choices>>);
+
+impl SteeredPlan {
+    /// The Plan bytes recorded so far: each pick and draw the run didn't
+    /// force, up to recovery, as a bytes input reads it.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.0
+            .borrow()
+            .decider
+            .recorded_bytes()
+            .expect("Sim::steer starts the recording")
+            .to_vec()
+    }
 }
 
 /// One step's pick, for tests and reports.
@@ -177,6 +211,8 @@ pub struct Sim {
     mid_poll: MidPoll,
     /// The harness tasks that can produce work forever.
     generators: Rc<Generators>,
+    /// The rule that makes live picks in place of the Plan, if any.
+    steer: Option<Box<dyn Steer>>,
 }
 
 /// The run's generators: harness tasks that can produce work forever, such
@@ -282,6 +318,7 @@ impl Sim {
             on_end: Vec::new(),
             mid_poll: MidPoll::default(),
             generators: Rc::default(),
+            steer: None,
         }
     }
 
@@ -343,6 +380,15 @@ impl Sim {
         self.holds.push(hold);
     }
 
+    /// Lets `steer` make live picks in place of the Plan, and records the
+    /// bytes that replay the run's choices without it. A second call
+    /// replaces the first steer.
+    pub fn steer(&mut self, steer: Box<dyn Steer>) -> SteeredPlan {
+        self.steer = Some(steer);
+        self.choices.borrow_mut().decider.record_bytes();
+        SteeredPlan(Rc::clone(&self.choices))
+    }
+
     /// The run's scheduler, for setup such as spawning the tasks under test.
     /// Draws in setup code are recorded in the `init` record.
     pub fn scheduler(&mut self) -> &mut Scheduler {
@@ -385,9 +431,10 @@ impl Sim {
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
-    /// each step, then `end`. A sink that doesn't want steps
-    /// ([`RecordSink::wants_steps`]) gets only `init` and `end`, and the run
-    /// skips each step's `obs` digest.
+    /// after setup's step 0 observations, each step, then `end`. A sink that
+    /// doesn't want steps ([`RecordSink::wants_steps`]) gets only `init` and
+    /// `end`, and the run skips every `obs` digest, step 0's included, and
+    /// tells its sources so ([`ActionSource::record_contents`]).
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
         state.log.set_run(self.run_id);
@@ -397,12 +444,14 @@ impl Sim {
             choices.set_owner(Owner::Harness);
             choices.take_draws()
         };
-        sink.record(Record::Init(InitRecord { draws }));
         // A checker's failure from setup, such as a missing source, ends the
         // run before its first step.
         let end = match self.failure.take().or_else(|| checker.harness_failure()) {
-            Some(failure) => state.end_harness(failure),
-            None => self.drive(checker, &mut state, sink),
+            Some(failure) => {
+                sink.record(Record::Init(InitRecord { draws, obs: None }));
+                state.end_harness(failure)
+            }
+            None => self.drive(checker, &mut state, sink, draws),
         };
         // A trace replay that ended before its record did diverged.
         let unreached = match end.outcome {
@@ -516,21 +565,33 @@ impl Sim {
         cleanup
     }
 
-    /// Steps until the run ends.
+    /// Steps until the run ends, after observing setup and emitting `init`
+    /// with setup's `draws`.
     fn drive(
         &mut self,
         checker: &mut dyn Checker,
         st: &mut State,
         sink: &mut dyn RecordSink,
+        draws: Vec<DrawRecord>,
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
         // Read once, so a run never emits only some of its steps.
         let record_steps = sink.wants_steps();
-        if let Err(failure) = self.observe_sources(st) {
+        for source in &mut self.sources {
+            source.record_contents(record_steps);
+        }
+        let observed = self.observe_sources(st);
+        // The first ready set logs the setup tasks' spawns into step 0, so
+        // it's read before `init`'s digest, which then covers all of step
+        // 0's observations. It draws nothing and moves nothing.
+        let first = observed.is_ok().then(|| self.ready(st));
+        let obs = record_steps.then(|| digest(st.log.of_step(st.step)));
+        sink.record(Record::Init(InitRecord { draws, obs }));
+        if let Err(failure) = observed {
             return st.end_harness(failure);
         }
-        let mut ready = match self.ready(st) {
+        let mut ready = match first.expect("read whenever setup's sources observed cleanly") {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
         };
@@ -701,9 +762,18 @@ impl Sim {
             let decision = {
                 // This borrow ends before any task code runs, so tasks can draw.
                 let mut choices = self.choices.borrow_mut();
-                match phase {
-                    Phase::Live => choices.decider.pick(&identities),
-                    Phase::Drain => choices.decider.pick_round_robin(&identities),
+                let steered = match &mut self.steer {
+                    Some(steer) if phase == Phase::Live && !choices.decider.recovering() => {
+                        steer.pick(&identities, &st.log)
+                    }
+                    _ => None,
+                };
+                match (phase, steered) {
+                    (Phase::Live, Some(index)) => {
+                        Ok(choices.decider.pick_steered(&identities, index))
+                    }
+                    (Phase::Live, None) => choices.decider.pick(&identities),
+                    (Phase::Drain, _) => choices.decider.pick_round_robin(&identities),
                 }
             };
             let decision = match decision {
@@ -1100,10 +1170,14 @@ impl Sim {
     /// seen for the first time as spawned, and which ones the harness holds.
     fn ready(&self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
         let ready = self.sched().ready();
+        let waited_on = self.sched().waited_on();
         let mut out = Vec::with_capacity(ready.len());
         st.held.clear();
         for r in ready {
-            if self.holds.iter().any(|hold| hold.holds(r.task, &r.at)) {
+            let waited_on = waited_on.contains(&r.task);
+            if self.holds.iter().any(|hold| {
+                (!waited_on || hold.holds_while_waited_on()) && hold.holds(r.task, &r.at)
+            }) {
                 st.held.insert(r.task);
             }
             let name = match st.names.get(&r.task) {

@@ -1,7 +1,7 @@
 //! S4.7: discovery's `wait_complete` wakes once the initial exchange
 //! completes. The scenario and its check are the `discovery/wait-complete`
-//! harness, and `tests/witness.rs` holds the regression. This file holds
-//! the input builder and the seed sweep.
+//! harness, `zakura_sim::seed` builds its input, and `tests/witness.rs`
+//! holds the regression. This file holds the seed sweep.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -17,15 +17,10 @@ use support::{inputs, recorded};
 use zakura_network::zakura::{ZakuraDiscoveryHandle, ZakuraNodeRecord};
 use zakura_quic::NodeId;
 use zakura_sim::{
-    check::after_step,
-    domain::discovery::{
-        is_source, wait_complete_wakes, WaitState, WAIT_COMPLETE_WAKES as PROPERTY,
-    },
+    domain::discovery::{wait_complete_wakes, WAIT_COMPLETE_WAKES as PROPERTY},
     harness::discovery::{run_config, spawn, Spawned, WaitComplete},
-    property::{Assumptions, Registry, RegistryChecker, Source, Sources, Tee},
-    record::DrawRecord,
-    record::Record,
-    Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    property::{Assumptions, Registry, RegistryChecker, Source, Sources},
+    seed, Outcome, Plan, PropertyOutcome, RunReport,
 };
 
 /// The registry's check of [`PROPERTY`] alone, for runs outside the
@@ -37,142 +32,6 @@ fn wakes_checker() -> RegistryChecker<WaitComplete> {
         Assumptions::none(),
         &Sources::observed(&[Source::Schedule]),
     )
-}
-
-/// Each step's enabled set, the index it picked, and the index that would
-/// hold the source back at its `notified`, for building inputs by hand.
-type Choices = Vec<(Vec<String>, usize, Option<usize>)>;
-
-/// The task an identity runs, if it runs one.
-fn task_of(identity: &str) -> Option<&str> {
-    let rest = identity.strip_prefix("task:")?;
-    Some(&rest[..rest.rfind(':')?])
-}
-
-/// An enabled action other than the source, when the source stands between
-/// its check and its `notified` and a mark is still to come.
-fn hold_source(state: &WaitState, enabled: &[String]) -> Option<usize> {
-    let source_enabled = enabled.iter().filter_map(|e| task_of(e)).any(is_source);
-    if !source_enabled || !state.source_between_check_and_notified() || state.all_marked() {
-        return None;
-    }
-    enabled
-        .iter()
-        .position(|e| !task_of(e).is_some_and(is_source))
-}
-
-/// Runs the scenario under `plan` with the check. Returns the report, the
-/// records, and each step's choices.
-fn run(plan: PlanInput) -> (RunReport, Vec<String>, Choices) {
-    let mut choices = Choices::new();
-    let record = after_step(|cx| {
-        let enabled: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
-        let pick = cx.pick.to_string();
-        // The loop picks from the enabled set, so the pick is always in it.
-        let index = enabled.iter().position(|e| *e == pick).unwrap_or_default();
-        // The state before this step, as the pick saw it.
-        let before = cx.log.entries().partition_point(|e| e.step < cx.step);
-        let hold = hold_source(&WaitState::of(&cx.log.entries()[..before]), &enabled);
-        choices.push((enabled, index, hold));
-        None
-    });
-    let (report, lines) = recorded(
-        run_config(),
-        plan,
-        |sim| {
-            spawn(sim);
-        },
-        &mut Tee(wakes_checker(), record),
-    );
-    (report, lines, choices)
-}
-
-/// How many bytes choose among `range` values, as the `Plan` decodes them.
-fn width(range: u128) -> usize {
-    match range {
-        0..=0x100 => 1,
-        0x101..=0x1_0000 => 2,
-        0x1_0001..=0x1_0000_0000 => 4,
-        _ => 8,
-    }
-}
-
-/// Appends `value` as `width(range)` little-endian bytes.
-fn push(bytes: &mut Vec<u8>, value: u64, range: u128) {
-    bytes.extend_from_slice(&value.to_le_bytes()[..width(range)]);
-}
-
-/// Appends a draw's answer, unless its bound makes it forced.
-fn push_draw(bytes: &mut Vec<u8>, draw: &DrawRecord) {
-    match draw.bound.0 {
-        1 => {}
-        0 => push(bytes, draw.value.0, 1 << 64),
-        bound => push(bytes, draw.value.0, u128::from(bound)),
-    }
-}
-
-/// Builds a fuzz input that holds the source back at its `notified` until
-/// the sink has run all three marks. Each round reruns the input, finds the
-/// first step where the round-robin default didn't hold the source back,
-/// and rewrites the input from there.
-///
-/// Returns `Ok` with the input once it violates the property, or `Err` with
-/// the finished input if holding the source back everywhere it can doesn't.
-fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
-    let mut bytes = Vec::new();
-    for _ in 0..1_000 {
-        let (report, lines, choices) = run(Plan::from_fuzz(&bytes));
-        if report.end.violation.is_some() {
-            return Ok(bytes);
-        }
-        let step_of = |line: &String| match serde_json::from_str::<Record>(line).unwrap() {
-            Record::Step(step) => Some(step),
-            Record::Meta(_) | Record::Init(_) | Record::End(_) => None,
-        };
-        let steps: Vec<_> = lines.iter().filter_map(step_of).collect();
-        let Some(deviation) = choices
-            .iter()
-            .position(|(_, picked, hold)| hold.is_some_and(|h| h != *picked))
-        else {
-            return Err(bytes);
-        };
-        let mut next = Vec::new();
-        if let Ok(Record::Init(init)) = serde_json::from_str::<Record>(&lines[0]) {
-            init.draws.iter().for_each(|d| push_draw(&mut next, d));
-        }
-        for (step, (_, picked, hold)) in steps.iter().zip(&choices).take(deviation + 1) {
-            let index = if step.step == steps[deviation].step {
-                hold.expect("the deviation holds the source")
-            } else {
-                *picked
-            };
-            if step.options > 1 {
-                // A step's index and option count fit in u64 and u128.
-                push(&mut next, index as u64, step.options as u128);
-            }
-            if step.step < steps[deviation].step {
-                step.draws.iter().for_each(|d| push_draw(&mut next, d));
-            }
-        }
-        bytes = next;
-    }
-    panic!("no input found in 1,000 rounds");
-}
-
-/// The committed input that holds the source back, from
-/// [`hold_source_back`] on the fixed code. `tests/witness.rs` runs it as S4.7's
-/// witness test, and the lost-wakeup planted case runs it on the reverted code.
-const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
-
-#[test]
-#[ignore = "rewrites the committed input"]
-fn regenerate_wait_complete_input() {
-    let bytes = hold_source_back().expect_err("the fix wakes the source");
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/discovery-wait-complete.bin"
-    );
-    std::fs::write(path, &bytes).expect("the fixture directory exists");
 }
 
 /// Asserts `report` ended cleanly, held the property at least once, and
@@ -200,13 +59,6 @@ fn assert_wakes(report: &RunReport) {
     );
 }
 
-#[test]
-fn holding_the_source_back_finds_no_violation() {
-    let bytes = hold_source_back().expect_err("the fix wakes the source");
-    let (report, _, _) = run(Plan::from_fuzz(&bytes));
-    assert_wakes(&report);
-}
-
 /// The book's record for `node`, read once the run has ended. Every task has
 /// stopped by then, so the book's lock is free and the read finishes in one
 /// poll.
@@ -218,14 +70,20 @@ fn book_record(handle: &ZakuraDiscoveryHandle, node: NodeId) -> Option<ZakuraNod
     }
 }
 
-/// The peer's Hello record is valid for the run's clock, so it enters the
-/// book rather than being dropped as expired or too far ahead.
+/// The `discovery-wait-complete` seed holds the source back at its
+/// `notified` until the sink has run all three marks, and the source still
+/// wakes. The peer's Hello record is valid for the run's clock, so it enters
+/// the book rather than being dropped as expired or too far ahead.
 #[test]
 fn the_peer_record_enters_the_book() {
+    let input = seed::find("discovery-wait-complete")
+        .expect("the seed is registered")
+        .input()
+        .to_vec();
     let spawned = RefCell::new(None);
     let (report, _) = recorded(
         run_config(),
-        Plan::from_fuzz(INPUT),
+        Plan::from_fuzz(&input),
         |sim| *spawned.borrow_mut() = Some(spawn(sim)),
         &mut wakes_checker(),
     );

@@ -1,0 +1,39 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+index 59651731cf..0327519ec7 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -504,7 +504,8 @@ impl PublisherState {
+                 }
+             }
+             let schema = subscription.fixed.schema;
+-            let count = page_room(unspent, schema, self.limits, HEADER_BYTES);
++            // Mutation: a page holds one header more than its credit covers.
++            let count = page_room(unspent, schema, self.limits, HEADER_BYTES).saturating_add(1);
+             if subscription.stall.is_some() {
+                 continue;
+             }
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs b/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs
+index 855c774aeb..bac15ecd5d 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/publisher.rs
+@@ -394,18 +394,11 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> PublicationLedger<K, C> {
+         }
+         // Widening usize to u64 is lossless on supported targets.
+         let bytes = bytes as u64;
+-        published
+-            .credit
+-            .check(u64::from(objects), bytes)
+-            .map_err(|_| PageStall::NoCredit)?;
++        // Mutation: a page no longer waits for unspent credit.
+         if published.sent.len() >= history {
+             return Err(PageStall::HistoryFull);
+         }
+-        // The check above found enough unspent credit, so this spends it.
+-        published
+-            .credit
+-            .consume(u64::from(objects), bytes)
+-            .map_err(|_| PageStall::NoCredit)?;
++        let _ = published.credit.consume(u64::from(objects), bytes);
+         published
+             .sent
+             .push_back((cursor, published.credit.consumed()));

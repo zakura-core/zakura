@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use super::{Cadence, MessageRole, MessageRule};
+use super::{ByteRate, Cadence, MessageRole, MessageRule};
 use crate::zakura::{transport::StreamMode, Stream, FRAME_HEADER_BYTES};
 
 /// A rule that a layout's message tables break.
@@ -134,6 +134,12 @@ pub enum LayoutError {
     /// A request allows no exchange in flight, so a peer can never send it.
     NoRequestsInFlight {
         /// The request's message type.
+        message_type: u16,
+    },
+    /// A byte rate never refills, or one of its allowances cannot pay for
+    /// the row's largest payload, so a conformant sender could never send it.
+    ByteRateBelowPayload {
+        /// The row's message type.
         message_type: u16,
     },
     /// A cadence admits no message or never refills.
@@ -390,6 +396,9 @@ impl LayoutError {
             Self::NoRequestsInFlight { .. } => {
                 "each request allows at least one exchange in flight"
             }
+            Self::ByteRateBelowPayload { .. } => {
+                "each byte rate refills and its allowances pay for the row's largest payload"
+            }
             Self::EmptyCadence { .. } => "each cadence admits a message and refills",
             Self::RefillNotFasterThanSender { .. } => {
                 "each cadence refills faster than its sender sends"
@@ -438,6 +447,7 @@ impl fmt::Display for LayoutError {
             | Self::NoLiveSubscriptions { message_type }
             | Self::EmptyCredit { message_type }
             | Self::ShortCursorHistory { message_type }
+            | Self::ByteRateBelowPayload { message_type }
             | Self::SubscriptionWithoutPages { message_type }
             | Self::PageAboveCredit { message_type }
             | Self::ResponseWithoutRequest { message_type }
@@ -632,6 +642,17 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
                     return Err(error);
                 }
             }
+            MessageRole::Metered { rate } => {
+                if matches!(stream.mode, StreamMode::RequestResponse) {
+                    return Err(LayoutError::AnnouncementOnRequestResponse {
+                        kind: stream.kind,
+                        message_type,
+                    });
+                }
+                if let Err(error) = check_byte_rate(message_type, rate, row.payload.max()) {
+                    return Err(error);
+                }
+            }
             MessageRole::Request {
                 max_in_flight,
                 cadence,
@@ -717,6 +738,24 @@ const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), Layout
     }
     if cadence.capacity < Cadence::min_capacity(cadence.send_interval) {
         return Err(LayoutError::CapacityBelowStall { message_type });
+    }
+    Ok(())
+}
+
+/// Check that `rate` refills and that each of its allowances pays for a
+/// payload of `max_payload` bytes.
+const fn check_byte_rate(
+    message_type: u16,
+    rate: ByteRate,
+    max_payload: usize,
+) -> Result<(), LayoutError> {
+    // Widening u32 to u64 and usize to u64 is lossless on supported targets.
+    let max_payload = max_payload as u64;
+    if rate.bytes_per_second == 0
+        || (rate.opening_allowance as u64) < max_payload
+        || (rate.sender_allowance as u64) < max_payload
+    {
+        return Err(LayoutError::ByteRateBelowPayload { message_type });
     }
     Ok(())
 }

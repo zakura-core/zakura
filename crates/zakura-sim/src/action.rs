@@ -98,6 +98,13 @@ pub trait ActionSource {
         Ok(())
     }
 
+    /// Tells the source, before the run's first observation, whether the run
+    /// records its steps. A source whose observations would cost more to
+    /// make complete, such as hashing every datagram, may take that cost
+    /// only when `on`. Its other observations must not depend on it. The
+    /// default ignores it.
+    fn record_contents(&mut self, _on: bool) {}
+
     /// True once one of this source's own actions started the run's
     /// recovery phase. The run asks after each step that runs one of the
     /// source's actions. From the next pick on, picks and draws follow the

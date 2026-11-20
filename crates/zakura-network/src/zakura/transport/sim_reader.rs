@@ -164,7 +164,8 @@ impl StreamAdmission {
         let admission = admit_tabled_message(
             frame,
             self.rules,
-            |rule| buckets.charge(layout, rule),
+            |rule, payload_len| buckets.charge_frame(layout, rule, payload_len),
+            || {},
             || {},
         );
         admission.ordered_close_cause().map_or(Ok(()), Err)
@@ -245,6 +246,10 @@ mod tests {
         assert_eq!(
             InboundMessageAdmission::Throttled.ordered_close_cause(),
             Some("ordered_rate_limited")
+        );
+        assert_eq!(
+            InboundMessageAdmission::ByteRateOverrun.ordered_close_cause(),
+            Some("ordered_byte_rate_overrun")
         );
     }
 }

@@ -22,6 +22,9 @@
 //! label, or an unclaimed fault, fails the run as a harness failure, so it
 //! can't hide an obligation.
 
+pub(crate) mod cadence_window;
+pub mod handshake;
+
 use std::fmt;
 
 use zakura_network::zakura::{MessageRole, MessageRule, Stream};
@@ -335,7 +338,7 @@ pub fn downstream_properties<S: HasView>(
         };
         for rule in rules {
             let templates: &[(&[Effect], Template)] = match rule.role {
-                MessageRole::Announcement { .. } => &[],
+                MessageRole::Announcement { .. } | MessageRole::Metered { .. } => &[],
                 MessageRole::Request { .. } => {
                     &[(&[Effect::Serving, Effect::Output], Template::ServingBounded)]
                 }
@@ -386,7 +389,7 @@ pub fn sender_properties<S: HasView>(family: &'static str, streams: &[Stream]) -
         };
         for rule in rules {
             let mut templates = match rule.role {
-                MessageRole::Announcement { .. } => vec![],
+                MessageRole::Announcement { .. } | MessageRole::Metered { .. } => vec![],
                 MessageRole::Request { .. } => vec![Template::SenderWithinLimit],
                 MessageRole::Response {
                     ends_exchange: false,
@@ -460,7 +463,7 @@ fn has_cadence(rule: &MessageRule) -> bool {
         MessageRole::Request { cadence, .. } | MessageRole::Subscription { cadence, .. } => {
             cadence.is_some()
         }
-        MessageRole::Response { .. } => false,
+        MessageRole::Metered { .. } | MessageRole::Response { .. } => false,
     }
 }
 
@@ -485,6 +488,8 @@ fn row_templates(rule: &MessageRule) -> Vec<Template> {
     ];
     match rule.role {
         MessageRole::Announcement { .. } => {}
+        // A metered row is charged by payload bytes, and an overrun closes.
+        MessageRole::Metered { .. } => labels.push(Label::OverRate),
         MessageRole::Request { .. } => labels.push(Label::OverMargin),
         MessageRole::Response { .. } => labels.extend([Label::Unsolicited, Label::OverOwed]),
         MessageRole::Subscription { .. } => labels.extend([

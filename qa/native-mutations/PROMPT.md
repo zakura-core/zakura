@@ -21,8 +21,9 @@ you write anything:
    instance. A break in one instance's `code` runs against that instance
    only.
 3. **The reaching witness.** Each instance names one witness: a retained
-   `qa/planted/` case's committed input (`planted`), a committed fuzz input
-   (`input`), or one `zakura-sim` test (`test` and `test_target`). The
+   `qa/planted/` case's seed or typed scenario (`planted`), a seed of the
+   simulator's registry by name (`seed`), or one `zakura-sim` test (`test`
+   and `test_target`). The
    witness holds on `main`. Read what it drives, so that your break lies on
    its path.
 4. **The existing patches.** Read every patch for the entry's IDs under

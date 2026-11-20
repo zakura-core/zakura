@@ -8,8 +8,9 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::{inputs, storage_witnesses};
+use support::inputs;
 use tempfile::TempDir;
+use zakura_sim::harness::header_sync::storage_witnesses;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -229,6 +230,9 @@ fn a_held_reply_is_delivered_in_the_reset_generation() {
             Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
         )],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     for input in inputs(8, 256) {
         let report = run(&scenario, input);
@@ -276,6 +280,9 @@ fn resets_with_nothing_to_do_publish_nothing() {
             ),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     for input in inputs(4, 256) {
         let report = run(&scenario, input);
@@ -313,6 +320,9 @@ fn released_read() -> StorageScenario {
             ])),
         )],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -375,6 +385,9 @@ fn a_storage_stop_logs_the_held_apply_as_dropped() {
             node_step(ControlAction::StopStorage, None),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     for input in inputs(8, 256) {
         let report = run(&scenario, input);
@@ -552,6 +565,9 @@ fn failure_after_shutdown(step: ControlStep) -> String {
         },
         controls: vec![node_step(ControlAction::Shutdown, None), step],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     };
     run_prepared::<Storage>(
         &scenario,

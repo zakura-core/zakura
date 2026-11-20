@@ -5,11 +5,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import peer_location  # noqa: E402
 import propagation  # noqa: E402
 
 # us-west-0's mainnet node id, and the label us-east-0's trace rows carry for it.
@@ -310,10 +313,30 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(
             peers[0],
             {"ip": slow, "agent": "/Zakura:1.8.7/", "nodes": ["us-east-0"], "downloads": 3, "failed": 1,
-             "median_ms": 300, "p90_ms": 300, "max_ms": 300, "last": START},
+             "median_ms": 300, "p90_ms": 300, "max_ms": 300, "last": START, "location": None},
         )  # fmt: skip
         # A peer that never delivered a block has attempts but no time.
         self.assertEqual((peers[2]["downloads"], peers[2]["failed"], peers[2]["median_ms"]), (1, 1, None))
+
+    def test_outside_peers_are_located_and_private_or_fleet_peers_are_never_asked_about(self):
+        asked = []
+
+        def locate(ip):
+            asked.append(ip)
+            return {"country": "DE", "country_name": "Germany", "city": None} if ip == "203.0.113.5" else None
+
+        records = [record(wall={"heard": 0.0, "tip": 0.1}, downloads=[
+            download("203.0.113.5"), download("203.0.113.6"), download(PRIVATE_IP), download("192.0.2.10"),
+        ])]  # fmt: skip
+        joined = propagation.join(
+            {"us-east-0": report(*records)}, NODE_IDS, now=START + 60, fleet_addresses=FLEET_ADDRESSES,
+            is_private=lambda ip: ip == PRIVATE_IP, locate=locate,
+        )  # fmt: skip
+        self.assertEqual(sorted(asked), ["203.0.113.5", "203.0.113.6"])
+        locations = {peer["ip"]: peer["location"] for peer in joined["outside_peers"]}
+        self.assertEqual(locations, {
+            "203.0.113.5": {"country": "DE", "country_name": "Germany", "city": None}, "203.0.113.6": None,
+        })  # fmt: skip
 
     def test_the_slowest_downloads_are_single_attempts_with_their_block(self):
         joined = self.join([download("203.0.113.5", ms=300)], [download("192.0.2.10", ms=900), download(None, ms=None)])
@@ -335,6 +358,83 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(joined["slowest_downloads"][0]["size"], 1_500_000)
         unknown = propagation.join({"us-east-0": reports["us-east-0"]}, NODE_IDS, now=START + 60)
         self.assertIsNone(unknown["slowest_downloads"][0]["size"])
+
+
+class InvalidDatabaseError(RuntimeError):
+    """Matches the optional reader's exception for corrupt databases and records."""
+
+
+class FakeReader:
+    """Stands in for a `maxminddb` reader over a database holding `records`."""
+
+    def __init__(self, records):
+        self.records, self.asked = records, []
+
+    def get(self, ip):
+        self.asked.append(ip)
+        if ip == "not an address":
+            raise ValueError(ip)
+        return self.records.get(ip)
+
+
+class LocatorTests(unittest.TestCase):
+    FRANKFURT = {
+        "city": {"names": {"en": "Frankfurt am Main", "de": "Frankfurt"}},
+        "country": {"iso_code": "DE", "names": {"en": "Germany"}},
+    }
+
+    def locator(self, reader):
+        module = types.SimpleNamespace(open_database=lambda path: reader, InvalidDatabaseError=InvalidDatabaseError)
+        with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": module}):
+            return peer_location.open_locator(database.name)
+
+    def test_a_peer_is_placed_by_city_and_country_and_looked_up_once(self):
+        reader = FakeReader({"203.0.113.5": self.FRANKFURT, "203.0.113.6": {"country": {"iso_code": "us"}}})
+        locate = self.locator(reader)
+        self.assertEqual(
+            locate("203.0.113.5"), {"country": "DE", "country_name": "Germany", "city": "Frankfurt am Main"}
+        )
+        locate("203.0.113.5")
+        self.assertEqual(reader.asked, ["203.0.113.5"])
+        # A country without names is shown by its code; a record without a country is no place.
+        self.assertEqual(locate("203.0.113.6"), {"country": "US", "country_name": "US", "city": None})
+        self.assertIsNone(locate("203.0.113.7"))
+        self.assertIsNone(locate("not an address"))
+
+    def test_text_from_the_database_that_cannot_be_shown_is_dropped_or_cut(self):
+        odd = {"country": {"iso_code": "D3", "names": {"en": "Nowhere"}}}
+        long = {"country": {"iso_code": "DE", "names": {"en": "x" * 500}}, "city": {"names": {"en": 7}}}
+        locate = self.locator(FakeReader({"203.0.113.5": odd, "203.0.113.6": long}))
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertEqual(locate("203.0.113.6"), {"country": "DE", "country_name": "x" * 64, "city": None})
+
+    def test_without_a_database_or_reader_every_peer_is_unplaced(self):
+        self.assertIsNone(peer_location.open_locator("")("203.0.113.5"))
+        with self.assertLogs(level="WARNING"):
+            self.assertIsNone(peer_location.open_locator("/nonexistent/geo.mmdb")("203.0.113.5"))
+        with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": None}):
+            with self.assertLogs(level="WARNING"):
+                self.assertIsNone(peer_location.open_locator(database.name)("203.0.113.5"))
+
+    def test_a_corrupt_database_disables_locations(self):
+        module = types.SimpleNamespace(
+            open_database=mock.Mock(side_effect=InvalidDatabaseError("invalid database")),
+            InvalidDatabaseError=InvalidDatabaseError,
+        )
+        with tempfile.NamedTemporaryFile() as database, mock.patch.dict(sys.modules, {"maxminddb": module}):
+            with self.assertLogs(level="WARNING"):
+                locate = peer_location.open_locator(database.name)
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertIsNone(locate("203.0.113.6"))
+
+    def test_a_corrupt_record_is_unknown_and_other_peers_can_still_be_located(self):
+        reader = mock.Mock()
+        reader.get.side_effect = [InvalidDatabaseError("invalid record"), self.FRANKFURT]
+        locate = self.locator(reader)
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertIsNone(locate("203.0.113.5"))
+        self.assertEqual(locate("203.0.113.6")["country"], "DE")
+        self.assertEqual(reader.get.call_args_list, [mock.call("203.0.113.5"), mock.call("203.0.113.6")])
 
 
 if __name__ == "__main__":

@@ -163,6 +163,7 @@ td.wrap { white-space: normal; min-width: 200px; max-width: 360px; }
         <button id="outside-by-software" type="button" aria-pressed="false">By software</button></div></header>
     <div class="scroll"><table id="outside"></table></div>
     <p class="note" id="outside-note"></p>
+    <p class="note" id="outside-credit" hidden>Locations are approximate: <a href="https://db-ip.com">IP Geolocation by DB-IP</a>.</p>
   </section>
 
   <section class="panel">
@@ -589,6 +590,14 @@ function sortedRows(rows, { key, descending }) {
   });
 }
 
+// Where an outside peer is, as the dashboard's location database placed it: a flag, then
+// the city (when known) and the country. Regional-indicator letters make the flag.
+function place(location) {
+  if (!location) return "";
+  const flag = String.fromCodePoint(...[...location.country].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+  return flag + " " + [location.city, location.country_name].filter(Boolean).join(", ");
+}
+
 function renderOutside(data) {
   const view = state.outsideBy;
   const bySoftware = view === "software";
@@ -596,7 +605,7 @@ function renderOutside(data) {
   document.getElementById("outside-by-software").setAttribute("aria-pressed", String(bySoftware));
   const first = bySoftware
     ? [["Software", false, "agent"], ["Peers", true, "peers"]]
-    : [["Peer address", false, "ip"], ["Peer runs", false, "agent"]];
+    : [["Peer address", false, "ip"], ["Location", false, "place"], ["Peer runs", false, "agent"]];
   const columns = [...first, [bySoftware ? "Our nodes that downloaded from them" : "Our nodes that downloaded from it"],
     ["Downloads", true, "downloads"], ["Legacy failures", true, "failed"], ["Median", true, "median_ms"],
     ["9 in 10", true, "p90_ms"], [""], ["Slowest", true, "max_ms"], ["Last used", false, "last"]];
@@ -606,7 +615,10 @@ function renderOutside(data) {
     ? "One row per software version that outside peers named when connecting."
     : "One row per peer that is not ours and that one of our nodes downloaded a block from. The software is the peer's own, as it named it when connecting.")
     + ` Ordered by ${sortLabel}, ${sort.descending ? "highest" : "lowest"} first; select a column heading to sort by it.`;
-  const rows = sortedRows((bySoftware ? data.outside_software : data.outside_peers) || [], sort);
+  // Sorting by location groups peers by country, then city.
+  const peers = (data.outside_peers || []).map((row) => ({ ...row, place: row.location
+    ? [row.location.country_name, row.location.city].filter(Boolean).join(" ") : null }));
+  const rows = sortedRows(bySoftware ? data.outside_software || [] : peers, sort);
   const worst = Math.max(1, ...rows.map((row) => row.p90_ms || 0));
   table(document.getElementById("outside"), columns,
     rows.map((row) => {
@@ -614,7 +626,8 @@ function renderOutside(data) {
       row.nodes.forEach((name, index) => users.append(index ? ", " : "", nodeLink(name)));
       const lead = bySoftware
         ? [cell(software(row.agent)), cell(String(row.peers), true)]
-        : [el("td", { class: "mono", text: row.ip }), cell(software(row.agent))];
+        : [el("td", { class: "mono", text: row.ip }),
+          row.location ? cell(place(row.location)) : el("td", {}, el("span", { class: "quiet", text: "unknown" })), cell(software(row.agent))];
       return el("tr", {}, ...lead, users,
         cell(String(row.downloads), true), cell(String(row.failed), true), cell(ms(row.median_ms), true),
         cell(ms(row.p90_ms), true),
@@ -627,9 +640,10 @@ function renderOutside(data) {
       // highest first for numbers and times, A to Z for names and addresses.
       state.outsideSort[view] = key === sort.key
         ? { key, descending: !sort.descending }
-        : { key, descending: !["ip", "agent"].includes(key) };
+        : { key, descending: !["ip", "place", "agent"].includes(key) };
       renderOutside(data);
     } });
+  document.getElementById("outside-credit").hidden = bySoftware || !rows.some((row) => row.location);
   document.getElementById("outside-note").textContent = rows.length
     ? (bySoftware
       ? "A version is the exact name a peer sent, so each release is its own row. Times count every download from those peers that delivered the block. "

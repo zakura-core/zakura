@@ -33,6 +33,7 @@ on:
       - Update Testnet checkpoints
       - Zakura continuous genesis sync fleet
       - Zakura E2E
+      - Zakura mempool gossip
       - zakura-mac-cranelift
       - zcashd-compat Regtest
     types: [completed]

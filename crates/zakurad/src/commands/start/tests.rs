@@ -35,10 +35,15 @@ async fn shutdown_cannot_mask_a_ready_writer_failure() {
 fn advertised_services_describe_storage_mode_with_or_without_zcashd_compat() {
     for compat in [false, true] {
         for (storage_mode, expected) in [
-            (StorageMode::Archive, PeerServices::NODE_NETWORK),
+            (
+                StorageMode::Archive,
+                PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH,
+            ),
             (
                 StorageMode::Pruned(PruningConfig::default()),
-                PeerServices::NODE_NETWORK | PeerServices::NODE_PRUNED,
+                PeerServices::NODE_NETWORK
+                    | PeerServices::NODE_BLOCK_PUSH
+                    | PeerServices::NODE_PRUNED,
             ),
         ] {
             let mut config = ZakuradConfig::default();

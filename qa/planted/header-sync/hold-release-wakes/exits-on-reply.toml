@@ -29,4 +29,3 @@ also_violates = [
 [typed]
 harness = "header-sync/liveness"
 scenario = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.json"
-plan = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.plan"

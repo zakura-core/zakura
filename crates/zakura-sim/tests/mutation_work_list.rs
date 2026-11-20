@@ -23,7 +23,15 @@ const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
 /// The ID prefixes whose `Active` properties the loop must cover. Header
 /// sync's are Adam's side, and the step loop's own (`sim/…`) guard no
 /// production code.
-const IN_SCOPE: &[&str] = &["block-sync/", "block/", "discovery/"];
+const IN_SCOPE: &[&str] = &["block-sync/", "block/", "discovery/", "handshake/"];
+const HANDSHAKE_SESSIONS: &[&str] = &[
+    "session/honest-never-punished",
+    "session/stream-opens-bounded",
+    "session/setup-slot-bounded",
+    "session/capacity-conserved",
+    "session/installed-services-authorized",
+    "session/renegotiation-covers-inflight-handshakes",
+];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +121,9 @@ fn registered() -> BTreeMap<String, Status> {
     let mut ids = BTreeMap::new();
     for harness in HARNESSES {
         for property in (harness.properties)() {
-            if !IN_SCOPE.iter().any(|scope| property.id.starts_with(scope)) {
+            if !IN_SCOPE.iter().any(|scope| property.id.starts_with(scope))
+                && !HANDSHAKE_SESSIONS.contains(&property.id.as_str())
+            {
                 continue;
             }
             if let Some(status) = ids.insert(property.id.clone(), property.status) {
@@ -300,10 +310,13 @@ fn check_witness(owner: &str, witness: &serde_json::Value) {
             "{owner}: {} has no test {test}",
             file.display()
         );
+    } else if let Some(name) = field("seed") {
+        assert!(
+            zakura_sim::seed::find(name).is_some(),
+            "{owner}: no seed is named {name}"
+        );
     } else {
-        let path = field("planted")
-            .or_else(|| field("input"))
-            .unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
+        let path = field("planted").unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
         assert!(root().join(path).is_file(), "{owner}: {path} doesn't exist");
     }
 }
@@ -332,6 +345,24 @@ fn every_named_witness_exists() {
         if let Some(witness) = case.get("witness") {
             check_witness(case["patch"].as_str().unwrap_or(CASES), witness);
         }
+    }
+}
+
+#[test]
+fn every_handshake_rule_has_a_generator_harness() {
+    let map = zakura_sim::explore::generate::generator_harnesses();
+    for (id, status) in registered() {
+        if status == Status::Active
+            && (id.starts_with("handshake/") || HANDSHAKE_SESSIONS.contains(&id.as_str()))
+        {
+            assert!(
+                map.get(&id).is_some_and(|harnesses| !harnesses.is_empty()),
+                "{id} has no generator harness"
+            );
+        }
+    }
+    for harness in ["handshake/counts", "handshake/wire"] {
+        assert!(map["handshake/pending-bounded"].contains(&harness));
     }
 }
 

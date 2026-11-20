@@ -6,5 +6,5 @@
 # V1 and whose mirror serves the auxiliary records. The reactor's repair
 # path, the subscriber and the page format decide when the repair opens
 # and under which schema, so a change there can move the input off it.
-input = "crates/zakura-sim/tests/fixtures/header-repair-applied.bin"
+seed = "header-repair-applied"
 checks = ["crates/zakura-network/src/zakura/header_sync"]

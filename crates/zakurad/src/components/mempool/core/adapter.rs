@@ -253,6 +253,10 @@ async fn peer_batch(
     let slots: Vec<PeerSlot> = (0..unknown.len())
         .map_while(|_| PeerSlot::take(&shared, &source))
         .collect();
+    // Many ids can share one transaction's effects, so a batch passes slots
+    // on at most the peer's limit of times, which bounds its reservations
+    // at twice that limit.
+    let mut passes = MAX_INBOUND_CONCURRENCY_PER_PEER;
     for slot in slots {
         while let Some(item) = unknown.pop_front() {
             match shared.handle.reserve(item.id(), deadline).await {
@@ -270,7 +274,11 @@ async fn peer_batch(
                 }
                 // Someone else, such as tx-relay, reserved it after the
                 // lookup, so it was known after all and passes its slot on.
-                Ok(Err(Unreserved::Pending | Unreserved::Pooled | Unreserved::Rejected(_))) => {}
+                Ok(Err(Unreserved::Pending | Unreserved::Pooled | Unreserved::Rejected(_)))
+                    if passes > 0 =>
+                {
+                    passes -= 1;
+                }
                 Ok(Err(_)) => break,
                 Err(_elapsed) => {
                     let _ = timed_out();
@@ -1893,6 +1901,43 @@ mod tests {
         assert_eq!(reserved, (1..=5).map(id).collect::<Vec<_>>());
         let answer = request.await.expect("the task does not panic");
         assert!(matches!(answer, Ok(Response::Queued(_))));
+    }
+
+    /// Ids that turn out to be known after the lookup, such as many
+    /// authorizations of one transaction that entered the pool meanwhile,
+    /// pass the peer's slots on at most the peer's limit of times, so the
+    /// batch costs the core at most twice that many reservations.
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_ids_pass_a_peers_slots_on_a_bounded_number_of_times() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let ids: Vec<Gossip> = (0..30u8)
+            .map(|n| {
+                let mut hash = [4; 32];
+                hash[0] = n;
+                Gossip::Id(UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash)))
+            })
+            .collect();
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: ids,
+            source: peer(),
+        }));
+        let Some(PoolCommand::KnownIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch asks which ids the core knows");
+        };
+        let _ = reply.send(Default::default());
+        let mut reserved = 0;
+        while let Ok(Some(PoolCommand::Reserve { reply, .. })) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
+        {
+            reserved += 1;
+            let _ = reply.send(Err(Unreserved::Pooled));
+        }
+        assert_eq!(reserved, 2 * MAX_INBOUND_CONCURRENCY_PER_PEER);
+        let _ = request.await;
     }
 
     /// A peer's batch takes at most the peer's limit of ids, in one pass, as

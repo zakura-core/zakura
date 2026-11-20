@@ -15,8 +15,9 @@ fn reporting_codec() -> (Codec, Arc<Mutex<Vec<block::Hash>>>) {
     let reported = Arc::new(Mutex::new(Vec::new()));
     let recorded = reported.clone();
     let hook: BlockHeaderHook = Arc::new(move |hash| recorded.lock().unwrap().push(hash));
-    let mut codec = Codec::builder().with_block_header_hook(Some(hook)).finish();
+    let mut codec = Codec::builder().finish();
     codec.reconfigure_full_body_len();
+    codec.report_block_headers_to(Some(hook));
     (codec, reported)
 }
 
@@ -59,14 +60,24 @@ fn a_block_message_reports_its_hash_once_its_block_header_has_arrived() {
     );
 
     let mut src = BytesMut::from(&frame[..BLOCK_HEADER_END - 1]);
-    assert_eq!(codec.decode(&mut src).expect("header is valid"), None);
+    assert_eq!(
+        codec
+            .decode(&mut src)
+            .expect("an incomplete message is not an error"),
+        None
+    );
     assert!(
         reported.lock().unwrap().is_empty(),
         "nothing is reported until the whole block header is here",
     );
 
     src.extend_from_slice(&frame[BLOCK_HEADER_END - 1..BLOCK_HEADER_END]);
-    assert_eq!(codec.decode(&mut src).expect("header is valid"), None);
+    assert_eq!(
+        codec
+            .decode(&mut src)
+            .expect("an incomplete message is not an error"),
+        None
+    );
     assert_eq!(
         *reported.lock().unwrap(),
         [block.hash()],
@@ -112,7 +123,12 @@ fn a_block_smaller_than_a_full_size_header_reports_when_it_is_complete() {
     assert!(frame.len() < BLOCK_HEADER_END);
 
     let mut src = BytesMut::from(&frame[..frame.len() - 1]);
-    assert_eq!(codec.decode(&mut src).expect("header is valid"), None);
+    assert_eq!(
+        codec
+            .decode(&mut src)
+            .expect("an incomplete message is not an error"),
+        None
+    );
     assert!(reported.lock().unwrap().is_empty());
 
     src.extend_from_slice(&frame[frame.len() - 1..]);

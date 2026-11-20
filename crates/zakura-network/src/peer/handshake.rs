@@ -682,10 +682,10 @@ where
     }
 
     /// Call `block_announcement_hook` for each block a peer announces in a single-block `inv`,
-    /// and for each `block` message if it was set up for them, at most a few times per
+    /// and for the block header that starts each `block` message, at most a few times per
     /// connection per window. Optional.
     ///
-    /// If this is unset, announcements are not passed on.
+    /// If this is unset, neither is passed on.
     pub fn with_block_announcement_hook(
         mut self,
         block_announcement_hook: BlockAnnouncementHook,
@@ -1644,8 +1644,7 @@ where
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
         let gossip_trace = self.gossip_trace.clone();
-        // One allowance for this connection, shared by its decoder and its message filter.
-        let block_announcements = self.block_announcement_hook.for_connection();
+        let block_announcement_hook = self.block_announcement_hook.clone();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
@@ -1681,7 +1680,6 @@ where
                 Codec::builder()
                     .for_network(&config.network)
                     .with_block_checksums(block_checksums)
-                    .with_block_header_hook(block_announcements.block_header_hook())
                     .finish(),
             );
             let mut connection_tracker = connection_tracker;
@@ -1814,6 +1812,10 @@ where
             let bare_codec = peer_conn.codec_mut();
             bare_codec.reconfigure_version(connection_info.negotiated_version);
             bare_codec.reconfigure_full_body_len();
+            // One allowance for this connection, shared by its decoder and its message filter.
+            // The decoder reports block headers only now that the handshake is done.
+            let block_announcements = block_announcement_hook.for_connection();
+            bare_codec.report_block_headers_to(block_announcements.block_header_hook());
 
             debug!("constructing client, spawning server");
 

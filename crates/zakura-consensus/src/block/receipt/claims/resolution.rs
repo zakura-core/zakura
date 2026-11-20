@@ -41,22 +41,22 @@ impl AnnouncementClaims {
         let header = table.by_hash.get(&hash);
         // A legacy sighting made during an earlier header apply is usable only if every apply
         // fails.
-        let inv = height
+        let legacy = height
             .zip(table.announced.get(hash))
-            .filter(|(height, inv)| {
-                header.is_none_or(|header| inv.order < header.order)
+            .filter(|(height, legacy)| {
+                header.is_none_or(|header| legacy.order < header.order)
                     && *height >= table.floor
-                    && in_claim_window(*height, inv.tip_at_announcement)
+                    && in_claim_window(*height, legacy.tip_at_announcement)
             })
-            .map_or(Unclaimed, |(height, inv)| {
-                classify(inv.source, height, inv.order, inv.seen_at)
+            .map_or(Unclaimed, |(height, legacy)| {
+                classify(legacy.source, height, legacy.order, legacy.seen_at)
             });
-        if matches!(inv, Used { .. }) {
-            return inv;
+        if matches!(legacy, Used { .. }) {
+            return legacy;
         }
 
         let Some(header) = header else {
-            return inv;
+            return legacy;
         };
         let header = classify(
             ClaimSource::Header,
@@ -64,9 +64,9 @@ impl AnnouncementClaims {
             header.order,
             header.seen_at,
         );
-        match (inv, header) {
+        match (legacy, header) {
             (_, Used { .. }) | (Unclaimed, _) => header,
-            _ => inv,
+            _ => legacy,
         }
     }
 }

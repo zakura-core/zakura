@@ -1395,7 +1395,8 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
 }
 
 /// The block headers a connection's decoder sees and the `inv`s its message filter sees draw on
-/// the same four calls per window.
+/// the same four blocks per window. A block shown twice in a window is counted and passed on
+/// once, so a peer that announces a block and then sends it uses one place.
 #[tokio::test(start_paused = true)]
 async fn block_headers_and_announcements_share_one_connection_allowance() {
     let node = RecordingNode::default();
@@ -1417,16 +1418,23 @@ async fn block_headers_and_announcements_share_one_connection_allowance() {
         .expect("passed through");
     };
 
+    // An announced block that is then sent, and a pushed block that is then announced.
     announce(1);
-    for byte in 2..=6 {
+    header_arrived(hash(1));
+    header_arrived(hash(2));
+    announce(2);
+    assert_eq!(*announced.lock().unwrap(), [hash(1)]);
+    assert_eq!(*headers.lock().unwrap(), [hash(2)]);
+
+    for byte in 3..=6 {
         header_arrived(hash(byte));
     }
+    announce(7);
     assert_eq!(
         *headers.lock().unwrap(),
         [hash(2), hash(3), hash(4)],
-        "one announcement leaves three calls for block headers",
+        "the two earlier blocks left room for two more",
     );
-    announce(7);
     assert_eq!(
         *announced.lock().unwrap(),
         [hash(1)],

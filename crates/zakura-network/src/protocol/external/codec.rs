@@ -34,8 +34,8 @@ use crate::constants;
 use super::{
     addr::{AddrInVersion, AddrV1, AddrV2},
     message::{
-        HashedBlock, Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH,
-        MAX_REJECT_REASON_LENGTH, MAX_USER_AGENT_LENGTH,
+        Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH,
+        MAX_USER_AGENT_LENGTH,
     },
     types::*,
 };
@@ -279,6 +279,7 @@ pub struct Builder {
     /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
     block_checksums: BlockChecksums,
     /// Called with the hash of the block header that starts each received `block` message.
+    /// Unset until the handshake is done.
     block_header_hook: Option<BlockHeaderHook>,
 }
 
@@ -310,6 +311,19 @@ impl Codec {
     pub fn reconfigure_full_body_len(&mut self) {
         self.builder.max_len = MAX_PROTOCOL_MESSAGE_LEN;
     }
+
+    /// Start calling `block_header_hook` with the block hash once the block header of each
+    /// received `block` message has arrived, before the block's transactions. Does nothing if
+    /// it is `None`.
+    ///
+    /// Called after a successful handshake, so a peer that has not completed one reports
+    /// nothing, as its `inv`s would not be read either.
+    ///
+    /// The hash is of header bytes already received. The message header alone names no block:
+    /// its four-byte checksum can be matched by padding a block mined later.
+    pub(crate) fn report_block_headers_to(&mut self, block_header_hook: Option<BlockHeaderHook>) {
+        self.builder.block_header_hook = block_header_hook;
+    }
 }
 
 impl Builder {
@@ -340,20 +354,6 @@ impl Builder {
     /// sends can reuse a block's remembered checksum.
     pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
         self.block_checksums = block_checksums;
-        self
-    }
-
-    /// Call `block_header_hook` with the block hash once the block header of each received
-    /// `block` message has arrived, before the block's transactions. Does nothing if it is
-    /// `None`.
-    ///
-    /// The hash is of header bytes already received. The message header alone names no block:
-    /// its four-byte checksum can be matched by padding a block mined later.
-    pub(crate) fn with_block_header_hook(
-        mut self,
-        block_header_hook: Option<BlockHeaderHook>,
-    ) -> Self {
-        self.block_header_hook = block_header_hook;
         self
     }
 }
@@ -1084,9 +1084,6 @@ impl Codec {
             return Ok(());
         }
         *block_header_pending = false;
-        let Some(hook) = &self.builder.block_header_hook else {
-            return Ok(());
-        };
 
         let body = &src[..(*body_len).min(src.len())];
         // As for whole bodies in `decode`: these are peer bytes, and the parser only reads them.
@@ -1103,7 +1100,7 @@ impl Codec {
             );
             Error::Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR)
         })?;
-        if let Some(hash) = hash {
+        if let (Some(hash), Some(hook)) = (hash, &self.builder.block_header_hook) {
             hook(hash);
         }
         Ok(())
@@ -1116,7 +1113,7 @@ impl Codec {
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(HashedBlock::from(block)))
+        Ok(Message::Block(block.into()))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

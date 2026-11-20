@@ -79,7 +79,7 @@ impl Announcements {
         self.0.get(&hash).copied()
     }
 
-    /// Discards an `inv` saved as a fallback for this earlier header reservation.
+    /// Discards a legacy sighting saved as a fallback for this earlier header reservation.
     pub(super) fn discard_after_header(&mut self, hash: block::Hash, header_order: u64) {
         if let std::collections::hash_map::Entry::Occupied(entry) = self.0.entry(hash) {
             if entry.get().order > header_order {

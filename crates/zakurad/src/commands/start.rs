@@ -225,9 +225,9 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
-/// Claims receipt order in `claims` for each block a legacy peer newly announces, or starts
-/// sending in a `block` message, so legacy-only blocks follow the same equal-work rule as blocks
-/// whose headers arrive first.
+/// Claims receipt order in `claims` for each block a legacy peer newly announces, or whose block
+/// header arrives at the start of a `block` message, so legacy-only blocks follow the same
+/// equal-work rule as blocks whose headers arrive first.
 ///
 /// The best chain tip stands in for header sync's verified tip, which a node without native
 /// header sync never reports.
@@ -645,8 +645,9 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
-        // Header sync, legacy block `inv`s and the starts of legacy `block` messages claim
-        // blocks announced first, and the block verifier ranks equal-work bodies by those claims.
+        // Header sync, legacy block `inv`s and the block headers of legacy `block` messages
+        // claim blocks announced first, and the block verifier ranks equal-work bodies by those
+        // claims.
         let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(

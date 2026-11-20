@@ -57,9 +57,9 @@ The reservation is called a claim. Six rules define it:
   and mined-block rules then apply. The deadline counts from the header's
   arrival, and the window uses the tip at that time, so a rival committed
   while the block arrives does not push it out. This applies to every `block`
-  message, requested or pushed. The record is in force at once, so it also
-  ranks a copy of the block that reaches the verifier afterwards by a faster
-  route.
+  message, requested or pushed, once the peer has completed its handshake.
+  The record is in force at once, so it also ranks a copy of the block that
+  reaches the verifier afterwards by a faster route.
 
   Without it, a miner's own neighbours could switch to a rival. A Zakura miner
   pushes the full block to its first peers before its `inv`, so they had no
@@ -102,10 +102,11 @@ The reservation is called a claim. Six rules define it:
   The legacy store holds 512 blocks. Entries older than 4 seconds, twice the
   body deadline, are dropped when a new block is recorded, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 4 `inv`s and block headers, together,
-  per 2 seconds to the store, leaving room for both blocks in a tip race and
-  for repeated or bunched announcements. One connection cannot fill the
-  store. A block's height is not known when its header arrives, so blocks a
+  Each legacy connection passes at most 4 blocks per 2 seconds to the store,
+  whether it announced them or sent their headers, leaving room for both
+  blocks in a tip race and for bunched announcements. A block it shows again
+  in the same 2 seconds, such as an announced block it then sends, is counted
+  once. One connection cannot fill the store. A block's height is not known when its header arrives, so blocks a
   peer serves during catch-up use the allowance and the store too. A node
   that is catching up, or a sustained flood, can at worst return blocks to
   arrival order, and the store clears four seconds after it stops. A record

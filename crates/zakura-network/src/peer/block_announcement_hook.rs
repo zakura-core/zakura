@@ -14,12 +14,14 @@ use zakura_chain::block;
 
 use crate::protocol::external::BlockHeaderHook;
 
-/// The most sightings one connection hands to the hook in each [`ANNOUNCEMENT_WINDOW`].
+/// The most blocks one connection hands to the hook in each [`ANNOUNCEMENT_WINDOW`].
 ///
-/// Four calls leave room for both blocks in a tip race and for repeated or bunched
-/// announcements, while bounding one connection's share of the hook's work and of the node's
-/// claim store. `inv`s and `block` messages share the allowance.
-const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 4;
+/// Four blocks leave room for both blocks in a tip race and for bunched announcements, while
+/// bounding one connection's share of the hook's work and of the node's claim store. `inv`s
+/// and `block` messages share the allowance, and a block the connection shows again in the
+/// same window, such as an announced block it then sends, is neither counted nor passed on
+/// twice.
+const MAX_ANNOUNCEMENTS_PER_WINDOW: usize = 4;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
 const ANNOUNCEMENT_WINDOW: Duration = Duration::from_secs(2);
@@ -84,57 +86,59 @@ pub(crate) struct ConnectionAnnouncements {
 #[derive(Debug, Default)]
 struct Window {
     started: Option<Instant>,
-    calls: u32,
+    /// The blocks passed to the hook in this window, at most [`MAX_ANNOUNCEMENTS_PER_WINDOW`].
+    passed: Vec<block::Hash>,
 }
 
 impl ConnectionAnnouncements {
-    /// Passes the announced block `hash` to the hook, unless this connection has used its
-    /// share of the current window.
+    /// Passes the announced block `hash` to the hook, unless this connection already showed
+    /// that block in the current window or has used its share of it.
     pub(crate) fn announce(&self, hash: block::Hash) {
-        if let Some(node) = self.admitted() {
+        if let Some(node) = self.admitted(hash) {
             node.announced(hash);
         }
     }
 
     /// The function this connection's decoder calls with the hash of each block header that
     /// starts a `block` message, unless the hook is unset. Each call is passed to the hook
-    /// unless this connection has used its share of the current window.
+    /// under the same limit as [`Self::announce`].
     pub(crate) fn block_header_hook(&self) -> Option<BlockHeaderHook> {
         self.hook.0.as_ref()?;
         let connection = self.clone();
         Some(Arc::new(move |hash| {
-            if let Some(node) = connection.admitted() {
+            if let Some(node) = connection.admitted(hash) {
                 node.block_header_arrived(hash);
             }
         }))
     }
 
-    /// The node to call, if the hook is set and one more call fits in the current window. The
-    /// call is counted.
-    fn admitted(&self) -> Option<&dyn BlockAnnouncements> {
+    /// The node to call about `hash`, if the hook is set, this connection has not already
+    /// passed `hash` on in the current window, and one more block fits in it. The block is
+    /// counted.
+    fn admitted(&self, hash: block::Hash) -> Option<&dyn BlockAnnouncements> {
         let node = self.hook.0.as_deref()?;
         self.window
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .admit(Instant::now())
+            .admit(hash, Instant::now())
             .then_some(node)
     }
 }
 
 impl Window {
-    /// Counts a call at `now`, returning whether it fits in the window.
-    fn admit(&mut self, now: Instant) -> bool {
+    /// Counts `hash` at `now`, returning whether it is new to the window and fits in it.
+    fn admit(&mut self, hash: block::Hash, now: Instant) -> bool {
         let expired = self
             .started
             .is_none_or(|started| now.saturating_duration_since(started) >= ANNOUNCEMENT_WINDOW);
         if expired {
             self.started = Some(now);
-            self.calls = 0;
+            self.passed.clear();
         }
-        if self.calls >= MAX_ANNOUNCEMENTS_PER_WINDOW {
+        if self.passed.len() >= MAX_ANNOUNCEMENTS_PER_WINDOW || self.passed.contains(&hash) {
             return false;
         }
-        self.calls += 1;
+        self.passed.push(hash);
         true
     }
 }

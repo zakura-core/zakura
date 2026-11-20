@@ -1,8 +1,9 @@
 //! How the block header at the start of a legacy `block` message claims receipt order.
 //!
-//! It makes the same sighting an `inv` makes, so the rules those share are tested once, in
-//! `announced`. These tests cover what differs: when the sighting is made, and that the two
-//! kinds of message share one sighting per block.
+//! It makes the same sighting an `inv` makes, so the rules those share (the deadline, the height
+//! window, header claims and mined blocks) are tested once, in `announced`. These tests cover
+//! what differs: when the sighting is made, and that the two kinds of message share one
+//! sighting per block.
 
 use super::*;
 
@@ -49,27 +50,6 @@ fn a_block_whose_header_arrived_first_outranks_a_rival_announced_during_its_tran
         Some((ClaimSource::BlockMessage, place)),
     );
     assert!(place < rival);
-}
-
-#[test]
-fn a_block_header_sighting_deadline_counts_from_the_sighting() {
-    let claims = AnnouncementClaims::default();
-    let header_at = Instant::now();
-    sight_header(&claims, hash(1), header_at);
-
-    let at_the_bound = header_at + CLAIM_BODY_DEADLINE;
-    assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), arrival(at_the_bound)),
-        ClaimOutcome::Used { source: ClaimSource::BlockMessage, age, .. }
-            if age == CLAIM_BODY_DEADLINE
-    ));
-
-    let late = at_the_bound + Duration::from_millis(1);
-    assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
-        ClaimOutcome::Expired { source: ClaimSource::BlockMessage, age }
-            if age == late - header_at
-    ));
 }
 
 /// A peer that withholds a block cannot keep its place fresh by sending the block's header, or
@@ -126,65 +106,37 @@ fn a_block_keeps_its_first_legacy_sighting_whichever_message_made_it() {
     );
 }
 
+/// The verifier's registry gives a real body the place its block header took.
 #[test]
-fn a_rival_committed_while_a_block_arrives_does_not_cost_it_its_place() {
+fn a_body_registered_after_its_block_header_takes_the_headers_place() {
     let claims = AnnouncementClaims::default();
+    let registry = ReceiptRegistry::new(claims.clone());
     let header_at = Instant::now();
-    sight_header(&claims, hash(1), header_at);
-    let place = claims.announced_order(hash(1));
-
-    // The rival at the same height commits and raises the tip before the block completes.
-    let rival_at = header_at + Duration::from_millis(300);
-    claims.note_announcement_at(hash(3), CLAIMED, rival_at);
-
-    let completed_at = header_at + Duration::from_millis(800);
-    assert_eq!(
-        used(&claims, hash(1), completed_at).map(|(_, order)| order),
-        place,
-    );
-}
-
-#[test]
-fn the_earlier_of_a_header_claim_and_a_block_header_sighting_wins() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    let later = now + Duration::from_millis(300);
-
-    // Native header sync admits the header first.
-    claim(&claims, hash(1), now);
-    let native = claims
-        .claimed_order(hash(1))
-        .expect("the header is claimed");
-    sight_header(&claims, hash(1), later);
-    assert_eq!(
-        used(&claims, hash(1), later),
-        Some((ClaimSource::Header, native))
-    );
-
-    // The legacy `block` message's header arrives first.
-    sight_header(&claims, hash(2), now);
-    let legacy = claims
-        .announced_order(hash(2))
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    claims.note_block_header_at(block.hash(), block::Height(0), header_at);
+    let place = claims
+        .announced_order(block.hash())
         .expect("the header sighting is recorded");
-    claim(&claims, hash(2), later);
-    assert_eq!(
-        used(&claims, hash(2), later),
-        Some((ClaimSource::BlockMessage, legacy))
+
+    // A rival's body is registered while the block's transactions are still arriving.
+    let rival: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let rival = BlockHandle::from(Arc::new(rival));
+    let rival = registry.register_at(
+        rival.hash(),
+        &rival,
+        arrival(header_at + Duration::from_millis(300)),
     );
-}
 
-#[test]
-fn a_mined_block_outranks_an_earlier_block_header_sighting_at_its_height() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    sight_header(&claims, hash(1), now);
-
-    let _mined = claims.mark_mined(hash(3), CLAIMED, order::next());
-    assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), arrival(now)),
-        ClaimOutcome::Voided {
-            source: ClaimSource::BlockMessage,
-            ..
-        }
-    ));
+    let body = BlockHandle::from(Arc::new(block));
+    let receipt = registry.register_at(
+        body.hash(),
+        &body,
+        arrival(header_at + Duration::from_millis(800)),
+    );
+    assert_eq!(receipt.order, place);
+    assert!(receipt.order < rival.order);
 }

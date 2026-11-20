@@ -16,12 +16,13 @@ use crate::protocol::external::BlockHeaderHook;
 
 /// The most blocks one connection hands to the hook in each [`ANNOUNCEMENT_WINDOW`].
 ///
-/// Four blocks leave room for both blocks in a tip race and for bunched announcements, while
-/// bounding one connection's share of the hook's work and of the node's claim store. `inv`s
-/// and `block` messages share the allowance, and a block the connection shows again in the
-/// same window, such as an announced block it then sends, is neither counted nor passed on
-/// twice.
-const MAX_ANNOUNCEMENTS_PER_WINDOW: usize = 4;
+/// Three blocks leave room for both blocks in a tip race and one more, while bounding one
+/// connection's share of the hook's work and of the node's claim store. The store is sized
+/// from this number, so that every connection the default limits allow, each using its full
+/// share, cannot fill it. `inv`s and `block` messages share the allowance, and a block the
+/// connection shows again in the same window, such as an announced block it then sends, is
+/// neither counted nor passed on twice.
+const MAX_ANNOUNCEMENTS_PER_WINDOW: usize = 3;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
 const ANNOUNCEMENT_WINDOW: Duration = Duration::from_secs(2);

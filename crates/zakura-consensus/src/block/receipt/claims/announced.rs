@@ -12,11 +12,19 @@ use super::{super::order, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
 
 /// The most announced blocks the store holds.
 ///
-/// Honest announcements arrive about one block per connection per block interval, and each
-/// entry lasts [`ANNOUNCEMENT_LIFETIME`], so this is far above honest use. A full store refuses
-/// new hashes instead of dropping old ones, so flooding it cannot remove an announcement that is
-/// already in force. A refused block is ranked by body arrival.
-pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 512;
+/// Chosen so that peers cannot fill the store at the default connection limits. A legacy
+/// connection passes at most 3 blocks per 2 seconds to the store and an entry lasts
+/// [`ANNOUNCEMENT_LIFETIME`], 4 seconds, so one connection holds at most 9 unexpired entries:
+/// three windows' worth, when the first was filled exactly 4 seconds before the last. The
+/// default limits allow 450 connections, and at most about 44 more can be opened within one
+/// entry's lifetime (one inbound a second, ten outbound), so at most 494 connections hold
+/// 4,446 entries. A node configured for more than about 550 connections can be filled.
+///
+/// Honest announcements arrive about one block per connection per block interval, so this is
+/// far above honest use. A full store refuses new hashes instead of dropping old ones, so even
+/// where it can be filled, flooding cannot remove an announcement that is already in force. A
+/// refused block is ranked by body arrival.
+pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 5_000;
 
 /// How long an announcement is kept.
 ///

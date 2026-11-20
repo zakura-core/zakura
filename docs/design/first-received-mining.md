@@ -99,19 +99,28 @@ The reservation is called a claim. Six rules define it:
   or below it get no claim and are ranked by arrival until the tip passes it
   again.
 
-  The legacy store holds 512 blocks. Entries older than 4 seconds, twice the
+  The legacy store holds 5,000 blocks. Entries older than 4 seconds, twice the
   body deadline, are dropped when a new block is recorded, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 4 blocks per 2 seconds to the store,
+  Each legacy connection passes at most 3 blocks per 2 seconds to the store,
   whether it announced them or sent their headers, leaving room for both
-  blocks in a tip race and for bunched announcements. A block it shows again
-  in the same 2 seconds, such as an announced block it then sends, is counted
-  once. One connection cannot fill the store. A block's height is not known when its header arrives, so blocks a
-  peer serves during catch-up use the allowance and the store too. A node
-  that is catching up, or a sustained flood, can at worst return blocks to
-  arrival order, and the store clears four seconds after it stops. A record
-  made after the block's entry was dropped counts as a new sighting, which
-  gives a withholder nothing it could not get by announcing late.
+  blocks in a tip race and one more. A block it shows again in the same 2
+  seconds, such as an announced block it then sends, is counted once.
+
+  The store's size follows from those numbers, so that peers cannot fill it at
+  the default connection limits. One connection holds at most 9 unexpired
+  entries: three windows' worth, when the first was filled exactly 4 seconds
+  before the last. The default limits allow 450 connections, and about 44
+  more can be opened within those 4 seconds, so at most 494 connections hold
+  4,446 entries. A node configured for more than about 550 connections can
+  still be filled.
+
+  A block's height is not known when its header arrives, so blocks a peer
+  serves during catch-up use the allowance and the store too, within the same
+  bound. Where the store can be filled, a sustained flood can at worst return
+  blocks to arrival order, and the store clears four seconds after it stops.
+  A record made after the block's entry was dropped counts as a new sighting,
+  which gives a withholder nothing it could not get by announcing late.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.

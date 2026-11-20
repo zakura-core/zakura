@@ -1351,7 +1351,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
     assert_eq!(*announced.lock().unwrap(), [blocks[0]]);
 }
 
-/// One connection hands the hook at most four announcements per two-second window, and each
+/// One connection hands the hook at most three announcements per two-second window, and each
 /// connection has its own allowance.
 #[tokio::test(start_paused = true)]
 async fn the_block_announcement_hook_is_limited_per_connection() {
@@ -1371,31 +1371,31 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
     };
     let count = || announced.lock().unwrap().len();
 
-    for byte in 1..=5 {
+    for byte in 1..=4 {
         announce(&connection, byte).expect("passed through");
     }
     assert_eq!(
         count(),
-        4,
-        "the fifth announcement in the window does not reach the hook"
+        3,
+        "the fourth announcement in the window does not reach the hook"
     );
 
     announce(&hook.for_connection(), 6).expect("passed through");
-    assert_eq!(count(), 5, "another connection has its own allowance");
+    assert_eq!(count(), 4, "another connection has its own allowance");
 
     tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
     announce(&connection, 7).expect("passed through");
-    assert_eq!(count(), 5, "the window has not ended");
+    assert_eq!(count(), 4, "the window has not ended");
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    for byte in 8..=12 {
+    for byte in 8..=11 {
         announce(&connection, byte).expect("passed through");
     }
-    assert_eq!(count(), 9, "a new window allows four more announcements");
+    assert_eq!(count(), 7, "a new window allows three more announcements");
 }
 
 /// The block headers a connection's decoder sees and the `inv`s its message filter sees draw on
-/// the same four blocks per window. A block shown twice in a window is counted and passed on
+/// the same three blocks per window. A block shown twice in a window is counted and passed on
 /// once, so a peer that announces a block and then sends it uses one place.
 #[tokio::test(start_paused = true)]
 async fn block_headers_and_announcements_share_one_connection_allowance() {
@@ -1426,14 +1426,14 @@ async fn block_headers_and_announcements_share_one_connection_allowance() {
     assert_eq!(*announced.lock().unwrap(), [hash(1)]);
     assert_eq!(*headers.lock().unwrap(), [hash(2)]);
 
-    for byte in 3..=6 {
+    for byte in 3..=5 {
         header_arrived(hash(byte));
     }
     announce(7);
     assert_eq!(
         *headers.lock().unwrap(),
-        [hash(2), hash(3), hash(4)],
-        "the two earlier blocks left room for two more",
+        [hash(2), hash(3)],
+        "the two earlier blocks left room for one more",
     );
     assert_eq!(
         *announced.lock().unwrap(),

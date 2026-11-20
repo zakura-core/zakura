@@ -280,8 +280,8 @@ const SLOW_FAMILIES: [&str; 3] = [
     "block-sync/storage/decoded-input-stall",
 ];
 
-/// How many generated Plans [`inputs`] runs on a harness with no scenario
-/// families, such as a machine's op tapes.
+/// How many generated op tapes [`inputs`] runs on a machine, which has no
+/// scenario families.
 const PLANS_WITHOUT_FAMILIES: usize = 8;
 
 /// The longest generated Plan [`inputs`] runs, cut to a target's
@@ -290,14 +290,14 @@ const PLAN_BYTES: usize = 256;
 
 /// `entry`'s inputs, named: the empty input, which runs the default scenario
 /// under the empty Plan, then each scenario family's tag under the empty
-/// Plan, but the [`SLOW_FAMILIES`]. A harness with no families runs the
-/// first [`PLANS_WITHOUT_FAMILIES`] generated Plans instead, each at most
+/// Plan, but the [`SLOW_FAMILIES`]. A machine runs the first
+/// [`PLANS_WITHOUT_FAMILIES`] generated op tapes as well, each at most
 /// `max_len` bytes. The harnesses' seeds live in the QA store, which a
 /// repository test doesn't read.
 fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
     let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
     let families = (entry.families)();
-    if families.is_empty() {
+    if entry.machine {
         let plans =
             zakura_sim::seed::draws::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
         for (index, plan) in plans.into_iter().enumerate() {
@@ -416,8 +416,8 @@ fn declared_targets_are_the_sim_packages() {
     assert!(!declared.contains(&"fork_transitions".to_owned()));
 }
 
-/// A store's seed case is a bypass of the seeds it names, a typed case of
-/// none, and a case that names neither or both fails.
+/// A store's seed case is a bypass of the seeds it names, a typed or search
+/// case of none, and a case that names none or more than one fails.
 #[test]
 fn bypasses_follow_their_seed() {
     let store = tempfile::tempdir().unwrap();
@@ -434,6 +434,10 @@ fn bypasses_follow_their_seed() {
     write(
         "header-sync/storage-bound/typed.toml",
         "[typed]\nharness = \"header-sync/storage\"\nscenario = \"s.json\"\n",
+    );
+    write(
+        "header-sync/storage-bound/search.toml",
+        "[search]\nharness = \"header-sync/storage\"\nseed = 1\nruns = 8\n",
     );
     let seed = |name: &str| Seed::new(name, "discovery/wait-complete", "s.rs", Vec::new());
     let found = bypasses(store.path(), &[seed("wait")]).unwrap();
@@ -453,7 +457,7 @@ fn bypasses_follow_their_seed() {
     write("header-sync/storage-bound/bad.toml", "checks = []\n");
     assert!(bypasses(store.path(), &[seed("wait")])
         .unwrap_err()
-        .contains("names neither"));
+        .contains("this names 0"));
     let empty = tempfile::tempdir().unwrap();
     assert!(bypasses(empty.path(), &[seed("wait")]).unwrap().is_empty());
 }

@@ -14,9 +14,9 @@ use crate::zakura::tx_relay::machine::{
     reactor::Recorded,
     session::{Timer, Timers},
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
-    ADVERT_DELAY, BASE_COOLDOWN, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN,
-    PENDING_PER_PEER, RETRY_FIRST, TRIED_PER_ENTRY,
+    ADVERT_DELAY, BASE_COOLDOWN, INITIAL_WINDOW, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
+    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP, PENDING_PER_PEER,
+    RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -205,17 +205,17 @@ fn a_peer_that_tried_an_id_is_not_asked_again_while_another_has_not() {
     }
 }
 
-/// The limit of 5 is counted once: a session's reserve calls, requests and
-/// bodies awaiting their verdicts stay within 5 together, and the bodies an
-/// ended session left at the pool count against its peer's next session
-/// until their verdicts come.
+/// The request limit is counted once: a session's reserve calls, requests
+/// and bodies awaiting their verdicts stay within its window together, and
+/// the bodies an ended session left at the pool count against its peer's
+/// next session until their verdicts come.
 #[test]
-fn the_limit_of_five_counts_the_bodies_an_ended_session_left() {
+fn the_window_counts_the_bodies_an_ended_session_left() {
     let mut bench = Bench::new();
     let ids: Vec<UnminedTxId> = (0..12).map(|n| bench.id(n)).collect();
     let first = bench.join(1);
     bench.inv(first, &ids[..7]);
-    assert_eq!(bench.calls().len(), MAX_REQUESTS_PER_PEER, "5 calls of 7");
+    assert_eq!(bench.calls().len(), INITIAL_WINDOW, "5 calls of 7");
     for (call, _) in bench.calls() {
         bench.grant(call);
     }
@@ -229,14 +229,117 @@ fn the_limit_of_five_counts_the_bodies_an_ended_session_left() {
     let second = bench.join(1);
     bench.inv(second, &ids[7..]);
     let calls = bench.calls().len();
-    assert_eq!(calls, MAX_REQUESTS_PER_PEER - 2, "the bodies count");
+    assert_eq!(calls, INITIAL_WINDOW - 2, "the bodies count");
     bench.verdict(waiters[0], Verdict::Admitted);
     let calls = bench.calls().len();
-    assert_eq!(calls, MAX_REQUESTS_PER_PEER - 1, "until their verdicts");
+    assert_eq!(calls, INITIAL_WINDOW - 1, "until their verdicts");
+}
+
+/// `session`'s window.
+fn window(bench: &Bench, session: SessionId) -> usize {
+    bench.machine.session(session).expect("live").window
+}
+
+/// `session`'s peer supplies `ids`, bodies `0..` in the order it announced
+/// them, each once the machine asks, and the pool admits each.
+fn admit_all(bench: &mut Bench, session: SessionId, ids: &[UnminedTxId]) {
+    for (n, id) in (0..).zip(ids) {
+        bench.fetch(session, *id);
+        let body = bench.tx(n);
+        assert!(
+            bench.deliver(session, *id, body),
+            "the asked-for body is read"
+        );
+        let waiter = bench.submitted().expect("submitted");
+        bench.add(&[*id]);
+        bench.verdict(waiter, Verdict::Admitted);
+    }
+}
+
+/// The window starts at `INITIAL_WINDOW`, grows by one on each admission of
+/// a body the session fetched while the window was full, up to what the
+/// peer's `Hello` serves, and halves when its requests miss their
+/// deadlines.
+#[test]
+fn the_window_grows_on_admissions_and_halves_on_a_missed_deadline() {
+    let mut bench = Bench::new();
+    let session = bench.join(1);
+    let ids: Vec<UnminedTxId> = (0..40).map(|n| bench.id(n)).collect();
+    bench.inv(session, &ids[..30]);
+    assert_eq!(window(&bench, session), INITIAL_WINDOW);
+    admit_all(&mut bench, session, &ids[..30]);
+    assert_eq!(
+        window(&bench, session),
+        MAX_SERVES,
+        "grown to the Hello's 16"
+    );
+
+    bench.inv(session, &ids[30..]);
+    for (call, _) in bench.calls() {
+        bench.grant(call);
+    }
+    assert!(bench.next(), "the requests' deadline");
+    assert_eq!(window(&bench, session), MAX_SERVES / 2, "halved once");
+}
+
+/// A body the pool rejects never widens its supplier's window, so a peer
+/// gets more than `INITIAL_WINDOW` bodies verified at once only after its
+/// bodies were admitted.
+#[test]
+fn rejected_bodies_never_widen_the_window() {
+    let mut bench = Bench::new();
+    let rejected = bench.rejection(RejectionScope::ExactTip, Charge::None);
+    let session = bench.join(1);
+    let ids: Vec<UnminedTxId> = (0..10).map(|n| bench.id(n)).collect();
+    bench.inv(session, &ids);
+    let out = called(&bench);
+    for id in &out {
+        bench.fetch(session, *id);
+    }
+    for id in out {
+        let n = ids.iter().position(|of| *of == id).expect("announced");
+        assert!(bench.deliver(session, id, bench.tx(u32::try_from(n).expect("small"))));
+        let waiter = bench.submitted().expect("submitted");
+        bench.verdict(waiter, rejected);
+    }
+    assert_eq!(window(&bench, session), INITIAL_WINDOW);
+}
+
+/// What a session asks for at once stays within `MAX_OUTSTANDING_BYTES` of
+/// announced sizes however large its window grew, so no deadline stretches
+/// past today's cap, and the oldest ready id that would pass it waits
+/// rather than let a smaller, newer one go first, even one the bytes left
+/// would fit.
+#[test]
+fn a_wide_window_still_asks_for_at_most_the_outstanding_bytes() {
+    let mut bench = Bench::new();
+    let session = bench.join(1);
+    let small: Vec<UnminedTxId> = (0..12).map(|n| bench.id(n)).collect();
+    bench.inv(session, &small);
+    admit_all(&mut bench, session, &small);
+    assert!(window(&bench, session) > INITIAL_WINDOW, "the window grew");
+
+    // Five of these leave room for one more small id, and not a sixth.
+    let big_size = MAX_TX_BYTES - SIZE;
+    let big: Vec<(UnminedTxId, u32)> = (100..106).map(|n| (bench.id(n), big_size)).collect();
+    bench.inv_sized(session, &big);
+    bench.tick(MS);
+    let newer = bench.id(200);
+    bench.inv(session, &[newer]);
+    let first_five: Vec<UnminedTxId> = big[..5].iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        called(&bench),
+        first_five,
+        "five of the large ones fill the bytes"
+    );
+    assert!(
+        !bench.reserved(newer),
+        "the sixth waits, and so does what is behind it"
+    );
 }
 
 /// A session that ends with its reserve calls unanswered leaves them
-/// counted against its peer's 5: the peer's next session claims nothing
+/// counted against its peer's window: the peer's next session claims nothing
 /// until an old call is answered, so ending and reopening while the pool is
 /// slow cannot pile up calls.
 #[test]
@@ -466,6 +569,36 @@ fn a_full_pending_set_counts_new_announcements_as_overflow() {
     let id = bench.id(2);
     bench.inv(honest, &[id]);
     assert!(bench.reserved(id), "another peer's id is not delayed");
+}
+
+/// An id whose only holder ended while its body waits for a verdict has no
+/// holder left, so a later announcement of it is its first source, taken
+/// past a full pending cap. If the verdict then leaves it undecided, the
+/// node still has a source for it.
+#[test]
+fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
+    let mut bench = Bench::new();
+    let script = script_len();
+    let per = u32::try_from(PENDING_PER_PEER).expect("fits");
+    let pool: Vec<UnminedTxId> = (0..per).map(|n| body(n + 1_000, script).id()).collect();
+    // A session past its share, then sessions that fill the cap.
+    let late = bench.join(1);
+    bench.inv(late, &pool[..300]);
+    let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
+    for peer in 2..=fillers + 1 {
+        let session = bench.join(peer);
+        bench.inv(session, &pool);
+    }
+    let supplier = bench.join(fillers + 2);
+    let waiter = bench.supply(supplier, 0);
+    let id = bench.id(0);
+    bench.end(supplier);
+
+    bench.inv(late, &[id]);
+    assert!(holds(&bench, late, id), "a first source past the full cap");
+    bench.verdict(waiter, Verdict::LocalFault(LocalFault::VerifyTimeout));
+    let wanted = bench.machine.wanted().entry(id).is_some();
+    assert!(wanted && holds(&bench, late, id), "the node keeps a source");
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest
@@ -816,7 +949,7 @@ fn a_cooldown_stops_its_supplier_only_and_a_second_one_closes_it() {
 }
 
 /// A peer whose bodies earn cooldowns gets no more of them verified per
-/// cooldown than it had out, at most five: the first cooldown stops new asks
+/// cooldown than it had out, at most its window: the first cooldown stops new asks
 /// of the peer id, the bodies still on the wire are dropped unread, a body
 /// already at the pool adds no strike, and a reconnect is asked nothing until
 /// the cooldown ends.
@@ -828,7 +961,7 @@ fn a_cooling_peer_gets_no_more_bodies_verified_than_it_had_out() {
     let ids: Vec<UnminedTxId> = (0..10).map(|n| bench.id(n)).collect();
     bench.inv(session, &ids);
     let out = called(&bench);
-    assert_eq!(out.len(), MAX_REQUESTS_PER_PEER, "its limit is out");
+    assert_eq!(out.len(), INITIAL_WINDOW, "its limit is out");
     for id in &out {
         bench.fetch(session, *id);
     }
@@ -862,7 +995,7 @@ fn a_cooling_peer_gets_no_more_bodies_verified_than_it_had_out() {
     assert!(bench.calls().is_empty(), "the peer id still cools");
     bench.tick(MS);
     bench.inv(session, &ids);
-    assert_eq!(called(&bench).len(), MAX_REQUESTS_PER_PEER, "its next five");
+    assert_eq!(called(&bench).len(), INITIAL_WINDOW, "its next five");
 }
 
 /// A body from an unconditional peer's session is never charged: a `Ban`
@@ -1108,6 +1241,34 @@ fn a_zero_advert_delay_announces_to_everyone_at_once() {
     assert_eq!(advertised(&bench, resynced), sessions);
 }
 
+/// The fan-out ranks sessions by the round-trip times their routines
+/// report, lowest first, from the next ranking on: with a window of one, an
+/// admission goes at once only to the session placed first.
+#[test]
+fn the_lowest_round_trip_time_hears_first_once_the_ranking_refreshes() {
+    let mut bench = Bench::with(one_at_once(ADVERT_DELAY), true, &[]);
+    let sessions = [bench.join(1), bench.join(2), bench.join(3)];
+    for (session, ms) in sessions.iter().zip([90, 60, 30]) {
+        bench.rtt(*session, Duration::from_millis(ms));
+    }
+    let before = bench.id(0);
+    bench.add(&[before]);
+    assert_eq!(
+        advertised(&bench, before),
+        vec![sessions[0]],
+        "sticky until then"
+    );
+
+    bench.tick(RANK_INTERVAL);
+    let after = bench.id(1);
+    bench.add(&[after]);
+    assert_eq!(
+        advertised(&bench, after),
+        vec![sessions[2]],
+        "the fastest first"
+    );
+}
+
 /// Sessions that open before the pool attaches announce the whole pool once
 /// the first snapshot, which the IO reads as a resync, turns it on: every
 /// session, whatever its rank, in that step, even with a window of one, so
@@ -1180,7 +1341,7 @@ fn only_an_id_sent_on_the_session_and_still_pooled_is_served() {
     let mut bench = Bench::with(FanOut::default(), true, &[kept, dropped]);
     let (asker, other) = (bench.join(1), bench.join(2));
     let small = bench.connect(3, false);
-    bench.hello(small, hello_of(MAX_REQUESTS_PER_PEER, SIZE - 1));
+    bench.hello(small, hello_of(INITIAL_WINDOW, SIZE - 1));
     bench.take_inv(asker, usize::MAX);
     bench.take_inv(small, usize::MAX);
     bench.remove(dropped, RemovalReason::Evicted);

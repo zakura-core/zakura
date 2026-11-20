@@ -743,6 +743,19 @@ impl StartCmd {
         // registered, not merely enabled.
         let mut network_config = config.network.clone();
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+        // The service is registered on the v2 endpoint, which a legacy-only
+        // stack never starts.
+        let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
+        info!(
+            configured = config.network.zakura.tx_relay.enabled,
+            registered = tx_relay_registered,
+            "tx-relay"
+        );
+        metrics::gauge!("zakura.p2p.tx_relay.registered").set(if tx_relay_registered {
+            1.0
+        } else {
+            0.0
+        });
 
         let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
@@ -852,7 +865,18 @@ impl StartCmd {
             misbehavior.clone(),
         );
 
-        info!(?pool_implementation, "initializing mempool");
+        info!(
+            configured = config.mempool.implementation.as_str(),
+            resolved = pool_implementation.as_str(),
+            "initializing mempool"
+        );
+        // A canary's effective pool, read from its metrics rather than from
+        // a config that says `default`.
+        metrics::gauge!(
+            "mempool.implementation",
+            "implementation" => pool_implementation.as_str(),
+        )
+        .set(1.0);
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
                 let parts = mempool::core::start(

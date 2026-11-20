@@ -69,6 +69,12 @@ run = true
 timeout-secs = 3600
 
 [[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "the_frontier_first_input_holds_capacity_release_wakes"
+run = true
+timeout-secs = 3600
+
+[[ignored]]
 file = "crates/zakura-sim/tests/block_resource_properties.rs"
 test = "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound"
 run = true

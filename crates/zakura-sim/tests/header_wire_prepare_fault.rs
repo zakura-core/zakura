@@ -9,21 +9,20 @@
 //! retires the round, so the failed prepare ends stale, and
 //! `header-sync/stale-completion-inert` holds through its penalty.
 //!
-//! The QA store holds that late fault as `fixtures/header-wire-late-fault`,
-//! the scenario and the steered script. The planted cases under
-//! `qa/planted/header-sync/header-fault-penalized/` run it on
+//! That late fault is committed as `tests/fixtures/header-wire-late-fault`,
+//! the scenario and the steered script, which the planted cases under
+//! `qa/planted/header-sync/header-fault-penalized/` run on
 //! `header-sync/wire`. No Plan bytes reach it unsteered, since the peer's
 //! disconnect is enabled from its first page.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{fs, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 use support::{
     inputs,
     prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
-    qa_store,
     steer::steer,
 };
 use zakura_sim::{
@@ -413,12 +412,18 @@ fn the_evidence_replays_in_a_fresh_process() {
     assert_eq!(line("LOG "), log);
 }
 
-/// The late-fault scenario's file in the QA store, as `header-sync/wire`'s
-/// JSON.
+/// The committed late-fault scenario, as `header-sync/wire`'s JSON.
 const LATE_FAULT: &str = "header-wire-late-fault.json";
 
-/// The late-fault script's file in the QA store, a scripted Plan as JSON.
+/// The committed late-fault script, a scripted Plan as JSON.
 const LATE_FAULT_SCRIPT: &str = "header-wire-late-fault.script.json";
+
+/// The committed fixture file `name`.
+fn fixture_file(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
 
 /// The late-fault scenario: the peer disconnects after serving its invalid
 /// tip, and the node's first preparation is held.
@@ -469,16 +474,42 @@ fn late_fault_script() -> Plan {
     plan
 }
 
-/// Rewrites the late-fault scenario and script in the QA store, which
-/// `ZAKURA_QA_STORE` names, from their builders. Run it with
-/// `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_wire_prepare_fault -- --ignored regenerate_late_fault_fixture`.
+/// The committed late-fault scenario and script, as `cargo xtask planted`
+/// reads them.
+fn committed_late_fault() -> (WireScenario, Plan) {
+    let read = |name: &str| {
+        fs::read_to_string(fixture_file(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    let scenario = serde_json::from_str(&read(LATE_FAULT))
+        .unwrap_or_else(|error| panic!("{LATE_FAULT}: {error}"));
+    let script = serde_json::from_str(&read(LATE_FAULT_SCRIPT))
+        .unwrap_or_else(|error| panic!("{LATE_FAULT_SCRIPT}: {error}"));
+    (scenario, script)
+}
+
+/// The committed late-fault fixture is what its builders give: the
+/// scenario and the default Plan steered over it on `header-sync/wire`.
 #[test]
-#[ignore = "rewrites the late-fault fixture in the QA store"]
+fn the_late_fault_fixture_matches_its_builders() {
+    let (scenario, script) = committed_late_fault();
+    assert_eq!(
+        scenario,
+        late_fault_scenario(),
+        "run `regenerate_late_fault_fixture`"
+    );
+    assert_eq!(
+        script,
+        late_fault_script(),
+        "run `regenerate_late_fault_fixture`"
+    );
+}
+
+/// Rewrites the committed late-fault fixture from its builders.
+#[test]
+#[ignore = "rewrites the committed late-fault fixture"]
 fn regenerate_late_fault_fixture() {
     let write = |name: &str, json: String| {
-        let path = qa_store::fixture(name);
-        fs::write(&path, json + "\n").unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        fs::write(fixture_file(name), json + "\n").expect("the fixture directory exists");
     };
     write(
         LATE_FAULT,
@@ -490,13 +521,13 @@ fn regenerate_late_fault_fixture() {
     );
 }
 
-/// On `header-sync/wire` itself, the late fault holds
+/// On `header-sync/wire` itself, the committed late fault holds
 /// `header-sync/header-fault-penalized` with its trigger history and no
 /// violation. The fault is late: the node penalized the session that sent
 /// the invalid page after it ended.
 #[test]
 fn the_late_fault_fixture_penalizes_after_the_session_ended() {
-    let (scenario, script) = (late_fault_scenario(), late_fault_script());
+    let (scenario, script) = committed_late_fault();
     check_witness::<HeaderWire>(
         WitnessScenario {
             scenario: scenario.clone(),
@@ -520,9 +551,9 @@ fn the_late_fault_fixture_penalizes_after_the_session_ended() {
     );
 }
 
-/// `record --witness` judges the late fault as `cargo xtask planted` runs
-/// it, from the scenario's text and `--script`, expecting a hold, and
-/// `replay` reruns its trace Exact in a fresh process.
+/// `record --witness` judges the committed late fault as `cargo xtask
+/// planted` runs it, from the scenario's text and `--script`, expecting a
+/// hold, and `replay` reruns its trace Exact in a fresh process.
 #[test]
 fn the_late_fault_fixture_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
@@ -533,13 +564,7 @@ fn the_late_fault_fixture_records_and_replays_in_a_fresh_process() {
     };
     let dir = tempfile::TempDir::new().expect("a temporary directory");
     let trace = dir.path().join("trace");
-    let scenario = serde_json::to_string(&late_fault_scenario()).expect("scenarios serialize");
-    let script = dir.path().join(LATE_FAULT_SCRIPT);
-    fs::write(
-        &script,
-        serde_json::to_string(&late_fault_script()).expect("Plans serialize"),
-    )
-    .expect("the script is written");
+    let scenario = fs::read_to_string(fixture_file(LATE_FAULT)).expect("the fixture is committed");
     let recorded = zakura_sim(&[
         "record",
         "--sim",
@@ -547,7 +572,9 @@ fn the_late_fault_fixture_records_and_replays_in_a_fresh_process() {
         "--scenario",
         &scenario,
         "--script",
-        script.to_str().expect("the path is UTF-8"),
+        fixture_file(LATE_FAULT_SCRIPT)
+            .to_str()
+            .expect("the path is UTF-8"),
         "--out",
         trace.to_str().expect("the path is UTF-8"),
         "--witness",

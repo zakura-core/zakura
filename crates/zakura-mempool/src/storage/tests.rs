@@ -3,7 +3,7 @@
 use zakura_chain::transaction::{self, UnminedTxId};
 use zakura_rt::collections::HashSet;
 
-use super::{verified_set::VerifiedSet, SameEffectsChainRejectionError};
+use super::SameEffectsChainRejectionError;
 
 mod eviction;
 mod known_ids;
@@ -42,52 +42,22 @@ impl<E: Clone> super::Storage<E> {
             })
             .map(UnminedTxId::mined_id)
             .collect();
-        self.verified.remove_all(tx_ids).len()
+        self.verified.remove_batch(tx_ids).len()
     }
 
-    /// Does to storage what the pool core does for a block that mined
-    /// `mined_ids`: removes each one that is stored, keeping what depends on
-    /// it, and caches each one as mined at `now`. Returns what was removed.
+    /// Does to storage what a block that mined `mined_ids` and nothing else
+    /// does: removes each one that is stored, keeping what depends on it,
+    /// and caches each one as mined at `now`. Returns what was removed.
     pub fn mine(
         &mut self,
         mined_ids: &HashSet<transaction::Hash>,
         now: crate::Instant,
     ) -> HashSet<UnminedTxId> {
-        let mut removed = HashSet::new();
-        for mined_id in mined_ids {
-            if let Some(tx) = self.remove_one(mined_id) {
-                removed.insert(tx.transaction.id());
-            }
-            self.reject_effects_chain(*mined_id, SameEffectsChainRejectionError::Mined, now);
+        let mined: Vec<_> = mined_ids.iter().copied().collect();
+        let removed = self.verified.remove_mined(&mined);
+        for mined_id in mined {
+            self.reject_effects_chain(mined_id, SameEffectsChainRejectionError::Mined, now);
         }
-        removed
-    }
-}
-
-impl VerifiedSet {
-    /// Removes the listed transactions and their descendants.
-    ///
-    /// Returns all removed unmined IDs. Missing IDs, duplicate IDs, and IDs
-    /// already removed as descendants are ignored.
-    pub(crate) fn remove_all(
-        &mut self,
-        tx_ids: impl IntoIterator<Item = transaction::Hash>,
-    ) -> HashSet<UnminedTxId> {
-        let mut removed_transactions = HashSet::new();
-
-        for key_to_remove in tx_ids {
-            if !self.contains(&key_to_remove) {
-                // A previous removal may already have removed this descendant.
-                continue;
-            }
-
-            removed_transactions.extend(
-                self.remove(&key_to_remove)
-                    .into_iter()
-                    .map(|tx| tx.transaction.id()),
-            );
-        }
-
-        removed_transactions
+        removed.into_iter().collect()
     }
 }

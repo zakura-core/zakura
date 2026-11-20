@@ -345,14 +345,17 @@ fn mempool_storage_crud_same_effects_mainnet() {
     // Check that it is in the mempool, and not rejected.
     assert!(storage.contains(&unmined_tx_2.transaction.id().mined_id()));
 
-    // The pool core finds that a block spent its inputs. Storage removes it and
-    // caches it as a duplicate spend.
-    let mined_id = unmined_tx_2.transaction.id().mined_id();
-    assert!(storage.remove_one(&mined_id).is_some());
-    storage.reject_effects_chain(
-        mined_id,
-        SameEffectsChainRejectionError::DuplicateSpend,
+    // A block spends its inputs. Storage removes it and caches it as a
+    // duplicate spend.
+    let removed = storage.connect_block(
+        &[],
+        [unmined_tx_2.transaction.transaction().as_ref()],
+        Height(1),
         crate::Instant::now(),
+    );
+    assert_eq!(
+        removed.dropped,
+        vec![(unmined_tx_2.transaction.id(), RemovalReason::Conflicted)]
     );
 
     // Check that it is /not/ in the mempool as a verified transaction.

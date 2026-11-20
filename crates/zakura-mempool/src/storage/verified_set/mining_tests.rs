@@ -23,11 +23,11 @@ fn ids(verified: &VerifiedSet) -> Vec<transaction::Hash> {
 }
 
 fn set_time(verified: &mut VerifiedSet, id: transaction::Hash, seconds: i64) {
-    let affected = verified.dependency_group([id]);
-    verified.remove_ordering_candidates(&affected);
+    let added_at = verified.added_at(&id).unwrap();
+    verified.remove_ordering_candidate(id, verified.transactions[&id].time);
     verified.transactions.get_mut(&id).unwrap().time =
         Some(chrono::DateTime::from_timestamp(seconds, 0).unwrap());
-    verified.insert_ordering_candidates(&affected);
+    verified.insert_ordering_candidate(id, added_at);
 }
 
 #[test]
@@ -76,9 +76,7 @@ fn mining_uses_ancestors_and_rescores_children_when_the_parent_is_mined() {
     assert_eq!(ids(&verified), vec![independent, child, parent]);
     verified.assert_dependency_groups_are_bounded();
 
-    verified.clear_mined_dependencies(&HashSet::from([parent]));
-    assert_eq!(ids(&verified), vec![child, independent, parent]);
-    verified.remove_all([parent]);
+    verified.remove_mined(&[parent]);
     assert_eq!(ids(&verified), vec![child, independent]);
     verified.assert_dependency_groups_are_bounded();
 }
@@ -122,11 +120,39 @@ fn descendant_removal_and_clear_remove_mining_candidates() {
         vec![transparent::OutPoint::from_usize(parent, 0)],
     );
     let survivor = insert(&mut verified, factory.tx(30_000), Vec::new());
-    assert_eq!(verified.remove(&parent).len(), 2);
+    assert_eq!(verified.remove_batch([parent]).len(), 2);
     assert_eq!(ids(&verified), vec![survivor]);
     verified.assert_dependency_groups_are_bounded();
     verified.clear();
     assert!(ids(&verified).is_empty());
+    verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn removing_a_join_parent_refreshes_the_other_parents_eviction_score() {
+    let mut factory = TxFactory::new();
+    let mut verified = VerifiedSet::default();
+    let first = insert(&mut verified, factory.tx_with(10_000, 1, 0), Vec::new());
+    let second = insert(&mut verified, factory.tx_with(10_000, 1, 0), Vec::new());
+    let child = insert(
+        &mut verified,
+        factory.tx(90_000),
+        vec![
+            transparent::OutPoint::from_usize(first, 0),
+            transparent::OutPoint::from_usize(second, 0),
+        ],
+    );
+    let removed: HashSet<_> = verified
+        .remove_batch([first])
+        .into_iter()
+        .map(|tx| tx.transaction.id().mined_id())
+        .collect();
+    assert_eq!(removed, HashSet::from([first, child]));
+    assert_eq!(ids(&verified), vec![second]);
+    assert_eq!(
+        verified.eviction_order.first().unwrap().0,
+        VerifiedSet::eviction_cost(&verified.transactions[&second])
+    );
     verified.assert_dependency_groups_are_bounded();
 }
 

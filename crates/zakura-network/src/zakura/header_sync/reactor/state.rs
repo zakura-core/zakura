@@ -259,7 +259,8 @@ impl ReactorState {
         }
     }
 
-    /// Note that `peer`'s idle offer waits for a staging slot.
+    /// Note that `peer`'s idle offer waits for a staging slot or for header
+    /// room, which every offer shares like a slot.
     pub(super) fn note_waiting_for_slot(&mut self, peer: &ZakuraPeerId) {
         if let Some(turn) = self.peers.get(peer).map(|schedule| schedule.turn) {
             self.waiting_for_slot = Some(self.waiting_for_slot.map_or(turn, |slot| slot.min(turn)));
@@ -360,8 +361,9 @@ impl ReactorState {
         self.last_scheduling_opportunity = Some(opportunity);
     }
 
-    /// The unspent offers of peers without work, in cached-pass order: more
-    /// claimed work first, then the rotation ([`PeerSchedule::turn`]).
+    /// The unspent offers of peers without work, in cached-pass order: the
+    /// rotation ([`PeerSchedule::turn`]), with offers that claim less work
+    /// than the node's own after the rest ([`PeerWorkPriority`]).
     ///
     /// `session_id` names each admitted peer's session.
     pub(super) fn cached_offers(
@@ -1128,7 +1130,7 @@ pub(super) struct PeerSchedule {
     /// more.
     pub(super) replaced_request_budget: Option<Duration>,
     /// The peer's place in the ordinary-offer rotation: lower goes first
-    /// among offers of equal claimed work.
+    /// among offers of equal priority ([`PeerWorkPriority`]).
     ///
     /// A session takes the next place when it's admitted, and its peer takes
     /// the next again each time its offer stages. So a waiting offer goes

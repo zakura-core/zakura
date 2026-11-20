@@ -270,10 +270,10 @@ fn staged_frontier(staged: usize) -> Frontier {
 }
 
 fn priority_of(priority: u8) -> PeerWorkPriority {
-    match priority % 3 {
-        0 => PeerWorkPriority::LowerComparableWork,
-        1 => PeerWorkPriority::Normal,
-        _ => PeerWorkPriority::HigherComparableWork,
+    if priority & 1 == 0 {
+        PeerWorkPriority::LowerComparableWork
+    } else {
+        PeerWorkPriority::Normal
     }
 }
 
@@ -357,7 +357,7 @@ impl Harness {
     /// unstarted work, and only work below `priority`. Replacing unstarted work
     /// releases its peer's capacity.
     fn record_stage(&mut self, peer: usize, tip: u8, priority: u8, result: QueueWorkResult) {
-        let rank = priority % 3;
+        let rank = priority & 1;
         let before = self.work.get(&peer).cloned();
         let full = before.is_none() && self.work.len() >= MAX_STAGED_TARGETS_V1;
         match result {
@@ -1157,7 +1157,7 @@ mod tests {
         ops.push(Op::Stage {
             peer: MAX_STAGED_TARGETS_V1,
             tip: 1,
-            priority: 2,
+            priority: 1,
         });
         let harness = run(ops);
         assert_eq!(harness.summary.evictions, 1);
@@ -1175,7 +1175,7 @@ mod tests {
             ops.push(Op::Stage {
                 peer,
                 tip: 0,
-                priority: if peer < 2 { 1 } else { 2 },
+                priority: if peer < 2 { 0 } else { 1 },
             });
         }
         let new = MAX_STAGED_TARGETS_V1;
@@ -1183,7 +1183,7 @@ mod tests {
         harness.apply(Op::Stage {
             peer: new,
             tip: 1,
-            priority: 1,
+            priority: 0,
         });
         assert!(
             !harness.queue.has_work(&peer_id(new)),
@@ -1192,7 +1192,7 @@ mod tests {
         harness.apply(Op::Stage {
             peer: new,
             tip: 1,
-            priority: 2,
+            priority: 1,
         });
         let kept: Vec<bool> = (0..3)
             .map(|peer| harness.queue.has_work(&peer_id(peer)))

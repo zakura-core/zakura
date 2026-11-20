@@ -394,11 +394,9 @@ fn status_held_back_at_capacity_is_staged_when_a_slot_frees() {
                 status: status_for(&snapshot, target),
             };
             assert_eq!(
-                reactor.peer_work_queue.stage(
-                    peer.clone(),
-                    staged,
-                    PeerWorkPriority::HigherComparableWork
-                ),
+                reactor
+                    .peer_work_queue
+                    .stage(peer.clone(), staged, PeerWorkPriority::Normal),
                 QueueWorkResult::NeedsLocator
             );
             peer
@@ -2768,4 +2766,52 @@ async fn a_later_peer_with_a_lower_key_waits_behind_an_earlier_offer() {
     time::advance(CACHED_PASS_REFILL).await;
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &honest, target);
+}
+
+/// F-830: an offer held back for header room keeps its turn for the room.
+/// When the room frees while the cached pass waits for its refill, a later
+/// peer's fresh status for another target waits for that pass instead of
+/// taking the room first.
+///
+/// This fails if a headroom wait leaves no record for the deferred pass's
+/// guard.
+#[tokio::test(start_paused = true)]
+async fn a_later_offer_waits_behind_an_earlier_offer_held_for_header_room() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 4000, 0);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    let honest_target = block::Hash([0x42; 32]);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, honest_target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "no room, so no locator read");
+
+    // The owner leaves with the pass budget spent, which frees the room,
+    // and a later peer's status arrives before the deferred pass runs.
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.schedule_cached_statuses();
+    assert!(
+        reactor.state.cached_pass_deferred,
+        "the pass waits for its refill"
+    );
+    reactor.handle_status(
+        late.clone(),
+        0,
+        status_for(&snapshot, block::Hash([0x43; 32])),
+    );
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the late offer doesn't take the room ahead of the honest one"
+    );
+
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, honest_target);
 }

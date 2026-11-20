@@ -285,15 +285,26 @@ enum Role {
     /// Advertises tip `n` of an invalid branch with more work than the honest
     /// tip, and serves that branch.
     Invalid(u8),
+    /// Advertises the honest tip with far more work than it has, and never
+    /// answers a subscription.
+    Inflated,
+    /// Plays [`Role::Honest`], but its status names a work anchor the node
+    /// doesn't share, so its claimed work can't be compared with the node's.
+    Unanchored,
 }
 
 impl Role {
+    /// Whether this peer serves the honest chain to the end.
+    fn honest(self) -> bool {
+        matches!(self, Role::Honest | Role::Unanchored)
+    }
+
     /// The key of this peer's `generation`th session, for peer `index` of
     /// `peers`. Adversaries sort before the honest peer, and each reopened
     /// session takes a fresh key.
     fn peer(self, index: usize, peers: usize, generation: usize) -> ZakuraPeerId {
         let byte = match self {
-            Role::Honest => 0xF0,
+            Role::Honest | Role::Unanchored => 0xF0,
             _ => u8::try_from(0x10 + index + peers * generation)
                 .ok()
                 .filter(|byte| *byte < 0xF0)
@@ -305,18 +316,19 @@ impl Role {
     /// The chain this peer serves, if it serves one.
     fn chain(self, honest: &Arc<Chain>) -> Option<Arc<Chain>> {
         match self {
-            Role::Honest | Role::Intermittent => Some(honest.clone()),
+            Role::Honest | Role::Unanchored | Role::Intermittent => Some(honest.clone()),
             Role::Invalid(branch) => Some(Arc::new(Chain::invalid(HONEST_LEN, branch))),
-            Role::Silent | Role::FalseTip(_) => None,
+            Role::Silent | Role::FalseTip(_) | Role::Inflated => None,
         }
     }
 
     fn status(self, honest: &Chain) -> Status {
         let honest_tip = honest.tip();
         let (tip, work) = match self {
-            Role::Honest | Role::Silent | Role::Intermittent => {
+            Role::Honest | Role::Unanchored | Role::Silent | Role::Intermittent => {
                 (honest_tip, U256::from(HONEST_LEN))
             }
+            Role::Inflated => (honest_tip, U256::from(1_000_000_u32)),
             Role::FalseTip(n) => (
                 zakura_header_chain::Frontier::new(
                     block::Height(HONEST_LEN + 1),
@@ -329,9 +341,14 @@ impl Role {
                 U256::from(2_000 + u32::from(n)),
             ),
         };
+        let work_anchor_hash = if self == Role::Unanchored {
+            block::Hash([0xAA; 32])
+        } else {
+            honest.frontier(0).hash
+        };
         Status {
             work_anchor_height: block::Height(0),
-            work_anchor_hash: honest.frontier(0).hash,
+            work_anchor_hash,
             selected_tip_height: tip.height,
             selected_tip_hash: tip.hash,
             suffix_cumulative_work: work,
@@ -467,7 +484,7 @@ async fn run(roles: &[Role]) -> Run {
 /// [`run`], with each adversary's `sessions`.
 async fn run_with(roles: &[Role], sessions: Sessions) -> Run {
     assert_eq!(
-        roles.iter().filter(|role| **role == Role::Honest).count(),
+        roles.iter().filter(|role| role.honest()).count(),
         1,
         "a run has exactly one honest peer"
     );
@@ -502,7 +519,7 @@ async fn run_with(roles: &[Role], sessions: Sessions) -> Run {
     for (index, role) in roles.iter().copied().enumerate() {
         let (session, connection, outbound) =
             connect(&handle, role, role.peer(index, roles.len(), 0), &honest).await;
-        if role == Role::Honest {
+        if role.honest() {
             honest_tokens = Some((session.cancel_token(), connection));
         } else {
             adversaries.push((role, session.cancel_token()));
@@ -523,7 +540,7 @@ async fn run_with(roles: &[Role], sessions: Sessions) -> Run {
                     request_timeout,
                 )
                 .await;
-                if role == Role::Honest || sessions == Sessions::One {
+                if role.honest() || sessions == Sessions::One {
                     return;
                 }
                 let peer = role.peer(index, peers, generation);
@@ -682,6 +699,25 @@ async fn mixed_adversaries_cannot_hold_the_honest_tip_past_the_deadline() {
 #[tokio::test(start_paused = true)]
 async fn reopening_silent_servers_cannot_hold_the_honest_tip_past_the_deadline() {
     let roles = [Role::Silent, Role::Silent, Role::Silent, Role::Honest];
+    run_with(&roles, Sessions::Reopen)
+        .await
+        .held_past_every_adversary();
+}
+
+/// F-829: silent servers of the honest tip that claim far more work than it
+/// has, and reopen under a fresh key each time the stall rule ends one. The
+/// honest peer's status names a work anchor the node doesn't share, so its
+/// claim can't be compared. Claimed work is unauthenticated, so the inflated
+/// claims rank with the honest one, and the rotation still gives the honest
+/// offer its turn after each adversary's.
+#[tokio::test(start_paused = true)]
+async fn inflated_work_claims_cannot_hold_the_honest_tip_past_the_deadline() {
+    let roles = [
+        Role::Inflated,
+        Role::Inflated,
+        Role::Inflated,
+        Role::Unanchored,
+    ];
     run_with(&roles, Sessions::Reopen)
         .await
         .held_past_every_adversary();

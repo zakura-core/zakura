@@ -329,20 +329,24 @@ enum PeerWorkState {
 }
 
 /// Advisory discovery priority.
-/// The scheduler maps incomparable claims to normal priority.
+///
+/// A status's claimed work is unauthenticated, so a claim above the node's
+/// own work earns nothing: it ranks with equal and incomparable claims, and
+/// the rotation orders them. Otherwise an adversary could inflate its claim
+/// to stage ahead of every waiting offer, or to evict honest unstarted work,
+/// each time it reopens. A claim below the node's own work only hurts its
+/// claimant, so it ranks last.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::zakura::header_sync) enum PeerWorkPriority {
     LowerComparableWork,
     Normal,
-    HigherComparableWork,
 }
 
 impl PeerWorkPriority {
     pub(in crate::zakura::header_sync) fn from_work_order(order: Option<Ordering>) -> Self {
         match order {
-            Some(Ordering::Greater) => Self::HigherComparableWork,
             Some(Ordering::Less) => Self::LowerComparableWork,
-            Some(Ordering::Equal) | None => Self::Normal,
+            Some(Ordering::Greater | Ordering::Equal) | None => Self::Normal,
         }
     }
 }

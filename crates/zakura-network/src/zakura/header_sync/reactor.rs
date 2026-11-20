@@ -1382,6 +1382,11 @@ impl HeaderSyncReactor {
                         }
                     );
                 }
+                // Header room is shared like a staging slot, so the offer
+                // keeps its turn for the room.
+                if !self.ordinary_discovery_paused() {
+                    self.state.note_waiting_for_slot(&peer);
+                }
                 self.peer_work_queue.remove_unstarted(&peer)
             }
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
@@ -1516,7 +1521,9 @@ impl HeaderSyncReactor {
         );
         for (peer, target) in offers {
             if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
-                // The pass would serve this offer next.
+                // The pass would serve this offer next. Every later offer
+                // of its priority comes after it in the rotation, so its turn
+                // covers theirs.
                 self.state.note_waiting_for_slot(&peer);
                 break;
             }
@@ -1530,6 +1537,8 @@ impl HeaderSyncReactor {
                 continue;
             }
             if self.ordinary_headroom(&peer, &target.status) == 0 {
+                // Header room is shared like a staging slot.
+                self.state.note_waiting_for_slot(&peer);
                 continue;
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);

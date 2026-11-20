@@ -1482,7 +1482,7 @@ async fn offer_waiting_on_staging_full_and_locator_capacity() {
                     session_id: 0,
                     status: super::status_offers::status_for(&snapshot, target),
                 },
-                PeerWorkPriority::HigherComparableWork,
+                PeerWorkPriority::Normal,
             ),
             QueueWorkResult::NeedsLocator
         );

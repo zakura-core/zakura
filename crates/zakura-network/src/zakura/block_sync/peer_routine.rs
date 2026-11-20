@@ -581,6 +581,11 @@ impl PeerRoutine {
                     Outcome::Unavailable => "range_unavailable",
                 });
                 self.handle_ending(completed);
+                let range = completed.range;
+                self.io.work.forget_reset_range(
+                    self.io.generation,
+                    (range.start().0..=range.last().0).map(block::Height),
+                );
                 return Ok(());
             }
             Authorization::IncompatibleHeader => {
@@ -1104,6 +1109,13 @@ impl PeerRoutine {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
                 .increment(1);
             self.drop_obsolete_outstanding(key);
+            if self
+                .io
+                .work
+                .was_reset_withdrawn(self.io.generation, height, hash)
+            {
+                self.accept_unmatched_queued_body(body);
+            }
             return;
         }
         if !self
@@ -1154,8 +1166,6 @@ impl PeerRoutine {
         let request_elapsed = queued_at.elapsed();
         let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
-        metrics::counter!("sync.block.body.received").increment(1);
-        self.io.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
         let receipt_settlement = match self
@@ -1170,15 +1180,28 @@ impl PeerRoutine {
             }
         };
         let Some(receipt_settlement) = receipt_settlement else {
+            if self
+                .io
+                .work
+                .was_reset_withdrawn(self.io.generation, height, body.hash)
+            {
+                self.drop_obsolete_outstanding(key);
+                self.accept_unmatched_queued_body(body);
+                return;
+            }
             tracing::debug!(
                 peer = ?self.io.peer,
                 ?height,
                 serialized_bytes,
                 "block-sync body already settled by another peer; marking received"
             );
+            metrics::counter!("sync.block.body.received").increment(1);
+            self.io.record_received(serialized_bytes);
             self.accept_already_settled_height(key, outstanding_owner, height);
             return;
         };
+        metrics::counter!("sync.block.body.received").increment(1);
+        self.io.record_received(serialized_bytes);
         let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
         else {
             return;
@@ -1239,8 +1262,9 @@ impl PeerRoutine {
     /// Accept a wanted unmatched body whose height another published request
     /// reserves: the arrival ends that request's reservation
     /// (first-completion-wins). Pending work has no owner, so a body for it is
-    /// left to the caller's ignore path. A received body consumes no request
-    /// budget.
+    /// left to the caller's ignore path, unless a destructive view reset withdrew
+    /// this session's request for it (see [`Self::adopt_reset_withdrawn_body`]).
+    /// A received body consumes no request budget.
     fn accept_unmatched_queued_body(&mut self, body: ReceivedBody) -> bool {
         let (height, hash, serialized_bytes) = (body.height, body.hash, body.serialized_bytes);
         if self.io.work.hash_for_height(height) != Some(hash) {
@@ -1253,11 +1277,18 @@ impl PeerRoutine {
         // another peer: this arrival ends that request's reservation instead of
         // discarding a valid body because another peer currently owns the
         // request slot. The ended reservation is released after the forward
-        // below. Pending work has no request owner, and accepting its body would
-        // create an unowned completion, so the caller ignores it. The queue
+        // below. A reset-withdrawn response can also take pending work. The queue
         // rechecks `hash` under the transfer's lock: a reset and reissue since
         // the caller's lookup leaves the replacement funded.
-        let (owner, settlement) = match self.io.work.begin_unmatched_receipt(height, hash) {
+        let ended = match self.io.work.begin_unmatched_receipt(height, hash) {
+            Ok(Some(ended)) => {
+                metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+                Ok(Some(ended))
+            }
+            Ok(None) => self.adopt_reset_withdrawn_body(height, hash),
+            Err(error) => Err(error),
+        };
+        let (owner, settlement) = match ended {
             Ok(Some(ended)) => ended,
             Ok(None) => return false,
             Err(_) => {
@@ -1268,7 +1299,6 @@ impl PeerRoutine {
         self.io
             .trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
-        metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
         let (funding, admitted_estimate_bytes) = (settlement.funding, Some(settlement.charge));
 
         let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
@@ -1313,6 +1343,42 @@ impl PeerRoutine {
         self.io
             .send_under_receipt(body, owner, funding, admitted_estimate_bytes);
         true
+    }
+
+    /// Take pending work for a body that answers a request this session sent and
+    /// a destructive view reset withdrew. The reset queued the same block again,
+    /// and the peer was already sending it, so a new request would download it
+    /// twice. Pending work that no reset withdrew from this session stays with
+    /// the caller's ignore path.
+    fn adopt_reset_withdrawn_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<
+        Option<(
+            zakura_header_chain::BodyWorkOwner,
+            super::work_queue::EndedReservation,
+        )>,
+        crate::zakura::transport::ReservationError,
+    > {
+        if !self
+            .io
+            .work
+            .was_reset_withdrawn(self.io.generation, height, hash)
+        {
+            return Ok(None);
+        }
+        let Some(request_id) = self.state.allocate_request_id() else {
+            return Ok(None);
+        };
+        let adopted =
+            self.io
+                .work
+                .begin_pending_receipt(height, hash, self.io.generation, request_id)?;
+        if adopted.is_some() {
+            metrics::counter!("sync.block.response.reset_withdrawn_accepted").increment(1);
+        }
+        Ok(adopted)
     }
 
     /// Both endings close the whole original request. A short `BlocksDone`
@@ -1548,6 +1614,7 @@ impl Drop for PeerRoutine {
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
         self.return_unreceived_requests("peer_routine_drop");
+        self.io.work.forget_reset_session(self.io.generation);
         // The routine's last snapshot, after it returned its work.
         #[cfg(any(test, zakura_sim))]
         self.observe_owners(true);

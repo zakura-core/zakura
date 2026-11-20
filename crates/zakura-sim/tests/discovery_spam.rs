@@ -8,18 +8,18 @@ use std::collections::BTreeSet;
 
 use zakura_network::zakura::MSG_DISCOVERY_PEERS;
 use zakura_sim::{
-    explore::{classify, run_bytes, ExploreOutcome},
+    explore::{classify, generate::draws, run_bytes, ExploreOutcome},
     harness::{
         self,
         discovery_service::{spam_prefix, DiscoverySpam, WireScenario},
         Subsystem,
     },
     peer::{
-        discovery::{DiscoveryAct, Request},
+        discovery::{DiscoveryAct, DiscoveryRule, Request},
         PeerAction,
     },
     property::Assume,
-    seed, NullSink, Observation, RunReport,
+    NullSink, Observation, RunReport,
 };
 
 /// Runs `prefix` on `discovery/spam` under the all-defaults Plan, and
@@ -124,16 +124,63 @@ fn a_spammer_keeps_going_after_its_connection_ends() {
     );
 }
 
-/// A spammer's `GetServices` with bad wanted services, sent past the margin,
-/// found by the generator (seed 4106, run 302). The node decodes a request
-/// before its serving counts it, so it refuses this one at decode, with no
-/// count. The peer's model labels it `BadContent`, which justifies the
-/// close. Before, it labelled it `OverMargin`, which the evidence settles
-/// only by the node's count, so the justified close failed
-/// `conformant-never-closes`.
+/// How many of the generator's `discovery/spam` inputs
+/// [`a_request_with_bad_content_is_refused_before_its_margin`] searches.
+const CONTENT_SEARCH_RUNS: usize = 1_024;
+
+/// How many matching inputs that test runs.
+const CONTENT_SEARCH_MATCHES: usize = 4;
+
+/// Whether `scenario` has a spammer that sends a `GetServices` with bad
+/// wanted services after two `GetServices` on the same connection, so the
+/// bad one goes out past the row's margin.
+fn bad_content_past_margin(scenario: &WireScenario) -> bool {
+    let bad = PeerAction::Discover {
+        act: DiscoveryAct::BadContent {
+            rule: DiscoveryRule::GetServicesWanted,
+        },
+    };
+    scenario.peers.iter().filter(|peer| peer.spams).any(|peer| {
+        let mut asked = 0;
+        peer.script.iter().any(|step| match step {
+            PeerAction::Ask {
+                request: Request::GetServices | Request::GetHeaderSyncService,
+            } => {
+                asked += 1;
+                false
+            }
+            PeerAction::Disconnect => {
+                asked = 0;
+                false
+            }
+            step => *step == bad && asked >= 2,
+        })
+    })
+}
+
+/// A spammer's `GetServices` with bad wanted services, sent past the margin.
+/// The node decodes a request before its serving counts it, so it refuses
+/// this one at decode, with no count. The peer's model labels it
+/// `BadContent`, which justifies the close. Before, it labelled it
+/// `OverMargin`, which the evidence settles only by the node's count, so the
+/// justified close failed `conformant-never-closes`.
+///
+/// The test searches the generator's inputs for scenarios that send such a
+/// request, and runs the first few. The generator first found one at seed
+/// 4106, run 302.
 #[test]
 fn a_request_with_bad_content_is_refused_before_its_margin() {
-    let seed =
-        seed::find("discovery-spam-content-before-margin").expect("the found input is a seed");
-    run_clean(seed.input());
+    let found: Vec<Vec<u8>> = draws(4106, 512, DiscoverySpam::families())
+        .take(CONTENT_SEARCH_RUNS)
+        .map(|(_, input)| input)
+        .filter(|input| bad_content_past_margin(&DiscoverySpam::draw(input)))
+        .take(CONTENT_SEARCH_MATCHES)
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "no input of {CONTENT_SEARCH_RUNS} sends bad content past the margin"
+    );
+    for input in &found {
+        run_clean(input);
+    }
 }

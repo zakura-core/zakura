@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod discovery_inputs;
 pub mod feed;
 pub mod prepare_fault;
 pub mod script;

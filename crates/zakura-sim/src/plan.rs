@@ -1180,7 +1180,7 @@ fn reduce(value: u64, bound: u64) -> u64 {
 
 /// How many input bytes choose among `range` values: 1 up to 256, 2 up to
 /// 65,536, then 4, then 8.
-pub(crate) fn width(range: u128) -> usize {
+pub fn width(range: u128) -> usize {
     match range {
         0..=0x100 => 1,
         0x101..=0x1_0000 => 2,

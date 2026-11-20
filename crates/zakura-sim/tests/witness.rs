@@ -2,6 +2,8 @@
 //! witness test fails.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::time::Duration;
 
 use zakura_rt::time::sleep;
@@ -12,19 +14,15 @@ use zakura_sim::{
         HasView, Kind, Pending, Property, PropertyId, Source, Sources, Status, TriggerHistory,
         Verdict,
     },
-    seed,
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig,
     Sim,
 };
 
-/// The `discovery-wait-complete` seed's input, which holds discovery's
-/// source back at its `notified` until the sink has run all three marks.
+/// The input that holds discovery's source back at its `notified` until
+/// the sink has run all three marks.
 fn input() -> Vec<u8> {
-    seed::find("discovery-wait-complete")
-        .expect("the seed is registered")
-        .input()
-        .to_vec()
+    support::discovery_inputs::wait_complete_input()
 }
 
 /// S4.7's scenario under `input`.

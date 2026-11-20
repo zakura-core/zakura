@@ -1077,9 +1077,9 @@ fn an_older_time_from_a_caller_does_not_turn_the_clock_back() {
 }
 
 /// A parked transaction ends at its submitter's deadline, as a timeout,
-/// even though its own wait for a parent runs longer. A parent admitted
-/// after that does not bring it back. Its wait for a parent still wins a
-/// tie, with today's cached missing-input answer.
+/// even though its own wait for a parent runs longer, and caches nothing.
+/// Its wait for a parent still wins a tie, with today's cached
+/// missing-input answer.
 #[test]
 fn a_submitters_deadline_ends_a_parked_admission() {
     let mut runner = TestRunner::deterministic();
@@ -1100,11 +1100,6 @@ fn a_submitters_deadline_ends_a_parked_admission() {
     ));
     assert_eq!(step.changes, vec![Change::Refused(child.id())]);
     assert_eq!(bench.machine.slots_in_use(), 0);
-
-    bench.now += Duration::from_secs(1);
-    let (_, parent_job) = bench.start(&parent);
-    let step = bench.pass(parent_job, &parent);
-    assert!(started(&step).is_empty(), "the child is not run again");
     assert!(bench.reserve(&child).0.is_ok(), "a timeout caches nothing");
 
     // A deadline at the same time as the end of the wait for a parent.

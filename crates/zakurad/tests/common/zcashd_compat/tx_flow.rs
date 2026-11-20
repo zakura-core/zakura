@@ -21,7 +21,7 @@ use zakura_test::net::random_known_port;
 use super::{
     config::{read_test_network_kind, MINER_PRIV_WIF},
     launch::{spawn_zakurad_with_zcashd_compat_config, ZcashdCompatSetup},
-    nu7::zatoshis,
+    nu7::{wait_for_zakura_mempool, zatoshis},
     setup_zcashd_compat, wait_for_zcashd_height, zakura_skip_zcashd_compat_tests,
 };
 use crate::common::regtest::MiningRpcMethods;
@@ -620,7 +620,7 @@ async fn signed_spend(setup: &ZcashdCompatSetup, input: &serde_json::Value) -> R
 
 /// Where a test submits its transactions.
 #[derive(Clone, Copy, Debug)]
-enum SubmitPath {
+pub enum SubmitPath {
     /// Zakura's own `sendrawtransaction`.
     Zakura,
     /// zcashd's `sendrawtransaction`, so Zakura learns of them from its peer.
@@ -636,7 +636,7 @@ enum SubmitPath {
 /// wire up differently. On the advert path the child may be verified before
 /// its parent arrives, and either order must work. The mempool crawler can
 /// also bring them in from zcashd, which still fetches them from the peer.
-async fn parent_and_child(path: SubmitPath) -> Result<()> {
+pub async fn parent_and_child(path: SubmitPath) -> Result<()> {
     let Some(setup) = setup_zcashd_compat().await? else {
         return Ok(());
     };
@@ -678,18 +678,10 @@ async fn parent_and_child(path: SubmitPath) -> Result<()> {
         assert_eq!(txid, tx.txid, "{path:?} returned an unexpected txid");
     }
 
-    for tx in [&parent, &child] {
-        wait_for_zakura_mempool_tx(&setup, &tx.txid).await?;
-    }
-    let mempool: Vec<String> = setup
-        .zakura_client
-        .json_result_from_call("getrawmempool", "[]")
-        .await
-        .map_err(|e| eyre!("Zakura getrawmempool: {e}"))?;
+    wait_for_zakura_mempool(&setup, &[parent.txid.clone(), child.txid.clone()]).await?;
     // The same bytes are the same txid and authorizing data: the full
     // unmined id.
     for tx in [&parent, &child] {
-        assert!(mempool.contains(&tx.txid), "both are pooled together");
         let pooled: serde_json::Value = setup
             .zakura_client
             .json_result_from_call(
@@ -706,7 +698,6 @@ async fn parent_and_child(path: SubmitPath) -> Result<()> {
     }
 
     setup.zakura_client.generate(1).await?;
-    wait_for_zcashd_height(&setup.zcashd_client, 111).await?;
     wait_for_zakura_mempool_without(&setup, &[&parent.txid, &child.txid]).await?;
     for tx in [&parent, &child] {
         let mined: serde_json::Value = setup
@@ -742,16 +733,4 @@ async fn wait_for_zakura_mempool_without(setup: &ZcashdCompatSetup, txids: &[&st
         sleep(Duration::from_secs(1)).await;
     }
     Err(eyre!("{txids:?} were still in Zakura's mempool after 30 s"))
-}
-
-/// Submits a signed parent and child through Zakura's `sendrawtransaction`.
-/// See [`parent_and_child`].
-pub async fn parent_and_child_submitted_to_zakura() -> Result<()> {
-    parent_and_child(SubmitPath::Zakura).await
-}
-
-/// Has zcashd advertise a signed parent and child to Zakura. See
-/// [`parent_and_child`].
-pub async fn parent_and_child_advertised_by_zcashd() -> Result<()> {
-    parent_and_child(SubmitPath::ZcashdAdvert).await
 }

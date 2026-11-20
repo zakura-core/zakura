@@ -745,14 +745,15 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The members of `ids` that [`Self::reserve`] would refuse without
     /// taking a slot. See `PoolHandle::known_ids`.
-    pub fn known_ids(&self, ids: HashSet<UnminedTxId>, now: Instant) -> HashSet<UnminedTxId> {
-        let (mut known, rest): (HashSet<_>, HashSet<_>) = ids.into_iter().partition(|id| {
+    pub fn known_ids(&self, mut ids: HashSet<UnminedTxId>, now: Instant) -> HashSet<UnminedTxId> {
+        let now = now.max(self.now);
+        ids.retain(|id| {
             self.pooled.contains_key(&id.mined_id())
                 || self.admission_of.contains_key(id)
                 || self.queued.contains_key(&id.mined_id())
+                || self.storage.rejection(id, now).is_some()
         });
-        known.extend(self.rejected_ids(rest, now));
-        known
+        ids
     }
 
     // Observations.

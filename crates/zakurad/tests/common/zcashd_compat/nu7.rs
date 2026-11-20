@@ -214,7 +214,10 @@ async fn send_fee_transaction(setup: &ZcashdCompatSetup, input: &Value) -> Resul
 }
 
 /// Waits up to 30 seconds for zakurad's mempool to contain every one of `txids`.
-async fn wait_for_zakura_mempool(setup: &ZcashdCompatSetup, txids: &[String]) -> Result<()> {
+pub(super) async fn wait_for_zakura_mempool(
+    setup: &ZcashdCompatSetup,
+    txids: &[String],
+) -> Result<()> {
     for _ in 0..30 {
         let mempool: Vec<String> = setup
             .zakura_client

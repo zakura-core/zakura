@@ -226,7 +226,7 @@ crates/zakurad/tests/common/
     ├── chain.rs               height_and_hash_agree, getblock_hash_consistent
     ├── wallet.rs              address_generation, initial_balance_zero,
     │                          getwalletinfo_fields_present
-    ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms, parent_and_child_*
+    ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms, parent_and_child
     ├── resilience.rs          zakurad_clean_shutdown, zcashd_restarts_after_exit
     ├── nu7.rs                 activation_follows_zakurad, fee_burn_and_wallet_transactions,
     │                          burst_sync_and_restart, sapling_spend_reorg_and_restart

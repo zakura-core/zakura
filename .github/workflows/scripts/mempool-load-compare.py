@@ -47,8 +47,12 @@ COMPARISONS = (
      "Typical gossip spread across nodes."),
     ("Propagation p95 (s)", ("propagation", "spread_p95_secs"), True,
      "Tail gossip spread. **The number to watch for advertisement/retry changes.**"),
-    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), False,
-     "Full-network reach. A drop means transactions are not getting everywhere."),
+    # The count follows how many were submitted, like throughput, so the
+    # share of observed txids is what gets graded.
+    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), None,
+     "Follows how many were submitted. Informational, not graded."),
+    ("Share reaching all nodes", ("propagation", "all_nodes_share"), False,
+     "Full-network reach per observed txid. A drop means transactions are not getting everywhere."),
     # A shallower peak can mean faster draining or fewer submitted, so it
     # never decides a run on its own.
     ("Peak mempool depth", ("peak_mempool_txs",), None,
@@ -64,7 +68,26 @@ NOISE_FLOOR_PCT = 10.0
 POLLED_SPREADS = {("propagation", "spread_p50_secs"), ("propagation", "spread_p95_secs")}
 
 
+def all_nodes_share(leg: dict) -> float | None:
+    """The share of a leg's observed txids that reached every node.
+
+    A leg that observed nothing reached nothing, so it reads 0.0 rather than
+    missing. The leg's own verdict already marks it too thin to grade.
+    """
+    reached = dig(leg, ("propagation", "txids_on_all_nodes"))
+    observed = dig(leg, ("propagation", "txids_observed"))
+    if not isinstance(reached, (int, float)) or not isinstance(observed, (int, float)):
+        return None
+    return reached / observed if observed else 0.0
+
+
+# Metrics a summary doesn't carry, derived from the ones it does.
+DERIVED = {("propagation", "all_nodes_share"): all_nodes_share}
+
+
 def dig(data: dict, path: tuple[str, ...]):
+    if path in DERIVED:
+        return DERIVED[path](data)
     for key in path:
         if not isinstance(data, dict):
             return None

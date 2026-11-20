@@ -1232,6 +1232,7 @@ class Comparison(unittest.TestCase):
             "propagation": {
                 "spread_p50_secs": 0.5,
                 "spread_p95_secs": 1.0,
+                "txids_observed": 1000,
                 "txids_on_all_nodes": 900,
             },
             "effective_tx_per_sec": 3.33,
@@ -1280,12 +1281,22 @@ class Comparison(unittest.TestCase):
     def test_small_deltas_are_treated_as_noise(self):
         target = self.leg(propagation={"txids_on_all_nodes": 945})  # +5%
         rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "=")
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "=")
+
+    def test_reach_is_graded_as_a_share_not_a_count(self):
+        # Mining luck lets the target submit fewer. Every one still reached
+        # every node, so the run is no worse.
+        baseline = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 100})
+        target = self.leg(propagation={"txids_observed": 80, "txids_on_all_nodes": 80})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "info")
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "=")
+        self.assertEqual(compare.gate(baseline, target, rows), ("pass", []))
 
     def test_zero_baseline_does_not_produce_infinity(self):
         baseline = self.leg(propagation={"txids_on_all_nodes": 0})
         rows = compare.build_rows(baseline, self.leg())
-        row = self.row_for(rows, "Txids reaching all nodes")
+        row = self.row_for(rows, "Share reaching all nodes")
         self.assertIsNone(row["delta_pct"])
         # Unbounded, but unambiguously an improvement in direction.
         self.assertEqual(row["verdict"], "better")
@@ -1369,7 +1380,7 @@ class Comparison(unittest.TestCase):
         rows = compare.build_rows(self.leg(), target)
         report = compare.render(self.leg(), target, rows)
         self.assertIn("regressed beyond the noise floor", report)
-        self.assertIn("Txids reaching all nodes", report.split("regressed beyond")[-1])
+        self.assertIn("Share reaching all nodes", report.split("regressed beyond")[-1])
         # Zero-baseline deltas must not render as a numeric infinity. Check the
         # delta cells specifically -- "info"/"informational" appear elsewhere.
         import re

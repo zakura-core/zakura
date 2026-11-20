@@ -11,7 +11,9 @@
 //! A `hedge` row is a second request for a block whose first request had not delivered it yet
 //! (see `[network.block_download_score_and_hedge]`). `hedge_reason` says why it was sent:
 //! `predicted` when another announcer was expected to deliver clearly sooner, `stalled` when the
-//! first request ran well past its expected time. `first_request_waited_ms` is how long the first
+//! first request ran well past its expected time, or, when that time rests on a size the first
+//! peer declared, no later than the last check before the window for a second request closed.
+//! `first_request_waited_ms` is how long the first
 //! request had been outstanding since dispatch to a peer, excluding local routing queue time, and
 //! `first_score_ms` is the first peer's expected answer time. `decision_block_bytes` is the
 //! block's serialized size, if the first peer's reply had started to arrive when the second

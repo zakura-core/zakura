@@ -26,7 +26,10 @@ use crate::{
     peer::{
         ClientTestHarness, ConnectedAddr, ConnectedClient, LoadTrackedClient, MinimumPeerVersion,
     },
-    peer_set::{inventory_registry::InventoryStatus, InventoryChange, PeerSet},
+    peer_set::{
+        inventory_registry::InventoryStatus, second_request::LAST_STALL_CHECK, InventoryChange,
+        PeerSet,
+    },
     protocol::external::{types::PeerServices, InventoryHash, Message},
     BoxError, PeerSocketAddr, Request, Response,
 };
@@ -2691,6 +2694,55 @@ async fn a_held_second_request_is_sent_when_the_first_request_is_overdue_or_stal
             "the {when} first request alone sends the held request"
         );
     }
+}
+
+/// The first peer declares its reply's size before the node can check it. A peer that declares
+/// the largest block and then sends nothing more is still noticed while a second request can be
+/// sent, although both announcers would need longer than the window for a block that large.
+#[tokio::test(start_paused = true)]
+async fn a_first_peer_that_declares_a_large_block_and_stops_still_gets_a_stall_request() {
+    let _init_guard = zakura_test::init();
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let mut first = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let _measured = [
+        measured_peer(&mut first, &registry, Some(1_000)),
+        measured_peer(&mut other, &registry, Some(1_000)),
+    ];
+    let mut peers = OwnedPeerSet::spawn(&mut [&mut first, &mut other]);
+
+    peers.announce(BLOCK_HASH, &first);
+    let (attempt, _first, _second) = peers.download(BLOCK_HASH, &mut first).await;
+    peers.announce(BLOCK_HASH, &other);
+    assert_eq!(
+        other.written_now().await,
+        None,
+        "an announcer just as far away is not asked while the first request is on time"
+    );
+    attempt
+        .first_dispatch()
+        .expect("first request was routed")
+        .block_size
+        .publish(block::MAX_BLOCK_BYTES);
+
+    // With the size unknown, the first request stalls 1,500 ms after it is sent.
+    let stalled_by_round_trip = Duration::from_millis(1_500);
+    tokio::time::advance(stalled_by_round_trip).await;
+    assert_eq!(
+        other.written_now().await,
+        None,
+        "a block that large is expected to take either peer about 7 seconds"
+    );
+
+    let last_check = crate::BlockHedge::WINDOW - LAST_STALL_CHECK;
+    tokio::time::advance(last_check - stalled_by_round_trip - Duration::from_millis(1)).await;
+    assert_eq!(other.written_now().await, None);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        other.written_now().await,
+        Some(Message::GetData(vec![BLOCK_HASH.into()])),
+        "the last stall check before the window closes sends the held request"
+    );
 }
 
 /// Withdrawing the earlier of two held requests leaves the owner scheduled for the other.

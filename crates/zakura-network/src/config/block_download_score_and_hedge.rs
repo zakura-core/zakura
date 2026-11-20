@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 ///   must have measured answer times. Once the first peer starts sending the requested block and its header
 ///   hash matches, the expected times are for a block of that size: the peer's round trip, times
 ///   the round trips the size needs on a new connection, times how the peer's earlier large
-///   blocks compared with that, with a minimum of one round trip. The first reply that passes the requested-hash and
+///   blocks compared with that, with a minimum of one round trip. The size is the first peer's
+///   claim until the whole block has arrived, so however large it is, a first request that
+///   stops is still noticed while a second request can be sent. The first reply that passes the requested-hash and
 ///   tip-child height checks is tried first. If its height falls outside the local window or
 ///   verification rejects its commitments or duplicate transactions, the node tries the other
 ///   already-requested copy once.

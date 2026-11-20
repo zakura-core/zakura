@@ -139,7 +139,7 @@ use crate::{
             SecondRequestChoice,
         },
         second_request::{
-            next_decision_after, second_request_reason, HeldSecondRequest, SecondResponse,
+            second_request_reason, FirstRequestTimes, HeldSecondRequest, SecondResponse,
         },
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
@@ -1190,6 +1190,11 @@ where
     ///
     /// A peer whose answers have not been measured loses to one whose have. If neither has
     /// been measured, the first drawn wins, which is already a random choice.
+    ///
+    /// A peer's record on large blocks is left out, because an announcement does not say how
+    /// large the block is and most blocks fit one round trip: ranking by that record would
+    /// pass over a nearby peer for all of them. A first peer that is slow on large blocks gives
+    /// way to a second request instead, once its reply declares the size.
     fn select_p2c_peer_by_round_trip(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
         match peers.len() {
             0 => None,
@@ -1745,7 +1750,13 @@ where
         let first_peer = first.legacy_peer;
         let block_bytes = first.block_size.read_for_routing(cx);
         let first_score = first.estimate.expected(block_bytes)?;
-        *next_decision = next_decision_after(first.at, first_score, considered_at, *next_decision);
+        let window_end = attempt.window_end();
+        let first_times = FirstRequestTimes::new(
+            first.estimate.round_trip()?,
+            first_score,
+            window_end.saturating_duration_since(first.at),
+        );
+        *next_decision = first_times.next_decision_after(first.at, considered_at, window_end);
         let mut candidates = 0;
         let best = self
             .inventory_registry
@@ -1765,7 +1776,7 @@ where
             return None;
         };
         let first_request_waited = first.at.elapsed();
-        let Some(reason) = second_request_reason(first_score, first_request_waited, score) else {
+        let Some(reason) = second_request_reason(first_times, first_request_waited, score) else {
             metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
             return None;
         };

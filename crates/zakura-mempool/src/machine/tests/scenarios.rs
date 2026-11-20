@@ -17,7 +17,7 @@ use zakura_node_services::mempool::port::{
 use super::{build, paying, started, twin, verified, Bench, TestVerifyError, Tx, START};
 use crate::{
     config::Config,
-    machine::{Effect, JobId, Limits, Outcome, Step, WaiterId},
+    machine::{Effect, JobId, Limits, Outcome, Step, WaiterId, RETRY_GAP},
     storage::{
         ExactTipRejectionError, NonStandardTransactionError, RejectionError,
         SameEffectsChainRejectionError, SameEffectsTipRejectionError,
@@ -948,9 +948,9 @@ fn admit_parent(bench: &mut Bench, parent: &Tx) -> Vec<JobId> {
     started(&bench.pass(job, parent))
 }
 
-/// Arriving parents run a parked transaction again at most
-/// `MAX_MEMPOOL_ANCESTORS` times per tip, however many it names. A block
-/// gives it its retries back.
+/// Arriving parents run a parked transaction again at once at most
+/// `MAX_MEMPOOL_ANCESTORS` times per tip, however many it names, and later
+/// arrivals at most once per `RETRY_GAP`. A block gives it its retries back.
 #[test]
 fn arriving_parents_run_a_parked_transaction_again_at_most_twice() {
     let mut runner = TestRunner::deterministic();
@@ -970,6 +970,12 @@ fn arriving_parents_run_a_parked_transaction_again_at_most_twice() {
             "the child's retries are used up"
         );
     }
+    // Arrivals past the cap wait, and run it once together after the gap.
+    let rerun = started(&bench.tick(RETRY_GAP - Duration::from_millis(1)));
+    assert!(rerun.is_empty(), "not before the gap");
+    let rerun = started(&bench.tick(Duration::from_millis(1)));
+    assert_eq!(rerun.len(), 1, "both waiting arrivals run it once");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
 
     // A block mines a parent, which runs the child again and gives it its
     // retries back.
@@ -1014,11 +1020,11 @@ fn a_parent_the_cap_holds_back_earns_one_last_check() {
     assert_eq!(rejection(&step, waiter).scope, RejectionScope::ExactTip);
 }
 
-/// A parent that is evicted and enters again was in the pool for the check
-/// its first entry earned, so it costs the child no retry, and the child's
-/// other parent still runs it.
+/// A parent that is evicted and enters again can spend the child's retries,
+/// but cannot keep its other parent from running it: that arrival runs it
+/// within `RETRY_GAP`, well before a peer's deadline.
 #[test]
-fn a_parent_that_enters_again_costs_no_retry() {
+fn a_parent_that_enters_again_cannot_hold_the_child_back() {
     let mut runner = TestRunner::deterministic();
     let parents = unrelated(&mut runner, 2);
     let spends: Vec<OutPoint> = parents.iter().map(|parent| parent.outpoint(0)).collect();
@@ -1046,13 +1052,20 @@ fn a_parent_that_enters_again_costs_no_retry() {
     bench.admit(&paying(&fillers[1], 200_000_000));
     assert!(!bench.machine.pooled_ids().contains(&first.id()));
     let again = paying(&twin(&parents[0]), 300_000_000);
-    assert!(
-        admit_parent(&mut bench, &again).is_empty(),
-        "nothing changed for the child since its last check"
-    );
+    let rerun = admit_parent(&mut bench, &again);
+    assert_eq!(rerun.len(), 1, "its return spends the second retry");
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
 
-    let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
-    assert_eq!(rerun.len(), 1, "the other parent still runs the child");
+    assert!(
+        admit_parent(&mut bench, &paying(&parents[1], 400_000_000)).is_empty(),
+        "past the cap, the other parent waits"
+    );
+    let rerun = started(&bench.tick(RETRY_GAP));
+    assert_eq!(
+        rerun.len(),
+        1,
+        "the other parent runs the child after the gap"
+    );
 }
 
 /// A parent that leaves before the check it started ends, and then enters

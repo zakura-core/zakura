@@ -583,6 +583,9 @@ async fn signed_spend(setup: &ZcashdCompatSetup, input: &serde_json::Value) -> R
         .await
         .map_err(|e| eyre!("getnewaddress: {e}"))?;
     let value = zatoshis(&input["amount"])? - FEE_ZAT;
+    // The value is at most `MAX_MONEY` (2.1e15 zatoshis), below 2^53, so it
+    // converts to `f64` exactly. Dividing by 1e8 is then off by under 0.3
+    // zatoshis, so printing eight decimals gives back the exact value.
     #[allow(clippy::cast_precision_loss)]
     let value = value as f64 / 100_000_000.0;
     let raw: String = setup

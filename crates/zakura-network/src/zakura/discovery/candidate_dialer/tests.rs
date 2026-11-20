@@ -1361,9 +1361,12 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
     let discovery = node.discovery();
     // Two silent IPs: the second address starts one dial stagger after the
     // round, so the dial fails one stagger past a round deadline.
+    let Some(second_ip) = zakura_test::net::second_loopback_ip() else {
+        return;
+    };
     let mut silent = Vec::new();
-    for ip in ["127.0.0.1:0", "127.0.0.2:0"] {
-        silent.push(tokio::net::UdpSocket::bind(ip).await.unwrap());
+    for ip in [std::net::Ipv4Addr::LOCALHOST, second_ip] {
+        silent.push(tokio::net::UdpSocket::bind((ip, 0)).await.unwrap());
     }
     discovery
         .insert_static_candidate(NodeAddr::with_addrs(

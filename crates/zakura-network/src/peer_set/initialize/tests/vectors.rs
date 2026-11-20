@@ -2761,7 +2761,9 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     }
 
     let public_ip = Ipv4Addr::LOCALHOST;
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
+        return;
+    };
     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
 
     let success_stay_open_inbound_handshaker =
@@ -2871,7 +2873,9 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         return;
     }
 
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
+        return;
+    };
     let success_disconnect_inbound_handshaker =
         service_fn(|req: HandshakeRequest<TcpStream>| async move {
             let HandshakeRequest {
@@ -3515,7 +3519,9 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         return;
     }
 
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let Some(zcashd_compat_ip) = zakura_test::net::second_loopback_ip() else {
+        return;
+    };
     let unreachable_inbound_handshaker = service_fn(|_| async {
         unreachable!("banned zcashd-compat peer should never reach the handshaker")
     });

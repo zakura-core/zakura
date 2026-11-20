@@ -12,7 +12,7 @@ use futures::{
     stream::{self, BoxStream},
     FutureExt, SinkExt, StreamExt,
 };
-use tower::{discover::Change, Service, ServiceExt};
+use tower::{discover::Change, util::BoxCloneSyncService, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block},
@@ -2197,6 +2197,164 @@ async fn late_primary_miss_keeps_recovered_announcer() {
 #[tokio::test(start_paused = true)]
 async fn late_hedge_miss_keeps_recovered_announcer() {
     assert_late_miss_keeps_recovered_announcer(true).await;
+}
+
+/// Three single-transaction downloads from one advert, with the advertiser busy for the third.
+struct BusyTxAdvertiser {
+    /// The peer set, run by its owner task as in production, which routes held requests.
+    peers: BoxCloneSyncService<Request, Response, BoxError>,
+    _guard: PeerSetGuard,
+    advertiser: TestPeer,
+    other: TestPeer,
+    /// The third transaction, which the advertiser can serve.
+    tx: UnminedTx,
+    txids: [UnminedTxId; 3],
+    /// Kept so the advertiser's connection does not see the first two requests cancelled.
+    _earlier: [BoxFuture<'static, Result<Response, BoxError>>; 2],
+    third: BoxFuture<'static, Result<Response, BoxError>>,
+}
+
+/// Connects an advertiser of three transactions and a peer that did not advertise them, then
+/// asks for each transaction on its own, as the mempool does.
+///
+/// The advertiser's connection writes the first `getdata`, and its client holds the second until
+/// the first response arrives. So the advertiser is busy when the third request is routed, while
+/// the other peer is ready. Checks that the third request has not gone to the other peer.
+async fn busy_tx_advertiser() -> BusyTxAdvertiser {
+    let mut advertiser = TestPeer::spawn(1);
+    let mut other = TestPeer::spawn(2);
+    let tx = test_transaction();
+    let txids = [
+        UnminedTxId::Legacy(transaction::Hash([0x51; 32])),
+        UnminedTxId::Legacy(transaction::Hash([0x52; 32])),
+        tx.id(),
+    ];
+    let request = |txid: UnminedTxId| Request::TransactionsById(iter::once(txid).collect());
+
+    let (peer_set, mut guard) =
+        peer_set_with_peers(&mut [&mut advertiser, &mut other], crate::Config::default());
+    let advert: Vec<InventoryHash> = txids.iter().copied().map(Into::into).collect();
+    guard
+        .inventory_sender()
+        .as_mut()
+        .expect("guard has an inventory sender")
+        .send(
+            InventoryChange::new_available_multi(&advert, advertiser.addr)
+                .expect("the advert names transactions"),
+        )
+        .expect("peer set receives inventory");
+    let (mut peers, _adverts) =
+        crate::peer_set::driver::spawn(peer_set, tokio_util::sync::CancellationToken::new());
+
+    let first = peers
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(request(txids[0]));
+    assert_eq!(
+        advertiser.written_now().await,
+        Some(Message::GetData(vec![txids[0].into()])),
+    );
+    let second = peers
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(request(txids[1]));
+    assert_eq!(
+        advertiser.written_now().await,
+        None,
+        "the second request waits behind the first response",
+    );
+    let third = peers
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(request(txids[2]));
+    assert_eq!(
+        other.written_now().await,
+        None,
+        "the third request is not sent to a peer that never advertised it",
+    );
+
+    BusyTxAdvertiser {
+        peers,
+        _guard: guard,
+        advertiser,
+        other,
+        tx,
+        txids,
+        _earlier: [first, second],
+        third,
+    }
+}
+
+/// A transaction request waits for its busy advertiser instead of going to a peer that never
+/// advertised the transaction.
+#[tokio::test(start_paused = true)]
+async fn tx_getdata_waits_for_busy_advertiser() {
+    let _init_guard = zakura_test::init();
+    let mut batch = busy_tx_advertiser().await;
+
+    for answered in 0..2 {
+        batch
+            .advertiser
+            .peer_inbound
+            .send(Ok(Message::NotFound(vec![batch.txids[answered].into()])))
+            .await
+            .expect("connection is open");
+        assert_eq!(
+            batch.advertiser.written_now().await,
+            Some(Message::GetData(vec![batch.txids[answered + 1].into()])),
+            "the advertiser's connection takes its next request after each response",
+        );
+    }
+
+    batch
+        .advertiser
+        .peer_inbound
+        .send(Ok(Message::Tx(batch.tx)))
+        .await
+        .expect("connection is open");
+    assert!(
+        matches!(batch.third.await, Ok(Response::Transactions(_))),
+        "the advertiser serves the held request",
+    );
+    assert_eq!(batch.other.written_now().await, None);
+}
+
+/// A held transaction request is routed as before once it has waited for its advertiser too long.
+#[tokio::test(start_paused = true)]
+async fn held_tx_getdata_asks_another_peer_after_the_wait() {
+    let _init_guard = zakura_test::init();
+    let mut batch = busy_tx_advertiser().await;
+
+    // The owner wakes itself at the deadline, without another request.
+    tokio::time::advance(super::super::TX_ADVERTISER_WAIT).await;
+    assert_eq!(
+        batch.other.written_now().await,
+        Some(Message::GetData(vec![batch.txids[2].into()])),
+    );
+    assert_eq!(batch.advertiser.written_now().await, None);
+}
+
+/// A held transaction request is routed as before when its only advertiser leaves the peer set.
+#[tokio::test(start_paused = true)]
+async fn held_tx_getdata_asks_another_peer_when_advertiser_disconnects() {
+    let _init_guard = zakura_test::init();
+    let mut batch = busy_tx_advertiser().await;
+
+    batch
+        .peers
+        .ready()
+        .await
+        .expect("peer set is ready")
+        .call(Request::DisconnectPeer(batch.advertiser.addr))
+        .await
+        .expect("disconnect succeeds");
+    assert_eq!(
+        batch.other.written_now().await,
+        Some(Message::GetData(vec![batch.txids[2].into()])),
+    );
 }
 
 /// A peer set with second requests on, run by its owner task as in production.

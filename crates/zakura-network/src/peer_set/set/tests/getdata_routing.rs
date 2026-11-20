@@ -2219,7 +2219,7 @@ struct BusyTxAdvertiser {
 ///
 /// The advertiser's connection writes the first `getdata`, and its client holds the second until
 /// the first response arrives. So the advertiser is busy when the third request is routed, while
-/// the other peer is ready.
+/// the other peer is ready. Checks that the third request has not gone to the other peer.
 async fn busy_tx_advertiser() -> BusyTxAdvertiser {
     let mut advertiser = TestPeer::spawn(1);
     let mut other = TestPeer::spawn(2);
@@ -2231,12 +2231,8 @@ async fn busy_tx_advertiser() -> BusyTxAdvertiser {
     ];
     let request = |txid: UnminedTxId| Request::TransactionsById(iter::once(txid).collect());
 
-    let (minimum_peer_version, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
-    let (peer_set, mut guard) = PeerSetBuilder::new()
-        .with_discover(discover(vec![advertiser.discovered(), other.discovered()]))
-        .with_minimum_peer_version(minimum_peer_version)
-        .max_conns_per_ip(2)
-        .build();
+    let (peer_set, mut guard) =
+        peer_set_with_peers(&mut [&mut advertiser, &mut other], crate::Config::default());
     let advert: Vec<InventoryHash> = txids.iter().copied().map(Into::into).collect();
     guard
         .inventory_sender()
@@ -2274,6 +2270,11 @@ async fn busy_tx_advertiser() -> BusyTxAdvertiser {
         .await
         .expect("peer set is ready")
         .call(request(txids[2]));
+    assert_eq!(
+        other.written_now().await,
+        None,
+        "the third request is not sent to a peer that never advertised it",
+    );
 
     BusyTxAdvertiser {
         peers,
@@ -2292,101 +2293,67 @@ async fn busy_tx_advertiser() -> BusyTxAdvertiser {
 #[tokio::test(start_paused = true)]
 async fn tx_getdata_waits_for_busy_advertiser() {
     let _init_guard = zakura_test::init();
-    let BusyTxAdvertiser {
-        peers: _peers,
-        _guard,
-        mut advertiser,
-        mut other,
-        tx,
-        txids,
-        _earlier,
-        third,
-    } = busy_tx_advertiser().await;
-
-    assert_eq!(
-        other.written_now().await,
-        None,
-        "the third request is not sent to a peer that never advertised it",
-    );
+    let mut batch = busy_tx_advertiser().await;
 
     for answered in 0..2 {
-        advertiser
+        batch
+            .advertiser
             .peer_inbound
-            .send(Ok(Message::NotFound(vec![txids[answered].into()])))
+            .send(Ok(Message::NotFound(vec![batch.txids[answered].into()])))
             .await
             .expect("connection is open");
         assert_eq!(
-            advertiser.written_now().await,
-            Some(Message::GetData(vec![txids[answered + 1].into()])),
+            batch.advertiser.written_now().await,
+            Some(Message::GetData(vec![batch.txids[answered + 1].into()])),
             "the advertiser's connection takes its next request after each response",
         );
     }
 
-    advertiser
+    batch
+        .advertiser
         .peer_inbound
-        .send(Ok(Message::Tx(tx)))
+        .send(Ok(Message::Tx(batch.tx)))
         .await
         .expect("connection is open");
     assert!(
-        matches!(third.await, Ok(Response::Transactions(_))),
+        matches!(batch.third.await, Ok(Response::Transactions(_))),
         "the advertiser serves the held request",
     );
-    assert_eq!(other.written_now().await, None);
+    assert_eq!(batch.other.written_now().await, None);
 }
 
 /// A held transaction request is routed as before once it has waited for its advertiser too long.
 #[tokio::test(start_paused = true)]
 async fn held_tx_getdata_asks_another_peer_after_the_wait() {
     let _init_guard = zakura_test::init();
-    let BusyTxAdvertiser {
-        peers: _peers,
-        _guard,
-        mut advertiser,
-        mut other,
-        txids,
-        _earlier,
-        third: _third,
-        ..
-    } = busy_tx_advertiser().await;
-
-    assert_eq!(other.written_now().await, None);
+    let mut batch = busy_tx_advertiser().await;
 
     // The owner wakes itself at the deadline, without another request.
     tokio::time::advance(super::super::TX_ADVERTISER_WAIT).await;
     assert_eq!(
-        other.written_now().await,
-        Some(Message::GetData(vec![txids[2].into()])),
+        batch.other.written_now().await,
+        Some(Message::GetData(vec![batch.txids[2].into()])),
     );
-    assert_eq!(advertiser.written_now().await, None);
+    assert_eq!(batch.advertiser.written_now().await, None);
 }
 
 /// A held transaction request is routed as before when its only advertiser leaves the peer set.
 #[tokio::test(start_paused = true)]
 async fn held_tx_getdata_asks_another_peer_when_advertiser_disconnects() {
     let _init_guard = zakura_test::init();
-    let BusyTxAdvertiser {
-        mut peers,
-        _guard,
-        advertiser,
-        mut other,
-        txids,
-        _earlier,
-        third: _third,
-        ..
-    } = busy_tx_advertiser().await;
+    let mut batch = busy_tx_advertiser().await;
 
-    assert_eq!(other.written_now().await, None);
-
-    peers
+    batch
+        .peers
         .ready()
         .await
         .expect("peer set is ready")
-        .call(Request::DisconnectPeer(advertiser.addr))
+        .call(Request::DisconnectPeer(batch.advertiser.addr))
         .await
         .expect("disconnect succeeds");
     assert_eq!(
-        other.written_now().await,
-        Some(Message::GetData(vec![txids[2].into()])),
+        batch.other.written_now().await,
+        Some(Message::GetData(vec![batch.txids[2].into()])),
     );
 }
 

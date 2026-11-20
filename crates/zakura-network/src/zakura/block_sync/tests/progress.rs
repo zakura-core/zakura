@@ -4,29 +4,51 @@
 //! it. The reactor and its peer routines run on a paused clock, and each peer
 //! speaks through the service's streams. The test plays state: it answers each
 //! needed-block query, commits each submitted body, and grows the verified tip.
-//! A run holds when every body commits by the deadline [`block_progress_deadline`]
+//! A run holds when every body commits by the deadline [`progress_deadline`]
 //! derives, and is violated otherwise. The oracle reads only the reactor's
 //! actions, the clock and each peer's streams. It never picks a supplier.
 
 use std::sync::Mutex as StdMutex;
 
-use super::{
-    super::{block_progress_deadline, BlockProgressUnbounded},
-    *,
-};
+use super::*;
 
 /// Bodies the honest chain has above genesis: more than one session's
 /// no-progress request cap, so a liar at that cap can't hold them all.
 const BLOCKS: u32 = DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS + 16;
 
-/// [`block_progress_deadline`], the deadline the simulator's progress
-/// harness also derives.
+/// Why a progress deadline has no figure.
+#[derive(Debug, Eq, PartialEq)]
+enum MissingBound {
+    /// The deadline outlasts the park cooldown, so a parked adversary can
+    /// return within it. Only the per-IP handshake rate bounds how often it
+    /// returns, so no figure follows from the block-sync constants.
+    ParkEnds,
+}
+
+/// The time by which every body must commit against `adversaries` peers that
+/// each hold one session, when the honest peer must move `bytes`.
+///
+/// A session that delivers no body is parked by its liveness deadline: the
+/// allowance, its next owed body at the minimum rate, and at most one
+/// local-write grace of `request_timeout`. An adversary owes at most every
+/// needed body, so its deadline is at most `liveness(bytes)`. In the worst
+/// case the adversaries hold work one after another. The honest peer then
+/// moves every body at the minimum rate within one more deadline. The figure
+/// holds only while no parked adversary returns, so it must end before the
+/// park cooldown does.
 fn progress_deadline(
     config: &ZakuraBlockSyncConfig,
     adversaries: u32,
     bytes: u64,
-) -> Result<Duration, BlockProgressUnbounded> {
-    block_progress_deadline(config, adversaries, bytes)
+) -> Result<Duration, MissingBound> {
+    let liveness = config.effective_liveness_timeout()
+        + admission::min_rate_transfer_time(bytes)
+        + config.request_timeout;
+    let deadline = liveness * adversaries.saturating_add(1);
+    if deadline > config.effective_no_progress_peer_cooldown() {
+        return Err(MissingBound::ParkEnds);
+    }
+    Ok(deadline)
 }
 
 /// What one peer does.
@@ -333,7 +355,7 @@ fn the_deadline_follows_the_liveness_rule_and_park_cooldown() {
     // return before the honest peer's turn.
     assert_eq!(
         progress_deadline(&config, 3, bytes),
-        Err(BlockProgressUnbounded::ParkEnds)
+        Err(MissingBound::ParkEnds)
     );
 }
 

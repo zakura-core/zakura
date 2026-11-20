@@ -5,7 +5,7 @@
 //! storage through the typed port, as production does. The port prepares
 //! pages with the production header rules and publishes each applied target
 //! as a new committed snapshot. A run holds when that snapshot reaches the
-//! honest tip by the deadline [`header_progress_deadline`] derives, and is violated
+//! honest tip by the deadline [`progress_deadline`] derives, and is violated
 //! otherwise. The oracle reads only the committed snapshot, the clock and
 //! each peer's session and connection tokens. It never picks a supplier.
 
@@ -15,7 +15,7 @@ use zakura_chain::work::difficulty::INVALID_COMPACT_DIFFICULTY;
 use zakura_node_services::header_chain as port;
 
 use super::*;
-use crate::zakura::{CloseCause, FramedRecv, HeaderProgressUnbounded};
+use crate::zakura::{CloseCause, FramedRecv};
 
 /// Headers the honest chain has above genesis.
 const HONEST_LEN: u32 = 4;
@@ -24,18 +24,40 @@ const HONEST_LEN: u32 = 4;
 /// meet a staged target that hasn't started.
 const LOCATOR_READ: Duration = Duration::from_millis(1);
 
-/// [`header_progress_deadline`], the deadline the simulator's progress
-/// harness also derives.
+/// Why a progress deadline has no figure.
+#[derive(Debug, Eq, PartialEq)]
+enum MissingBound {
+    /// `max_unproductive_header_requests` is zero, so no stall ever ends an
+    /// adversary's session.
+    NoStallRule,
+}
+
+/// The time by which a node must adopt the honest tip against `adversaries`
+/// peers, each holding one session at a time and free to open a new one
+/// under a fresh key whenever the node ends the last.
+///
+/// A session holds a target for at most `max_unproductive_header_requests`
+/// request timeouts before the stall rule ends it. Each turn can wait one
+/// cached-pass refill before the next offer stages. Only one peer owns a
+/// branch target at a time, and offers take turns in the order their peers
+/// last took one, so a reopened session's offer waits behind the honest one.
+/// In the worst case the adversaries that waited ahead of the honest offer
+/// hold the honest branch one after another, and the honest round then
+/// finishes within one more turn. At most the header-sync session slots,
+/// less the honest one, wait ahead, so the deadline never exceeds one turn
+/// per slot.
 fn progress_deadline(
     startup: &HeaderSyncStartup,
     adversaries: u32,
-) -> Result<Duration, HeaderProgressUnbounded> {
-    crate::zakura::header_progress_deadline(
-        &startup.config,
-        startup.request_timeout,
-        startup.max_connections,
-        adversaries,
-    )
+) -> Result<Duration, MissingBound> {
+    let strikes = startup.config.max_unproductive_header_requests;
+    if strikes == 0 {
+        return Err(MissingBound::NoStallRule);
+    }
+    let turn = startup.request_timeout * strikes + CACHED_PASS_REFILL;
+    let slots =
+        u32::try_from(startup.config.serving_sessions(startup.max_connections)).unwrap_or(u32::MAX);
+    Ok(turn * adversaries.saturating_add(1).min(slots))
 }
 
 /// Genesis and the headers above it, each linked to the one before.
@@ -624,7 +646,7 @@ fn the_deadline_follows_the_request_timeout_and_stall_rule() {
     startup.config.max_unproductive_header_requests = 0;
     assert_eq!(
         progress_deadline(&startup, 1),
-        Err(HeaderProgressUnbounded::NoStallRule)
+        Err(MissingBound::NoStallRule)
     );
 }
 

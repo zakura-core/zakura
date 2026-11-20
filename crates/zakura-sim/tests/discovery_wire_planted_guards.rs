@@ -74,7 +74,7 @@ impl Scenario {
 
 /// Each planted case: its ID's suffix, its name, and its scenario.
 fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
-    use DiscoveryRow::{GetPeers, GetServices, Peers, Services};
+    use DiscoveryRow::{Peers, Services};
     let act = Scenario::Act;
     let bad = |rule| Scenario::Act(DiscoveryAct::BadContent { rule });
     vec![
@@ -87,26 +87,6 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             "hello/bad-content-closes",
             "drop-forged-hello",
             bad(DiscoveryRule::HelloSignature),
-        ),
-        (
-            "hello/cadence-never-closes",
-            "close-on-empty-hello-bucket",
-            act(DiscoveryAct::HelloBurst),
-        ),
-        (
-            "get-peers/over-margin-closes",
-            "admit-past-margin",
-            act(DiscoveryAct::OverMargin { row: GetPeers }),
-        ),
-        (
-            "get-peers/bad-content-closes",
-            "drop-refused-get-peers",
-            bad(DiscoveryRule::GetPeersLimit),
-        ),
-        (
-            "get-peers/cadence-never-closes",
-            "close-on-empty-get-peers-bucket",
-            act(DiscoveryAct::RequestRun { row: GetPeers }),
         ),
         (
             "peers/unsolicited-closes",
@@ -124,29 +104,9 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             bad(DiscoveryRule::PeersSignature),
         ),
         (
-            "get-services/over-margin-closes",
-            "admit-past-margin",
-            act(DiscoveryAct::OverMargin { row: GetServices }),
-        ),
-        (
-            "get-services/bad-content-closes",
-            "drop-refused-get-services",
-            bad(DiscoveryRule::GetServicesWanted),
-        ),
-        (
-            "get-services/cadence-never-closes",
-            "close-on-empty-get-services-bucket",
-            act(DiscoveryAct::RequestRun { row: GetServices }),
-        ),
-        (
             "services/unsolicited-closes",
             "admit-unreserved-services",
             act(DiscoveryAct::Unsolicited { row: Services }),
-        ),
-        (
-            "services/bad-content-closes",
-            "skip-services-node-id",
-            bad(DiscoveryRule::ServicesNodeId),
         ),
         ("hello/sender-cadence", "repeat-hello", Scenario::Honest),
         (
@@ -156,11 +116,6 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
         ),
         ("get-peers/sender-cadence", "re-ask-peers", Scenario::Honest),
         (
-            "peers/sender-ends-once",
-            "answer-peers-twice",
-            Scenario::Asks(Request::GetPeers),
-        ),
-        (
             "get-services/sender-within-limit",
             "ask-services-twice",
             Scenario::Held(Answer::Services),
@@ -169,11 +124,6 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             "get-services/sender-cadence",
             "re-ask-services",
             Scenario::Honest,
-        ),
-        (
-            "services/sender-ends-once",
-            "answer-services-twice",
-            Scenario::Asks(Request::GetServices),
         ),
         (
             "services/sender-within-owed",

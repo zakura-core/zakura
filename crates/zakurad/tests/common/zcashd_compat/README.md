@@ -169,6 +169,8 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_getwalletinfo_fields_present` | wallet | Full check | Full check |
 | `zcashd_compat_transparent_tx_in_mempool` | tx_flow | Mines 200, sends tx, polls zakurad mempool | Validates `getmempoolinfo` structure only |
 | `zcashd_compat_transparent_tx_confirms` | tx_flow | Sends + mines + checks confirmations on both sides | **Skipped** |
+| `zcashd_compat_parent_and_child_submitted_to_zakura` | tx_flow | Signs a parent and child, submits both to zakurad, checks both are pooled then mined | **Skipped** |
+| `zcashd_compat_parent_and_child_advertised_by_zcashd` | tx_flow | Same, with zcashd advertising both to zakurad | **Skipped** |
 | `zcashd_compat_zakurad_clean_shutdown` | resilience | Mines 3, SIGKILLs zakurad, asserts clean exit | **Skipped** (don't own process) |
 | `zcashd_compat_zcashd_restarts_after_exit` | resilience | SIGTERMs zcashd, waits for supervisor restart | **Skipped** (unix only; don't own process) |
 | `zcashd_compat_peer_connectivity` | network | **Skipped** (regtest has no peers) | Asserts at least one peer connected |
@@ -224,7 +226,7 @@ crates/zakurad/tests/common/
     ├── chain.rs               height_and_hash_agree, getblock_hash_consistent
     ├── wallet.rs              address_generation, initial_balance_zero,
     │                          getwalletinfo_fields_present
-    ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms
+    ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms, parent_and_child
     ├── resilience.rs          zakurad_clean_shutdown, zcashd_restarts_after_exit
     ├── nu7.rs                 activation_follows_zakurad, fee_burn_and_wallet_transactions,
     │                          burst_sync_and_restart, sapling_spend_reorg_and_restart

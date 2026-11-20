@@ -13,8 +13,6 @@ mod fuzz;
 #[cfg(any(test, zakura_sim))]
 pub mod observe;
 mod peer;
-#[cfg(any(test, zakura_sim))]
-mod progress;
 mod reactor;
 mod scheduler;
 mod service;
@@ -41,8 +39,6 @@ pub use events::{
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use fuzz::{replay_header_pursuit_bytes, HeaderPursuitReplaySummary, NoEffectsProbe};
-#[cfg(any(test, zakura_sim))]
-pub use progress::{header_progress_deadline, header_progress_turn, HeaderProgressUnbounded};
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPurpose};
 pub use scheduler::retry::{

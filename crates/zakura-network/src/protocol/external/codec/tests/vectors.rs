@@ -243,6 +243,52 @@ fn a_partial_block_size_hint_respects_the_block_limit() {
     }
 }
 
+/// A fragmented transport header can publish only to a watch active from its first bytes.
+#[test]
+fn a_fragmented_header_cannot_supply_a_size_to_a_new_watch() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    let message = wire_message(*BLOCK_COMMAND, body);
+    let size = u64::try_from(body.len()).unwrap();
+
+    for split in 1..HEADER_LEN {
+        for (watch_at_start, install_new_watch) in [(true, false), (true, true), (false, true)] {
+            let mut codec = Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish();
+            let observer = codec.inbound_block_size();
+            let original = Arc::new(BlockReplySize::default());
+            let current = Arc::new(BlockReplySize::default());
+            if watch_at_start {
+                observer.watch(hash, original.clone());
+            }
+            let mut received = BytesMut::from(&message[..split]);
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            if install_new_watch {
+                observer.clear();
+                observer.watch(hash, current.clone());
+            }
+            // Poll the same prefix again, as can happen while the connection changes requests.
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            received.extend_from_slice(&message[split..message.len() - 1]);
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            assert_eq!(original.get(), (!install_new_watch).then_some(size));
+            assert_eq!(current.get(), None);
+            if install_new_watch {
+                received.extend_from_slice(&message[message.len() - 1..]);
+                assert!(codec.decode(&mut received).unwrap().is_some());
+                received.extend_from_slice(&message[..message.len() - 1]);
+                assert!(codec.decode(&mut received).unwrap().is_none());
+                assert_eq!(
+                    current.get(),
+                    Some(size),
+                    "the next frame belongs to the new watch"
+                );
+            }
+        }
+    }
+}
+
 /// Cancelling and re-requesting even the same hash cannot redirect a partially read frame.
 #[test]
 fn a_frame_keeps_the_size_destination_it_started_with() {

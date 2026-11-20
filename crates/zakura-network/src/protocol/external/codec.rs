@@ -290,6 +290,8 @@ impl BlockReplySize {
 struct RequestedBlockSize {
     hash: block::Hash,
     bytes: Arc<BlockReplySize>,
+    /// Set if this watch was active when the decoder first saw a fragmented transport header.
+    saw_header_start: bool,
 }
 
 /// Shares the active primary request between the connection and its decoder.
@@ -299,16 +301,33 @@ pub(crate) struct InboundBlockSize(Arc<Mutex<Option<RequestedBlockSize>>>);
 impl InboundBlockSize {
     /// Called after the connection writes a single-block request.
     pub(crate) fn watch(&self, hash: block::Hash, bytes: Arc<BlockReplySize>) {
-        *self.0.lock().expect("block size lock is never poisoned") =
-            Some(RequestedBlockSize { hash, bytes });
+        *self.0.lock().expect("block size lock is never poisoned") = Some(RequestedBlockSize {
+            hash,
+            bytes,
+            saw_header_start: false,
+        });
     }
 
-    /// Capture the request that owns this frame, even if the connection later retries it.
-    fn snapshot(&self) -> Option<RequestedBlockSize> {
+    /// Mark the current watch without capturing a size destination before the command and length are known.
+    fn mark_header_start(&self) {
+        if let Some(request) = self
+            .0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .as_mut()
+        {
+            request.saw_header_start = true;
+        }
+    }
+
+    /// A watch installed after a partial header arrived cannot own that frame.
+    fn snapshot(&self, fragmented_header: bool) -> Option<RequestedBlockSize> {
         self.0
             .lock()
             .expect("block size lock is never poisoned")
-            .clone()
+            .as_ref()
+            .filter(|request| !fragmented_header || request.saw_header_start)
+            .cloned()
     }
 
     /// Stop observing this request when the connection becomes idle.
@@ -377,7 +396,7 @@ impl Builder {
     pub fn finish(self) -> Codec {
         Codec {
             builder: self,
-            state: DecodeState::Head,
+            state: DecodeState::Head { fragmented: false },
             inbound_block_size: InboundBlockSize::default(),
             #[cfg(test)]
             body_decode_panic: Cell::new(None),
@@ -695,7 +714,9 @@ impl Codec {
 // ======== Decoding =========
 
 enum DecodeState {
-    Head,
+    Head {
+        fragmented: bool,
+    },
     Body {
         body_len: usize,
         command: [u8; 12],
@@ -707,7 +728,7 @@ enum DecodeState {
 impl fmt::Debug for DecodeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            DecodeState::Head => write!(f, "DecodeState::Head"),
+            DecodeState::Head { .. } => write!(f, "DecodeState::Head"),
             DecodeState::Body {
                 body_len,
                 command,
@@ -738,9 +759,13 @@ impl Decoder for Codec {
         // per call stays bounded without a separate count.
         'messages: loop {
             match self.state {
-                DecodeState::Head => {
+                DecodeState::Head { fragmented } => {
                     // First check that the src buffer contains an entire header.
                     if src.len() < HEADER_LEN {
+                        if !fragmented && !src.is_empty() {
+                            self.inbound_block_size.mark_header_start();
+                            self.state = DecodeState::Head { fragmented: true };
+                        }
                         trace!(?self.state, "src buffer does not have an entire header, waiting");
                         // Signal that decoding requires more data.
                         return Ok(None);
@@ -790,7 +815,7 @@ impl Decoder for Codec {
                         requested_size: if command == *BLOCK_COMMAND
                             && u64::from(declared_len) <= block::MAX_BLOCK_BYTES
                         {
-                            self.inbound_block_size.snapshot()
+                            self.inbound_block_size.snapshot(fragmented)
                         } else {
                             None
                         },
@@ -828,7 +853,7 @@ impl Decoder for Codec {
                     // and reset the decoder state for the next message. Otherwise
                     // we will attempt to read the next header as the current body.
                     let body = src.split_to(body_len);
-                    self.state = DecodeState::Head;
+                    self.state = DecodeState::Head { fragmented: false };
 
                     if checksum != message_checksum(&body[..]) {
                         return Err(Parse(

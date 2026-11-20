@@ -64,13 +64,15 @@ fn reorg_verdict_republish() -> Vec<u8> {
 /// the fork while storage holds a submission, with every read stalled.
 const RESET_MID_WRITE_PREFIX: [u8; 2] = [COMBINED_TAG, 0b0001_0100];
 
-/// The [`xorshift_plan`] seed whose run under [`WriterLast`] reaches
-/// zakura#2378: the first of 200 a search tried that does.
-const RESET_MID_WRITE_SEED: u64 = 23;
+/// How many [`xorshift_plan`] seeds [`reset_mid_write`] tries.
+const RESET_MID_WRITE_SEEDS: u64 = 200;
 
 /// `sync-wire-reset-mid-write`'s full input, which reaches zakura#2378:
 /// [`RESET_MID_WRITE_PREFIX`], then the Plan bytes that replay, with no
-/// steer, the run of [`RESET_MID_WRITE_SEED`]'s Plan under [`WriterLast`].
+/// steer, the run under [`WriterLast`] of the first [`xorshift_plan`] seed
+/// whose run ends in [`STALLED_SERVICE_ISOLATED`]'s violation. A search
+/// finds the seed, so a change to the steps before the reset doesn't move
+/// the input off it.
 /// The steer is what reaches the reset: random Plans alone rarely leave a
 /// request mid-write when the fork's reset lands. The fork's tip reset then
 /// retires a block request while its frame is partly written, which cancels
@@ -78,18 +80,31 @@ const RESET_MID_WRITE_SEED: u64 = 23;
 /// connection with `unfinished_exchange` while the session's other requests
 /// wait.
 ///
-/// The steered run takes a few seconds, so the first call runs it and later
-/// calls in the process reuse its bytes.
+/// Each steered run takes a few seconds, so the first call runs the search
+/// and later calls in the process reuse its bytes.
 fn reset_mid_write() -> &'static [u8] {
     static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
     INPUT.get_or_init(|| {
         let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
-        let ports = SyncWire::prepare(&scenario);
-        let input = Plan::from_fuzz(&xorshift_plan(RESET_MID_WRITE_SEED));
-        let steer = Box::new(WriterLast::default());
-        let (_, plan) = run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
-            .unwrap_or_else(|error| panic!("the steered zakura#2378 run fails: {error}"));
-        [&RESET_MID_WRITE_PREFIX[..], &plan].concat()
+        (0..RESET_MID_WRITE_SEEDS)
+            .find_map(|seed| {
+                let ports = SyncWire::prepare(&scenario);
+                let input = Plan::from_fuzz(&xorshift_plan(seed));
+                let steer = Box::new(WriterLast::default());
+                let (report, plan) =
+                    run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
+                        .unwrap_or_else(|error| {
+                            panic!("the steered zakura#2378 run fails: {error}")
+                        });
+                let reached = report
+                    .end
+                    .violation
+                    .is_some_and(|violation| violation.property == STALLED_SERVICE_ISOLATED);
+                reached.then(|| [&RESET_MID_WRITE_PREFIX[..], &plan].concat())
+            })
+            .unwrap_or_else(|| {
+                panic!("no steered run of {RESET_MID_WRITE_SEEDS} seeds reaches zakura#2378")
+            })
     })
 }
 

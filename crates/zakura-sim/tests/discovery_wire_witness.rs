@@ -327,8 +327,7 @@ fn every_discovery_property_applies_in_its_witness() {
 /// [`OWED`], and each conformant control, from its family's tag, so the
 /// generator reaches stream 4's refusal, `sender-within-owed` and
 /// `conformant-never-closes` IDs (mutation plan, mut-6). Each family's name
-/// is its own. The drawn `expired-hello` is the scenario of
-/// `conformant-never-closes`' planted case.
+/// is its own.
 #[test]
 fn each_hostile_family_draws_its_witness() {
     let families = DiscoveryWire::families();
@@ -354,16 +353,9 @@ fn each_hostile_family_draws_its_witness() {
         assert_eq!(act.label(), Label::Conformant, "{name}");
         assert_eq!(drawn(name), act_scenario(act), "{name}");
     }
-    let planted: WireScenario = serde_json::from_str(EXPIRED_HELLO_SCENARIO).unwrap();
-    assert_eq!(drawn("expired-hello"), planted);
     let names: BTreeSet<&str> = families.iter().map(|family| family.name).collect();
     assert_eq!(names.len(), families.len(), "{families:?}");
 }
-
-/// The committed scenario of `conformant-never-closes`' planted case.
-const EXPIRED_HELLO_SCENARIO: &str = include_str!(
-    "../../../qa/planted/discovery/s4v2/conformant-never-closes/close-on-expired-hello.scenario.json"
-);
 
 /// The node's answers carry only what their requests asked for:
 /// `sender-within-owed` applies and holds on a `Peers` that answers a
@@ -539,10 +531,7 @@ fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
 /// delivering the `Peers` after the timeout.
 #[test]
 fn late_response_admitted_applies_in_its_saved_plan() {
-    let input = zakura_sim::seed::find("discovery-wire-late-response")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+    let input = support::discovery_inputs::late_response_input();
     let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
     assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
     let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);

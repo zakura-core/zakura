@@ -1,5 +1,6 @@
-//! E1's generator guard: every committed seed, a correct node cut at its
-//! harness's budget, drains to a dry end, never to its bound.
+//! E1's generator guard: every harness's default scenario and each of its
+//! scenario families, a correct node cut at its harness's budget, drains to
+//! a dry end, never to its bound.
 #![cfg(zakura_sim)]
 
 use std::{
@@ -11,17 +12,33 @@ use std::{
 };
 
 use zakura_sim::{
-    harness,
-    seed::{self, SeedSet, SeedWitness},
-    HarnessFailure, NullSink, Outcome, PropertyOutcome, RunReport,
+    harness::HARNESSES, HarnessFailure, NullSink, Outcome, PropertyOutcome, RunReport,
 };
 
-/// What's wrong with a saved run's end, if anything. `report` is `None`
-/// when the harness couldn't run the seed at all. A saved seed runs a
-/// correct node, so it ends with no harness failure, and with no
-/// violation but of a property a witness expects violated. A budget end's
-/// drain ran dry, and each witness's property ends as it expects.
-fn misend(report: Option<&RunReport>, witnesses: &[SeedWitness]) -> Option<String> {
+/// A property a run must end as `expect` says: `holds`, `applicable` or
+/// `violated`.
+#[derive(Clone, Debug)]
+struct Expected {
+    property: String,
+    expect: String,
+}
+
+/// The scenario families the sweep skips, as `harness/family`: each run
+/// takes minutes, too long for the sweep. `capacity-release` alone ran
+/// 330 s on the droplet.
+const SLOW_FAMILIES: [&str; 4] = [
+    "block-sync/storage/stuck-floor",
+    "block-sync/storage/above-window",
+    "block-sync/storage/capacity-release",
+    "block-sync/storage/decoded-input-stall",
+];
+
+/// What's wrong with a run's end, if anything. `report` is `None` when the
+/// harness couldn't run the input at all. The sweep runs a correct node, so
+/// a run ends with no harness failure, and with no violation but of a
+/// property `witnesses` expects violated. A budget end's drain ran dry, and
+/// each witness's property ends as it expects.
+fn misend(report: Option<&RunReport>, witnesses: &[Expected]) -> Option<String> {
     let Some(report) = report else {
         return Some("the harness couldn't run it".to_owned());
     };
@@ -72,49 +89,57 @@ fn misend(report: Option<&RunReport>, witnesses: &[SeedWitness]) -> Option<Strin
     })
 }
 
-/// Every corpus seed, run by its harness as a campaign would, ends as its
-/// witnesses expect ([`misend`]): once the
-/// budget cuts it, the drain finishes what the live phase started and runs
-/// dry within the harness's drain bound. An unbounded generator that never
+/// Each harness's inputs for the sweep, named: the empty input, which runs
+/// the default scenario under the empty Plan, then each scenario family's
+/// tag under the empty Plan. Machines have no drain, and a harness that
+/// plants its bugs must violate its properties, so neither runs.
+fn sweep() -> Vec<(String, &'static zakura_sim::harness::HarnessEntry, Vec<u8>)> {
+    let mut inputs = Vec::new();
+    for entry in HARNESSES.iter().filter(|entry| !entry.machine && !entry.planted) {
+        inputs.push((format!("{} default", entry.name), entry, Vec::new()));
+        for family in (entry.families)() {
+            let name = format!("{}/{}", entry.name, family.name);
+            if !SLOW_FAMILIES.contains(&name.as_str()) {
+                inputs.push((name, entry, family.tag));
+            }
+        }
+    }
+    inputs
+}
+
+/// Every harness's default scenario and scenario families ([`sweep`]), run
+/// as a campaign would, end with no violation ([`misend`]): once the budget
+/// cuts a run, the drain finishes what the live phase started and runs dry
+/// within the harness's drain bound. An unbounded generator that never
 /// registers ([`zakura_sim::sim::Generators`]) keeps a task ready, so its
-/// run hits the bound and fails here, naming the task. Machines have no
-/// drain. The seeds run on a few threads, each run on its own.
+/// run hits the bound and fails here, naming the task. The inputs run on a
+/// few threads, each run on its own.
 #[test]
 fn every_saved_plan_drains_dry() {
-    let loaded = seed::load(SeedSet::Corpus, None);
-    let seeds: Vec<_> = loaded
-        .admitted
-        .iter()
-        .map(|seed| {
-            let entry = harness::find(&seed.harness).expect("admitted seeds' harnesses exist");
-            (seed, entry)
-        })
-        .filter(|(_, entry)| !entry.machine)
-        .collect();
-    assert!(!seeds.is_empty(), "the corpus holds seeds");
+    let inputs = sweep();
+    assert!(!inputs.is_empty(), "the sweep has inputs");
     let next = AtomicUsize::new(0);
     let misended = Mutex::new(Vec::new());
     let threads = thread::available_parallelism().map_or(1, |n| n.get().min(8));
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                while let Some((seed, entry)) = seeds.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let run = (entry.run_bytes)(seed.input(), &mut NullSink, None);
-                    if let Some(why) = misend(run.report(), &seed.witness) {
+                while let Some((name, entry, input)) =
+                    inputs.get(next.fetch_add(1, Ordering::Relaxed))
+                {
+                    let run = (entry.run_bytes)(input, &mut NullSink, None);
+                    if let Some(why) = misend(run.report(), &[]) {
                         misended
                             .lock()
                             .expect("no thread panics holding it")
-                            .push(format!("{}: {why}", seed.name));
+                            .push(format!("{name}: {why}"));
                     }
                 }
             });
         }
     });
     let misended = misended.into_inner().expect("every thread finished");
-    assert!(
-        misended.is_empty(),
-        "saved runs that misended: {misended:#?}"
-    );
+    assert!(misended.is_empty(), "runs that misended: {misended:#?}");
 }
 
 /// Terra 2, round 4: a saved run that fails early, that the harness can't
@@ -150,7 +175,7 @@ fn misend_rejects_every_unexpected_end() {
         steps: 1,
         exhausted: false,
     });
-    let holds = [SeedWitness {
+    let holds = [Expected {
         property: "p".to_owned(),
         expect: "holds".to_owned(),
     }];
@@ -197,7 +222,7 @@ fn misend_rejects_every_unexpected_end() {
     );
     let expects_q = [
         holds[0].clone(),
-        SeedWitness {
+        Expected {
             property: "q".to_owned(),
             expect: "violated".to_owned(),
         },

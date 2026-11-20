@@ -41,7 +41,7 @@ use zakura_sim::{
         },
         header_sync::{grammar, HeaderWire, Storage as HeaderStorage, StorageScenario},
         run_harness,
-        wire_plans::act_scenario,
+        wire_plans::{act_scenario, SavedPlan},
         HarnessError, Subsystem,
     },
     model::Label,
@@ -513,15 +513,6 @@ where
     }
 }
 
-/// The input of the seed named `stem`, a full fuzz input the harness draws
-/// its scenario from.
-fn seed(stem: &str) -> Vec<u8> {
-    zakura_sim::seed::find(stem)
-        .unwrap_or_else(|| panic!("{stem} is registered"))
-        .input()
-        .to_vec()
-}
-
 /// Plan bytes after a scenario prefix, the same on every call.
 fn plan() -> Vec<u8> {
     // Truncation to a byte is the point: a spread of byte values.
@@ -588,23 +579,17 @@ fn witnesses() -> Vec<Witness> {
         StorageScenario::grow(),
         grow_to_drain_plan(),
     ));
-    // The searched witnesses, then fuzz-12 item 7's other witness seeds.
+    // The searched witnesses, then fuzz-12 item 7's other witnesses.
     for (name, input) in searched_inputs() {
         all.push(drawn(HeaderStorage::NAME, name, input.clone()));
     }
-    for witness in zakura_sim::seed::all() {
-        let searched = searched_inputs().contains_key(witness.name.as_str());
-        if witness.name.starts_with("header-storage-w-") && !searched {
-            all.push(drawn(
-                HeaderStorage::NAME,
-                &witness.name,
-                witness.input().to_vec(),
-            ));
-        }
+    for (name, scenario) in planned_witnesses() {
+        let input = grammar::input(&scenario, &plan()).unwrap_or_else(|error| panic!("{name}: {error}"));
+        all.push(drawn(HeaderStorage::NAME, &name, input));
     }
-    // fuzz-13's saved Plans, each run from its seed.
-    for stem in FUZZ_13_SEEDS {
-        all.push(drawn("header-sync/wire", stem, seed(stem)));
+    // fuzz-13's saved Plans, each its tag under the empty Plan.
+    for (name, saved) in FUZZ_13_PLANS {
+        all.push(drawn(HeaderWire::NAME, name, saved.tag().to_vec()));
     }
     // Competing mirrors under more plans, which also reach a reorg.
     for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
@@ -785,12 +770,49 @@ fn searched_inputs() -> &'static BTreeMap<&'static str, Vec<u8>> {
     })
 }
 
-/// fuzz-13's `header-sync/wire` seeds.
-const FUZZ_13_SEEDS: [&str; 3] = [
-    "header-wire-reopen",
-    "header-wire-old-page-after-reopen",
-    "header-wire-outcome-crossing",
+/// fuzz-13's `header-sync/wire` saved Plans, by witness name.
+const FUZZ_13_PLANS: [(&str, SavedPlan); 3] = [
+    ("header-wire-reopen", SavedPlan::Reopen),
+    ("header-wire-old-page-after-reopen", SavedPlan::OldPageAfterReopen),
+    ("header-wire-outcome-crossing", SavedPlan::Act(Act::OutcomeCrossing)),
 ];
+
+/// The fuzz-12 item 7 witnesses no search finds: each action and overlap
+/// the fuzz-12 controls added, under [`plan`]. Each is named
+/// `header-storage-w-<name>`.
+fn planned_witnesses() -> Vec<(String, StorageScenario)> {
+    let mut all: Vec<(String, StorageScenario)> = [
+        ("reset-locator", storage_witnesses::reset_held_locator()),
+        ("reset-prepare", storage_witnesses::reset_held_prepare()),
+        ("reset-apply", storage_witnesses::reset_held_apply()),
+        ("reset-reply", storage_witnesses::reset_reply_hold()),
+        ("reconsider", storage_witnesses::invalidate_reconsider()),
+        ("release", storage_witnesses::release_after_apply()),
+        ("reply-after-shutdown", storage_witnesses::reply_after_shutdown()),
+        ("reply-after-close", storage_witnesses::reply_after_close()),
+    ]
+    .into_iter()
+    .map(|(name, scenario)| (format!("header-storage-w-{name}"), scenario))
+    .collect();
+    for (kind, allow, outcome, after) in storage_witnesses::fault_witnesses() {
+        all.push((
+            storage_witnesses::fault_stem(kind, outcome),
+            storage_witnesses::fault_witness(kind, allow, after),
+        ));
+    }
+    for (prefix, classes) in [
+        ("recover", storage_witnesses::recovery_witnesses()),
+        ("owed", storage_witnesses::owed_recovery_witnesses()),
+    ] {
+        for (class, scenario) in classes {
+            let name = format!("header-storage-w-{prefix}-{}", class.replace(' ', "-"));
+            if !searched_inputs().contains_key(name.as_str()) {
+                all.push((name, scenario));
+            }
+        }
+    }
+    all
+}
 
 /// The no-hold passing control: [`StorageScenario::grow`] under a Plan whose
 /// run leaves an operation pending through its drain, and prepares one chain
@@ -913,7 +935,7 @@ fn every_collected_state_has_a_witness() {
         });
         assert_eq!(lost, None, "{}: no caller to lose", witness.name);
     }
-    // Each drawn header storage seed shows the rows it's committed for on
+    // Each drawn header storage witness shows the rows it's committed for on
     // its own run, so another witness can't stand in for it.
     let own = [
         (

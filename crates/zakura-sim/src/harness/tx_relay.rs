@@ -59,7 +59,9 @@ use super::{
 use crate::{
     domain::tx_relay::{self as properties, lock, RelayView, SharedRelay},
     peer::{
-        tx_relay::{Answer, Bodies, HelloMode, RelayPeer, RelayPeerSpec, RelayStep},
+        tx_relay::{
+            Answer, Bodies, HelloMode, RelayPeer, RelayPeerSpec, RelayStep, IDLE_TIMEOUT_SECS,
+        },
         PeerControl, PeerFailure, PeerRecords, NODE_ADDR,
     },
     property::{HasView, Property, Source, Sources, Status, TriggerHistory},
@@ -90,10 +92,10 @@ pub const BAD: usize = LOCAL + MAX_LOCAL;
 /// The universe's size.
 pub const UNIVERSE: usize = BAD + 2 * MAX_PEERS;
 
-/// The lock script size of the bodies this node holds itself: past a
-/// peer's QUIC receive window, so a peer that stops reading blocks the
-/// node's writer within one body.
-const LOCAL_SCRIPT: usize = 80 * 1024;
+/// The lock script size of the bodies this node holds itself: past what a
+/// peer's QUIC receive window and the node's send buffers hold, so a peer
+/// that stops reading blocks the node's writer within one body.
+const LOCAL_SCRIPT: usize = 1024 * 1024;
 
 /// The universe's bodies: transparent V4 transactions, each with its own
 /// output value. The peers' and the bad bodies are of one small size, and
@@ -183,11 +185,9 @@ impl Default for RelayScenario {
 
 /// The node's config: production defaults on Regtest, with `tx-relay` on,
 /// block sync's congestion window and the default stream window cut to
-/// 1 MiB, and the smallest QUIC send window. Block sync doesn't run here,
-/// but the largest kind's share sets every stream's receive window, which
-/// is the bulk of the `Inv` bucket's depth. The send window holds the
-/// node's data writer on a body a peer doesn't read, so the answers behind
-/// it queue unstarted.
+/// 1 MiB, and the QUIC idle timeout past a park. Block sync doesn't run
+/// here, but the largest kind's share sets every stream's receive window,
+/// which is the bulk of the `Inv` bucket's depth.
 pub fn node_config() -> Config {
     let mut config = Config {
         network: Network::new_regtest(Default::default()),
@@ -197,7 +197,7 @@ pub fn node_config() -> Config {
     config.zakura.quic.stream_receive_window_bytes = 1024 * 1024;
     config.zakura.block_sync.bbr_max_cwnd_bytes = 1024 * 1024;
     config.zakura.block_sync.floor_bypass_slots = 0;
-    config.zakura.quic.send_window_bytes = 64 * 1024;
+    config.zakura.quic.idle_timeout_secs = IDLE_TIMEOUT_SECS;
     config
 }
 

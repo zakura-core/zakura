@@ -341,7 +341,6 @@ const fn tx_relay_table(property: &'static str) -> Coverage {
 }
 
 /// A `tx-relay` generated property no scenario reaches, for `reason`.
-#[allow(dead_code)]
 const fn tx_relay_unreachable(property: &'static str, reason: &'static str) -> Coverage {
     Coverage {
         property,
@@ -1710,13 +1709,19 @@ pub static COVERAGE: &[Coverage] = &[
     tx_relay_table("tx-relay/s9v1/inv/reserved-flags-closes"),
     tx_relay_table("tx-relay/s9v1/inv/short-payload-closes"),
     tx_relay_table("tx-relay/s9v1/inv/long-payload-closes"),
-    tx_relay_table("tx-relay/s9v1/inv/over-rate-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s9v1/inv/over-rate-closes",
+        "no peer can tell which flooded Inv overran the node's byte bucket: the node refills it while it reads the flood, by an amount the run's schedule sets",
+    ),
     tx_relay_table("tx-relay/s9v1/inv/bad-content-closes"),
     tx_relay_table("tx-relay/s9v1/tx/reserved-flags-closes"),
     tx_relay_table("tx-relay/s9v1/tx/short-payload-closes"),
     tx_relay_table("tx-relay/s9v1/tx/long-payload-closes"),
     tx_relay_table("tx-relay/s9v1/tx/unsolicited-closes"),
-    tx_relay_table("tx-relay/s9v1/tx/over-owed-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s9v1/tx/over-owed-closes",
+        "each request owes one answer, and a second answer to it is unrequested, so the peer labels it unsolicited, never over-owed",
+    ),
     tx_relay_table("tx-relay/s9v1/tx/bad-content-closes"),
     tx_relay_table("tx-relay/s10v1/conformant-never-closes"),
     tx_relay_table("tx-relay/s10v1/undeclared-type-closes"),
@@ -1724,16 +1729,28 @@ pub static COVERAGE: &[Coverage] = &[
     tx_relay_table("tx-relay/s10v1/hello/short-payload-closes"),
     tx_relay_table("tx-relay/s10v1/hello/long-payload-closes"),
     tx_relay_table("tx-relay/s10v1/hello/bad-content-closes"),
-    tx_relay_table("tx-relay/s10v1/hello/cadence-never-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/hello/cadence-never-closes",
+        "a second Hello closes the connection under row 4 before the row's cadence bucket can run dry",
+    ),
     tx_relay_table("tx-relay/s10v1/get-txs/reserved-flags-closes"),
     tx_relay_table("tx-relay/s10v1/get-txs/short-payload-closes"),
     tx_relay_table("tx-relay/s10v1/get-txs/long-payload-closes"),
-    tx_relay_table("tx-relay/s10v1/get-txs/over-margin-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/get-txs/over-margin-closes",
+        "a request past the node's Hello is refused only while the node's writer holds the earlier ones unstarted, which no peer sees, so the peer labels it conformant and the node's close is neutral",
+    ),
     tx_relay_table("tx-relay/s10v1/get-txs/bad-content-closes"),
     tx_relay_table("tx-relay/s10v1/not-found/reserved-flags-closes"),
     tx_relay_table("tx-relay/s10v1/not-found/short-payload-closes"),
     tx_relay_table("tx-relay/s10v1/not-found/long-payload-closes"),
     tx_relay_table("tx-relay/s10v1/not-found/unsolicited-closes"),
-    tx_relay_table("tx-relay/s10v1/not-found/over-owed-closes"),
-    tx_relay_table("tx-relay/s10v1/not-found/bad-content-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/not-found/over-owed-closes",
+        "each request owes one answer, and a second answer to it is unrequested, so the peer labels it unsolicited, never over-owed",
+    ),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/not-found/bad-content-closes",
+        "a NotFound has no content rule of its own: one for an id the node never asked for breaks row 9, which the peer labels unsolicited",
+    ),
 ];

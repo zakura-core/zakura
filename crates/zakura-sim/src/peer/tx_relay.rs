@@ -223,12 +223,12 @@ pub enum RelayStep {
         /// Which stream.
         data: bool,
     },
-    /// `GetTxs` for two ids the node announced, the second twice, in one
+    /// `GetTxs` for three ids the node announced, the third twice, in one
     /// write, while the peer stops reading its data stream: row 7, neutral.
     RequestTwice,
-    /// Two more `GetTxs` than the node's `Hello` serves, in one write, for
-    /// ids it announced, while the peer stops reading its data stream: row
-    /// 8, neutral.
+    /// Three more `GetTxs` than the node's `Hello` serves, in one write,
+    /// for ids it announced, while the peer stops reading its data stream:
+    /// row 8, neutral.
     TooManyRequests,
 }
 
@@ -364,6 +364,11 @@ pub(crate) struct RelayPeer {
 /// peer that stops reading its data stream blocks the node's data writer
 /// within one of the node's own bodies.
 const RECEIVE_WINDOW: u32 = 64 * 1024;
+
+/// The QUIC idle timeout of a peer and of the node: past a park's three
+/// minutes, since a parked peer's connection carries no other service's
+/// frames here.
+pub const IDLE_TIMEOUT_SECS: u32 = 600;
 
 /// How long a peer stops reading its data stream while it asks for a burst
 /// of bodies, so the node's answers queue unstarted.
@@ -599,6 +604,7 @@ impl RelayPeer {
             &QuicConfig {
                 stream_receive_window_bytes: RECEIVE_WINDOW,
                 receive_window_bytes: RECEIVE_WINDOW,
+                idle_timeout_secs: IDLE_TIMEOUT_SECS,
                 ..QuicConfig::default()
             },
             self.net.clone(),
@@ -1291,25 +1297,28 @@ impl RelayPeer {
                 if !hello {
                     return Some(true);
                 }
-                // Two ids the node announced, the second asked for twice
-                // while the peer reads nothing: the node's writer blocks on
-                // the first body, so the second's request is still
-                // unanswered when it comes again.
-                if session.announced.len() < 2 {
+                // Three ids the node announced, the third asked for twice
+                // while the peer reads nothing. The peer's reader finishes
+                // the first body, and the node's writer blocks on the
+                // second, so the third's request is still unanswered when
+                // it comes again.
+                if !hello || session.announced.len() < 3 {
                     return Some(true);
                 }
-                let ids: Vec<UnminedTxId> = session.announced.drain(..2).collect();
+                let ids: Vec<UnminedTxId> = session.announced.drain(..3).collect();
                 pause_reads(session);
-                (Vec::new(), vec![ask(ids[0]), ask(ids[1]), ask(ids[1])])
+                let asks = [ids[0], ids[1], ids[2], ids[2]];
+                (Vec::new(), asks.into_iter().map(ask).collect())
             }
             RelayStep::TooManyRequests => {
-                // While the peer reads nothing, the node's writer blocks on
-                // the first body, and the rest queue unstarted: the last
-                // request is past what the node's `Hello` serves.
-                if !hello || session.announced.len() < MAX_SERVES + 2 {
+                // While the peer reads nothing, its reader finishes the
+                // first body, the node's writer blocks on the second, and
+                // the rest queue unstarted: the last request is past what
+                // the node's `Hello` serves.
+                if !hello || session.announced.len() < MAX_SERVES + 3 {
                     return Some(true);
                 }
-                let ids: Vec<UnminedTxId> = session.announced.drain(..MAX_SERVES + 2).collect();
+                let ids: Vec<UnminedTxId> = session.announced.drain(..MAX_SERVES + 3).collect();
                 pause_reads(session);
                 (Vec::new(), ids.into_iter().map(ask).collect())
             }

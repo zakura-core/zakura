@@ -21,7 +21,8 @@ use super::{
     wanted::{Admission, Changes},
     CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
     PoolView, RelayEffect, SessionId, Shared, Time, Unreserved, Verdict, Violation, WaiterId,
-    INV_RETRY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN, PENDING_PER_PEER,
+    INITIAL_WINDOW, INV_RETRY, MAX_OUTSTANDING_BYTES, MAX_SERVES, MAX_TX_BYTES, PARK_COOLDOWN,
+    PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
 };
 use crate::zakura::tx_relay::wire::{inv_payload_bound, MAX_INV_ENTRIES};
 
@@ -165,6 +166,7 @@ impl PeerMachine {
             self.violation(shared, Violation::BadHello);
         } else {
             self.state.hello = Some(hello);
+            self.state.window = INITIAL_WINDOW.min(hello.serves);
             // Announcements it made before can join the table now, if it
             // has the go.
             if shared.reactor.has_go(self.state.peer, self.session) {
@@ -518,9 +520,18 @@ impl PeerMachine {
             shared.ended_verdict(pool, waiter, verdict, self.now);
             return;
         }
+        // Whether the window was full with this body still counted.
+        let full = self.in_flight(shared) >= self.state.window;
         let Some((id, generation)) = self.state.submissions.remove(&waiter) else {
             return self.settle(shared, pool);
         };
+        if full && verdict == Verdict::Admitted {
+            let serves = self
+                .state
+                .hello
+                .map_or(INITIAL_WINDOW, |hello| hello.serves);
+            self.state.window = self.state.window.saturating_add(1).min(serves);
+        }
         let submitted = self
             .submitted_at
             .remove(&waiter)
@@ -610,8 +621,6 @@ impl PeerMachine {
 
     /// This session's routine reports its connection's smoothed round-trip
     /// time. It counts at the next ranking.
-    // Unused until the IO reports round-trip times, which a later change wires in.
-    #[allow(dead_code)]
     pub(crate) fn observe_rtt(
         &mut self,
         shared: &mut Shared,
@@ -1021,7 +1030,7 @@ impl PeerMachine {
         }
         // Its reserve calls still in flight are answered to the reactor, and
         // their grants go back as they arrive. Until then they count against
-        // the peer's 5.
+        // the peer's next session's window.
         shared.reactor.hand_calls(peer, self.state.reserving.len());
         for call in self.calls.keys() {
             shared.ended_calls.insert(*call, peer);
@@ -1046,9 +1055,10 @@ impl PeerMachine {
         }
         // A submission keeps its claim until its verdict, so nobody fetches
         // the id again while the pool still decides it.
-        for pending in &self.state.pending {
+        for pending in self.state.pending.iter() {
             shared.wanted.unhold(pending.id, pending.generation);
         }
+        self.state.pending.clear(&mut shared.pending);
         for (waiter, submitted) in self.submitted_at.drain() {
             shared.ended_submitted.insert(waiter, submitted);
         }
@@ -1098,8 +1108,9 @@ impl PeerMachine {
         // Without a `Hello` it could never be asked, so its announcements
         // wait for one.
         if state.hello.is_some() {
-            let waiting: Vec<(UnminedTxId, u32)> =
-                std::mem::take(&mut state.waiting).into_iter().collect();
+            let waiting: Vec<(UnminedTxId, u32)> = std::mem::take(&mut self.state.waiting)
+                .into_iter()
+                .collect();
             self.take_ids(shared, pool, &waiting);
         }
     }
@@ -1130,7 +1141,13 @@ impl PeerMachine {
             if pool.holds(&id) || size > MAX_TX_BYTES {
                 continue;
             }
-            let current = shared.wanted.entry(id).map(|entry| entry.generation);
+            let entry = shared.wanted.entry(id);
+            let current = entry.map(|entry| entry.generation);
+            // No session holds it, though a claim may: the body of a session
+            // that ended can still wait for its verdict. Such an id has no
+            // source left if that verdict leaves it undecided, so it is a
+            // first source. The claim still stops a second fetch meanwhile.
+            let first = entry.is_none_or(|entry| entry.holders == 0);
             // A peer that tried this entry is not asked again, however often
             // it announces the id, until the entry ends.
             if current.is_some_and(|generation| shared.wanted.has_tried(state.peer, id, generation))
@@ -1150,25 +1167,38 @@ impl PeerMachine {
             if already || busy || !taken.insert(id) {
                 continue;
             }
-            fresh.push((id, size));
+            fresh.push((id, size, first));
         }
-        // Room is decided before the table changes, so an id that does not
-        // fit leaves no holder behind.
-        let fits = state.room().min(fresh.len());
-        let dropped = fresh.len().saturating_sub(fits);
-        state.overflow = state
-            .overflow
-            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-        fresh.truncate(fits);
-        for (id, size) in fresh {
+        // Each id's room is decided before the table changes, so an id that
+        // does not fit leaves no holder behind. See `PENDING_CAP` for the
+        // rule.
+        let mut dropped: u64 = 0;
+        for (id, size, first) in fresh {
+            let share = self.state.pending.len() < PENDING_SHARE;
+            let records = shared.pending;
+            let node = records < PENDING_CAP || (first && records < 2 * PENDING_CAP);
+            if self.state.room() == 0 || !(share || node) {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            // The set keeps one reference per id, and one it still holds
+            // here names an entry that ended, which its next read of the
+            // ring would drop.
+            if let Some(stale) = self.state.pending.of(id) {
+                self.drop_decided(shared, id, stale.generation);
+            }
             let generation = shared.wanted.hold(id, self.now);
-            self.state.pending.push(Pending {
-                id,
-                generation,
-                size,
-            });
+            self.state.pending.push(
+                Pending {
+                    id,
+                    generation,
+                    size,
+                },
+                &mut shared.pending,
+            );
             file(&mut self.state, &shared.wanted, id);
         }
+        self.state.overflow = self.state.overflow.saturating_add(dropped);
     }
 
     /// Reconsiders announcing `id` to its peer, as a read of its admission
@@ -1250,7 +1280,11 @@ impl PeerMachine {
     /// Drops this session's pending reference to `id` in `generation`,
     /// which its peer tried.
     fn drop_tried_reference(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
-        if self.state.take_pending_of(id, generation).is_some() {
+        if self
+            .state
+            .take_pending_of(id, generation, &mut shared.pending)
+            .is_some()
+        {
             shared.wanted.unhold(id, generation);
         }
     }
@@ -1280,6 +1314,12 @@ impl PeerMachine {
         missed.sort_by_key(|id| self.state.requests.get_index_of(id));
         // A deadline set twice to the same time has two timers.
         missed.dedup();
+        // A late peer is asked for less at once, as block sync's window dips
+        // once per batch of timeouts. A fetch the pool cancelled counts too,
+        // since the peer was still late.
+        if !missed.is_empty() {
+            self.state.window = (self.state.window / 2).max(1);
+        }
         let mut freed = Vec::new();
         for id in missed {
             let request = self.state.requests.get_mut(&id).expect("the timer stands");
@@ -1500,6 +1540,14 @@ impl PeerMachine {
         }
     }
 
+    /// Ids reserving, requested or awaiting a verdict on this session, with
+    /// what its peer's ended sessions left: what its window counts.
+    fn in_flight(&self, shared: &Shared) -> usize {
+        self.state
+            .in_flight()
+            .saturating_add(shared.reactor.unsettled_count(self.state.peer))
+    }
+
     /// The oldest id this session may claim now, if it has a free slot.
     fn next_claim(&self, shared: &Shared) -> Option<Pending> {
         let (peer, session, state) = (self.state.peer, self.session, &self.state);
@@ -1507,20 +1555,18 @@ impl PeerMachine {
             return None;
         }
         let hello = state.hello?;
-        let in_flight = state
-            .in_flight()
-            .saturating_add(shared.reactor.unsettled_count(peer));
-        let asking = state.requests.len().saturating_add(state.reserving.len());
-        if in_flight >= MAX_REQUESTS_PER_PEER || asking >= hello.serves {
+        debug_assert!(state.window <= hello.serves, "the Hello caps the window");
+        if self.in_flight(shared) >= state.window {
             return None;
         }
+        let asked = state.asked_bytes();
         // The id ready longest goes first: since its first announcement, or
         // since its retry delay ended. Neither fresh work nor retries starve
         // the other. The filed entries are in that order, and one filed
         // later than now is still in its retry delay, as is every one after
         // it, since an entry is ready no earlier than its retry time.
         for ((ready, _), pending) in state.pending.ready() {
-            if *ready > self.now {
+            if ready > self.now {
                 return None;
             }
             // A request given up but still on the wire, or a reserve call,
@@ -1529,7 +1575,12 @@ impl PeerMachine {
             {
                 continue;
             }
-            return Some(*pending);
+            // The oldest ready id waits for bytes to free rather than let
+            // smaller ones keep passing it.
+            if asked.saturating_add(u64::from(pending.size)) > MAX_OUTSTANDING_BYTES {
+                return None;
+            }
+            return Some(pending);
         }
         None
     }
@@ -1541,8 +1592,10 @@ impl PeerMachine {
         self.ring_cursor = end;
         let ids: Vec<UnminedTxId> = match changes {
             Changes::Ids(ids) => ids,
-            Changes::Overrun => (&self.state.pending)
-                .into_iter()
+            Changes::Overrun => self
+                .state
+                .pending
+                .iter()
                 .map(|pending| pending.id)
                 .collect(),
         };
@@ -1556,19 +1609,14 @@ impl PeerMachine {
     /// fetch of it this session still had. A reference to an entry its peer
     /// tried goes too.
     fn refile(&mut self, shared: &mut Shared, id: UnminedTxId) {
-        // References are oldest first, and only the newest can name the
-        // current entry, so the stale ones go from the front.
-        let held = loop {
-            let Some(held) = self.state.pending.of(id) else {
-                self.state.pending.unfile(id);
-                return;
-            };
-            let current = shared.wanted.entry(id).map(|entry| entry.generation);
-            if current == Some(held.generation) {
-                break held;
-            }
-            self.drop_decided(shared, id, held.generation);
+        let Some(held) = self.state.pending.of(id) else {
+            return;
         };
+        let current = shared.wanted.entry(id).map(|entry| entry.generation);
+        if current != Some(held.generation) {
+            self.drop_decided(shared, id, held.generation);
+            return;
+        }
         if shared
             .wanted
             .has_tried(self.state.peer, id, held.generation)
@@ -1582,7 +1630,7 @@ impl PeerMachine {
     /// Drops this session's references to `id` in `generation`, which was
     /// decided, and gives back a fetch of it the session still had.
     fn drop_decided(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
-        self.state.drop_decided(id, generation);
+        self.state.drop_decided(id, generation, &mut shared.pending);
         if let Some(reservation) = self
             .state
             .requests

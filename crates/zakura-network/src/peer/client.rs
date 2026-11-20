@@ -17,6 +17,7 @@ use futures::{
     channel::{mpsc, oneshot},
     future, ready,
     stream::{Stream, StreamExt},
+    task::AtomicWaker,
     FutureExt,
 };
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -93,6 +94,9 @@ pub struct Client {
 /// be written now.
 ///
 /// The connection records block outcomes in reply order before waking their callers.
+///
+/// The peer set can ask to be woken when the connection becomes usable as a block source again:
+/// it is free, or its missed block mark clears. See [`RequestSlot::notify_when_usable`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestSlot {
     /// True while the connection is handling a client request, or after either half shuts down.
@@ -105,6 +109,10 @@ pub(crate) struct RequestSlot {
     /// When the peer last announced a block and then did not deliver it to a gossip block request,
     /// retained until a subsequent verified delivery clears it. Scored routing checks its age.
     announced_block_missed_at: Arc<std::sync::Mutex<Option<Arc<tokio::time::Instant>>>>,
+
+    /// The task to wake when this connection becomes usable as a block source again. Empty
+    /// unless the peer set is holding a second block request that this peer could serve.
+    usable_waker: Arc<AtomicWaker>,
 }
 
 /// How long scored routing passes over a peer that failed to deliver an announced block,
@@ -119,7 +127,10 @@ pub(crate) const ANNOUNCED_BLOCK_MISS_LIFETIME: Duration = Duration::from_secs(1
 impl RequestSlot {
     /// Records whether the connection is handling a client request (or can no longer take one).
     pub(crate) fn set_busy(&self, busy: bool) {
-        self.busy.store(busy, Ordering::Release);
+        let was_busy = self.busy.swap(busy, Ordering::AcqRel);
+        if was_busy && !busy {
+            self.usable_waker.wake();
+        }
     }
 
     /// Returns true if the connection is waiting for its next client request.
@@ -128,6 +139,10 @@ impl RequestSlot {
     }
 
     /// Records whether the connection's last block request ended unanswered.
+    ///
+    /// Clearing the mark wakes nobody. Only a finished block reply clears it, and the
+    /// connection is busy until that reply is handed over, so the wake-up from
+    /// [`Self::set_busy`] that follows is the first time the peer is usable again.
     pub(crate) fn set_block_request_unanswered(&self, unanswered: bool) {
         self.block_request_unanswered
             .store(unanswered, Ordering::Release);
@@ -151,20 +166,39 @@ impl RequestSlot {
             .is_some_and(|current| Arc::ptr_eq(current, at_receipt))
         {
             *missed = None;
+            drop(missed);
+            self.usable_waker.wake();
         }
     }
 
     /// Returns true if the peer announced a block and then did not deliver it within the last
     /// [`ANNOUNCED_BLOCK_MISS_LIFETIME`], and no subsequent verified delivery cleared the miss.
     pub(crate) fn announced_block_missed(&self) -> bool {
+        self.announced_block_miss_expiry().is_some()
+    }
+
+    /// When the current miss expires, if it still excludes this peer from scored routing.
+    pub(super) fn announced_block_miss_expiry(&self) -> Option<tokio::time::Instant> {
         self.missed_at()
             .as_ref()
-            .is_some_and(|missed_at| missed_at.elapsed() < ANNOUNCED_BLOCK_MISS_LIFETIME)
+            .map(|missed_at| **missed_at + ANNOUNCED_BLOCK_MISS_LIFETIME)
+            .filter(|expiry| *expiry > tokio::time::Instant::now())
     }
 
     /// Identifies the miss preceding this reply, including two misses within the same clock tick.
     pub(crate) fn miss_at_receipt(&self) -> Option<Arc<tokio::time::Instant>> {
         self.missed_at().clone()
+    }
+
+    /// Registers the task polling with `cx` to be woken the next time this connection becomes
+    /// free, or a verified delivery clears its missed block mark. Only the last registered task
+    /// is woken, once. A connection that becomes free has also cleared any unanswered block
+    /// mark it is going to clear (see [`Self::set_block_request_unanswered`]).
+    ///
+    /// Register before reading the slot, so that a change between the read and the task going
+    /// to sleep still wakes it.
+    pub(crate) fn notify_when_usable(&self, cx: &Context<'_>) {
+        self.usable_waker.register(cx.waker());
     }
 
     fn missed_at(&self) -> std::sync::MutexGuard<'_, Option<Arc<tokio::time::Instant>>> {

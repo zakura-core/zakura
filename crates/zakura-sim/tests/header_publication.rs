@@ -130,6 +130,9 @@ pub fn startup_only() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -197,6 +200,9 @@ pub fn grow() -> StorageScenario {
             Some(Trigger::Submitted(locator())),
         )],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

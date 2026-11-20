@@ -86,6 +86,9 @@ pub fn held_locator() -> StorageScenario {
             Trigger::Completed(Select::nth(OpKind::Locator, 1)),
         ),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -157,6 +160,9 @@ pub fn two_forks() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -239,6 +245,9 @@ pub fn quiet_reset() -> StorageScenario {
             ),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

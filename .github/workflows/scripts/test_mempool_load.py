@@ -875,6 +875,22 @@ class Verdict(unittest.TestCase):
         result.update(overrides)
         return result
 
+    def test_a_thin_loaded_leg_is_degraded(self):
+        result = self.healthy_result()
+        result["throughput"]["submitted"] = 12
+        verdict, reasons = monitor.grade_run(result, self.make_args())
+        self.assertEqual(verdict, "degraded")
+        self.assertTrue(any("attempts" in r for r in reasons))
+
+    def test_heavy_rejects_are_graded_on_attempts(self):
+        # 40 successes and 20 rejects is 60 attempts, past the minimum of 50,
+        # though the successes alone are not.
+        result = self.healthy_result()
+        result["throughput"].update({"submitted": 40, "node_rejects": 20, "reject_rate": 20 / 60})
+        verdict, reasons = monitor.grade_run(result, self.make_args())
+        self.assertEqual(verdict, "failed")
+        self.assertTrue(any("reject rate" in r for r in reasons))
+
     def test_a_frozen_chain_fails_the_run(self):
         # The headline "green run that measured nothing" case.
         result = self.healthy_result()
@@ -1216,6 +1232,7 @@ class Comparison(unittest.TestCase):
             "propagation": {
                 "spread_p50_secs": 0.5,
                 "spread_p95_secs": 1.0,
+                "txids_observed": 1000,
                 "txids_on_all_nodes": 900,
             },
             "effective_tx_per_sec": 3.33,
@@ -1264,12 +1281,31 @@ class Comparison(unittest.TestCase):
     def test_small_deltas_are_treated_as_noise(self):
         target = self.leg(propagation={"txids_on_all_nodes": 945})  # +5%
         rows = compare.build_rows(self.leg(), target)
-        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "=")
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "=")
+
+    def test_reach_is_graded_as_a_share_not_a_count(self):
+        # Mining luck lets the target submit fewer. Every one still reached
+        # every node, so the run is no worse.
+        baseline = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 100})
+        target = self.leg(propagation={"txids_observed": 80, "txids_on_all_nodes": 80})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Txids reaching all nodes")["verdict"], "info")
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "=")
+        self.assertEqual(compare.gate(baseline, target, rows), ("pass", []))
+
+    def test_a_reach_drop_of_exactly_the_floor_is_graded(self):
+        # 100/100 to 90/100 is a 10% drop, which float error puts just under
+        # the floor unless the grade rounds it.
+        baseline = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 100})
+        target = self.leg(propagation={"txids_observed": 100, "txids_on_all_nodes": 90})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Share reaching all nodes")["verdict"], "WORSE")
+        self.assertEqual(compare.gate(baseline, target, rows)[0], "fail")
 
     def test_zero_baseline_does_not_produce_infinity(self):
         baseline = self.leg(propagation={"txids_on_all_nodes": 0})
         rows = compare.build_rows(baseline, self.leg())
-        row = self.row_for(rows, "Txids reaching all nodes")
+        row = self.row_for(rows, "Share reaching all nodes")
         self.assertIsNone(row["delta_pct"])
         # Unbounded, but unambiguously an improvement in direction.
         self.assertEqual(row["verdict"], "better")
@@ -1297,13 +1333,63 @@ class Comparison(unittest.TestCase):
         del target["propagation"]["spread_p95_secs"]
         rows = compare.build_rows(self.leg(), target)
         self.assertIsNone(self.row_for(rows, "Propagation p95 (s)")["delta_pct"])
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "MISSING")
+        self.assertEqual(compare.gate(self.leg(), target, rows)[0], "fail")
+
+    def test_gate_passes_clean_legs_and_fails_a_regression(self):
+        rows = compare.build_rows(self.leg(), self.leg())
+        self.assertEqual(compare.gate(self.leg(), self.leg(), rows), ("pass", []))
+        target = self.leg(throughput={"reject_rate": 0.10})
+        rows = compare.build_rows(self.leg(), target)
+        self.assertEqual(compare.gate(self.leg(), target, rows)[0], "fail")
+
+    def test_gate_fails_a_failed_baseline_and_holds_a_thin_leg(self):
+        rows = compare.build_rows(self.leg(), self.leg())
+        failed = self.leg(verdict="failed")
+        self.assertEqual(compare.gate(failed, self.leg(), rows)[0], "fail")
+        thin = self.leg(verdict="degraded")
+        self.assertEqual(compare.gate(self.leg(), thin, rows)[0], "inconclusive")
+
+    def test_a_thin_leg_is_not_graded_on_its_deltas(self):
+        baseline = self.leg(verdict="degraded", throughput={"reject_rate": 0.0})
+        target = self.leg(verdict="degraded", throughput={"reject_rate": 0.05})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Reject rate")["verdict"], "WORSE")
+        self.assertEqual(compare.gate(baseline, target, rows)[0], "inconclusive")
+
+    def test_a_spread_change_below_the_resolution_is_no_change(self):
+        baseline = self.leg(propagation={"spread_p95_secs": 0.010, "resolution_secs": 1.1})
+        target = self.leg(propagation={"spread_p95_secs": 0.012, "resolution_secs": 1.1})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "=")
+        self.assertEqual(compare.gate(baseline, target, rows), ("pass", []))
+        # A change past the resolution still counts.
+        target = self.leg(propagation={"spread_p95_secs": 3.0, "resolution_secs": 1.1})
+        rows = compare.build_rows(baseline, target)
+        self.assertEqual(self.row_for(rows, "Propagation p95 (s)")["verdict"], "WORSE")
+
+    def test_a_shallower_peak_alone_does_not_fail(self):
+        target = self.leg()
+        target["peak_mempool_txs"] = target["peak_mempool_txs"] * 8 // 10
+        rows = compare.build_rows(self.leg(), target)
+        self.assertEqual(self.row_for(rows, "Peak mempool depth")["verdict"], "info")
+        self.assertEqual(compare.gate(self.leg(), target, rows), ("pass", []))
+
+    def test_main_fails_without_a_summary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "summary.md")
+            status = compare.main(["--baseline", os.path.join(tmp, "missing.json"),
+                                   "--target", os.path.join(tmp, "missing.json"),
+                                   "--out", out])
+        self.assertEqual(status, 1)
 
     def test_report_names_the_regressed_metrics(self):
         target = self.leg(propagation={"txids_on_all_nodes": 400})
         rows = compare.build_rows(self.leg(), target)
         report = compare.render(self.leg(), target, rows)
         self.assertIn("regressed beyond the noise floor", report)
-        self.assertIn("Txids reaching all nodes", report.split("regressed beyond")[-1])
+        self.assertIn("Share reaching all nodes", report.split("regressed beyond")[-1])
         # Zero-baseline deltas must not render as a numeric infinity. Check the
         # delta cells specifically -- "info"/"informational" appear elsewhere.
         import re

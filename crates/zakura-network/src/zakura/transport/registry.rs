@@ -571,6 +571,7 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
+        let rtt = peer.rtt_reader();
         let (
             peer_id,
             conn_id,
@@ -605,17 +606,20 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
-                conn_id,
-                peer_id.clone(),
-                remote_ip,
-                negotiated,
-                direction,
-                service_streams,
-                cancel_token.clone(),
-                service_cancel_token,
-                close_cause.clone(),
-            ));
+            service.add_peer(
+                Peer::new_with_service_cancel_token(
+                    conn_id,
+                    peer_id.clone(),
+                    remote_ip,
+                    negotiated,
+                    direction,
+                    service_streams,
+                    cancel_token.clone(),
+                    service_cancel_token,
+                    close_cause.clone(),
+                )
+                .with_rtt_reader(rtt.clone()),
+            );
         }
 
         admitted_capabilities

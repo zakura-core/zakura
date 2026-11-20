@@ -280,9 +280,21 @@ impl Bench {
 
     /// Submits the body of `tx` under `reservation`.
     fn submit(&mut self, reservation: ReservationId, tx: &Tx) -> (WaiterId, Step) {
+        self.submit_until(reservation, tx, None)
+    }
+
+    /// Submits the body of `tx` under `reservation`, whose submitter stops
+    /// waiting at `give_up` on the test's clock, if set.
+    fn submit_until(
+        &mut self,
+        reservation: ReservationId,
+        tx: &Tx,
+        give_up: Option<Duration>,
+    ) -> (WaiterId, Step) {
+        let give_up = give_up.map(|at| self.base + at);
         let (waiter, step) =
             self.machine
-                .submit(reservation, tx.real.transaction.clone(), self.at());
+                .submit(reservation, tx.real.transaction.clone(), give_up, self.at());
         self.tracker.waits(waiter, tx.id());
         (waiter, self.took(step))
     }

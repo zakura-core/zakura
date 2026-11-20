@@ -208,6 +208,27 @@ impl PendingBlockSignal {
     }
 }
 
+/// The verdict on one pending submission, before or after it resolves.
+#[derive(Debug)]
+pub struct PendingBlockResolution(watch::Receiver<PendingStatus>);
+
+impl PendingBlockResolution {
+    /// Waits until the submission commits or fails, and returns whether it committed. A
+    /// submission dropped without a verdict did not commit.
+    pub async fn committed(mut self) -> bool {
+        loop {
+            match *self.0.borrow_and_update() {
+                PendingStatus::Committed => return true,
+                PendingStatus::Failed => return false,
+                PendingStatus::Waiting => {}
+            }
+            if self.0.changed().await.is_err() {
+                return matches!(*self.0.borrow(), PendingStatus::Committed);
+            }
+        }
+    }
+}
+
 /// Owns one pending-block registry entry.
 #[derive(Debug)]
 pub struct PendingBlockRegistration {
@@ -300,6 +321,16 @@ impl PendingBlockRegistry {
             Err(()) => PendingStatus::Failed,
         };
         entry.status.send_replace(status);
+    }
+
+    /// Returns the pending verdict on block `hash`, if this node is verifying a submission of it.
+    pub fn resolution(&self, hash: block::Hash) -> Option<PendingBlockResolution> {
+        self.0
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .map(|entry| PendingBlockResolution(entry.status.subscribe()))
     }
 
     /// Returns an admitted body immediately while its contextual commit is pending.

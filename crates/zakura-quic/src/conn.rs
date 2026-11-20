@@ -16,7 +16,7 @@ use zakura_rt::{
 };
 
 use crate::{
-    driver::{ConnCmd, ConnRef},
+    driver::{ConnCmd, ConnRef, ConnShared},
     key::NodeId,
     stream::{RecvStream, SendStream},
 };
@@ -193,6 +193,8 @@ pub struct ConnLoad {
     pub frame_rx: quinn_proto::FrameStats,
     /// Sends that failed with an error other than `WouldBlock`.
     pub send_errors: u64,
+    /// Smoothed round-trip time, which [`RttReader`] reads.
+    pub(crate) rtt: Duration,
 }
 
 /// The longest a [`ConnLoad`] snapshot lags while the connection is active.
@@ -214,7 +216,25 @@ impl ConnLoad {
             udp_rx: quinn_proto::UdpStats::default(),
             frame_rx: quinn_proto::FrameStats::default(),
             send_errors: 0,
+            rtt: Duration::ZERO,
         }
+    }
+}
+
+/// Reads one connection's smoothed round-trip time from its latest
+/// [`ConnLoad`] without keeping the connection open, so a service can hold
+/// it for as long as its session runs.
+#[derive(Clone, Debug)]
+pub struct RttReader(zakura_rt::sync::Weak<ConnShared>);
+
+impl RttReader {
+    /// The smoothed round-trip time in the connection's latest snapshot,
+    /// which lags by at most [`LOAD_INTERVAL`] while the connection is
+    /// active. `None` once the connection is gone.
+    pub fn rtt(&self) -> Option<Duration> {
+        let shared = self.0.upgrade()?;
+        let rtt = shared.load.borrow().rtt;
+        Some(rtt)
     }
 }
 
@@ -386,6 +406,12 @@ impl Conn {
     /// never waits on the connection task.
     pub fn load(&self) -> ConnLoad {
         *self.inner.shared.load.borrow()
+    }
+
+    /// A reader of this connection's smoothed round-trip time that does not
+    /// hold the connection open.
+    pub fn rtt_reader(&self) -> RttReader {
+        RttReader(zakura_rt::sync::downgrade(&self.inner.shared))
     }
 
     /// A probe that reads [`Self::load`]'s snapshot without holding the

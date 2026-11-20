@@ -1,4 +1,0 @@
-# Evicts confirmed entries first, so relays can displace what peer samples disclose.
-seed = "discovery-record-book"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

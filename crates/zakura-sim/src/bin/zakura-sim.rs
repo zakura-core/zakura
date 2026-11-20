@@ -86,6 +86,7 @@ mod cli {
             ABANDON_LIMIT_VAR,
         },
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
+        planted,
         record::{EndRecord, OutcomeKind},
         seed::{self, SeedSet},
         suite,
@@ -136,7 +137,7 @@ mod cli {
         text.push_str(
             "\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
-             `--seed` runs the named seed from `seeds`, on its own harness.\n\
+             `--seed` runs the named seed from the QA store's `seeds`, on its own harness.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario, and\n\
              `--scenario` alone runs the empty Plan against it.\n\
              `--scenario` and `--script` run a scripted Plan, as JSON, against it.\n\
@@ -630,9 +631,14 @@ mod cli {
         Ok(())
     }
 
-    /// The seed named `name`, in any set.
+    /// The seed named `name`, in any set, from the QA store.
     fn named_seed(name: &str) -> Result<seed::Seed, Error> {
-        seed::find(name).ok_or_else(|| Error::Usage(format!("no seed is named `{name}`")))
+        let store = planted::require_store().map_err(|error| Error::Usage(error.to_string()))?;
+        let seeds = seed::read(&store).map_err(Error::Failed)?;
+        seeds
+            .into_iter()
+            .find(|seed| seed.name == name)
+            .ok_or_else(|| Error::Usage(format!("the QA store has no seed named `{name}`")))
     }
 
     /// The flags `seeds` takes, as given.

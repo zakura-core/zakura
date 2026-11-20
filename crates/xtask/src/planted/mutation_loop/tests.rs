@@ -664,6 +664,7 @@ fn one_case(
     passed: bool,
 ) -> (Runner, Slot, LoopCase, BaselineReport) {
     let runner = Runner {
+        store: tree.to_path_buf(),
         out: out.to_path_buf(),
         work: out.join("work"),
         pinned: repository(tree),
@@ -1010,25 +1011,68 @@ fn planted_prefixes_end_at_a_component() {
     ));
 }
 
+/// Writes `text` to `path` under `root`, with its directories.
+fn write_file(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    fs::create_dir_all(path.parent().expect("a file has a parent")).expect("the directory");
+    fs::write(path, text).expect("the file is written");
+}
+
+/// A patch that changes the first line of `file`.
+fn stub_patch(file: &str) -> String {
+    format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-a\n+b\n")
+}
+
 /// A case watches its work-list entry's paths beside its patch's own: a
 /// change to `admission.rs`, the reserved-byte instance's code, reruns
 /// `budget-ignores-charges`, whose patch changes only the shared
-/// `guard.rs`.
+/// `guard.rs`. The store holds that case and its work-list entry.
 #[test]
 fn a_case_watches_its_work_list_entrys_paths() {
     let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-    let cases = super::native_cases(&repo_root, &repo_root.join("qa/native-mutations"))
-        .expect("the committed cases parse");
-    let case = cases
-        .iter()
-        .find(|case| case.label.ends_with("budget-ignores-charges.patch"))
-        .expect("the bounds entry keeps budget-ignores-charges");
-    let watched = super::watched(&repo_root, case).expect("the work list parses");
+    let store = tempfile::tempdir().expect("a temporary store");
+    write_file(
+        store.path(),
+        "qa/native-mutations/bounds/budget-ignores-charges/budget-ignores-charges.patch",
+        &stub_patch("crates/zakura-network/src/zakura/transport/guard.rs"),
+    );
+    write_file(
+        store.path(),
+        "qa/native-mutations/cases.json",
+        r#"[{"patch": "bounds/budget-ignores-charges/budget-ignores-charges.patch",
+            "entry": "bounds", "property": "block-sync/reserved-byte-bound",
+            "witness": {"test": "t", "test_target": "block_resource_properties"}}]"#,
+    );
+    write_file(
+        store.path(),
+        "qa/native-mutations/work-list.toml",
+        r#"[[entry]]
+id = "bounds"
+check = ["crates/zakura-sim/src/domain/shared/bounds.rs"]
+shared = ["crates/zakura-network/src/zakura/transport/guard.rs"]
+
+[[entry.instance]]
+property = "block-sync/retained-byte-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs"]
+
+[[entry.instance]]
+property = "block-sync/reserved-byte-bound"
+code = ["crates/zakura-network/src/zakura/block_sync/admission.rs"]
+"#,
+    );
+    let cases = super::native_cases(store.path(), &store.path().join("qa/native-mutations"))
+        .expect("the stored cases parse");
+    let [case] = cases.as_slice() else {
+        panic!("one case: {cases:?}");
+    };
+    let watched = super::watched(&repo_root, store.path(), case).expect("the work list parses");
     for path in [
         "crates/zakura-network/src/zakura/block_sync/admission.rs",
         "crates/zakura-network/src/zakura/transport/guard.rs",
         "crates/zakura-sim/src/domain/shared/bounds.rs",
         "qa/native-mutations/work-list.toml",
+        "qa/native-mutations/cases.json",
+        "qa/native-mutations/bounds/budget-ignores-charges/budget-ignores-charges.patch",
     ] {
         assert!(
             crate::planted::is_affected(&watched, &[path.into()]),
@@ -1044,21 +1088,32 @@ fn a_case_watches_its_work_list_entrys_paths() {
 
 /// With generator lanes on, every case watches the inputs the lanes read:
 /// the work list, whose `[[no-generator]]` records apply to a planted case
-/// that names no entry, then the seed registry, whose inputs an `inproc`
+/// that names no entry, then the store's seeds, whose inputs an `inproc`
 /// search excludes, or the fuzz targets for a `libfuzzer` lane. A
 /// triage-only change affects no case. With the lanes off, a planted case
-/// watches neither the work list nor the fuzz targets. Every case watches
-/// the registry, which is shared machinery.
+/// watches neither the work list nor the fuzz targets, only its own seed.
 #[test]
 fn generator_lanes_watch_their_inputs() {
     let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-    let cases = planted_cases(&repo_root, &["session/connection-shares-bound".to_owned()])
-        .expect("the committed planted cases parse");
-    let case = cases
-        .first()
-        .expect("connection-shares-bound has planted cases");
+    let store = tempfile::tempdir().expect("a temporary store");
+    write_file(
+        store.path(),
+        "qa/planted/session/connection-shares-bound/case.patch",
+        &stub_patch("crates/zakura-network/src/zakura/transport/guard.rs"),
+    );
+    write_file(
+        store.path(),
+        "qa/planted/session/connection-shares-bound/case.toml",
+        "seed = \"shares\"\nchecks = [\"crates/zakura-sim/src/domain\"]\n",
+    );
+    let cases = planted_cases(
+        store.path(),
+        &["session/connection-shares-bound".to_owned()],
+    )
+    .expect("the stored planted cases parse");
+    let case = cases.first().expect("the stored planted case");
     assert_eq!(case.entry, None);
-    let own = super::watched(&repo_root, case).expect("the case's files read");
+    let own = super::watched(&repo_root, store.path(), case).expect("the case's files read");
     let watches = |flags: &GenerateFlags, path: &str| {
         let changed = [std::path::PathBuf::from(path)];
         crate::planted::is_affected(&own, &changed) || super::generate::affected(flags, &changed)
@@ -1072,13 +1127,14 @@ fn generator_lanes_watch_their_inputs() {
         ..inproc.clone()
     };
     let work_list = "qa/native-mutations/work-list.toml";
-    let registry = "crates/zakura-sim/src/seed/handshake.rs";
+    let registry = "seeds/other.bin";
     let target = "qa/fuzz/sim/fuzz_targets/block_sync_storage.rs";
     let triage = "qa/native-mutations/triage.toml";
     for path in [work_list, target, triage] {
         assert!(!watches(&GenerateFlags::default(), path), "off: {path}");
     }
-    assert!(watches(&GenerateFlags::default(), registry));
+    assert!(watches(&GenerateFlags::default(), "seeds/shares.bin"));
+    assert!(!watches(&GenerateFlags::default(), registry));
     assert!(watches(&inproc, work_list));
     assert!(super::generate::affected(&inproc, &[registry.into()]));
     assert!(!watches(&inproc, target));
@@ -2746,14 +2802,6 @@ reason = "b.patch is killed now"
     assert_eq!(cases[0]["later_field"], "kept");
     assert_eq!(report["property_findings"][0]["seed"], 1);
     assert!(triage::reapply(&mut json!({"pinned": "p"}), &records).is_err());
-}
-
-/// The committed triage records read, each naming its class.
-#[test]
-fn the_committed_triage_records_read() {
-    let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-    let records = triage::read(&repo_root).expect("the committed triage records read");
-    assert!(!records.is_empty());
 }
 
 /// A mutant's trace leaves its picks on the unpatched build, so a trace with

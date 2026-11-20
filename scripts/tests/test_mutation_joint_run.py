@@ -161,17 +161,26 @@ class RoutineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state:
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--harness-runs", "block-sync/storage=20")
         self.assertIsNone(plan["latest"])
-        self.assertEqual([step["name"] for step in plan["steps"]], ["suite-manifest", "suite", "loop"])
+        self.assertEqual(
+            [step["name"] for step in plan["steps"]], ["qa-store-pull", "suite-manifest", "suite", "loop"]
+        )
         self.assertEqual(
             plan["order"],
-            ["suite-manifest", "suite", "loop", "cases", "triage-loop", "triage-libfuzzer", "completeness"],
+            ["qa-store-pull", "suite-manifest", "suite", "loop", "cases", "triage-loop", "triage-libfuzzer",
+             "completeness"],
         )
-        manifest, suite, loop = plan["steps"]
+        pull, manifest, suite, loop = plan["steps"]
+        store = str(Path(state).resolve() / "qa-store")
+        self.assertEqual(plan["store"], store)
+        self.assertEqual(pull["argv"][2:5], ["pull", "--dest", store])
         self.assertEqual(manifest["argv"][:3], ["cargo", "xtask", "sim-suite"])
         self.assertIn("--frozen", manifest["argv"])
-        self.assertEqual(suite["env"], {"RUSTFLAGS": "--cfg zakura_sim"})
+        self.assertEqual(suite["env"], {"RUSTFLAGS": "--cfg zakura_sim", joint.STORE_ENV: store})
+        for step in [manifest, loop, plan["cases"], *plan["triage"]]:
+            self.assertEqual(step["env"][joint.STORE_ENV], store, step["name"])
         self.assertIn("planted", suite["argv"])
         self.assertNotIn("--changed-since", loop["argv"])
+        self.assertNotIn("--store-changed", loop["argv"])
         self.assertEqual(loop["argv"][loop["argv"].index("--generate-runs") + 1], "20000")
         self.assertEqual(
             loop["argv"][loop["argv"].index("--generate-harness-runs") + 1], "block-sync/storage=20"
@@ -182,12 +191,14 @@ class RoutineTests(unittest.TestCase):
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--", "--jobs", "4")
         names = [step["name"] for step in plan["steps"]]
-        self.assertEqual(names, ["suite-manifest", "suite", "loop", "libfuzzer"])
-        for step in plan["steps"][2:]:
+        self.assertEqual(names, ["qa-store-pull", "suite-manifest", "suite", "loop", "libfuzzer"])
+        for step in plan["steps"][3:]:
             self.assertEqual(step["argv"][step["argv"].index("--changed-since") + 1], "a" * 40)
+            changed = step["argv"][step["argv"].index("--store-changed") + 1]
+            self.assertEqual(Path(changed).name, joint.STORE_CHANGED_FILES[step["name"]])
             self.assertEqual(step["argv"][-2:], ["--jobs", "4"])
             self.assertEqual(step["cwd"], "/c")
-        self.assertIn("libfuzzer", plan["steps"][3]["argv"])
+        self.assertIn("libfuzzer", plan["steps"][4]["argv"])
         self.assertEqual(plan["cases"]["argv"], ["cargo", "xtask", "planted", "loop", "--list", "--jobs", "4"])
 
     def test_the_libfuzzer_lane_runs_on_what_changed_since_its_own_pin(self):
@@ -195,7 +206,7 @@ class RoutineTests(unittest.TestCase):
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             (Path(state) / joint.LIBFUZZER_LATEST_FILE).write_text(json.dumps({"pinned": "b" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60")
-        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][2:]}
+        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][3:]}
         self.assertEqual(since, {"loop": "a" * 40, "libfuzzer": "b" * 40})
 
     def test_a_fuzz_budget_adds_the_suite_fuzz_and_its_archive_before_the_cases(self):
@@ -203,7 +214,7 @@ class RoutineTests(unittest.TestCase):
             plan = self.dry_run(state, "--fuzz-seconds", "600", "--fuzz-jobs", "2")
             suite_only = self.dry_run(state, "--suite-fuzz")
         self.assertEqual(plan["order"], [
-            "suite-manifest", "suite", "loop", "suite-fuzz", "archive",
+            "qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive",
             "cases", "triage-loop", "triage-libfuzzer", "completeness",
         ])
         steps = {step["name"]: step["argv"] for step in plan["steps"]}
@@ -221,6 +232,28 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(completeness[completeness.index("--suite-fuzz") + 1], str(Path(out) / "suite-fuzz.json"))
         fuzz = next(step["argv"] for step in suite_only["steps"] if step["name"] == "suite-fuzz")
         self.assertNotIn("--seconds", fuzz, "--suite-fuzz alone keeps each target's suite budget")
+
+    def test_planted_shards_add_the_days_shard_and_its_targets(self):
+        args = joint.argparse.Namespace(
+            store=None, planted_shards=7, planted_targets=True, sim_targets=True, harness_runs=[],
+            loop_args=[], generate_runs=1, libfuzzer_seconds=0, suite_fuzz=False, fuzz_seconds=0,
+        )
+        steps = joint.routine_steps("/c", "/s", "/s/run", None, args, day=7 * 1000 + 3)
+        names = [step["name"] for step in steps]
+        self.assertEqual(
+            names,
+            ["qa-store-pull", "suite-manifest", "suite", "planted", "planted-targets", "sim-targets", "loop"],
+        )
+        by_name = {step["name"]: step for step in steps}
+        self.assertEqual(by_name["planted"]["argv"], ["cargo", "xtask", "planted", "--shard", "3/7"])
+        self.assertEqual(by_name["planted-targets"]["argv"][1], f"+{joint.FUZZ_TOOLCHAIN}")
+        self.assertEqual(by_name["planted-targets"]["argv"][-3:], ["--targets", "--shard", "3/7"])
+        self.assertEqual(by_name["sim-targets"]["argv"][by_name["sim-targets"]["argv"].index("--out") + 1],
+                         "/s/run/sim-targets")
+        # Seven days run every shard once.
+        self.assertEqual({joint.planted_shard(7, day) for day in range(10, 17)}, {f"{i}/7" for i in range(7)})
+        off = joint.argparse.Namespace(**{**vars(args), "planted_shards": 0, "sim_targets": False})
+        self.assertNotIn("planted", [step["name"] for step in joint.routine_steps("/c", "/s", "/s/run", None, off)])
 
     def test_the_case_list_is_keyed_as_the_report_is(self):
         listed = [{"patch": "one.patch", "property": "p", "witness": {"test_target": "t", "test": "x"}}]
@@ -254,16 +287,19 @@ class RoutineTests(unittest.TestCase):
 
 
 class CumulativeTests(unittest.TestCase):
-    def routine(self, state, reports, libfuzzer_seconds="0", triage=None, failing=()):
+    def routine(self, state, reports, libfuzzer_seconds="0", triage=None, failing=(), pull=True):
         """Run the routine once with each step writing `reports[name]` as its report, if it has one.
 
         A `triage-<lane>` step calls `triage(argv)` if given, each step in
         `failing` exits 1, and the steps that ran are in `self.ran`.
         """
         self.ran = []
+        self.store = getattr(self, "store", {})
 
         def run_step(step, run_dir):
             self.ran.append(step)
+            if step["name"] == "qa-store-pull" and pull:
+                (Path(run_dir) / joint.STORE_MANIFEST_FILE).write_text(json.dumps(self.store))
             if step["name"] in reports:
                 out = Path(run_dir) / step["name"]
                 out.mkdir()
@@ -337,7 +373,8 @@ class CumulativeTests(unittest.TestCase):
 
             self.assertEqual(self.routine(state, {}, triage=record), 0)
             self.assertEqual(
-                [step["name"] for step in self.ran], ["suite-manifest", "suite", "loop", "triage-loop", "completeness"]
+                [step["name"] for step in self.ran],
+                ["qa-store-pull", "suite-manifest", "suite", "loop", "triage-loop", "completeness"],
             )
             second = sorted(Path(state, "runs").iterdir())[1]
             changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
@@ -366,13 +403,49 @@ class CumulativeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state:
             self.routine(state, {"loop": {"cases": [case("one.patch", "killed-by-named-rule")]}})
             with mock.patch.object(joint, "current_cases", return_value=None):
-                with mock.patch.object(joint, "run_step", return_value=0), \
+                with mock.patch.object(joint, "run_step", side_effect=self.pulled), \
                         mock.patch.object(joint, "pin", return_value="f" * 40), \
                         contextlib.redirect_stdout(io.StringIO()):
                     status = joint.main(["routine", "--checkout", "/c", "--state", state])
             self.assertEqual(status, 1)
             merged = json.loads((Path(state) / "cumulative.json").read_text())
             self.assertEqual(len(merged["cases"]), 1)
+
+    @staticmethod
+    def pulled(step, run_dir):
+        """A `run_step` that only writes an empty store manifest at the pull."""
+        if step["name"] == "qa-store-pull":
+            (Path(run_dir) / joint.STORE_MANIFEST_FILE).write_text("{}")
+        return 0
+
+    def test_the_loop_reruns_what_changed_in_the_store_since_its_pin(self):
+        killed = {"cases": [case("one.patch", "killed-by-named-rule")]}
+        with tempfile.TemporaryDirectory() as state:
+            self.store = {"qa/planted/a/x.toml": "1", "seeds/s.bin": "2"}
+            self.routine(state, {"loop": killed}, "60")
+            self.store = {"qa/planted/a/x.toml": "1", "seeds/s.bin": "3", "fixtures/f.json": "4"}
+            self.routine(state, {"loop": killed}, "60", failing={"libfuzzer"})
+            run_dir = sorted(Path(state, "runs").iterdir())[1]
+            self.assertEqual((run_dir / joint.STORE_CHANGED_FILES["loop"]).read_text(),
+                             "fixtures/f.json\nseeds/s.bin\n")
+            # The libFuzzer lane had no pin, so it diffs against the loop's.
+            self.assertEqual((run_dir / joint.STORE_CHANGED_FILES["libfuzzer"]).read_text(),
+                             "fixtures/f.json\nseeds/s.bin\n")
+            self.store = {"qa/planted/a/x.toml": "5", "seeds/s.bin": "3", "fixtures/f.json": "4"}
+            self.routine(state, {"loop": killed}, "60")
+            run_dir = sorted(Path(state, "runs").iterdir())[2]
+            self.assertEqual((run_dir / joint.STORE_CHANGED_FILES["loop"]).read_text(), "qa/planted/a/x.toml\n")
+            # Its failed run kept the first run's pin and manifest.
+            self.assertEqual((run_dir / joint.STORE_CHANGED_FILES["libfuzzer"]).read_text(),
+                             "fixtures/f.json\nqa/planted/a/x.toml\nseeds/s.bin\n")
+
+    def test_a_failed_pull_runs_nothing_else_and_keeps_the_pin(self):
+        with tempfile.TemporaryDirectory() as state:
+            self.routine(state, {"loop": {"cases": [case("one.patch", "killed-by-named-rule")]}})
+            latest = (Path(state) / joint.LATEST_FILE).read_text()
+            self.assertEqual(self.routine(state, {}, failing={"qa-store-pull"}, pull=False), 1)
+            self.assertEqual([step["name"] for step in self.ran], ["qa-store-pull"])
+            self.assertEqual((Path(state) / joint.LATEST_FILE).read_text(), latest)
 
     def test_a_blocked_generator_search_fails_the_unit_until_it_clears(self):
         blocked = {"cases": [case("one.patch", "killed-by-named-rule", [(11, "baseline-fails")])],
@@ -438,11 +511,12 @@ class CumulativeTests(unittest.TestCase):
             record = json.loads((run_dir / joint.ROUTINE_FILE).read_text())
         self.assertEqual(status, 1, "the first survivor is news")
         self.assertEqual(seen["order"], [
-            "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "triage-loop", "completeness",
+            "qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "triage-loop",
+            "completeness",
         ])
         self.assertEqual(
             list(seen["routine"]["steps"]),
-            ["suite-manifest", "suite", "loop", "suite-fuzz", "archive", "cases", "triage-loop"],
+            ["qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "cases", "triage-loop"],
         )
         self.assertEqual(len(seen["findings"]["loop"]["newly_surviving"]), 1)
         self.assertEqual(set(seen["findings"]["loop"]), set(joint.diff({}, {})))
@@ -453,6 +527,8 @@ class CumulativeTests(unittest.TestCase):
     def routine_with_completeness(seen):
         """Return a `run_step` that writes a loop report, and saves routine.json and findings.json at `completeness`."""
         def run_step(step, run_dir):
+            if step["name"] == "qa-store-pull":
+                (Path(run_dir) / joint.STORE_MANIFEST_FILE).write_text("{}")
             if step["name"] == "loop":
                 (Path(run_dir) / "loop").mkdir()
                 (Path(run_dir) / "loop" / joint.REPORT_FILE).write_text(

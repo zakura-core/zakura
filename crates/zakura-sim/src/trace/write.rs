@@ -133,9 +133,8 @@ fn check_line(line: &str, written: u64, max_bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Where a trace's blobs live: its own `blobs/` first, then the store
-/// committed at `crates/zakura-sim/tests/fixtures/blobs/`, so a committed
-/// trace can name a large fixture without a copy.
+/// Where a trace's blobs live: its own `blobs/`, or the directories a
+/// caller names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobStore {
     /// The directories to look in, in order. [`BlobStore::put`] writes to the
@@ -146,17 +145,12 @@ pub struct BlobStore {
 impl BlobStore {
     /// The store for the trace in `dir`.
     pub fn for_trace(dir: &Path) -> Self {
-        BlobStore::new(vec![dir.join(BLOBS_DIR), Self::committed()])
+        BlobStore::new(vec![dir.join(BLOBS_DIR)])
     }
 
     /// A store that looks in `dirs`, in order.
     pub fn new(dirs: Vec<PathBuf>) -> Self {
         BlobStore { dirs }
-    }
-
-    /// The committed store, in this crate's test fixtures.
-    pub fn committed() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/blobs")
     }
 
     /// Writes `bytes` to the first directory, named by their SHA-256, and

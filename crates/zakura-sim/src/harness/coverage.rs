@@ -46,12 +46,13 @@ impl Passing {
 pub enum Bypass {
     /// A test that runs a planted variant itself, as the race fixtures do.
     Test(Witness),
-    /// A patch `qa/planted/<property>/<name>.patch`, which `cargo xtask
-    /// planted` applies to a scratch checkout. The name is without
-    /// `.patch`.
+    /// A patch `qa/planted/<property>/<name>.patch` in the QA store
+    /// ([`crate::planted`]), which `cargo xtask planted` applies to a
+    /// scratch checkout. The name is without `.patch`. The suite manifest
+    /// checks that the case exists only when a store is present.
     Planted(&'static str),
-    /// A production patch relative to `qa/native-mutations`, bound to this
-    /// property in `cases.json`. The droplet mutation campaign runs it.
+    /// A production patch relative to the QA store's `qa/native-mutations`,
+    /// bound to this property in `cases.json`. The droplet mutation campaign runs it.
     Native(&'static str),
     /// No bug can violate the property yet: its check is missing what the
     /// reason names. Only a `Draft` property names one.
@@ -174,7 +175,7 @@ const fn header(property: &'static str, passing: &'static str) -> Coverage {
 }
 
 /// A header-sync generated property's row whose bypass is its planted
-/// case `case`, under `qa/planted/<property>/`, rather than
+/// case `case`, under the QA store's `qa/planted/<property>/`, rather than
 /// [`HEADER_BYPASS`].
 const fn header_caught(
     property: &'static str,

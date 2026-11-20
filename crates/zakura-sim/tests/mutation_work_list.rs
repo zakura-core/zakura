@@ -2,12 +2,17 @@
 //! enforced block-sync, block and discovery property exactly once, and
 //! each of them has a generator harness or a recorded reason it has none
 //! (mut-4.2).
+//!
+//! The work list and `cases.json` live in the QA store, so the tests that
+//! read them run only with `ZAKURA_QA_STORE` set, as the joint-run
+//! droplet's suite step sets it. Without a store they print that they
+//! skipped.
 #![cfg(zakura_sim)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
@@ -17,7 +22,7 @@ use zakura_sim::{
     property::Status,
 };
 
-/// The work list, relative to the repository root.
+/// The work list, relative to the QA store's root.
 const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
 
 /// The ID prefixes whose `Active` properties the loop must cover. Header
@@ -110,8 +115,18 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn work_list() -> WorkList {
-    let text = fs::read_to_string(root().join(WORK_LIST)).unwrap();
+/// The QA store's root, or `None` after printing that `test` skipped.
+#[allow(clippy::print_stderr)]
+fn store(test: &str) -> Option<PathBuf> {
+    let store = zakura_sim::planted::store_root();
+    if store.is_none() {
+        eprintln!("{test}: skipped, since no QA store is set");
+    }
+    store
+}
+
+fn work_list(store: &Path) -> WorkList {
+    let text = fs::read_to_string(store.join(WORK_LIST)).unwrap();
     toml::from_str(&text).unwrap_or_else(|error| panic!("{WORK_LIST}: {error}"))
 }
 
@@ -140,7 +155,10 @@ fn registered() -> BTreeMap<String, Status> {
 /// the shared wire path runs against is one of them.
 #[test]
 fn the_work_list_covers_every_active_id_once() {
-    let list = work_list();
+    let Some(store) = store("the_work_list_covers_every_active_id_once") else {
+        return;
+    };
+    let list = work_list(&store);
     assert_eq!(list.schema, 1);
     let registered = registered();
     let mut tables = BTreeMap::new();
@@ -264,7 +282,10 @@ fn covered(list: &WorkList, registered: &BTreeMap<String, Status>) -> BTreeSet<S
 /// misspelled ID fails here.
 #[test]
 fn every_covered_id_has_a_generator_or_a_reason() {
-    let list = work_list();
+    let Some(store) = store("every_covered_id_has_a_generator_or_a_reason") else {
+        return;
+    };
+    let list = work_list(&store);
     let registered = registered();
     let covered = covered(&list, &registered);
     let map = generator_harnesses();
@@ -290,14 +311,14 @@ fn every_covered_id_has_a_generator_or_a_reason() {
     );
 }
 
-/// The loop's retained cases, relative to the repository root.
+/// The loop's retained cases, relative to the QA store's root.
 const CASES: &str = "qa/native-mutations/cases.json";
 
 /// Panics unless `witness`, a work-list or `cases.json` witness, names
 /// something that exists: a `test` names a function in its
-/// `crates/zakura-sim/tests/<test_target>.rs`, and a `planted` or `input`
-/// names a file.
-fn check_witness(owner: &str, witness: &serde_json::Value) {
+/// `crates/zakura-sim/tests/<test_target>.rs`, a `seed` names a seed of the
+/// QA store `store`, and a `planted` names a file there.
+fn check_witness(store: &Path, owner: &str, witness: &serde_json::Value) {
     let field = |name: &str| witness.get(name).and_then(serde_json::Value::as_str);
     if let Some(test) = field("test") {
         let target = field("test_target")
@@ -312,12 +333,15 @@ fn check_witness(owner: &str, witness: &serde_json::Value) {
         );
     } else if let Some(name) = field("seed") {
         assert!(
-            zakura_sim::seed::find(name).is_some(),
+            store
+                .join(zakura_sim::seed::SEEDS_DIR)
+                .join(format!("{name}.bin"))
+                .is_file(),
             "{owner}: no seed is named {name}"
         );
     } else {
         let path = field("planted").unwrap_or_else(|| panic!("{owner}: unknown witness {witness}"));
-        assert!(root().join(path).is_file(), "{owner}: {path} doesn't exist");
+        assert!(store.join(path).is_file(), "{owner}: {path} doesn't exist");
     }
 }
 
@@ -326,8 +350,11 @@ fn check_witness(owner: &str, witness: &serde_json::Value) {
 /// `baseline-fails`.
 #[test]
 fn every_named_witness_exists() {
+    let Some(store) = store("every_named_witness_exists") else {
+        return;
+    };
     let as_json = |value: &toml::Value| serde_json::to_value(value).unwrap();
-    for entry in work_list().entry {
+    for entry in work_list(&store).entry {
         let witnesses = entry
             .instance
             .iter()
@@ -335,15 +362,15 @@ fn every_named_witness_exists() {
             .chain(entry.tables.iter().map(|table| &table.witness))
             .chain(&entry.witnesses);
         for witness in witnesses {
-            check_witness(&entry.id, &as_json(witness));
+            check_witness(&store, &entry.id, &as_json(witness));
         }
     }
-    let text = fs::read_to_string(root().join(CASES)).unwrap();
+    let text = fs::read_to_string(store.join(CASES)).unwrap();
     let cases: Vec<serde_json::Value> =
         serde_json::from_str(&text).unwrap_or_else(|error| panic!("{CASES}: {error}"));
     for case in &cases {
         if let Some(witness) = case.get("witness") {
-            check_witness(case["patch"].as_str().unwrap_or(CASES), witness);
+            check_witness(&store, case["patch"].as_str().unwrap_or(CASES), witness);
         }
     }
 }
@@ -374,7 +401,10 @@ fn every_handshake_rule_has_a_generator_harness() {
 /// once.
 #[test]
 fn every_test_witness_has_a_drawn_family_or_a_reason() {
-    let list = work_list();
+    let Some(store) = store("every_test_witness_has_a_drawn_family_or_a_reason") else {
+        return;
+    };
+    let list = work_list(&store);
     let map = generator_harnesses();
     let unreached: BTreeSet<&str> = list
         .no_generator
@@ -408,7 +438,7 @@ fn every_test_witness_has_a_drawn_family_or_a_reason() {
             );
         }
     }
-    let text = fs::read_to_string(root().join(CASES)).unwrap();
+    let text = fs::read_to_string(store.join(CASES)).unwrap();
     let cases: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
     let mut tested = BTreeSet::new();
     for case in &cases {

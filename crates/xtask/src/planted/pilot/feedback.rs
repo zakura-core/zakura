@@ -2,14 +2,15 @@
 //! `qa/mutation-pilot/feedback.toml`.
 //!
 //! The list freezes the comparison's bounds, seeds and arms, and names
-//! retained planted cases, each by its path under `qa/planted/`, with its
-//! property, fuzz target and fault class. [`read`] checks each case against
-//! the planted catalogue, the seed registry and the fuzz package's target
-//! table, and returns it as a pilot [`Case`] whose hashes are those of the
-//! tree's files. The
-//! runner then checks the same hashes in its checkout of `HEAD`
-//! ([`super::check_pins`]), so a case changed but not committed fails
-//! before any campaign runs.
+//! retained planted cases, each by its path under the QA store's
+//! `qa/planted/`, with its property, fuzz target and fault class. [`read`]
+//! checks each case against the store's planted cases and seeds and the
+//! fuzz package's target table, and returns it as a pilot [`Case`] whose
+//! hashes are those of the store's and the tree's files. The case's patch
+//! and witness are absolute paths in the store. The runner then checks the
+//! same hashes in its checkout of `HEAD` ([`super::check_pins`]), so a
+//! production file changed but not committed fails before any campaign
+//! runs.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -63,18 +64,22 @@ pub(super) struct List {
     pub(super) cases: Vec<Case>,
 }
 
-/// Reads and checks the case list in `repo_root` against the seed
-/// `registry`, and returns its bytes, for the report's digest, and its
+/// Reads and checks the case list in `repo_root` against the planted cases
+/// of the QA store `store` and the seed `registry`, and returns its bytes, for the report's digest, and its
 /// cases ([`resolve`]).
-pub(super) fn read(repo_root: &Path, registry: &Registry) -> Result<(Vec<u8>, List), BoxError> {
+pub(super) fn read(
+    repo_root: &Path,
+    store: &Path,
+    registry: &Registry,
+) -> Result<(Vec<u8>, List), BoxError> {
     let path = repo_root.join(LIST);
     let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let file: ListFile = toml::from_str(std::str::from_utf8(&bytes)?)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let targets = fuzz_targets(repo_root)?;
     check_libfuzzer_args(&file.bounds, &targets).map_err(|error| format!("{LIST}: {error}"))?;
-    let planted = cases(repo_root)?;
-    let cases = resolve(repo_root, &file.cases, &planted, registry, &targets)
+    let planted = cases(store)?;
+    let cases = resolve(repo_root, store, &file.cases, &planted, registry, &targets)
         .map_err(|error| format!("{LIST}: {error}"))?;
     Ok((
         bytes,
@@ -86,11 +91,11 @@ pub(super) fn read(repo_root: &Path, registry: &Registry) -> Result<(Vec<u8>, Li
     ))
 }
 
-/// Each of `entries` as a pilot case, from the `planted` cases under
-/// `repo_root`, the seed `registry`, which names each seed's harness, and
-/// the fuzz package's `targets`, each mapped to the harness it runs. A
-/// case's ID is its path, its production files are those its patch
-/// changes, and each hash is of the file in `repo_root`. Its witness is its
+/// Each of `entries` as a pilot case, from the `planted` cases in `store`,
+/// the seed `registry`, which names each seed's harness, and the fuzz
+/// package's `targets`, each mapped to the harness it runs. A case's ID is
+/// its path, its production files are those its patch changes in
+/// `repo_root`, and each hash is of the file in `store` or `repo_root`. Its witness is its
 /// planted case file, which names its seed: a campaign starts from no seed,
 /// so the pins only check that the case still names the same one.
 ///
@@ -100,6 +105,7 @@ pub(super) fn read(repo_root: &Path, registry: &Registry) -> Result<(Vec<u8>, Li
 /// runs another harness than the case's seed.
 pub(super) fn resolve(
     repo_root: &Path,
+    store: &Path,
     entries: &[Entry],
     planted: &[Planted],
     registry: &Registry,
@@ -112,10 +118,7 @@ pub(super) fn resolve(
             return Err(format!("{id} is listed twice").into());
         }
         let patch = Path::new(PLANTED_DIR).join(format!("{id}.patch"));
-        let Some(found) = planted
-            .iter()
-            .find(|case| case.patch == repo_root.join(&patch))
-        else {
+        let Some(found) = planted.iter().find(|case| case.patch == store.join(&patch)) else {
             return Err(format!("{id}: no planted case has the patch {}", patch.display()).into());
         };
         if entry.property != found.property {
@@ -153,6 +156,7 @@ pub(super) fn resolve(
             )
             .into());
         }
+        let patch = store.join(patch);
         let case_file = patch.with_extension("toml");
         let production_files = patched_files(repo_root, &found.patch)?
             .into_iter()
@@ -168,14 +172,14 @@ pub(super) fn resolve(
         resolved.push(Case {
             id: id.clone(),
             fault_class: entry.fault_class.clone(),
-            patch_sha256: file_sha256(&repo_root.join(&patch))?,
+            patch_sha256: file_sha256(&patch)?,
             patch,
             production_files,
             property: found.property.clone(),
             also_violates: found.also_violates.clone(),
             harness: seed_harness,
             target: entry.target.clone(),
-            witness_sha256: file_sha256(&repo_root.join(&case_file))?,
+            witness_sha256: file_sha256(&case_file)?,
             witness: case_file,
             equivalent: None,
             discovery_excluded: None,

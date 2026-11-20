@@ -821,8 +821,8 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
 /// is `long-payload`.
 pub const SCRIPTED: [&str; 1] = ["discovery/s4v2/services/over-owed-closes"];
 
-/// True if the generated ID `id` has a planted case under `qa/planted/`,
-/// so it isn't a `Draft`.
+/// True if the generated ID `id` has a planted case under the QA store's
+/// `qa/planted/`, so it isn't a `Draft`.
 pub fn has_planted_case(id: &str) -> bool {
     planted_trigger(id).is_some()
 }

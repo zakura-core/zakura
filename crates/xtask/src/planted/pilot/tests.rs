@@ -2403,34 +2403,37 @@ fn a_campaign_lane_reads_its_arm_and_attempts() {
     }
 }
 
-/// The committed feedback comparison's case list, checked against a
-/// registry that lists each case's seed on its target's harness. Only a
-/// built simulator lists the real registry.
+/// The committed feedback comparison's case list, checked against a store
+/// that holds a stub planted case for each listed case and a registry that
+/// lists each stub's seed on its target's harness. Each stub's patch changes
+/// `crates/zakura-network/src/lib.rs`. The real cases live in the QA store,
+/// which repository tests don't read.
 fn committed_list() -> feedback::List {
     let root = crate::repo_root().expect("xtask lives in the workspace");
+    let store = tempfile::tempdir().expect("a temporary store");
     let targets = fuzz_targets(&root).expect("cargo metadata reads it");
     let list: toml::Table = toml::from_str(
         &fs::read_to_string(root.join(feedback::LIST)).expect("the list is committed"),
     )
     .expect("the list parses");
+    let file = "crates/zakura-network/src/lib.rs";
     let rows = list["case"]
         .as_array()
         .expect("the list names cases")
         .iter()
         .map(|entry| {
             let field = |name: &str| entry[name].as_str().expect("a listed case's field");
-            let case_file = root
-                .join(PLANTED_DIR)
-                .join(format!("{}.toml", field("case")));
-            let case: toml::Table = toml::from_str(
-                &fs::read_to_string(&case_file).expect("the planted case is committed"),
+            let seed = field("case").replace('/', "-");
+            let case = store.path().join(PLANTED_DIR).join(field("case"));
+            fs::create_dir_all(case.parent().expect("a case has a property")).unwrap();
+            fs::write(
+                case.with_extension("patch"),
+                format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-a\n+b\n"),
             )
-            .expect("the planted case parses");
+            .unwrap();
+            fs::write(case.with_extension("toml"), format!("seed = \"{seed}\"\n")).unwrap();
             SeedRow {
-                name: case["seed"]
-                    .as_str()
-                    .expect("a listed case names a seed")
-                    .to_owned(),
+                name: seed,
                 harness: targets[field("target")]
                     .clone()
                     .expect("the target runs a harness"),
@@ -2440,18 +2443,15 @@ fn committed_list() -> feedback::List {
                 reason: None,
             }
         });
-    // Two listed cases may share a seed.
-    let mut rows: Vec<SeedRow> = rows.collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.dedup();
-    let registry = Registry::from_rows(rows).expect("each seed runs one harness");
-    feedback::read(&root, &registry)
+    let registry =
+        Registry::from_rows(rows.collect::<Vec<_>>()).expect("each seed runs one harness");
+    feedback::read(&root, store.path(), &registry)
         .expect("the committed list checks")
         .1
 }
 
 /// The committed case list resolves each case to its planted patch, case
-/// file and production files, and freezes ten seeds in both arms: ten cases
+/// file and production files in a stub store, and freezes ten seeds in both arms: ten cases
 /// on five targets, 300 campaigns of 600 s.
 #[test]
 fn the_feedback_list_plans_paired_arms() {
@@ -2550,14 +2550,15 @@ fn entry(id: &str, property: &str, target: &str) -> feedback::Entry {
     }
 }
 
-/// A listed case resolves to its planted patch, case file, its seed's
-/// harness, allowed properties and patched production files, hashed in the
-/// tree.
+/// A listed case resolves to its planted patch and case file in the store,
+/// its seed's harness, allowed properties and patched production files,
+/// hashed in the store and the tree. Here the store is the repository.
 #[test]
 fn a_listed_case_resolves_to_its_planted_case() {
     let (dir, planted, registry, targets) = planted_repo();
     let root = dir.path();
     let cases = feedback::resolve(
+        root,
         root,
         &[entry("p/q/name", "p/q", "t_one")],
         &[planted],
@@ -2569,9 +2570,9 @@ fn a_listed_case_resolves_to_its_planted_case() {
         panic!("one case: {cases:?}");
     };
     assert_eq!(case.id, "p/q/name");
-    assert_eq!(case.patch, Path::new("qa/planted/p/q/name.patch"));
+    assert_eq!(case.patch, root.join("qa/planted/p/q/name.patch"));
     assert_eq!(case.harness, "h/one");
-    assert_eq!(case.witness, Path::new("qa/planted/p/q/name.toml"));
+    assert_eq!(case.witness, root.join("qa/planted/p/q/name.toml"));
     assert_eq!(case.also_violates, ["p/also"]);
     let file = |path: &str| file_sha256(&root.join(path)).expect("the file is hashed");
     assert_eq!(
@@ -2637,6 +2638,7 @@ fn the_feedback_list_rejects_bad_cases() {
         (Vec::new(), &planted, "the list names no case"),
     ] {
         let error = feedback::resolve(
+            root,
             root,
             &entries,
             std::slice::from_ref(planted),

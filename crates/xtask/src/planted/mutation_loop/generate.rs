@@ -112,11 +112,11 @@ const DEFAULT_SECONDS: u64 = 600;
 /// the repository root.
 const FUZZ_DIR: &str = "qa/fuzz/sim";
 
-/// True if `changed`, paths relative to the repository root, holds one
-/// whose change can change any case's generator lanes under `flags`: the
-/// work list, whose `[[no-generator]]` records decide which cases get a
-/// lane, then the seed registry's source, whose inputs an `inproc` search
-/// skips ([`write_exclusions`]), or a file under [`FUZZ_DIR`], whose
+/// True if `changed`, paths relative to the repository's or the QA store's
+/// root, holds one whose change can change any case's generator lanes under
+/// `flags`: the store's work list, whose `[[no-generator]]` records decide
+/// which cases get a lane, then the store's seeds, whose inputs an `inproc`
+/// search skips ([`write_exclusions`]), or a file under [`FUZZ_DIR`], whose
 /// targets a `libfuzzer` lane builds. False with the lanes off, so a
 /// triage-only commit selects no case.
 pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {

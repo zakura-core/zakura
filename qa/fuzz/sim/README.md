@@ -22,11 +22,12 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 ```
 
 `sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
-manual dispatch, and `block_sync_storage` on its seeds alone. That run is a smoke: it shows each target still builds and
+manual dispatch, and `block_sync_storage` for one second. That run is a smoke: it shows each target still builds and
 runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
 campaigns. It caches `corpus/<target>/` under the target's name and a digest of
-its harness's `cargo xtask sim-versions` output, adds the harness's corpus seeds, and replays that corpus in a
-fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
+its harness's `cargo xtask sim-versions` output, and replays that corpus in a
+fresh process before fuzzing. The harnesses' seeds live in the QA store
+(`scripts/qa_store.py`), which CI doesn't read. `scripts/check-fuzz-campaign.py` fails a pull request
 whose target has no harness or no campaign.
 
 ## Targets
@@ -404,7 +405,7 @@ cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|no
 
 For each target, it resolves the harness through
 `[package.metadata.zakura-sim.targets]`, loads the harness's admitted
-seeds, builds the target with the pinned nightly, and runs the built target
+seeds from the QA store, builds the target with the pinned nightly, and runs the built target
 once on the seeds, with the suite row's libFuzzer arguments and
 `ZAKURA_SIM_STATS` set. The target's stats file must name the harness the
 table maps it to, so a target whose `sim_target!` runs another harness
@@ -431,8 +432,10 @@ would fail its targets out of memory. Each target gets one status:
   which libFuzzer cuts it to.
 
 It prints each target's status, the harness's own properties that applied
-and those that didn't, and the retained bypasses under `qa/planted/` whose
-seed runs on the harness, or that there are none. It then prints each harness that no target runs, with the reason
+and those that didn't, and the retained bypasses under the QA store's
+`qa/planted/` whose seed runs on the harness, or that there are none. It
+reads the seeds and bypasses from `$ZAKURA_QA_STORE`, and runs no seed
+without one. It then prints each harness that no target runs, with the reason
 its `[[missing-target]]` row in `qa/suite.toml` gives, so the report
 accounts for every harness. `<dir>/readiness.json` holds the same report,
 with each built target's commit, dirty state and toolchain from its build
@@ -458,17 +461,18 @@ its target: `--targets` prints the case with the reason and runs the rest.
 The nightly `zakura_sim targets` job in `tests-unit.yml` runs
 `cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
 requests. `planted --targets` rebuilds the patched `zakura-sim` and target
-for each case, which takes hours over the whole catalogue, so the nightly
-`zakura_sim planted targets` job runs it in shards, as
-[Long runs](#long-runs) says.
+for each case, which takes hours over the whole catalogue, so the joint-run
+droplet runs it in shards, as [Long runs](#long-runs) says.
 
 ## Seeds
 
-Curated seeds are built in code: the registry, `crates/zakura-sim/src/seed/`,
-builds each seed's full fuzz input from typed fields, a saved scenario's
-tag, or a fixed draw, and names its harness, the test that runs it and the
-property witnesses it carries. No seed is committed as bytes. A planted case
-or a mutation-loop witness names a seed by name.
+Seeds live in the QA store, not in the repository: `seeds/index.json` names
+each seed's harness, set, source and the property witnesses it carries, and
+`seeds/<name>.bin` holds its full fuzz input. `scripts/qa_store.py pull`
+fills the store from the Space, and `zakura-sim` reads it through
+`ZAKURA_QA_STORE`. Without a store there are no seeds. A planted case or a
+mutation-loop witness names a seed by name. No repository test reads a seed:
+a test builds its scenario in code or searches for its input.
 
 Each seed belongs to one set. Campaigns, `cargo xtask sim-targets` and
 `--out` run each `corpus` seed as an input that passes, so no corpus seed
@@ -484,7 +488,7 @@ AddressSanitizer build, far past a campaign's 30-second input timeout, so
 the seed would fail every campaign's first pass over its corpus. Its own
 tests and its planted case still run it.
 
-`cargo xtask sim-seeds` builds and validates one set's seeds against the
+`cargo xtask sim-seeds` validates one set's stored seeds against the
 current generators, the corpus by default or the set `--set` names. A seed
 that fails, such as one whose prefix decodes to another scenario, fails the
 command with the reason. With `--sim` and `--out`, it writes one harness's
@@ -523,7 +527,7 @@ main.
   for a target without a collector), the suite manifest's digest, each
   worker's libFuzzer seed and CPUs, the budget, libFuzzer flags and sanitizer
   variables such as `ASAN_OPTIONS`, and the
-  initial snapshot, which holds the harness's curated seeds. Each worker runs
+  initial snapshot, which holds the harness's seeds from the QA store. Each worker runs
   libFuzzer on its own corpus directory plus the initial snapshot, and
   restarts a process that ends early, such as at a crash or the abandonment
   limit, up to `--max-restarts` times. Each process's log keeps the first and
@@ -572,7 +576,7 @@ campaign segment. `start --parent <run> --corpus carry` carries the last
 snapshot over when the harness's versions didn't change and both segments'
 fuzzer builds are clean, since a dirty build can change the generator without
 changing a version.
-`--corpus seeds` starts from the curated seeds alone. Either way the previous
+`--corpus seeds` starts from the QA store's seeds alone. Either way the previous
 segment's manifests and snapshots stay in the store.
 
 ```console
@@ -640,31 +644,28 @@ only from a target with a collector.
 ## Long runs
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
-each target for two minutes, and runs `block_sync_storage` on its seeds
-alone. The `zakura_sim planted` job in `tests-unit.yml`
-splits `qa/planted/` into fourteen shards. Each night its two parts run the
-two shards the UTC weekday picks, with `cargo xtask planted --shard
-<index>/14`, so each case runs once a week. A
-case's shard follows from its position in path order. Adding or removing a
-case moves every later case to another shard, so across that change a case
-can run on two nights in a row or wait up to 13 nights. A shard that holds no
-case fails the run. Each shard has its own failure issue,
-`[nightly] zakura_sim planted shard <index>/14 failed`, and only a passing run
-of that shard closes it, so a pass of another shard can't close it. The
-`zakura_sim planted targets` job splits the cases that `--targets` keeps the
-same way, and runs `cargo xtask planted --targets --shard <index>/14`. Its
-failure issue for each shard is
-`[nightly] zakura_sim planted targets shard <index>/14 failed`. A remote
-host runs the rest, and its results never block a pull request.
+each target for two minutes. The planted cases and the seeds live in the QA
+store, which CI doesn't read, so the joint-run droplet checks them
+(`deploy/mutation-joint/README.md`). With `--planted-shards 7`, its daily
+routine splits the store's `qa/planted/` into seven shards and runs the
+day's shard with `cargo xtask planted --shard <index>/7`, so each case runs
+once a week. A case's shard follows from its position in path order. Adding
+or removing a case moves every later case to another shard, so across that
+change a case can run on two days in a row or wait up to 13 days. A shard
+that holds no case fails the run. `--planted-targets` also runs
+`cargo xtask planted --targets --shard <index>/7`, and `--sim-targets` runs
+`cargo xtask sim-targets` on the store's seeds. A failed step fails the
+routine's unit, and its results never block a pull request.
 
-`scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
+`scripts/sim-long-runs.sh` runs the whole catalogue from a checkout on a
+remote host, with `ZAKURA_QA_STORE` set. Each run
 writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs
 `cargo xtask planted` over the whole catalogue, then
 `cargo xtask planted --targets`. With `--seconds`, it then builds every
 target in [Targets](#targets), and then runs one [campaign](#campaigns) per
 target, all at once, each with the suite row's libFuzzer limits. Each
 target's store is `campaigns/<target>/` in the run's directory, and each
-campaign starts from the harness's curated seeds. A failed step doesn't stop
+campaign starts from the harness's seeds in the store. A failed step doesn't stop
 the later ones. The script fails if a planted check fails, if a campaign
 fails to build or start, or if a campaign doesn't end `complete`. Findings
 alone don't change a campaign's status; read them with

@@ -24,7 +24,7 @@ use zakura_sim::{
         ProcessExit, Worker,
     },
     harness::{HarnessEntry, HARNESSES},
-    seed::{self, SeedSet},
+    seed::{self, Seed},
     suite::{SuiteFile, SUITE_FILE},
 };
 
@@ -64,12 +64,13 @@ fn manifest() -> String {
     fs::read_to_string(root().join(FUZZ_PACKAGE).join("Cargo.toml")).unwrap()
 }
 
-/// Each target's own properties that no seed applies. These targets' seeds
-/// run honest and single-fault scenarios, and the coverage manifest names
+/// Each target's own properties that no input of [`inputs`] applies. These
+/// inputs run honest and single-fault scenarios, and the coverage manifest names
 /// the test where each listed property applies, such as a frame-conformance
-/// property on a faulted frame. A target missing from the list has seeds
-/// that apply every own property. A listed property that a seed now applies
-/// fails the test until it leaves the list, so the list only shrinks.
+/// property on a faulted frame. A target missing from the list has inputs
+/// that apply every own property. A listed property that an input now
+/// applies fails the test until it leaves the list, so the list only
+/// shrinks.
 ///
 /// `block-sync/capacity-release-wakes` applies only once the commit window
 /// fills, which only the slow-set capacity-release seeds
@@ -271,14 +272,37 @@ fn unapplied_allowed(target: &str) -> Vec<String> {
     allowed
 }
 
-/// Each declared target resolves to its registered harness, its harness has
-/// admitted seeds and no rejected one, and the seeds apply each of the
-/// harness's own properties and those of every harness the target covers,
-/// except the properties [`UNAPPLIED`] lists. A target without seeds, or
-/// whose seeds reach only the properties every harness checks, fails here
-/// before the nightly job runs it.
+/// The scenario families whose runs take minutes, as `harness/family`, which
+/// [`inputs`] leaves out.
+const SLOW_FAMILIES: [&str; 3] = [
+    "block-sync/storage/stuck-floor",
+    "block-sync/storage/above-window",
+    "block-sync/storage/decoded-input-stall",
+];
+
+/// `entry`'s inputs, named: the empty input, which runs the default scenario
+/// under the empty Plan, then each scenario family's tag under the empty
+/// Plan, but the [`SLOW_FAMILIES`]. The harnesses' seeds live in the QA
+/// store, which a repository test doesn't read.
+fn inputs(entry: &HarnessEntry) -> Vec<(String, Vec<u8>)> {
+    let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
+    for family in (entry.families)() {
+        let name = format!("{}/{}", entry.name, family.name);
+        if !SLOW_FAMILIES.contains(&name.as_str()) {
+            inputs.push((name, family.tag));
+        }
+    }
+    inputs
+}
+
+/// Each declared target resolves to its registered harness, and its
+/// harness's default scenario and scenario families ([`inputs`]) apply each
+/// of the harness's own properties and those of every harness the target
+/// covers, except the properties [`UNAPPLIED`] lists. A target whose inputs
+/// reach only the properties every harness checks fails here. The
+/// joint-run droplet's `cargo xtask sim-targets` runs the store's seeds.
 #[test]
-fn every_declared_target_runs_seeds_that_apply_its_properties() {
+fn every_declared_target_runs_inputs_that_apply_its_properties() {
     let suite = suite();
     let manifest = manifest();
     let declared = declared_targets(&suite);
@@ -286,37 +310,23 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
     let mut mismatched = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
-        let loaded = seed::load(SeedSet::Corpus, Some(entry.name));
-        assert!(
-            loaded.rejected.is_empty(),
-            "{}: {:?}",
-            target.name,
-            loaded.rejected
-        );
-        assert!(
-            !loaded.admitted.is_empty(),
-            "{} ({}) has no curated seed",
-            target.name,
-            entry.name
-        );
+        let inputs = inputs(entry);
         if let Some(max) = max_len(&target.args) {
-            for seed in &loaded.admitted {
+            for (name, input) in &inputs {
                 assert!(
-                    seed.input().len() <= max,
-                    "{}: -max_len={max} cuts {} ({} bytes)",
+                    input.len() <= max,
+                    "{}: -max_len={max} cuts {name} ({} bytes)",
                     target.name,
-                    seed.name,
-                    seed.input().len()
+                    input.len()
                 );
             }
         }
         let mut worker = Worker::new();
-        let reached: BTreeSet<String> = loaded
-            .admitted
+        let reached: BTreeSet<String> = inputs
             .iter()
-            .flat_map(|seed| {
-                let (outcome, applied) = run_seed(&mut worker, entry, seed.input());
-                assert_eq!(outcome, "clean", "{}", seed.name);
+            .flat_map(|(name, input)| {
+                let (outcome, applied) = run_seed(&mut worker, entry, input);
+                assert_eq!(outcome, "clean", "{name}");
                 applied
             })
             .collect();
@@ -339,7 +349,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             let (_, unapplied) = own_applicability(covered, &reached);
             assert!(
                 unapplied.is_empty(),
-                "{} covers {}, and no seed applies {unapplied:?}",
+                "{} covers {}, and no input applies {unapplied:?}",
                 target.name,
                 covered.name
             );
@@ -347,7 +357,7 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
     }
     assert!(
         mismatched.is_empty(),
-        "the seeds' unapplied own properties differ from UNAPPLIED; these entries match the seeds:\n{}",
+        "the inputs' unapplied own properties differ from UNAPPLIED; these entries match the inputs:\n{}",
         mismatched.join("\n")
     );
 }
@@ -388,47 +398,46 @@ fn declared_targets_are_the_sim_packages() {
     assert!(!declared.contains(&"fork_transitions".to_owned()));
 }
 
-/// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name one of them as input.
+/// A store's seed case is a bypass of the seeds it names, a typed case of
+/// none, and a case that names neither or both fails.
 #[test]
 fn bypasses_follow_their_seed() {
-    let load = |harness| seed::load(SeedSet::Corpus, Some(harness)).admitted;
-    let discovery = bypasses(&root(), &load("discovery/wait-complete")).unwrap();
-    assert_eq!(discovery.len(), 1, "{discovery:?}");
-    assert_eq!(discovery[0].property, "discovery/wait-complete-wakes");
+    let store = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = store.path().join("qa/planted").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "discovery/wait-complete-wakes/lost-wakeup.toml",
+        "seed = \"wait\"\n",
+    );
+    write("header-sync/storage-bound/other.toml", "seed = \"other\"\n");
+    write(
+        "header-sync/storage-bound/typed.toml",
+        "[typed]\nharness = \"header-sync/storage\"\nscenario = \"s.json\"\n",
+    );
+    let seed = |name: &str| Seed::new(name, "discovery/wait-complete", "s.rs", Vec::new());
+    let found = bypasses(store.path(), &[seed("wait")]).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].property, "discovery/wait-complete-wakes");
     assert_eq!(
-        discovery[0].patch,
+        found[0].patch,
         Path::new("qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch")
     );
-    let storage = bypasses(&root(), &load("header-sync/storage")).unwrap();
-    let patches: Vec<&Path> = storage
-        .iter()
-        .map(|bypass| bypass.patch.as_path())
-        .collect();
     assert_eq!(
-        patches,
-        [
-            "qa/planted/harness/direct-dispatch/locator-to-action-channel.patch",
-            "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
-            "qa/planted/header-sync/outstanding-work-bounded/secondary-reservation.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/consumed-locator-permit.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-locator-permit.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/shutdown-kept-queue.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
-        ]
-        .map(Path::new),
-        "{storage:?}"
+        bypasses(store.path(), &[seed("other"), seed("wait")])
+            .unwrap()
+            .len(),
+        2
     );
+    assert!(bypasses(store.path(), &[]).unwrap().is_empty());
+    write("header-sync/storage-bound/bad.toml", "checks = []\n");
+    assert!(bypasses(store.path(), &[seed("wait")])
+        .unwrap_err()
+        .contains("names neither"));
+    let empty = tempfile::tempdir().unwrap();
+    assert!(bypasses(empty.path(), &[seed("wait")]).unwrap().is_empty());
 }
 
 /// The harness's own properties leave out the ones every harness checks.

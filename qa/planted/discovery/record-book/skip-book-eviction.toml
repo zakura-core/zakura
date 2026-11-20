@@ -1,4 +1,0 @@
-# Stops evicting at the book limit, so a relay can grow the book without bound.
-seed = "discovery-record-book"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

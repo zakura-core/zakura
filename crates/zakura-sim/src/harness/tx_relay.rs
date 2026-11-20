@@ -875,13 +875,24 @@ pub const NEUTRAL_WITNESSES: [(&str, Prefix); 5] = [
         .expect("the witness fits its grammar")
     }),
     ("tx-relay: repeated cooldown", || {
-        // Both bad bodies, each earning a cooldown, decided after both
-        // arrive.
+        // A bad body earning a cooldown, then, once that cooldown ends,
+        // the second. The peer asks for an unknown id between waits, so
+        // its connection doesn't idle out.
         composed_prefix(
             0x09,
-            0x80 | 8 | 4,
+            8,
             0,
-            &[(0, RelayStep::AnnounceAll), (0, WAIT)],
+            &[
+                (0, RelayStep::Announce),
+                (0, WAIT_LONG),
+                (0, WAIT_COOLDOWN),
+                (0, RelayStep::AskUnknown),
+                (0, WAIT_COOLDOWN),
+                (0, RelayStep::AskUnknown),
+                (0, WAIT_LONG),
+                (0, RelayStep::Announce),
+                (0, WAIT_LONG),
+            ],
         )
         .expect("the witness fits its grammar")
     }),
@@ -919,6 +930,9 @@ fn steps_prefix(node: u8, peers: u8, answer: u8, steps: &[RelayStep]) -> [u8; CO
 
 /// Waits ten seconds.
 const WAIT_LONG: RelayStep = RelayStep::Wait { secs: 10 };
+
+/// Half the node's cooldown: two of these outlast it.
+const WAIT_COOLDOWN: RelayStep = RelayStep::Wait { secs: 300 };
 
 /// Each domain property's named witness, in the order
 /// [`crate::domain::tx_relay::IDS`] lists them.
@@ -1010,9 +1024,9 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
 /// steps.
 pub const BUDGET: u64 = 150_000;
 
-/// The budget of a scenario whose peer never answers, or that fills a
-/// pending set or a skip set: room for a park's three minutes, or for tens
-/// of thousands of ids.
+/// The budget of a scenario whose peer never answers, that fills a
+/// pending set or a skip set, or that waits out a cooldown: room for a
+/// park's three minutes, tens of thousands of ids, or ten minutes.
 pub const LONG_BUDGET: u64 = 1_200_000;
 
 impl Subsystem for TxRelayWire {
@@ -1029,10 +1043,14 @@ impl Subsystem for TxRelayWire {
     fn config(scenario: &RelayScenario) -> RunConfig {
         let long = scenario.peers.iter().any(|peer| {
             peer.answer == Answer::Never
-                || peer
-                    .steps
-                    .iter()
-                    .any(|step| matches!(step, RelayStep::FillPending | RelayStep::FillKnown))
+                || peer.steps.iter().any(|step| {
+                    matches!(
+                        step,
+                        RelayStep::FillPending
+                            | RelayStep::FillKnown
+                            | RelayStep::Wait { secs: 300 }
+                    )
+                })
         });
         let budget = if long { LONG_BUDGET } else { BUDGET };
         RunConfig {

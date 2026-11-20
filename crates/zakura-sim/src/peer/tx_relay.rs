@@ -235,7 +235,7 @@ pub enum RelayStep {
 impl RelayStep {
     /// The steps that keep every wire rule. A new one goes at the end, with
     /// a bump of the harness's generator.
-    pub const CONFORMANT: [RelayStep; 14] = [
+    pub const CONFORMANT: [RelayStep; 15] = [
         RelayStep::Announce,
         RelayStep::AnnounceAll,
         RelayStep::AnnounceFake { count: 1 },
@@ -250,6 +250,9 @@ impl RelayStep {
         RelayStep::Reopen,
         RelayStep::Wait { secs: 1 },
         RelayStep::Wait { secs: 10 },
+        // Half the idle timeout: a peer that sends between two of these
+        // outlasts the node's cooldown.
+        RelayStep::Wait { secs: 300 },
     ];
 
     /// The steps that break a rule, after [`Self::CONFORMANT`] in a

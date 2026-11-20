@@ -2236,7 +2236,7 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2278,7 +2278,9 @@ mod tests {
             DownloadAction::AddedToQueue
         );
         assert_eq!(
-            requests.recv().await.expect("other block starts"),
+            tokio::time::timeout(Duration::from_millis(1), requests.recv())
+                .await?
+                .expect("other block starts"),
             zn::Request::BlocksByHashFrom {
                 hashes: IndexSet::from([hash(99)]),
                 source: peer,
@@ -2323,7 +2325,9 @@ mod tests {
             downloads.download_and_verify(hash(99), None),
             DownloadAction::AddedToQueue
         );
-        requests.recv().await.expect("first download starts");
+        tokio::time::timeout(Duration::from_millis(1), requests.recv())
+            .await?
+            .expect("first download starts");
         assert_eq!(
             downloads.download_and_verify(block.hash(), None),
             DownloadAction::AddedToQueue
@@ -2400,7 +2404,9 @@ mod tests {
         let (mut downloads, mut requests) = downloads_reporting_requests(registry.clone());
         let peer = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
         downloads.download_and_verify(hash(99), Some(peer.clone()));
-        requests.recv().await.expect("occupying download starts");
+        tokio::time::timeout(Duration::from_millis(1), requests.recv())
+            .await?
+            .expect("occupying download starts");
         for nonce in 0..MAX_LOCAL_SUBMISSION_WAITS {
             let mut block = original.clone();
             let nonce = u8::try_from(nonce).expect("waiter bound fits in u8");

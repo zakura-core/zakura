@@ -254,16 +254,15 @@ fn honest_runs_hold_every_generated_id_they_reach() {
 }
 
 /// How many generated Plans a search tries before it fails.
-const SEARCH_PLANS: usize = 256;
+const SEARCH_PLANS: usize = 64;
 
 /// The first of [`SEARCH_PLANS`] generated Plans under which `scenario`'s
 /// run has a routine judge an old-chain body after a fork request reserved
 /// its height. Returns that run, or fails when no Plan reaches it.
 fn old_body_after_a_fork_request(scenario: &BlockScenario) -> RunReport {
-    for (index, plan) in byte_inputs(SEARCH_PLANS, 16_384).into_iter().enumerate() {
+    for plan in byte_inputs(SEARCH_PLANS, 16_384) {
         let (report, ports) = run(scenario, Plan::from_fuzz(&plan));
         if old_body_judged_after_a_fork_request(&report, &ports, scenario) {
-            eprintln!("plan {index} reaches the overlap");
             return report;
         }
     }

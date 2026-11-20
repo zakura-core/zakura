@@ -268,14 +268,12 @@ async fn the_control_exchange_gets_what_remains_of_the_admission_deadline() -> R
     // TLS and a slow claim use 600 ms of the deadline. The client never
     // opens the control stream.
     zakura_rt::time::sleep(Duration::from_millis(600)).await;
-    let peer = ZakuraPeerId::new(inbound.remote_id().as_bytes().to_vec())?;
-    let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&inbound), &peer);
+    let mut conn = ZakuraConnTrace::without_peer_on(&handler.trace, trace_conn_id(&inbound));
     let control_started = Instant::now();
     let result = handler
         .run_native_responder_handshake_with_permit(
             &inbound,
-            &peer,
-            &conn,
+            &mut conn,
             handler
                 .claim_pending_handshake(true)
                 .expect("the inbound handshake share has room"),

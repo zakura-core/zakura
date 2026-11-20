@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-20. Version 0.23.
+Status: draft for review, 2026-11-20. Version 0.24.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -51,6 +51,9 @@ charges once TLS starts, and reports when the endpoint admitted a
 connection; it changes ADM-3 and API-4, and §17t lists each change. Version
 0.23 names the Ed25519 public key `NodeKey`, apart from the `NodeId` that
 holds it. It updates ID-1, TLS-6 through TLS-8, API-1 and API-4. See §17u.
+Version 0.24 has a connection report the key TLS proved, and leaves the
+node ID for the application to bind; it changes TLS-8, ADM-9, OBS-3 and
+API-4, and §17v lists each change.
 
 ## 0. Conventions
 
@@ -185,9 +188,10 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   dialed `NodeId` to its verifier in memory.
 - **TLS-7.** The client verifier MUST abort unless the server presents the
   expected `NodeKey`.
-- **TLS-8.** Each endpoint MUST derive the peer's `NodeId` from the
-  `NodeKey` the peer proved in the TLS handshake. `Conn::remote_key()`
-  returns that key, and `Conn::remote_id()` returns the derived ID.
+- **TLS-8.** The server MUST take the client's `NodeKey` from the client's
+  certificate. `Conn::remote_key()` MUST return only a key proven this way.
+  The handshake proves a key and no node ID: `Conn::remote_id()` is `None`
+  until the application binds an ID (API-4).
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
   `bind_with` MAY replace the provider's random source and key-exchange
@@ -512,7 +516,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The slot MUST NOT be released earlier.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
-  `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
+  `remote_key()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
@@ -835,7 +839,8 @@ These are not configurable. Changing one needs a spec change.
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
+  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer` (null
+  until the application binds the connection's node ID),
   `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
@@ -928,8 +933,12 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     already taken over the attempt's accounting; otherwise the acceptor
     releases what `admit` reserved.
 - **API-4.** `Conn`:
-  - `remote_id()`, `remote_key()`, `admitted_ip()`, `admitted_addr()`,
+  - `remote_key()`, `admitted_ip()`, `admitted_addr()`,
     `admitted_at()`, `source_validated()`, `alpn()` and `stable_id()`.
+  - `bind_remote_id(NodeId)` and `remote_id()`. The application binds the
+    node ID once it has established which node holds `remote_key()`.
+    `remote_id()` returns it, and `None` before. The first ID bound stays,
+    and every clone of the connection sees it.
     `source_validated()` is
     `IncomingInfo::validated` for an inbound connection, and true for an
     outbound one. `admitted_at()` is the instant of the endpoint's `Accept`
@@ -1664,3 +1673,20 @@ Changed:
   to `NodeKey::verify_strict()`.
 - **API-4.** Adds `Conn::remote_key()`, the key the peer proved in the TLS
   handshake.
+
+## 17v. Changes in version 0.24
+
+The TLS handshake proves that the peer holds a key. Which node that key
+belongs to is a separate question, and the application answers it: Zakura's
+responder reads it from the peer's control hello, and its dialer knows which
+node it dialed. The connection reported the key as the node ID, so nothing
+marked the point where the ID became known. A node ID is still its key, so no
+ID and nothing on the wire changes.
+
+Changed:
+
+- **TLS-8.** The handshake yields a `NodeKey`, not a `NodeId`.
+- **ADM-9.** The `Conn` handed to the acceptor has a proven `remote_key()`.
+- **API-4.** `Conn::remote_id()` returns an `Option`, empty until
+  `Conn::bind_remote_id` is called.
+- **OBS-3.** A sample taken before the ID is bound has no `peer`.

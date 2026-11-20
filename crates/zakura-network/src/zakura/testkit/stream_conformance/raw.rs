@@ -24,6 +24,8 @@ use crate::{
 pub(crate) struct RawLayoutPeer {
     endpoint: QuicEndpoint,
     pub(crate) connection: Connection,
+    /// The node this peer dialed.
+    victim: zakura_quic::NodeId,
     limits: ZakuraLocalLimits,
     /// The layout's members, in layout order, once opened.
     members: Vec<(SendStream, RecvStream)>,
@@ -52,6 +54,7 @@ impl RawLayoutPeer {
         let endpoint = LocalEndpointFactory::with_limits(limits)
             .endpoint(seed)
             .await?;
+        let victim_id = victim.id;
         let connection = within("connect", async {
             Ok(endpoint.connect(victim, &[P2P_V2_ALPN]).await?)
         })
@@ -68,6 +71,7 @@ impl RawLayoutPeer {
         Ok(Self {
             endpoint,
             connection,
+            victim: victim_id,
             limits: limits.clone(),
             members: Vec::new(),
             siblings: std::collections::HashMap::new(),
@@ -106,7 +110,7 @@ impl RawLayoutPeer {
     pub(crate) async fn open_layout(&mut self, layout: &[Stream]) -> Result<(), BoxError> {
         self.members.clear();
         let multi = layout.len() > 1;
-        if i_open_collision_winner(&self.endpoint.local_id(), &self.connection.remote_id()) {
+        if i_open_collision_winner(&self.endpoint.local_id(), &self.victim) {
             let wire_id: u64 = rand_10::random::<u64>().max(1);
             for member in layout {
                 let (mut send, recv) = self.open_stream(member.kind, member.version).await?;

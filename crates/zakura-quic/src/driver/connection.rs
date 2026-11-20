@@ -27,7 +27,7 @@ use crate::{
     },
     endpoint::ConnectionSlot,
     error::{ReadError, WriteError},
-    key::NodeId,
+    key::NodeKey,
     socket::{SocketCell, UdpIo},
     sys::canonical_ip,
     tls,
@@ -133,7 +133,7 @@ struct ConnTask<S: UdpIo> {
     admitted: SocketAddr,
     handshake: Option<oneshot::Sender<Result<Handshake, ConnectionError>>>,
 
-    remote_id: Option<NodeId>,
+    remote_key: Option<NodeKey>,
     error: Option<ConnectionError>,
     /// Why this node closed the connection, for the final sample (OBS-3).
     local_close: Option<String>,
@@ -220,7 +220,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         hooks,
         admitted,
         handshake: Some(handshake),
-        remote_id: None,
+        remote_key: None,
         error: None,
         local_close: None,
         drained_sent: false,
@@ -344,7 +344,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
                 // API-4: the last handle dropped.
                 None => {
                     cmds_open = false;
-                    let reason: &'static [u8] = if task.remote_id.is_some() {
+                    let reason: &'static [u8] = if task.remote_key.is_some() {
                         b"all handles dropped"
                     } else {
                         b"handshake abandoned"
@@ -477,7 +477,7 @@ impl<S: UdpIo> ConnTask<S> {
     /// Runs when the IP changes and, while it differs from the admitted IP,
     /// on every sample, so a ban that lands after the move still applies.
     fn check_path(&mut self, recheck: bool) {
-        if self.remote_id.is_none() || self.error.is_some() {
+        if self.remote_key.is_none() || self.error.is_some() {
             return;
         }
         let ip = canonical_ip(self.conn.remote_address().ip());
@@ -627,10 +627,10 @@ impl<S: UdpIo> ConnTask<S> {
     fn on_connected(&mut self) {
         let session = self.conn.crypto_session();
         let handshake = Handshake {
-            remote_id: tls::remote_node_key(session).map(NodeId::from),
+            remote_key: tls::remote_node_key(session),
             alpn: tls::negotiated_alpn(session),
         };
-        self.remote_id = handshake.remote_id;
+        self.remote_key = handshake.remote_key;
         #[cfg(any(test, zakura_sim, feature = "test-support"))]
         let _ = self.shared.shared_id.set(tls::shared_id(session));
         metrics::gauge!("zakura.quic.connections").increment(1.0);
@@ -662,7 +662,7 @@ impl<S: UdpIo> ConnTask<S> {
                 }
             }
         }
-        if self.remote_id.is_some() {
+        if self.remote_key.is_some() {
             metrics::gauge!("zakura.quic.connections").decrement(1.0);
             let reason = match (&reason, self.local_close.take()) {
                 (ConnectionError::LocallyClosed, Some(local)) => local,
@@ -1149,9 +1149,7 @@ impl<S: UdpIo> ConnTask<S> {
         ConnSample {
             stable_id: self.shared.stable_id,
             outbound: self.conn.side().is_client(),
-            remote_id: self.remote_id.unwrap_or_else(|| {
-                unreachable!("samples run only after the handshake set remote_id")
-            }),
+            remote_id: self.shared.remote_id.get().copied(),
             admitted_ip: canonical_ip(self.admitted.ip()),
             rtt: path.rtt,
             cwnd: path.cwnd,
@@ -1168,7 +1166,7 @@ impl<S: UdpIo> ConnTask<S> {
 
     /// The 10 s sample: PATH-3's re-check, then OBS-3.
     fn sample(&mut self) {
-        if self.remote_id.is_none() || self.error.is_some() {
+        if self.remote_key.is_none() || self.error.is_some() {
             return;
         }
         self.check_path(true);
@@ -1298,7 +1296,7 @@ mod tests {
             hooks,
             admitted,
             handshake: Some(handshake),
-            remote_id: None,
+            remote_key: None,
             error: None,
             local_close: None,
             drained_sent: false,

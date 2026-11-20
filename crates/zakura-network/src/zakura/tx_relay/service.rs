@@ -1112,12 +1112,6 @@ impl Routine {
     /// task.
     fn finish(mut self) {
         self.step(|machine, shared, pool, now| machine.end(shared, pool, now));
-        #[cfg(zakura_sim)]
-        if let Some(observer) = &self.wiring.observer {
-            observer(TxRelayEvent::Ended {
-                session: self.machine.session().0,
-            });
-        }
         {
             let mut node = self.wiring.node.lock().expect("the node is never poisoned");
             node.sessions.remove(&self.machine.session());
@@ -1151,13 +1145,7 @@ impl Routine {
             return;
         };
         let message = match message {
-            TxRelayMessage::Hello {
-                serves,
-                max_tx_bytes,
-            } => Received::Hello {
-                serves: *serves,
-                max_tx_bytes: *max_tx_bytes,
-            },
+            TxRelayMessage::Hello { .. } => Received::Hello,
             TxRelayMessage::Inv(entries) => Received::Inv(entries.clone()),
             TxRelayMessage::GetTxs(id) => Received::GetTxs(*id),
             TxRelayMessage::Tx { id, body } => Received::Tx {
@@ -1187,7 +1175,6 @@ impl Routine {
             .filter_map(|effect| match effect {
                 RelayEffect::Ask { id, .. } => Some(SimEffect::Ask(*id)),
                 RelayEffect::Serve { id, .. } => Some(SimEffect::Serve(*id)),
-                RelayEffect::NotFound { id, .. } => Some(SimEffect::NotFound(*id)),
                 RelayEffect::Submit {
                     reservation, body, ..
                 } => Some(SimEffect::Submit {
@@ -1212,7 +1199,6 @@ impl Routine {
         let state = &self.machine.state;
         observer(TxRelayEvent::Stepped {
             session: session.0,
-            peer: self.io.connection.0.clone(),
             effects,
             state: SimState {
                 hello_serves: state.hello.map(|hello| hello.serves),
@@ -1224,7 +1210,6 @@ impl Routine {
                 waiting: state.waiting.len(),
                 known: state.known.len(),
                 cooling,
-                ended: self.machine.is_ended(),
             },
         });
     }

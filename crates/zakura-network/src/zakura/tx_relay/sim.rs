@@ -5,7 +5,7 @@
 //! A routine reports each step under the node's lock, so the steps of all
 //! sessions reach the observer in the order they happened.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::PoolHandle;
@@ -37,20 +37,6 @@ pub const PENDING_PER_PEER: usize = machine::PENDING_PER_PEER;
 /// Ids one session remembers its peer announcing or supplying.
 pub const KNOWN_CAP: usize = machine::KNOWN_CAP;
 
-/// How long a first stall refuses the peer's next sessions.
-pub const PARK_COOLDOWN: Duration = machine::PARK_COOLDOWN;
-
-/// The first cooldown a charge starts.
-pub const BASE_COOLDOWN: Duration = machine::BASE_COOLDOWN;
-
-/// The fixed part of a request's deadline.
-pub const BASE_DEADLINE: Duration = machine::BASE_DEADLINE;
-
-/// The latest a request's deadline falls after its sent time.
-pub fn max_span() -> Duration {
-    machine::peer::max_span()
-}
-
 /// Hears every [`TxRelayEvent`], in order.
 pub type TxRelayObserver = Arc<dyn Fn(TxRelayEvent) + Send + Sync>;
 
@@ -80,8 +66,6 @@ pub enum TxRelayEvent {
     Stepped {
         /// The session.
         session: u64,
-        /// Its peer.
-        peer: ZakuraPeerId,
         /// What the step did, in order.
         effects: Vec<SimEffect>,
         /// What the session holds after it.
@@ -94,23 +78,13 @@ pub enum TxRelayEvent {
         /// Its ids and sizes.
         entries: Vec<(UnminedTxId, u32)>,
     },
-    /// The session ended.
-    Ended {
-        /// The session.
-        session: u64,
-    },
 }
 
 /// A peer message, as the routine decoded it.
 #[derive(Clone, Debug)]
 pub enum Received {
     /// `Hello`.
-    Hello {
-        /// The requests it serves.
-        serves: u16,
-        /// Its largest transaction.
-        max_tx_bytes: u32,
-    },
+    Hello,
     /// `Inv`, with its ids and sizes.
     Inv(Vec<(UnminedTxId, u32)>),
     /// `GetTxs`.
@@ -133,8 +107,6 @@ pub enum SimEffect {
     Ask(UnminedTxId),
     /// The body of the id, for the data writer.
     Serve(UnminedTxId),
-    /// A `NotFound` for the id.
-    NotFound(UnminedTxId),
     /// A body went to the pool.
     Submit {
         /// The id its reservation was granted for.
@@ -178,8 +150,6 @@ pub struct SimState {
     pub known: usize,
     /// Whether the peer is cooling at the step's time.
     pub cooling: bool,
-    /// Whether the session ended.
-    pub ended: bool,
 }
 
 /// [`super::tx_relay_service`], reporting each session's steps to
@@ -205,10 +175,4 @@ pub fn tx_relay_service_observed(
         seeks: vec![tx_relay_service_id()],
         tx_relay_sessions: Some(sessions),
     }
-}
-
-/// How long a request may stay unanswered before its peer stalled: two
-/// spans past its sent time, at most.
-pub fn stall_bound() -> Duration {
-    max_span().saturating_mul(2)
 }

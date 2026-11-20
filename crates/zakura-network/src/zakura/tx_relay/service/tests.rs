@@ -171,6 +171,8 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
         inv_buckets: InvBuckets::default(),
         base: Instant::now(),
         unconditional: UnconditionalPeers::default(),
+        #[cfg(zakura_sim)]
+        observer: None,
     };
     (wiring, handed)
 }

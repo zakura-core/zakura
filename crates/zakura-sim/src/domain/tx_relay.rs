@@ -333,7 +333,6 @@ impl RelayEvidence {
                 session,
                 effects,
                 state,
-                ..
             } => {
                 for effect in effects {
                     self.effect(session, effect);
@@ -341,7 +340,6 @@ impl RelayEvidence {
                 self.state(session, state);
             }
             TxRelayEvent::InvSent { session, entries } => self.inv_sent(session, &entries),
-            TxRelayEvent::Ended { .. } => {}
         }
     }
 
@@ -356,7 +354,7 @@ impl RelayEvidence {
         let state = self.session(session);
         let cooling = state.state.cooling;
         match message {
-            Received::Hello { .. } => state.hello = true,
+            Received::Hello => state.hello = true,
             Received::Inv(entries) => {
                 let early = !state.hello;
                 for (id, size) in entries {
@@ -424,7 +422,6 @@ impl RelayEvidence {
                     );
                 }
             }
-            SimEffect::NotFound(_) => {}
             SimEffect::Submit {
                 requested,
                 body,

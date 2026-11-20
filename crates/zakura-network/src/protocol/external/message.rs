@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
+use tokio::time::Instant;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::sync::Arc;
@@ -27,21 +28,54 @@ use proptest_derive::Arbitrary;
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::serialization::arbitrary::datetime_full;
 
+/// A place in the node's block receipt order, reserved when a received `block` message started
+/// arriving. See [`crate::BlockAnnouncementHook::with_block_messages`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockReservation {
+    /// The receipt order the node reserved.
+    pub order: u64,
+    /// When the message's header was read.
+    pub started_at: Instant,
+}
+
 /// A block in a `block` message, with its hash computed once when the message is made.
 ///
 /// Sending a block uses its hash several times (tracking the upload, finding its checksum),
 /// and so does receiving one (matching it to a request, logging it). A block's hash is not
 /// stored in the block, so each use would otherwise hash the header again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct HashedBlock {
     hash: block::Hash,
     block: BlockHandle,
+    /// The receipt order reserved when this message started arriving, if it was received from a
+    /// connection that reserves them.
+    reservation: Option<BlockReservation>,
 }
+
+/// Messages carrying the same block are equal, whenever they arrived.
+impl PartialEq for HashedBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.block == other.block
+    }
+}
+
+impl Eq for HashedBlock {}
 
 impl HashedBlock {
     /// The hash of this block.
     pub fn hash(&self) -> block::Hash {
         self.hash
+    }
+
+    /// The receipt order reserved when this message started arriving, if one was.
+    pub fn reservation(&self) -> Option<BlockReservation> {
+        self.reservation
+    }
+
+    /// This block, received in a message that reserved `reservation` when it started arriving.
+    pub(crate) fn with_reservation(mut self, reservation: Option<BlockReservation>) -> Self {
+        self.reservation = reservation;
+        self
     }
 
     /// Returns the block, dropping its hash.
@@ -55,6 +89,7 @@ impl From<BlockHandle> for HashedBlock {
         Self {
             hash: block.hash(),
             block,
+            reservation: None,
         }
     }
 }

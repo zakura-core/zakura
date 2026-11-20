@@ -14,6 +14,7 @@ use std::{
 use super::*;
 use crate::{
     peer_set::ActiveConnectionCounter,
+    protocol::external::{BlockReservation, HashedBlock},
     zakura::{
         Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
         ZakuraUpgradeOutcome,
@@ -22,7 +23,7 @@ use crate::{
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
-use zakura_chain::{block, chain_tip::NoChainTip};
+use zakura_chain::{block, chain_tip::NoChainTip, serialization::ZcashDeserializeInto};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1391,6 +1392,82 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
         announce(&mut connection, byte).expect("passed through");
     }
     assert_eq!(count(), 9, "a new window allows four more announcements");
+}
+
+/// A completed `block` message that reserved an order reaches the hook with its reservation,
+/// at most four times per connection per window, without using up the `inv` allowance. A
+/// message without a reservation, or one that failed to decode, does not reach it.
+#[tokio::test(start_paused = true)]
+async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = received.clone();
+    let (hook, announced) = recording_hook();
+    let hook = hook.with_block_messages(
+        || unreachable!("only the codec reserves"),
+        move |hash, reservation| recorded.lock().unwrap().push((hash, reservation)),
+    );
+    let mut connection = hook.for_connection();
+    let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("block test vector should deserialize");
+    let reservation = |order| BlockReservation {
+        order,
+        started_at: tokio::time::Instant::now(),
+    };
+    let deliver = |connection: &mut ConnectionAnnouncements,
+                   msg: Result<Message, SerializationError>| {
+        register_inventory_status(
+            msg,
+            ConnectedAddr::new_isolated(),
+            &broadcast::channel(16).0,
+            &AnnouncedBlocks::default(),
+            connection,
+            &Default::default(),
+        )
+    };
+    let block_message = |order: Option<u64>| {
+        Ok(Message::Block(
+            HashedBlock::from(block.clone()).with_reservation(order.map(reservation)),
+        ))
+    };
+    let count = || received.lock().unwrap().len();
+
+    let _ = deliver(&mut connection, block_message(None));
+    let _ = deliver(
+        &mut connection,
+        Err(SerializationError::Parse("bad checksum")),
+    );
+    assert_eq!(
+        count(),
+        0,
+        "only a decoded block with a reservation is passed on"
+    );
+
+    for order in 1..=5 {
+        deliver(&mut connection, block_message(Some(order))).expect("passed through");
+    }
+    assert_eq!(
+        *received.lock().unwrap(),
+        (1..=4)
+            .map(|order| (block.hash(), reservation(order)))
+            .collect::<Vec<_>>(),
+        "the fifth block message in the window does not reach the hook",
+    );
+
+    deliver(
+        &mut connection,
+        Ok(Message::Inv(vec![InventoryHash::Block(block.hash())])),
+    )
+    .expect("passed through");
+    assert_eq!(
+        announced.lock().unwrap().len(),
+        1,
+        "block messages do not use the inv allowance"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    deliver(&mut connection, block_message(Some(6))).expect("passed through");
+    assert_eq!(count(), 5, "a new window allows more block messages");
 }
 
 /// A hook that records the hashes it is called with.

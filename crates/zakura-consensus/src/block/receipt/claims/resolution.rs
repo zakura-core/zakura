@@ -38,24 +38,23 @@ impl AnnouncementClaims {
             }
         };
 
-        let header = table.by_hash.get(&hash);
-        // An inv received during an earlier header apply is usable only if every apply fails.
-        let inv = height
+        // A legacy announcement is only recorded while the hash has no header claim with an
+        // earlier order. When both are present the legacy reservation therefore has the
+        // earlier order.
+        let announced = height
             .zip(table.announced.get(hash))
-            .filter(|(height, inv)| {
-                header.is_none_or(|header| inv.order < header.order)
-                    && *height >= table.floor
-                    && in_claim_window(*height, inv.tip_at_announcement)
+            .filter(|(height, announced)| {
+                *height >= table.floor && in_claim_window(*height, announced.tip_at_announcement)
             })
-            .map_or(Unclaimed, |(height, inv)| {
-                classify(ClaimSource::Inv, height, inv.order, inv.seen_at)
+            .map_or(Unclaimed, |(height, announced)| {
+                classify(announced.source, height, announced.order, announced.seen_at)
             });
-        if matches!(inv, Used { .. }) {
-            return inv;
+        if matches!(announced, Used { .. }) {
+            return announced;
         }
 
-        let Some(header) = header else {
-            return inv;
+        let Some(header) = table.by_hash.get(&hash) else {
+            return announced;
         };
         let header = classify(
             ClaimSource::Header,
@@ -63,9 +62,9 @@ impl AnnouncementClaims {
             header.order,
             header.seen_at,
         );
-        match (inv, header) {
+        match (announced, header) {
             (_, Used { .. }) | (Unclaimed, _) => header,
-            _ => inv,
+            _ => announced,
         }
     }
 }
@@ -77,6 +76,8 @@ pub(in crate::block::receipt) enum ClaimSource {
     Header,
     /// A legacy peer sent the first `inv` for the block.
     Inv,
+    /// A legacy `block` message carrying the block started arriving before any `inv` for it.
+    BlockMessage,
 }
 
 impl ClaimSource {
@@ -84,6 +85,7 @@ impl ClaimSource {
         match self {
             Self::Header => "header",
             Self::Inv => "inv",
+            Self::BlockMessage => "block",
         }
     }
 }

@@ -6,3 +6,5 @@ mod resource_inventory;
 mod vectors;
 
 mod network_bounds;
+
+mod block_reservation;

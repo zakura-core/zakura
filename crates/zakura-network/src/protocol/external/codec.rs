@@ -14,6 +14,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use chrono::{TimeZone, Utc};
 use indexmap::IndexMap;
+use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder};
 
 use zakura_chain::{
@@ -34,8 +35,8 @@ use crate::constants;
 use super::{
     addr::{AddrInVersion, AddrV1, AddrV2},
     message::{
-        Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH,
-        MAX_USER_AGENT_LENGTH,
+        BlockReservation, HashedBlock, Message, RejectReason, VersionMessage,
+        MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH, MAX_USER_AGENT_LENGTH,
     },
     types::*,
 };
@@ -45,6 +46,9 @@ mod tests;
 
 /// The length of a Bitcoin message header.
 const HEADER_LEN: usize = 24usize;
+
+/// The command of a `block` message.
+const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
 
 /// Bloom filter commands accepted and discarded for peer compatibility.
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
@@ -275,7 +279,12 @@ pub struct Builder {
     max_len: usize,
     /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
     block_checksums: BlockChecksums,
+    /// Reserves a receipt order when a `block` message starts arriving, if the node wants one.
+    reserve_block_order: Option<ReserveBlockOrder>,
 }
+
+/// Reserves a place in the node's block receipt order, returning the order.
+pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -285,6 +294,7 @@ impl Codec {
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
             block_checksums: BlockChecksums::default(),
+            reserve_block_order: None,
         }
     }
 
@@ -330,6 +340,19 @@ impl Builder {
     /// sends can reuse a block's remembered checksum.
     pub(crate) fn with_block_checksums(mut self, block_checksums: BlockChecksums) -> Self {
         self.block_checksums = block_checksums;
+        self
+    }
+
+    /// Call `reserve_block_order` when the header of each received `block` message is read,
+    /// and carry the reservation on the decoded block. Does nothing if it is `None`.
+    ///
+    /// Reserving at the header, before the body arrives, lets a large block rank ahead of
+    /// announcements that arrive while it is still being received.
+    pub(crate) fn with_block_order_reservation(
+        mut self,
+        reserve_block_order: Option<ReserveBlockOrder>,
+    ) -> Self {
+        self.reserve_block_order = reserve_block_order;
         self
     }
 }
@@ -629,6 +652,8 @@ enum DecodeState {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
+        /// The receipt order reserved when a `block` message's header was read.
+        reservation: Option<BlockReservation>,
     },
 }
 
@@ -640,11 +665,13 @@ impl fmt::Debug for DecodeState {
                 body_len,
                 command,
                 checksum,
+                reservation,
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
                 .field("command", &String::from_utf8_lossy(command))
                 .field("checksum", &checksum)
+                .field("reservation", &reservation)
                 .finish(),
         }
     }
@@ -709,10 +736,21 @@ impl Decoder for Codec {
                     // Reserve buffer space for the next arriving bytes, not the claimed body.
                     src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
+                    // Reserve before waiting for the body, so a rival announced while this
+                    // block arrives ranks behind it.
+                    let reservation = match &self.builder.reserve_block_order {
+                        Some(reserve) if command == *BLOCK_COMMAND => Some(BlockReservation {
+                            order: reserve(),
+                            started_at: Instant::now(),
+                        }),
+                        _ => None,
+                    };
+
                     self.state = DecodeState::Body {
                         body_len,
                         command,
                         checksum,
+                        reservation,
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -722,6 +760,7 @@ impl Decoder for Codec {
                     body_len,
                     command,
                     checksum,
+                    reservation,
                 } => {
                     if src.len() < body_len {
                         // Need to wait for the full body
@@ -774,7 +813,7 @@ impl Decoder for Codec {
                             b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
                             b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                             b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                            b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                            BLOCK_COMMAND => self.read_block(&mut body_reader, reservation),
                             b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
                             b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
                             b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
@@ -1026,14 +1065,20 @@ impl Codec {
         Ok(Message::GetAddr)
     }
 
-    fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+    fn read_block(
+        &self,
+        reader: &mut &[u8],
+        reservation: Option<BlockReservation>,
+    ) -> Result<Message, Error> {
         let result = self.deserialize_block_spawning(reader);
         let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(block.into()))
+        Ok(Message::Block(
+            HashedBlock::from(block).with_reservation(reservation),
+        ))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

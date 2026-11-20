@@ -682,7 +682,8 @@ where
     }
 
     /// Call `block_announcement_hook` for each block a peer announces in a single-block `inv`,
-    /// at most a few times per connection per window. Optional.
+    /// and for each `block` message if it was set up for them, at most a few times per
+    /// connection per window. Optional.
     ///
     /// If this is unset, announcements are not passed on.
     pub fn with_block_announcement_hook(
@@ -1679,6 +1680,7 @@ where
                 Codec::builder()
                     .for_network(&config.network)
                     .with_block_checksums(block_checksums)
+                    .with_block_order_reservation(block_announcement_hook.block_order_reservation())
                     .finish(),
             );
             let mut connection_tracker = connection_tracker;
@@ -2094,7 +2096,8 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 ///
 /// An `inv` that names exactly one block is a new block announcement, and is passed to
 /// `block_announcements` and written to `gossip_trace`. One that names several is the answer to
-/// a query.
+/// a query. A `block` message whose codec reserved a receipt order when it started arriving is
+/// also passed to `block_announcements`.
 pub(crate) fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
@@ -2109,6 +2112,11 @@ pub(crate) fn register_inventory_status(
             if let [InventoryHash::Block(hash)] = items[..] {
                 block_announcements.announce(hash);
                 gossip_trace.block_inv_received(hash);
+            }
+        }
+        Ok(Message::Block(block)) => {
+            if let Some(reservation) = block.reservation() {
+                block_announcements.block_received(block.hash(), reservation);
             }
         }
         // A request for the body or a missing response contradicts an earlier announcement.

@@ -226,20 +226,37 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
 }
 
 /// Claims receipt order in `announcement_claims` for each block a legacy peer newly announces,
-/// so legacy-only blocks follow the same equal-work rule as blocks whose headers arrive first.
+/// or starts sending in a `block` message, so legacy-only blocks follow the same equal-work rule
+/// as blocks whose headers arrive first.
 ///
 /// The best chain tip stands in for header sync's verified tip, which a node without native
 /// header sync never reports.
 fn legacy_block_announcement_hook(
     announcement_claims: zakura_consensus::AnnouncementClaims,
-    latest_chain_tip: impl ChainTip + Send + Sync + 'static,
+    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
 ) -> zakura_network::BlockAnnouncementHook {
+    let reserving_claims = announcement_claims.clone();
+    let block_message_claims = announcement_claims.clone();
+    let block_message_tip = latest_chain_tip.clone();
     zakura_network::BlockAnnouncementHook::new(move |hash| {
         // Before the first block is committed there is no tip to place a claim above.
         if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
             announcement_claims.note_announcement(hash, verified_tip);
         }
     })
+    .with_block_messages(
+        move || reserving_claims.reserve_order(),
+        move |hash, reservation| {
+            if let Some(verified_tip) = block_message_tip.best_tip_height() {
+                block_message_claims.note_block_message(
+                    hash,
+                    reservation.order,
+                    reservation.started_at,
+                    verified_tip,
+                );
+            }
+        },
+    )
 }
 
 /// The tasks spawned by the `start` command, which are all aborted when this is dropped.

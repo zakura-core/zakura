@@ -1264,7 +1264,7 @@ mod tests {
     ) -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
-            .client_config(key.public_key(), &[b"test"])
+            .client_config(Some(key.public_key()), &[b"test"])
             .unwrap();
         let mut endpoint = quinn_proto::Endpoint::new(Arc::default(), None, true, None);
         let admitted = "127.0.0.1:12345".parse().unwrap();

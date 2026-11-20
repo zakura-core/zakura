@@ -30,14 +30,16 @@ const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms 
     mapping: &[(SignatureScheme::ED25519, &[&ED25519_STRICT])],
 };
 
-/// Accepts the server only if its raw public key equals the dialed node's key (TLS-7).
+/// Accepts the server only if its raw public key is the key the dialer
+/// expects (TLS-7). A dialer that expects no particular key accepts any valid
+/// Ed25519 key, and learns which one from the handshake.
 #[derive(Debug)]
 pub(crate) struct ServerCertificateVerifier {
-    expected: NodeKey,
+    expected: Option<NodeKey>,
 }
 
 impl ServerCertificateVerifier {
-    pub(crate) fn new(expected: NodeKey) -> Self {
+    pub(crate) fn new(expected: Option<NodeKey>) -> Self {
         Self { expected }
     }
 }
@@ -57,10 +59,13 @@ impl ServerCertVerifier for ServerCertificateVerifier {
             ));
         }
 
-        // Comparing whole SPKI encodings checks both the constant Ed25519
-        // prefix and the key bytes.
-        let expected = super::ed25519_spki(&self.expected);
-        if expected.as_ref() != end_entity.as_ref() {
+        let acceptable = match &self.expected {
+            // Comparing whole SPKI encodings checks both the constant Ed25519
+            // prefix and the key bytes.
+            Some(expected) => super::ed25519_spki(expected).as_ref() == end_entity.as_ref(),
+            None => super::node_key_from_spki(end_entity.as_ref()).is_some(),
+        };
+        if !acceptable {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));

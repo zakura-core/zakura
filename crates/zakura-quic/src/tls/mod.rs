@@ -119,7 +119,7 @@ impl TlsConfig {
         let tls = Self::with_provider(secret_key, provider);
         #[cfg(any(test, zakura_sim))]
         inputs.provider_built(&tls.provider);
-        tls.client_config(secret_key.public_key(), &[b"zakura-quic/check"])?;
+        tls.client_config(Some(secret_key.public_key()), &[b"zakura-quic/check"])?;
         Ok(tls)
     }
 
@@ -160,10 +160,11 @@ impl TlsConfig {
     }
 
     /// Builds a client config that accepts only a server that proves the key
-    /// `expected` (TLS-7), and offers `alpns` in preference order.
+    /// `expected` (TLS-7), or any valid key when there is none, and offers
+    /// `alpns` in preference order.
     pub(crate) fn client_config(
         &self,
-        expected: NodeKey,
+        expected: Option<NodeKey>,
         alpns: &[&[u8]],
     ) -> Result<QuicClientConfig, TlsConfigError> {
         Ok(QuicClientConfig::try_from(
@@ -173,7 +174,7 @@ impl TlsConfig {
 
     fn rustls_client(
         &self,
-        expected: NodeKey,
+        expected: Option<NodeKey>,
         alpns: &[&[u8]],
     ) -> Result<rustls::ClientConfig, TlsConfigError> {
         let mut crypto =
@@ -373,7 +374,7 @@ mod tests {
         // Writing a ClientHello starts the key share.
         let starts = TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed);
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public_key(), &[b"a"])
+            .rustls_client(Some(NodeSecretKey::generate().public_key()), &[b"a"])
             .unwrap();
         let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
         rustls::ClientConnection::new(Arc::new(client), name).unwrap();
@@ -413,7 +414,7 @@ mod tests {
         let tls = TlsConfig::new(&NodeSecretKey::generate());
         let server = tls.rustls_server(vec![b"a".to_vec()]).unwrap();
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public_key(), &[b"a"])
+            .rustls_client(Some(NodeSecretKey::generate().public_key()), &[b"a"])
             .unwrap();
         assert_eq!(format!("{:?}", server.time_provider), "RuntimeUtc");
         assert_eq!(format!("{:?}", client.time_provider), "RuntimeUtc");
@@ -442,7 +443,7 @@ mod tests {
         assert_eq!(server.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);
 
         let peer = NodeSecretKey::generate().public_key();
-        let client = tls.rustls_client(peer, &[b"b", b"a"]).unwrap();
+        let client = tls.rustls_client(Some(peer), &[b"b", b"a"]).unwrap();
         assert!(!client.enable_sni);
         assert!(!client.enable_early_data);
         assert_eq!(client.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);

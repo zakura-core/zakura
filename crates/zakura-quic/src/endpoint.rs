@@ -29,7 +29,7 @@ use crate::{
     },
     error::{BindError, ConnectError},
     inputs::EndpointInputs,
-    key::{NodeAddr, NodeId, NodeSecretKey},
+    key::{NodeAddr, NodeId, NodeKey, NodeSecretKey},
     socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
     tls::{RuntimeUtc, TlsConfig},
@@ -164,6 +164,7 @@ type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
     pub(crate) id: NodeId,
+    pub(crate) key: NodeKey,
     pub(crate) config: QuicConfig,
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
@@ -293,6 +294,7 @@ impl QuicEndpoint {
         }
         let shared = Arc::new(Shared {
             id: secret.public(),
+            key: secret.public_key(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
@@ -399,6 +401,11 @@ impl QuicEndpoint {
     /// This endpoint's node ID.
     pub fn local_id(&self) -> NodeId {
         self.inner.shared.id
+    }
+
+    /// The Ed25519 key this endpoint proves in every TLS handshake.
+    pub fn local_key(&self) -> NodeKey {
+        self.inner.shared.key
     }
 
     /// The bound socket addresses, canonical (SOCK-10, SOCK-11).
@@ -581,7 +588,7 @@ impl QuicEndpoint {
             .claim_dial_slots(targets.len(), ceiling)
             .ok_or(ConnectError::ConnectionLimit)?;
 
-        let crypto = Arc::new(shared.tls.client_config(addr.id.key(), alpns)?);
+        let crypto = Arc::new(shared.tls.client_config(addr.key, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();
@@ -610,7 +617,7 @@ impl QuicEndpoint {
                     // Dropping `attempts` drops every other attempt, which
                     // closes those connections with code 0.
                     drop(attempts);
-                    return finish_dial(conn, handshake, addr.id, target, started);
+                    return finish_dial(conn, handshake, addr.key, target, started);
                 }
                 Err(error) => {
                     if best.as_ref().is_none_or(|best| error.rank() > best.rank()) {
@@ -775,7 +782,7 @@ impl QuicEndpoint {
 fn finish_dial(
     conn: ConnRef,
     handshake: Handshake,
-    expected: NodeId,
+    expected: Option<NodeKey>,
     target: SocketAddr,
     started: Instant,
 ) -> Result<Conn, ConnectError> {
@@ -786,15 +793,18 @@ fn finish_dial(
         });
     };
     // The verifier already enforced TLS-7; this guards against a verifier bug.
-    if handshake.remote_key != Some(expected.key()) {
+    let Some(remote_key) = handshake
+        .remote_key
+        .filter(|key| expected.is_none_or(|expected| expected == *key))
+    else {
         close(b"identity");
         return Err(ConnectError::WrongIdentity);
-    }
+    };
     let Some(alpn) = handshake.alpn else {
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected.key(), target, started, true, alpn))
+    Ok(Conn::new(conn, remote_key, target, started, true, alpn))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,

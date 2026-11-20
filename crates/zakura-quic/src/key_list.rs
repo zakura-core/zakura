@@ -7,7 +7,7 @@
 
 use blake2b_simd::Params;
 
-use crate::key::{NodeKey, KEY_LENGTH};
+use crate::key::{NodeId, NodeKey, KEY_LENGTH};
 
 /// The most entries a key list holds (ID-8).
 pub const MAX_NODE_KEYS: usize = 4;
@@ -137,21 +137,17 @@ impl NodeKeyList {
             })
     }
 
-    /// The hash that is this list's node ID: BLAKE2b-256 of the encoded list
-    /// (ID-9). Entries this release doesn't understand are hashed too, so
-    /// every release derives the same ID from the same list.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the node ID becomes this hash in the next commit")
-    )]
-    pub(crate) fn digest(&self) -> [u8; KEY_LENGTH] {
+    /// The node ID of the node these keys belong to: BLAKE2b-256 of the
+    /// encoded list (ID-9). Entries this release doesn't understand are
+    /// hashed too, so every release derives the same ID from the same list.
+    pub fn node_id(&self) -> NodeId {
         let hash = Params::new()
             .hash_length(KEY_LENGTH)
             .personal(NODE_ID_PERSONALISATION)
             .hash(&self.encode());
         let mut digest = [0; KEY_LENGTH];
         digest.copy_from_slice(hash.as_bytes());
-        digest
+        NodeId::from_bytes(&digest)
     }
 }
 
@@ -182,7 +178,7 @@ mod tests {
         let one = NodeKeyList::single(key());
         assert_eq!(one.encode().len(), 35);
         assert_eq!(
-            hex::encode(one.digest()),
+            one.node_id().to_string(),
             "b596e1f72ff13a26526121761aaa59cdc0b0414ec5673ffcf40e45613c624ce5"
         );
 
@@ -190,7 +186,7 @@ mod tests {
             .expect("increasing tags form a list");
         assert_eq!(two.encode().len(), 69);
         assert_eq!(
-            hex::encode(two.digest()),
+            two.node_id().to_string(),
             "a849105942d50fa486dfb52ce19533507e265f703349e9f24d413247a20bef99"
         );
     }
@@ -203,11 +199,11 @@ mod tests {
         let decoded = NodeKeyList::decode(&bytes).expect("an encoded list decodes");
 
         assert_eq!(decoded.encode(), bytes);
-        assert_eq!(decoded.digest(), list.digest());
+        assert_eq!(decoded.node_id(), list.node_id());
         assert_eq!(decoded.ed25519(), Some(key()));
         assert_ne!(
-            decoded.digest(),
-            NodeKeyList::single(key()).digest(),
+            decoded.node_id(),
+            NodeKeyList::single(key()).node_id(),
             "the unknown entry is part of the node ID"
         );
     }

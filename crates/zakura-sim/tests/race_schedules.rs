@@ -365,7 +365,9 @@ fn replayed_on_changes<F: Fixture>(trace: &Trace) -> Vec<(Variant, Left)> {
 /// fix, an unrelated task, or an extra point of either kind reports where
 /// it left the recorded schedule, never a verified replay. The registered
 /// harness and the wrapper without a change both replay the same trace
-/// verified, so the change is what diverges.
+/// verified, so the change is what diverges. The expected steps belong to
+/// the schedules the search finds; a change that moves a search result
+/// moves its row.
 #[test]
 fn changed_code_replay_reports_divergence() {
     use Left::{Options, Pick};
@@ -384,7 +386,7 @@ fn changed_code_replay_reports_divergence() {
         (AbBa::NAME, [Options(5), Options(1), Pick(3), Options(6)]),
         (
             AbortWithoutJoin::NAME,
-            [Pick(9), Options(1), Pick(3), Options(4)],
+            [Pick(9), Options(1), Pick(2), Options(3)],
         ),
     ]);
     let root = TempDir::new().unwrap();

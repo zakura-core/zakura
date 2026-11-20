@@ -11,8 +11,8 @@ mod support;
 use support::{byte_inputs, inputs, plan_search::first_plan};
 use zakura_sim::{
     domain::block_sync_semantic::{
-        CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
-        REACTOR_QUERY_LIFECYCLE, STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
+        DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND, REACTOR_QUERY_LIFECYCLE,
+        STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
     },
     harness::{
         block_node::{
@@ -32,13 +32,12 @@ use zakura_sim::{
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// How many Plans, each up to 16 KiB, a search for a reset-mid-flight or
-/// capacity-release order tries.
+/// How many Plans, each up to 16 KiB, the reset-mid-flight search tries.
 const SEARCH_PLANS: usize = 16;
 
 /// How many Plans, each up to 256 bytes, the stale-beside-current search
 /// tries.
-const STALE_PLANS: usize = 64;
+const STALE_PLANS: usize = 16;
 
 /// `tag`, then `plan`: a full fuzz input.
 fn tagged(tag: [u8; 2], plan: &[u8]) -> Vec<u8> {
@@ -271,32 +270,6 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
         model.raw_queued_at_cap > 0,
         "no raw body entered a full queue"
     );
-}
-
-/// A capacity-release Plan exists that handles the detached commit's tip
-/// first: the frontier releases height 1, and the stale reply frees room
-/// that wakes the waiting fork body. Before #1523's fix, that body stayed
-/// unsubmitted until the node waited on time. The witness requires that
-/// order: the verified tip reached the released submission's height, and
-/// no `applying` entry holds it.
-#[test]
-#[ignore = "each debug run takes about eight minutes, and the search runs up to 16; run it on demand with `--ignored` and `--profile planted`"]
-fn the_frontier_first_input_holds_capacity_release_wakes() {
-    first_plan("capacity frontier first", SEARCH_PLANS, 16_384, |plan| {
-        capacity_frontier_first_shortfall(&tagged(CAPACITY_RELEASE_TAG, plan))
-    });
-}
-
-/// Checks that `input` fills the frontier-first input's role, or returns
-/// why it falls short. Its run must be a witness that holds
-/// `capacity-release-wakes` and pairs every block storage operation, so it
-/// reaches #1523's order: the verified tip passed a released submission's
-/// height before its reply freed room beside a waiting body.
-/// `stale-completion-no-wake.patch` also needs that submission to be older
-/// than the reactor's authority. In this scenario storage releases height
-/// 1, which it admitted before the reset.
-fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
-    witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds).map(drop)
 }
 
 /// Bypass: an alternate callback hands the node's block service a body

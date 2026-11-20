@@ -6,6 +6,8 @@
 //! tries the empty Plan, which runs the tasks round-robin, then a fixed
 //! stream of short Plans.
 
+use std::time::Instant;
+
 use zakura_sim::{
     harness::{
         fixtures::{Fixture, Race, Scenario, Variant},
@@ -56,16 +58,29 @@ fn reaches<F: Fixture>(plan: &[u8]) -> bool {
 
 /// `F`'s schedule's Plan bytes: the empty Plan if it reaches the race, or
 /// else the first of [`SCHEDULE_PLANS`] short Plans that does.
+///
+/// It prints which Plan it picked and how long the search took, which
+/// `--nocapture` shows.
+#[allow(clippy::print_stderr)]
 pub fn schedule_plan<F: Fixture>() -> Vec<u8> {
-    std::iter::once(Vec::new())
+    let started = Instant::now();
+    let (index, plan) = std::iter::once(Vec::new())
         .chain(byte_inputs(SCHEDULE_PLANS, SCHEDULE_PLAN_BYTES))
-        .find(|plan| reaches::<F>(plan))
+        .enumerate()
+        .find(|(_, plan)| reaches::<F>(plan))
         .unwrap_or_else(|| {
             panic!(
                 "{}: no Plan of the empty one and {SCHEDULE_PLANS} short ones reaches the race",
                 F::NAME
             )
-        })
+        });
+    eprintln!(
+        "{} schedule: Plan {index} of {} passed after {:?}",
+        F::NAME,
+        SCHEDULE_PLANS + 1,
+        started.elapsed()
+    );
+    plan
 }
 
 /// `F`'s schedule as a full fuzz input of its own harness: the planted

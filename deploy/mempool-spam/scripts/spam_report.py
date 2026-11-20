@@ -52,13 +52,23 @@ def build_report(events: list[dict]) -> dict:
         tx["mined"] = tx["confirmations"] > 0
         in_mempool = tx.get("first_seen", {})
         in_block = tx.get("seen_in_block", {})
-        if "missing" not in tx:
-            tx["missing"] = [
-                name for name in node_names if name not in in_mempool and name not in in_block
-            ]
-        missed_by_node.update(tx["missing"])
+        if "unobserved" in tx:
+            missing = tx.get("missing", [])
+            tx["mempool_all"] = bool(node_names) and all(
+                name in in_mempool for name in node_names
+            )
+        else:
+            # Logged before a definite absence was told apart from a failed
+            # answer, or a mempool arrival from a first sighting in a block.
+            # Such a round proves neither that every node held the
+            # transaction nor that any missed it.
+            tx["seen_all"] = False
+            tx["mempool_all"] = False
+            tx["inconclusive"] = True
+            missing = []
+        tx["missing"] = missing
+        missed_by_node.update(missing)
         block_first_by_node.update(in_block.keys())
-        tx["mempool_all"] = bool(node_names) and all(name in in_mempool for name in node_names)
         # Spread covers mempool arrivals only. A node that first saw the
         # transaction in a block says when it was mined, not how gossip did.
         seen_values = list(in_mempool.values())
@@ -78,7 +88,10 @@ def build_report(events: list[dict]) -> dict:
         "submitted": len(submitted),
         "seen_all": sum(bool(tx.get("seen_all")) for tx in submitted),
         "mempool_all": sum(tx["mempool_all"] for tx in submitted),
-        "missed": sum(not tx.get("seen_all") for tx in submitted),
+        # A round where a node's answers never settled whether it held the
+        # transaction neither passes nor misses.
+        "inconclusive": sum(bool(tx.get("inconclusive")) for tx in submitted),
+        "missed": sum(bool(tx["missing"]) for tx in submitted),
         "mined": sum(tx["mined"] for tx in submitted),
         "unconfirmed": sum(not tx["mined"] for tx in submitted),
         "spread_p50_secs": percentile(spreads, 50),
@@ -107,6 +120,7 @@ def markdown(report: dict) -> str:
         f"- Submitted: **{summary['submitted']}**",
         f"- Seen on all nodes: **{summary['seen_all']}**",
         f"- In every mempool: **{summary['mempool_all']}**",
+        f"- Inconclusive rounds: **{summary['inconclusive']}**",
         f"- Propagation misses: **{summary['missed']}**",
         f"- Mined after drain: **{summary['mined']}**",
         f"- Still unconfirmed: **{summary['unconfirmed']}**",

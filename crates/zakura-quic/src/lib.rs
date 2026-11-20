@@ -43,7 +43,7 @@ pub use config::{
 };
 pub use conn::{
     BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,
-    DriverStats, LOAD_INTERVAL,
+    DriverStats, RttReader, LOAD_INTERVAL,
 };
 pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
 #[cfg(zakura_sim)]

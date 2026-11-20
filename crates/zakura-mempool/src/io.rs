@@ -35,7 +35,8 @@ use std::{future::Future, pin::Pin};
 use chrono::{DateTime, Utc};
 use zakura_chain::transaction::UnminedTx;
 use zakura_node_services::mempool::port::{
-    ChainEvent, ChainTip, LocalFault, PoolCommand, PoolInbox, ReservationId, Verdict,
+    ChainEvent, ChainTip, ChangeSeq, LocalFault, PoolCommand, PoolInbox, PoolSnapshot,
+    ReservationId, Verdict,
 };
 use zakura_rt::{
     collections::HashMap,
@@ -46,7 +47,9 @@ use zakura_rt::{
 
 use crate::{
     config::Config,
-    machine::{Effect, JobId, Limits, MempoolState, Outcome, Step, VerifyError, WaiterId},
+    machine::{
+        Effect, JobId, Limits, MempoolState, Outcome, PoolCounts, Step, VerifyError, WaiterId,
+    },
     storage::{SameEffectsTipRejectionError, StorageStats},
 };
 
@@ -128,6 +131,9 @@ pub struct MempoolIO<E, V> {
     replies: Vec<Box<dyn FnOnce() + Send>>,
     /// What storage held when its metrics were last emitted.
     emitted: StorageStats,
+    /// The pool's size when its gauges were last emitted, or `None` before
+    /// the first emission, so an empty pool still exports zeros.
+    emitted_counts: Option<PoolCounts>,
     /// Told about each chain event the core applies. See
     /// [`Self::on_tip_applied`].
     tips: Option<TipObserver>,
@@ -195,6 +201,7 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
             steps: Vec::new(),
             replies: Vec::new(),
             emitted: StorageStats::default(),
+            emitted_counts: None,
             tips: None,
         }
     }
@@ -412,10 +419,25 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
         self.emit_storage_metrics();
     }
 
+    /// Emits the core's own size gauges, if they changed since the last
+    /// emission: the pool readers and templates see, and what a reset took
+    /// out that is not back yet. See [`PoolCounts`].
+    fn emit_pool_counts(&mut self) {
+        let counts = self.machine.pool_counts();
+        if self.emitted_counts == Some(counts) {
+            return;
+        }
+        self.emitted_counts = Some(counts);
+        // Counts this small convert to `f64` exactly.
+        metrics::gauge!("mempool.core.transactions.pooled").set(counts.pooled as f64);
+        metrics::gauge!("mempool.core.transactions.readmitting").set(counts.readmitting as f64);
+    }
+
     /// Emits what storage holds under today's pool metric names, if it
     /// changed since the last emission. Counters grow by what storage counted
     /// since then.
     fn emit_storage_metrics(&mut self) {
+        self.emit_pool_counts();
         let stats = self.machine.storage_stats();
         if stats == self.emitted {
             return;
@@ -473,7 +495,7 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
 
     /// Publishes the batches, and one snapshot after them, when a batch
     /// changed anything or the snapshot's tip or state would differ. A
-    /// snapshot copies the pool, so steps that changed
+    /// snapshot copies the pool's indexes, so steps that changed
     /// nothing a reader sees publish nothing.
     ///
     /// Batches with no changes are published too when anything is, so the
@@ -488,8 +510,16 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
         }
         self.published = Some(now);
         let machine = &self.machine;
-        self.inbox
-            .publish_batches(batches, |last_change| machine.snapshot(last_change));
+        // Every change to what the pool holds is logged, so the last snapshot
+        // plus these changes is the pool now. The first snapshot starts from
+        // the empty pool the core starts with.
+        let previous = self.inbox.published();
+        let empty = PoolSnapshot::inactive(now.tip, ChangeSeq(0));
+        let previous = previous.as_deref().unwrap_or(&empty);
+        let changes: Vec<_> = batches.iter().flatten().copied().collect();
+        self.inbox.publish_batches(batches, |last_change| {
+            machine.next_snapshot(previous, &changes, last_change)
+        });
     }
 
     /// Starts a verification task for `job`.

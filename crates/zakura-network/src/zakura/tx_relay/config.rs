@@ -15,7 +15,7 @@ use super::machine::{FanOut, ADVERT_DELAY, WINDOW_FULL, WINDOW_SMALL};
 pub struct ZakuraTxRelayConfig {
     /// Whether to move transactions over `tx-relay`. Off by default. At full
     /// load, with 92 peers each announcing a full pool of its own, its
-    /// bookkeeping can use about 1.4 GiB of memory.
+    /// bookkeeping can use about 400 MiB of memory.
     pub enabled: bool,
 
     /// How long a session outside a transaction's fan-out window waits before

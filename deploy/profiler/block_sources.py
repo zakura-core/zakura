@@ -7,8 +7,8 @@ This module summarises the outcomes recorded in two trace tables:
 - `legacy_peer_request` `block_request_finish` rows of first (`advertised`) and second
   (`hedge`) block requests: how far each download was from its peer's score, by block size,
   and how often second requests were sent, delivered and won;
-- `delivery_score` `delivery_sample` rows, one per sample that changed a peer's score, which show
-  what the scores are made of;
+- `delivery_score` `delivery_sample` rows, which show what the scores are made of
+  and when a verified block arrived;
 - `delivery_score` `block_missed` rows, one per announced block a peer did not deliver,
   matched with the next observed block from the same connection.
 
@@ -29,7 +29,7 @@ MAX_SAMPLES = 300_000
 # much transfer time it leaves out.
 SIZE_BUCKETS = ((50_000, "under 50 KB"), (256 * 1024, "50-256 KB"), (None, "over 256 KB"))
 UNKNOWN_SIZE = "size not traced"
-SAMPLE_KINDS = ("ping", "transaction", "block", "carried_over")
+SCORE_SAMPLE_KINDS = ("ping", "transaction", "block", "carried_over")
 MISSED_REQUESTS = ("first", "second")
 
 
@@ -98,12 +98,14 @@ class BlockSources:
             with self._lock:
                 self._requests.append(request)
         elif event == "delivery_sample":
-            if row.get("kind") not in SAMPLE_KINDS or type(row.get("score_ms")) is not int:
+            kind = row.get("kind")
+            # A large block confirms delivery even on a peer whose round trip is still unknown.
+            if kind != "large_block" and (kind not in SCORE_SAMPLE_KINDS or type(row.get("score_ms")) is not int):
                 return
             sample = (
                 self._when(row),
                 (row.get("process_trace_id"), row.get("connection_id")),
-                row["kind"],
+                kind,
                 row.get("weight"),
             )
             with self._lock:
@@ -202,10 +204,10 @@ def sample_mix(samples):
     counts = collections.Counter(kind for _, _, kind, _ in samples)
     weights = [
         weight for _, _, kind, weight in samples
-        if kind != "carried_over" and isinstance(weight, (int, float))
+        if kind not in ("carried_over", "large_block") and isinstance(weight, (int, float))
     ]
     return {
-        "counts": {kind: counts.get(kind, 0) for kind in SAMPLE_KINDS},
+        "counts": {kind: counts.get(kind, 0) for kind in SCORE_SAMPLE_KINDS},
         "weight": spread(weights),
     }
 
@@ -217,7 +219,7 @@ def missed_blocks(misses, requests, samples):
         if r["delivered"]:
             delivered[r["connection"]].append(r["when"])
     for when, connection, kind, *_ in samples:
-        if kind == "block":
+        if kind in ("block", "large_block"):
             delivered[connection].append(when)
     counts = collections.Counter(kind for _, _, kind in misses)
     delays = collections.defaultdict(list)

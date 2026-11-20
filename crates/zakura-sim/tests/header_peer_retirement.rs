@@ -8,7 +8,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, process::Command};
 
 use zakura_network::zakura::observe::HeaderTargetPhase;
 
@@ -370,10 +370,10 @@ fn the_departure_fixture_repeats_a_a_and_a_b_a() {
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
 }
 
-/// The fixtures `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-retire-<name>.json`.
+/// The fixtures `cargo xtask planted` runs as typed cases. The QA store
+/// holds each as `fixtures/header-retire-<name>.json`.
 /// Each runs under the empty Plan.
-fn committed_fixtures() -> [(&'static str, LivenessScenario); 8] {
+fn typed_fixtures() -> [(&'static str, LivenessScenario); 8] {
     [
         ("timeout", LivenessScenario::Timeout { late_apply: false }),
         ("late-page", LivenessScenario::LatePage),
@@ -422,24 +422,15 @@ fn committed_fixtures() -> [(&'static str, LivenessScenario); 8] {
     ]
 }
 
-/// The committed fixture file `header-retire-<name>.<extension>`.
-fn fixture_file(name: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("header-retire-{name}.{extension}"))
-}
-
-/// Each committed fixture is its named fixture, as JSON, and holds
-/// and applies under the empty Plan.
+/// Each typed fixture reads back from its JSON, as the QA store holds it,
+/// and holds and applies under the empty Plan.
 #[test]
 fn the_committed_fixtures_match_their_names() {
-    for (name, fixture) in committed_fixtures() {
-        let committed: LivenessScenario = serde_json::from_str(
-            &fs::read_to_string(fixture_file(name, "json"))
-                .unwrap_or_else(|error| panic!("{name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(committed, fixture, "{name}");
+    for (name, fixture) in typed_fixtures() {
+        let json = serde_json::to_string(&fixture).expect("scenarios serialize");
+        let read: LivenessScenario =
+            serde_json::from_str(&json).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(read, fixture, "{name}");
         let (report, _, _) = run(fixture, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
@@ -451,22 +442,21 @@ fn the_committed_fixtures_match_their_names() {
     }
 }
 
-/// `record --witness` judges each committed fixture as `cargo xtask
-/// planted` runs it, expecting a hold, the trace ends idle, and `replay`
+/// `record --witness` judges each typed fixture as `cargo xtask planted`
+/// runs it, expecting a hold, the trace ends idle, and `replay`
 /// reruns it Exact in a fresh process.
 #[test]
-fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
+fn every_typed_fixture_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
             .args(args)
             .output()
             .expect("the binary runs")
     };
-    for (name, _) in committed_fixtures() {
+    for (name, fixture) in typed_fixtures() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let trace = dir.path().join("trace");
-        let scenario =
-            fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
+        let scenario = serde_json::to_string(&fixture).expect("scenarios serialize");
         let recorded = zakura_sim(&[
             "record",
             "--sim",

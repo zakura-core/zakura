@@ -584,7 +584,8 @@ fn witnesses() -> Vec<Witness> {
         all.push(drawn(HeaderStorage::NAME, name, input.clone()));
     }
     for (name, scenario) in planned_witnesses() {
-        let input = grammar::input(&scenario, &plan()).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let input =
+            grammar::input(&scenario, &plan()).unwrap_or_else(|error| panic!("{name}: {error}"));
         all.push(drawn(HeaderStorage::NAME, &name, input));
     }
     // fuzz-13's saved Plans, each its tag under the empty Plan.
@@ -773,8 +774,14 @@ fn searched_inputs() -> &'static BTreeMap<&'static str, Vec<u8>> {
 /// fuzz-13's `header-sync/wire` saved Plans, by witness name.
 const FUZZ_13_PLANS: [(&str, SavedPlan); 3] = [
     ("header-wire-reopen", SavedPlan::Reopen),
-    ("header-wire-old-page-after-reopen", SavedPlan::OldPageAfterReopen),
-    ("header-wire-outcome-crossing", SavedPlan::Act(Act::OutcomeCrossing)),
+    (
+        "header-wire-old-page-after-reopen",
+        SavedPlan::OldPageAfterReopen,
+    ),
+    (
+        "header-wire-outcome-crossing",
+        SavedPlan::Act(Act::OutcomeCrossing),
+    ),
 ];
 
 /// The fuzz-12 item 7 witnesses no search finds: each action and overlap
@@ -788,7 +795,10 @@ fn planned_witnesses() -> Vec<(String, StorageScenario)> {
         ("reset-reply", storage_witnesses::reset_reply_hold()),
         ("reconsider", storage_witnesses::invalidate_reconsider()),
         ("release", storage_witnesses::release_after_apply()),
-        ("reply-after-shutdown", storage_witnesses::reply_after_shutdown()),
+        (
+            "reply-after-shutdown",
+            storage_witnesses::reply_after_shutdown(),
+        ),
         ("reply-after-close", storage_witnesses::reply_after_close()),
     ]
     .into_iter()

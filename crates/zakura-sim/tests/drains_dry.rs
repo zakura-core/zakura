@@ -95,7 +95,10 @@ fn misend(report: Option<&RunReport>, witnesses: &[Expected]) -> Option<String> 
 /// plants its bugs must violate its properties, so neither runs.
 fn sweep() -> Vec<(String, &'static zakura_sim::harness::HarnessEntry, Vec<u8>)> {
     let mut inputs = Vec::new();
-    for entry in HARNESSES.iter().filter(|entry| !entry.machine && !entry.planted) {
+    for entry in HARNESSES
+        .iter()
+        .filter(|entry| !entry.machine && !entry.planted)
+    {
         inputs.push((format!("{} default", entry.name), entry, Vec::new()));
         for family in (entry.families)() {
             let name = format!("{}/{}", entry.name, family.name);

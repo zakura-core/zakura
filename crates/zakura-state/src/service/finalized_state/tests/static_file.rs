@@ -226,6 +226,78 @@ fn secondary_range_reads_include_blocks_the_primary_moved_later() {
 }
 
 #[test]
+fn a_lagging_secondary_reads_static_files_when_tx_by_loc_fails() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    let mut primary = FinalizedState::new(&config, &network).expect("state opens");
+    // The moved rows' files stay until the damage below.
+    primary.static_file_mover = Arc::new(StaticFileMover::with_file_delete_delay(
+        std::time::Duration::from_secs(3_600),
+    ));
+
+    // Genesis never moves, so it gets its own SST file, which stays readable.
+    commit(&mut primary, &blocks[..1]);
+    primary
+        .db
+        .compact_raw_transaction_range(Height(0), Height(1));
+    let genesis_files = primary.db.live_sst_paths_for_test("tx_by_loc");
+    // Widening a `u32` to `usize` is lossless on supported targets.
+    let before_move = STATIC_FILE_MOVE_THRESHOLD as usize;
+    commit(&mut primary, &blocks[1..before_move]);
+    primary
+        .db
+        .compact_raw_transaction_range(Height(1), Height(TEST_TIP + 1));
+    let moved_files: Vec<_> = primary
+        .db
+        .live_sst_paths_for_test("tx_by_loc")
+        .into_iter()
+        .filter(|path| !genesis_files.contains(path))
+        .collect();
+    assert!(!moved_files.is_empty());
+
+    // The secondary opens before the move and keeps that view.
+    let (_read_state, secondary, _non_finalized) =
+        crate::init_read_only(config, &network).expect("secondary opens alongside the primary");
+    commit(&mut primary, &blocks[before_move..]);
+    assert_eq!(secondary.static_file_transactions_tip(), None);
+
+    // Damaging the files under the handles the secondary already holds fails
+    // its `tx_by_loc` reads, like a deleted file it had no handle to.
+    for path in &moved_files {
+        let mut bytes = std::fs::read(path).expect("the secondary's view still lists the file");
+        let damaged = bytes.len() / 2;
+        bytes[..damaged].iter_mut().for_each(|byte| *byte ^= 0xFF);
+        std::fs::write(path, bytes).expect("the file can be rewritten in place");
+    }
+    let tx_by_loc = secondary
+        .db()
+        .cf_handle("tx_by_loc")
+        .expect("column family exists");
+    assert!(secondary
+        .db()
+        .zs_try_get::<_, _, RawBytes>(&tx_by_loc, &TransactionLocation::min_for_height(Height(1)))
+        .is_err());
+
+    // Point and range reads come from the primary's static files instead.
+    assert_chain_reads(&secondary, &blocks[..before_move]);
+    let expected: Vec<_> = blocks[..before_move]
+        .iter()
+        .flat_map(|block| block.transactions.iter().map(|tx| tx.hash()))
+        .collect();
+    let read: Vec<_> = secondary
+        .stored_transactions_by_location_range(
+            TransactionLocation::min_for_height(Height(0))
+                ..=TransactionLocation::max_for_height(Height(STATIC_FILE_MOVE_THRESHOLD - 1)),
+        )
+        .map(|(_, transaction)| transaction.hash())
+        .collect();
+    assert_eq!(read, expected);
+}
+
+#[test]
 fn static_files_win_over_a_rocksdb_row_at_a_moved_height() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
@@ -518,7 +590,7 @@ fn a_refused_open_keeps_a_jar_that_lost_its_config() {
             ..
         })
     ));
-    for suffix in ["", "off", "blk"] {
+    for suffix in ["", "off", "blk", "sum"] {
         assert!(
             base.with_extension(suffix).exists(),
             "the open keeps the jar's {suffix:?} file for recovery",

@@ -435,14 +435,77 @@ impl ZakuraDb {
         &self,
         heights: RangeInclusive<Height>,
     ) -> Vec<RangeInclusive<Height>> {
+        match self.readable_static_file_heights(self.retained_heights(heights)) {
+            Some(heights) => self.static_files.ranges_within(heights),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns `heights` without the heights below the pruning marker. Genesis
+    /// is never pruned, so a range from genesis keeps its start.
+    fn retained_heights(&self, heights: RangeInclusive<Height>) -> RangeInclusive<Height> {
         let floor = self
             .lowest_retained_height()
             .filter(|_| *heights.start() != Height(0));
         let start = floor.map_or(*heights.start(), |floor| floor.max(*heights.start()));
-        match self.readable_static_file_heights(start..=*heights.end()) {
-            Some(heights) => self.static_files.ranges_within(heights),
-            None => Vec::new(),
+        start..=*heights.end()
+    }
+
+    /// Handles a `tx_by_loc` read that failed with `error`, and returns the tip
+    /// of the static files on disk, which a secondary reads instead.
+    ///
+    /// The primary deletes a `tx_by_loc` table file once the move of every row in
+    /// it was recorded, [`MOVED_FILE_DELETE_DELAY`] earlier. A secondary whose
+    /// RocksDB view is older than that move can still look up those rows, and
+    /// RocksDB fails the read if this instance has no open handle to the deleted
+    /// file. The static files on disk already hold those blocks, so a secondary
+    /// rescans them and reads up to their tip, past the tip its own view
+    /// recorded. Finalized bodies don't change while it runs, because offline
+    /// rollback requires stopping secondaries first. It doesn't catch up with
+    /// the primary, because only its syncer may advance its view.
+    ///
+    /// The primary's own view never lists a deleted file, so it panics, like
+    /// any other database failure.
+    pub(crate) fn static_file_tip_after_failed_read(
+        &self,
+        error: rocksdb::Error,
+    ) -> Option<Height> {
+        if !self.db.is_read_only_secondary() {
+            panic!("unexpected database failure: {error}");
         }
+        tracing::debug!(
+            ?error,
+            "reading static files after a failed secondary tx_by_loc read"
+        );
+        if let Err(error) = self.static_files.rescan(self.secondary_keep_from()) {
+            tracing::warn!(?error, "failed to rescan secondary static files");
+            return None;
+        }
+        self.static_files.tip()
+    }
+
+    /// Returns the raw transactions of block `height` from static files, like
+    /// [`Self::static_file_block_transactions`], but up to the static files'
+    /// own tip, see [`Self::static_file_tip_after_failed_read`].
+    pub(crate) fn rescanned_static_file_block_transactions(
+        &self,
+        height: Height,
+    ) -> Option<Vec<RawBytes>> {
+        if self.is_pruned_height(height) {
+            return None;
+        }
+        self.read_static_file(|| self.static_files.block_transactions(height))
+    }
+
+    /// Returns the static file block ranges within `heights`, like
+    /// [`Self::static_file_ranges_within`], but up to the static files' own
+    /// tip, see [`Self::static_file_tip_after_failed_read`].
+    pub(crate) fn rescanned_static_file_ranges_within(
+        &self,
+        heights: RangeInclusive<Height>,
+    ) -> Vec<RangeInclusive<Height>> {
+        self.static_files
+            .ranges_within(self.retained_heights(heights))
     }
 
     /// Removes static file blocks above `height` after an offline rollback

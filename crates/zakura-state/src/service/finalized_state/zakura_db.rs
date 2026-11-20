@@ -645,6 +645,11 @@ impl ZakuraDb {
         self.db.live_sst_bytes_for_test(cf_name)
     }
 
+    /// Returns the paths of the current SST files of the column family named `cf_name`.
+    pub(crate) fn live_sst_paths_for_test(&self, cf_name: &str) -> Vec<std::path::PathBuf> {
+        self.db.live_sst_paths_for_test(cf_name)
+    }
+
     /// Returns every raw key and value in the column family named `cf_name`, in key order.
     pub(crate) fn raw_column_family_entries_for_test(
         &self,

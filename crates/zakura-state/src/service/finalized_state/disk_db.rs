@@ -519,17 +519,8 @@ impl ReadDisk for DiskDb {
         K: IntoDisk,
         V: FromDisk,
     {
-        let key_bytes = key.as_bytes();
-
-        // We use `get_pinned_cf` to avoid taking ownership of the serialized
-        // value, because we're going to deserialize it anyways, which avoids an
-        // extra copy
-        let value_bytes = self
-            .db
-            .get_pinned_cf(cf, key_bytes)
-            .expect("unexpected database failure");
-
-        value_bytes.map(V::from_bytes)
+        self.zs_try_get(cf, key)
+            .expect("unexpected database failure")
     }
 
     fn zs_contains<C, K>(&self, cf: &C, key: &K) -> bool
@@ -537,14 +528,8 @@ impl ReadDisk for DiskDb {
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk,
     {
-        let key_bytes = key.as_bytes();
-
-        // We use `get_pinned_cf` to avoid taking ownership of the serialized
-        // value, because we don't use the value at all. This avoids an extra copy.
-        self.db
-            .get_pinned_cf(cf, key_bytes)
+        self.zs_try_contains(cf, key)
             .expect("unexpected database failure")
-            .is_some()
     }
 
     fn zs_first_key_value<C, K, V>(&self, cf: &C) -> Option<(K, V)>
@@ -893,6 +878,53 @@ impl DiskDb {
         );
     }
 
+    /// Returns the value for `key` in `cf` like [`ReadDisk::zs_get`], but returns
+    /// a database error instead of panicking.
+    pub(crate) fn zs_try_get<C, K, V>(&self, cf: &C, key: &K) -> Result<Option<V>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        // `get_pinned_cf` avoids copying the value before it is deserialized.
+        Ok(self
+            .db
+            .get_pinned_cf(cf, key.as_bytes())?
+            .map(V::from_bytes))
+    }
+
+    /// Returns `true` if `cf` contains `key`, like [`ReadDisk::zs_contains`], but
+    /// returns a database error instead of panicking.
+    pub(crate) fn zs_try_contains<C, K>(&self, cf: &C, key: &K) -> Result<bool, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+    {
+        // `get_pinned_cf` avoids copying a value that is never used.
+        Ok(self.db.get_pinned_cf(cf, key.as_bytes())?.is_some())
+    }
+
+    /// Returns a forward iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_forward_range_iter_with_read_ahead`] when `read_ahead_bytes` is
+    /// set, that yields a database error instead of panicking. The iterator ends
+    /// after its first error.
+    ///
+    /// Holding this iterator open might delay block commit transactions.
+    pub(crate) fn zs_try_forward_range_iter<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        read_ahead_bytes: Option<usize>,
+    ) -> impl Iterator<Item = Result<(K, V), rocksdb::Error>> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_try_range_iter_with_direction(cf, range, false, read_ahead_bytes)
+    }
+
     /// Returns a forward iterator over the items in `cf` in `range`.
     ///
     /// Holding this iterator open might delay block commit transactions.
@@ -973,6 +1005,26 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
+        self.zs_try_range_iter_with_direction(cf, range, reverse, read_ahead_bytes)
+            .map(|result| result.expect("unexpected database failure"))
+    }
+
+    /// Returns an iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_range_iter_with_direction`], that yields a database error
+    /// instead of panicking. The iterator ends after its first error.
+    fn zs_try_range_iter_with_direction<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        reverse: bool,
+        read_ahead_bytes: Option<usize>,
+    ) -> impl Iterator<Item = Result<(K, V), rocksdb::Error>> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
         use std::ops::Bound::{self, *};
 
         // Replace with map() when it stabilises:
@@ -999,18 +1051,24 @@ impl DiskDb {
         // in previous RocksDB versions
         self.db
             .iterator_cf_opt(cf, opts, mode)
-            .map(|result| result.expect("unexpected database failure"))
-            .map(|(key, value)| (key.to_vec(), value))
+            .map(|result| result.map(|(key, value)| (key.to_vec(), value)))
             // Skip excluded "from" bound and empty ranges. The `mode` already skips keys
             // strictly before the "from" bound.
             .skip_while({
                 let range = range.clone();
-                move |(key, _value)| !range.contains(key)
+                move |result| {
+                    result
+                        .as_ref()
+                        .is_ok_and(|(key, _value)| !range.contains(key))
+                }
             })
             // Take until the excluded "to" bound is reached,
-            // or we're after the included "to" bound.
-            .take_while(move |(key, _value)| range.contains(key))
-            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+            // or we're after the included "to" bound. Errors pass through.
+            .take_while(move |result| match result {
+                Ok((key, _value)) => range.contains(key),
+                Err(_) => true,
+            })
+            .map(|result| result.map(|(key, value)| (K::from_bytes(key), V::from_bytes(value))))
     }
 
     /// Returns the RocksDB ReadOptions with a lower and upper bound for a range.
@@ -1546,6 +1604,18 @@ impl DiskDb {
             .property_int_value_cf(&cf, "rocksdb.live-sst-files-size")
             .expect("reading a test database property succeeds")
             .unwrap_or(0)
+    }
+
+    /// Returns the paths of the current SST files of the column family named `cf_name`.
+    #[cfg(test)]
+    pub(crate) fn live_sst_paths_for_test(&self, cf_name: &str) -> Vec<std::path::PathBuf> {
+        self.db
+            .live_files()
+            .expect("listing a test database's files succeeds")
+            .into_iter()
+            .filter(|file| file.column_family_name == cf_name)
+            .map(|file| self.db.path().join(file.name.trim_start_matches('/')))
+            .collect()
     }
 
     /// Deletes the SST files of `cf` whose keys all lie in `from..=to`, which

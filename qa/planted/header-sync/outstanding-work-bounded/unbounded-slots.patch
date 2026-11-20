@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index 9f71e35495..fe562f289f 100644
+index 868bba6423..4079b1c315 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -1452,8 +1452,9 @@ impl HeaderSyncReactor {
+@@ -1470,8 +1470,9 @@ impl HeaderSyncReactor {
          let Some(local) = self.committed_snapshot.as_ref() else {
              return;
          };
@@ -13,20 +13,20 @@ index 9f71e35495..fe562f289f 100644
          {
              return;
          }
-@@ -1496,7 +1497,7 @@ impl HeaderSyncReactor {
+@@ -1515,7 +1516,7 @@ impl HeaderSyncReactor {
              },
          );
          for (peer, target) in offers {
 -            if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
 +            if self.peer_work_queue.len() > zakura_header_chain::MAX_STAGED_TARGETS_V1 {
+                 // The pass would serve this offer next.
+                 self.state.note_waiting_for_slot(&peer);
                  break;
-             }
-             // Leave a held-back status unspent without counting it as refused on every event.
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
-index 30d6f23ae1..a19259b33a 100644
+index 8e21f8d297..aacc1228aa 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
-@@ -902,7 +902,7 @@ impl WorkPolicy {
+@@ -906,7 +906,7 @@ impl WorkPolicy {
              };
          }
          let mut release = None;

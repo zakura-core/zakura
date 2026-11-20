@@ -31,7 +31,8 @@ use crate::{
     observe::{StorageFact, StorageRequest},
     property::{
         Assume, AssumeRecord, Assumptions, Capture, CheckCtx, HasView, Kind, LivenessBound,
-        ObligationKey, Property, PropertyId, Source, Sources, Status, Subject, Verdict,
+        ObligationKey, Property, PropertyId, Source, Sources, Status, Subject, TriggerHistory,
+        Verdict,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, RunConfig, RunEnd, Sim,
 };
@@ -411,8 +412,14 @@ pub fn adversary_progress() -> Property<BlockProgress> {
         needs: &[Source::Storage, Source::View],
         status: Status::Draft,
         check: check_adversary_progress,
-        witness: None,
+        witness: Some(TriggerHistory::View(started_block_work)),
     }
+}
+
+/// [`ADVERSARY_PROGRESS`]'s trigger history: the node submitted a body,
+/// in a run whose deadline fits inside the park.
+fn started_block_work(view: &ProgressView, log: &ObservationLog) -> bool {
+    view.deadline.is_ok() && first_submission(log.entries()).is_some()
 }
 
 /// The node's first block storage submission in `entries`, by step.

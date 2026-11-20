@@ -1,9 +1,9 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index 7aa1720809..16039012ce 100644
+index 868bba6423..18d916791e 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -1342,7 +1342,9 @@ impl HeaderSyncReactor {
-             {
+@@ -1532,7 +1532,9 @@ impl HeaderSyncReactor {
+             if self.ordinary_headroom(&peer, &target.status) == 0 {
                  continue;
              }
 -            self.consider_advertised_header_target(peer, target.session_id, target.status);

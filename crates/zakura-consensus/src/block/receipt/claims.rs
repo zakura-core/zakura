@@ -296,9 +296,8 @@ impl AnnouncementClaims {
     /// window is checked against the tip at the start, so a rival committed while this block
     /// was arriving does not push it out.
     ///
-    /// No header check is needed here: the message passed its payload checksum, so its sender
-    /// held the whole block, proof of work included, when the message started. The order only
-    /// ranks a block after it is fully verified.
+    /// The reservation credits the transfer from when the receiver read the message header.
+    /// Only a fully verified block can use that order in an equal-work tie.
     pub fn note_block_message(
         &self,
         hash: block::Hash,

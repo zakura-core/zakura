@@ -69,13 +69,10 @@ The reservation is called a claim. Six rules define it:
   0.8 s of transfer, the miner's neighbour kept the miner's block in 0 of 10
   races with claims on, and 10 of 10 with claims off.
 
-  This is as safe as an `inv` claim. The message header carries the payload's
-  checksum, so a message that passes it was started by a sender that already
-  had the whole block. If that block is valid, its proof of work was done
-  before the message started, and an invalid block is never ranked. A sender gains nothing by
-  trickling the body slowly: an `inv` sent at the same moment would claim the
-  same place, and the body must still reach the verifier within the deadline
-  counted from the start.
+  The reservation gives the block credit for when this node first observed
+  the transfer. The body must reach the verifier within two seconds of the
+  receiver reading the message header. Only a fully verified block can use
+  that credit in an equal-work tie.
 - **Each block keeps its earliest claim of each kind, and neither is
   renewed.** A header claim, once made, is never replaced or renewed by
   delivering the header again. An `inv` for a block that already has a header

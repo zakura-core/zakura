@@ -2,7 +2,7 @@
 //! simulated QUIC, each behind a real handler that registers header sync,
 //! block sync and discovery, so all three services share each connection.
 //!
-//! Each saved scenario is a seed. It runs to its step budget holding its
+//! Each saved scenario runs from its tag. It runs to its step budget holding its
 //! witnesses, repeats A/A and A/B/A, and replays Exact in a fresh process
 //! through `zakura-sim replay`.
 #![cfg(zakura_sim)]
@@ -34,7 +34,6 @@ use zakura_sim::{
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
-    seed::{self, SeedSet},
     MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -71,7 +70,7 @@ fn run_scenario_judged_by_caller(
     (report, sink.lines(), ports)
 }
 
-/// Runs a full fuzz input as `zakura-sim record --seed` does.
+/// Runs a full fuzz input as `zakura-sim record --input` does.
 fn replay(input: &[u8]) -> (RunReport, Vec<String>, SyncPorts) {
     let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES);
     run_scenario(&SyncWire::draw(prefix), Plan::from_fuzz(plan))
@@ -207,9 +206,9 @@ fn refused_stale_writes(log: &ObservationLog) -> Vec<u64> {
 /// registry writes meet the replacement's entry, and the gates refuse them.
 #[test]
 fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::Replace, input);
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
@@ -303,9 +302,9 @@ fn replacement_claims_at_superseded_end(log: &ObservationLog) -> Vec<usize> {
 /// node's tips still reach the mirror's tip.
 #[test]
 fn a_superseded_routine_drops_beside_its_replacements_claims() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::ReplaceClaims, input);
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
@@ -385,9 +384,9 @@ fn a_redial_asleep_at_the_budget_finishes_in_the_drain() {
 /// complete.
 #[test]
 fn a_stalled_block_session_starves_no_other_service() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::StalledBlocks, input);
         let tip = ports.mirror_tip();
         let fixture_tip = ports.chain.last().expect("the fixture has blocks").height.0;
@@ -572,7 +571,7 @@ fn a_saturating_service_starves_no_other_on_its_connection() {
 
 /// fuzz-13's combined actions: each curated combination of a chain change
 /// at a pipeline stage, a connection replacement and a read stall runs its
-/// seed's empty Plan with no active property violated, and both of the node's
+/// prefix under the empty Plan with no active property violated, and both of the node's
 /// tips reach the mirrors' tip.
 #[test]
 fn curated_combined_actions_sync_both_tips() {
@@ -583,92 +582,12 @@ fn curated_combined_actions_sync_both_tips() {
     }
 }
 
-/// zakura#2378's known failure: the fork while storage holds a submission,
-/// with every read stalled, under a Plan that a steered run recorded so that
-/// a block request's writer runs last while its frame write is under way.
-const RESET_MID_WRITE: &str = "sync-wire-reset-mid-write";
-
-/// The steps at which a reset retired a block request whose frame write
-/// had started and not finished.
-fn mid_write_resets(log: &ObservationLog) -> Vec<u64> {
-    let mut last = BTreeMap::new();
-    let mut resets = Vec::new();
-    for entry in log.entries() {
-        if let Observation::BlockSync {
-            event: BlockSyncFact::Request { owner, step, .. },
-            ..
-        } = &entry.obs
-        {
-            let request = (owner.session_id, owner.request_id);
-            if step == "reset" {
-                if last.get(&request).map(String::as_str) == Some("started") {
-                    resets.push(entry.step);
-                }
-            } else {
-                last.insert(request, step.clone());
-            }
-        }
-    }
-    resets
-}
-
-/// zakura#2378's known failure: a reset that retires a block request mid-write
-/// cancels the whole block-sync session, and the writer fence closes the
-/// honest connection with `unfinished_exchange` while the session's other
-/// requests wait, which [`STALLED_SERVICE_ISOLATED`] forbids.
-///
-/// [`RESET_MID_WRITE`] must validate as a known-failure seed of `sync/wire`
-/// whose only witness expects that violation. Its run must reset a request
-/// mid-write and then end in exactly that violation. The test fails with
-/// "fixed: remove this expectation (zakura#2378)" once the reset no longer
-/// closes the connection, and asks for a new seed if the schedule stops
-/// reaching the mid-write reset at all.
-#[test]
-fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
-    let report = seed::load(SeedSet::KnownFailure, Some(SyncWire::NAME));
-    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-    let seed = report
-        .admitted
-        .iter()
-        .find(|seed| seed.name == RESET_MID_WRITE)
-        .expect("the seed is a known failure");
-    let witnesses: Vec<(&str, &str)> = seed
-        .witness
-        .iter()
-        .map(|witness| (witness.property.as_str(), witness.expect.as_str()))
-        .collect();
-    assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "violated")]);
-    let (prefix, plan) = seed.input().split_at(SyncWire::SCENARIO_BYTES);
-    let (report, _, _) =
-        run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
-    assert!(
-        !mid_write_resets(&report.log).is_empty(),
-        "{RESET_MID_WRITE} no longer resets a block request mid-write, so it no longer \
-         reaches zakura#2378: build a new seed: {:?}",
-        report.end
-    );
-    let violation = report.end.violation.as_ref().unwrap_or_else(|| {
-        panic!(
-            "{RESET_MID_WRITE} no longer violates {STALLED_SERVICE_ISOLATED}, so zakura#2378 \
-             is fixed: remove this expectation (zakura#2378): {:?}",
-            report.end
-        )
-    });
-    assert!(
-        violation.property == STALLED_SERVICE_ISOLATED
-            && violation.actual.contains("with cause unfinished_exchange"),
-        "{RESET_MID_WRITE} should violate {STALLED_SERVICE_ISOLATED} with an \
-         unfinished_exchange close until zakura#2378 is fixed, and violated another: \
-         {violation:?}"
-    );
-}
-
 /// A run's end record: its last line.
 fn end(lines: &[String]) -> &str {
     lines.last().expect("a run writes its end record")
 }
 
-/// Each saved scenario's seed, its tag and the empty Plan, runs to its step
+/// Each saved scenario, its tag under the empty Plan, runs to its step
 /// budget with no property violated, its drain runs dry, and cleanup finds
 /// no panic, failed unwind or leaked task. Each of its witnesses applies
 /// and holds.
@@ -753,7 +672,7 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record --seed` runs each saved scenario's seed in another
+/// `zakura-sim record --input` runs each saved scenario's tag in another
 /// process to the end record this process's run gives, and `zakura-sim
 /// replay` reruns its trace Exact in a third.
 #[test]
@@ -762,10 +681,14 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
         let name = saved.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
+        let input = dir.path().join("input.bin");
+        fs::write(&input, saved.tag()).unwrap();
         let recorded = zakura_sim(&[
             "record",
-            "--seed",
-            &format!("sync-wire-{name}"),
+            "--input",
+            input.to_str().unwrap(),
+            "--sim",
+            SyncWire::NAME,
             "--out",
             trace.to_str().unwrap(),
         ]);

@@ -1,13 +1,14 @@
 //! The six race fixtures from `scheduler.md`, run through `Sim` (S4.4).
 //! Every planted variant fails on some input, the fixes never do, and one
 //! worker hides the races inside a poll, as on the bare scheduler. Each
-//! fixture's witness test runs its saved schedule's Plan bytes, which reach
-//! the race's trigger history, on the race and on the fix.
+//! fixture's witness test runs its schedule's Plan bytes, which a bounded
+//! search finds to reach the race's trigger history, on the race and on the
+//! fix.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use support::inputs;
+use support::{inputs, race_schedule::schedule_plan};
 use zakura_sim::{
     harness::{
         fixtures::{
@@ -16,7 +17,6 @@ use zakura_sim::{
         },
         run_harness, Subsystem,
     },
-    seed,
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -138,23 +138,11 @@ fn witnessed<F: Fixture>(variant: Variant, input: &[u8]) -> WitnessScenario<Race
     }
 }
 
-/// `F`'s saved schedule's Plan bytes: the seed `race-schedule-<name>` after
-/// its scenario prefix, which `race_schedules.rs` checks encodes the planted
-/// race on 2 workers.
-fn saved_plan<F: Fixture>() -> Vec<u8> {
-    let name = format!("race-schedule-{}", F::NAME.trim_start_matches("race/"));
-    let input = seed::find(&name)
-        .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input()
-        .to_vec();
-    input[<Race<F> as Subsystem>::SCENARIO_BYTES..].to_vec()
-}
-
-/// `F`'s witness test (sched-4 S4.4): on its saved schedule's Plan bytes,
+/// `F`'s witness test (sched-4 S4.4): on its schedule's Plan bytes,
 /// the planted race reaches its trigger history and violates the property,
 /// and the fix reaches it too and holds.
 fn witness_test<F: Fixture>() {
-    let input = saved_plan::<F>();
+    let input = schedule_plan::<F>();
     check_witness(
         witnessed::<F>(Variant::Base, &input),
         F::NAME,
@@ -167,8 +155,8 @@ fn witness_test<F: Fixture>() {
     );
 }
 
-// The first three fixtures' saved Plans are empty, which runs the tasks in
-// round-robin order and interleaves them.
+// The first three fixtures' schedules are the empty Plan, which runs the
+// tasks in round-robin order and interleaves them.
 
 #[test]
 fn lost_update_witness() {

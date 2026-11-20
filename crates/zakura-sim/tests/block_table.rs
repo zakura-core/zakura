@@ -15,6 +15,7 @@ mod support;
 
 use support::{
     inputs,
+    plan_search::first_plan,
     script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{block_sync_streams, BlockSyncMessage, MSG_BS_BLOCK};
@@ -33,7 +34,6 @@ use zakura_sim::{
     },
     model::Label,
     observe::{BlockSyncFact, RowAt, StorageFact, StorageRequest, StreamId},
-    seed::{self, draws::byte_input},
     table::{GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -251,11 +251,15 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
+/// How many Plans, each up to 16 KiB, a search for an old-chain body after
+/// a fork request tries.
+const OLD_BODY_PLANS: usize = 16;
+
 /// The Plan under which [`old_chain_scenario`]'s run has a routine judge an
 /// old-chain body after a fork request reserved its height
-/// ([`old_chain_shortfall`]): the first of 64 fuzz Plans that does.
+/// ([`old_chain_shortfall`]): the first of [`OLD_BODY_PLANS`] that does.
 fn old_chain_plan() -> Vec<u8> {
-    byte_input(64, 16_384, 0)
+    first_plan("old chain", OLD_BODY_PLANS, 16_384, old_chain_shortfall)
 }
 
 /// True if a routine judged an old-chain body of a height past
@@ -380,36 +384,47 @@ fn old_chain_shortfall(plan: &[u8]) -> Result<(), String> {
 /// must refuse its hash.
 #[test]
 fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
-    if let Err(shortfall) = old_chain_shortfall(&old_chain_plan()) {
-        panic!("{shortfall}");
-    }
+    old_chain_plan();
 }
 
-/// The stale-request-body seed holds `receiver-work-authorized` after an
-/// old-chain body answers a stale request for a height that a fork request
-/// reserves. With
-/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
-/// the routine credits that body to the fork request, and the same seed
-/// violates it.
-#[test]
-fn the_stale_request_body_input_holds_receiver_work_authorized() {
-    let input = seed::find("block-sync-stale-request-body")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
-    let (prefix, plan) = input.split_at(Storage::SCENARIO_BYTES);
-    let scenario = Storage::draw(prefix);
-    assert_eq!(scenario, BlockScenario::reset_mid_flight());
+/// Checks that `plan` fills the stale-request-body role, or returns why it
+/// falls short. The reset-mid-flight scenario's run under it must end
+/// without a violation, hold `receiver-work-authorized`, and have a routine
+/// judge an old-chain body for a height past the fork after a fork request
+/// reserved that height.
+fn stale_request_body_shortfall(plan: &[u8]) -> Result<(), String> {
+    let scenario = BlockScenario::reset_mid_flight();
     let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        held(&report, &id("block/receiver-work-authorized")),
-        "{:?}",
-        report.properties
-    );
-    assert!(
-        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
-        "no routine judged an old-chain body after a fork request reserved its height"
+    if report.end.violation.is_some() {
+        return Err(format!("a violation: {:?}", report.end));
+    }
+    if !held(&report, &id("block/receiver-work-authorized")) {
+        return Err(format!(
+            "receiver-work-authorized didn't hold: {:?}",
+            report.properties
+        ));
+    }
+    if !old_body_judged_after_a_fork_request(&report, &ports, &scenario) {
+        return Err(
+            "no routine judged an old-chain body after a fork request reserved its height"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// A reset-mid-flight Plan exists whose run holds `receiver-work-authorized`
+/// after an old-chain body answers a stale request for a height that a fork
+/// request reserves. With
+/// `stale-body-credits-current-owner.patch`, the routine credits that body
+/// to the fork request, and the same input violates it.
+#[test]
+fn a_stale_request_body_holds_receiver_work_authorized() {
+    first_plan(
+        "stale request body",
+        OLD_BODY_PLANS,
+        16_384,
+        stale_request_body_shortfall,
     );
 }
 

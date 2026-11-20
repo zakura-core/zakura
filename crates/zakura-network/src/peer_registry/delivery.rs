@@ -36,34 +36,37 @@ const TIME_CONSTANT: Duration = Duration::from_secs(10 * 60);
 /// 500-2,000 ms.
 pub(crate) const ROUND_TRIP_REPLY_BYTES: u64 = 10 * 1_460;
 
-/// What a delivery sample measured.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A delivery measurement prepared when the reply arrives.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum DeliverySampleKind {
-    /// A heartbeat ping's round trip.
     Ping,
-    /// A reply to a block request that held at least one requested block.
-    Block {
-        /// The serialized size of the blocks in the reply.
+    SmallBlock {
         wire_bytes: u64,
+    },
+    LargeBlock {
+        wire_bytes: u64,
+        prediction: Option<LargeBlockPrediction>,
     },
 }
 
-impl DeliverySampleKind {
-    /// Whether the sample is a round trip, and so counts toward the peer's round trip rather
-    /// than its large-block slowdown factor. Every ping is one. A block reply is one when it
-    /// is at most [`ROUND_TRIP_REPLY_BYTES`].
-    pub(crate) fn is_round_trip(self) -> bool {
-        match self {
-            Self::Ping => true,
-            Self::Block { wire_bytes } => wire_bytes <= ROUND_TRIP_REPLY_BYTES,
-        }
-    }
+/// Both predictions use the same measured round trip. The cold time normalizes the
+/// verified sample; the expected time includes the peer's previous large-block history.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LargeBlockPrediction {
+    cold_secs: f64,
+    pub(super) expected: Duration,
+}
 
-    /// The serialized size of the blocks in a block reply, or `None` for a ping.
-    pub(crate) fn wire_bytes(self) -> Option<u64> {
-        match self {
-            Self::Ping => None,
-            Self::Block { wire_bytes } => Some(wire_bytes),
+impl DeliverySampleKind {
+    /// Only large replies need a snapshot of the connection's estimate.
+    pub(crate) fn block(wire_bytes: u64, estimate: impl FnOnce() -> DeliveryEstimate) -> Self {
+        if wire_bytes <= ROUND_TRIP_REPLY_BYTES {
+            Self::SmallBlock { wire_bytes }
+        } else {
+            Self::LargeBlock {
+                wire_bytes,
+                prediction: estimate().large_block_prediction(wire_bytes),
+            }
         }
     }
 }
@@ -131,32 +134,37 @@ pub(crate) struct DeliveryEstimate {
 impl DeliveryEstimate {
     /// Records that the peer took `sample` to answer, with the answer arriving at `received_at`.
     ///
-    /// A round trip ([`DeliverySampleKind::is_round_trip`]) updates the round trip. A larger
-    /// block reply updates the large-block slowdown factor instead, and is ignored while no
-    /// round trip is known to compare it with.
+    /// Large replies are normalized against the baseline saved at receipt, even when
+    /// verification finishes after a newer measurement.
     pub(crate) fn record(
         &mut self,
         kind: DeliverySampleKind,
         sample: Duration,
         received_at: Instant,
     ) {
-        if kind.is_round_trip() {
-            self.round_trip.record(sample.as_secs_f64(), received_at);
-        } else if let Some(cold_secs) = kind
-            .wire_bytes()
-            .and_then(|wire_bytes| self.cold_transfer_secs(wire_bytes))
-            // A zero round trip predicts zero, which no sample can be divided by.
-            .filter(|cold_secs| *cold_secs > 0.0)
-        {
-            self.large_block_slowdown
-                .record(sample.as_secs_f64() / cold_secs, received_at);
+        match kind {
+            DeliverySampleKind::Ping | DeliverySampleKind::SmallBlock { .. } => {
+                self.round_trip.record(sample.as_secs_f64(), received_at);
+            }
+            DeliverySampleKind::LargeBlock {
+                prediction: Some(prediction),
+                ..
+            } if prediction.cold_secs > 0.0 => {
+                self.large_block_slowdown
+                    .record(sample.as_secs_f64() / prediction.cold_secs, received_at);
+            }
+            DeliverySampleKind::LargeBlock { .. } => {}
         }
     }
 
-    /// The seconds a new connection to this peer would take to deliver `wire_bytes`, or `None`
-    /// when no round trip is known.
-    fn cold_transfer_secs(&self, wire_bytes: u64) -> Option<f64> {
-        Some(self.round_trip.value()? * round_trips(wire_bytes))
+    fn large_block_prediction(&self, wire_bytes: u64) -> Option<LargeBlockPrediction> {
+        let rtt = self.round_trip.value()?;
+        let trips = round_trips(wire_bytes);
+        let slowdown = self.large_block_slowdown().unwrap_or(1.0);
+        Some(LargeBlockPrediction {
+            cold_secs: rtt * trips,
+            expected: duration_from_secs(rtt * (trips * slowdown).max(1.0)),
+        })
     }
 
     /// The decayed number of round-trip samples the score rests on, as of the last one.
@@ -183,13 +191,12 @@ impl DeliveryEstimate {
     /// slowdown factor, with the round trip as a lower bound. A peer with no large-block
     /// record is taken at the model's word.
     pub(crate) fn expected(&self, wire_bytes: Option<u64>) -> Option<Duration> {
-        let large = wire_bytes.filter(|wire_bytes| *wire_bytes > ROUND_TRIP_REPLY_BYTES);
-        let Some(wire_bytes) = large else {
-            return self.round_trip();
-        };
-        let slowdown = self.large_block_slowdown().unwrap_or(1.0);
-        let trips = (round_trips(wire_bytes) * slowdown).max(1.0);
-        Some(duration_from_secs(self.round_trip.value()? * trips))
+        match wire_bytes {
+            Some(bytes) if bytes > ROUND_TRIP_REPLY_BYTES => {
+                Some(self.large_block_prediction(bytes)?.expected)
+            }
+            _ => self.round_trip(),
+        }
     }
 }
 
@@ -212,8 +219,8 @@ mod tests {
         Duration::from_millis(millis)
     }
 
-    fn block(wire_bytes: u64) -> DeliverySampleKind {
-        DeliverySampleKind::Block { wire_bytes }
+    fn large_reply(estimate: DeliveryEstimate) -> DeliverySampleKind {
+        DeliverySampleKind::block(LARGE, || estimate)
     }
 
     /// An estimate with one 100 ms round trip, measured at the returned time.
@@ -226,7 +233,12 @@ mod tests {
 
     /// What the cold-connection model predicts for `estimate`'s peer and a 1.5 MB block.
     fn cold(estimate: &DeliveryEstimate) -> Duration {
-        Duration::from_secs_f64(estimate.cold_transfer_secs(LARGE).expect("measured"))
+        Duration::from_secs_f64(
+            estimate
+                .large_block_prediction(LARGE)
+                .expect("measured")
+                .cold_secs,
+        )
     }
 
     #[test]
@@ -254,7 +266,7 @@ mod tests {
         let before = estimate.expected(Some(LARGE)).expect("measured");
         assert_eq!(before, cold(&estimate), "no record means the cold model");
 
-        estimate.record(block(LARGE), before * 3, now);
+        estimate.record(large_reply(estimate), before * 3, now);
 
         assert_eq!(
             estimate.round_trip(),
@@ -276,7 +288,7 @@ mod tests {
     #[test]
     fn an_unknown_size_is_expected_in_one_round_trip() {
         let (mut estimate, now) = measured();
-        estimate.record(block(LARGE), Duration::from_secs(5), now);
+        estimate.record(large_reply(estimate), Duration::from_secs(5), now);
         assert_eq!(estimate.expected(None), Some(ms(100)));
         assert_eq!(estimate.expected(None), estimate.round_trip());
     }
@@ -284,7 +296,11 @@ mod tests {
     #[test]
     fn a_peer_measured_only_on_large_blocks_has_no_expectation() {
         let mut estimate = DeliveryEstimate::default();
-        estimate.record(block(LARGE), Duration::from_secs(2), Instant::now());
+        estimate.record(
+            large_reply(estimate),
+            Duration::from_secs(2),
+            Instant::now(),
+        );
         assert_eq!(estimate.round_trip(), None);
         assert_eq!(estimate.expected(None), None);
         assert_eq!(estimate.expected(Some(LARGE)), None);
@@ -298,7 +314,7 @@ mod tests {
     #[test]
     fn a_reply_as_slow_as_the_cold_model_gives_a_factor_of_one() {
         let (mut estimate, now) = measured();
-        estimate.record(block(LARGE), cold(&estimate), now);
+        estimate.record(large_reply(estimate), cold(&estimate), now);
         let slowdown = estimate.large_block_slowdown().expect("measured");
         assert!((slowdown - 1.0).abs() < 1e-6, "factor {slowdown}");
     }
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn a_warm_connection_s_fast_large_blocks_lower_the_expectation() {
         let (mut estimate, now) = measured();
-        estimate.record(block(LARGE), cold(&estimate) / 3, now);
+        estimate.record(large_reply(estimate), cold(&estimate) / 3, now);
         let expected = estimate.expected(Some(LARGE)).expect("measured");
         assert!(expected < cold(&estimate) / 2, "expected {expected:?}");
     }
@@ -316,7 +332,7 @@ mod tests {
         let mut estimate = DeliveryEstimate::default();
         let now = Instant::now();
         estimate.record(PING, ms(220), now);
-        estimate.record(block(LARGE), ms(500), now);
+        estimate.record(large_reply(estimate), ms(500), now);
         for size in [ROUND_TRIP_REPLY_BYTES, ROUND_TRIP_REPLY_BYTES + 1] {
             assert_eq!(estimate.expected(Some(size)), Some(ms(220)));
         }
@@ -328,7 +344,7 @@ mod tests {
         let now = Instant::now();
         let mut estimate = DeliveryEstimate::default();
         estimate.record(PING, Duration::ZERO, now);
-        estimate.record(block(LARGE), Duration::from_secs(2), now);
+        estimate.record(large_reply(estimate), Duration::from_secs(2), now);
         assert_eq!(estimate.large_block_slowdown(), None);
         assert_eq!(estimate.expected(Some(LARGE)), Some(Duration::ZERO));
     }
@@ -349,16 +365,15 @@ mod tests {
 
     #[test]
     fn a_block_reply_is_a_round_trip_up_to_the_size_limit() {
-        assert!(DeliverySampleKind::Ping.is_round_trip());
-        assert!(block(1_700).is_round_trip());
-        assert!(
-            block(ROUND_TRIP_REPLY_BYTES).is_round_trip(),
-            "a reply of exactly the limit still fits one round trip"
-        );
-        assert!(
-            !block(ROUND_TRIP_REPLY_BYTES + 1).is_round_trip(),
-            "one byte over the limit needs another round trip"
-        );
+        for bytes in [1_700, ROUND_TRIP_REPLY_BYTES] {
+            let kind =
+                DeliverySampleKind::block(bytes, || panic!("small replies need no estimate"));
+            assert!(matches!(kind, DeliverySampleKind::SmallBlock { .. }));
+        }
+        assert!(matches!(
+            DeliverySampleKind::block(ROUND_TRIP_REPLY_BYTES + 1, DeliveryEstimate::default),
+            DeliverySampleKind::LargeBlock { .. }
+        ));
         assert_eq!(ROUND_TRIP_REPLY_BYTES, 14_600);
     }
 

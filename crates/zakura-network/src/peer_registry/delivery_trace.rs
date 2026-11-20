@@ -11,9 +11,9 @@
 //! one round trip, so it does not change the score: its `score_before_ms` and `score_ms` are
 //! equal, and both are missing when the peer has no score yet. It updates the peer's large-block
 //! slowdown factor instead. Its row has `expected_ms`, what the peer was expected to take for a
-//! block of that size just before this sample, and `slowdown`, the factor after it: how many
+//! block of that size when the reply arrived, and `slowdown`, the factor after it: how many
 //! times longer than a new connection's round trips for the size the peer's large blocks take.
-//! Both are missing when the peer has no score yet. Comparing `sample_ms` with `expected_ms`
+//! A reply received before the first round trip has no `expected_ms`. Comparing `sample_ms` with `expected_ms`
 //! shows how well the expectation fits.
 //!
 //! A `block_missed` row says the peer announced a block and then did not deliver it to a first or
@@ -31,15 +31,6 @@ use super::delivery::{DeliveryEstimate, DeliverySampleKind};
 use zakura_jsonl_trace::{saturating_millis, JsonlEventEmitter, JsonlTraceEvent, JsonlTraceTable};
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("delivery_score", "delivery_score.jsonl");
-
-/// The `kind` column of a sample's row.
-fn label(kind: DeliverySampleKind) -> &'static str {
-    match kind {
-        DeliverySampleKind::Ping => "ping",
-        DeliverySampleKind::Block { .. } if kind.is_round_trip() => "block",
-        DeliverySampleKind::Block { .. } => "large_block",
-    }
-}
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename = "delivery_sample")]
@@ -91,35 +82,43 @@ impl DeliveryTrace {
         }
     }
 
-    /// Records a `kind` sample of `sample`, with the peer's estimate `before` it and `after`
-    /// it. A sample that is not a round trip has the same score on both sides, and its row
-    /// says what `before` expected for a block of its size.
+    /// Traces the round trip before and after credit, and a large reply's prediction at receipt.
     pub(super) fn sample(
         &self,
         kind: DeliverySampleKind,
         sample: Duration,
-        before: &DeliveryEstimate,
+        round_trip_before: Option<Duration>,
         after: &DeliveryEstimate,
     ) {
         // Two decimals are enough to compare peers and to see how many samples a score rests on.
         let two_decimals = |value: f64| (value * 100.0).round() / 100.0;
-        let large_block = !kind.is_round_trip();
-        self.emitter.emit_event(|| DeliverySampleEvent {
-            connection_id: self.connection_id,
-            kind: label(kind),
-            sample_ms: saturating_millis(sample),
-            wire_bytes: kind.wire_bytes(),
-            score_before_ms: before.round_trip().map(saturating_millis),
-            score_ms: after.round_trip().map(saturating_millis),
-            weight: two_decimals(after.weight()),
-            expected_ms: large_block
-                .then(|| before.expected(kind.wire_bytes()))
-                .flatten()
-                .map(saturating_millis),
-            slowdown: large_block
-                .then(|| after.large_block_slowdown())
-                .flatten()
-                .map(two_decimals),
+        self.emitter.emit_event(|| {
+            let (label, wire_bytes, expected_ms, slowdown) = match kind {
+                DeliverySampleKind::Ping => ("ping", None, None, None),
+                DeliverySampleKind::SmallBlock { wire_bytes } => {
+                    ("block", Some(wire_bytes), None, None)
+                }
+                DeliverySampleKind::LargeBlock {
+                    wire_bytes,
+                    prediction,
+                } => (
+                    "large_block",
+                    Some(wire_bytes),
+                    prediction.map(|p| saturating_millis(p.expected)),
+                    after.large_block_slowdown().map(two_decimals),
+                ),
+            };
+            DeliverySampleEvent {
+                connection_id: self.connection_id,
+                kind: label,
+                sample_ms: saturating_millis(sample),
+                wire_bytes,
+                score_before_ms: round_trip_before.map(saturating_millis),
+                score_ms: after.round_trip().map(saturating_millis),
+                weight: two_decimals(after.weight()),
+                expected_ms,
+                slowdown,
+            }
         });
     }
 

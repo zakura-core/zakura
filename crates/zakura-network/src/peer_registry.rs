@@ -361,19 +361,19 @@ impl PeerRegistryUpdater {
             .delivery_estimates
             .entry(self.key.clone())
             .or_default();
-        let before = *estimate;
+        let round_trip_before = estimate.round_trip();
         estimate.record(kind, sample, now);
         let after = *estimate;
         drop(state);
 
-        self.delivery_trace.sample(kind, sample, &before, &after);
+        self.delivery_trace.sample(kind, sample, round_trip_before, &after);
         self.score_waker.wake();
     }
 
     /// Registers the task polling with `cx` to be woken the next time a delivery sample is
     /// recorded for this connection. Only the last registered task is woken, once.
     ///
-    /// Register before reading [`Self::delivery_score`], so that a sample recorded between the
+    /// Register before reading [`Self::delivery_estimate`], so that a sample recorded between the
     /// read and the task going to sleep still wakes it.
     pub(crate) fn notify_when_score_changes(&self, cx: &std::task::Context<'_>) {
         self.score_waker.register(cx.waker());
@@ -440,6 +440,8 @@ pub(crate) fn trace_user_agent(user_agent: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod receipt;
+
     use super::*;
 
     fn peer(port: u16) -> ConnectedPeer {
@@ -501,7 +503,7 @@ mod tests {
         drop(guard);
         assert_eq!(updater.delivery_estimate().round_trip(), None);
         updater.record_delivery_sample(
-            DeliverySampleKind::Block { wire_bytes: 1_700 },
+            DeliverySampleKind::block(1_700, || updater.delivery_estimate()),
             Duration::from_millis(5),
             Instant::now(),
         );
@@ -526,7 +528,7 @@ mod tests {
         let now = Instant::now();
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
         updater.record_delivery_sample(
-            DeliverySampleKind::Block { wire_bytes: 1_700 },
+            DeliverySampleKind::block(1_700, || updater.delivery_estimate()),
             Duration::from_millis(30),
             now,
         );
@@ -585,7 +587,7 @@ mod tests {
             zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
             7,
         ));
-        let block = |wire_bytes| DeliverySampleKind::Block { wire_bytes };
+        let block = |bytes| DeliverySampleKind::block(bytes, || updater.delivery_estimate());
         let now = Instant::now();
 
         updater.record_delivery_sample(block(1_200_000), Duration::from_secs(4), now);

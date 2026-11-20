@@ -219,6 +219,30 @@ fn a_partial_frame_reports_only_the_requested_block_size() {
     }
 }
 
+/// A partial reply may inform routing up to the block limit, inclusive.
+#[test]
+fn a_partial_block_size_hint_respects_the_block_limit() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    let limit = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    for (length, expected) in [(limit, Some(block::MAX_BLOCK_BYTES)), (limit + 1, None)] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(OnceLock::new());
+        codec.inbound_block_size().watch(hash, size.clone());
+        let mut prefix = wire_message(*BLOCK_COMMAND, body);
+        // Only the transport header and the matching block header have arrived.
+        prefix[16..20].copy_from_slice(&length.to_le_bytes());
+        prefix.truncate(HEADER_LEN + block::MAX_SERIALIZED_HEADER_BYTES);
+        assert!(codec
+            .decode(&mut BytesMut::from(prefix.as_slice()))
+            .unwrap()
+            .is_none());
+        assert_eq!(size.get().copied(), expected);
+    }
+}
+
 /// Cancelling and re-requesting even the same hash cannot redirect a partially read frame.
 #[test]
 fn a_frame_keeps_the_size_destination_it_started_with() {

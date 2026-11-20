@@ -17,6 +17,7 @@ use zakura_chain::{
     transaction::{UnminedTx, UnminedTxId},
 };
 
+use crate::peer_registry::{DeliverySampleKind, PeerRegistryUpdater};
 use crate::{meta_addr::MetaAddr, protocol::internal::InventoryResponse, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -38,10 +39,8 @@ struct BlockObservation {
     recorded: OnceLock<()>,
     slot: crate::peer::RequestSlot,
     missed: Option<Arc<tokio::time::Instant>>,
-    registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+    delivery: Option<(PeerRegistryUpdater, DeliverySampleKind)>,
     duration: Duration,
-    /// The serialized size of the blocks in the reply.
-    wire_bytes: u64,
     received_at: Instant,
 }
 
@@ -61,11 +60,9 @@ impl DeliveredBlock {
                 if let Some(missed) = &observation.missed {
                     observation.slot.clear_miss_at_receipt(missed);
                 }
-                if let Some(registry) = &observation.registry {
+                if let Some((registry, kind)) = &observation.delivery {
                     registry.record_delivery_sample(
-                        crate::peer_registry::DeliverySampleKind::Block {
-                            wire_bytes: observation.wire_bytes,
-                        },
+                        *kind,
                         observation.duration,
                         observation.received_at,
                     );
@@ -239,8 +236,9 @@ impl Response {
     pub(crate) fn observe_block_delivery(
         &mut self,
         slot: &crate::peer::RequestSlot,
-        registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+        registry: Option<PeerRegistryUpdater>,
         duration: Duration,
+        received_at: Instant,
     ) {
         let Self::Blocks(blocks) = self else { return };
         let missed = slot.miss_at_receipt();
@@ -248,26 +246,25 @@ impl Response {
             return;
         }
         // Only the registry reads the size, so a reply that can only clear a miss is not measured.
-        let wire_bytes = if registry.is_some() {
-            blocks
+        let delivery = registry.map(|registry| {
+            let wire_bytes = blocks
                 .iter()
                 .filter_map(|entry| match entry {
                     Available((block, _)) => Some(block.zcash_serialized_size()),
                     Missing(_) => None,
                 })
                 .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
-                .fold(0, u64::saturating_add)
-        } else {
-            0
-        };
+                .fold(0, u64::saturating_add);
+            let kind = DeliverySampleKind::block(wire_bytes, || registry.delivery_estimate());
+            (registry, kind)
+        });
         let observation = Arc::new(BlockObservation {
             recorded: OnceLock::new(),
             slot: slot.clone(),
             missed,
-            registry,
+            delivery,
             duration,
-            wire_bytes,
-            received_at: Instant::now(),
+            received_at,
         });
         for entry in blocks {
             if let Available((block, _)) = entry {

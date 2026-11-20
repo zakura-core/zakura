@@ -728,7 +728,8 @@ impl Decoder for Codec {
                     let mut header_reader = Cursor::new(&header);
                     let magic = Magic(header_reader.read_4_bytes()?);
                     let command = header_reader.read_12_bytes()?;
-                    let body_len = header_reader.read_u32::<LittleEndian>()? as usize;
+                    let declared_len = header_reader.read_u32::<LittleEndian>()?;
+                    let body_len = declared_len as usize; // Supported targets have at least 32-bit usize.
                     let checksum = sha256d::Checksum(header_reader.read_4_bytes()?);
                     trace!(
                         ?self.state,
@@ -761,7 +762,9 @@ impl Decoder for Codec {
                         body_len,
                         command,
                         checksum,
-                        requested_size: if command == *BLOCK_COMMAND {
+                        requested_size: if command == *BLOCK_COMMAND
+                            && u64::from(declared_len) <= block::MAX_BLOCK_BYTES
+                        {
                             self.inbound_block_size.snapshot()
                         } else {
                             None

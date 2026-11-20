@@ -2024,6 +2024,7 @@ where
                         &self.request_slot,
                         self.delivery_samples.clone(),
                         started.elapsed(),
+                        std::time::Instant::now(),
                     );
                 }
             } else {

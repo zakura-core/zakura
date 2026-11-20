@@ -106,6 +106,7 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                 &chain_info,
                 "0".repeat(46).parse().unwrap(),
                 mempool,
+                &Default::default(),
                 None,
             )
             .unwrap();

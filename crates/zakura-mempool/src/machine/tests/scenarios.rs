@@ -1134,6 +1134,30 @@ fn a_parent_that_returns_during_its_check_runs_the_child_again() {
     );
 }
 
+/// Past the cap, the gap runs from when the last check started, not from
+/// when its answer came back: a parent that arrived during a slow check
+/// still runs the child `RETRY_GAP` after that check began.
+#[test]
+fn the_retry_gap_runs_from_the_start_of_the_last_check() {
+    let mut runner = TestRunner::deterministic();
+    let (parents, child, spends) = child_of_many(&mut runner, 3);
+    let mut bench = Bench::new();
+    let (_, job) = bench.start(&child);
+    assert!(bench.missing(job, spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[0]);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let rerun = admit_parent(&mut bench, &parents[1]);
+
+    // The last parent arrives a second into the second retry, whose answer
+    // comes back four seconds in.
+    bench.now += Duration::from_secs(1);
+    bench.admit(&parents[2]);
+    bench.now += Duration::from_secs(3);
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    let step = bench.tick(RETRY_GAP - Duration::from_secs(4));
+    assert_eq!(started(&step).len(), 1, "a gap after the check started");
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

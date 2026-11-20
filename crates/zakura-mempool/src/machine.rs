@@ -233,10 +233,12 @@ struct Admission<E> {
     /// Runs since the tip changed because a transaction entered the pool.
     /// See [`MAX_PARENT_RETRIES`].
     parent_retries: usize,
-    /// When a parent that arrived past the cap runs it again. See
-    /// [`RETRY_GAP`]. If its wait ends first, it ends with the one last check
-    /// rather than the missing inputs it last saw.
+    /// When a parent that arrived past the cap runs it again, [`RETRY_GAP`]
+    /// after `ran_at`. If its wait ends first, it ends with the one last
+    /// check rather than the missing inputs it last saw.
     retry_at: Option<Instant>,
+    /// When its latest check started.
+    ran_at: Instant,
     /// When its submitter stops waiting. It ends then as a timeout, whatever
     /// its stage. See `Reservation::give_up_at`.
     give_up: Option<Instant>,
@@ -477,6 +479,7 @@ impl<E: VerifyError> MempoolState<E> {
                 last_check_used: false,
                 parent_retries: 0,
                 retry_at: None,
+                ran_at: self.now,
                 give_up: None,
                 after_reset: false,
             },
@@ -1323,8 +1326,14 @@ impl<E: VerifyError> MempoolState<E> {
                     return;
                 }
                 if arrived && !wait_over {
-                    // Past the cap, it parks below and runs again later.
-                    admission.retry_at = Some(now + RETRY_GAP);
+                    // Past the cap, it runs again a gap after this check
+                    // started, which a slow check may already have passed.
+                    let at = admission.ran_at + RETRY_GAP;
+                    if at <= now {
+                        self.start_admission(key);
+                        return;
+                    }
+                    admission.retry_at = Some(at);
                 }
                 if wait_over && arrived {
                     // There is no check left to give, and this answer is
@@ -1442,6 +1451,7 @@ impl<E: VerifyError> MempoolState<E> {
                     last_check_used: false,
                     parent_retries: 0,
                     retry_at: None,
+                    ran_at: self.now,
                     give_up: None,
                     after_reset: true,
                 },
@@ -1495,7 +1505,8 @@ impl<E: VerifyError> MempoolState<E> {
     /// Starts a verification of an admission that holds its body.
     fn start_admission(&mut self, key: u64) {
         let job = JobId(self.fresh());
-        let mut deadline = self.now + T_VERIFY;
+        let now = self.now;
+        let mut deadline = now + T_VERIFY;
         let admission = self.admission_at(key);
         // `enter` has ended every admission whose submitter's deadline has
         // passed, so this stays in the future.
@@ -1504,6 +1515,7 @@ impl<E: VerifyError> MempoolState<E> {
         }
         // This check sees every parent that has arrived.
         admission.retry_at = None;
+        admission.ran_at = now;
         admission.stage = Stage::Verifying { job, deadline };
         let tx_id = admission.tx_id;
         let after_reset = admission.after_reset;
@@ -1542,11 +1554,14 @@ impl<E: VerifyError> MempoolState<E> {
             if !on.contains(&parent) {
                 continue;
             }
+            let gap_end = admission.ran_at + RETRY_GAP;
             if admission.parent_retries < MAX_PARENT_RETRIES {
                 admission.parent_retries += 1;
                 woken.push(*key);
+            } else if gap_end <= now {
+                woken.push(*key);
             } else {
-                admission.retry_at.get_or_insert(now + RETRY_GAP);
+                admission.retry_at = Some(gap_end);
             }
         }
         for key in woken {

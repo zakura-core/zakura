@@ -26,6 +26,13 @@ The Space's bucket comes from `ZAKURA_CORPUS_BUCKET` and its endpoint from
 `/etc/zakura-mutation-joint.env`, which `--env-file` reads. `pull` and
 `push` need boto3, which the droplet's system Python carries. Repository
 tests never reach the Space.
+
+Trust boundary: the joint-run routine applies the store's patches and builds
+and runs the patched code as root on the droplet, so a store writer can run
+code there. The Space is private, and its only bucket-scoped key lives in
+that droplet's root-only env file, so only someone who can already run code
+on the droplet, or an account administrator, can write the store; no CI job
+reads it.
 """
 
 import argparse

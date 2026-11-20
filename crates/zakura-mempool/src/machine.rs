@@ -39,7 +39,7 @@ use zakura_chain::{
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, Change, ChangeSeq, Charge, ConnectedBlock, LocalFault, PoolSnapshot,
     Rejection, RejectionDetail, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
-    MAX_PENDING, MAX_READMITTING, T_PARK, T_VERIFY,
+    MAX_PENDING, MAX_READMITTING, MAX_RELAYED, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -200,6 +200,8 @@ pub struct Limits {
     /// Slots for pooled transactions verified again after a reset,
     /// [`MAX_READMITTING`].
     pub readmitting: usize,
+    /// Slots `tx-relay` fetches can hold, [`MAX_RELAYED`].
+    pub relayed: usize,
 }
 
 impl Default for Limits {
@@ -207,6 +209,7 @@ impl Default for Limits {
         Self {
             pending: MAX_PENDING,
             readmitting: MAX_READMITTING,
+            relayed: MAX_RELAYED,
         }
     }
 }
@@ -230,6 +233,8 @@ struct Admission<E> {
     /// body until `body` is set. `None` for a pooled transaction that a
     /// reset sent back through admission: nobody waits for its verdict.
     owner: Option<ReservationId>,
+    /// Whether a `tx-relay` fetch reserved it. See [`Limits::relayed`].
+    relayed: bool,
     body: Option<UnminedTx>,
     /// The submission that brought the body, which gets the verdict.
     waiter: Option<WaiterId>,
@@ -310,6 +315,8 @@ struct Lease {
     tx_id: UnminedTxId,
     /// The verdict its admission got, which its caller gets too.
     verdict: Verdict,
+    /// Whether a `tx-relay` fetch holds it. See [`Limits::relayed`].
+    relayed: bool,
 }
 
 /// The spends and nullifiers of a set of transactions, to find what conflicts
@@ -405,6 +412,8 @@ pub struct MempoolState<E> {
     queued_cost: u64,
     /// The re-admissions under way. Each holds a slot.
     readmitting: usize,
+    /// The admissions and leases `tx-relay` fetches hold.
+    relaying: usize,
     /// Every pooled transaction, oldest first.
     pool: BTreeMap<u64, Pooled>,
     pooled: HashMap<transaction::Hash, u64>,
@@ -443,6 +452,7 @@ impl<E: VerifyError> MempoolState<E> {
             queued: HashMap::default(),
             queued_cost: 0,
             readmitting: 0,
+            relaying: 0,
             pool: BTreeMap::new(),
             pooled: HashMap::default(),
             children: HashMap::default(),
@@ -468,12 +478,24 @@ impl<E: VerifyError> MempoolState<E> {
         now: Instant,
     ) -> (Result<ReservationId, Unreserved>, Step) {
         self.enter(now);
-        let answer = self.grant(tx_id);
+        let answer = self.grant(tx_id, false);
+        (answer, self.take_step())
+    }
+
+    /// [`Self::reserve`] for a `tx-relay` fetch, which also needs room under
+    /// [`Limits::relayed`].
+    pub fn reserve_relayed(
+        &mut self,
+        tx_id: UnminedTxId,
+        now: Instant,
+    ) -> (Result<ReservationId, Unreserved>, Step) {
+        self.enter(now);
+        let answer = self.grant(tx_id, true);
         (answer, self.take_step())
     }
 
     /// Grants a reservation for `tx_id`, or says why not.
-    fn grant(&mut self, tx_id: UnminedTxId) -> Result<ReservationId, Unreserved> {
+    fn grant(&mut self, tx_id: UnminedTxId, relayed: bool) -> Result<ReservationId, Unreserved> {
         if !self.active {
             return Err(Unreserved::Inactive);
         }
@@ -497,7 +519,9 @@ impl<E: VerifyError> MempoolState<E> {
         if self.admission_of.contains_key(&tx_id) || self.queued.contains_key(&tx_id.mined_id()) {
             return Err(Unreserved::Pending);
         }
-        if self.slots_in_use() >= self.limits.pending {
+        if self.slots_in_use() >= self.limits.pending
+            || (relayed && self.relaying >= self.limits.relayed)
+        {
             return Err(Unreserved::NoRoom);
         }
         let owner = ReservationId(self.fresh());
@@ -507,6 +531,7 @@ impl<E: VerifyError> MempoolState<E> {
             Admission {
                 tx_id,
                 owner: Some(owner),
+                relayed,
                 body: None,
                 waiter: None,
                 stage: Stage::Reserved,
@@ -522,6 +547,9 @@ impl<E: VerifyError> MempoolState<E> {
         );
         self.admission_of.insert(tx_id, key);
         self.owners.insert(owner, key);
+        if relayed {
+            self.relaying = self.relaying.saturating_add(1);
+        }
         Ok(owner)
     }
 
@@ -575,7 +603,7 @@ impl<E: VerifyError> MempoolState<E> {
             // The admission this reservation was granted for ended while
             // its fetch was out. The caller gets that admission's verdict,
             // as if it had come in time.
-            let verdict = match self.leases.remove(&reservation) {
+            let verdict = match self.take_lease(reservation) {
                 Some(lease) => lease.verdict,
                 None => self.stale_verdict(tx_id),
             };
@@ -1029,6 +1057,20 @@ impl<E: VerifyError> MempoolState<E> {
             self.readmitting <= self.limits.readmitting,
             "pool/readmission-within-limit: the re-admission share"
         );
+        let relaying = self
+            .admissions
+            .values()
+            .filter(|admission| admission.relayed)
+            .count()
+            + self.leases.values().filter(|lease| lease.relayed).count();
+        assert_eq!(
+            relaying, self.relaying,
+            "the tx-relay count matches the admissions and leases"
+        );
+        assert!(
+            self.relaying <= self.limits.relayed,
+            "pool/relayed-within-limit: the tx-relay share"
+        );
         assert!(
             self.storage.total_cost().saturating_add(self.queued_cost) <= self.storage.cost_limit(),
             "pool/cost-within-limit: the pool and the queue together stay within the cost limit"
@@ -1220,7 +1262,16 @@ impl<E: VerifyError> MempoolState<E> {
         if let Some(key) = self.owners.remove(&reservation) {
             self.end(key);
         }
-        self.leases.remove(&reservation);
+        self.take_lease(reservation);
+    }
+
+    /// Frees `reservation`'s lease, if it has one.
+    fn take_lease(&mut self, reservation: ReservationId) -> Option<Lease> {
+        let lease = self.leases.remove(&reservation)?;
+        if lease.relayed {
+            self.relaying = self.relaying.saturating_sub(1);
+        }
+        Some(lease)
     }
 
     /// Applies a fresh outcome to an undecided transaction.
@@ -1444,8 +1495,12 @@ impl<E: VerifyError> MempoolState<E> {
                     Lease {
                         tx_id: admission.tx_id,
                         verdict: verdict.clone(),
+                        relayed: admission.relayed,
                     },
                 );
+                if admission.relayed {
+                    self.relaying = self.relaying.saturating_add(1);
+                }
             }
         }
         if let Some(waiter) = admission.waiter {
@@ -1462,6 +1517,9 @@ impl<E: VerifyError> MempoolState<E> {
         self.admission_of.remove(&admission.tx_id);
         if admission.owner.is_none() {
             self.readmitting = self.readmitting.saturating_sub(1);
+        }
+        if admission.relayed {
+            self.relaying = self.relaying.saturating_sub(1);
         }
         admission
     }
@@ -1483,6 +1541,7 @@ impl<E: VerifyError> MempoolState<E> {
                 Admission {
                     tx_id,
                     owner: None,
+                    relayed: false,
                     body: Some(tx),
                     waiter: None,
                     stage: Stage::Reserved,

@@ -367,7 +367,7 @@ fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
 
             // The core grants the fetch.
             let grant = async {
-                let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
+                let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
                     panic!("the session reserves the id it was offered");
                 };
                 let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());

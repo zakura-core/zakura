@@ -2062,10 +2062,8 @@ fn file(state: &mut PeerState, wanted: &WantedIds, id: UnminedTxId) {
     let claimable = wanted
         .entry(id)
         .filter(|entry| entry.claim.is_none() && state.pending.holds(id, entry.generation));
-    match claimable
-        .and_then(|entry| Some((state.pending.get(id, entry.generation)?, ready_key(entry))))
-    {
-        Some((pending, key)) => state.pending.file(pending, key),
+    match claimable {
+        Some(entry) => state.pending.file(id, ready_key(entry)),
         None => state.pending.unfile(id),
     }
 }

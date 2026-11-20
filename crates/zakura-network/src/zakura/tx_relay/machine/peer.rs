@@ -501,9 +501,6 @@ impl PendingSet {
             },
         );
         debug_assert!(old.is_none(), "one reference per id");
-        if let Some(key) = old.and_then(|old| old.filed) {
-            self.ready.remove(&key);
-        }
     }
 
     /// Whether `id` is pending, in any generation.
@@ -516,12 +513,6 @@ impl PendingSet {
         self.held
             .get(&OrdId(id))
             .is_some_and(|held| held.generation == generation)
-    }
-
-    /// The pending reference to `id` in `generation`.
-    pub(crate) fn get(&self, id: UnminedTxId, generation: EntryGen) -> Option<Pending> {
-        self.of(id)
-            .filter(|pending| pending.generation == generation)
     }
 
     /// The pending reference to `id`, in any generation.
@@ -545,10 +536,10 @@ impl PendingSet {
         }
     }
 
-    /// Files `pending` at `key`, in place of any earlier filing of its id.
-    /// The set holds `pending`.
-    pub(crate) fn file(&mut self, pending: Pending, key: ReadyKey) {
-        let Some(held) = self.held.get_mut(&OrdId(pending.id)) else {
+    /// Files `id` at `key`, in place of any earlier filing of it. The set
+    /// holds `id`.
+    pub(crate) fn file(&mut self, id: UnminedTxId, key: ReadyKey) {
+        let Some(held) = self.held.get_mut(&OrdId(id)) else {
             return;
         };
         if let Some(old) = held.filed.replace(key) {
@@ -557,7 +548,7 @@ impl PendingSet {
             }
             self.ready.remove(&old);
         }
-        self.ready.insert(key, pending.id);
+        self.ready.insert(key, id);
     }
 
     /// Unfiles `id`, if it is filed.

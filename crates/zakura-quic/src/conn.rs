@@ -190,8 +190,8 @@ pub struct ConnLoad {
     pub frame_rx: quinn_proto::FrameStats,
     /// Sends that failed with an error other than `WouldBlock`.
     pub send_errors: u64,
-    /// Smoothed round-trip time.
-    pub rtt: Duration,
+    /// Smoothed round-trip time, which [`RttReader`] reads.
+    pub(crate) rtt: Duration,
 }
 
 /// The longest a [`ConnLoad`] snapshot lags while the connection is active.

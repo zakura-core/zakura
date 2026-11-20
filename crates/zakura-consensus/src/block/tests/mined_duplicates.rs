@@ -93,7 +93,14 @@ async fn a_mined_duplicate_keeps_priority_only_for_an_overlapping_write_of_its_b
 async fn a_cancelled_peer_write_preserves_priority_only_if_the_mined_submission_observes_commit() {
     let _init_guard = zakura_test::init();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        for cancel_local in [false, true] {
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        enum CommitTiming {
+            BeforeFirstPoll,
+            DuringConfirmation,
+            AfterLocalCancellation,
+        }
+        use CommitTiming::*;
+        for timing in [BeforeFirstPoll, DuringConfirmation, AfterLocalCancellation] {
             let mut tips = EqualWorkTips::new().await;
             let (rival, mined) = (tips.a.clone(), tips.b.clone());
             let hash = mined.hash();
@@ -134,36 +141,35 @@ async fn a_cancelled_peer_write_preserves_priority_only_if_the_mined_submission_
 
             let peer = tokio::spawn(tips.verifier.call(Request::Commit(mined.clone().into())));
             let pending_write = queued.recv().await.unwrap();
-            let local = tips.verifier.call(Request::CommitMined {
+            peer.abort();
+            assert!(peer.await.unwrap_err().is_cancelled());
+            let mut local = tips.verifier.call(Request::CommitMined {
                 size: mined.zcash_serialized_size(),
                 block: mined.clone().into(),
                 admission: zs::BlockAdmission::pending(),
             });
-            peer.abort();
-            assert!(peer.await.unwrap_err().is_cancelled());
-
-            // State owns the peer's write. Hold it until the duplicate is waiting for proof.
-            let local = tokio::spawn(local);
-            confirming.notified().await;
-            if cancel_local {
-                local.abort();
+            if timing != BeforeFirstPoll {
+                tokio::select! {
+                    _ = confirming.notified() => {},
+                    result = &mut local => panic!("local submission finished before confirmation: {result:?}"),
+                }
             }
+            // Dropping the future here cancels the local request before state publishes the block.
+            let local = (timing != AfterLocalCancellation).then_some(local);
             let committed = writer
                 .oneshot(zs::Request::CommitSemanticallyVerifiedBlock(pending_write))
                 .await
                 .unwrap();
             assert!(matches!(committed, zs::Response::Committed(h) if h == hash));
-            if cancel_local {
-                assert!(local.await.unwrap_err().is_cancelled());
-            } else {
-                assert!(local.await.unwrap().unwrap_err().is_duplicate_request());
+            if let Some(local) = local {
+                assert!(local.await.unwrap_err().is_duplicate_request());
             }
             tips.verifier
                 .call(Request::Commit(rival.clone().into()))
                 .await
                 .unwrap();
-            let expected = if cancel_local { rival.hash() } else { hash };
-            assert_eq!(tips.tip_hash(), Some(expected));
+            let expected = if timing == AfterLocalCancellation { rival.hash() } else { hash };
+            assert_eq!(tips.tip_hash(), Some(expected), "{timing:?}");
         }
     })
     .await
@@ -171,28 +177,17 @@ async fn a_cancelled_peer_write_preserves_priority_only_if_the_mined_submission_
 }
 
 #[tokio::test(start_paused = true)]
-async fn duplicate_confirmation_requires_a_successful_write_of_the_exact_body_before_timeout() {
-    let b: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+async fn duplicate_confirmation_ends_on_state_failure_or_timeout() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let submitted = BlockHandle::from(b.clone());
-    let hash = b.hash();
-    let other = BlockHandle::from(mined_body_variant(&b, 1));
-
-    let wrong_body = service_fn(move |request| {
-        let other = other.clone();
-        async move {
-            Ok::<_, BoxError>(match request {
-                zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(Default::default())),
-                zs::Request::AnyChainBlock(_) => zs::Response::Block(Some(other)),
-                _ => panic!("unexpected confirmation request"),
-            })
-        }
-    });
-    assert!(!committed_mined_body(wrong_body, hash, submitted.clone()).await);
-
+    let hash = block.hash();
+    let chains = zs::WatchReceiver::new(
+        tokio::sync::watch::channel(zs::NonFinalizedState::new(&Network::Mainnet)).1,
+    );
+    let submitted = BlockHandle::from(block);
     let rejected = service_fn(|_| async { Err::<zs::Response, BoxError>("write rejected".into()) });
-    assert!(!committed_mined_body(rejected, hash, submitted.clone()).await);
+    assert!(!committed_mined_body(rejected, &chains, hash, submitted.clone()).await);
     let stalled = service_fn(|_| std::future::pending::<Result<zs::Response, BoxError>>());
-    assert!(!committed_mined_body(stalled, hash, submitted).await);
+    assert!(!committed_mined_body(stalled, &chains, hash, submitted).await);
 }

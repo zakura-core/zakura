@@ -81,8 +81,10 @@ The reservation is called a claim. Five rules define it:
   still verifying or has verified, until the verified tip passes that height or
   the node mines more than two blocks above it. If an overlapping peer delivery
   commits the identical body, the local submission keeps this protection and
-  still reports a duplicate. If
-  the submitted block fails verification, rival bodies that arrive afterwards
+  still reports a duplicate. The verifier checks the committed forks at submission
+  and confirms the exact body in state, even if the peer has stopped waiting
+  for its write. Resubmitting a previously committed block gives it no new
+  protection. If the submitted block fails verification, rival bodies that arrive afterwards
   take their claims again. A rival body that arrived while it was verifying
   keeps its arrival order.
 

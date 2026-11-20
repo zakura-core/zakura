@@ -160,7 +160,7 @@ zakura-network = { path = "../zakura-network", version = "19.0.0" }
 zakura-mempool = { path = "../zakura-mempool", version = "0.1.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false }
-zakura-state = { path = "../zakura-state", version = "18.0.0" }
+zakura-state = { path = "../zakura-state", version = "18.1.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.8" }
 zcash_script = { workspace = true }
 
@@ -238,7 +238,7 @@ zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["prop
 zakura-consensus = { path = "../zakura-consensus", version = "18.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "19.0.0", features = ["proptest-impl", "zakura-testkit"] }
-zakura-state = { path = "../zakura-state", version = "18.0.0", features = ["proptest-impl"] }
+zakura-state = { path = "../zakura-state", version = "18.1.0", features = ["proptest-impl"] }
 zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "18.0.1", default-features = false, features = ["proptest-impl"] }
 

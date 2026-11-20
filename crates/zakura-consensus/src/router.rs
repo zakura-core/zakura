@@ -481,7 +481,7 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     mut state_service: S,
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
-    announcement_claims: AnnouncementClaims,
+    announcement_claims: Option<(AnnouncementClaims, zs::WatchReceiver<zs::NonFinalizedState>)>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -617,8 +617,10 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone())
-        .with_announcement_claims(announcement_claims);
+    let mut block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    if let Some((claims, chains)) = announcement_claims {
+        block = block.with_announcement_claims(claims, chains);
+    }
     let checkpoint = CheckpointVerifier::from_checkpoint_list(
         list,
         network,
@@ -674,7 +676,7 @@ where
         state_service,
         transaction_state,
         mempool,
-        AnnouncementClaims::default(),
+        None,
     )
     .await
 }
@@ -682,7 +684,7 @@ where
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
 ///
 /// The block verifier ranks equal-work blocks by the claims in `announcement_claims`. Pass the
-/// table that header sync writes to.
+/// table that header sync writes to and the committed chains published by the same state service.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
     network: &Network,
@@ -690,6 +692,7 @@ pub async fn init_with_read_state<S, R, Mempool>(
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
     announcement_claims: AnnouncementClaims,
+    committed_chains: zs::WatchReceiver<zs::NonFinalizedState>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -720,7 +723,7 @@ where
         state_service,
         transaction_state,
         mempool,
-        announcement_claims,
+        Some((announcement_claims, committed_chains)),
     )
     .await
 }

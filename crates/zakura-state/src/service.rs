@@ -1800,6 +1800,11 @@ impl ReadStateService {
         artifact_checkpoint.is_some()
     }
 
+    /// Subscribe to committed non-finalized chains, including equal-work side branches.
+    pub fn subscribe_non_finalized_state(&self) -> WatchReceiver<NonFinalizedState> {
+        self.non_finalized_state_receiver.clone()
+    }
+
     /// Subscribe to the lowest height at and above which block bodies are retained.
     ///
     /// The initial value reflects persisted pruning. Later values follow successful

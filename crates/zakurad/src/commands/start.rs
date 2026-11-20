@@ -782,6 +782,7 @@ impl StartCmd {
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
                 announcement_claims,
+                read_only_state_service.subscribe_non_finalized_state(),
             )
             .boxed()
             .await;

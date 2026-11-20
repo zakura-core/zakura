@@ -4342,6 +4342,7 @@ impl EqualWorkTips {
         let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
         let zakura_state::InitializedState {
             state,
+            read_state,
             latest_chain_tip: tip,
             ..
         } = zs::init_test_services(&network).await;
@@ -4378,7 +4379,7 @@ impl EqualWorkTips {
             crate::transaction::boxed_state(state),
             crate::transaction::boxed_transaction_verifier(transaction),
         )
-        .with_announcement_claims(claims.clone());
+        .with_announcement_claims(claims.clone(), read_state.subscribe_non_finalized_state());
 
         Self {
             a,

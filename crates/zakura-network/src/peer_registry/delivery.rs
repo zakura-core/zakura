@@ -14,8 +14,9 @@
 //! For a block that fits one round trip, or whose size is not known, the expected time is the
 //! round trip alone.
 //!
-//! Older samples count for less, so a peer that slows down loses its good estimate within
-//! minutes. A peer that announces a block and then does not deliver it keeps its score. With
+//! Older samples count for less, so a peer whose round trip grows loses its good estimate
+//! within minutes, as pings keep arriving. The large-block factor changes only when the peer
+//! delivers another large block. A peer that announces a block and then does not deliver it keeps its score. With
 //! scoring enabled, routing passes over it until a later delivery verifies or the miss expires.
 
 use std::time::{Duration, Instant};

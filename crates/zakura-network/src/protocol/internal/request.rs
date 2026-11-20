@@ -65,7 +65,9 @@ pub(crate) struct FirstDispatch {
     pub(crate) at: Instant,
     pub(crate) legacy_peer: Option<PeerSocketAddr>,
     pub(crate) estimate: DeliveryEstimate,
-    /// Published once the decoder recognizes the requested block on this exchange.
+    /// Published once the decoder recognizes the requested block on this exchange. A download
+    /// is handed to at most one legacy peer, so the connection that writes its request, and
+    /// takes this destination, is the one `estimate` describes.
     pub(crate) block_size: Arc<BlockReplySize>,
 }
 

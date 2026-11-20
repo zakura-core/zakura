@@ -1734,7 +1734,9 @@ where
     /// request went to, and the best is the one expected to answer soonest. It is chosen when it
     /// is expected to deliver clearly before the first request should, or when the first request
     /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
-    /// this node, so a peer cannot claim a faster one.
+    /// this node, so a peer cannot claim a faster one. The block's size, once known, is the
+    /// first peer's claim until the block has arrived: it lengthens every peer's expected time
+    /// alike, and [`FirstRequestTimes::new`] limits how far it can delay a stall.
     ///
     /// Returns the chosen peer, which is in the ready set. Otherwise returns `None`. Either
     /// way, registers `cx` for announcer changes and shortens `next_decision` for expiring misses.

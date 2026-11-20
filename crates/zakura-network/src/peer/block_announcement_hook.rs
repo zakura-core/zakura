@@ -12,6 +12,8 @@ use std::{
 use tokio::time::Instant;
 use zakura_chain::block;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use crate::constants;
 use crate::protocol::external::BlockHeaderHook;
 
 /// The most blocks one connection hands to the hook in each [`ANNOUNCEMENT_WINDOW`].
@@ -19,9 +21,10 @@ use crate::protocol::external::BlockHeaderHook;
 /// Three blocks leave room for both blocks in a tip race and one more, while bounding one
 /// connection's share of the hook's work and of the node's claim store. The store is sized
 /// from this number, so that every connection the default limits allow, each using its full
-/// share, cannot fill it. `inv`s and `block` messages share the allowance, and a block the
-/// connection shows again in the same window, such as an announced block it then sends, is
-/// neither counted nor passed on twice.
+/// share, cannot fill it: a `zakurad` test checks that against the store's own size. `inv`s
+/// and `block` messages share the allowance, and a block the connection shows again in the
+/// same window, such as an announced block it then sends, is neither counted nor passed on
+/// twice.
 const MAX_ANNOUNCEMENTS_PER_WINDOW: usize = 3;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
@@ -54,6 +57,32 @@ impl BlockAnnouncementHook {
     /// A hook that passes the blocks legacy peers show this node to `node`.
     pub fn new(node: impl BlockAnnouncements + 'static) -> Self {
         Self(Some(Arc::new(node)))
+    }
+
+    /// The most blocks that legacy connections can pass to the hook within any `span`, on a
+    /// node with `config`'s connection limits.
+    ///
+    /// Counts every connection the limits allow at once, and every connection that can be
+    /// opened within `span` to replace one of them, each using its full allowance. A store that
+    /// keeps each block for `span` and holds this many cannot be filled by peers.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn most_blocks_passed_within(config: &crate::Config, span: Duration) -> usize {
+        // A connection's windows start at least one window apart, and a block passed late in a
+        // window that started before `span` still falls inside it.
+        let windows = span.as_nanos().div_ceil(ANNOUNCEMENT_WINDOW.as_nanos()) + 1;
+        // Outbound connections are dialed one interval apart, counting one at each end.
+        let dialed =
+            span.as_nanos() / constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL.as_nanos() + 1;
+        // A count too large for `usize` is still an upper bound when saturated.
+        let [windows, dialed] =
+            [windows, dialed].map(|count| usize::try_from(count).unwrap_or(usize::MAX));
+
+        config
+            .peerset_total_connection_limit()
+            .saturating_add(crate::peer_set::most_inbound_accepts_within(span))
+            .saturating_add(dialed)
+            .saturating_mul(MAX_ANNOUNCEMENTS_PER_WINDOW)
+            .saturating_mul(windows)
     }
 
     /// This hook as one connection uses it, limited per connection.

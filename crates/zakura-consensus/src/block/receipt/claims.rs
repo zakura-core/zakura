@@ -353,6 +353,15 @@ impl AnnouncementClaims {
         }
     }
 
+    /// The most legacy sightings held at once. A block first sighted while that many are held
+    /// is ranked by body arrival.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub const MAX_LEGACY_SIGHTINGS: usize = announced::MAX_ANNOUNCED_BLOCKS;
+
+    /// How long a legacy sighting counts towards [`Self::MAX_LEGACY_SIGHTINGS`].
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub const LEGACY_SIGHTING_LIFETIME: Duration = announced::ANNOUNCEMENT_LIFETIME;
+
     /// Whether a claim is held for `hash`.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn is_claimed(&self, hash: block::Hash) -> bool {

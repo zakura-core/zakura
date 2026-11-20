@@ -21,7 +21,8 @@ use super::{super::order, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
 /// accepted in bursts of 16, and 41 outbound, which are dialed at most ten a second. So at
 /// most 523 connections hold 4,707 entries. The bound stops holding once the configured
 /// connection limit passes about 480, which is a `peerset_initial_target_size` of about 107
-/// against the default 100.
+/// against the default 100. A `zakurad` test recomputes this from both crates' numbers, so it
+/// fails if the allowance, the connection limits, this size or the lifetime change apart.
 ///
 /// Honest announcements arrive about one block per connection per block interval, so this is
 /// far above honest use. A full store refuses new hashes instead of dropping old ones, so even
@@ -33,7 +34,7 @@ pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 5_000;
 ///
 /// Twice the body deadline, so a body that arrives after its deadline is still counted as
 /// expired rather than unclaimed.
-const ANNOUNCEMENT_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
+pub(super) const ANNOUNCEMENT_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
 
 /// Receipt order, time and highest verified tip at the block's first legacy sighting, and
 /// which kind of message made it.

@@ -1,6 +1,6 @@
 //! hdr-9c.2b: `header-sync/commit-only-authorized` and
 //! `header-sync/reset-invalidates-work` through a successful VCT body
-//! repair, on `header-sync/repair`. On each repairing seed both
+//! repair, on `header-sync/repair`. On each repairing input both
 //! properties apply and hold, and the repair's apply commits and leaves the
 //! engine's header generation unchanged, so it adds no header to the chain.
 //! The repair round opens under V1 and its mirror serves auxiliary records,
@@ -8,6 +8,9 @@
 //! `v1-record-charged-twice` planted case breaks it there.
 #![cfg(zakura_sim)]
 
+mod support;
+
+use support::header_inputs::repair_input;
 use zakura_sim::{
     domain::header_sync::{COMMIT_ONLY_AUTHORIZED, RESET_INVALIDATES_WORK},
     harness::{
@@ -15,11 +18,12 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{Observation, StorageFact, StorageRequest, StorageResult},
-    seed, MemorySink, Plan, PropertyOutcome, RunReport,
+    MemorySink, Plan, PropertyOutcome, RunReport,
 };
 
-/// The repairing seeds, `header-repair-*` in `zakura_sim::seed`, each with
-/// its fixture: a scenario byte, then Plan bytes.
+/// The repairing fixtures, each with the name its input goes by. Each
+/// input is the fixture's scenario byte, then the Plan
+/// [`repair_input`] finds.
 const SEEDS: [(&str, RepairScenario); 3] = [
     ("header-repair-applied", RepairScenario::Applied),
     (
@@ -54,16 +58,13 @@ fn storage(report: &RunReport) -> Vec<&StorageFact> {
         .collect()
 }
 
-/// Each repairing seed holds both properties, and they apply, and
+/// Each repairing input holds both properties, and they apply, and
 /// its repair's one apply commits at the header generation the completion
 /// before it left.
 #[test]
 fn a_successful_repair_holds_commit_and_reset_properties() {
     for (stem, scenario) in SEEDS {
-        let input = seed::find(stem)
-            .unwrap_or_else(|| panic!("{stem} is registered"))
-            .input()
-            .to_vec();
+        let input = repair_input(scenario);
         let report = run(stem, scenario, &input);
         for property in [COMMIT_ONLY_AUTHORIZED, RESET_INVALIDATES_WORK] {
             let outcome = report

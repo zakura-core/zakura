@@ -1,9 +1,14 @@
 //! fuzz-12 item 7: each action and overlap the fuzz-12 controls added, as a
-//! generator-3 seed, `header-storage-w-*` in `zakura_sim::seed`, so the
-//! fuzzer can draw it. Each seed is a witness scenario's canonical prefix
-//! and 1,024 Plan bytes, and its run shows the overlap it's named for in the
-//! facts it logs, not only that the run ended.
+//! generator-3 input the fuzzer can draw. Each input is a witness
+//! scenario's canonical prefix and 1,024 Plan bytes, and its run shows the
+//! overlap it's named for in the facts it logs, not only that the run
+//! ended. A bounded search finds each witness's Plan: not every Plan orders
+//! the overlap.
 #![cfg(zakura_sim)]
+
+mod support;
+
+use support::header_inputs::{first, storage_input, storage_plans};
 
 use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
@@ -13,14 +18,14 @@ use zakura_sim::{
     harness::{
         self,
         header_node::policy::OpKind,
-        header_sync::{storage_witnesses, Storage},
+        header_sync::{storage_witnesses, Storage, StorageScenario},
         Subsystem,
     },
     observe::{StorageFact, StoragePoint, StorageRequest, StorageResult},
-    seed, NullSink, Observation, RunReport,
+    NullSink, Observation, RunReport,
 };
 
-/// The overlap a witness seed's run shows.
+/// The overlap a witness input's run shows.
 #[derive(Clone, Copy, Debug)]
 enum Shows {
     /// An operation of this kind was pending at a reset and completed after
@@ -66,8 +71,8 @@ enum Shows {
     Owed(&'static str),
     /// The first read, held until two other reads completed, completed
     /// through the engine with a page after them. That's `holds()`'s first
-    /// hold succeeding, which the migrated seed's slice doesn't show: its
-    /// held read ends `PageUnavailable`.
+    /// hold succeeding, which not every Plan shows: on some, its held read
+    /// ends `PageUnavailable`.
     SucceededAfterHold,
 }
 
@@ -334,7 +339,7 @@ impl Shows {
     }
 }
 
-/// What each witness seed's run shows, by name.
+/// What each witness input's run shows, by name.
 fn shows(stem: &str) -> Shows {
     use std::cmp::Ordering;
     let witness = stem
@@ -404,31 +409,74 @@ fn shows(stem: &str) -> Shows {
     }
 }
 
-/// Each witness seed's run through the registered harness ends clean, and
-/// shows the overlap it's named for. Every witness has a seed.
+/// Every fuzz-12 witness scenario, by its stem: 15 named witnesses, 10
+/// faults, 5 recovery classes and hdr-13's two owed recoveries.
+fn witnesses() -> Vec<(String, StorageScenario)> {
+    type Named = (&'static str, fn() -> StorageScenario);
+    let named: [Named; 15] = [
+        ("hold-succeeds", StorageScenario::holds),
+        ("reset-locator", storage_witnesses::reset_held_locator),
+        ("reset-prepare", storage_witnesses::reset_held_prepare),
+        ("reset-apply", storage_witnesses::reset_held_apply),
+        ("reset-reply", storage_witnesses::reset_reply_hold),
+        ("reconsider", storage_witnesses::invalidate_reconsider),
+        ("release", storage_witnesses::release_after_apply),
+        ("reply-hold", storage_witnesses::reply_hold),
+        (
+            "reply-after-shutdown",
+            storage_witnesses::reply_after_shutdown,
+        ),
+        ("reply-after-close", storage_witnesses::reply_after_close),
+        ("stop-storage", storage_witnesses::stop_with_held_apply),
+        ("peer-lease-denied", storage_witnesses::peer_lease_denied),
+        ("equal-forks", storage_witnesses::equal_forks),
+        ("longer-fork", storage_witnesses::longer_fork),
+        ("weighted-fork", storage_witnesses::weighted_fork),
+    ];
+    let mut witnesses: Vec<(String, StorageScenario)> = named
+        .into_iter()
+        .map(|(name, scenario)| (format!("header-storage-w-{name}"), scenario()))
+        .collect();
+    for (kind, allow, outcome, after) in storage_witnesses::fault_witnesses() {
+        witnesses.push((
+            storage_witnesses::fault_stem(kind, outcome),
+            storage_witnesses::fault_witness(kind, allow, after),
+        ));
+    }
+    for (prefix, classes) in [
+        ("recover", storage_witnesses::recovery_witnesses()),
+        ("owed", storage_witnesses::owed_recovery_witnesses()),
+    ] {
+        for (class, scenario) in classes {
+            let stem = format!("header-storage-w-{prefix}-{}", class.replace(' ', "-"));
+            witnesses.push((stem, scenario));
+        }
+    }
+    witnesses
+}
+
+/// For each witness scenario, a search over [`storage_plans`] finds a Plan
+/// whose run through the registered harness ends clean and shows the
+/// overlap the witness is named for.
 #[test]
 fn witness_seeds_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
-    let seeds: Vec<_> = seed::all()
-        .into_iter()
-        .filter(|seed| seed.name.starts_with("header-storage-w-"))
-        .collect();
-    // 15 named witnesses, 10 faults, 5 recovery classes and hdr-13's two
-    // owed recoveries.
-    assert_eq!(seeds.len(), 32);
-    for seed in seeds {
-        let stem = &seed.name;
-        let shows = shows(stem);
-        let run = (entry.run_bytes)(seed.input(), &mut NullSink, None);
-        let report = run
-            .report()
-            .unwrap_or_else(|| panic!("{stem}: {:?}", run.result));
-        assert_eq!(
-            classify(entry, &run).outcome,
-            ExploreOutcome::Clean,
-            "{stem}"
+    let witnesses = witnesses();
+    assert_eq!(witnesses.len(), 32);
+    let plans = storage_plans();
+    for (stem, scenario) in witnesses {
+        let shows = shows(&stem);
+        first(
+            &format!("{stem}'s {shows:?}"),
+            plans.iter().map(|plan| storage_input(&scenario, plan)),
+            |input| {
+                let run = (entry.run_bytes)(input, &mut NullSink, None);
+                run.report().is_some_and(|report| {
+                    classify(entry, &run).outcome == ExploreOutcome::Clean
+                        && run.leaked() == 0
+                        && shows.in_run(report)
+                })
+            },
         );
-        assert_eq!(run.leaked(), 0, "{stem}");
-        assert!(shows.in_run(report), "{stem} doesn't show {shows:?}");
     }
 }

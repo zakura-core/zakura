@@ -7,8 +7,9 @@
 
 mod support;
 
-use std::{io::Write, path::Path, process::Command};
+use std::{io::Write, path::Path, process::Command, sync::OnceLock};
 
+use support::header_inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::header_sync::{WATCH_OBSERVED_UNDER_FLOOD, WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD},
@@ -18,27 +19,19 @@ use zakura_sim::{
         header_sync::{Flood, FloodScenario},
         record, run_prepared, RecordInput, Subsystem,
     },
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
     MemorySink, NullSink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// A seed's name, its fixture and its property.
+/// A searched input's name, its fixture and its property.
 type Seed = (&'static str, FloodScenario, &'static str);
 
-/// The seeds, `header-flood-*` in `zakura_sim::seed`: a fixture's scenario
-/// byte, then Plan bytes. Each Plan is one whose flooded queue competes
-/// with the commit's watch read, and on which the reverted reactor breaks
-/// that queue's rule while still adopting the published state before
-/// either queue's third event: through the held read's completion in the
-/// wire fixture, and a churn connect in the lifecycle one. On the wire
-/// seed, the wire queue delivers an event after its commit and before the
-/// watch read, and `cargo xtask planted
-/// header-sync/watch-observed-under-flood` checks that reverting #1566's
-/// top-of-turn watch check violates the wire rule on it, and only that.
-/// The lifecycle seed is the same for the lifecycle queue and
-/// `header-sync/watch-observed-under-lifecycle-flood`.
+/// The searched inputs: a fixture's scenario byte, then Plan bytes. Each
+/// Plan is one whose flooded queue competes with the commit's watch read:
+/// the queue delivers an event after the commit and before the watch read.
+/// That order is the property's trigger history, and the one on which
+/// reverting #1566's top-of-turn watch check breaks the queue's rule.
 const SEEDS: [Seed; 2] = [
     (
         "header-flood-wire",
@@ -52,12 +45,39 @@ const SEEDS: [Seed; 2] = [
     ),
 ];
 
-/// `seed`'s input.
-fn seed_input((name, ..): Seed) -> Vec<u8> {
-    seed::find(name)
-        .unwrap_or_else(|| panic!("{name} is registered"))
-        .input()
-        .to_vec()
+/// How many Plans [`seed_input`]'s search draws.
+const SEARCH_PLANS: usize = 16;
+
+/// The longest Plan [`seed_input`]'s search draws.
+const SEARCH_PLAN_BYTES: usize = 256;
+
+/// `scenario`'s fixture byte.
+fn scenario_byte(scenario: FloodScenario) -> u8 {
+    match scenario {
+        FloodScenario::Wire => 0,
+        FloodScenario::Lifecycle => 1,
+    }
+}
+
+/// The input for a [`SEEDS`] row: its fixture byte, then the first of
+/// [`SEARCH_PLANS`] Plans whose run reaches the property's trigger history
+/// and holds it. Not every Plan's queue competes with the commit's watch
+/// read, so the search skips the ones that don't. The process keeps each
+/// found input.
+fn seed_input((name, scenario, property): Seed) -> Vec<u8> {
+    static FOUND: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
+    let slot = &FOUND[usize::from(scenario_byte(scenario))];
+    slot.get_or_init(|| {
+        let entry = harness::find(Flood::NAME).expect("the harness is registered");
+        header_inputs::first(
+            name,
+            support::byte_inputs(SEARCH_PLANS, SEARCH_PLAN_BYTES)
+                .into_iter()
+                .map(|plan| [&[scenario_byte(scenario)][..], &plan].concat()),
+            |input| header_inputs::holds(entry, input, &[property]),
+        )
+    })
+    .clone()
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -86,7 +106,7 @@ fn run(scenario: FloodScenario, input: PlanInput) -> (RunReport, [PropertyOutcom
     (report, outcomes)
 }
 
-/// Each seed holds its property through the registered harness
+/// Each searched input holds its property through the registered harness
 /// and reaches its trigger history: its queue delivered an event after the
 /// commit and before the watch read.
 #[test]
@@ -108,7 +128,7 @@ fn the_flood_seeds_hold_their_watch_rules() {
 
 /// Both watch properties hold under every plan in both fixtures. Not every
 /// plan's queue competes with the commit's watch read, which is why the
-/// seeds' Plans are fixed.
+/// witnesses search for their Plans.
 #[test]
 fn the_flood_fixtures_hold_both_watch_rules_under_every_plan() {
     for scenario in [FloodScenario::Wire, FloodScenario::Lifecycle] {
@@ -139,7 +159,7 @@ fn the_scenario_byte_picks_the_flood_fixture() {
 }
 
 /// The run's log and both watch outcomes depend only on the plan: the
-/// wire seed's plan A twice, then B, then A again, gives A's every
+/// wire input's plan A twice, then B, then A again, gives A's every
 /// time, and B's log differs.
 #[test]
 fn flood_runs_repeat_a_a_and_a_b_a() {
@@ -160,12 +180,12 @@ fn flood_runs_repeat_a_a_and_a_b_a() {
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
 }
 
-/// Set, to a seed's index in [`SEEDS`] and a directory holding
+/// Set, to an input's index in [`SEEDS`] and a directory holding
 /// its recorded trace, in the child process that
 /// [`the_flood_witnesses_replay_in_a_fresh_process`] starts.
 const CHILD: &str = "ZAKURA_SIM_FLOOD_TRACE";
 
-/// Each seed, recorded in this process, replays exactly in a
+/// Each searched input, recorded in this process, replays exactly in a
 /// fresh process of the same test binary, where its run gives the same
 /// watch outcomes.
 #[test]
@@ -212,8 +232,8 @@ fn the_flood_witnesses_replay_in_a_fresh_process() {
     }
 }
 
-/// Each seed draws its fixture, and runs through the registered harness to
-/// a defined end that the explorer classifies clean.
+/// Each searched input draws its fixture, and runs through the registered
+/// harness to a defined end that the explorer classifies clean.
 #[test]
 fn the_flood_seeds_draw_their_fixtures_and_run_clean() {
     let entry = harness::find(Flood::NAME).expect("the harness is registered");

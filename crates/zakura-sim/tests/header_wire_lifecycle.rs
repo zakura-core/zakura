@@ -1,7 +1,7 @@
 //! M5-F: connection lifecycle on `header-sync/wire`, and the saved Plans.
 //! A replacement while storage is pending follows M4's ordering over real
 //! connections, a disconnect with pages in flight ends cleanly, and each
-//! saved Plan's seed reaches its history with no property violated: the
+//! saved Plan's input reaches its history with no property violated: the
 //! spec's completion evidence. A history a test needs that never happened fails
 //! it: a missing observation is a harness failure, never evidence.
 #![cfg(zakura_sim)]
@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
 
 use support::{
+    header_inputs::wire_input,
     inputs,
     steer::{before, steer, Steer},
 };
@@ -37,7 +38,6 @@ use zakura_sim::{
         StorageResult, TransportFact,
     },
     peer::{adversary::Act, honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     Checker, MemorySink, NoChecks, Observation, Outcome, Plan, PlanInput, PropertyOutcome,
     RunReport, StepCtx,
@@ -763,15 +763,6 @@ impl Marks {
     }
 }
 
-/// Saved Plan `plan`'s seed input, `header-wire-<name>`.
-fn seed_input(plan: SavedPlan) -> Vec<u8> {
-    let name = format!("header-wire-{}", plan.name());
-    seed::find(&name)
-        .unwrap_or_else(|| panic!("{name} is registered"))
-        .input()
-        .to_vec()
-}
-
 /// Runs an input as `zakura-sim record --input` does: its prefix picks the
 /// scenario, and the rest is the Plan. Returns the report with the ports.
 fn replay(input: &[u8]) -> (RunReport, WirePorts) {
@@ -790,7 +781,7 @@ fn judging(label: Label, row: &str) -> String {
     }
 }
 
-/// Each saved Plan's seed, `header-wire-<name>`, runs to its step budget
+/// Each saved Plan's input ([`wire_input`]) runs to its step budget
 /// with no property violated, no task panicked and none leaked. Its prefix
 /// picks the saved scenario. The honest sync reaches the 120-header tip
 /// with `conformant-never-closes` and `session/honest-never-punished`
@@ -800,7 +791,7 @@ fn judging(label: Label, row: &str) -> String {
 #[test]
 fn saved_plans_reach_their_histories() {
     for plan in SavedPlan::ALL {
-        let input = seed_input(plan);
+        let input = wire_input(plan);
         assert_eq!(
             HeaderWire::draw(&input[..2]),
             plan.scenario(),
@@ -1008,8 +999,8 @@ fn records(input: &[u8]) -> Vec<String> {
 fn fuzz_13_saved_plans_repeat_a_a_and_a_b_a() {
     for (index, plan) in FUZZ_13.into_iter().enumerate() {
         let other = FUZZ_13[(index + 1) % FUZZ_13.len()];
-        let a = seed_input(plan);
-        let b = seed_input(other);
+        let a = wire_input(plan);
+        let b = wire_input(other);
         let first = records(&a);
         assert_eq!(records(&a), first, "{}: A/A", plan.name());
         assert_ne!(records(&b), first, "{}: B differs", plan.name());
@@ -1020,7 +1011,7 @@ fn fuzz_13_saved_plans_repeat_a_a_and_a_b_a() {
 /// The variable naming the traces a fresh-process replay child reads.
 const FUZZ_13_CHILD: &str = "ZAKURA_SIM_FUZZ_13_TRACES";
 
-/// Each of fuzz-13's saved Plans, recorded from its seed,
+/// Each of fuzz-13's saved Plans, recorded from its input,
 /// replays Exact in a fresh process: every pick, draw and observation,
 /// stamps included.
 #[test]
@@ -1037,7 +1028,7 @@ fn fuzz_13_saved_plans_replay_exact_in_a_fresh_process() {
     }
     let dir = TempDir::new().expect("a temporary directory");
     for plan in FUZZ_13 {
-        let input = seed_input(plan);
+        let input = wire_input(plan);
         harness::record(
             entry,
             RecordInput::Input(&input),

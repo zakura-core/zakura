@@ -3,6 +3,57 @@
 use super::*;
 
 #[test]
+fn a_body_keeps_its_place_when_a_rival_and_announcement_arrive_during_registration() {
+    let body: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let body = BlockHandle::from(body);
+    let rival: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let rival = BlockHandle::from(rival);
+    for source in [ClaimSource::Inv, ClaimSource::Header] {
+        for delay in [Duration::ZERO, Duration::from_millis(1)] {
+            let claims = AnnouncementClaims::default();
+            let registry = ReceiptRegistry::new(claims.clone());
+            let first = BodyArrival::now();
+            let later = first.time + delay;
+            let competing = registry.register_at(rival.hash(), &rival, arrival(later));
+            match source {
+                ClaimSource::Inv => {
+                    claims.note_announcement_at(body.hash(), block::Height(0), later)
+                }
+                ClaimSource::Header => claims
+                    .begin_at([(body.hash(), block::Height(1))], block::Height(0), later)
+                    .commit(),
+            }
+            let (receipt, counted) = registry.draw(body.hash(), &body, first);
+            assert!(
+                receipt.order < competing.order,
+                "the first body keeps priority over its rival"
+            );
+            assert_eq!(receipt.order, first.order);
+            assert_eq!(counted, Some(ClaimOutcome::Unclaimed));
+        }
+    }
+}
+
+#[test]
+fn a_claim_timestamp_after_body_arrival_is_ineligible_even_with_an_earlier_order() {
+    let now = Instant::now();
+    let later = now + Duration::from_nanos(1);
+    let claims = AnnouncementClaims::default();
+    announce(&claims, hash(1), later);
+    claim(&claims, hash(2), later);
+    for hash in [hash(1), hash(2)] {
+        assert_eq!(
+            claims.resolve(hash, Some(CLAIMED), arrival(now)),
+            ClaimOutcome::Unclaimed
+        );
+    }
+}
+
+#[test]
 fn a_claim_is_shared_by_every_body_delivered_under_its_header() {
     let claims = AnnouncementClaims::default();
     let registry = ReceiptRegistry::new(claims.clone());
@@ -28,18 +79,27 @@ fn a_claim_is_shared_by_every_body_delivered_under_its_header() {
     // Junk bodies fill the tracked slots and spill into untracked receipts. None of them
     // uses the claim up, so the real body still finds it.
     let receipts: Vec<_> = (0..=MAX_BODIES_PER_HASH + 1)
-        .map(|count| registry.register_at(block.hash(), &variant(count), now))
+        .map(|count| registry.register_at(block.hash(), &variant(count), arrival(now)))
         .collect();
     assert!(receipts[MAX_BODIES_PER_HASH].registered.is_none());
     assert!(receipts.iter().all(|receipt| receipt.order == claimed));
 
     // A delivery after every earlier one finished is still inside the deadline.
     drop(receipts);
-    let again = registry.register_at(block.hash(), &variant(0), now + CLAIM_BODY_DEADLINE);
+    let again = registry.register_at(
+        block.hash(),
+        &variant(0),
+        arrival(now + CLAIM_BODY_DEADLINE),
+    );
     assert_eq!(again.order, claimed);
     let late = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
     drop(again);
-    assert!(registry.register_at(block.hash(), &variant(0), late).order > claimed);
+    assert!(
+        registry
+            .register_at(block.hash(), &variant(0), arrival(late))
+            .order
+            > claimed
+    );
 }
 
 #[test]
@@ -54,14 +114,16 @@ fn a_claimed_body_shares_its_order_with_overlapping_deliveries() {
         .begin_at([(block.hash(), block::Height(1))], block::Height(0), now)
         .commit();
     let handle = BlockHandle::from(block.clone());
-    let first = registry.register_at(block.hash(), &handle, now);
+    let first = registry.register_at(block.hash(), &handle, arrival(now));
     assert_eq!(Some(first.order), claims.claimed_order(block.hash()));
 
     // An overlapping delivery shares the receipt even after the claim's deadline.
     let late = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
     let duplicate = BlockHandle::from(Arc::new(block.as_ref().clone()));
     assert_eq!(
-        registry.register_at(block.hash(), &duplicate, late).order,
+        registry
+            .register_at(block.hash(), &duplicate, arrival(late))
+            .order,
         first.order
     );
 }
@@ -227,7 +289,7 @@ fn claim_outcomes_are_counted_once_per_tracked_receipt() {
         BlockHandle::from(Arc::new(variant))
     };
     let counted = |body: &BlockHandle| {
-        let (receipt, counted) = registry.draw(block.hash(), body, now);
+        let (receipt, counted) = registry.draw(block.hash(), body, arrival(now));
         (receipt, counted.is_some())
     };
 

@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use tokio::time::Instant;
 use zakura_chain::block;
 
+use super::super::order::BodyArrival;
 use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
@@ -14,13 +14,18 @@ impl AnnouncementClaims {
         &self,
         hash: block::Hash,
         height: Option<block::Height>,
-        now: Instant,
+        arrival: BodyArrival,
     ) -> ClaimOutcome {
         use ClaimOutcome::{Expired, Unclaimed, Used, Voided};
 
         let table = self.table();
         let classify = |source, height, order, seen_at| {
-            let age = now.saturating_duration_since(seen_at);
+            if order >= arrival.order {
+                return Unclaimed;
+            }
+            let Some(age) = arrival.time.checked_duration_since(seen_at) else {
+                return Unclaimed;
+            };
             let voided = table.mined.iter().any(|(mined_hash, mined)| {
                 *mined_hash != hash && mined.height == height && order < mined.order
             });

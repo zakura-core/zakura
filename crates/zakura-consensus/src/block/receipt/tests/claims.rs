@@ -4,7 +4,7 @@ use super::*;
 
 /// What a body of `hash` finds when it arrives at `now` inside its deadline.
 fn used(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> Used {
-    match claims.resolve(hash, Some(CLAIMED), now) {
+    match claims.resolve(hash, Some(CLAIMED), arrival(now)) {
         ClaimOutcome::Used { order, age, .. } => Used { order, age },
         outcome => panic!("expected a used claim, found {outcome:?}"),
     }
@@ -118,9 +118,12 @@ fn small_and_full_size_bodies_get_the_same_deadline() {
         let body = BlockHandle::from(Arc::new(block));
 
         let deadline = now + CLAIM_BODY_DEADLINE;
-        assert_eq!(registry.register_at(hash, &body, deadline).order, reserved);
+        assert_eq!(
+            registry.register_at(hash, &body, arrival(deadline)).order,
+            reserved
+        );
         let late = deadline + Duration::from_millis(1);
-        assert!(registry.register_at(hash, &body, late).order > reserved);
+        assert!(registry.register_at(hash, &body, arrival(late)).order > reserved);
     }
 }
 
@@ -238,7 +241,7 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), now),
+            claims.resolve(hash(1), Some(CLAIMED), arrival(now)),
             ClaimOutcome::Voided { .. }
         )
     };
@@ -359,13 +362,13 @@ fn a_rival_claimed_before_a_mined_block_never_regains_its_claim() {
 
     // The record outlasts the claim's deadline, so it voids the claim to its last instant.
     let claim_ends = now + CLAIM_BODY_DEADLINE;
-    for arrival in [now, claim_ends, now + MINED_RECORD_LIFETIME] {
-        submit_another(&claims, arrival);
+    for time in [now, claim_ends, now + MINED_RECORD_LIFETIME] {
+        submit_another(&claims, time);
         assert!(matches!(
-            claims.resolve(hash(1), Some(CLAIMED), arrival),
+            claims.resolve(hash(1), Some(CLAIMED), arrival(time)),
             ClaimOutcome::Voided { .. }
         ));
-        assert!(body_order(&claims, hash(1), arrival) > mined_order);
+        assert!(body_order(&claims, hash(1), time) > mined_order);
     }
 
     // Once the record is retired, the claim has long expired on its own.
@@ -373,7 +376,7 @@ fn a_rival_claimed_before_a_mined_block_never_regains_its_claim() {
     submit_another(&claims, late);
     assert_eq!(claims.mined_blocks(), 0);
     assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), late),
+        claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
         ClaimOutcome::Expired { .. }
     ));
     assert!(body_order(&claims, hash(1), late) > mined_order);
@@ -417,7 +420,7 @@ fn a_mined_block_record_takes_the_height_of_the_body_that_verifies() {
     claim(&claims, hash(1), now);
     let voided = || {
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), now),
+            claims.resolve(hash(1), Some(CLAIMED), arrival(now)),
             ClaimOutcome::Voided { .. }
         )
     };

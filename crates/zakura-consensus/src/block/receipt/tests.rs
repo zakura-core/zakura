@@ -19,7 +19,7 @@ use super::{
         size_label, AnnouncementClaims, ClaimOutcome, ClaimSource, CLAIM_BODY_DEADLINE,
         MAX_ANNOUNCED_BLOCKS, MAX_ANNOUNCEMENT_CLAIMS, MINED_RECORD_LIFETIME,
     },
-    order,
+    order::{self, BodyArrival},
     registry::{ReceiptGuard, ReceiptRegistry, MAX_BODIES_PER_HASH},
 };
 
@@ -49,10 +49,18 @@ fn announce(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) {
     claims.note_announcement_at(hash, TIP, now);
 }
 
+fn arrival(time: Instant) -> BodyArrival {
+    BodyArrival {
+        order: order::next(),
+        time,
+    }
+}
+
 /// The order a body of `hash` gets when it arrives at `now`.
 fn body_order(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> u64 {
+    let arrival = arrival(now);
     claims
-        .resolve(hash, Some(CLAIMED), now)
+        .resolve(hash, Some(CLAIMED), arrival)
         .claimed_order()
-        .unwrap_or_else(order::next)
+        .unwrap_or(arrival.order)
 }

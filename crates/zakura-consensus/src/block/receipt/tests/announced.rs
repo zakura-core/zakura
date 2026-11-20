@@ -9,7 +9,7 @@ fn used(
     height: block::Height,
     now: Instant,
 ) -> Option<(ClaimSource, u64)> {
-    match claims.resolve(hash, Some(height), now) {
+    match claims.resolve(hash, Some(height), arrival(now)) {
         ClaimOutcome::Used { source, order, .. } => Some((source, order)),
         _ => None,
     }
@@ -42,7 +42,7 @@ fn a_body_inside_its_inv_deadline_outranks_a_rival_announced_later() {
     let late = at_the_bound + Duration::from_millis(1);
     assert!(
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), late),
+            claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
             ClaimOutcome::Expired {
                 source: ClaimSource::Inv,
                 ..
@@ -64,13 +64,13 @@ fn an_inv_claims_only_bodies_just_above_the_verified_tip() {
 
     for height in [99, 100, 103, 5_000].map(block::Height) {
         assert_eq!(
-            claims.resolve(hash(1), Some(height), now),
+            claims.resolve(hash(1), Some(height), arrival(now)),
             ClaimOutcome::Unclaimed,
             "a body at {height:?} is not racing at the tip",
         );
     }
     assert_eq!(
-        claims.resolve(hash(1), None, now),
+        claims.resolve(hash(1), None, arrival(now)),
         ClaimOutcome::Unclaimed,
         "a body without a coinbase height has no place to claim",
     );
@@ -216,7 +216,7 @@ fn an_expired_inv_does_not_cost_a_later_header_claim_its_deadline() {
     // Once both expire, the metrics report the first announcement.
     let both_expired = header_at + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
     assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), both_expired),
+        claims.resolve(hash(1), Some(CLAIMED), arrival(both_expired)),
         ClaimOutcome::Expired { source: ClaimSource::Inv, age, .. } if age == both_expired - now
     ));
 }
@@ -255,7 +255,7 @@ fn a_repeated_inv_does_not_renew_or_move_the_claim() {
     announce(&claims, hash(1), late);
     assert!(
         matches!(
-            claims.resolve(hash(1), Some(CLAIMED), late),
+            claims.resolve(hash(1), Some(CLAIMED), arrival(late)),
             ClaimOutcome::Expired { age, .. } if age == late - now
         ),
         "the claim still dates from the first inv",
@@ -331,7 +331,7 @@ fn a_mined_block_outranks_an_earlier_inv_at_its_height() {
     let mined_order = order::next();
     let mined = claims.mark_mined(hash(3), CLAIMED, mined_order);
     assert!(matches!(
-        claims.resolve(hash(1), Some(CLAIMED), now),
+        claims.resolve(hash(1), Some(CLAIMED), arrival(now)),
         ClaimOutcome::Voided {
             source: ClaimSource::Inv,
             ..
@@ -366,13 +366,19 @@ fn an_invalid_body_under_an_announced_hash_leaves_the_real_block_its_order() {
     let mut junk = block.clone();
     junk.transactions.push(block.transactions[0].clone());
     assert_eq!(junk.hash(), block.hash());
-    let junk = registry.register_at(block.hash(), &BlockHandle::from(Arc::new(junk)), now);
+    let junk = registry.register_at(
+        block.hash(),
+        &BlockHandle::from(Arc::new(junk)),
+        arrival(now),
+    );
     assert_eq!(junk.order, announced);
     drop(junk);
 
     let real = BlockHandle::from(Arc::new(block.clone()));
     assert_eq!(
-        registry.register_at(block.hash(), &real, now).order,
+        registry
+            .register_at(block.hash(), &real, arrival(now))
+            .order,
         announced,
         "the junk body did not use the announcement up",
     );

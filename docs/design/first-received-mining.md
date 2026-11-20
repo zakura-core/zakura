@@ -12,9 +12,10 @@ A greater-work chain still replaces an earlier equal-work winner.
 ## Announcement priority
 
 A block's receipt order is drawn when its complete body reaches the full-block
-verifier. A block announced first keeps the order reserved for that
-announcement instead, provided its body reaches the verifier within a fixed
-deadline. A block is announced when native header sync admits its header, or
+verifier, before looking up announcements or other active deliveries. An
+announcement can supply its earlier order only if it was recorded before the
+body drew its order and the body arrived within the announcement's deadline.
+A block is announced when native header sync admits its header, or
 when a legacy peer sends the first `inv` for it.
 
 Without this, a block full of transactions can lose an equal-work race to an

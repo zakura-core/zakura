@@ -2,6 +2,24 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::time::Instant;
+
+/// A complete body's own place and deadline reference, captured before either receipt lock.
+#[derive(Clone, Copy)]
+pub(super) struct BodyArrival {
+    pub(super) order: u64,
+    pub(super) time: Instant,
+}
+
+impl BodyArrival {
+    pub(super) fn now() -> Self {
+        Self {
+            order: next(),
+            time: Instant::now(),
+        }
+    }
+}
+
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 
 /// Draws the next receipt order.

@@ -5,13 +5,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::time::Instant;
 use zakura_chain::{block, serialization::ZcashSerialize};
 use zakura_node_services::block_memory::BlockHandle;
 
 use super::{
     claims::{AnnouncementClaims, ClaimOutcome, MinedGuard},
-    order,
+    order::BodyArrival,
 };
 
 /// The most distinct bodies tracked under one block hash at a time.
@@ -37,7 +36,7 @@ type Active = Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>;
 ///
 /// A body that shares no active receipt takes the order of its block's announcement claim if it
 /// arrived inside the claim's deadline and no block this node mined at that height outranks the
-/// claim. Otherwise it takes the next order. Every body under a claimed hash can therefore take
+/// claim. Otherwise it keeps its own arrival order. Every body under a claimed hash can take
 /// the same order, while still having a receipt of its own.
 #[derive(Clone, Debug, Default)]
 pub(in crate::block) struct ReceiptRegistry {
@@ -79,16 +78,16 @@ impl ReceiptRegistry {
         hash: block::Hash,
         block: &BlockHandle,
     ) -> ReceiptGuard {
-        self.register_at(hash, block, Instant::now())
+        self.register_at(hash, block, BodyArrival::now())
     }
 
     pub(super) fn register_at(
         &self,
         hash: block::Hash,
         block: &BlockHandle,
-        now: Instant,
+        arrival: BodyArrival,
     ) -> ReceiptGuard {
-        let (receipt, counted) = self.draw(hash, block, now);
+        let (receipt, counted) = self.draw(hash, block, arrival);
         if let Some(claim) = counted {
             claim.record(hash, receipt.order, || block.zcash_serialized_size());
         }
@@ -104,16 +103,16 @@ impl ReceiptRegistry {
         &self,
         hash: block::Hash,
         block: &BlockHandle,
-        now: Instant,
+        arrival: BodyArrival,
     ) -> (ReceiptGuard, Option<ClaimOutcome>) {
-        let claim = self.claims.resolve(hash, block.coinbase_height(), now);
+        let claim = self.claims.resolve(hash, block.coinbase_height(), arrival);
+        let new_order = claim.claimed_order().unwrap_or(arrival.order);
         let (order, registered, counted) = {
             let mut active = self
                 .active
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bodies = active.entry(hash).or_default();
-            let new_order = || claim.claimed_order().unwrap_or_else(order::next);
             // Handle equality compares the blocks, skipping headers and transactions they share.
             if let Some(entry) = bodies.iter_mut().find(|entry| entry.block == *block) {
                 entry.callers = entry
@@ -122,15 +121,14 @@ impl ReceiptRegistry {
                     .expect("each active caller owns memory, so its count fits in usize");
                 (entry.order, Some((hash, entry.block.clone())), None)
             } else if bodies.len() < MAX_BODIES_PER_HASH {
-                let order = new_order();
                 bodies.push(Entry {
                     block: block.clone(),
-                    order,
+                    order: new_order,
                     callers: 1,
                 });
-                (order, Some((hash, block.clone())), Some(claim))
+                (new_order, Some((hash, block.clone())), Some(claim))
             } else {
-                (new_order(), None, None)
+                (new_order, None, None)
             }
         };
         let receipt = ReceiptGuard {

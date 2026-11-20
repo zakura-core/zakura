@@ -282,7 +282,7 @@ fn oversized_block_and_tx_messages_are_rejected() {
         .finish();
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
         assert!(matches!(
-            codec.read_block(&mut body.as_slice(), None),
+            codec.read_block(&mut body.as_slice()),
             Err(Error::Parse("block is larger than MAX_BLOCK_BYTES"))
         ));
         assert!(matches!(

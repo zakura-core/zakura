@@ -34,8 +34,8 @@ use crate::constants;
 use super::{
     addr::{AddrInVersion, AddrV1, AddrV2},
     message::{
-        BlockReservation, HashedBlock, Message, RejectReason, VersionMessage,
-        MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH, MAX_USER_AGENT_LENGTH,
+        HashedBlock, Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH,
+        MAX_REJECT_REASON_LENGTH, MAX_USER_AGENT_LENGTH,
     },
     types::*,
 };
@@ -278,14 +278,13 @@ pub struct Builder {
     max_len: usize,
     /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
     block_checksums: BlockChecksums,
-    /// Reserves a receipt order when a `block` message starts arriving, if the node wants one.
-    reserve_block_order: Option<ReserveBlockOrder>,
+    /// Called with the hash of the block header that starts each received `block` message.
+    block_header_hook: Option<BlockHeaderHook>,
 }
 
-/// Reserves a place in the node's block receipt order for the block with this hash, or returns
-/// `None` if the node does not reserve one for this message.
-pub(crate) type ReserveBlockOrder =
-    Arc<dyn Fn(block::Hash) -> Option<BlockReservation> + Send + Sync>;
+/// Called with the hash of the block header that starts a received `block` message, as soon as
+/// that header has arrived.
+pub(crate) type BlockHeaderHook = Arc<dyn Fn(block::Hash) + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -295,7 +294,7 @@ impl Codec {
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
             block_checksums: BlockChecksums::default(),
-            reserve_block_order: None,
+            block_header_hook: None,
         }
     }
 
@@ -344,19 +343,17 @@ impl Builder {
         self
     }
 
-    /// Call `reserve_block_order` with the block hash once the block header of each received
-    /// `block` message has arrived, and carry the reservation on the decoded block. Does
-    /// nothing if it is `None`.
+    /// Call `block_header_hook` with the block hash once the block header of each received
+    /// `block` message has arrived, before the block's transactions. Does nothing if it is
+    /// `None`.
     ///
-    /// Reserving at the block header, before the transactions arrive, lets a large block rank
-    /// ahead of announcements that arrive while it is still being received. Waiting for the
-    /// block header, not just the message header, ties the reservation to a block that already
-    /// exists.
-    pub(crate) fn with_block_order_reservation(
+    /// The hash is of header bytes already received. The message header alone names no block:
+    /// its four-byte checksum can be matched by padding a block mined later.
+    pub(crate) fn with_block_header_hook(
         mut self,
-        reserve_block_order: Option<ReserveBlockOrder>,
+        block_header_hook: Option<BlockHeaderHook>,
     ) -> Self {
-        self.reserve_block_order = reserve_block_order;
+        self.block_header_hook = block_header_hook;
         self
     }
 }
@@ -656,10 +653,9 @@ enum DecodeState {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
-        /// Whether this is a `block` message that has not yet been offered a receipt order.
-        reserve_pending: bool,
-        /// The receipt order reserved for a `block` message once its block header arrived.
-        reservation: Option<BlockReservation>,
+        /// Whether this is a `block` message whose block header has not yet been reported to
+        /// the block header hook.
+        block_header_pending: bool,
     },
 }
 
@@ -671,15 +667,13 @@ impl fmt::Debug for DecodeState {
                 body_len,
                 command,
                 checksum,
-                reserve_pending,
-                reservation,
+                block_header_pending,
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
                 .field("command", &String::from_utf8_lossy(command))
                 .field("checksum", &checksum)
-                .field("reserve_pending", &reserve_pending)
-                .field("reservation", &reservation)
+                .field("block_header_pending", &block_header_pending)
                 .finish(),
         }
     }
@@ -699,7 +693,7 @@ impl Decoder for Codec {
         // `max_len`, and one call only discards bytes already buffered, so the work
         // per call stays bounded without a separate count.
         'messages: loop {
-            self.reserve_block_order(src);
+            self.report_block_header(src)?;
             match self.state {
                 DecodeState::Head => {
                     // First check that the src buffer contains an entire header.
@@ -749,9 +743,8 @@ impl Decoder for Codec {
                         body_len,
                         command,
                         checksum,
-                        reserve_pending: command == *BLOCK_COMMAND
-                            && self.builder.reserve_block_order.is_some(),
-                        reservation: None,
+                        block_header_pending: command == *BLOCK_COMMAND
+                            && self.builder.block_header_hook.is_some(),
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -761,7 +754,6 @@ impl Decoder for Codec {
                     body_len,
                     command,
                     checksum,
-                    reservation,
                     ..
                 } => {
                     if src.len() < body_len {
@@ -815,7 +807,7 @@ impl Decoder for Codec {
                             b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
                             b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                             b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                            BLOCK_COMMAND => self.read_block(&mut body_reader, reservation),
+                            BLOCK_COMMAND => self.read_block(&mut body_reader),
                             b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
                             b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
                             b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
@@ -1067,56 +1059,64 @@ impl Codec {
         Ok(Message::GetAddr)
     }
 
-    /// Offers the node a receipt order for the `block` message being received, once the first
-    /// bytes of its body, which are the block header, are in `src`. Does nothing for other
-    /// messages, and runs at most once per message however slowly the bytes arrive.
+    /// Reports the block header of the `block` message being received to the block header
+    /// hook, once the first bytes of the message body, which are that header, are in `src`.
+    /// Does nothing for other messages, and reports at most once per message however slowly
+    /// the bytes arrive.
     ///
-    /// The order is reserved for that header's hash and no other. A peer therefore cannot
-    /// reserve a place and fill it in with a block mined later: the hash of a valid block is
-    /// not known before its proof of work is done. The message header alone would not do,
-    /// because its four-byte checksum can be matched by padding a later block.
+    /// Only this message's body is parsed, never bytes of a following message, and a body that
+    /// does not start with a block header reports nothing: decoding the whole message reports
+    /// that error. Regtest headers are shorter than [`block::MAX_SERIALIZED_HEADER_BYTES`], so
+    /// a Regtest block smaller than that is reported when its whole body has arrived.
     ///
-    /// Regtest headers are shorter than [`block::MAX_SERIALIZED_HEADER_BYTES`], so a Regtest
-    /// block smaller than that reserves when its whole body has arrived.
-    fn reserve_block_order(&mut self, src: &BytesMut) {
+    /// Returns an error, which ends the connection, only if the header parser panics.
+    fn report_block_header(&mut self, src: &BytesMut) -> Result<(), Error> {
         let DecodeState::Body {
             body_len,
-            reserve_pending,
-            reservation,
+            block_header_pending,
             ..
         } = &mut self.state
         else {
-            return;
+            return Ok(());
         };
-        if !*reserve_pending || src.len() < (*body_len).min(block::MAX_SERIALIZED_HEADER_BYTES) {
-            return;
+        if !*block_header_pending || src.len() < (*body_len).min(block::MAX_SERIALIZED_HEADER_BYTES)
+        {
+            return Ok(());
         }
-        *reserve_pending = false;
+        *block_header_pending = false;
+        let Some(hook) = &self.builder.block_header_hook else {
+            return Ok(());
+        };
 
-        let Some(reserve) = &self.builder.reserve_block_order else {
-            return;
-        };
-        // A body that does not start with a block header reserves nothing. Decoding the whole
-        // message reports the error.
-        if let Ok(header) = block::Header::zcash_deserialize(&src[..]) {
-            *reservation = reserve(header.hash());
+        let body = &src[..(*body_len).min(src.len())];
+        // As for whole bodies in `decode`: these are peer bytes, and the parser only reads them.
+        let hash = panic::catch_unwind(|| {
+            block::Header::zcash_deserialize(body)
+                .ok()
+                .map(|header| header.hash())
+        })
+        .map_err(|_panic_payload| {
+            metrics::counter!("peer.message.parse.panics", "parser" => "legacy_block_header")
+                .increment(1);
+            tracing::error!(
+                "peer-controlled block header parser panicked; disconnecting legacy peer"
+            );
+            Error::Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR)
+        })?;
+        if let Some(hash) = hash {
+            hook(hash);
         }
+        Ok(())
     }
 
-    fn read_block(
-        &self,
-        reader: &mut &[u8],
-        reservation: Option<BlockReservation>,
-    ) -> Result<Message, Error> {
+    fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
         let result = self.deserialize_block_spawning(reader);
         let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(
-            HashedBlock::from(block).with_reservation(reservation),
-        ))
+        Ok(Message::Block(HashedBlock::from(block)))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use zakura_chain::block;
 
-use super::{AnnouncementClaims, CLAIM_BODY_DEADLINE};
+use super::super::order::BodyArrival;
+use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
     /// Gives a body the earliest usable reservation for its hash, without consuming it.
@@ -37,31 +38,36 @@ impl AnnouncementClaims {
             }
         };
 
-        let legacy = table.announced.get(hash).filter_map(|candidate| {
-            let height = height.filter(|height| *height >= table.floor)?;
-            Some((
-                candidate.source_at(height)?,
-                height,
-                candidate.order,
-                candidate.seen_at,
-            ))
-        });
-        let header = table.by_hash.get(&hash).map(|header| {
-            (
-                ClaimSource::Header,
-                header.height,
-                header.order,
-                header.seen_at,
-            )
-        });
-        legacy
-            .chain(header)
-            .map(|(source, height, order, seen_at)| {
-                (order, classify(source, height, order, seen_at))
+        let header = table.by_hash.get(&hash);
+        // A legacy sighting made during an earlier header apply is usable only if every apply
+        // fails.
+        let inv = height
+            .zip(table.announced.get(hash))
+            .filter(|(height, inv)| {
+                header.is_none_or(|header| inv.order < header.order)
+                    && *height >= table.floor
+                    && in_claim_window(*height, inv.tip_at_announcement)
             })
-            // Prefer a usable claim. If all failed, report the earliest eligible sighting for metrics.
-            .min_by_key(|(order, outcome)| (outcome.claimed_order().is_none(), *order))
-            .map_or(Unclaimed, |(_, outcome)| outcome)
+            .map_or(Unclaimed, |(height, inv)| {
+                classify(inv.source, height, inv.order, inv.seen_at)
+            });
+        if matches!(inv, Used { .. }) {
+            return inv;
+        }
+
+        let Some(header) = header else {
+            return inv;
+        };
+        let header = classify(
+            ClaimSource::Header,
+            header.height,
+            header.order,
+            header.seen_at,
+        );
+        match (inv, header) {
+            (_, Used { .. }) | (Unclaimed, _) => header,
+            _ => inv,
+        }
     }
 }
 
@@ -72,13 +78,13 @@ pub(in crate::block::receipt) enum ClaimSource {
     Header,
     /// A legacy peer sent the first `inv` for the block.
     Inv,
-    /// A legacy `block` message carrying the block, counted from when its block header
-    /// arrived, holds the earliest legacy reservation. It need not have been pushed or preceded an `inv`.
+    /// The block header at the start of a legacy `block` message was the block's first legacy
+    /// sighting. The message may have been requested or pushed.
     BlockMessage,
 }
 
 impl ClaimSource {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Header => "header",
             Self::Inv => "inv",

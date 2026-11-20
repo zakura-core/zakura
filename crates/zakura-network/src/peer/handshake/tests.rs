@@ -15,7 +15,6 @@ use super::*;
 use crate::{
     peer::BlockAnnouncements,
     peer_set::ActiveConnectionCounter,
-    protocol::external::{BlockReservation, HashedBlock},
     zakura::{
         Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
         ZakuraUpgradeOutcome,
@@ -24,7 +23,7 @@ use crate::{
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
-use zakura_chain::{block, chain_tip::NoChainTip, serialization::ZcashDeserializeInto};
+use zakura_chain::{block, chain_tip::NoChainTip};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1220,7 +1219,7 @@ fn only_a_single_block_inv_is_traced_as_an_announcement() {
             connected_addr,
             &broadcast::channel(16).0,
             &AnnouncedBlocks::default(),
-            &mut Default::default(),
+            &Default::default(),
             &trace.for_peer(&connected_addr),
         )
         .expect("the filter passes the message through");
@@ -1282,7 +1281,7 @@ fn inbound_invs_record_announced_blocks() {
             connected_addr,
             &broadcast::channel(16).0,
             &announced,
-            &mut Default::default(),
+            &Default::default(),
             &Default::default(),
         )
         .expect("the filter passes the message through");
@@ -1307,7 +1306,7 @@ fn inbound_invs_record_announced_blocks() {
         ConnectedAddr::new_inbound_direct(peer_addr(38233)),
         &broadcast::channel(16).0,
         &announced,
-        &mut Default::default(),
+        &Default::default(),
         &Default::default(),
     )
     .expect("the filter passes the message through");
@@ -1322,7 +1321,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
     let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
     let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
     let (hook, announced) = recording_hook();
-    let mut block_announcements = hook.for_connection();
+    let block_announcements = hook.for_connection();
 
     for message in [
         Message::Inv(vec![InventoryHash::Block(blocks[0])]),
@@ -1343,7 +1342,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
             ConnectedAddr::new_inbound_direct(peer_addr(38233)),
             &broadcast::channel(16).0,
             &AnnouncedBlocks::default(),
-            &mut block_announcements,
+            &block_announcements,
             &Default::default(),
         )
         .expect("the filter passes the message through");
@@ -1357,8 +1356,8 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
 #[tokio::test(start_paused = true)]
 async fn the_block_announcement_hook_is_limited_per_connection() {
     let (hook, announced) = recording_hook();
-    let mut connection = hook.for_connection();
-    let announce = |connection: &mut ConnectionAnnouncements, byte: u8| {
+    let connection = hook.for_connection();
+    let announce = |connection: &ConnectionAnnouncements, byte: u8| {
         register_inventory_status(
             Ok(Message::Inv(vec![InventoryHash::Block(block::Hash(
                 [byte; 32],
@@ -1373,7 +1372,7 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
     let count = || announced.lock().unwrap().len();
 
     for byte in 1..=5 {
-        announce(&mut connection, byte).expect("passed through");
+        announce(&connection, byte).expect("passed through");
     }
     assert_eq!(
         count(),
@@ -1381,129 +1380,77 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
         "the fifth announcement in the window does not reach the hook"
     );
 
-    announce(&mut hook.for_connection(), 6).expect("passed through");
+    announce(&hook.for_connection(), 6).expect("passed through");
     assert_eq!(count(), 5, "another connection has its own allowance");
 
     tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
-    announce(&mut connection, 7).expect("passed through");
+    announce(&connection, 7).expect("passed through");
     assert_eq!(count(), 5, "the window has not ended");
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
     for byte in 8..=12 {
-        announce(&mut connection, byte).expect("passed through");
+        announce(&connection, byte).expect("passed through");
     }
     assert_eq!(count(), 9, "a new window allows four more announcements");
 }
 
-/// A completed `block` message that reserved an order reaches the hook with its height and
-/// reservation. Only calls the hook reports as near the tip count against the connection's
-/// four per window, which `inv`s share. A message without a reservation, one whose reservation
-/// was made for another block, or one that failed to decode, does not reach it.
+/// The block headers a connection's decoder sees and the `inv`s its message filter sees draw on
+/// the same four calls per window.
 #[tokio::test(start_paused = true)]
-async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
+async fn block_headers_and_announcements_share_one_connection_allowance() {
     let node = RecordingNode::default();
-    let (announced, received) = (node.announced.clone(), node.received.clone());
-    let hook = BlockAnnouncementHook::new(node);
-    let mut connection = hook.for_connection();
-    let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .expect("block test vector should deserialize");
-    let reservation = |order| BlockReservation {
-        hash: block.hash(),
-        order,
-        verified_tip: block::Height(0),
-        floor: block::Height(0),
-        started_at: tokio::time::Instant::now(),
-    };
-    let deliver = |connection: &mut ConnectionAnnouncements,
-                   msg: Result<Message, SerializationError>| {
+    let (announced, headers) = (node.announced.clone(), node.headers.clone());
+    let connection = BlockAnnouncementHook::new(node).for_connection();
+    let header_arrived = connection
+        .block_header_hook()
+        .expect("a set hook gives the decoder a function to call");
+    let hash = |byte: u8| block::Hash([byte; 32]);
+    let announce = |byte: u8| {
         register_inventory_status(
-            msg,
+            Ok(Message::Inv(vec![InventoryHash::Block(hash(byte))])),
             ConnectedAddr::new_isolated(),
             &broadcast::channel(16).0,
             &AnnouncedBlocks::default(),
-            connection,
+            &connection,
             &Default::default(),
         )
-    };
-    let block_message = |order: Option<u64>| {
-        Ok(Message::Block(
-            HashedBlock::from(block.clone()).with_reservation(order.map(reservation)),
-        ))
-    };
-    let orders = || -> Vec<u64> {
-        received
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, reservation)| reservation.order)
-            .collect()
+        .expect("passed through");
     };
 
-    let _ = deliver(&mut connection, block_message(None));
-    let for_another_block = BlockReservation {
-        hash: block::Hash([7; 32]),
-        ..reservation(1)
-    };
-    let _ = deliver(
-        &mut connection,
-        Ok(Message::Block(
-            HashedBlock::from(block.clone()).with_reservation(Some(for_another_block)),
-        )),
-    );
-    let _ = deliver(
-        &mut connection,
-        Err(SerializationError::Parse("bad checksum")),
-    );
-    assert_eq!(
-        orders(),
-        [0; 0],
-        "only a decoded block with a reservation made for it is passed on"
-    );
-
-    // One announcement leaves three calls for near-tip blocks.
-    deliver(
-        &mut connection,
-        Ok(Message::Inv(vec![InventoryHash::Block(block.hash())])),
-    )
-    .expect("passed through");
-    assert_eq!(announced.lock().unwrap().len(), 1);
-    for order in 1..=10 {
-        deliver(&mut connection, block_message(Some(order))).expect("passed through");
+    announce(1);
+    for byte in 2..=6 {
+        header_arrived(hash(byte));
     }
     assert_eq!(
-        orders(),
-        (1..=5).collect::<Vec<_>>(),
-        "blocks the hook reports as far from the tip do not use the allowance",
+        *headers.lock().unwrap(),
+        [hash(2), hash(3), hash(4)],
+        "one announcement leaves three calls for block headers",
     );
-    let (height, reserved) = received.lock().unwrap()[0];
+    announce(7);
     assert_eq!(
-        (reserved.hash, height),
-        (block.hash(), block.coinbase_height())
-    );
-
-    deliver(
-        &mut connection,
-        Ok(Message::Inv(vec![InventoryHash::Block(block.hash())])),
-    )
-    .expect("passed through");
-    assert_eq!(
-        announced.lock().unwrap().len(),
-        1,
-        "near-tip block messages use the shared allowance"
+        *announced.lock().unwrap(),
+        [hash(1)],
+        "block headers used up the allowance the announcement shares",
     );
 
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    deliver(&mut connection, block_message(Some(11))).expect("passed through");
-    assert_eq!(orders().len(), 6, "a new window allows more block messages");
+    header_arrived(hash(8));
+    assert_eq!(headers.lock().unwrap().last(), Some(&hash(8)));
+
+    assert!(
+        BlockAnnouncementHook::default()
+            .for_connection()
+            .block_header_hook()
+            .is_none(),
+        "an unset hook leaves the decoder nothing to call",
+    );
 }
 
-/// A node that records the blocks it is told about, and reports the `block` messages with odd
-/// orders as near the tip.
+/// A node that records the blocks it is told about.
 #[derive(Clone, Default)]
 struct RecordingNode {
     announced: Arc<std::sync::Mutex<Vec<block::Hash>>>,
-    received: Arc<std::sync::Mutex<Vec<(Option<block::Height>, BlockReservation)>>>,
+    headers: Arc<std::sync::Mutex<Vec<block::Hash>>>,
 }
 
 impl BlockAnnouncements for RecordingNode {
@@ -1511,13 +1458,8 @@ impl BlockAnnouncements for RecordingNode {
         self.announced.lock().unwrap().push(hash);
     }
 
-    fn block_started(&self, _hash: block::Hash) -> Option<BlockReservation> {
-        unreachable!("only the codec reserves")
-    }
-
-    fn block_received(&self, height: Option<block::Height>, reservation: BlockReservation) -> bool {
-        self.received.lock().unwrap().push((height, reservation));
-        reservation.order % 2 == 1
+    fn block_header_arrived(&self, hash: block::Hash) {
+        self.headers.lock().unwrap().push(hash);
     }
 }
 
@@ -1555,7 +1497,7 @@ fn body_requests_withdraw_only_requested_block_announcements() {
                 connected_addr,
                 &broadcast::channel(16).0,
                 &announced,
-                &mut Default::default(),
+                &Default::default(),
                 &Default::default(),
             )
             .expect("the filter passes the request through");

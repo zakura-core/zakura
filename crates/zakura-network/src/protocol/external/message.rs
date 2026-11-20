@@ -4,7 +4,6 @@ use std::{error::Error, fmt};
 use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
-pub use zakura_node_services::block_receipt::BlockReservation;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::sync::Arc;
@@ -33,40 +32,16 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 /// Sending a block uses its hash several times (tracking the upload, finding its checksum),
 /// and so does receiving one (matching it to a request, logging it). A block's hash is not
 /// stored in the block, so each use would otherwise hash the header again.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashedBlock {
     hash: block::Hash,
     block: BlockHandle,
-    /// The receipt order reserved for this block when its header arrived, if it was received
-    /// from a connection that reserves them.
-    reservation: Option<BlockReservation>,
 }
-
-/// Messages carrying the same block are equal, whenever they arrived.
-impl PartialEq for HashedBlock {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.block == other.block
-    }
-}
-
-impl Eq for HashedBlock {}
 
 impl HashedBlock {
     /// The hash of this block.
     pub fn hash(&self) -> block::Hash {
         self.hash
-    }
-
-    /// The receipt order reserved for this block when its header arrived, if one was.
-    pub fn reservation(&self) -> Option<BlockReservation> {
-        self.reservation
-    }
-
-    /// This block, received in a message that reserved `reservation` when its block header
-    /// arrived. A reservation made for another block's hash is dropped.
-    pub(crate) fn with_reservation(mut self, reservation: Option<BlockReservation>) -> Self {
-        self.reservation = reservation.filter(|reservation| reservation.hash == self.hash);
-        self
     }
 
     /// Returns the block, dropping its hash.
@@ -80,7 +55,6 @@ impl From<BlockHandle> for HashedBlock {
         Self {
             hash: block.hash(),
             block,
-            reservation: None,
         }
     }
 }

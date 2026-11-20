@@ -12,7 +12,11 @@ fn a_body_keeps_its_place_when_a_rival_and_announcement_arrive_during_registrati
         .zcash_deserialize_into()
         .unwrap();
     let rival = BlockHandle::from(rival);
-    for source in [ClaimSource::Inv, ClaimSource::Header] {
+    for source in [
+        ClaimSource::Inv,
+        ClaimSource::BlockMessage,
+        ClaimSource::Header,
+    ] {
         for delay in [Duration::ZERO, Duration::from_millis(1)] {
             let claims = AnnouncementClaims::default();
             let registry = ReceiptRegistry::new(claims.clone());
@@ -22,6 +26,9 @@ fn a_body_keeps_its_place_when_a_rival_and_announcement_arrive_during_registrati
             match source {
                 ClaimSource::Inv => {
                     claims.note_announcement_at(body.hash(), block::Height(0), later)
+                }
+                ClaimSource::BlockMessage => {
+                    claims.note_block_header_at(body.hash(), block::Height(0), later)
                 }
                 ClaimSource::Header => claims
                     .begin_at([(body.hash(), block::Height(1))], block::Height(0), later)

@@ -1644,7 +1644,8 @@ where
         let address_book_updater = self.address_book_updater.clone();
         let inv_collector = self.inv_collector.clone();
         let gossip_trace = self.gossip_trace.clone();
-        let block_announcement_hook = self.block_announcement_hook.clone();
+        // One allowance for this connection, shared by its decoder and its message filter.
+        let block_announcements = self.block_announcement_hook.for_connection();
         let config = self.config.clone();
         let user_agent = self.user_agent.clone();
         let our_services = self.our_services;
@@ -1680,7 +1681,7 @@ where
                 Codec::builder()
                     .for_network(&config.network)
                     .with_block_checksums(block_checksums)
-                    .with_block_order_reservation(block_announcement_hook.block_order_reservation())
+                    .with_block_header_hook(block_announcements.block_header_hook())
                     .finish(),
             );
             let mut connection_tracker = connection_tracker;
@@ -1862,7 +1863,6 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
-            let mut block_announcements = block_announcement_hook.for_connection();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
             let peer_registry_updater = peer_registry_updater
@@ -1931,7 +1931,7 @@ where
                             connected_addr,
                             &inbound_inv_collector,
                             &inbound_announced_blocks,
-                            &mut block_announcements,
+                            &block_announcements,
                             &inbound_gossip_trace,
                         )
                     })
@@ -2096,14 +2096,13 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 ///
 /// An `inv` that names exactly one block is a new block announcement, and is passed to
 /// `block_announcements` and written to `gossip_trace`. One that names several is the answer to
-/// a query. A `block` message whose codec reserved a receipt order when its block header arrived
-/// is also passed to `block_announcements`.
+/// a query.
 pub(crate) fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
     inv_collector: &broadcast::Sender<InventoryChange>,
     announced_blocks: &AnnouncedBlocks,
-    block_announcements: &mut ConnectionAnnouncements,
+    block_announcements: &ConnectionAnnouncements,
     gossip_trace: &PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {
@@ -2112,11 +2111,6 @@ pub(crate) fn register_inventory_status(
             if let [InventoryHash::Block(hash)] = items[..] {
                 block_announcements.announce(hash);
                 gossip_trace.block_inv_received(hash);
-            }
-        }
-        Ok(Message::Block(block)) => {
-            if let Some(reservation) = block.reservation() {
-                block_announcements.block_received(block.coinbase_height(), reservation);
             }
         }
         // A request for the body or a missing response contradicts an earlier announcement.

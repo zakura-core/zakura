@@ -61,7 +61,7 @@ fn inv_registry_inbound_wrapper_with(status: InventoryMarker, test_hashes: HashS
         test_peer,
         &inv_stream_tx,
         &Default::default(),
-        &mut Default::default(),
+        &Default::default(),
         &Default::default(),
     );
     assert_eq!(

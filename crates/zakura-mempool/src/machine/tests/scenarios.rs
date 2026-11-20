@@ -1090,6 +1090,37 @@ fn a_parent_that_left_before_its_check_runs_the_child_when_it_returns() {
     );
 }
 
+/// A parent that leaves before the check it started looks for it, and comes
+/// back before that check ends, runs the child again at once.
+#[test]
+fn a_parent_that_returns_during_its_check_runs_the_child_again() {
+    let mut runner = TestRunner::deterministic();
+    let parent = build(&mut runner, &[], 1, None);
+    let child = build(&mut runner, &[parent.outpoint(0)], 1, None);
+    let fillers = unrelated(&mut runner, 2);
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: parent.real.cost() + fillers[0].real.cost(),
+            ..Config::default()
+        },
+        Limits::default(),
+    );
+    let (_, job) = bench.start(&child);
+    assert!(bench.missing(job, vec![parent.outpoint(0)]).is_empty());
+
+    let rerun = admit_parent(&mut bench, &paying(&parent, 500_000));
+    assert_eq!(rerun.len(), 1);
+    bench.admit(&paying(&fillers[0], 100_000_000));
+    bench.admit(&paying(&fillers[1], 200_000_000));
+    bench.admit(&paying(&twin(&parent), 300_000_000));
+    let step = bench.missing(rerun[0], vec![parent.outpoint(0)]);
+    assert_eq!(
+        started(&step).len(),
+        1,
+        "the parent came back during the check"
+    );
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

@@ -1317,12 +1317,19 @@ impl<E: VerifyError> MempoolState<E> {
                     .filter(|outpoint| self.arrived_since(outpoint, started_at))
                     .map(|outpoint| outpoint.hash)
                     .collect();
-                // The parents of its runs that are still pooled were there
-                // for this check.
+                // The parents of its runs pooled since before this check
+                // started were there for it. One that came back during the
+                // check is in `arrived`.
                 let seen: Vec<bool> = self.admissions[&key]
                     .retried_for
                     .iter()
-                    .map(|retry| retry.seen || self.pooled.contains_key(&retry.parent))
+                    .map(|retry| {
+                        retry.seen
+                            || self
+                                .pooled
+                                .get(&retry.parent)
+                                .is_some_and(|pooled| self.pool[pooled].added_at <= started_at)
+                    })
                     .collect();
                 let admission = self.admission_at(key);
                 for (retry, seen) in admission.retried_for.iter_mut().zip(seen) {

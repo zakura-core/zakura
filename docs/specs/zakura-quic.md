@@ -1782,7 +1782,10 @@ Changed:
 - **WIRE-2, §13.** The ALPN moves to `p2p-v2/4` and the Zakura protocol
   version to 4, a hard break under COMPAT-8 with no overlap with version 3.
 - **API-1.** Adds `NodeKeyList`, `NodeAddr::key` and the key list a
-  `NodeSecretKey` carries.
+  `NodeSecretKey` carries. Removes `NodeId::key()`, `NodeId::verify_strict()`
+  and the conversion from a `NodeKey`: a node ID is a hash and holds no key.
+  `NodeKey::node_id()` gives the ID of the one-key list. These break the
+  crate's published API, so its version moves to 2.0.0.
 - **API-2, API-4.** Add `local_key()` and `local_keys()` to the endpoint and
   `local_keys()` to the connection.
 - **SEC-2.** The wrong-server refusal applies to a dial that names a key.

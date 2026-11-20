@@ -261,9 +261,10 @@ struct Admission<E> {
 impl<E> Admission<E> {
     /// Holds back a parent that arrived past the cap until [`RETRY_GAP`]
     /// after its latest check started, or says it runs now: once that gap
-    /// has passed, or when its submitter's deadline comes before both the
-    /// gap's end and its wait's end, which spends its one last check while
-    /// there is still time. A wait that ends first gives that check itself.
+    /// has passed, or when its submitter's deadline comes by both the gap's
+    /// end and its wait's end, which spends its one last check while there
+    /// is still time. A wait that ends strictly first gives that check
+    /// itself. At a tie the wait's end finds the deadline already passed.
     fn hold_arrival(&mut self, now: Instant) -> bool {
         let gap_end = self.ran_at + RETRY_GAP;
         if gap_end <= now {
@@ -272,7 +273,7 @@ impl<E> Admission<E> {
         let wait_end = self.missing_since.map(|since| since + T_PARK);
         let deadline_first = self
             .give_up
-            .is_some_and(|at| at <= gap_end && wait_end.is_none_or(|end| at < end));
+            .is_some_and(|at| at <= gap_end && wait_end.is_none_or(|end| at <= end));
         if !self.last_check_used && deadline_first {
             self.last_check_used = true;
             return true;

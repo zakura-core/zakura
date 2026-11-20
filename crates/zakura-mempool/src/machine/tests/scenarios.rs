@@ -1105,20 +1105,28 @@ fn the_retry_gap_runs_from_the_start_of_the_last_check() {
 }
 
 /// A parent held back past the cap spends the child's last check at once
-/// when the submitter's deadline comes before both the gap's end and the
-/// wait's end. Here the child parks at 15 s with a 73 s deadline, so its
-/// wait ends at 75 s, its second retry runs at 65 s, and its other parent
-/// arrives at 66 s, when the gap would end at 75 s.
+/// when the submitter's 73 s deadline comes by both the gap's end and the
+/// wait's end. In the first case the child parks at 15 s, so its wait ends
+/// at 75 s, its second retry runs at 65 s, and its other parent arrives at
+/// 66 s, when the gap would end at 75 s. In the second the child parks at
+/// 13 s, so its wait ends at 73 s too, its second retry runs at 69 s, and
+/// its other parent arrives at 70 s.
 #[test]
 fn a_held_parent_spends_the_last_check_before_the_deadline() {
-    let (parents, mut bench) = one_parent_spends_the_retries(
-        Duration::from_secs(15),
-        Some(Duration::from_secs(73)),
-        Duration::from_secs(65),
-    );
-    bench.now = Duration::from_secs(66);
-    let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
-    assert_eq!(rerun.len(), 1, "the last check runs before 73 s");
+    for (parks_at, again_at) in [(15, 65), (13, 69)] {
+        let (parents, mut bench) = one_parent_spends_the_retries(
+            Duration::from_secs(parks_at),
+            Some(Duration::from_secs(73)),
+            Duration::from_secs(again_at),
+        );
+        bench.now = Duration::from_secs(again_at + 1);
+        let rerun = admit_parent(&mut bench, &paying(&parents[1], 400_000_000));
+        assert_eq!(
+            rerun.len(),
+            1,
+            "the last check runs before 73 s, parked at {parks_at} s"
+        );
+    }
 }
 
 /// A parent held back past the cap waits for the wait's end when that comes

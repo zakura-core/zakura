@@ -3,8 +3,10 @@
 #![allow(dead_code)]
 
 pub mod feed;
+pub mod plan_search;
 pub mod prepare_fault;
 pub mod qa_store;
+pub mod race_schedule;
 pub mod script;
 pub mod steer;
 

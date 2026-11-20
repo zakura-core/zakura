@@ -1367,7 +1367,10 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/sender-within-owed",
         OWED_ANSWERS,
-        Bypass::Planted("ignore-peers-limit"),
+        Bypass::Test(sim_test(
+            DISCOVERY_WITNESSES,
+            "peers_sender_within_owed_breaks_in_its_bypass",
+        )),
     ),
     discovery(
         "discovery/s4v2/services/sender-within-owed",

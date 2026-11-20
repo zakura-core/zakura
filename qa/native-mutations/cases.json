@@ -720,16 +720,6 @@
     "fault_class": "request-authorization"
   },
   {
-    "patch": "discovery-table/ignore-requested-peer-limit/ignore-requested-peer-limit.patch",
-    "entry": "discovery-table",
-    "property": "discovery/s4v2/peers/sender-within-owed",
-    "witness": {
-      "test": "answers_within_their_requests_hold_sender_within_owed",
-      "test_target": "discovery_wire_witness"
-    },
-    "fault_class": "request-authorization"
-  },
-  {
     "patch": "teardown/admitted-keeps-setup-slot/admitted-keeps-setup-slot.patch",
     "entry": "session-capacity",
     "property": "session/capacity-conserved",

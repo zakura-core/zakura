@@ -536,10 +536,41 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         quic_stream: Some(4),
         seq: 0,
     };
+    // The node's frame on the ID's row, as the peer's models labelled it.
+    let sent = |label: Label| Observation::NodeFrame {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+        row: id.row.map(str::to_owned),
+        rule_stream: STREAM,
+        label,
+        exhausted: false,
+        exchange: None,
+    };
     match id.template {
         Template::Closes(label) => vec![vec![peer(label)], vec![judged]],
+        Template::SenderWithinOwed => vec![vec![sent(Label::OverOwed)]],
         template => panic!("no scripted bypass covers {template:?}"),
     }
+}
+
+/// `peers/sender-within-owed` fails, alone, on the history of a node that
+/// answers a `GetPeers` with more records than it asked for: the peer's
+/// models label the node's `Peers` over-owed. This is its bypass in the
+/// coverage manifest.
+#[test]
+fn peers_sender_within_owed_breaks_in_its_bypass() {
+    let name = id("peers/sender-within-owed");
+    let parsed = GeneratedId::parse(&name).expect("a generated ID parses back");
+    let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+    let violated: Vec<&str> = report
+        .properties
+        .iter()
+        .filter(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
+        .map(|property| property.property.as_str())
+        .collect();
+    assert_eq!(violated, [name.as_str()], "{:?}", report.properties);
 }
 
 /// Each [`SCRIPTED`] ID fails on a scripted history that bypasses its

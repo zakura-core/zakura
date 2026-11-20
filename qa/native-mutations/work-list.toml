@@ -295,7 +295,6 @@ code = [
     "crates/zakura-network/src/zakura/discovery/requester.rs",
     "crates/zakura-network/src/zakura/discovery/requester",
     "crates/zakura-network/src/zakura/discovery/protocol.rs",
-    "crates/zakura-network/src/zakura/discovery/state.rs",
     "crates/zakura-network/src/zakura/discovery/peer.rs",
     "crates/zakura-network/src/zakura/discovery/wire.rs",
 ]
@@ -883,12 +882,6 @@ patch = "discovery-table/wants-unnamed-services/wants-unnamed-services.patch"
 property = "discovery/s4v2/services/sender-within-owed"
 harness = "discovery/wire"
 families = ["get-header-sync-service"]
-
-[[drawn-witness]]
-patch = "discovery-table/ignore-requested-peer-limit/ignore-requested-peer-limit.patch"
-property = "discovery/s4v2/peers/sender-within-owed"
-harness = "discovery/wire"
-families = ["get-one-peer"]
 
 # The handshake cases. Each family draws the test's scenario through
 # `handshake/wire`'s or `handshake/counts`'s decoder.

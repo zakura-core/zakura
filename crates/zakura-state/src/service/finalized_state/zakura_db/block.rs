@@ -829,7 +829,8 @@ impl ZakuraDb {
     /// On a secondary, a `tx_by_loc` read can fail after the primary moved the
     /// blocks it was reading, see [`Self::static_file_tip_after_failed_read`].
     /// The iterator then continues after the last row it returned, with static
-    /// files up to their own tip, instead of panicking.
+    /// files up to their own tip, instead of panicking. It does that again for
+    /// each later failure if the static files grew in between.
     pub fn raw_transactions_by_location_range<R>(
         &self,
         range: R,
@@ -840,21 +841,28 @@ impl ZakuraDb {
         let (start, end) = (range.start_bound().cloned(), range.end_bound().cloned());
         let mut rows = self.raw_transactions_in_bounds(start, end, None);
         let mut last = None;
-        let mut read_static_files = false;
+        // The static file tip the last failed read resumed from. A long scan
+        // on a secondary can outlast more than one move, so each failure may
+        // resume once the static files have grown past that tip.
+        let mut resumed_from: Option<Option<Height>> = None;
         std::iter::from_fn(move || loop {
             match rows.next()? {
                 Ok(row) => {
                     last = Some(row.0);
                     return Some(row);
                 }
-                Err(error) if !read_static_files => {
-                    read_static_files = true;
+                Err(error) => {
+                    let message = error.to_string();
                     let static_tip = self.static_file_tip_after_failed_read(error);
+                    if resumed_from.is_some_and(|previous| static_tip <= previous) {
+                        panic!(
+                            "a tx_by_loc read failed again without the static files growing: \
+                             {message}"
+                        );
+                    }
+                    resumed_from = Some(static_tip);
                     let start = last.map_or(start, Bound::Excluded);
                     rows = self.raw_transactions_in_bounds(start, end, static_tip);
-                }
-                Err(error) => {
-                    panic!("a tx_by_loc read failed again after reading static files: {error}")
                 }
             }
         })

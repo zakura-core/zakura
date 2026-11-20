@@ -18,6 +18,7 @@ use crate::zakura::{
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
 #[cfg(test)]
+#[path = "../../../../tests/unit/zakura/handler/service_session/state/mod.rs"]
 mod tests;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

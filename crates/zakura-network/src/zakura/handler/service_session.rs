@@ -478,4 +478,5 @@ impl ZakuraProtocolHandler {
 }
 
 #[cfg(all(test, not(zakura_sim)))]
+#[path = "../../../tests/unit/zakura/handler/service_session/mod.rs"]
 mod tests;

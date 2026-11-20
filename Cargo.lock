@@ -2670,6 +2670,7 @@ dependencies = [
 name = "zakura"
 version = "1.8.9"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -3337,6 +3338,7 @@ dependencies = [
  "zakura-orchard",
  "zakura-primitives",
  "zakura-protocol",
+ "zakura-rt",
  "zakura-sapling-crypto",
  "zakura-script",
  "zakura-state",

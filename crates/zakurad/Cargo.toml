@@ -218,6 +218,7 @@ derive-new.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+base64 = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 criterion = { workspace = true }

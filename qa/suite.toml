@@ -120,12 +120,6 @@ run = false
 reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
-test = "regenerate_late_fault_fixture"
-run = false
-reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false

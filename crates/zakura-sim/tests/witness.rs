@@ -8,15 +8,20 @@ use std::time::Duration;
 
 use zakura_rt::time::sleep;
 use zakura_sim::{
-    domain::discovery::WAIT_COMPLETE_WAKES,
-    harness::{self, discovery::WaitComplete, Subsystem},
+    check::after_step,
+    domain::discovery::{WaitState, WAIT_COMPLETE_WAKES},
+    harness::{
+        self,
+        discovery::{run_config, spawn, WaitComplete},
+        Subsystem,
+    },
     property::{
         HasView, Kind, Pending, Property, PropertyId, Source, Sources, Status, TriggerHistory,
         Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
-    NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig,
-    Sim,
+    MemorySink, NaReason, Observation, ObservationLog, Plan, PlanChoice, PlanInput,
+    PropertyOutcome, Record, RunConfig, Sim,
 };
 
 /// The input that holds discovery's source back at its `notified` until
@@ -48,9 +53,38 @@ fn discovery_wait_complete_lost_wakeup() {
 }
 
 /// The byte of [`input`] that picks the sink's first step of the final
-/// mark. Each later byte picks between the sink and the source, and 1 picks
-/// the source.
-const FINAL_MARK_STARTS: usize = 147;
+/// mark: the step that lands the final record or runs the final notify,
+/// whichever comes first. Each later byte picks between the sink and the
+/// source, and 1 picks the source.
+///
+/// A run of [`input`] finds the byte, so a change to the steps before the
+/// final mark doesn't move the test off it.
+fn final_mark_starts() -> usize {
+    let input = input();
+    let mut starts = None;
+    let mut find = after_step(|cx| {
+        if starts.is_none() {
+            let state = WaitState::of(cx.log.entries());
+            if state.all_recorded() || state.all_marked() {
+                starts = Some(cx.step);
+            }
+        }
+        None
+    });
+    let mut sim = Sim::new(run_config(), Plan::from_fuzz(&input));
+    spawn(&mut sim);
+    let mut sink = MemorySink::default();
+    sim.run(&mut find, &mut sink);
+    drop(find);
+    let step = starts.expect("the input runs the final mark");
+    sink.records
+        .iter()
+        .find_map(|record| match record {
+            Record::Step(record) if record.step == step => record.offset,
+            _ => None,
+        })
+        .expect("a byte picks the final mark's first step")
+}
 
 /// S4.7's sink side: [`input`] up to the sink's first step of the final
 /// mark, then four picks of the source. The source's check lands while the
@@ -59,7 +93,7 @@ const FINAL_MARK_STARTS: usize = 147;
 /// fails, and its next `Notified` comes after the last notify.
 #[test]
 fn discovery_wait_complete_check_inside_final_mark() {
-    let mut input = input()[..=FINAL_MARK_STARTS].to_vec();
+    let mut input = input()[..=final_mark_starts()].to_vec();
     input.extend([1; 4]);
     check_witness(
         lost_wakeup(Plan::from_fuzz(&input)),

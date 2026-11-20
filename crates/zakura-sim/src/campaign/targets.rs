@@ -415,14 +415,16 @@ pub fn max_len(args: &[String]) -> Option<usize> {
 }
 
 /// The retained production bypasses under the QA store `store`'s
-/// `qa/planted/` whose seed is one of `seeds`, by name. A typed case names no seed, so no
-/// target runs it. A case naming neither a seed nor a typed case, or both,
-/// is an error, as `cargo xtask planted` reports it.
+/// `qa/planted/` whose seed is one of `seeds`, by name. A typed or search
+/// case names no seed, so no target runs it. A case that names no seed,
+/// typed case or search, or more than one, is an error, as
+/// `cargo xtask planted` reports it.
 pub fn bypasses(store: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
         seed: Option<String>,
         typed: Option<toml::Table>,
+        search: Option<toml::Table>,
     }
     let mut cases = Vec::new();
     let root = store.join(PLANTED_DIR);
@@ -436,15 +438,19 @@ pub fn bypasses(store: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String>
             .map_err(|error| format!("reading {}: {error}", case.display()))?;
         let file: CaseFile = toml::from_str(&text)
             .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-        let name = match (file.seed, file.typed) {
-            (Some(name), None) => name,
-            (None, Some(_)) => continue,
-            (name, _) => {
+        let name = match (file.seed, file.typed, file.search) {
+            (Some(name), None, None) => name,
+            (None, Some(_), None) | (None, None, Some(_)) => continue,
+            (seed, typed, search) => {
+                let named = [seed.is_some(), typed.is_some(), search.is_some()]
+                    .into_iter()
+                    .filter(|named| *named)
+                    .count();
                 return Err(format!(
-                    "{}: a case names either `seed` or `[typed]`, and this names {}",
+                    "{}: a case names one of `seed`, `[typed]` and `[search]`, and this names \
+                     {named}",
                     case.display(),
-                    if name.is_some() { "both" } else { "neither" }
-                ))
+                ));
             }
         };
         if !seeds.iter().any(|seed| seed.name == name) {

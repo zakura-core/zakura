@@ -95,6 +95,7 @@ macro_rules! machine_entry {
                     sink,
                 )
             },
+            untriggered: Vec::new,
             run_bytes: |bytes, sink, extra| {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },

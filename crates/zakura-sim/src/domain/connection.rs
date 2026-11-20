@@ -33,10 +33,13 @@ pub const CREDIT_ISOLATED: &str = "session/credit-isolated";
 pub const SEND_ISOLATED: &str = "session/send-isolated";
 
 /// Each service's frame gates on a connection grant no more than that
-/// service's shares, and free no more than their capacities. The check
-/// reads the gates' own grants and free bytes, so a frame a service keeps
-/// after its grant ends is out of its reach. A grant released twice leaves
-/// its gate's free bytes above the capacity, which the check reads.
+/// service's shares, and free no more than their capacities, and each raw
+/// gate grants at least the bytes of the received frames its services hold.
+/// The check reads the gates' own grants and free bytes, and the frames
+/// each service's receive handle holds from the node's `frame-held` and
+/// `frame-released` rows. A grant released twice leaves its gate's free
+/// bytes above the capacity. A grant released before its frame leaves the
+/// held frames above the gate's grants.
 pub const CONNECTION_SHARES_BOUND: &str = "session/connection-shares-bound";
 
 /// The production limits the properties judge against: the node's, and the
@@ -142,19 +145,25 @@ where
             // about one send window later. The longest wait counts one body,
             // 500,001 bytes against a bound of 565,578, because the node
             // counts a frame's whole payload when it reads the frame's
-            // header. Frames under 64 KiB can queue several to a stream; no
-            // run shows whether a frame that blocks before them waits behind
-            // them all.
+            // header.
+            // Frames under 64 KiB can queue several to a stream (#2365).
+            // With 2,000-byte bodies and the chain growing every 250 ms, a
+            // header-sync frame waits at most 48,240 bytes, 24 bodies,
+            // against a bound of 67,685. No wait passes one send window, so
+            // the frame doesn't wait behind every body block sync queues
+            // (`tests/sync_wire.rs`,
+            // `a_frame_behind_many_small_bodies_waits_within_one_send_window`).
             status: Status::Draft,
             check: check_send_isolated::<S>,
             witness: Some(TriggerHistory::View(written_under_saturation::<S>)),
         },
         Property {
             id: PropertyId::new(CONNECTION_SHARES_BOUND),
-            claim: "on every connection, each service's raw inbound frame gate grants no more \
-                    than its receive share and its output frame gate no more than its output \
-                    share, as the node's reactor shares declare them, and neither gate frees \
-                    more bytes than its capacity",
+            claim: "on every connection, each service's held received frames stay within its \
+                    receive share: its raw inbound frame gate grants every byte of the frames \
+                    it holds and no more than its receive share; its output frame gate grants \
+                    no more than its output share, as the node's reactor shares declare them; \
+                    and neither gate frees more bytes than its capacity",
             kind: Kind::Safety,
             assumes: &[],
             // The taps' rows, and the view's bounds and fold.
@@ -230,9 +239,14 @@ struct ConnectionFold {
     holding: BTreeMap<u64, u16>,
     /// Each node connection's raw bytes held per kind at its last load.
     held: BTreeMap<(u64, u16), u64>,
+    /// Each node connection's raw gate capacity per kind at its last load.
+    capacity: BTreeMap<(u64, u16), u64>,
     /// Each node connection's raw and output gates' free bytes per kind at
     /// its last load.
     free: BTreeMap<(u64, u16), (u64, u64)>,
+    /// The wire bytes of each received frame a node service holds, by
+    /// connection, QUIC stream and read sequence number.
+    frames: BTreeMap<(u64, u64, u64), u64>,
     /// Each peer connection's saturation at its last load.
     saturated: BTreeMap<PeerConn, bool>,
     /// Each peer connection's pending writes, by stream and sequence.
@@ -246,6 +260,9 @@ struct ConnectionFold {
     /// Whether a gate's free bytes rose between two loads of its
     /// connection: a grant returned bytes.
     grant_returned: bool,
+    /// Whether a load sampled a connection, or a received frame reached a
+    /// service, while a service held a received frame there.
+    frame_held: bool,
     /// Whether a write that started under saturation reached the node
     /// after other services' frames.
     written_under_saturation: bool,
@@ -334,8 +351,65 @@ impl ConnectionFold {
             TransportFact::FrameRead { quic_stream, seq } => {
                 self.frame_read(bounds, connection, *quic_stream, *seq);
             }
+            TransportFact::FrameHeld {
+                quic_stream,
+                seq,
+                bytes,
+            } => {
+                self.frames.insert((connection, *quic_stream, *seq), *bytes);
+                // A grant that drops while its frame waits in the service's
+                // queue changes no gate after the frame arrives, so no
+                // later load may come: judge the held frames against the
+                // last one now.
+                let Some(&kind) = self.node_kinds.get(&(connection, *quic_stream)) else {
+                    return;
+                };
+                let last = (
+                    self.held.get(&(connection, kind)),
+                    self.capacity.get(&(connection, kind)),
+                );
+                if let (Some(&granted), Some(&capacity)) = last {
+                    self.held_frames_granted(connection, kind, granted, capacity);
+                }
+            }
+            TransportFact::FrameReleased { quic_stream, seq } => {
+                self.frames.remove(&(connection, *quic_stream, *seq));
+            }
             _ => {}
         }
+    }
+
+    /// [`CONNECTION_SHARES_BOUND`] on the received frames the services of
+    /// `kind` on `connection` hold, against the `granted` bytes of the
+    /// kind's raw gate of `capacity`.
+    fn held_frames_granted(&mut self, connection: u64, kind: u16, granted: u64, capacity: u64) {
+        self.findings.shares.judged = true;
+        let frames = self.held_frames(connection, kind, capacity);
+        self.frame_held |= frames > 0;
+        if frames > granted {
+            self.findings.shares.violations.push((
+                "each service's raw inbound gate on a connection grants the bytes of the \
+                 received frames the service holds"
+                    .to_owned(),
+                format!(
+                    "kind {kind}'s services hold {frames} bytes of received frames on \
+                     connection {connection}, and its raw inbound gate grants {granted}"
+                ),
+            ));
+        }
+    }
+
+    /// The bytes of the received frames the services of `kind` on
+    /// `connection` hold, each clamped to the kind's raw gate `capacity`, as
+    /// the gate clamps a frame's charge.
+    fn held_frames(&self, connection: u64, kind: u16, capacity: u64) -> u64 {
+        self.frames
+            .range((connection, 0, 0)..=(connection, u64::MAX, u64::MAX))
+            .filter(|((_, quic_stream, _), _)| {
+                self.node_kinds.get(&(connection, *quic_stream)) == Some(&kind)
+            })
+            .map(|(_, bytes)| (*bytes).min(capacity))
+            .fold(0, u64::saturating_add)
     }
 
     /// Folds one of a peer's rows on `connection`.
@@ -412,6 +486,8 @@ impl ConnectionFold {
         for load in kinds {
             let share = shares.share(load.kind);
             self.held.insert((connection, load.kind), load.raw_held);
+            self.capacity
+                .insert((connection, load.kind), load.raw_capacity);
             let free = (
                 load.raw_capacity
                     .saturating_sub(load.raw_held)
@@ -429,6 +505,7 @@ impl ConnectionFold {
             if load.raw_held > handshake {
                 self.holding.insert(connection, load.kind);
             }
+            self.held_frames_granted(connection, load.kind, load.raw_held, load.raw_capacity);
             for (what, held, bound, excess, capacity) in [
                 (
                     "raw inbound gate",
@@ -673,7 +750,10 @@ where
 /// connection held more received frame bytes than another service's
 /// receive share there, so a gate the two shared would have let one take
 /// the other's share; or a gate's free bytes rose between two loads, so a
-/// grant returned bytes and a second return would free them twice.
+/// grant returned bytes and a second return would free them twice; or a
+/// load sampled a connection, or a received frame reached a service, while
+/// a service held a received frame, so a grant released before its frame
+/// would show.
 fn shares_bound_triggered<S>(view: &S::View, log: &ObservationLog) -> bool
 where
     S: HasView,
@@ -682,7 +762,7 @@ where
     view.wire().is_some_and(|wire| {
         let mut fold = wire.fold.borrow_mut();
         fold.advance(&wire.bounds, log);
-        fold.held_past_another_share || fold.grant_returned
+        fold.held_past_another_share || fold.grant_returned || fold.frame_held
     })
 }
 
@@ -699,4 +779,118 @@ where
         fold.advance(&wire.bounds, log);
         fold.written_under_saturation
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::KindLoad;
+
+    /// The stream kind, QUIC stream and connection the rows name.
+    const KIND: u16 = 6;
+    const QUIC_STREAM: u64 = 4;
+    const CONNECTION: u64 = 1;
+    /// The wire bytes of the one received frame.
+    const FRAME: u64 = 61;
+
+    /// The node's row `event` on [`CONNECTION`] at `step`.
+    fn node(step: u64, event: TransportFact) -> Entry {
+        Entry {
+            step,
+            obs: Observation::Transport {
+                instance: 0,
+                seq: step,
+                node: "node".to_owned(),
+                connection: Some(CONNECTION),
+                remote: String::new(),
+                event,
+            },
+        }
+    }
+
+    /// A load whose raw gate for [`KIND`] grants `raw_held` bytes.
+    fn load(step: u64, raw_held: u64) -> Entry {
+        node(
+            step,
+            TransportFact::Load {
+                receive_window: 0,
+                data_blocked: 0,
+                stream_data_blocked: 0,
+                queued_send_bytes: 0,
+                send_blocked_streams: 0,
+                kinds: vec![KindLoad {
+                    kind: KIND,
+                    raw_held,
+                    raw_capacity: 1_000,
+                    raw_excess: 0,
+                    output_held: 0,
+                    output_capacity: 1_000,
+                    output_excess: 0,
+                }],
+            },
+        )
+    }
+
+    /// Folds a session of [`KIND`], then `rows`, and returns the
+    /// [`CONNECTION_SHARES_BOUND`] findings of the last row's step.
+    fn shares_after(rows: Vec<Entry>) -> Findings {
+        let bounds = WireBounds {
+            node: ZakuraLocalLimits::from_config(&zakura_network::Config::default()),
+            peer_send_window: 0,
+        };
+        let session = Entry {
+            step: 1,
+            obs: Observation::Session {
+                connection: CONNECTION,
+                peer: "peer".to_owned(),
+                quic_stream: QUIC_STREAM,
+                kind: KIND,
+                version: 1,
+                session_id: 1,
+            },
+        };
+        let mut fold = ConnectionFold::default();
+        for row in [session].into_iter().chain(rows) {
+            fold.fold(&bounds, &row);
+        }
+        fold.findings.shares
+    }
+
+    /// The frame's `frame-held` row at `step`.
+    fn held(step: u64) -> Entry {
+        node(
+            step,
+            TransportFact::FrameHeld {
+                quic_stream: QUIC_STREAM,
+                seq: 0,
+                bytes: FRAME,
+            },
+        )
+    }
+
+    /// A grant that dropped while its frame waited in the service's queue
+    /// leaves no load after the frame's `frame-held` row. The row itself
+    /// judges the held frame against the last load, which granted nothing.
+    #[test]
+    fn a_frame_held_after_its_grant_dropped_violates() {
+        let shares = shares_after(vec![load(2, FRAME), load(3, 0), held(4)]);
+        assert!(shares.judged);
+        assert_eq!(
+            shares.violations.first().map(|(_, actual)| actual.as_str()),
+            Some(
+                "kind 6's services hold 61 bytes of received frames on connection 1, and its \
+                 raw inbound gate grants 0"
+            ),
+            "{:?}",
+            shares.violations
+        );
+    }
+
+    /// A frame whose grant still holds its bytes at the last load holds.
+    #[test]
+    fn a_frame_held_under_its_grant_holds() {
+        let shares = shares_after(vec![load(2, FRAME), held(3)]);
+        assert!(shares.judged);
+        assert_eq!(shares.violations, Vec::new());
+    }
 }

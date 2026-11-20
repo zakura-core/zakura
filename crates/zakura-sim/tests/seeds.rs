@@ -1,16 +1,148 @@
 //! The QA store's seed loader (explorer implementation plan, E3a-1): a
 //! store's index and inputs read back as the seeds written, and the seed
 //! check rejects a seed that doesn't fit its harness, witnesses or set.
-//! Every seed here is built in code and written to a temporary store: the
-//! real seeds live in the Space, which repository tests don't read.
+//! These seeds are built in code and written to a temporary store: the real
+//! seeds live in the Space, which repository tests don't read. With
+//! `ZAKURA_QA_STORE` set, two more tests check the store's seeds and
+//! planted cases.
 #![cfg(zakura_sim)]
 
-use std::fs;
+use std::{collections::BTreeSet, fs};
 
 use zakura_sim::{
+    harness::HARNESSES,
+    planted,
     seed::{self, Index, Seed, SeedError, SeedSet},
     witness::Expect,
 };
+
+/// With `ZAKURA_QA_STORE` set, every stored seed in every set validates,
+/// and no two share a name. The corpus holds seeds, since fuzz campaigns
+/// and target checks start from it.
+#[test]
+fn every_stored_seed_validates() {
+    if planted::store_root().is_none() {
+        return;
+    }
+    for set in [SeedSet::Corpus, SeedSet::KnownFailure, SeedSet::Slow] {
+        let report = seed::load(set, None);
+        let failures: Vec<String> = report
+            .rejected
+            .iter()
+            .map(|failed| format!("{}: {}", failed.seed.name, failed.error))
+            .collect();
+        assert!(failures.is_empty(), "{set:?}: {failures:#?}");
+    }
+    assert!(!seed::load(SeedSet::Corpus, None).admitted.is_empty());
+    let mut names = BTreeSet::new();
+    for seed in seed::all() {
+        assert!(
+            names.insert(seed.name.clone()),
+            "two seeds are named {}",
+            seed.name
+        );
+    }
+}
+
+
+/// With `ZAKURA_QA_STORE` set, as the joint-run droplet's suite step sets
+/// it, each case under the store's `qa/planted/` sits beside its patch and names a property
+/// a harness reports. A seed case names a seed of any set that carries a
+/// `holds` witness of the case's property, as `cargo xtask planted` checks
+/// it unpatched. A typed case names a stored scenario, and a Plan file if
+/// it gives one. A search case names a harness that reports the case's
+/// property, and commits no input.
+#[test]
+fn planted_cases_name_their_witnesses() {
+    let Some(root) = planted::store_root() else {
+        return;
+    };
+    let catalogue = root.join(planted::PLANTED_DIR);
+    let seeds = seed::all();
+    let reported: BTreeSet<String> = HARNESSES
+        .iter()
+        .flat_map(|entry| (entry.properties)())
+        .map(|property| property.id.to_string())
+        .collect();
+    let patches = planted::files(&catalogue, "patch").unwrap();
+    let cases = planted::files(&catalogue, "toml").unwrap();
+    assert_eq!(
+        cases.len(),
+        patches.len(),
+        "each case file has a patch, and each patch a case file"
+    );
+    for case in &cases {
+        assert!(
+            patches.contains(&case.with_extension("patch")),
+            "{}: the runner finds no patch beside it",
+            case.display()
+        );
+        let id = planted::property_id(&catalogue, case)
+            .unwrap_or_else(|| panic!("{}: no property", case.display()));
+        assert!(
+            reported.contains(&id),
+            "{}: no harness reports {id}",
+            case.display()
+        );
+        let table: toml::Table = toml::from_str(&fs::read_to_string(case).unwrap())
+            .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
+        // A typed case runs a stored scenario under Plan bytes, a
+        // scripted Plan or the empty Plan, not a seed.
+        if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
+            assert!(
+                !(typed.contains_key("plan") && typed.contains_key("script")),
+                "{}: both a plan and a script",
+                case.display()
+            );
+            for file in ["scenario", "plan", "script"] {
+                let Some(path) = typed.get(file).and_then(toml::Value::as_str) else {
+                    assert_ne!(file, "scenario", "{}: no scenario", case.display());
+                    continue;
+                };
+                assert!(root.join(path).is_file(), "{}: no {path}", case.display());
+            }
+            continue;
+        }
+        if let Some(search) = table.get("search").and_then(toml::Value::as_table) {
+            let harness = search
+                .get("harness")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("{}: the search names no harness", case.display()));
+            let entry = HARNESSES
+                .iter()
+                .find(|entry| entry.name == harness)
+                .unwrap_or_else(|| panic!("{}: no harness is named {harness}", case.display()));
+            assert!(
+                (entry.properties)()
+                    .iter()
+                    .any(|property| property.id == id),
+                "{}: {harness} doesn't report {id}",
+                case.display()
+            );
+            assert!(
+                !table.contains_key("seed") && !table.contains_key("typed"),
+                "{}: a search case names no other witness",
+                case.display()
+            );
+            continue;
+        }
+        let name = table["seed"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}: `seed` isn't a name", case.display()));
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.name == name)
+            .unwrap_or_else(|| panic!("{}: no seed is named {name}", case.display()));
+        assert!(
+            seed.witness
+                .iter()
+                .any(|witness| witness.property == id && witness.expect == "holds"),
+            "{}: {name} carries no `holds` witness of {id}",
+            case.display()
+        );
+    }
+    assert!(!cases.is_empty(), "the store holds the planted cases");
+}
 
 /// A corpus seed that passes [`seed::check`], to break one field at a time:
 /// the verification-capacity harness's default Plan.

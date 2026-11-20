@@ -16,7 +16,7 @@
 //! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
 //!     [--also-violates <ids>]
 //!     [--against <confirmation.json>]
-//! zakura-sim properties --sim <name>
+//! zakura-sim properties --sim <name> [--untriggered]
 //! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
 //! zakura-sim verify-archive <dir>
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
@@ -124,7 +124,7 @@ mod cli {
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
              [--also-violates <ids>]\n      \
              [--against <confirmation.json>]\n  \
-             zakura-sim properties --sim <name>\n  \
+             zakura-sim properties --sim <name> [--untriggered]\n  \
              zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n  \
@@ -181,7 +181,8 @@ mod cli {
              `--against` also holds the input to an earlier confirmation's harness,\n\
              generator, build, assumptions and cleanup.\n\
              `properties` prints the ID of each property the harness registers, one\n\
-             per line.\n\
+             per line. `--untriggered` prints only those with no trigger-history check,\n\
+             which a witness test judges only as applicable.\n\
              `triage` records each input twice, each time in a fresh process killed after\n\
              --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
              and archives the input with its runs under --out. It exits 1 only if an input\n\
@@ -896,16 +897,30 @@ mod cli {
     }
 
     /// `properties`: prints the ID of each property `--sim` registers, one
-    /// per line, in report order.
+    /// per line, in report order. With `--untriggered`, it prints only those
+    /// that register no trigger-history check.
     #[allow(clippy::print_stdout)]
     fn properties(args: Vec<String>) -> Result<(), Error> {
-        let sim = match <[String; 2]>::try_from(args) {
-            Ok([flag, sim]) if flag == "--sim" => sim,
-            _ => return Err(Error::Usage("`properties` takes --sim <name>".to_owned())),
+        let (sim, untriggered) = match args.as_slice() {
+            [flag, sim] if flag == "--sim" => (sim, false),
+            [flag, sim, only] if flag == "--sim" && only == "--untriggered" => (sim, true),
+            _ => {
+                return Err(Error::Usage(
+                    "`properties` takes --sim <name> [--untriggered]".to_owned(),
+                ))
+            }
         };
-        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
-        for property in (entry.properties)() {
-            println!("{}", property.id);
+        let entry = harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        let ids: Vec<String> = if untriggered {
+            (entry.untriggered)()
+        } else {
+            (entry.properties)()
+                .into_iter()
+                .map(|property| property.id)
+                .collect()
+        };
+        for id in ids {
+            println!("{id}");
         }
         Ok(())
     }

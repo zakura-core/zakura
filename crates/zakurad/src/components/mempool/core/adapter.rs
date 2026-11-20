@@ -69,9 +69,9 @@ const MAX_TIP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// arrives, since the state's best tip can move too.
 const TIP_RECHECK: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// How long past its deadline a submission waits for the core's verdict. The
-/// core ends the admission at the deadline, so the peer's slot is freed only
-/// once the core has, and only a stuck core is timed out here.
+/// How long past its deadline a submission waits for the core's verdict, so
+/// a verdict the core reached in time can still be delivered. The core's own
+/// deadline on the admission is what stops a late transaction getting in.
 const VERDICT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What every submission task shares.

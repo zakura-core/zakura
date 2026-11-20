@@ -1113,7 +1113,8 @@ impl PeerMachine {
 
     /// Takes announced ids into this session, which has the go: its pending
     /// set, and the table. The first `carried` of them were counted while
-    /// the session waited, so they keep that room past the node-wide cap.
+    /// the session waited, so they keep that room past the node-wide cap,
+    /// up to one more cap's worth of pending ids.
     fn take_ids(
         &mut self,
         shared: &mut Shared,
@@ -1165,11 +1166,16 @@ impl PeerMachine {
         // fit leaves no holder behind. Past the node-wide cap a session
         // still holds its share, so peers that fill the cap crowd out
         // nobody else's first ids.
-        let node_room = PENDING_CAP.saturating_sub(shared.wanted.held());
+        let held = shared.wanted.held();
+        let node_room = PENDING_CAP.saturating_sub(held);
         let share_room = PENDING_SHARE.saturating_sub(state.pending.len());
+        // Taking waiting ids in frees their waiting room for others, so what
+        // they carry past the cap is bounded too, or sessions that announce
+        // before their `Hello` one after another could grow it for ever.
+        let carry_room = carried.min(PENDING_CAP.saturating_mul(2).saturating_sub(held));
         let fits = state
             .room()
-            .min(node_room.max(share_room).max(carried))
+            .min(node_room.max(share_room).max(carry_room))
             .min(fresh.len());
         let dropped = fresh.len().saturating_sub(fits);
         state.overflow = state

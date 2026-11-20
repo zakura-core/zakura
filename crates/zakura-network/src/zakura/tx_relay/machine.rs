@@ -178,7 +178,8 @@
 //!   they wait for the go or a `Hello` are bounded the same way, in a budget
 //!   of their own, so ids that can't be fetched yet never crowd out ones
 //!   that can, and the waiting ids a session takes in once it may fetch
-//!   keep the room they were counted in.
+//!   keep the room they were counted in, up to twice [`PENDING_CAP`]
+//!   pending ids in all.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
 //!   body the reactor holds for it, and the supplier's sessions mark an id

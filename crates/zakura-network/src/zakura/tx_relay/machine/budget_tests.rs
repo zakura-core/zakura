@@ -168,11 +168,24 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         assert_eq!(state.waiting.len(), waiting, "silent session {n} waits");
     }
     // Once one may fetch, what it kept while it waited joins its pending
-    // set in the room it was counted in, past the full pending cap.
+    // set in the room it was counted in, past the full pending cap. That
+    // frees its waiting room for others, so sessions that announce before
+    // their `Hello` one after another carry ids past the cap only up to
+    // twice it, plus their shares.
     machine.hello(silent[0], hello(), now);
     let state = machine.session(silent[0]).expect("live");
     assert_eq!(state.pending.len(), PENDING_PER_PEER, "none of it is lost");
-    for session in silent {
+    let mut late = Vec::new();
+    for n in 0..SESSIONS {
+        let session = machine.connect(PeerKey(2 * SESSIONS + n), false, now);
+        machine.inv(session, &ids, now);
+        machine.hello(session, hello(), now);
+        late.push(session);
+    }
+    let promoted = silent.len() + late.len();
+    let bound = 2 * PENDING_CAP + (sessions.len() + promoted) * PENDING_SHARE;
+    assert!(machine.wanted().held() <= bound, "carried ids stay bounded");
+    for session in silent.into_iter().chain(late) {
         machine.end(session, now);
     }
     assert_eq!(machine.wanted().len(), PENDING_PER_PEER);

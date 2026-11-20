@@ -27,7 +27,11 @@ impl Queries {
         payload_len: usize,
     ) -> Result<Option<Asked>, ClaimRefused> {
         self.claim(message_type, payload_len)
-            .map(|claim| claim.answer().map(|answer| answer.admitted.asked.clone()))
+            .map(|answer| answer.map(|answer| answer.admitted.asked.clone()))
+            .map_err(|unclaimed| match unclaimed {
+                Unclaimed::Refused(refused) => refused,
+                Unclaimed::Retired => panic!("the session's queries are live"),
+            })
     }
 }
 
@@ -477,7 +481,7 @@ async fn an_answer_queued_before_retirement_claims_nothing() {
     queries.retire();
     assert!(matches!(
         queries.claim(PEERS, peers_len(1)),
-        Ok(Claim::Retired)
+        Err(Unclaimed::Retired)
     ));
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
     assert_eq!(
@@ -504,12 +508,11 @@ async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
     let answer = queries
         .claim(PEERS, peers_len(1))
         .expect("the answer fits its query")
-        .answer()
         .expect("the frame answers a query");
     assert_eq!(pool.held(), 1, "the claimed answer keeps its pool entry");
     assert!(matches!(
         queries.claim(PEERS, 2),
-        Err(ClaimRefused::Unsolicited { .. })
+        Err(Unclaimed::Refused(ClaimRefused::Unsolicited { .. }))
     ));
     assert!(
         matches!(
@@ -589,11 +592,7 @@ async fn answers_settled_waits_for_a_claimed_answer_only() {
         .await
         .expect("an unanswered query holds nothing");
 
-    let answer = queries
-        .claim(PEERS, peers_len(1))
-        .unwrap()
-        .answer()
-        .unwrap();
+    let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
     let settled = held_settled_wait(&queries).await;
     assert_settles(settled, answer).await;
 }
@@ -617,11 +616,7 @@ async fn answers_settled_waits_for_a_frame_the_transport_queued() {
         .expect("the transport admits the owed answer");
 
     let settled = held_settled_wait(&queries).await;
-    let answer = queries
-        .claim(PEERS, peers_len(1))
-        .unwrap()
-        .answer()
-        .unwrap();
+    let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
     zakura_rt::task::yield_now().await;
     assert!(!settled.is_finished(), "the claimed answer holds the wait");
     assert_settles(settled, answer).await;

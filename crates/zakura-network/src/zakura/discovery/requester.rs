@@ -30,6 +30,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use thiserror::Error;
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
@@ -369,29 +370,17 @@ impl ClaimedAnswer {
     }
 }
 
-/// What a frame's claim found.
-#[derive(Debug)]
-pub(super) enum Claim {
-    /// The frame answers no query.
-    NotAnswer,
-    /// The frame answers a live query. It keeps the query's resources until
-    /// it drops.
-    Answer(ClaimedAnswer),
+/// Why a frame claimed no query.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub(super) enum Unclaimed {
+    /// The frame breaks its query's reservation, a protocol violation.
+    #[error(transparent)]
+    Refused(#[from] ClaimRefused),
     /// The session retired its queries, so nothing judges the frame. The
     /// transport reader can queue an answer just before the session ends,
     /// and the reader can take it just after (#2632). The peer broke no rule.
+    #[error("the session retired its queries")]
     Retired,
-}
-
-#[cfg(test)]
-impl Claim {
-    /// The claimed answer, if the frame answers a live query.
-    pub(super) fn answer(self) -> Option<ClaimedAnswer> {
-        match self {
-            Claim::Answer(answer) => Some(answer),
-            Claim::NotAnswer | Claim::Retired => None,
-        }
-    }
 }
 
 /// One session's reservations and its live queries. One lock guards both,
@@ -524,23 +513,19 @@ impl Queries {
     }
 
     /// Claims the live query that a `message_type` frame of `payload_len`
-    /// bytes answers, before its payload is decoded.
+    /// bytes answers, before its payload is decoded. Returns the claimed
+    /// answer, which keeps the query's resources until it drops, or `None` if
+    /// the frame answers no query.
     pub(super) fn claim(
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Claim, ClaimRefused> {
+    ) -> Result<Option<ClaimedAnswer>, Unclaimed> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
-            return Ok(Claim::NotAnswer);
+            return Ok(None);
         };
-        let live = &mut *self.lock();
-        // The transport reader charged the frame to the retired ledger, which
-        // retirement dropped, so there is nothing to take or claim.
-        if live.retired {
-            return Ok(Claim::Retired);
-        }
-        self.claim_locked(live, kind, message_type, payload_len)
-            .map(Claim::Answer)
+        self.claim_locked(&mut self.lock(), kind, message_type, payload_len)
+            .map(Some)
     }
 
     /// [`Self::claim`] of a `kind` answer, with the live queries already
@@ -552,7 +537,12 @@ impl Queries {
         kind: QueryKind,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<ClaimedAnswer, ClaimRefused> {
+    ) -> Result<ClaimedAnswer, Unclaimed> {
+        // Retirement dropped the ledger that the transport reader charged
+        // this frame to, so there is nothing to take or claim.
+        if live.retired {
+            return Err(Unclaimed::Retired);
+        }
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
@@ -633,7 +623,7 @@ impl Queries {
     /// unanswered written query resets the session. The reservations
     /// return to the pool, even while the transport reader outlives the
     /// session. An answer the transport reader already queued claims
-    /// nothing ([`Claim::Retired`]).
+    /// nothing ([`Unclaimed::Retired`]).
     pub(super) fn retire(&self) {
         self.fence.retire();
         let retired = std::mem::replace(

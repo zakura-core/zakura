@@ -328,6 +328,7 @@ async fn concurrent_requests_all_run_and_settle_their_raw_charges() -> Result<()
             prelude(Some(request)),
             context,
             registry.clone(),
+            Arc::new(LegacyReceiveCapacity::new()),
         ))));
     }
     timeout(TEST_TIMEOUT, async {
@@ -465,6 +466,7 @@ async fn spawn_request(
         prelude,
         context,
         registry.clone(),
+        Arc::new(LegacyReceiveCapacity::new()),
     )));
     Ok((peer_send, peer_recv, worker))
 }
@@ -617,6 +619,7 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
         prelude_of(SLOW.kind, Some(1)),
         context,
         registry,
+        Arc::new(LegacyReceiveCapacity::new()),
     )));
     timeout(TEST_TIMEOUT, async {
         while output.granted() == 0 {
@@ -773,6 +776,7 @@ impl LegacyRequests {
             },
             context,
             self.registry.clone(),
+            Arc::new(LegacyReceiveCapacity::new()),
         )));
         Ok((worker, cancel))
     }
@@ -1336,7 +1340,14 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
                 u64::MAX,
             )
             .ok_or("an unlimited gate fits every bound")?;
-            let frames = LegacyResponseCodec::encode_response(7, response, frame_cap, message_cap)?;
+            // The encoder's frame ceiling refuses a large object under tiny caps, so
+            // that response never reaches its reservation.
+            let frames =
+                match LegacyResponseCodec::encode_response(7, response, frame_cap, message_cap) {
+                    Ok(frames) => frames,
+                    Err(crate::zakura::LegacyGossipError::ResponseFrameBudget) => continue,
+                    Err(error) => return Err(error.into()),
+                };
             let bytes: u64 = frames
                 .iter()
                 .map(|frame| response_frame_bytes(frame.payload.len()))

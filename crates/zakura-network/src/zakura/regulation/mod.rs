@@ -96,7 +96,7 @@ pub(crate) use subscription::{
 
 mod slots;
 pub(crate) use slots::{
-    OutputByteBudget, OutputGrant, SlotBudget, SlotPermit, WeakOutputByteBudget,
+    OutputByteBudget, OutputGrant, SlotBudget, SlotPermit, WeakOutputByteBudget, WeakSlotBudget,
 };
 
 mod writer_fence;

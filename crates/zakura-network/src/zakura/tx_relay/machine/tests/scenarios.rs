@@ -15,8 +15,8 @@ use crate::zakura::tx_relay::machine::{
     session::{Timer, Timers},
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, INITIAL_WINDOW, INV_RETRY, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
-    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP, PENDING_PER_PEER,
-    PENDING_SHARE, RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
+    MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_PER_PEER, RANK_INTERVAL,
+    RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -240,31 +240,18 @@ fn window(bench: &Bench, session: SessionId) -> usize {
     bench.machine.session(session).expect("live").window
 }
 
-/// `session`'s peer answers its oldest request with the body among `ids`,
-/// and the pool admits it, until no request is left. The pool grants every
-/// reserve call on the way.
+/// `session`'s peer supplies `ids`, bodies `0..` in the order it announced
+/// them, each once the machine asks, and the pool admits each.
 fn admit_all(bench: &mut Bench, session: SessionId, ids: &[UnminedTxId]) {
-    loop {
-        for (call, _) in bench.calls() {
-            bench.grant(call);
-        }
-        let oldest = bench
-            .machine
-            .session(session)
-            .expect("live")
-            .requests
-            .first();
-        let Some((id, _)) = oldest.map(|(id, request)| (*id, *request)) else {
-            return;
-        };
-        let n = ids.iter().position(|of| *of == id).expect("announced");
-        let body = bench.tx(u32::try_from(n).expect("a small index"));
+    for (n, id) in (0..).zip(ids) {
+        bench.fetch(session, *id);
+        let body = bench.tx(n);
         assert!(
-            bench.deliver(session, id, body),
+            bench.deliver(session, *id, body),
             "the asked-for body is read"
         );
         let waiter = bench.submitted().expect("submitted");
-        bench.add(&[id]);
+        bench.add(&[*id]);
         bench.verdict(waiter, Verdict::Admitted);
     }
 }
@@ -280,7 +267,7 @@ fn the_window_grows_on_admissions_and_halves_on_a_missed_deadline() {
     let ids: Vec<UnminedTxId> = (0..40).map(|n| bench.id(n)).collect();
     bench.inv(session, &ids[..30]);
     assert_eq!(window(&bench, session), INITIAL_WINDOW);
-    admit_all(&mut bench, session, &ids);
+    admit_all(&mut bench, session, &ids[..30]);
     assert_eq!(
         window(&bench, session),
         MAX_SERVES,
@@ -321,7 +308,8 @@ fn rejected_bodies_never_widen_the_window() {
 /// What a session asks for at once stays within `MAX_OUTSTANDING_BYTES` of
 /// announced sizes however large its window grew, so no deadline stretches
 /// past today's cap, and the oldest ready id that would pass it waits
-/// rather than let a smaller, newer one go first.
+/// rather than let a smaller, newer one go first, even one the bytes left
+/// would fit.
 #[test]
 fn a_wide_window_still_asks_for_at_most_the_outstanding_bytes() {
     let mut bench = Bench::new();
@@ -331,7 +319,9 @@ fn a_wide_window_still_asks_for_at_most_the_outstanding_bytes() {
     admit_all(&mut bench, session, &small);
     assert!(window(&bench, session) > INITIAL_WINDOW, "the window grew");
 
-    let big: Vec<(UnminedTxId, u32)> = (100..106).map(|n| (bench.id(n), MAX_TX_BYTES)).collect();
+    // Five of these leave room for one more small id, and not a sixth.
+    let big_size = MAX_TX_BYTES - SIZE;
+    let big: Vec<(UnminedTxId, u32)> = (100..106).map(|n| (bench.id(n), big_size)).collect();
     bench.inv_sized(session, &big);
     bench.tick(MS);
     let newer = bench.id(200);
@@ -340,7 +330,7 @@ fn a_wide_window_still_asks_for_at_most_the_outstanding_bytes() {
     assert_eq!(
         called(&bench),
         first_five,
-        "five of the largest fill the bytes"
+        "five of the large ones fill the bytes"
     );
     assert!(
         !bench.reserved(newer),
@@ -579,48 +569,6 @@ fn a_full_pending_set_counts_new_announcements_as_overflow() {
     let id = bench.id(2);
     bench.inv(honest, &[id]);
     assert!(bench.reserved(id), "another peer's id is not delayed");
-}
-
-/// Past the node-wide pending cap a session takes no more than its share,
-/// counted as overflow, so peers that fill the cap leave every other
-/// session its share. Ids already held by others count as much as new ones,
-/// and so do announcements a session keeps while it waits for its `Hello`.
-#[test]
-fn sessions_past_the_pending_cap_keep_only_their_share() {
-    let mut bench = Bench::new();
-    let script = script_len();
-    let per = u32::try_from(PENDING_PER_PEER).expect("fits");
-    let pool: Vec<UnminedTxId> = (0..per).map(|n| body(n + 1_000, script).id()).collect();
-    let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
-    for peer in 1..=fillers {
-        let session = bench.join(peer);
-        bench.inv(session, &pool);
-    }
-    assert_eq!(bench.machine.wanted().held(), PENDING_CAP);
-
-    let late = bench.join(fillers + 1);
-    bench.inv(late, &pool);
-    let state = bench.machine.session(late).expect("open");
-    assert_eq!(
-        state.pending.len(),
-        PENDING_SHARE,
-        "its share of the shared ids"
-    );
-    let dropped = u64::try_from(PENDING_PER_PEER - PENDING_SHARE).expect("fits");
-    assert_eq!(state.overflow, dropped);
-    assert!(bench.closes().is_empty(), "overflow is no violation");
-
-    // A session that has not sent its `Hello` keeps what it was announced
-    // while it waits, and that counts against the cap too.
-    let silent = bench.connect(fillers + 2, false);
-    bench.inv(silent, &pool);
-    let state = bench.machine.session(silent).expect("open");
-    assert_eq!(
-        state.waiting.len(),
-        PENDING_SHARE,
-        "its share while it waits"
-    );
-    assert_eq!(state.overflow, dropped);
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest

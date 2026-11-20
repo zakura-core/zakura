@@ -658,8 +658,8 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
-        // Header sync and legacy block `inv`s claim blocks announced first, and the block
-        // verifier ranks equal-work bodies by those claims.
+        // Header sync, legacy block `inv`s and the starts of legacy `block` messages claim
+        // blocks announced first, and the block verifier ranks equal-work bodies by those claims.
         let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(

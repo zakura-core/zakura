@@ -71,19 +71,22 @@ The reservation is called a claim. Six rules define it:
 
   This is as safe as an `inv` claim. The message header carries the payload's
   checksum, so a message that passes it was started by a sender that already
-  had the whole block, proof of work included. A sender gains nothing by
+  had the whole block. If that block is valid, its proof of work was done
+  before the message started, and an invalid block is never ranked. A sender gains nothing by
   trickling the body slowly: an `inv` sent at the same moment would claim the
   same place, and the body must still reach the verifier within the deadline
   counted from the start.
 - **Each block keeps its earliest claim of each kind, and neither is
   renewed.** A header claim, once made, is never replaced or renewed by
   delivering the header again. An `inv` for a block that already has a header
-  claim or a legacy record records nothing. A `block` message replaces a
-  legacy record only if it reserved an earlier order, so a block is never
-  ranked behind an announcement that arrived while its body was still
-  arriving, and a later delivery cannot move it back. It is recorded even
-  next to an earlier header claim, so it still applies if that header's apply
-  fails.
+  claim or a legacy record records nothing. A `block` message that is still
+  inside its deadline replaces a legacy record that reserved a later order or
+  has expired, so a block is never ranked behind an announcement that arrived
+  while its body was still arriving, a later delivery cannot move it back, and
+  an expired claim never displaces a usable one. Taking a later reservation
+  over an expired `inv` gives the block only what the `block` message alone
+  would. It is recorded even next to an earlier header claim, so it still
+  applies if that header's apply fails.
   Reading a claim does not use it up, so an invalid body under the same hash
   cannot take it. A body whose block holds both kinds takes the earlier order
   among those still in force, so a legacy record never makes the outcome worse
@@ -100,12 +103,12 @@ The reservation is called a claim. Six rules define it:
   The legacy store, shared by `inv`s and `block` messages, holds 512 blocks. Entries older than 4 seconds, twice the
   body deadline, are dropped when a new block is recorded, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 4 `inv`s and 4 near-tip `block`
-  messages per 2 seconds to the store, leaving room for both blocks in a tip
-  race and for repeated or bunched announcements. The two are limited
-  separately, and blocks outside the height window are neither recorded nor
-  counted, so blocks a peer serves during catch-up cannot use up its next
-  announcement. One connection cannot fill the store. A sustained flood can
+  Each legacy connection passes at most 4 `inv`s and near-tip `block`
+  messages, together, per 2 seconds to the store, leaving room for both
+  blocks in a tip race and for repeated or bunched announcements. Blocks
+  outside the height window are neither recorded nor counted, so most blocks
+  a peer serves during catch-up do not use the allowance. Only the last one
+  or two can. One connection cannot fill the store. A sustained flood can
   at worst return blocks to arrival order. An announcement after its entry was
   dropped counts as a new sighting, which gives a withholder nothing it could
   not get by announcing late.

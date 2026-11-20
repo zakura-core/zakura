@@ -14,9 +14,9 @@ use crate::protocol::external::{BlockReservation, ReserveBlockOrder};
 /// [`ANNOUNCEMENT_WINDOW`].
 ///
 /// Four calls leave room for both blocks in a tip race and for repeated or bunched
-/// announcements, while bounding one connection's share of the hook's work. `inv`s and `block`
-/// messages are limited separately, and only `block` messages the hook reports as near the tip
-/// count, so blocks a peer serves during catch-up cannot use up its next announcement.
+/// announcements, while bounding one connection's share of the hook's work and of the node's
+/// claim store. `inv`s and `block` messages share the allowance, but only `block` messages the
+/// hook reports as near the tip count, so blocks a peer serves during catch-up do not use it.
 const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 4;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
@@ -60,8 +60,8 @@ impl BlockAnnouncementHook {
     /// `reserve` returns the reserved order and the node's verified tip, or `None` if the node
     /// cannot rank blocks yet. `received` returns whether the block was near enough to the tip
     /// to need a claim. Every `block` message reserves, whether it was requested or pushed, but
-    /// the calls to `received` that return `true` are limited per connection like
-    /// announcements. Both run on the connection's inbound path, so they must return quickly.
+    /// the calls to `received` that return `true` share each connection's announcement
+    /// allowance. Both run on the connection's inbound path, so they must return quickly.
     pub fn with_block_messages(
         mut self,
         reserve: impl Fn() -> Option<(u64, block::Height)> + Send + Sync + 'static,
@@ -89,8 +89,7 @@ impl BlockAnnouncementHook {
     pub(crate) fn for_connection(&self) -> ConnectionAnnouncements {
         ConnectionAnnouncements {
             hook: self.clone(),
-            announcement_window: Window::default(),
-            block_message_window: Window::default(),
+            window: Window::default(),
         }
     }
 }
@@ -108,8 +107,7 @@ impl fmt::Debug for BlockAnnouncementHook {
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionAnnouncements {
     hook: BlockAnnouncementHook,
-    announcement_window: Window,
-    block_message_window: Window,
+    window: Window,
 }
 
 /// The current fixed window of hook calls.
@@ -126,7 +124,7 @@ impl ConnectionAnnouncements {
         let Some(hook) = &self.hook.announced else {
             return;
         };
-        self.announcement_window.call(Instant::now(), || {
+        self.window.call(Instant::now(), || {
             hook(hash);
             true
         });
@@ -144,7 +142,7 @@ impl ConnectionAnnouncements {
         let Some(block_messages) = &self.hook.block_messages else {
             return;
         };
-        self.block_message_window.call(Instant::now(), || {
+        self.window.call(Instant::now(), || {
             (block_messages.received)(hash, height, reservation)
         });
     }

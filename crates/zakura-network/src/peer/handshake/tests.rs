@@ -1396,8 +1396,8 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
 
 /// A completed `block` message that reserved an order reaches the hook with its height and
 /// reservation. Only calls the hook reports as near the tip count against the connection's
-/// four per window, separately from the `inv` allowance. A message without a reservation, or
-/// one that failed to decode, does not reach it.
+/// four per window, which `inv`s share. A message without a reservation, or one that failed to
+/// decode, does not reach it.
 #[tokio::test(start_paused = true)]
 async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1456,12 +1456,19 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
         "only a decoded block with a reservation is passed on"
     );
 
+    // One announcement leaves three calls for near-tip blocks.
+    deliver(
+        &mut connection,
+        Ok(Message::Inv(vec![InventoryHash::Block(block.hash())])),
+    )
+    .expect("passed through");
+    assert_eq!(announced.lock().unwrap().len(), 1);
     for order in 1..=10 {
         deliver(&mut connection, block_message(Some(order))).expect("passed through");
     }
     assert_eq!(
         orders(),
-        (1..=7).collect::<Vec<_>>(),
+        (1..=5).collect::<Vec<_>>(),
         "blocks the hook reports as far from the tip do not use the allowance",
     );
     let (hash, height, _) = received.lock().unwrap()[0];
@@ -1475,12 +1482,12 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
     assert_eq!(
         announced.lock().unwrap().len(),
         1,
-        "block messages do not use the inv allowance"
+        "near-tip block messages use the shared allowance"
     );
 
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
     deliver(&mut connection, block_message(Some(11))).expect("passed through");
-    assert_eq!(orders().len(), 8, "a new window allows more block messages");
+    assert_eq!(orders().len(), 6, "a new window allows more block messages");
 }
 
 /// A hook that records the hashes it is called with.

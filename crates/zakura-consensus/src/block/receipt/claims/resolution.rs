@@ -55,22 +55,15 @@ impl AnnouncementClaims {
             header.order,
             header.seen_at,
         );
-        // A `block` message can record a legacy reservation later than a header claim, so
-        // when both are usable the earlier order wins.
-        match (announced, header) {
-            (
-                Used {
-                    order: legacy_order,
-                    ..
-                },
-                Used {
-                    order: header_order,
-                    ..
-                },
-            ) if header_order < legacy_order => header,
-            (Used { .. }, _) => announced,
-            (_, Used { .. }) | (Unclaimed, _) => header,
-            _ => announced,
+        // A `block` message can record a legacy reservation later than a header claim, so the
+        // body takes the earlier usable order. If neither is usable, metrics report the header
+        // claim's outcome when there is no legacy one, and the legacy one otherwise.
+        match (announced.claimed_order(), header.claimed_order()) {
+            (Some(legacy), Some(header_order)) if header_order < legacy => header,
+            (Some(_), _) => announced,
+            (None, Some(_)) => header,
+            (None, None) if announced == Unclaimed => header,
+            (None, None) => announced,
         }
     }
 }

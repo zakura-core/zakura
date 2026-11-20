@@ -63,11 +63,16 @@ impl Announcements {
     }
 
     /// Records that a `block` message carrying `hash` reserved `order` when it started arriving
-    /// at `started_at`.
+    /// at `started_at`, with the verified tip at `tip_at_announcement`, and completed at `now`.
     ///
-    /// An existing announcement with an earlier order is kept. One with a later order takes
-    /// this order and start time, so a block is never ranked behind an announcement that came
-    /// after its message started. It keeps its tip, which was read closer to the message start.
+    /// Of this reservation and an existing announcement, the block keeps the earlier one that
+    /// is still inside its deadline at `now`, so it is never ranked behind an announcement that
+    /// came after its message started, and an expired claim never displaces a usable one. If
+    /// neither is usable, the existing one is kept. A replaced announcement takes this tip, which
+    /// was read when its new order was reserved.
+    ///
+    /// Taking a later but usable reservation over an expired announcement gives the block no
+    /// more than a block message without that announcement would get.
     ///
     /// Returns `false` if the store is full of unexpired announcements and refused `hash`.
     pub(super) fn note_block_message(
@@ -78,11 +83,17 @@ impl Announcements {
         started_at: Instant,
         now: Instant,
     ) -> bool {
+        let usable = |seen_at| now.saturating_duration_since(seen_at) <= CLAIM_BODY_DEADLINE;
         if let Some(announced) = self.0.get_mut(&hash) {
-            if order < announced.order {
-                announced.order = order;
-                announced.seen_at = started_at;
-                announced.source = ClaimSource::BlockMessage;
+            let replace =
+                usable(started_at) && (order < announced.order || !usable(announced.seen_at));
+            if replace {
+                *announced = Announcement {
+                    order,
+                    seen_at: started_at,
+                    tip_at_announcement,
+                    source: ClaimSource::BlockMessage,
+                };
             }
             return true;
         }

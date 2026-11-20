@@ -276,3 +276,66 @@ fn a_full_store_refuses_a_new_block_message() {
     );
     assert_eq!(claims.announced_order(hash(MAX_ANNOUNCED_BLOCKS)), None);
 }
+
+#[test]
+fn a_block_message_taking_over_a_later_inv_keeps_the_tip_at_its_start() {
+    let claims = AnnouncementClaims::default();
+    let started_at = Instant::now();
+    let reserved = AnnouncementClaims::reserve_order();
+
+    // A rival at the same height commits, then another peer announces this block at the new tip.
+    let inv_at = started_at + Duration::from_millis(500);
+    claims.note_announcement_at(hash(1), CLAIMED, inv_at);
+
+    let completed_at = started_at + Duration::from_millis(800);
+    receive(&claims, hash(1), reserved, started_at, completed_at);
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, completed_at),
+        Some((ClaimSource::BlockMessage, reserved))
+    );
+}
+
+#[test]
+fn an_expired_reservation_does_not_displace_a_usable_one() {
+    let claims = AnnouncementClaims::default();
+    let slow_start = Instant::now();
+    let slow = AnnouncementClaims::reserve_order();
+    let fast_start = slow_start + Duration::from_millis(300);
+    let fast = AnnouncementClaims::reserve_order();
+    receive(
+        &claims,
+        hash(1),
+        fast,
+        fast_start,
+        slow_start + Duration::from_secs(1),
+    );
+
+    // The slow copy completes after its own deadline but inside the fast copy's.
+    let slow_done = slow_start + CLAIM_BODY_DEADLINE + Duration::from_millis(100);
+    receive(&claims, hash(1), slow, slow_start, slow_done);
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, slow_done),
+        Some((ClaimSource::BlockMessage, fast))
+    );
+}
+
+#[test]
+fn a_usable_block_message_replaces_an_expired_inv() {
+    let claims = AnnouncementClaims::default();
+    let inv_at = Instant::now();
+    announce(&claims, hash(1), inv_at);
+    let inv = claims
+        .announced_order(hash(1))
+        .expect("the inv is recorded");
+
+    let started_at = inv_at + Duration::from_millis(1_500);
+    let reserved = AnnouncementClaims::reserve_order();
+    let completed_at = inv_at + CLAIM_BODY_DEADLINE + Duration::from_millis(500);
+    receive(&claims, hash(1), reserved, started_at, completed_at);
+    assert!(inv < reserved);
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, completed_at),
+        Some((ClaimSource::BlockMessage, reserved)),
+        "the block ranks as if it had never been announced by inv",
+    );
+}

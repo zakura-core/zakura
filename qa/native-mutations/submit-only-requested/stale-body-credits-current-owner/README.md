@@ -19,8 +19,10 @@ The witness is the `block_table` test
 generated Plans of the reset-mid-flight scenario, which resets the chain to
 a fork while two mirrors serve, for a run in which one routine judges an
 old-chain body after the other routine's fork request reserved that
-body's height, while the first routine's old request is still local. The
-patch credits that body to the fork request.
+body's height. The patch credits that body to the fork request when the
+first routine's old request is still local. The run the search finds
+doesn't keep the old request local, so the witness doesn't catch the
+patch until #2629 gives the search a fact to target.
 
 `block-sync/s6v3/block/receiver-work-authorized` judges the body when it
 enters the sequencer's input queue. The credited request's connection

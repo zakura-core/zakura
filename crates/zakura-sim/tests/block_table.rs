@@ -382,8 +382,8 @@ fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
 /// old-chain body answers a stale request for a height that a fork request
 /// reserves, and `receiver-work-authorized` holds in it. With
 /// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
-/// the routine credits that body to the fork request, and the same run
-/// violates it.
+/// the routine credits such a body to the fork request when its old request
+/// is still local. The search can't target that order yet (#2629).
 #[test]
 fn a_stale_request_body_holds_receiver_work_authorized() {
     let report = old_body_after_a_fork_request(&BlockScenario::reset_mid_flight());

@@ -632,12 +632,15 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     // owns the peer (below). Panic teardown is in `on_panic`.
     let pipe = async move {
         let mut pipe = discovery_pipe(sink_peer_id);
+        let mut reading = None;
+        let read = run_discovery_pipe(&mut pipe, recv, sink, &mut reading).await;
         handle_pipe_exit(
             "discovery",
             &reject_connection_cancel,
             &reject_close_cause,
-            run_discovery_pipe(&mut pipe, recv, sink).await,
+            read,
         );
+        drop(reading);
     };
     let on_panic = move || {
         panic_close_cause.record("service_panic");
@@ -706,26 +709,28 @@ struct DiscoverySink {
     trace: ZakuraTrace,
 }
 
+/// Reads the session's frames until the stream ends, the session ends, or a
+/// frame is rejected.
+///
+/// `reading` holds a closing session's answer wait while the reader has
+/// frames it hasn't judged ([`next_frame`]). The caller drops it only after
+/// it records the result, so a close can't settle and record its own cause
+/// before a reject's.
 async fn run_discovery_pipe(
     pipe: &mut Pipe<DsLocal, DsEnv>,
     recv: FramedRecv,
     sink: DiscoverySink,
+    reading: &mut Option<SettlingHold>,
 ) -> Result<(), SinkReject> {
     let cancel = sink.session.cancel_token();
-    let mut reading = None;
     // A cancelled session drops its pending work, including a wait for a
     // verification slot, so it neither holds the slot queue nor imports after
     // its session ends.
-    let read = zakura_rt::select! {
+    zakura_rt::select! {
         biased;
         _ = cancel.cancelled() => Ok(()),
-        read = read_discovery_messages(pipe, recv, &sink, &mut reading) => read,
-    };
-    // Dropping the queued frames and the sink can yield. The hold outlasts
-    // them, so a close can't settle before the caller records this reject.
-    drop(sink);
-    drop(reading);
-    read
+        read = read_discovery_messages(pipe, recv, &sink, reading) => read,
+    }
 }
 
 /// Reads frames until the stream ends, and traces the violation that ends it
@@ -755,6 +760,10 @@ async fn read_discovery_messages(
 /// every frame the reader already received, and answers each request among
 /// them. The queue holds at most the session's receive credit, and the close's
 /// answer deadline still bounds the wait.
+///
+/// A frame that arrives after the reader found `recv` empty holds nothing
+/// until the reader takes it. If the close settles first, for example when an
+/// earlier answer finishes writing, the close drops it.
 async fn next_frame(
     recv: &mut FramedRecv,
     reading: &mut Option<SettlingHold>,
@@ -2158,7 +2167,7 @@ mod tests {
         let (to_sink, recv) = framed_channel(4);
         let reader = tokio::spawn(async move {
             let mut pipe = discovery_pipe(peer_id);
-            run_discovery_pipe(&mut pipe, recv, sink).await
+            run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
         });
         to_sink.send(empty_peers()?).await?;
         let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
@@ -2183,7 +2192,7 @@ mod tests {
         let (to_sink, recv) = framed_channel(4);
         let reader = tokio::spawn(async move {
             let mut pipe = discovery_pipe(peer_id);
-            run_discovery_pipe(&mut pipe, recv, sink).await
+            run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
         });
         to_sink
             .send(discovery_frame(DiscoveryMessage::Peers { records })?)
@@ -2241,7 +2250,7 @@ mod tests {
             let peer_id = peer_id.clone();
             async move {
                 let mut pipe = discovery_pipe(peer_id);
-                run_discovery_pipe(&mut pipe, recv, sink).await
+                run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
             }
         });
         to_sink
@@ -2320,7 +2329,7 @@ mod tests {
             let (to_sink, recv) = framed_channel(4);
             let reader = tokio::spawn(async move {
                 let mut pipe = discovery_pipe(peer_id);
-                run_discovery_pipe(&mut pipe, recv, sink).await
+                run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
             });
             (to_sink, reader)
         };
@@ -2456,7 +2465,8 @@ mod tests {
 
         let held = handle.hold_verify_slots();
         let mut pipe = discovery_pipe(peer_id.clone());
-        let reader = tokio::spawn(async move { run_discovery_pipe(&mut pipe, recv, sink).await });
+        let reader =
+            tokio::spawn(async move { run_discovery_pipe(&mut pipe, recv, sink, &mut None).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!reader.is_finished(), "the hello waits for a slot");
 
@@ -3915,7 +3925,7 @@ mod tests {
         let reader_peer = peer_id.clone();
         let reader = tokio::spawn(async move {
             let mut pipe = discovery_pipe(reader_peer);
-            run_discovery_pipe(&mut pipe, recv, sink).await
+            run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
         });
         to_sink
             .send(discovery_frame(DiscoveryMessage::Hello {
@@ -4095,7 +4105,7 @@ mod tests {
         let reader_peer = peer_id.clone();
         let reader = tokio::spawn(async move {
             let mut pipe = discovery_pipe(reader_peer);
-            run_discovery_pipe(&mut pipe, recv, sink).await
+            run_discovery_pipe(&mut pipe, recv, sink, &mut None).await
         });
         to_sink
             .send(discovery_frame(DiscoveryMessage::Peers {
@@ -4168,15 +4178,19 @@ mod tests {
     const HELLO_BURST: usize = 8;
 
     /// A discovery-only session whose peer completes the exchange, then
-    /// queues a `GetServices`, a burst of `Hello`s, and `last`. The reader
-    /// stalls on the discovery lock at the `GetServices` while the close
-    /// waits, so the close finds every queued frame unread.
+    /// queues a burst of `Hello`s and `last`, with a `GetServices` first if
+    /// `services_first`. The reader stalls on the discovery lock at the first
+    /// queued frame while the close waits, so the close finds every queued
+    /// frame unread. A `GetServices` answer the reader admits holds the close
+    /// to its deadline if the reader then rejects a frame.
     ///
-    /// Returns the reader's result, and whether the connection had closed when
-    /// the reader returned. Also returns the writer, the frames the node wrote
-    /// to the peer, and the connection's token.
+    /// Returns the reader's result, and whether the connection had closed a
+    /// while after the reader returned, before its hold drops. The production
+    /// caller records a reject in that gap. Also returns the writer, the frames
+    /// the node wrote to the peer, and the connection's token.
     async fn burst_at_exchange_end(
         seed: u8,
+        services_first: bool,
         last: Frame,
     ) -> Result<
         (
@@ -4203,8 +4217,13 @@ mod tests {
             let connection = connection.clone();
             async move {
                 let mut pipe = discovery_pipe(peer_id);
-                let read = run_discovery_pipe(&mut pipe, recv, sink).await;
-                (read, connection.is_cancelled())
+                let mut reading = None;
+                let read = run_discovery_pipe(&mut pipe, recv, sink, &mut reading).await;
+                // Long enough for the close to settle if nothing held it.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let closed = connection.is_cancelled();
+                drop(reading);
+                (read, closed)
             }
         });
         complete_peer_side_discovery_exchange(&to_reader, &mut peer_recv, &peer_secret, &handshake)
@@ -4214,13 +4233,15 @@ mod tests {
         assert!(exchange.hello && exchange.peers && exchange.services);
 
         let lock = handle.lock_for_test().await;
-        to_reader
-            .send(discovery_frame(DiscoveryMessage::GetServices(
-                GetServices {
-                    wanted_services: Vec::new(),
-                },
-            ))?)
-            .await?;
+        if services_first {
+            to_reader
+                .send(discovery_frame(DiscoveryMessage::GetServices(
+                    GetServices {
+                        wanted_services: Vec::new(),
+                    },
+                ))?)
+                .await?;
+        }
         let record = signed_discovery_record(&peer_secret, &handshake)?;
         for _ in 0..HELLO_BURST {
             to_reader
@@ -4253,7 +4274,8 @@ mod tests {
         let mut bad = get_peers_frame()?;
         // The limit is the payload's first field, and 0 fails its decode.
         bad.payload[..2].copy_from_slice(&0u16.to_le_bytes());
-        let (reader, writer, _peer_recv, _connection) = burst_at_exchange_end(78, bad).await?;
+        let (reader, writer, _peer_recv, _connection) =
+            burst_at_exchange_end(78, true, bad).await?;
 
         let (read, closed) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
         assert!(
@@ -4265,13 +4287,31 @@ mod tests {
         Ok(())
     }
 
+    /// With no answer left to write, only the reader's hold keeps the close
+    /// waiting after the reader rejects a frame. The hold outlasts the reader
+    /// until its caller records the reject.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejecting_reader_holds_the_close_until_its_caller_records_the_reject(
+    ) -> Result<(), crate::BoxError> {
+        let mut bad = get_peers_frame()?;
+        bad.payload[..2].copy_from_slice(&0u16.to_le_bytes());
+        let (reader, writer, _peer_recv, _connection) =
+            burst_at_exchange_end(82, false, bad).await?;
+
+        let (read, closed) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
+        assert!(matches!(read, Err(SinkReject::Protocol(..))), "{read:?}");
+        assert!(!closed, "the close waits while the caller holds the hold");
+        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        Ok(())
+    }
+
     /// An honest `GetPeers` queued behind a `Hello` burst at the exchange's end
     /// gets its answer before the exchange's graceful close.
     #[tokio::test(start_paused = true)]
     async fn a_graceful_close_answers_a_request_it_already_received() -> Result<(), crate::BoxError>
     {
         let (reader, writer, mut peer_recv, connection) =
-            burst_at_exchange_end(80, get_peers_frame()?).await?;
+            burst_at_exchange_end(80, true, get_peers_frame()?).await?;
 
         tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
             .await

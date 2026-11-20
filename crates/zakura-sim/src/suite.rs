@@ -2691,6 +2691,7 @@ mod tests {
         let mut builder = Builder {
             root: Path::new("."),
             canonical_root: PathBuf::from("."),
+            store: None,
             suite: &suite,
             problems: Vec::new(),
             ids: BTreeSet::new(),

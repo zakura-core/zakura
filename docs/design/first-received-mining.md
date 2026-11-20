@@ -77,9 +77,10 @@ The reservation is called a claim. Five rules define it:
   order, as if its header had never been seen.
 - **A node keeps the block it mined.** A locally submitted block takes its
   receipt order at submission, like any other body. A rival's earlier claim at
-  the same height is ignored from that moment, for every mined block that is
-  still verifying or has verified, until the verified tip passes that height or
-  the node mines more than two blocks above it. If an overlapping peer delivery
+  the same height is ignored from that moment, while the mined block is still
+  verifying and, once it has verified, for one body deadline after it was
+  submitted. Nothing longer is needed, because a claim made before the
+  submission has expired by then. If an overlapping peer delivery
   commits the identical body, the local submission keeps this protection and
   still reports a duplicate. The verifier checks the committed forks at submission
   and confirms the exact body in state, even if the peer has stopped waiting
@@ -101,6 +102,20 @@ attempt, a failed download or a repeated announcement does not restart the
 deadline. Inside the deadline, withholding is indistinguishable from slow
 honest delivery, so the deadline is both the delay forgiven for honest blocks
 and the most a withholder can gain.
+
+Inside the deadline that gain carries no risk of losing the tie. Under arrival
+order, a miner that sat on a body could lose to any block found meanwhile.
+With a claim it cannot, so until the deadline it is the only miner building on
+its new block. Two seconds is 2.7% of the 75 second target block interval.
+Bodies that bunch just under the deadline in the claim-age histogram would
+show this in use.
+
+The clock starts at the first announcement from any peer, not only from the
+block's miner. A peer that learns a block's hash can announce it to a node
+before the body can get there. If the body then takes longer than the
+deadline, the claim expires and the block is ranked by arrival, as it would be
+without a claim. A claim can therefore be used up by a third party, but a
+block is never ranked later than its body's arrival.
 
 The deadline is the same for every block size, because scaling it with size
 does not lower that bound. Under a deadline that grows with size up to a cap,

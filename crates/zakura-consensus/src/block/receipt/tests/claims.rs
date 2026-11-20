@@ -259,6 +259,12 @@ fn a_mined_block_record_lasts_while_any_request_for_it_is_active_or_once_it_veri
     assert!(voided());
     drop(higher);
     assert!(voided());
+
+    // Nor can one that verifies. Only its age retires a record.
+    claims
+        .mark_mined(hash(5), block::Height(CLAIMED.0 + 3), mined_order + 2)
+        .keep();
+    assert!(voided());
 }
 
 #[test]
@@ -334,67 +340,113 @@ fn a_claim_lasts_while_any_apply_covering_it_runs_or_succeeds() {
     assert!(!claims.is_claimed(hash(2)));
 }
 
-#[test]
-fn mined_block_records_end_once_the_node_mines_well_above_them() {
-    let claims = AnnouncementClaims::default();
-    let now = Instant::now();
-    claim(&claims, hash(1), now);
-    let voided = || {
-        matches!(
-            claims.resolve(hash(1), Some(CLAIMED), now),
-            ClaimOutcome::Voided { .. }
-        )
-    };
-    claims.mark_mined(hash(3), CLAIMED, order::next()).keep();
-    assert!(voided());
-
-    let two_above = block::Height(CLAIMED.0 + 2);
-    let three_above = block::Height(CLAIMED.0 + 3);
-    // Only the body that verifies supplies the height, even when both share a header.
-    let pending = claims.mark_mined(hash(4), three_above, order::next());
-    claims.mark_mined(hash(4), two_above, order::next()).keep();
-    drop(pending);
-    assert!(voided(), "a record within the claim window is kept");
-
-    claims
-        .mark_mined(hash(5), three_above, order::next())
-        .keep();
-    assert!(!voided());
+/// Submits and rejects another mined block at `now`, which retires the records old enough.
+fn submit_another(claims: &AnnouncementClaims, now: Instant) {
+    drop(claims.mark_mined_at(hash(9), block::Height(CLAIMED.0 + 1), order::next(), now));
 }
 
 #[test]
-fn mined_block_records_end_once_the_verified_tip_passes_them() {
+fn a_rival_claimed_before_a_mined_block_never_regains_its_claim() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    claims.mark_mined(hash(3), CLAIMED, order::next()).keep();
+    // The rival is claimed at the instant the mined block is recorded, the latest that a claim
+    // with an earlier order can be made.
+    claim(&claims, hash(1), now);
+    let mined_order = order::next();
+    claims
+        .mark_mined_at(hash(3), CLAIMED, mined_order, now)
+        .keep();
 
-    // At the verified tip a rival at the mined block's height can still win a tie.
-    claims.begin_at([], CLAIMED, now).commit();
-    assert_eq!(claims.mined_blocks(), 1);
+    // The claim's last instant is also the record's, so the record still voids it there.
+    let at_the_bound = now + CLAIM_BODY_DEADLINE;
+    for arrival in [now, at_the_bound] {
+        submit_another(&claims, arrival);
+        assert!(matches!(
+            claims.resolve(hash(1), Some(CLAIMED), arrival),
+            ClaimOutcome::Voided { .. }
+        ));
+    }
 
+    // After it the record is retired, and the claim has expired on its own.
+    let late = at_the_bound + Duration::from_millis(1);
+    submit_another(&claims, late);
+    assert_eq!(claims.mined_blocks(), 0);
+    assert!(matches!(
+        claims.resolve(hash(1), Some(CLAIMED), late),
+        ClaimOutcome::Expired { .. }
+    ));
+    assert!(body_order(&claims, hash(1), late) > mined_order);
+}
+
+#[test]
+fn a_verified_mined_block_record_is_retired_only_by_its_age() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    claims
+        .mark_mined_at(hash(3), CLAIMED, order::next(), now)
+        .keep();
+
+    // The verified tip passing the block does not retire its record.
     claims
         .begin_at([], block::Height(CLAIMED.0 + 1), now)
         .commit();
+    assert_eq!(claims.mined_blocks(), 1);
+
+    submit_another(&claims, now + CLAIM_BODY_DEADLINE);
+    assert_eq!(claims.mined_blocks(), 1, "kept through the deadline");
+
+    submit_another(
+        &claims,
+        now + CLAIM_BODY_DEADLINE + Duration::from_millis(1),
+    );
     assert_eq!(claims.mined_blocks(), 0);
 }
 
 #[test]
-fn a_guard_for_a_pruned_record_leaves_a_newer_record_alone() {
+fn a_mined_block_still_verifying_keeps_its_record_whatever_its_age() {
     let claims = AnnouncementClaims::default();
-    let stale = claims.mark_mined(hash(3), CLAIMED, order::next());
-    // Mining well above it prunes the record while its request is still verifying.
-    claims
-        .mark_mined(hash(4), block::Height(CLAIMED.0 + 3), order::next())
-        .keep();
-    let again = claims.mark_mined(hash(3), CLAIMED, order::next());
+    let now = Instant::now();
+    let long_after = now + CLAIM_BODY_DEADLINE * 10;
+
+    let rejected = claims.mark_mined_at(hash(3), CLAIMED, order::next(), now);
+    let verified = claims.mark_mined_at(hash(4), CLAIMED, order::next(), now);
+    submit_another(&claims, long_after);
     assert_eq!(claims.mined_blocks(), 2);
 
-    drop(stale);
-    assert_eq!(
-        claims.mined_blocks(),
-        2,
-        "the newer record is still verifying"
+    // Each guard still finds its own record.
+    drop(rejected);
+    assert_eq!(claims.mined_blocks(), 1);
+    verified.keep();
+    assert_eq!(claims.mined_blocks(), 1);
+
+    // Once verified, the record is old enough to retire.
+    submit_another(&claims, long_after);
+    assert_eq!(claims.mined_blocks(), 0);
+}
+
+#[test]
+fn a_block_mined_again_after_its_record_retired_is_recorded_anew() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let first_order = order::next();
+    claims
+        .mark_mined_at(hash(3), CLAIMED, first_order, now)
+        .keep();
+
+    // A rival is claimed after the first record has aged out, then the block is mined again.
+    let later = now + CLAIM_BODY_DEADLINE + Duration::from_millis(1);
+    claim(&claims, hash(1), later);
+    let rival = claims
+        .claimed_order(hash(1))
+        .expect("the rival was claimed");
+    let again_order = order::next();
+    let again = claims.mark_mined_at(hash(3), CLAIMED, again_order, later);
+    assert!(first_order < rival && rival < again_order);
+
+    assert!(
+        body_order(&claims, hash(1), later) > again_order,
+        "the new record carries the new submission's order",
     );
     drop(again);
-    assert_eq!(claims.mined_blocks(), 1);
+    assert_eq!(body_order(&claims, hash(1), later), rival);
 }

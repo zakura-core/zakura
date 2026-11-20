@@ -4,7 +4,7 @@
 //! sends an `inv` for it. The `announced` child holds the `inv` sightings.
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -70,9 +70,8 @@ struct Claim {
 struct MinedBlock {
     height: block::Height,
     order: u64,
-    /// Identifies this entry to its guards, so a guard for a pruned entry leaves a newer entry
-    /// for the same block alone.
-    id: u64,
+    /// When the first request for this block was recorded, which is after `order` was drawn.
+    marked_at: Instant,
     /// The requests still verifying this block.
     pending: usize,
     /// Whether a request for this block has verified it.
@@ -81,8 +80,8 @@ struct MinedBlock {
 
 #[derive(Debug)]
 struct ClaimTable {
-    /// The highest verified tip height seen. Claims and mined blocks below it are dropped, and
-    /// no claim is made at or below it, so a dropped hash can never be claimed again.
+    /// The highest verified tip height seen. Claims below it are dropped, and no claim is made
+    /// at or below it, so a dropped hash can never be claimed again.
     ///
     /// It never goes down. After a rollback below it, blocks at or below it get no claim and are
     /// ranked by arrival until the tip passes it again.
@@ -90,10 +89,9 @@ struct ClaimTable {
     by_hash: HashMap<block::Hash, Claim>,
     /// The first legacy `inv` for each block. Its height is only known once the body arrives.
     announced: Announcements,
-    /// Mined blocks that are verifying or verified, by hash. Failed ones are removed.
+    /// Mined blocks that are verifying or verified, by hash. Failed ones are removed, and
+    /// verified ones are retired by [`ClaimTable::retire_mined`].
     mined: HashMap<block::Hash, MinedBlock>,
-    /// The id given to the next [`MinedBlock`].
-    next_mined_id: u64,
 }
 
 impl Default for ClaimTable {
@@ -103,7 +101,6 @@ impl Default for ClaimTable {
             by_hash: HashMap::new(),
             announced: Announcements::default(),
             mined: HashMap::new(),
-            next_mined_id: 0,
         }
     }
 }
@@ -114,12 +111,25 @@ fn in_claim_window(height: block::Height, tip_at_announcement: block::Height) ->
 }
 
 impl ClaimTable {
-    /// Raises the floor to `verified_tip`, dropping the claims and mined blocks below it.
+    /// Raises the floor to `verified_tip`, dropping the claims below it.
     fn raise_floor(&mut self, verified_tip: block::Height) {
         self.floor = self.floor.max(verified_tip);
         let floor = self.floor;
         self.by_hash.retain(|_, claim| claim.height >= floor);
-        self.mined.retain(|_, mined| mined.height >= floor);
+    }
+
+    /// Drops the mined blocks recorded more than [`CLAIM_BODY_DEADLINE`] before `now` that no
+    /// request is still verifying.
+    ///
+    /// A record only voids claims with an earlier order than its own. Each of those was seen
+    /// before the record was made, so once the record is older than the deadline they have all
+    /// expired, and an expired claim is ranked by arrival just as a voided one is. A record
+    /// that old therefore changes no block's order.
+    fn retire_mined(&mut self, now: Instant) {
+        self.mined.retain(|_, mined| {
+            mined.pending > 0
+                || now.saturating_duration_since(mined.marked_at) <= CLAIM_BODY_DEADLINE
+        });
     }
 }
 
@@ -248,36 +258,42 @@ impl AnnouncementClaims {
     /// earlier claim at `height` is not honoured.
     ///
     /// The record lasts while the returned guard, or any other guard for the same block, is
-    /// alive. Once one of them is kept, it lasts until a header or legacy announcement raises the floor above
-    /// `height`, or this node mines a block more than [`MAX_CLAIM_HEIGHT_ABOVE_TIP`] above it.
+    /// alive. Once one of them is kept, it outlives them until it is older than
+    /// [`CLAIM_BODY_DEADLINE`], when every claim it could void has expired. It is dropped at
+    /// the next call after that.
+    ///
+    /// `order` must already be drawn. That is what dates every claim with an earlier order
+    /// before this record.
     pub(super) fn mark_mined(
         &self,
         hash: block::Hash,
         height: block::Height,
         order: u64,
     ) -> MinedGuard {
+        self.mark_mined_at(hash, height, order, Instant::now())
+    }
+
+    pub(super) fn mark_mined_at(
+        &self,
+        hash: block::Hash,
+        height: block::Height,
+        order: u64,
+        now: Instant,
+    ) -> MinedGuard {
         let mut table = self.table();
-        let table = &mut *table;
-        let next_mined_id = table.next_mined_id;
-        let mined = match table.mined.entry(hash) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                table.next_mined_id = next_mined_id.wrapping_add(1);
-                entry.insert(MinedBlock {
-                    height,
-                    order,
-                    id: next_mined_id,
-                    pending: 0,
-                    verified: false,
-                })
-            }
-        };
+        table.retire_mined(now);
+        let mined = table.mined.entry(hash).or_insert(MinedBlock {
+            height,
+            order,
+            marked_at: now,
+            pending: 0,
+            verified: false,
+        });
         mined.pending = mined.pending.saturating_add(1);
         MinedGuard {
             claims: self.clone(),
             hash,
             height,
-            id: mined.id,
         }
     }
 
@@ -348,42 +364,31 @@ impl Drop for PendingClaims {
 
 /// Keeps a locally mined block's record while its verification is active.
 ///
-/// Dropping the last guard for a block removes its record, unless one of them was kept.
+/// Dropping the last guard for a block removes its record, unless one of them was kept. A
+/// record is never dropped while a guard for it is alive, so a guard always acts on the record
+/// it was given.
 pub(in crate::block) struct MinedGuard {
     claims: AnnouncementClaims,
     hash: block::Hash,
     /// The height of this submission's body. Other bodies can share its header hash.
     height: block::Height,
-    id: u64,
 }
 
 impl MinedGuard {
     /// Keeps the record after this guard is gone, because the mined block verified.
     pub(in crate::block) fn keep(self) {
         let mut table = self.claims.table();
-        if let Some(mined) = self.own_entry(&mut table) {
+        if let Some(mined) = table.mined.get_mut(&self.hash) {
             mined.verified = true;
             mined.height = self.height;
-            // Bound the records even when no announcements advance the floor.
-            table
-                .mined
-                .retain(|_, other| self.height - other.height <= MAX_CLAIM_HEIGHT_ABOVE_TIP);
         }
-    }
-
-    /// The entry this guard holds, unless it was pruned.
-    fn own_entry<'a>(&self, table: &'a mut ClaimTable) -> Option<&'a mut MinedBlock> {
-        table
-            .mined
-            .get_mut(&self.hash)
-            .filter(|mined| mined.id == self.id)
     }
 }
 
 impl Drop for MinedGuard {
     fn drop(&mut self) {
         let mut table = self.claims.table();
-        let Some(mined) = self.own_entry(&mut table) else {
+        let Some(mined) = table.mined.get_mut(&self.hash) else {
             return;
         };
         mined.pending = mined.pending.saturating_sub(1);

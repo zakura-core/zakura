@@ -686,6 +686,10 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
+                    // LAB ONLY: the withholding peer sits on the body.
+                    if let Some(delay) = zakura_consensus::lab_knob("body_delay_ms") {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     let mut blocks: Vec<InventoryResponse<(zn::DeliveredBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;

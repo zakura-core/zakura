@@ -25,5 +25,5 @@ mod registry;
 mod tests;
 
 pub(in crate::block) use claims::CLAIM_BODY_DEADLINE;
-pub use claims::{AnnouncementClaims, PendingClaims};
+pub use claims::{lab_knob, AnnouncementClaims, PendingClaims};
 pub(in crate::block) use registry::ReceiptRegistry;

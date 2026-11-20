@@ -40,7 +40,7 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
-pub use receipt::{AnnouncementClaims, PendingClaims};
+pub use receipt::{lab_knob, AnnouncementClaims, PendingClaims};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]

@@ -277,12 +277,14 @@ impl QueryState {
 }
 
 /// What one session delivered and has not settled: its claimed answers of each
-/// kind, and each `Hello` in verification.
+/// kind, each `Hello` in verification, and the frames its reader received and
+/// has not judged.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct Settling {
     peers: usize,
     services: usize,
     hellos: usize,
+    reading: usize,
 }
 
 impl Settling {
@@ -291,6 +293,7 @@ impl Settling {
             Held::Answer(QueryKind::Peers) => &mut self.peers,
             Held::Answer(QueryKind::Services) => &mut self.services,
             Held::Hello => &mut self.hellos,
+            Held::Reading => &mut self.reading,
         }
     }
 
@@ -311,14 +314,18 @@ enum Held {
     /// A `Hello` in verification. It holds a closing session's wait and nothing
     /// else: no reservation, no pool entry, and no query kind.
     Hello,
+    /// The frames the reader received and has not judged. Like a `Hello`, it
+    /// holds only a closing session's wait.
+    Reading,
 }
 
-/// One answer or `Hello` that a session's reader has not settled.
+/// One answer, one `Hello`, or the received frames that a session's reader
+/// has not settled.
 ///
-/// The reader holds it through decode, verification, and import. Dropping it
-/// settles on every path, including a reader cancelled inside verification.
-/// Settlement needs no lock, so a destructor that runs at shutdown cannot
-/// contend with a paused lock holder.
+/// The reader holds an answer or a `Hello` through decode, verification, and
+/// import. Dropping it settles on every path, including a reader cancelled
+/// inside verification. Settlement needs no lock, so a destructor that runs at
+/// shutdown cannot contend with a paused lock holder.
 #[derive(Debug)]
 #[must_use = "dropping the hold settles what it holds"]
 pub(super) struct SettlingHold {
@@ -561,11 +568,16 @@ impl Queries {
         SettlingHold::new(Held::Hello, &self.settling)
     }
 
+    /// Counts the reader's received frames as unjudged until the returned hold
+    /// drops.
+    pub(super) fn reading(&self) -> SettlingHold {
+        SettlingHold::new(Held::Reading, &self.settling)
+    }
+
     /// Resolves once this session holds nothing it read and has not processed:
-    /// no claimed answer, no `Hello` in verification, and no answer the transport
-    /// reader queued. An unanswered query does not hold it, so a silent peer
-    /// costs no wait. A `Hello` the reader has not reached holds no reservation,
-    /// so it does not hold this either.
+    /// no claimed answer, no `Hello` in verification, no frame the reader
+    /// received and has not judged, and no answer the transport reader queued.
+    /// An unanswered query does not hold it, so a silent peer costs no wait.
     pub(super) async fn answers_settled(&self) {
         let mut settling = self.settling.subscribe();
         loop {

@@ -4,6 +4,7 @@
 
 pub mod discovery_inputs;
 pub mod feed;
+pub mod header_inputs;
 pub mod plan_search;
 pub mod prepare_fault;
 pub mod qa_store;

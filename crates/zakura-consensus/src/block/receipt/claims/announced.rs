@@ -16,9 +16,12 @@ use super::{super::order, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
 /// connection passes at most 3 blocks per 2 seconds to the store and an entry lasts
 /// [`ANNOUNCEMENT_LIFETIME`], 4 seconds, so one connection holds at most 9 unexpired entries:
 /// three windows' worth, when the first was filled exactly 4 seconds before the last. The
-/// default limits allow 450 connections, and at most about 44 more can be opened within one
-/// entry's lifetime (one inbound a second, ten outbound), so at most 494 connections hold
-/// 4,446 entries. A node configured for more than about 550 connections can be filled.
+/// default limits allow 450 connections at once. Every new connection has a fresh allowance,
+/// and within one entry's lifetime at most about 73 can be opened: 32 inbound, which are
+/// accepted in bursts of 16, and 41 outbound, which are dialed at most ten a second. So at
+/// most 523 connections hold 4,707 entries. The bound stops holding once the configured
+/// connection limit passes about 480, which is a `peerset_initial_target_size` of about 107
+/// against the default 100.
 ///
 /// Honest announcements arrive about one block per connection per block interval, so this is
 /// far above honest use. A full store refuses new hashes instead of dropping old ones, so even

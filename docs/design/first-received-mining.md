@@ -110,10 +110,13 @@ The reservation is called a claim. Six rules define it:
   The store's size follows from those numbers, so that peers cannot fill it at
   the default connection limits. One connection holds at most 9 unexpired
   entries: three windows' worth, when the first was filled exactly 4 seconds
-  before the last. The default limits allow 450 connections, and about 44
-  more can be opened within those 4 seconds, so at most 494 connections hold
-  4,446 entries. A node configured for more than about 550 connections can
-  still be filled.
+  before the last. The default limits allow 450 connections at once. Every
+  new connection has a fresh allowance, and within those 4 seconds at most
+  about 73 can be opened: 32 inbound, which are accepted in bursts of 16, and
+  41 outbound, which are dialed at most ten a second. So at most 523
+  connections hold 4,707 entries. The bound stops holding once the configured
+  connection limit passes about 480, which is a `peerset_initial_target_size`
+  of about 107 against the default 100. Such a node can still be filled.
 
   A block's height is not known when its header arrives, so blocks a peer
   serves during catch-up use the allowance and the store too, within the same

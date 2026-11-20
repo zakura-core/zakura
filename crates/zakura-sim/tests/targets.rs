@@ -23,7 +23,10 @@ use zakura_sim::{
         stats::{Counts, ProcessStats, STATS_VERSION},
         ProcessExit, Worker,
     },
-    harness::{HarnessEntry, HARNESSES},
+    harness::{
+        fixtures::{All, Variant, Which},
+        HarnessEntry, Subsystem, HARNESSES,
+    },
     seed::{self, Seed},
     suite::{SuiteFile, SUITE_FILE},
 };
@@ -288,11 +291,31 @@ const PLANS_WITHOUT_FAMILIES: usize = 8;
 /// `-max_len`.
 const PLAN_BYTES: usize = 256;
 
+/// `fixtures/all`'s prefix that picks `fixture`'s fixed variant on one
+/// worker, under the empty Plan. The default scenario runs one fixture, so
+/// a target covering every race fixture runs each one's fix.
+fn fixed_race(fixture: Which) -> Vec<u8> {
+    let index = |found: Option<usize>| {
+        // Six fixtures and five variants fit a byte.
+        u8::try_from(found.expect("every fixture and variant is listed")).expect("it fits a byte")
+    };
+    vec![
+        index(Which::ALL.iter().position(|which| *which == fixture)),
+        index(
+            Variant::ALL
+                .iter()
+                .position(|which| *which == Variant::Fixed),
+        ),
+        0,
+    ]
+}
+
 /// `entry`'s inputs, named: the empty input, which runs the default scenario
 /// under the empty Plan, then each scenario family's tag under the empty
 /// Plan, but the [`SLOW_FAMILIES`]. A machine runs the first
 /// [`PLANS_WITHOUT_FAMILIES`] generated op tapes as well, each at most
-/// `max_len` bytes. The harnesses' seeds live in the QA store, which a
+/// `max_len` bytes, and `fixtures/all` runs each race fixture's fix
+/// ([`fixed_race`]). The harnesses' seeds live in the QA store, which a
 /// repository test doesn't read.
 fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
     let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
@@ -302,6 +325,14 @@ fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
             zakura_sim::seed::draws::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
         for (index, plan) in plans.into_iter().enumerate() {
             inputs.push((format!("{} plan {index}", entry.name), plan));
+        }
+    }
+    if entry.name == All::NAME {
+        for fixture in Which::ALL {
+            inputs.push((
+                format!("{} {fixture:?} fixed", entry.name),
+                fixed_race(fixture),
+            ));
         }
     }
     for family in families {

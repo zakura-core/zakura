@@ -719,6 +719,35 @@ class ConfigKeyTests(unittest.TestCase):
                 self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": tx_relay})
                 self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
 
+    def test_ci_overrides_render_a_canary_the_loader_accepts(self):
+        # The testnet deploy workflow puts these lines in `[defaults]`.
+        def overrides(**inputs):
+            fields = dict(node="", p2p_stack="auto", fleet_p2p_stack="dual",
+                          mempool_implementation="auto", tx_relay=False, setup="auto")
+            return deploy.ci_overrides(**{**fields, **inputs})
+
+        self.assertEqual(overrides(), ['p2p_stack = "dual"'])
+        lines = overrides(node="node-a", mempool_implementation="core", tx_relay=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, "\n".join([
+                "[defaults]", 'network = "Testnet"', *lines, "",
+                "[[nodes]]", 'name = "node-a"', 'ssh_string = "root@example"',
+                'commit = "main"', "",
+            ]))
+            config = tomllib.loads(deploy.render_node_config(deploy.load_nodes(path, None)[0]))
+        self.assertEqual(config["mempool"], {"implementation": "core"})
+        self.assertEqual(config["network"]["zakura"]["tx_relay"], {"enabled": True})
+
+        for inputs, error in (
+            (dict(mempool_implementation="core"), "mempool_implementation overrides require one"),
+            (dict(tx_relay=True), "tx_relay requires one"),
+            (dict(p2p_stack="legacy"), "p2p_stack overrides require one"),
+            (dict(setup="v2"), "setup overrides require one"),
+            (dict(node="node-a", p2p_stack="legacy", setup="v2"), "not both"),
+        ):
+            with self.subTest(inputs), self.assertRaisesRegex(deploy.DeployError, error):
+                overrides(**inputs)
+
     def test_internal_miner_requires_an_address_and_the_miner_build(self):
         for extra in ('build_features = ["internal-miner"]',
                       'miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"'):

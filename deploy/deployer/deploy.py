@@ -250,6 +250,52 @@ def normalize_mempool_implementation(value: object, *, where: str) -> str:
     return implementation
 
 
+def ci_overrides(
+    *,
+    node: str,
+    p2p_stack: str,
+    fleet_p2p_stack: str,
+    mempool_implementation: str,
+    tx_relay: bool,
+    setup: str,
+) -> list[str]:
+    """Render a deploy workflow run's one-node overrides as `[defaults]` lines.
+
+    `p2p_stack`, `mempool_implementation` and `setup` are "auto" and `tx_relay`
+    is false to leave the fleet as it is. Each override is one node's choice,
+    so it needs `node`. The fleet's next deploy without it puts the node back.
+    `load_nodes` checks how the rendered values combine.
+    """
+    needs_node = {
+        "p2p_stack overrides require one explicit node": p2p_stack != "auto",
+        "mempool_implementation overrides require one explicit node": (
+            mempool_implementation != "auto"
+        ),
+        "tx_relay requires one explicit node": tx_relay,
+        "setup overrides require one explicit node": setup != "auto",
+    }
+    for error, overridden in needs_node.items():
+        if overridden and not node:
+            raise DeployError(error)
+    if p2p_stack != "auto" and setup != "auto":
+        raise DeployError("set p2p_stack or setup, not both")
+    where = "workflow inputs"
+    stack = fleet_p2p_stack if p2p_stack == "auto" else p2p_stack
+    lines = [f"p2p_stack = {json.dumps(normalize_p2p_stack(stack, where=where))}"]
+    if mempool_implementation != "auto":
+        pool = normalize_mempool_implementation(mempool_implementation, where=where)
+        lines.append(f"mempool_implementation = {json.dumps(pool)}")
+    if tx_relay:
+        lines.append("tx_relay = true")
+    if setup != "auto":
+        if setup not in SETUPS:
+            raise DeployError(
+                f"{where}: unknown setup {setup!r}; expected one of: {', '.join(SETUPS)}"
+            )
+        lines.append(f"setup = {json.dumps(setup)}")
+    return lines
+
+
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     if not config_path.is_file():
         raise DeployError(f"config not found: {config_path}")
@@ -1419,7 +1465,32 @@ def build_parser() -> argparse.ArgumentParser:
     lo.add_argument("--lines", type=int, default=50, help="initial lines to show (default: 50)")
     lo.set_defaults(func=cmd_logs_follow)
 
+    ci = sub.add_parser(
+        "ci-overrides", help="print the [defaults] lines a deploy workflow run's inputs render"
+    )
+    ci.add_argument("--node", default="", help="the one node the run targets, if any")
+    ci.add_argument("--p2p-stack", default="auto")
+    ci.add_argument("--fleet-p2p-stack", required=True, help="p2p_stack when --p2p-stack is auto")
+    ci.add_argument("--mempool-implementation", default="auto")
+    ci.add_argument("--tx-relay", choices=("true", "false"), default="false")
+    ci.add_argument("--setup", default="auto")
+    ci.set_defaults(func=cmd_ci_overrides)
+
     return p
+
+
+def cmd_ci_overrides(args) -> int:
+    """Prints `ci_overrides` for the parsed workflow inputs, one line each."""
+    lines = ci_overrides(
+        node=args.node,
+        p2p_stack=args.p2p_stack,
+        fleet_p2p_stack=args.fleet_p2p_stack,
+        mempool_implementation=args.mempool_implementation,
+        tx_relay=args.tx_relay == "true",
+        setup=args.setup,
+    )
+    print("\n".join(lines))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

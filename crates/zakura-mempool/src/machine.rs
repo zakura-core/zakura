@@ -60,6 +60,27 @@ use crate::{
 /// child with one bogus input again, until its wait ends.
 const MAX_PARENT_RETRIES: usize = MAX_MEMPOOL_ANCESTORS;
 
+/// The parent among `arrived` that may run a transaction waiting on
+/// `waiting` again, given `retried_for`, the parent of each earlier run, or
+/// `None` if none may. A parent new to `retried_for` may while retries are
+/// left. One already in it was usually in the pool for that run's check, so
+/// it may only when no other parent in `waiting` is still to come: it may
+/// have left before the verifier looked.
+fn parent_to_retry(
+    retried_for: &[transaction::Hash],
+    arrived: &[transaction::Hash],
+    waiting: &[transaction::Hash],
+) -> Option<transaction::Hash> {
+    if retried_for.len() >= MAX_PARENT_RETRIES {
+        return None;
+    }
+    if let Some(new) = arrived.iter().find(|parent| !retried_for.contains(parent)) {
+        return Some(*new);
+    }
+    let nothing_new_to_come = waiting.iter().all(|parent| retried_for.contains(parent));
+    arrived.first().copied().filter(|_| nothing_new_to_come)
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -221,10 +242,9 @@ struct Admission<E> {
     missing_error: Option<E>,
     /// Whether the one check allowed after that wait ended has been used.
     last_check_used: bool,
-    /// The parents whose entry into the pool ran it again since the tip
-    /// changed, at most [`MAX_PARENT_RETRIES`]. One that leaves and enters
-    /// again, as an evicted parent can, was already there for a check, so
-    /// it runs nothing and costs no retry.
+    /// The parent whose entry into the pool ran it again, once per run since
+    /// the tip changed, at most [`MAX_PARENT_RETRIES`]. See
+    /// [`parent_to_retry`].
     retried_for: Vec<transaction::Hash>,
     /// Whether a parent arrived that the cap did not let run it again. If
     /// so, the wait ends with the one last check rather than the missing
@@ -1298,13 +1318,13 @@ impl<E: VerifyError> MempoolState<E> {
                 if last_check {
                     admission.last_check_used = true;
                 }
-                let new_parent = arrived
-                    .iter()
-                    .find(|parent| !admission.retried_for.contains(parent))
-                    .filter(|_| !wait_over && admission.retried_for.len() < MAX_PARENT_RETRIES);
-                let retry = new_parent.is_some();
-                if let Some(parent) = new_parent {
-                    admission.retried_for.push(*parent);
+                let waiting: Vec<transaction::Hash> =
+                    missing.iter().map(|outpoint| outpoint.hash).collect();
+                let parent = parent_to_retry(&admission.retried_for, &arrived, &waiting)
+                    .filter(|_| !wait_over);
+                let retry = parent.is_some();
+                if let Some(parent) = parent {
+                    admission.retried_for.push(parent);
                 }
                 if retry || last_check {
                     self.start_admission(key);
@@ -1520,8 +1540,8 @@ impl<E: VerifyError> MempoolState<E> {
     }
 
     /// Runs again every admission parked on `parent`, which just entered the
-    /// pool, that has a retry left and has not been run for `parent`
-    /// already. Any other is owed a last check.
+    /// pool, that [`parent_to_retry`] lets it run. Any other is owed a last
+    /// check.
     fn wake_for_arrival(&mut self, parent: transaction::Hash) {
         let mut woken = Vec::new();
         for (key, admission) in &mut self.admissions {
@@ -1531,9 +1551,7 @@ impl<E: VerifyError> MempoolState<E> {
             if !on.contains(&parent) {
                 continue;
             }
-            if !admission.retried_for.contains(&parent)
-                && admission.retried_for.len() < MAX_PARENT_RETRIES
-            {
+            if let Some(parent) = parent_to_retry(&admission.retried_for, &[parent], on) {
                 admission.retried_for.push(parent);
                 woken.push(*key);
             } else {

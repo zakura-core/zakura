@@ -1152,10 +1152,12 @@ impl<E: VerifyError> MempoolState<E> {
         }
         for key in unparked {
             let admission = self.admission_at(key);
-            if admission.retry_at.is_some() && !admission.last_check_used {
-                // The missing inputs it last saw may be out of date, so they
-                // are not cached. A submitter that has gone gets a timeout.
-                if admission.give_up.is_some_and(|at| at <= now) {
+            if admission.retry_at.is_some() {
+                // A parent arrived after its last check, so the missing
+                // inputs it saw may be out of date and are not cached. It
+                // gets the one last check if that is left and its submitter
+                // still waits, and an uncached timeout otherwise.
+                if admission.last_check_used || admission.give_up.is_some_and(|at| at <= now) {
                     self.fail_locally(key, LocalFault::VerifyTimeout);
                 } else {
                     admission.last_check_used = true;

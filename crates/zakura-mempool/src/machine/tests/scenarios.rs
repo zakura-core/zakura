@@ -1196,6 +1196,82 @@ fn a_held_parent_spends_the_last_check_before_the_deadline() {
     assert_eq!(rerun.len(), 1, "the last check runs before 73 s");
 }
 
+/// A parent that arrives after the child's last check is spent leaves the
+/// child's missing inputs out of date, so when its wait ends it times out
+/// uncached instead of being rejected for the rest of the tip. Here the
+/// child parks at 10 s with a 73 s deadline, so its wait ends at 70 s. A
+/// returning parent spends its retries, the other parent's arrival at 65 s
+/// spends the last check while the first is evicted, and the first returns
+/// at 66 s.
+#[test]
+fn a_parent_after_the_last_check_leaves_nothing_cached() {
+    let mut runner = TestRunner::deterministic();
+    let parents = unrelated(&mut runner, 2);
+    let spends: Vec<OutPoint> = parents.iter().map(|parent| parent.outpoint(0)).collect();
+    let child = build(&mut runner, &spends, 1, None);
+    let fillers = unrelated(&mut runner, 4);
+    let mut bench = Bench::with(
+        Config {
+            tx_cost_limit: parents[0].real.cost() + fillers[0].real.cost(),
+            ..Config::default()
+        },
+        Limits::default(),
+    );
+    bench.now = Duration::from_secs(10);
+    let reservation = bench.reserved(&child);
+    let (waiter, step) = bench.submit_until(reservation, &child, Some(Duration::from_secs(73)));
+    assert!(bench.missing(started(&step)[0], spends.clone()).is_empty());
+
+    // The first parent runs the child twice, and is pushed out each time.
+    bench.now = Duration::from_secs(20);
+    let rerun = admit_parent(&mut bench, &paying(&parents[0], 500_000));
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    bench.admit(&paying(&fillers[0], 100_000_000));
+    bench.admit(&paying(&fillers[1], 200_000_000));
+    bench.now = Duration::from_secs(64);
+    let rerun = admit_parent(&mut bench, &paying(&twin(&parents[0]), 300_000_000));
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
+    bench.admit(&paying(&fillers[2], 400_000_000));
+    bench.admit(&paying(&fillers[3], 500_000_000));
+
+    // The other parent spends the last check, which misses the first.
+    bench.now = Duration::from_secs(65);
+    let last = admit_parent(&mut bench, &paying(&parents[1], 600_000_000));
+    assert_eq!(last.len(), 1, "the last check runs before the deadline");
+    assert!(bench.missing(last[0], spends.clone()).is_empty());
+
+    // The first parent comes back, and nothing checks the child again.
+    bench.now = Duration::from_secs(66);
+    // Both earlier authorizations are cached as evicted, so it returns
+    // under a third.
+    let mut transaction = (**parents[0].real.transaction.transaction()).clone();
+    if let Transaction::V6 {
+        ironwood_shielded_data: Some(data),
+        ..
+    } = &mut transaction
+    {
+        data.binding_sig = [2u8; 64].into();
+    }
+    let back = paying(
+        &Tx {
+            real: verified(transaction, 1_000_000),
+        },
+        700_000_000,
+    );
+    assert_eq!(back.id().mined_id(), parents[0].id().mined_id());
+    assert!(admit_parent(&mut bench, &back).is_empty());
+
+    let step = bench.tick(Duration::from_secs(4));
+    assert!(
+        matches!(
+            step.verdict(waiter),
+            Some(Verdict::LocalFault(LocalFault::VerifyTimeout))
+        ),
+        "{step:?}"
+    );
+    assert!(bench.reserve(&child).0.is_ok(), "nothing is cached");
+}
+
 // Deadlines.
 
 /// A deadline that has passed is applied before the input that shows it,

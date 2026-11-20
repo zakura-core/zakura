@@ -185,7 +185,12 @@ async fn queued_body_rechecks_rejection_and_preserves_committed_delivery() {
     use zakura_chain::serialization::ZcashDeserializeInto;
     let _init = zakura_test::init();
     timeout(Duration::from_secs(10), async {
-        for outcome in [PendingBlockStatus::Failed, PendingBlockStatus::Committed] {
+        for (push, state_admitted, outcome) in [
+            (false, false, PendingBlockStatus::Failed),
+            (false, false, PendingBlockStatus::Committed),
+            (false, true, PendingBlockStatus::Failed),
+            (true, true, PendingBlockStatus::Failed),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let local = TcpStream::connect(listener.local_addr().unwrap())
                 .await
@@ -220,10 +225,25 @@ async fn queued_body_rechecks_rejection_and_preserves_committed_delivery() {
                     .zcash_deserialize_into()
                     .unwrap();
             let hash = block.hash();
-            let (status, permit) = PendingBlockSendPermit::channel();
+            let (status, permit) = if state_admitted {
+                PendingBlockSendPermit::state_admitted_channel()
+            } else {
+                PendingBlockSendPermit::channel()
+            };
+            let (result, _delivery) = oneshot::channel();
+            let advert = BlockAdvert {
+                hash,
+                result,
+                push,
+                pending_send: Some(permit.clone()),
+            };
             let request = Request::BlocksByHash([hash].into_iter().collect());
             let drive = async {
-                connection.drive_peer_request(request).await;
+                if push {
+                    connection.send_block_advert(advert, None).await;
+                } else {
+                    connection.drive_peer_request(request).await;
+                }
                 connection
                     .peer_tx
                     .send(Message::Ping(crate::types::Nonce(456)))
@@ -252,7 +272,9 @@ async fn queued_body_rechecks_rejection_and_preserves_committed_delivery() {
             } else {
                 Message::Block(block.clone().into())
             };
-            assert_eq!(received.next().await.unwrap().unwrap(), expected);
+            if !push {
+                assert_eq!(received.next().await.unwrap().unwrap(), expected);
+            }
             assert_eq!(
                 received.next().await.unwrap().unwrap(),
                 Message::Ping(crate::types::Nonce(456))
@@ -280,6 +302,21 @@ fn post_handshake_codec() -> Codec {
     let mut codec = Codec::builder().finish();
     codec.reconfigure_full_body_len();
     codec
+}
+
+#[test]
+fn state_admitted_body_uses_shared_checksum_and_retains_withdrawal_permission() {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+    let block: std::sync::Arc<block::Block> = zakura_test::vectors::BLOCK_TESTNET_141042_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (_, permit) = PendingBlockSendPermit::state_admitted_channel();
+    let (message, _, retained) = super::super::legacy_block_message(ServedBlock {
+        block: block.clone().into(),
+        pending_send: Some(permit.clone()),
+    });
+    assert_eq!(message, Message::Block(block.into()));
+    assert_eq!(retained, Some(permit));
 }
 
 /// Real TCP decoding checks both temporary sends and a committed send under one header.
@@ -324,7 +361,11 @@ async fn temporary_body_checksums_do_not_poison_same_header_retries() {
         .into_iter()
         .enumerate()
         {
-            let message = Message::Block(body.into());
+            let expected = Message::Block(body.clone().into());
+            let (message, _, permit) = super::super::legacy_block_message(ServedBlock {
+                block: body.into(),
+                pending_send: permit,
+            });
             let (sent, decoded) = tokio::join!(
                 sender.send_authorized(message.clone(), || true, permit),
                 received.next(),
@@ -334,7 +375,7 @@ async fn temporary_body_checksums_do_not_poison_same_header_retries() {
                 decoded
                     .unwrap()
                     .expect("each block has the checksum of its own bytes"),
-                message
+                expected
             );
             if index == 0 {
                 rejected.send_replace(PendingBlockStatus::Failed);

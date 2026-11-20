@@ -60,7 +60,7 @@ use crate::{
 
 use InventoryResponse::*;
 
-/// Frame temporary bodies with an attempt-local checksum and keep their write permission.
+/// Choose the checksum from the body returned by lookup, retaining its write permission.
 fn legacy_block_message(
     served: ServedBlock,
 ) -> (Message, block::Hash, Option<PendingBlockSendPermit>) {
@@ -70,8 +70,11 @@ fn legacy_block_message(
     } = served;
     let block = HashedBlock::from(block);
     let hash = block.hash();
-    let message = match &pending_send {
-        Some(permit) => Message::UncachedBlock(block, permit.body_checksum()),
+    let message = match pending_send
+        .as_ref()
+        .and_then(PendingBlockSendPermit::attempt_checksum)
+    {
+        Some(checksum) => Message::UncachedBlock(block, checksum.clone()),
         None => Message::Block(block),
     };
     (message, hash, pending_send)

@@ -132,7 +132,8 @@ enum BodyDecodePanic {
 /// the block.
 ///
 /// A checksum is found by the block's hash. Bodies using this cache come from committed
-/// state. Temporary submission bodies use [`Message::UncachedBlock`] instead, even when
+/// state or from state-authorized early relay after their body commitments were checked.
+/// Trusted early submissions use [`Message::UncachedBlock`] instead, even when
 /// they later commit, and neither read nor populate this cache; they share a checksum
 /// only across sends of the same submission attempt. Before contextual
 /// verification checks `hashBlockCommitments`, different v5 authorization data can produce
@@ -394,7 +395,7 @@ impl Encoder<Message> for Codec {
         // copies it again at each step, which costs more than measuring it first. A block
         // that was sent before has its body length remembered with its checksum, so it is
         // serialized only once; every other message is measured first.
-        // Temporary submission bodies never read or populate the shared cache.
+        // Trusted early submission bodies never read or populate the shared cache.
         let block_hash = match &item {
             Message::Block(block) => Some(block.hash()),
             _ => None,

@@ -1156,7 +1156,7 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
         .finish();
     temporary.reconfigure_full_body_len();
     let (_, rejected) = zakura_node_services::block_relay::PendingBlockSendPermit::channel();
-    let attempt = rejected.body_checksum();
+    let attempt = rejected.attempt_checksum().unwrap().clone();
     let mut frame = BytesMut::new();
     temporary
         .encode(
@@ -1209,7 +1209,7 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
     frame.clear();
     temporary
         .encode(
-            Message::UncachedBlock(valid.into(), retry.body_checksum()),
+            Message::UncachedBlock(valid.into(), retry.attempt_checksum().unwrap().clone()),
             &mut frame,
         )
         .unwrap();

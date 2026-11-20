@@ -5147,9 +5147,17 @@ async fn rpc_client_proposal_can_submit_solution() {
         "the event carries the submitted block's size"
     );
     assert_eq!(submission_method, MinedBlockSubmission::CompactHeader);
-    assert_eq!(
-        pending_blocks.get(candidate_hash).map(|block| block.hash()),
-        Some(candidate_hash),
+    let served = pending_blocks
+        .get_for_peer(candidate_hash)
+        .expect("state admitted this body for early relay");
+    assert_eq!(served.hash(), candidate_hash);
+    let permit = served
+        .pending_send
+        .expect("pending writes remain revocable");
+    assert_eq!(permit, pending.send_permit());
+    assert!(
+        permit.attempt_checksum().is_none(),
+        "the admitted body can use its shared checksum"
     );
     assert!(pending.is_valid());
 

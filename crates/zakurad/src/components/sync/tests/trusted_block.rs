@@ -1141,6 +1141,11 @@ async fn trusted_block_with_unknown_parent_is_not_relayed_early() {
         true,
     ));
     assert_eq!(relay.gate.entered().await, child.hash());
+    let resolution = relay
+        .pending
+        .resolution(child.hash())
+        .expect("local validation owns the hash");
+    assert_eq!(fetch_from_peer(&relay, child.hash()).await, None);
     // Early relay would reach the receiver within milliseconds while validation is held.
     assert!(
         timeout(Duration::from_secs(2), receiver.advertisements.recv())
@@ -1150,6 +1155,7 @@ async fn trusted_block_with_unknown_parent_is_not_relayed_early() {
     );
     relay.gate.release();
     assert_eq!(orphan.await.unwrap(), "inconclusive");
+    assert!(!resolution.committed().await);
     assert!(relay.pending.get(child.hash()).is_none());
 
     assert_eq!(
@@ -1200,6 +1206,10 @@ async fn trusted_block_with_unknown_parent_is_not_relayed_early() {
     })
     .await
     .expect("the receiver fetches the retried child from the relay");
+    assert_eq!(
+        fetch_from_peer(&relay, child.hash()).await.unwrap(),
+        child.zcash_serialize_to_vec().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -1227,7 +1237,8 @@ async fn stalled_parent_lookup_still_starts_validation_and_releases_submission_c
             .unwrap(),
         block.hash()
     );
-    assert!(node.pending.get(block.hash()).is_some());
+    assert!(node.pending.resolution(block.hash()).is_some());
+    assert!(node.pending.get_for_peer(block.hash()).is_none());
     assert!(node.held_relays.try_recv().is_err());
 
     tokio::time::pause();
@@ -1591,9 +1602,19 @@ async fn fetch_from_peer(node: &Node, hash: zakura_chain::block::Hash) -> Option
             Some(zakura_network::InventoryResponse::Available((block, _))) => {
                 Some(block.zcash_serialize_to_vec().unwrap())
             }
-            _ => None,
+            other => panic!("expected the requested block, got {other:?}"),
         },
-        _ => None,
+        Err(error) => {
+            assert_eq!(
+                error
+                    .downcast_ref::<zakura_network::SharedPeerError>()
+                    .and_then(|err| err.not_found_class()),
+                Some(zakura_network::NotFoundClass::Response),
+                "expected an explicit notfound reply for {hash}, got {error}"
+            );
+            None
+        }
+        other => panic!("expected a block response for {hash}, got {other:?}"),
     }
 }
 

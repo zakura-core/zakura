@@ -210,13 +210,16 @@ async fn invalid_pow_is_relayed_then_rejected(failure: ValidationFailure) {
         (hash, failure),
     );
     assert!(relay.pending.get(hash).is_none());
-    timeout(
+    let reply = timeout(
         Duration::from_secs(20),
-        observer.clone().oneshot(Request::Peers),
+        observer
+            .clone()
+            .oneshot(Request::Ping(zakura_network::types::Nonce(456))),
     )
     .await
-    .unwrap()
+    .expect("the observer connection still answers after withdrawal")
     .unwrap();
+    assert!(matches!(reply, Response::Pong(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

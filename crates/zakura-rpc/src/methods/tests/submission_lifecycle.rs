@@ -93,3 +93,82 @@ async fn duplicate_whose_other_copy_never_commits_is_withdrawn_at_the_deadline()
         (Some(DuplicateBody::Unconfirmed), false)
     );
 }
+
+/// Both an in-flight hash and an unavailable hash lookup suppress early peer access.
+/// A verifier duplicate with no readable committed copy is retryable in either case.
+#[tokio::test(start_paused = true)]
+async fn trusted_rpc_keeps_uncertain_hashes_private_and_reports_an_unconfirmed_duplicate() {
+    use crate::tests::test_rpc::TestRpcImpl;
+    use zakura_chain::{chain_tip::NoChainTip, parameters::Network};
+    use zakura_test::mock_service::MockService;
+
+    let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+    let hash = Network::Mainnet.genesis_hash();
+    for in_flight in [true, false] {
+        let mempool: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+        let mut verifier: MockService<_, _, _, tower::BoxError> =
+            MockService::build().for_unit_tests();
+        let state = tower::service_fn(move |request| async move {
+            assert!(matches!(request, zakura_state::Request::KnownBlock(h) if h == hash));
+            if in_flight {
+                Ok(zakura_state::Response::KnownBlock(Some(
+                    KnownBlock::WriteChannel,
+                )))
+            } else {
+                Err(tower::BoxError::from("hash lookup unavailable"))
+            }
+        });
+        let read = tower::service_fn(|request| async move {
+            Ok::<_, tower::BoxError>(match request {
+                ReadRequest::BlockInfo(_) => ReadResponse::BlockInfo(Some(Default::default())),
+                ReadRequest::AnyChainBlock(_) => ReadResponse::Block(None),
+                other => panic!("unexpected state request {other:?}"),
+            })
+        });
+        let (_logs, log_rx) = tokio::sync::watch::channel(None);
+        let (events, mut early) = tokio::sync::mpsc::unbounded_channel();
+        let (rpc, queue) = TestRpcImpl::new_for_tests(
+            Network::Mainnet,
+            Default::default(),
+            false,
+            "test",
+            "test",
+            tower::buffer::Buffer::new(mempool, 1),
+            state,
+            read,
+            verifier.clone(),
+            Default::default(),
+            NoChainTip,
+            Default::default(),
+            log_rx,
+            Some(events),
+        );
+        let pending = rpc.gbt.pending_blocks();
+        let bytes = bytes.clone();
+        let result = tokio::spawn(async move { rpc.submit_trusted_block(&bytes).await });
+        let verification = verifier
+            .expect_request_that(|req| matches!(req, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        let resolution = pending
+            .resolution(hash)
+            .expect("local gossip can await verification");
+        assert!(pending.get_for_peer(hash).is_none());
+        verification.respond_error(tower::BoxError::from(zakura_consensus::RouterError::from(
+            zakura_consensus::VerifyBlockError::from(zakura_consensus::BlockError::AlreadyInChain(
+                hash,
+                KnownBlock::WriteChannel,
+            )),
+        )));
+        let Ok(response) = result.await.unwrap() else {
+            panic!("a complete submission within capacity returns a verification outcome")
+        };
+        assert_eq!(
+            crate::server::trusted_block::outcome(&response),
+            "inconclusive"
+        );
+        assert!(!resolution.committed().await);
+        assert!(early.try_recv().is_err());
+        assert!(pending.resolution(hash).is_none());
+        queue.abort();
+    }
+}

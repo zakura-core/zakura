@@ -164,7 +164,7 @@ struct PendingBlock {
     owner_id: u64,
     block: Arc<block::Block>,
     status: watch::Sender<PendingStatus>,
-    permit: PendingBlockSendPermit,
+    peer_permit: Option<PendingBlockSendPermit>,
 }
 
 /// Stores pending block bodies with their registration owners.
@@ -174,7 +174,8 @@ struct PendingBlockRegistryInner {
     next_owner_id: AtomicU64,
 }
 
-/// Holds early-advertised block bodies until their contextual commits finish.
+/// Tracks local submissions through verification. Only bodies authorized for early relay
+/// are available to peers.
 #[derive(Clone, Debug)]
 pub struct PendingBlockRegistry(Arc<PendingBlockRegistryInner>);
 
@@ -325,6 +326,30 @@ impl PendingBlockRegistry {
     ///
     /// Returns no registration when the hash already has an owner or the registry is full.
     pub fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
+        self.insert_trusted(block, true)
+    }
+
+    pub(crate) fn insert_trusted(
+        &self,
+        block: Arc<block::Block>,
+        early_relay: bool,
+    ) -> Option<PendingBlockRegistration> {
+        self.register(block, early_relay, PendingBlockSendPermit::channel)
+    }
+
+    pub(crate) fn insert_state_admitted(
+        &self,
+        block: Arc<block::Block>,
+    ) -> Option<PendingBlockRegistration> {
+        self.register(block, true, PendingBlockSendPermit::state_admitted_channel)
+    }
+
+    fn register(
+        &self,
+        block: Arc<block::Block>,
+        peer_visible: bool,
+        channel: impl FnOnce() -> (watch::Sender<PendingStatus>, PendingBlockSendPermit),
+    ) -> Option<PendingBlockRegistration> {
         let hash = block.hash();
         let mut entries = self
             .0
@@ -340,7 +365,7 @@ impl PendingBlockRegistry {
         }
 
         let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
-        let (status, permit) = PendingBlockSendPermit::channel();
+        let (status, permit) = channel();
         let receiver = permit.subscribe();
         entries.insert(
             hash,
@@ -348,7 +373,7 @@ impl PendingBlockRegistry {
                 owner_id,
                 block,
                 status,
-                permit: permit.clone(),
+                peer_permit: peer_visible.then(|| permit.clone()),
             },
         );
         Some(PendingBlockRegistration {
@@ -399,7 +424,8 @@ impl PendingBlockRegistry {
             .map(|entry| PendingBlockResolution(entry.status.subscribe()))
     }
 
-    /// Returns a temporary peer response with its attempt-specific write permission.
+    /// Returns a peer-visible body with its write permission. Private submissions remain
+    /// available to local download coordination through [`Self::resolution`].
     pub fn get_for_peer(&self, hash: block::Hash) -> Option<ServedBlock> {
         let block = self
             .0
@@ -407,9 +433,12 @@ impl PendingBlockRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .map(|entry| ServedBlock {
-                block: entry.block.clone().into(),
-                pending_send: Some(entry.permit.clone()),
+            .and_then(|entry| {
+                let permit = entry.peer_permit.as_ref()?;
+                Some(ServedBlock {
+                    block: entry.block.clone().into(),
+                    pending_send: Some(permit.clone()),
+                })
             });
         if block.is_some() {
             metrics::counter!("mining.pending_registry.served").increment(1);

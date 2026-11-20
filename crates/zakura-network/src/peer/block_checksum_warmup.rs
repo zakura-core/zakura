@@ -166,7 +166,10 @@ where
     };
     blocks.into_iter().find_map(|block| match block {
         InventoryResponse::Available((body, _))
-            if body.pending_send().is_none() && body.hash() == hash =>
+            if body
+                .pending_send()
+                .is_none_or(|permit| permit.attempt_checksum().is_none())
+                && body.hash() == hash =>
         {
             Some(body.into_block())
         }

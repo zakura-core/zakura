@@ -27,7 +27,7 @@ pub enum PendingBlockStatus {
 #[derive(Clone, Debug)]
 pub struct PendingBlockSendPermit {
     status: Arc<watch::Sender<PendingBlockStatus>>,
-    checksum: AttemptChecksum,
+    checksum: Option<AttemptChecksum>,
 }
 
 impl PendingBlockSendPermit {
@@ -35,12 +35,24 @@ impl PendingBlockSendPermit {
     ///
     /// The submission owner must publish failure on cancellation or drop.
     pub fn channel() -> (watch::Sender<PendingBlockStatus>, Self) {
+        Self::with_checksum(Some(AttemptChecksum::default()))
+    }
+
+    /// Creates a revocable permission for a body whose commitments were checked before
+    /// state admission. Legacy sends can safely share its checksum by header hash.
+    pub fn state_admitted_channel() -> (watch::Sender<PendingBlockStatus>, Self) {
+        Self::with_checksum(None)
+    }
+
+    fn with_checksum(
+        checksum: Option<AttemptChecksum>,
+    ) -> (watch::Sender<PendingBlockStatus>, Self) {
         let (status, _) = watch::channel(PendingBlockStatus::Waiting);
         (
             status.clone(),
             Self {
                 status: Arc::new(status),
-                checksum: AttemptChecksum::default(),
+                checksum,
             },
         )
     }
@@ -50,12 +62,12 @@ impl PendingBlockSendPermit {
         self.status.subscribe()
     }
 
-    /// The network checksum shared by this attempt's body sends.
+    /// The attempt-local checksum, if the body has not been authorized for shared caching.
     ///
     /// One permit belongs to one submitted body, so its sends can share a checksum without the
     /// cache keyed by header hash, where a different body under the same hash could poison it.
-    pub fn body_checksum(&self) -> AttemptChecksum {
-        self.checksum.clone()
+    pub fn attempt_checksum(&self) -> Option<&AttemptChecksum> {
+        self.checksum.as_ref()
     }
 
     /// Runs a synchronous write start unless this submission has been withdrawn.

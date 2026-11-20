@@ -79,7 +79,9 @@ duplicate check.
   waiting for validation.
 - Otherwise the block is validated without early relay and is announced only
   after it commits. This covers an unconfirmed parent, a hash that another path
-  is already committing, and a lookup that fails or misses the deadline. The
+  is already committing, and a lookup that fails or misses the deadline. Peers
+  that already know the hash cannot fetch the submitted body while it waits for
+  validation. Local downloads can still wait for the submission to finish. The
   verifier still runs its own duplicate check.
 
 A block whose parent is still missing returns `inconclusive`. In every case
@@ -142,18 +144,19 @@ response; its announcements are not withdrawn. The final permission check is
 ordered against withdrawal at the start of each local write. Writes already
 started may finish; bytes already sent cannot be recalled. A corrected-body
 retry has independent permission even when its header hash matches the rejected
-submission. Temporary bodies compute each legacy message checksum from their exact
+submission. Trusted pending bodies compute each legacy message checksum from their exact
 bytes and never read or populate the shared checksum cache. A different body with
 the same header and length therefore cannot poison a corrected retry. Committed
-state reads retain checksum sharing. Ordinary `submitblock` early relay, enabled by
-`optimistic_block_inventory`, applies the same withdrawal when contextual
-validation fails.
+state reads retain checksum sharing. Ordinary early relay through `submitblock`
+or `submitsolution` can also precompute and share the checksum once the state
+has checked the body commitments and authorized relay. A later contextual
+failure still withdraws its queued writes.
 
 An invalid submission does not disable early relay for later submissions.
 
 A pending body is never served in place of a committed block. When a peer asks for
 a hash, the relay serves the committed block if state has one, and the pending body
-only otherwise.
+only if early relay was authorized and state has no committed copy.
 
 The duplicate lookup cannot close every race: the same block can commit through
 another path, for example gossip from the GBT node, after the lookup and before the
@@ -168,9 +171,9 @@ submitted block with the committed one:
   channel, usually before that write finishes. The relay therefore keeps
   reading the committed block every 50 milliseconds for up to five seconds. If
   it does not appear by then, for example because the other copy was rejected,
-  the bodies cannot be compared and the pending body is withdrawn too. If it did
-  match, peers whose body responses were withdrawn get "not found" for a block
-  the relay may later commit, with the side effect described below.
+  the relay withdraws the pending body and returns `inconclusive`. The caller
+  may retry. If a committed copy was read, either comparison returns
+  `duplicate` because the hash is confirmed.
 
 Until that comparison finishes, which can take up to five seconds, the HTTP
 response and one pending-body slot are held, and body responses that fetched the

@@ -227,7 +227,7 @@ impl Submission {
                     if authorized {
                         let (relay, registration) = match &policy {
                             RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
-                                admitted_registration = pending_blocks.insert(self.block.clone());
+                                admitted_registration = pending_blocks.insert_state_admitted(self.block.clone());
                                 (EarlyBlockRelay::StateAdmission(admission), admitted_registration.as_ref())
                             }
                             RelayPolicy::TrustedSubmission { registration, .. } => {

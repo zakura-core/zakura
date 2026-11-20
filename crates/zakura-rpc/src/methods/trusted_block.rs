@@ -95,10 +95,11 @@ where
             }
             Err(response) => return Ok(response.into()),
         };
+        let early_relay = skipped.is_none();
         let registration = self
             .gbt
             .pending_blocks()
-            .insert(block.clone())
+            .insert_trusted(block.clone(), early_relay)
             .ok_or(TrustedSubmissionError::Capacity)?;
         let submission = Submission {
             block,
@@ -114,13 +115,16 @@ where
             self.gbt.mined_block_sender(),
             RelayPolicy::TrustedSubmission {
                 registration,
-                early_relay: skipped.is_none(),
+                early_relay,
                 committed_block: committed_block_lookup(self.read_state.clone()),
             },
             move |outcome| {
                 metrics::histogram!("rpc.trusted_submission.validation.duration_seconds")
                     .record(submitted_at.elapsed().as_secs_f64());
                 let response = match outcome.verification {
+                    VerificationOutcome::Completed(_) if outcome.duplicate_body == Some(DuplicateBody::Unconfirmed) => {
+                        SubmitBlockErrorResponse::Inconclusive.into()
+                    }
                     VerificationOutcome::Completed(result) => Self::mined_block_response(
                         result,
                         hash,
@@ -137,11 +141,13 @@ where
                 if let Some(body) = outcome.duplicate_body {
                     metrics::counter!("rpc.trusted_submission.duplicate_body", "body" => body.label())
                         .increment(1);
-                    if body != DuplicateBody::Identical {
+                    if body == DuplicateBody::Unconfirmed {
+                        tracing::warn!(?hash, "could not confirm a committed copy before the deadline: withdrawing the submitted body");
+                    } else if body == DuplicateBody::Differs {
                         tracing::warn!(
                             ?hash,
                             body = body.label(),
-                            "trusted submission's hash committed with a body not confirmed equal to it: withdrawing the submitted body"
+                            "committed copy differs from the trusted submission: withdrawing the submitted body"
                         );
                     }
                 }

@@ -1,5 +1,6 @@
 //! Tests for receipt order and announcement claims, with their shared fixtures.
 
+mod announced;
 mod claims;
 mod counter;
 mod registry;
@@ -15,7 +16,8 @@ use zakura_node_services::block_memory::BlockHandle;
 
 use super::{
     claims::{
-        size_label, AnnouncementClaims, ClaimOutcome, CLAIM_BODY_DEADLINE, MAX_ANNOUNCEMENT_CLAIMS,
+        size_label, AnnouncementClaims, ClaimOutcome, ClaimSource, CLAIM_BODY_DEADLINE,
+        MAX_ANNOUNCED_BLOCKS, MAX_ANNOUNCEMENT_CLAIMS,
     },
     order,
     registry::{ReceiptGuard, ReceiptRegistry, MAX_BODIES_PER_HASH},
@@ -42,10 +44,15 @@ fn claim(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) {
     claims.begin_at([(hash, CLAIMED)], TIP, now).commit();
 }
 
-/// The order a body of `hash` with `bytes` serialized bytes gets when it arrives at `now`.
-fn body_order(claims: &AnnouncementClaims, hash: block::Hash, bytes: usize, now: Instant) -> u64 {
+/// Records a legacy `inv` for `hash` at `now`, with the verified tip at [`TIP`].
+fn announce(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) {
+    claims.note_announcement_at(hash, TIP, now);
+}
+
+/// The order a body of `hash` gets when it arrives at `now`.
+fn body_order(claims: &AnnouncementClaims, hash: block::Hash, now: Instant) -> u64 {
     claims
-        .resolve(hash, now, || bytes)
+        .resolve(hash, Some(CLAIMED), now)
         .claimed_order()
         .unwrap_or_else(order::next)
 }

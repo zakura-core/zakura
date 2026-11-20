@@ -12,35 +12,66 @@ A greater-work chain still replaces an earlier equal-work winner.
 ## Announcement priority
 
 A block's receipt order is drawn when its complete body reaches the full-block
-verifier. A block whose header was admitted first keeps the order reserved for
-that header instead, provided its body reaches the verifier within a fixed
-deadline.
+verifier. A block announced first keeps the order reserved for that
+announcement instead, provided its body reaches the verifier within a fixed
+deadline. A block is announced when native header sync admits its header, or
+when a legacy peer sends the first `inv` for it.
 
 Without this, a block full of transactions can lose an equal-work race to an
 empty block announced later, because the larger body takes longer to transfer.
 That penalizes including transactions.
 
-The reservation is called a claim. Four rules define it:
+The reservation is called a claim. Five rules define it:
 
-- **A claim needs a fully validated header.** Native header sync reserves the
-  order and the time when it starts applying a header, so a body that arrives
-  during the apply already takes them. The claim is kept once state has
-  accepted the header, by which point the header has passed Equihash, its
-  target, parent linkage and the contextual difficulty and time rules. Applies
-  of the same header from several peers share the first reservation. If none
-  of them succeeds, the claim is removed, and a later apply of that header
-  claims from its own start, which can only rank the block later. A header
-  deferred for a future timestamp gets no claim. Only headers one or two
-  blocks above the verified tip are claimed, so catch-up creates none.
-- **A block has one claim, and it is permanent.** A claim, once made, is never
-  replaced or renewed by delivering the header again, and reading it does not
-  use it up, so an invalid body under the same header cannot take it. The
-  table holds 64 claims. When it is full it refuses new claims and never
-  drops old ones. A claim is removed when no apply covering it succeeds, or
-  at the first header apply after the verified tip passes its height, where
-  no new claim can be made. That floor is the highest verified tip seen and
-  never goes down, so after a rollback blocks at or below it get no claim and
-  are ranked by arrival until the tip passes it again.
+- **A header claim needs a fully validated header.** Native header sync
+  reserves the order and the time when it starts applying a header, so a body
+  that arrives during the apply already takes them. The claim is kept once
+  state has accepted the header, by which point the header has passed
+  Equihash, its target, parent linkage and the contextual difficulty and time
+  rules. Applies of the same header from several peers share the first
+  reservation. If none of them succeeds, the claim is removed, and a later
+  apply of that header claims from its own start, which can only rank the
+  block later. A header deferred for a future timestamp gets no claim. Only
+  headers one or two blocks above the verified tip are claimed, so catch-up
+  creates none.
+- **A legacy `inv` claims without a header check.** The first `inv` that names
+  only one block records the order and the time it arrived. An `inv` naming
+  several blocks answers a query and records nothing. This is safe without
+  validating anything at `inv` time, for two reasons. A valid block hash cannot
+  exist before its proof of work is done, so an `inv` is never earlier than the
+  block's discovery. And receipt order is only compared between fully
+  validated, committed blocks, so a fake or stale hash cannot help any block.
+  The `inv` carries no height, so the body's coinbase height must be one or two
+  blocks above the highest verified tip seen at the first announcement. A rival
+  can reach that height first and still lose the tie. The claim stops applying
+  once the highest verified tip passes the body's height. On a node
+  without native header sync, the best chain tip at `inv` time stands in for
+  the verified tip.
+- **Each block keeps its first claim of each kind, and neither is renewed.** A
+  header claim, once made, is never replaced or renewed by delivering the
+  header again. An `inv` for a block that already has a header claim or an
+  `inv` record records nothing. Reading a claim does not use it up, so an
+  invalid body under the same hash cannot take it. A body whose block holds
+  both takes the earlier order among those still in force, so an `inv` never
+  makes the outcome worse than the header claim alone.
+
+  The header table holds 64 claims. When it is full it refuses new claims and
+  never drops old ones. A claim is removed when no apply covering it
+  succeeds, or at the first header apply or legacy `inv` after the verified
+  tip passes its height, where no new claim can be made. That floor is the
+  highest verified tip seen and never goes down, so after a rollback blocks at
+  or below it get no claim and are ranked by arrival until the tip passes it
+  again.
+
+  The `inv` store holds 512 blocks. Entries older than 4 seconds, twice the
+  body deadline, are dropped when a new block is recorded, so a late body is
+  still counted as expired. A store full of newer entries refuses new blocks.
+  Each legacy connection passes at most 4 `inv`s per 2 seconds to the store,
+  leaving room for both blocks in a tip race and for repeated or bunched
+  announcements. One connection cannot fill the store. A sustained flood can
+  at worst return blocks to arrival order. An announcement after its entry was
+  dropped counts as a new sighting, which gives a withholder nothing it could
+  not get by announcing late.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.
@@ -86,9 +117,9 @@ The 2 seconds is an estimate of honest delivery, not a measurement. The
 `sync.block.announcement_claim` counter records how each body resolved
 (`used`, `expired`, `voided` by a mined block, or `none`), and the
 `sync.block.announcement_claim.age.seconds` histogram records the age of the
-claim at body arrival, both labelled by block size. The
-`sync.block.announcement_claim.refused` counter records claims refused by a
-full table.
+claim at body arrival, both labelled by block size and by `source`, `header`
+or `inv`. The `sync.block.announcement_claim.refused` counter records claims
+refused by a full table or store, labelled by `source`.
 
 For example, A's header is admitted before B's, but B's smaller body arrives
 and validates first. Mining uses B until A validates. If A's body arrived
@@ -98,12 +129,17 @@ B stays.
 A claim never makes a block eligible. Mining still waits for full validation.
 Some blocks have no claim and are ranked by body arrival:
 
-- A block seen only through legacy peers, because no legacy path validates
-  headers before bodies.
 - A block whose header arrived before a restart. Claims are not persisted.
 - A block refused by a full table. On Testnet, minimum-difficulty headers can
   fill the table, which then refuses claims until the verified tip passes the
   flooded heights.
+- A block a legacy peer announced only in a multi-block `inv`, or announced
+  past its connection's limit, with no header claim.
+
+An `inv` claim only removes the last hop's delay. Legacy relays store and
+forward, so each upstream hop has already received and verified the whole
+body before announcing it, and that time is not recovered. Header claims from
+native header sync arrive before the bodies at every hop.
 
 [Fork retention](../specs/fork-aware-header-chain-engine.md#lc-retain-01)
 keeps newly accepted parents available for extension and evicted bodies eligible

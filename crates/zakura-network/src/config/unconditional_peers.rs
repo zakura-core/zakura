@@ -31,7 +31,8 @@ use crate::{
 /// A DNS name stands for the one address that its dialer last resolved it to, see
 /// [`set_resolved_ip`](Self::set_resolved_ip). That address is treated like a listed
 /// single address until the name resolves to another one. A name can be pinned to a
-/// node ID, such as `<node id>@peer.example.com:8233`, see [`UnconditionalPeerName`].
+/// node, by its key (`<key>@peer.example.com:8233`) or by its node ID
+/// (`id:<node id>@peer.example.com:8233`), see [`UnconditionalPeerName`].
 ///
 /// The list is cheap to clone, so every component that needs it can hold a copy. Every
 /// copy sees the latest resolved addresses.
@@ -76,7 +77,8 @@ pub struct UnconditionalPeerName {
     pub node_id: Option<ConfiguredNode>,
 }
 
-/// Writes the name in its config form, such as `<node id>@peer.example.com:8233`.
+/// Writes the name in its config form, such as `<key>@peer.example.com:8233`, with
+/// the pin in the form it was given.
 impl fmt::Display for UnconditionalPeerName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(node_id) = self.node_id {
@@ -395,14 +397,14 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
             if let Some((node_id, name)) = entry.split_once('@') {
                 let node_id = node_id.parse().map_err(|error| {
                     de::Error::custom(format!(
-                        "invalid node ID in network.unconditional_peers entry {entry:?}: {error}"
+                        "invalid node in network.unconditional_peers entry {entry:?}: {error}"
                     ))
                 })?;
                 let name = parse_name(name, Some(node_id)).ok_or_else(|| {
                     de::Error::custom(format!(
-                        "invalid network.unconditional_peers entry {entry:?}: a node ID \
-                         can only pin a DNS name with a port, such as \
-                         <node id>@peer.example.com:8233"
+                        "invalid network.unconditional_peers entry {entry:?}: a key or \
+                         node ID can only pin a DNS name with a port, such as \
+                         <key>@peer.example.com:8233 or id:<node id>@peer.example.com:8233"
                     ))
                 })?;
                 names.push(name);
@@ -414,9 +416,10 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
                 return Err(de::Error::custom(format!(
                     "invalid network.unconditional_peers entry {entry:?}: expected an IP \
                      address, an IP address or DNS name with a port, a DNS name with a port \
-                     and a node ID, or a canonical CIDR range without host bits, such as \
-                     192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
-                     <node id>@peer.example.com:8233 or 2001:db8::/32"
+                     and a key or node ID, or a canonical CIDR range without host bits, such \
+                     as 192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
+                     <key>@peer.example.com:8233, id:<node id>@peer.example.com:8233 or \
+                     2001:db8::/32"
                 )));
             }
         }

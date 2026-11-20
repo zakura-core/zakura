@@ -375,8 +375,9 @@ pub struct Config {
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, an IP address and port, such
     /// as `"192.0.2.1:8233"` or `"[2001:db8::1]:8233"`, a DNS name and port, such as
-    /// `"peer.example.com:8233"`, a DNS name and port pinned to the peer's node ID, such
-    /// as `"<node id>@peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`.
+    /// `"peer.example.com:8233"`, a DNS name and port pinned to the peer's Ed25519 key,
+    /// such as `"<key>@peer.example.com:8233"`, or to its node ID, such as
+    /// `"id:<node id>@peer.example.com:8233"`, or a CIDR range, such as `"2001:db8::/32"`.
     /// CIDR ranges with host bits set are rejected, and a DNS name needs a port.
     /// Use this setting for peers you operate, such as your own nodes, miners, or
     /// sidecars.

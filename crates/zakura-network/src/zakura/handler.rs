@@ -306,11 +306,14 @@ const ZAKURA_CLOSE_UNKNOWN_STREAM: u32 = 5;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuraConfig {
-    /// Native Zakura bootstrap peers as `node_id@direct_addr`.
+    /// Native Zakura bootstrap peers as `key@direct_addr` or
+    /// `id:node_id@direct_addr`.
     ///
     /// Native bootstrap uses direct addresses only because relays and discovery
-    /// are disabled for Zakura v1. Each entry must contain the peer's 32-byte
-    /// node id and a directly reachable socket address.
+    /// are disabled for Zakura v1. Each entry names the peer and a directly
+    /// reachable socket address. A bare 64-hex value is the peer's Ed25519
+    /// public key. `id:` followed by 64 hex characters is its node ID, which
+    /// is the form a node prints for itself at startup.
     pub bootstrap_peers: Vec<String>,
     /// Address the native Zakura QUIC endpoint binds to.
     ///

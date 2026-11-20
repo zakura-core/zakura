@@ -2198,7 +2198,7 @@ fn unconditional_peers_reject_invalid_pins() {
         (format!("{node_id}@2001:db8::/32"), "only pins a DNS name"),
         (format!("{node_id}@peer.example.com"), "needs a port"),
         (format!("{node_id}@"), "needs a name"),
-        ("abcd@peer.example.com:8233".to_string(), "not a node ID"),
+        ("abcd@peer.example.com:8233".to_string(), "not a key or node ID"),
         (
             format!("{node_id}@{node_id}@peer.example.com:8233"),
             "has one pin",

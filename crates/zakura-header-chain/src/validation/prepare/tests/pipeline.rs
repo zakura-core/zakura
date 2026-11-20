@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     parameters::{testnet::RegtestParameters, Network},
+    work::{difficulty::CompactDifficulty, equihash},
 };
 
 use super::super::*;
@@ -257,4 +261,109 @@ fn empty_batch_is_rejected_before_header_validation() {
         ),
         Err(HeaderFailure::Empty)
     ));
+}
+
+/// Prepares `headers` on a 4-thread pool with a counting Equihash check that
+/// rejects each header whose nonce is `rejected`'s. Returns the verdict, the
+/// number of Equihash checks that ran, and the batch width.
+fn prepare_counting(
+    headers: &[Arc<block::Header>],
+    rejected: block::Header,
+) -> (
+    Result<crate::PreparedHeaderBatch, HeaderFailure>,
+    usize,
+    usize,
+) {
+    let (rules, lease, anchor) = fixture();
+    let checks = AtomicUsize::new(0);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("the test pool starts");
+    pool.install(|| {
+        let verdict = super::super::pipeline::prepare_headers_checking_solutions(
+            HeaderBatchInput::new(headers),
+            lease.parent(),
+            &rules,
+            &FixedClock(anchor.time + Duration::hours(1)),
+            &|header| {
+                checks.fetch_add(1, Ordering::Relaxed);
+                if header.nonce == rejected.nonce {
+                    return Err(equihash::Error::InvalidSolutionSize {
+                        network: rules.network().clone(),
+                    });
+                }
+                Ok(())
+            },
+        );
+        (
+            verdict,
+            checks.load(Ordering::Relaxed),
+            super::super::pipeline::batch_width(),
+        )
+    })
+}
+
+/// hsync-9: a full batch whose first header fails Equihash runs at most one
+/// batch width of Equihash checks, not all 4,000.
+#[test]
+fn an_invalid_first_header_runs_at_most_one_batch_of_equihash_checks() {
+    let (_, lease, anchor) = fixture();
+    let valid = child(lease.parent, &anchor, 1);
+    let invalid = child(lease.parent, &anchor, 2);
+    let mut headers = vec![valid; crate::MAX_HEADERS_PER_TRANSITION_V1];
+    headers[0] = invalid.clone();
+
+    let (verdict, checks, width) = prepare_counting(&headers, *invalid);
+
+    assert!(matches!(
+        verdict,
+        Err(HeaderFailure::Invalid {
+            offset: 0,
+            rule: HeaderRule::Equihash,
+            ..
+        })
+    ));
+    assert!(width < headers.len(), "the page spans several batches");
+    assert!(
+        (1..=width).contains(&checks),
+        "{checks} checks, width {width}"
+    );
+}
+
+/// hsync-9: the verdict names the lowest failing offset and its rule, as a
+/// run over every header does. Every header below the failure still runs,
+/// and no batch after it starts.
+#[test]
+fn the_lowest_failing_offset_wins_across_batches() {
+    let (_, lease, anchor) = fixture();
+    let valid = child(lease.parent, &anchor, 1);
+    let rejected = child(lease.parent, &anchor, 2);
+    let mut bad_target = *valid;
+    // A negative compact target has no expanded form.
+    bad_target.difficulty_threshold = CompactDifficulty::from_le_bytes([0xff; 4]);
+    let mut headers = vec![valid; crate::MAX_HEADERS_PER_TRANSITION_V1];
+    let (.., width) = prepare_counting(&headers, *rejected);
+    // A compact-target failure in the second batch, and Equihash failures at
+    // higher offsets in the same and the last batch.
+    let target_offset = width + width / 2;
+    headers[target_offset] = Arc::new(bad_target);
+    headers[target_offset + 1] = rejected.clone();
+    *headers.last_mut().expect("the page is full") = rejected.clone();
+
+    let (verdict, checks, _) = prepare_counting(&headers, *rejected);
+
+    assert!(matches!(
+        verdict,
+        Err(HeaderFailure::Invalid {
+            offset,
+            rule: HeaderRule::CompactTarget,
+            ..
+        }) if offset == target_offset
+    ));
+    // Each header below the failure, and at most the rest of its batch.
+    assert!(
+        (target_offset..2 * width).contains(&checks),
+        "{checks} checks, width {width}"
+    );
 }

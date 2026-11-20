@@ -244,7 +244,8 @@ impl LifecycleSender {
             }
             Event::PeerDisconnected {
                 peer, session_id, ..
-            } => {
+            }
+            | Event::PeerReadTimedOut { peer, session_id } => {
                 if let Some(disconnect) = disconnects.remove(&(peer.clone(), *session_id)) {
                     disconnect.send(LifecycleEvent { event, applied });
                 }
@@ -366,6 +367,13 @@ pub enum Event {
         /// Bounded first-cause teardown reason.
         reason: &'static str,
     },
+    /// A header-sync stream stalled while reading a frame.
+    PeerReadTimedOut {
+        /// Authenticated peer identity.
+        peer: ZakuraPeerId,
+        /// Exact ordered-stream generation that stalled.
+        session_id: u64,
+    },
     /// First-party discovery summary used only for dial preference.
     AdvisorySummary {
         /// Peer that supplied the summary.
@@ -467,6 +475,7 @@ impl Event {
         match self {
             Self::PeerConnected(_) => "peer_connected",
             Self::PeerDisconnected { .. } => "peer_disconnected",
+            Self::PeerReadTimedOut { .. } => "peer_read_timed_out",
             Self::AdvisorySummary { .. } => "advisory_header_summary",
             Self::Status { .. } => "status",
             Self::Page { .. } => "page",

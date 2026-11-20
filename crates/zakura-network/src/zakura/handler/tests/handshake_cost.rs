@@ -73,7 +73,8 @@ async fn measure_failed_control_handshake_cpu() -> Result<(), BoxError> {
         .is_err());
         assert_eq!(refusals.0.load(Ordering::Relaxed), attempt + 1);
         clients.push(client);
-        // Ten attempts per second remain below the production 16/s cadence.
+        // Ten attempts per second remain below the production cadences:
+        // 16/s per address and 24/s per node.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(supervisor.registered_ids().await.is_empty());

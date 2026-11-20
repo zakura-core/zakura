@@ -27,7 +27,8 @@
 //! the selected chain still contains a header comes from
 //! [`Port::selected_chain_contains`], which walks nothing and takes no lease.
 //! Local failures wait for an update, a selected-chain change, or a capacity
-//! release, never for a timer.
+//! release, never for a timer. The one timer is the walk meter's: a job that
+//! would lease from an `Open`'s locators waits for its token.
 //!
 //! [`PublisherState`] holds the subscription policy, which runs without a
 //! runtime and holds only values. This module holds the resources: the lock,
@@ -55,6 +56,8 @@ use std::{
 
 use futures::FutureExt;
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 use zakura_chain::block;
 use zakura_header_chain::{
     BranchId, EngineSnapshot, Frontier, HeaderGeneration, HeaderWorkAuthority, SourceId,
@@ -67,6 +70,7 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_rt::{
     sync::{mpsc, watch, CancellationToken, Mutex, MutexGuard, Notify, PoisonError},
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -80,7 +84,7 @@ use crate::zakura::{
     },
     regulation::{
         Applied, ExecutionSlots, PublicationReporter, PublicationSlots, Push, PushPermit, PushSend,
-        SlotId, SubscriptionFault, SubscriptionLimits, TerminalPermit,
+        SharedBucket, SlotId, SubscriptionFault, SubscriptionLimits, TerminalPermit,
     },
     transport::sim_chain,
     wire_codec::encode_frame,
@@ -100,7 +104,7 @@ pub use machine::{
     trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
     HeaderPublisherSubscriptionView, HeaderPublisherView,
 };
-pub(crate) use state::is_legal;
+pub(crate) use state::{is_legal, OPEN_WALKS};
 use state::{
     on_empty_page, on_following_check, on_lease_acquired, on_lease_refused, on_probe,
     reaches_target, recheck, CapacityWait, Exit, Job, JobKey, LeaseRefused, Output, Page,
@@ -151,6 +155,17 @@ pub(crate) enum PublisherFault {
     UnadvertisedSchema,
 }
 
+impl PublisherFault {
+    /// The close-spec row this fault breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Subscription(fault) => fault.close_row(),
+            Self::ChangedFields => CloseRow::HSYNC_CLOSE_31,
+            Self::UnadvertisedSchema => CloseRow::HSYNC_CLOSE_32,
+        }
+    }
+}
+
 /// One session's publisher: the handle the session reader applies updates
 /// through.
 #[derive(Debug)]
@@ -186,6 +201,13 @@ impl PublisherOwner {
             #[cfg(any(test, zakura_sim))]
             life: None,
         }
+    }
+
+    /// This owner, metering its `Open` walks with its connection's
+    /// `open_walks`.
+    fn with_open_walks(mut self, open_walks: SharedBucket) -> Self {
+        self.state = self.state.with_open_walks(open_walks);
+        self
     }
 
     /// This owner, reporting its subscription transitions through `tap`'s
@@ -492,8 +514,36 @@ impl From<Output> for Refusal {
 }
 
 impl Publisher {
+    /// [`Self::spawn_metered`] with a meter of its own, for tests.
+    #[cfg(test)]
+    pub(crate) fn spawn<const HEADER_BYTES: usize>(
+        port: Arc<dyn Port>,
+        push: Push,
+        send: FramedSend,
+        owner: LeaseOwner,
+        limits: PageLimits,
+        cancel: CancellationToken,
+        tap: (
+            Option<crate::zakura::RegulationTap<u64>>,
+            Option<super::CreditTap>,
+        ),
+    ) -> (Self, JoinHandle<()>) {
+        Self::spawn_metered::<HEADER_BYTES>(
+            port,
+            push,
+            send,
+            owner,
+            limits,
+            cancel,
+            SharedBucket::new(OPEN_WALKS),
+            tap,
+        )
+    }
+
     /// Start publishing on one session, and return the handle with the task
-    /// that writes pages and outcomes to `send` until `cancel` fires.
+    /// that writes pages and outcomes to `send` until `cancel` fires. Jobs
+    /// that walk from an `Open`'s locators spend `open_walks`, which the
+    /// session's connection keeps.
     ///
     /// The task re-raises a page job's panic, even one whose page it had
     /// abandoned, so the session's owner sees it through the returned handle
@@ -503,13 +553,15 @@ impl Publisher {
     /// version 9 codec. In test and simulator builds, `tap`'s regulation
     /// tap reports the subscription transitions, and its credit tap the
     /// task's start and end ([`PublisherLife`]).
-    pub(crate) fn spawn<const HEADER_BYTES: usize>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_metered<const HEADER_BYTES: usize>(
         port: Arc<dyn Port>,
         push: Push,
         send: FramedSend,
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
+        open_walks: SharedBucket,
         #[cfg(any(test, zakura_sim))] tap: (
             Option<crate::zakura::RegulationTap<u64>>,
             Option<super::CreditTap>,
@@ -526,7 +578,7 @@ impl Publisher {
                 .session_cancel(&life.peer, life.session_id, cancel.clone());
         }
         let shared = Arc::new(Mutex::new(sim_chain!(
-            PublisherOwner::new(limits) => observed_by((tap, life.clone()))
+            PublisherOwner::new(limits).with_open_walks(open_walks) => observed_by((tap, life.clone()))
         )));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
@@ -685,6 +737,8 @@ async fn publish<const HEADER_BYTES: usize>(
     // The page in progress, under the key state recorded for its job.
     let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
+        // When the walk meter lets a job it held back start, if it did.
+        let mut walk_due = None;
         let (outcomes, abandoned) = {
             let mut shared = lock(&task.shared);
             let outcomes = shared.end_due();
@@ -725,7 +779,10 @@ async fn publish<const HEADER_BYTES: usize>(
         if work.is_none() {
             let snapshot = selected.borrow().clone();
             let mut shared = lock(&task.shared);
-            let job = shared.state.next_job::<HEADER_BYTES>(snapshot.as_ref());
+            let job = shared
+                .state
+                .next_job::<HEADER_BYTES>(snapshot.as_ref(), Instant::now());
+            walk_due = shared.state.walk_due();
             let ending = shared.state.end_queued();
             drop(shared);
             if let Some(job) = job {
@@ -769,6 +826,8 @@ async fn publish<const HEADER_BYTES: usize>(
                 }
             }
             () = task.wake.notified() => {}
+            () = zakura_rt::time::sleep_until(walk_due.unwrap_or_else(Instant::now)),
+                if walk_due.is_some() => {}
             changed = selected.changed(), if selected_open => {
                 if changed.is_ok() {
                     lock(&task.shared).state.selected_changed();

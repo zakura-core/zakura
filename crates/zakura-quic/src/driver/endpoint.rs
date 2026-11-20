@@ -498,6 +498,7 @@ impl<F: SocketFactory> EndpointTask<F> {
         self.response_buf.clear();
         match decision {
             Admit::Accept => {
+                let admitted_at = zakura_rt::time::Instant::now();
                 // ADM-12: a live slot. Closed connections draining hold their
                 // own allowance, so they don't count here (ADM-13).
                 let Some(slot) = self.shared.connections.claim_inbound() else {
@@ -535,6 +536,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                             "quic.inbound_handshake",
                             inbound_handshake(
                                 connecting,
+                                admitted_at,
                                 info.validated,
                                 self.shared.config.handshake_timeout(),
                                 pending,

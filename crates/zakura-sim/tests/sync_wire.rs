@@ -27,17 +27,18 @@ use zakura_sim::{
         connection::{CONNECTION_SHARES_BOUND, CREDIT_ISOLATED, SEND_ISOLATED},
         session::{REPLACEMENT_PRESERVES_AUTHORIZATION, STALLED_SERVICE_ISOLATED},
     },
+    explore::generate::ReachSearch,
     harness::{
         block_node::policy::Trigger,
         run_prepared,
         sync::{SyncAction, SyncPorts, SyncStep},
-        sync_wire::{SavedWire, SyncWire, CURATED, STALL_GROWTH, STALL_MS},
+        sync_wire::{SavedWire, SyncWire, COMBINED_TAG, CURATED, STALL_GROWTH, STALL_MS},
         HarnessError, Subsystem,
     },
     observe::{BlockSyncFact, StorageFact, StorageRequest, TransportFact},
-    seed::{self, SeedSet},
     witness::{witness_prepared, Expect},
-    MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    Category, Identity, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput,
+    PropertyOutcome, RunReport, Steer,
 };
 
 /// Runs `saved` under `input`, and returns the report with its records and
@@ -648,10 +649,100 @@ fn curated_combined_actions_sync_both_tips() {
     }
 }
 
-/// zakura#2378's known failure: the fork while storage holds a submission,
-/// with every read stalled, under a Plan that a steered run recorded so that
-/// a block request's writer runs last while its frame write is under way.
-const RESET_MID_WRITE: &str = "sync-wire-reset-mid-write";
+/// How many runs [`a_mid_write_reset_keeps_an_honest_connection`]'s
+/// search may take to reset a block request mid-write. Searches from seeds
+/// 0 to 5 took 30, 24, 9, 1, 6 and 6 runs when this was set, at about 4 s a
+/// run, so 150 leaves a margin of five times the slowest.
+const MID_WRITE_RESET_RUNS: u64 = 150;
+
+/// The longest Plan the search draws: long enough that most drawn Plans
+/// outlast their run, since an exhausted Plan picks the same way each
+/// time.
+const MID_WRITE_PLAN_BYTES: usize = 400_000;
+
+/// fuzz-13's combined actions `FB 14`: the fork while storage holds a
+/// submission, with every mirror's range reads stalled. The fork's tip
+/// reset then retires block requests while the stall keeps them
+/// outstanding.
+const FORK_AT_SUBMISSION_STALLED: [u8; 2] = [COMBINED_TAG, 0b0001_0100];
+
+/// A steer that picks each block request's writer last among the ready
+/// actions while its frame write is under way, as a slow thread would.
+/// Otherwise it lets the Plan pick. Random Plans alone rarely leave a
+/// request mid-write when the fork's reset lands.
+///
+/// A writer is the task whose step logged the request's `started` step, and
+/// its write is under way until the request's next step. Among the other
+/// ready actions, the steer takes the first that sorts after its previous
+/// pick, wrapping to the start.
+#[derive(Default)]
+struct WriterLast {
+    /// How many log entries the steer has read.
+    read: usize,
+    /// Each block request, as `(session, request)`, that started at the step
+    /// being read and has no writer yet.
+    started: Vec<(u64, u64)>,
+    /// Each block request whose write is under way, and its writer's name.
+    writing: BTreeMap<(u64, u64), String>,
+    /// The steer's previous pick.
+    last: Option<Identity>,
+}
+
+impl WriterLast {
+    /// The steer for any input: it reads only the run's log.
+    fn for_input(_: &[u8]) -> Box<dyn Steer> {
+        Box::new(WriterLast::default())
+    }
+
+    /// Reads the log entries after the ones already read.
+    fn catch_up(&mut self, log: &ObservationLog) {
+        for entry in &log.entries()[self.read..] {
+            if let Some(task) = entry.obs.ran_task() {
+                for request in self.started.drain(..) {
+                    self.writing.insert(request, task.to_owned());
+                }
+            }
+            if let Observation::BlockSync {
+                event: BlockSyncFact::Request { owner, step, .. },
+                ..
+            } = &entry.obs
+            {
+                let request = (owner.session_id, owner.request_id);
+                if step == "started" {
+                    self.started.push(request);
+                } else {
+                    self.writing.remove(&request);
+                }
+            }
+        }
+        self.read = log.entries().len();
+    }
+}
+
+impl Steer for WriterLast {
+    /// The first ready action after the previous pick that isn't a writer
+    /// mid-write, if any writer is mid-write and ready.
+    fn pick(&mut self, options: &[Identity], log: &ObservationLog) -> Option<usize> {
+        self.catch_up(log);
+        let writing = |option: &Identity| {
+            option.category == Category::Task && self.writing.values().any(|w| *w == option.key)
+        };
+        if !options.iter().any(writing) {
+            return None;
+        }
+        let rest: Vec<usize> = (0..options.len())
+            .filter(|&index| !writing(&options[index]))
+            .collect();
+        let after_last = |&&index: &&usize| {
+            self.last.as_ref().is_none_or(|last| {
+                (options[index].category, &options[index].key) > (last.category, &last.key)
+            })
+        };
+        let index = *rest.iter().find(after_last).or(rest.first())?;
+        self.last = Some(options[index].clone());
+        Some(index)
+    }
+}
 
 /// The steps at which a reset retired a block request whose frame write
 /// had started and not finished.
@@ -677,54 +768,43 @@ fn mid_write_resets(log: &ObservationLog) -> Vec<u64> {
     resets
 }
 
-/// zakura#2378's known failure: a reset that retires a block request mid-write
-/// cancels the whole block-sync session, and the writer fence closes the
+/// A run that reset a block request mid-write: its end, and
+/// [`STALLED_SERVICE_ISOLATED`]'s outcome.
+fn mid_write_reset(report: &RunReport) -> Option<(String, PropertyOutcome)> {
+    if mid_write_resets(&report.log).is_empty() {
+        return None;
+    }
+    Some((
+        format!("{:?}", report.end),
+        outcome(report, STALLED_SERVICE_ISOLATED).clone(),
+    ))
+}
+
+/// zakura#2378: a reset that retires a block request mid-write once
+/// cancelled the whole block-sync session, and the writer fence closed the
 /// honest connection with `unfinished_exchange` while the session's other
-/// requests wait, which [`STALLED_SERVICE_ISOLATED`] forbids.
+/// requests waited, which [`STALLED_SERVICE_ISOLATED`] forbids. The fence
+/// now holds the session's token, so the reset ends only the session, and
+/// the connection stays open.
 ///
-/// [`RESET_MID_WRITE`] must validate as a known-failure seed of `sync/wire`
-/// whose only witness expects that violation. Its run must reset a request
-/// mid-write and then end in exactly that violation. The test fails with
-/// "fixed: remove this expectation (zakura#2378)" once the reset no longer
-/// closes the connection, and asks for a new seed if the schedule stops
-/// reaching the mid-write reset at all.
+/// A search over Plans for [`FORK_AT_SUBMISSION_STALLED`], under
+/// [`WriterLast`], finds a run that resets a request mid-write, and in that
+/// run the property holds.
 #[test]
-fn a_mid_write_reset_closes_an_honest_connection_until_zakura_2378_is_fixed() {
-    let report = seed::load(SeedSet::KnownFailure, Some(SyncWire::NAME));
-    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-    let seed = report
-        .admitted
-        .iter()
-        .find(|seed| seed.name == RESET_MID_WRITE)
-        .expect("the seed is a known failure");
-    let witnesses: Vec<(&str, &str)> = seed
-        .witness
-        .iter()
-        .map(|witness| (witness.property.as_str(), witness.expect.as_str()))
-        .collect();
-    assert_eq!(witnesses, [(STALLED_SERVICE_ISOLATED, "violated")]);
-    let (prefix, plan) = seed.input().split_at(SyncWire::SCENARIO_BYTES);
-    let (report, _, _) =
-        run_scenario_judged_by_caller(&SyncWire::draw(prefix), Plan::from_fuzz(plan));
+fn a_mid_write_reset_keeps_an_honest_connection() {
+    let search = ReachSearch {
+        prefix: FORK_AT_SUBMISSION_STALLED.to_vec(),
+        max_bytes: MID_WRITE_PLAN_BYTES,
+        steer: Some(WriterLast::for_input),
+        ..ReachSearch::new(support::REACH_SEED, MID_WRITE_RESET_RUNS)
+    };
+    let reached = support::reaches_with(SyncWire::NAME, &search, mid_write_reset);
+    let (end, outcome) = reached.found;
     assert!(
-        !mid_write_resets(&report.log).is_empty(),
-        "{RESET_MID_WRITE} no longer resets a block request mid-write, so it no longer \
-         reaches zakura#2378: build a new seed: {:?}",
-        report.end
-    );
-    let violation = report.end.violation.as_ref().unwrap_or_else(|| {
-        panic!(
-            "{RESET_MID_WRITE} no longer violates {STALLED_SERVICE_ISOLATED}, so zakura#2378 \
-             is fixed: remove this expectation (zakura#2378): {:?}",
-            report.end
-        )
-    });
-    assert!(
-        violation.property == STALLED_SERVICE_ISOLATED
-            && violation.actual.contains("with cause unfinished_exchange"),
-        "{RESET_MID_WRITE} should violate {STALLED_SERVICE_ISOLATED} with an \
-         unfinished_exchange close until zakura#2378 is fixed, and violated another: \
-         {violation:?}"
+        matches!(outcome, PropertyOutcome::Held { applicable } if applicable > 0),
+        "run {} reset a block request mid-write, and {STALLED_SERVICE_ISOLATED} is \
+         {outcome:?}: {end}",
+        reached.run
     );
 }
 

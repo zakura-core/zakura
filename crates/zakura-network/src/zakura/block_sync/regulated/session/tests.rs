@@ -603,7 +603,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
         assert!(
             matches!(
                 session.admit(Range::new(Height(start), count).unwrap()),
-                Err(SinkReject::Protocol(_))
+                Err(SinkReject::Protocol(..))
             ),
             "{count} heights from {start} overlap a live range"
         );

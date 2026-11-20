@@ -40,8 +40,8 @@ use zakura_network::{
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStartup,
-        CloseCauseReader, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
-        ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        CloseCauseReader, CloseOutcome, CloseRow, FramedRecv, FramedSend, Peer, Service,
+        ServicePeerDirection, ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
@@ -1103,7 +1103,15 @@ fn an_unsolicited_ending_closes_the_connection_with_its_cause() {
     let (connection, cause) = net.connections[0].clone();
     net.run_until(|_| connection.is_cancelled());
     assert!(connection.is_cancelled(), "{:?}", net.steps);
-    assert_eq!(cause.get(), Some("service_protocol_reject"));
+    // An ending for no outstanding request breaks `bsync-close-12`.
+    assert_eq!(
+        cause.get(),
+        Some(CloseOutcome::fault(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+            CloseRow::BSYNC_CLOSE_12,
+        ))
+    );
     assert_eq!(net.finish(), ["completed"]);
 }
 

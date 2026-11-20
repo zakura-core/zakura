@@ -32,7 +32,7 @@ use zakura_sim::{
         header_sync::{HeaderWire, WirePorts, WireScenario},
         run_prepared, HarnessError, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{
         PeerCredit, StorageFact, StorageRequest, TransitionFact, TransportFact, TransportLimits,
     },
@@ -331,7 +331,7 @@ fn honest_runs_never_close() {
                 Observation::Transport {
                     event: TransportFact::CloseDecided { cause: Some(cause) },
                     ..
-                } => assert!(!is_fault_cause(cause), "a fault close: {cause}"),
+                } => assert!(!cause.is_fault(), "a fault close: {cause}"),
                 _ => {}
             }
         }

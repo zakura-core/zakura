@@ -137,17 +137,20 @@ pub(crate) type PageFixed = (LeU64, BlockHash, HeightLe, BlockHash, LeU32, (Bool
 /// `HeadersOutcome`: the subscription ID, initial target, and outcome code.
 pub(crate) type OutcomePayload = (LeU64, BlockHash, U8);
 
+/// The `Status` row's cadence: sent at most once a second.
+pub(crate) const STATUS_CADENCE: Cadence = Cadence {
+    capacity: 602,
+    refill_interval: Duration::from_millis(500),
+    send_interval: Duration::from_secs(1),
+};
+
 /// Each side's frontier and serving caps, sent at most once a second.
 const STATUS: MessageRule = MessageRule {
     name: "status",
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
-        cadence: Cadence {
-            capacity: 602,
-            refill_interval: Duration::from_millis(500),
-            send_interval: Duration::from_secs(1),
-        },
+        cadence: STATUS_CADENCE,
     },
 };
 

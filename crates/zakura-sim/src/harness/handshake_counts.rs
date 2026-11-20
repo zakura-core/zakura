@@ -44,7 +44,7 @@ const MACHINE: Machine = Machine {
     rules: &[
         (
             CADENCE,
-            "Failed attempts consume only initial, refilled, and refunded tokens.",
+            "TLS attempts consume only initial, refilled, and refunded tokens.",
             Status::Active,
         ),
         (
@@ -239,6 +239,9 @@ fn operations(input: &[u8]) -> Vec<u8> {
         1 => {
             for slot in 0..26 {
                 let host = slot % 4 + (slot / 12) * 8;
+                // Eight addresses would reach the node's reserve, which
+                // admits one attempt per address.
+                operations.extend([7, NODE_REFILL_MS, 0]);
                 operations.extend([0, slot, host, 2, slot, 0]);
             }
             for slot in 26..34 {
@@ -248,6 +251,7 @@ fn operations(input: &[u8]) -> Vec<u8> {
         _ => {
             for slot in 0..70u8 {
                 let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+                operations.extend([7, NODE_REFILL_MS, 0]);
                 operations.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
             }
             for slot in 70..94 {
@@ -259,6 +263,12 @@ fn operations(input: &[u8]) -> Vec<u8> {
     operations.extend(input.iter().skip(3).take(1536 - operations.len()));
     operations
 }
+
+/// Milliseconds that refill the node's cadence by at least one token: it
+/// refills 24 tokens a second. A burst that waits this long before each
+/// attempt is never refused for the node's rate, so it reaches the
+/// connection caps.
+const NODE_REFILL_MS: u8 = 42;
 
 /// The cadence refills one token per sixteenth of a second: sixteen nodes
 /// share an address, and each retries once a second.
@@ -284,13 +294,14 @@ impl CadenceLog {
         ip: IpAddr,
         failures: &mut Vec<(String, MachineFailure)>,
     ) -> bool {
-        let admitted = counts.admit_cadence(
+        let admission = counts.admit_cadence(
             ip,
             false,
             ADDRESS_CAP,
             CONNECTION_CAP + PENDING_CAP,
             self.now(),
-        ) == HandshakeCadenceAdmission::Admit;
+        );
+        let admitted = admission == HandshakeCadenceAdmission::Admit;
         if admitted && !self.windows[host].charge(self.now_ns) {
             failure(
                 failures,
@@ -298,7 +309,12 @@ impl CadenceLog {
                 "an address started more TLS attempts than its cadence pays for",
             );
         }
-        if !admitted && !self.windows[host].refusal_earned(self.now_ns) {
+        // The node's bucket bounds every address together, so only an
+        // address refusal must be earned by that address's charges.
+        if !admitted
+            && admission != HandshakeCadenceAdmission::NodeExhausted
+            && !self.windows[host].refusal_earned(self.now_ns)
+        {
             failure(failures, CONFORMANT, "an address with a token was refused");
         }
         admitted
@@ -424,9 +440,6 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 let registered = counts.can_register(owner.ip, ADDRESS_CAP, false);
                 release_handshake(&mut counts, owner);
                 if registered {
-                    if owner.inbound {
-                        cadence.refund(&mut counts, owner.host, owner.ip);
-                    }
                     counts.add_registered(owner.ip);
                     owner.phase = Phase::Registered;
                     owners[slot] = Some(owner);
@@ -585,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn registrations_and_transport_retries_refund_their_attempts() {
+    fn transport_retries_refund_their_attempts_and_registrations_keep_theirs() {
         let mut input = Vec::new();
         for _ in 0..40 {
             input.extend([0, 0, 0, 9, 0, 0]);
@@ -619,6 +632,7 @@ mod tests {
         let mut input = Vec::new();
         for slot in 0..70u8 {
             let host = if slot % 8 < 4 { slot % 8 } else { slot % 8 + 4 };
+            input.extend([7, NODE_REFILL_MS, 0]);
             input.extend([0, slot, host, 2, slot, 0, 3, slot, 0]);
         }
         for slot in 70..94u8 {

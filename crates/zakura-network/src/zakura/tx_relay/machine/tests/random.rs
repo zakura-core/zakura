@@ -33,7 +33,7 @@ use zakura_node_services::mempool::port::{
 use super::{body, script_len, Bench, SIZE};
 use crate::zakura::tx_relay::machine::{
     peer::Hello, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, WaiterId,
-    ADVERT_DELAY, MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
+    ADVERT_DELAY, MAX_SERVES, MAX_TX_BYTES,
 };
 
 /// The ids a run's peers announce.
@@ -353,7 +353,7 @@ impl Run {
             Some(session) => session,
             None => return self.tick(),
         };
-        let serves = MAX_REQUESTS_PER_PEER + self.rng.below(3);
+        let serves = 1 + self.rng.below(MAX_SERVES);
         self.note(|_| format!("{} sends a Hello", session.0));
         let max_tx_bytes = MAX_TX_BYTES;
         self.bench.hello(

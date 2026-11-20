@@ -87,7 +87,7 @@
 //! | A crossed grant fits consumed credit plus the window, in each unit, and still counts | `a_crossed_grant_is_held_by_the_ended_window` |
 //! | An idle subscription holds no execution and needs no outcome | `an_idle_subscription_holds_nothing_and_needs_no_outcome` |
 //! | Closure needs no credit and no execution | `close_needs_no_credit_and_no_execution` |
-//! | Retiring a session with a live subscription closes the connection | `retirement_with_a_live_subscription_closes_the_connection` |
+//! | Retiring a session with a live subscription resets the session | `retirement_with_a_live_subscription_resets_the_session` |
 //! | Pages a reader queues never exceed the unspent credit | `queued_pages_never_exceed_the_unspent_credit` |
 
 mod credit;
@@ -98,6 +98,8 @@ mod subscriber;
 mod tests;
 
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 
 pub(crate) use credit::{within_window, CreditExceeded, ResponseCredit, Totals};
 #[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
@@ -203,6 +205,22 @@ pub(crate) enum SubscriptionFault {
 }
 
 impl SubscriptionFault {
+    /// The regulation close-spec row this fault breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Unknown => CloseRow::REG_CLOSE_10,
+            Self::OverCredit => CloseRow::REG_CLOSE_11,
+            Self::Sequence { .. } => CloseRow::REG_CLOSE_12,
+            Self::UnknownAcknowledgement => CloseRow::REG_CLOSE_13,
+            Self::EmptyCredit => CloseRow::REG_CLOSE_14,
+            Self::AboveWindow => CloseRow::REG_CLOSE_15,
+            Self::CrossedAboveWindow => CloseRow::REG_CLOSE_16,
+            Self::AfterClose => CloseRow::REG_CLOSE_17,
+            Self::ReusedKey => CloseRow::REG_CLOSE_18,
+            Self::NoSlot { .. } => CloseRow::REG_CLOSE_19,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {

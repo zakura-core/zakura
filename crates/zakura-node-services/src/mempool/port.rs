@@ -81,7 +81,9 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// The wait is flat. It does not stop while a parent is being verified, and
 /// waking the transaction or checking it again does not restart it. When it
 /// ends, a parked transaction is rejected, and one whose inputs keep
-/// arriving during its checks gets one more check and no more.
+/// arriving during its checks gets one more check and no more. A parent
+/// that enters the pool runs a waiting transaction again at once only a few
+/// times per tip, and after that at most every few seconds.
 pub const T_PARK: Duration = Duration::from_secs(60);
 
 /// Commands that can wait for the core. A full queue makes
@@ -110,6 +112,8 @@ pub struct Reservation {
     release: Option<mpsc::UnboundedSender<ReservationId>>,
     /// Cancelled when the core no longer needs this reservation's body.
     cancel: CancellationToken,
+    /// When the core ends the admission. See [`Self::give_up_at`].
+    give_up: Option<Instant>,
 }
 
 impl Reservation {
@@ -126,7 +130,25 @@ impl Reservation {
             tx_id,
             release: Some(release),
             cancel,
+            give_up: None,
         }
+    }
+
+    /// Has the core end this reservation's admission at `at`, as a
+    /// [`LocalFault::VerifyTimeout`], if it is still undecided then. A caller
+    /// that frees its own per-peer state at a deadline sets it here, so the
+    /// transaction is not still undecided in the core after the caller has
+    /// let go of it. Without one, the admission ends only at the core's own
+    /// limits, [`T_VERIFY`] and [`T_PARK`].
+    pub fn give_up_at(mut self, at: Instant) -> Self {
+        self.give_up = Some(at);
+        self
+    }
+
+    /// When the core ends this reservation's admission, if its caller set a
+    /// time. See [`Self::give_up_at`].
+    pub fn give_up(&self) -> Option<Instant> {
+        self.give_up
     }
 
     /// Cancelled when the core no longer needs the body this reservation
@@ -256,7 +278,8 @@ pub struct Rejection {
 /// nothing is cached. The caller can submit again.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum LocalFault {
-    /// The verification did not finish before its deadline.
+    /// The verification did not finish before its deadline, or its
+    /// submitter's deadline passed. See [`Reservation::give_up_at`].
     VerifyTimeout,
     /// The verification job panicked.
     VerifyPanicked,
@@ -473,37 +496,127 @@ pub struct PoolSnapshot {
     pub tip: ChainTip,
     /// The newest change this snapshot includes.
     pub last_change: ChangeSeq,
-    /// The transactions, in mining order.
-    pub transactions: Vec<VerifiedUnminedTx>,
-    /// The dependencies between them.
+    /// The dependencies between the transactions.
     pub dependencies: TransactionDependencies,
-    by_mined_id: HashMap<transaction::Hash, usize>,
+    /// Mined ids, in mining order.
+    order: Vec<transaction::Hash>,
+    /// Bodies are shared, so a later snapshot copies only these pointers.
+    by_mined_id: HashMap<transaction::Hash, Arc<VerifiedUnminedTx>>,
     spent: HashSet<transparent::OutPoint>,
 }
 
 impl PoolSnapshot {
-    /// Build a snapshot and its lookup indexes.
+    /// Build a snapshot of `transactions`, given in mining order, and its
+    /// lookup indexes.
     pub fn new(
         tip: ChainTip,
         last_change: ChangeSeq,
         transactions: Vec<VerifiedUnminedTx>,
         dependencies: TransactionDependencies,
     ) -> Self {
-        let mut by_mined_id = HashMap::new();
-        let mut spent = HashSet::new();
-        for (index, tx) in transactions.iter().enumerate() {
-            by_mined_id.insert(tx.transaction.id().mined_id(), index);
-            spent.extend(tx.transaction.transaction().spent_outpoints());
-        }
-        Self {
+        let mut snapshot = Self {
             active: true,
             tip,
             last_change,
-            transactions,
             dependencies,
-            by_mined_id,
-            spent,
+            order: Vec::with_capacity(transactions.len()),
+            by_mined_id: HashMap::with_capacity(transactions.len()),
+            spent: HashSet::new(),
+        };
+        for tx in transactions {
+            snapshot.order.push(tx.transaction.id().mined_id());
+            snapshot.insert(Arc::new(tx));
         }
+        snapshot
+    }
+
+    /// The snapshot after `changes`, built from `self`, the one before them.
+    ///
+    /// Only the transactions `changes` add or remove are touched, and the
+    /// rest keep their bodies, so this copies `self`'s indexes but no
+    /// transaction. `pooled` looks up a transaction the pool now holds, and
+    /// `order` is every pooled mined id in mining order.
+    ///
+    /// # Panics
+    ///
+    /// If `pooled` lacks a transaction that `changes` add and don't remove
+    /// again.
+    pub fn after<'a>(
+        &self,
+        tip: ChainTip,
+        last_change: ChangeSeq,
+        changes: &[Change],
+        pooled: impl Fn(&transaction::Hash) -> Option<&'a VerifiedUnminedTx>,
+        order: Vec<transaction::Hash>,
+        dependencies: TransactionDependencies,
+    ) -> Self {
+        // Only where a transaction ends up counts: one step can add and
+        // remove the same one.
+        let mut pooled_now: HashMap<transaction::Hash, bool> = HashMap::new();
+        for change in changes {
+            match change {
+                Change::Added(id) => pooled_now.insert(id.mined_id(), true),
+                Change::Removed { id, .. } => pooled_now.insert(id.mined_id(), false),
+                Change::Refused(_) => None,
+            };
+        }
+        let mut next = Self {
+            active: true,
+            tip,
+            last_change,
+            dependencies,
+            order,
+            by_mined_id: self.by_mined_id.clone(),
+            spent: self.spent.clone(),
+        };
+        // Every old entry goes before any new one: a transaction that
+        // leaves can share an outpoint with one that arrives in its place.
+        for id in pooled_now.keys() {
+            if let Some(old) = next.by_mined_id.remove(id) {
+                for outpoint in old.transaction.transaction().spent_outpoints() {
+                    next.spent.remove(&outpoint);
+                }
+            }
+        }
+        for (id, now_pooled) in pooled_now {
+            if now_pooled {
+                let tx = pooled(&id).expect("a transaction the log added and kept is pooled");
+                next.insert(Arc::new(tx.clone()));
+            }
+        }
+        debug_assert_eq!(
+            next.order.len(),
+            next.by_mined_id.len(),
+            "the mining order names every pooled transaction once"
+        );
+        next
+    }
+
+    /// Indexes `tx`, but doesn't place it in the mining order.
+    fn insert(&mut self, tx: Arc<VerifiedUnminedTx>) {
+        self.spent
+            .extend(tx.transaction.transaction().spent_outpoints());
+        self.by_mined_id.insert(tx.transaction.id().mined_id(), tx);
+    }
+
+    /// The transactions, in mining order.
+    pub fn transactions(&self) -> impl ExactSizeIterator<Item = &VerifiedUnminedTx> + '_ {
+        self.order.iter().map(|id| {
+            &**self
+                .by_mined_id
+                .get(id)
+                .expect("the mining order names only pooled transactions")
+        })
+    }
+
+    /// How many transactions the pool holds.
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Whether the pool holds no transaction.
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
     }
 
     /// The snapshot of a pool that is off. The core publishes one when it
@@ -523,9 +636,7 @@ impl PoolSnapshot {
 
     /// The pooled transaction with this mined id.
     pub fn transaction(&self, id: &transaction::Hash) -> Option<&VerifiedUnminedTx> {
-        self.by_mined_id
-            .get(id)
-            .and_then(|index| self.transactions.get(*index))
+        self.by_mined_id.get(id).map(|tx| &**tx)
     }
 
     /// The output a pooled transaction creates at `outpoint`.
@@ -569,6 +680,13 @@ pub enum PoolCommand {
     /// A reservation was dropped before the core accepted it. No caller
     /// sends this. [`PoolInbox::next`] yields it.
     Released(ReservationId),
+    /// [`PoolHandle::known_ids`].
+    KnownIds {
+        /// The ids to check.
+        ids: HashSet<UnminedTxId>,
+        /// The ids the core already knows.
+        reply: oneshot::Sender<HashSet<UnminedTxId>>,
+    },
     /// [`PoolHandle::rejected_ids`].
     RejectedIds {
         /// The ids to check.
@@ -829,6 +947,28 @@ impl PoolHandle {
         .await
     }
 
+    /// The members of `ids` that [`Self::reserve`] would refuse without
+    /// taking a slot: pooled, undecided, waiting to be verified again after a
+    /// reset, or covered by a cached rejection. A caller that shares out
+    /// slots of its own asks this first, so an id someone else is bringing
+    /// in costs none of them. Waits until `deadline`, and is empty when the
+    /// core has stopped. See [`PoolHandle`].
+    pub async fn known_ids(
+        &self,
+        ids: HashSet<UnminedTxId>,
+        deadline: Instant,
+    ) -> Result<HashSet<UnminedTxId>, Elapsed> {
+        by(deadline, async {
+            let (reply, answer) = oneshot::channel();
+            let command = PoolCommand::KnownIds { ids, reply };
+            if self.commands.send(command).await.is_err() {
+                return HashSet::new();
+            }
+            answer.await.unwrap_or_default()
+        })
+        .await
+    }
+
     /// The latest snapshot, or `None` until the core has attached and
     /// published one.
     pub fn snapshot(&self) -> Option<Arc<PoolSnapshot>> {
@@ -861,6 +1001,11 @@ impl PoolHandle {
 }
 
 impl PoolInbox {
+    /// The snapshot last published, or `None` before the first.
+    pub fn published(&self) -> Option<Arc<PoolSnapshot>> {
+        self.snapshot.borrow().clone()
+    }
+
     /// The next thing a caller did, or `None` once every handle is gone.
     ///
     /// A dropped reservation arrives as [`PoolCommand::Released`] and wakes

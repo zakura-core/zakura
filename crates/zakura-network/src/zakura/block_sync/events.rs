@@ -4,6 +4,13 @@ use super::{request::*, *};
 use std::num::NonZeroU64;
 use zakura_node_services::block_memory::BlockHandle;
 
+/// The authenticated connection that supplied a retained block body.
+#[derive(Clone, Debug)]
+pub(super) struct BlockSupplier {
+    pub(super) peer: ZakuraPeerId,
+    pub(super) conn_id: crate::zakura::ZakuraConnId,
+}
+
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncBlockMeta {
@@ -286,6 +293,8 @@ pub enum BlockSyncAction {
     Misbehavior {
         /// Misbehaving peer.
         peer: ZakuraPeerId,
+        /// Registration that supplied the body, if this is a delayed verifier verdict.
+        conn_id: Option<crate::zakura::ZakuraConnId>,
         /// Reason for reporting.
         reason: BlockSyncMisbehavior,
     },

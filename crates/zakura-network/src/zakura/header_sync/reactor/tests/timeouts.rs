@@ -2075,7 +2075,10 @@ async fn a_full_repair_timeout_still_excludes_the_supplier() {
     time::advance(fixture.reactor.startup.request_timeout).await;
     fixture.reactor.retire_timed_out_requests(Instant::now());
 
-    assert_eq!(fixture.reactor.state.peers[peer].unproductive_requests, 1);
+    assert!(
+        !fixture.reactor.sessions.contains_key(peer),
+        "one full timeout is a stall, which drops the supplier"
+    );
     let task = fixture
         .reactor
         .state

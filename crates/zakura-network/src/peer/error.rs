@@ -11,10 +11,10 @@ use crate::{
     zakura::{ZakuraProtocolError, ZakuraUpgradeError},
 };
 
-/// The answer to a [`BlockByHashHedge`](crate::Request::BlockByHashHedge) request when no
-/// other peer that announced the block is expected to deliver it clearly sooner than the first
-/// request, and the first request has not stalled. No peer was contacted, so the caller can ask
-/// again later.
+/// The answer to a [`BlockByHashHedge`](crate::Request::BlockByHashHedge) request whose window
+/// closed without a second request: until then, no other peer that announced the block was
+/// expected to deliver it clearly sooner than the first request, and the first request had not
+/// stalled. No peer was contacted.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("no peer is expected to deliver the block sooner than the first request")]
 pub struct NoFasterBlockSource;

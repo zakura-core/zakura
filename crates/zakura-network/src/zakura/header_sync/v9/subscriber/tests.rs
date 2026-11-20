@@ -24,7 +24,7 @@ use crate::zakura::{
     },
     regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    CloseCause, Credit, Frame, FrameRejection, MessageRole,
+    Credit, Frame, FrameRejection, MessageRole,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -84,7 +84,7 @@ const PAGE_HEADERS: u32 = 3;
 
 /// A subscriber on an in-process session whose fence closes `connection`.
 fn fenced(connection: &CancellationToken) -> Sub {
-    let fence = WriterFence::new(connection.clone(), CloseCause::default());
+    let fence = WriterFence::new(connection.clone());
     Sub::new(HB, fence, &framed_channel(1).1)
 }
 
@@ -451,7 +451,7 @@ fn the_frame_header_check_runs_before_decode() {
     let slot = PrecheckSlot::default();
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(HB, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
     let len = frame.payload.len();
@@ -500,7 +500,7 @@ fn the_largest_credit_fits_the_receive_budget() {
     let slot = PrecheckSlot::default();
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(MAINNET, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
     let tip = Frontier::new(block::Height(1_000_000), block::Hash([1; 32]));
@@ -757,6 +757,47 @@ fn unlinked_headers_fault() {
         Err(SubscriberFault::Linkage),
         "a push after the target must extend the cursor"
     );
+}
+
+/// hsync-8: a page above its credit faults before the loop hashes any header.
+/// The page below is unlinked from its first header, which the loop checks
+/// before it hashes that header. So `OverCredit` instead of `Linkage` shows
+/// that the page cost zero header hashes. The refusal spends no credit.
+#[test]
+fn a_page_above_its_credit_faults_before_any_header_hash() {
+    let (mut tree, chain) = chain(8);
+    let fork = tree.extend(chain[1], 2);
+    let locators = [chain[5], chain[0]];
+    let mut fixture = Fixture::open(tree, chain[7], &locators, 1);
+    let frame = page_frame(
+        &fixture.tree,
+        fixture.id,
+        chain[7].hash,
+        chain[5],
+        &fork,
+        false,
+        AuxSchema::None,
+    );
+    let (page, len) = decode_page(&frame);
+    assert_eq!(
+        fixture.sub.receive_page(&page, len),
+        Err(SubscriptionFault::OverCredit.into())
+    );
+
+    let frame = page_frame(
+        &fixture.tree,
+        fixture.id,
+        chain[7].hash,
+        chain[5],
+        &chain[6..7],
+        false,
+        AuxSchema::None,
+    );
+    let (page, len) = decode_page(&frame);
+    fixture
+        .sub
+        .receive_page(&page, len)
+        .expect("the refused page spent none of the one-header credit");
 }
 
 /// A path that reaches the target's height without the target never reaches
@@ -1402,7 +1443,7 @@ fn an_open_holds_its_exchange_until_the_outcome() {
         "the peer may answer a written Open"
     );
 
-    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let fence = WriterFence::new(CancellationToken::new());
     let mut sub = Sub::new(HB, fence.clone(), &framed_channel(1).1);
     assert!(fence.retire());
     assert_eq!(

@@ -38,16 +38,18 @@ impl PeerState {
         }
     }
 
-    /// Check block liveness at `now`. A deadline that falls during brief
-    /// outbound write congestion gets one bounded delay per no-progress
-    /// episode; see [`liveness_grace_allowed`].
+    /// Check block liveness at `now`, while the peer's authorizations owe
+    /// `authorized` body bytes. A deadline that falls during brief outbound
+    /// write congestion gets one bounded delay per no-progress episode; see
+    /// [`liveness_grace_allowed`].
     pub(in super::super) fn check_block_liveness(
         &mut self,
         now: Instant,
+        authorized: u64,
         outbound_full: bool,
         request_timeout: Duration,
     ) -> LivenessDecision {
-        match self.window.check_liveness(now) {
+        match self.window.check_liveness_owing(now, authorized) {
             LivenessOutcome::Ok => LivenessDecision::Continue,
             LivenessOutcome::Disarm => {
                 self.window.clear_liveness_if_idle();
@@ -69,7 +71,7 @@ impl PeerState {
                 // extension: a peer that stopped reading holds outbound full past
                 // `request_timeout`, falls through to the park arm, and is parked at the
                 // liveness deadline — it cannot dodge the timer.
-                self.window.extend_liveness_deadline(now, request_timeout);
+                self.window.extend_liveness_deadline(request_timeout);
                 LivenessDecision::Continue
             }
             LivenessOutcome::Park => LivenessDecision::Stall,
@@ -89,13 +91,14 @@ impl PeerState {
         &self,
         failure: OrderedStreamFailure,
     ) -> Option<&'static str> {
-        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
+        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline().is_none() {
             return None;
         }
         Some(match failure {
             OrderedStreamFailure::RemoteClose => {
                 "block-sync peer closed the stream with its requests unanswered"
             }
+            OrderedStreamFailure::ReadTimeout => "block-sync frame read stalled",
             OrderedStreamFailure::WriteTimeout => {
                 "block-sync stream write stalled with download requests unanswered"
             }

@@ -38,7 +38,7 @@ use super::{
     machine::{
         peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
         PeerMachine, PoolView, RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved,
-        Verdict, Violation, WaiterId, MAX_SERVES,
+        Verdict, Violation, WaiterId, MAX_SERVES, RANK_INTERVAL,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
@@ -54,8 +54,8 @@ use crate::{
         resume_task_panic,
         transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
-        Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
-        Stream, ZakuraConnId, ZakuraPeerId,
+        CloseOutcome, CloseRow, Frame, FrameGuard, FramedRecv, FramedSend, NeutralCause, Peer,
+        Service, SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId,
     },
 };
 
@@ -307,6 +307,7 @@ impl Service for TxRelayService {
             ownership.gap_until = None;
         }
         let peer_key = self.peer_key(&peer.id);
+        let rtt = peer.rtt_reader();
         let conn_cancel = peer.cancel_token();
         let session_cancel = peer.service_cancel_token();
         let close_cause = peer.close_cause();
@@ -329,6 +330,7 @@ impl Service for TxRelayService {
             peer.remote_ip,
             SessionIo::new(data, state, close, reports_rx, inv, connection),
             session_cancel,
+            rtt,
         );
         task::spawn_named("tx-relay-routine", routine.run(data_recv, state_recv));
     }
@@ -351,7 +353,7 @@ struct Closer {
 
 impl Closer {
     /// Records `reason`, if nothing came first, and closes the connection.
-    fn close(&self, reason: &'static str) {
+    fn close(&self, reason: CloseOutcome) {
         self.close_cause.record(reason);
         self.conn_cancel.cancel();
     }
@@ -589,8 +591,7 @@ impl PoolView for SnapshotView {
 
     fn ids(&self) -> Vec<UnminedTxId> {
         self.0
-            .transactions
-            .iter()
+            .transactions()
             .map(|tx| tx.transaction.id())
             .collect()
     }
@@ -637,6 +638,10 @@ struct Routine {
     io: SessionIo,
     /// The session's cancellation, which stops its writers too.
     cancel: CancellationToken,
+    /// Reads the connection's smoothed round-trip time, which the routine
+    /// reports to the ranking once a [`RANK_INTERVAL`], from `rtt_due` on.
+    rtt: Option<zakura_quic::RttReader>,
+    rtt_due: Instant,
     /// The pool as this routine last read it, and its place in the log, or
     /// `None` before the first snapshot.
     view: SnapshotView,
@@ -652,13 +657,15 @@ struct Routine {
 
 impl Routine {
     /// Opens a session of `peer` on `io`, sends our `Hello`, and returns its
-    /// routine, which reads the pool before its first step.
+    /// routine, which reads the pool before its first step and reports the
+    /// round-trip time `rtt` reads on its first tick.
     fn open(
         wiring: Wiring,
         peer: PeerKey,
         remote_ip: Option<IpAddr>,
         io: SessionIo,
         cancel: CancellationToken,
+        rtt: Option<zakura_quic::RttReader>,
     ) -> Self {
         let wake = Arc::new(Notify::new());
         let view = SnapshotView::empty();
@@ -700,6 +707,8 @@ impl Routine {
             wake,
             io,
             cancel,
+            rtt,
+            rtt_due: Instant::now(),
             view,
             cursor: None,
             pool_open: true,
@@ -819,7 +828,7 @@ impl Routine {
             wake.notify_one();
         }
         for (close, reason) in closes {
-            close.close(close_reason(reason));
+            close.close(close_outcome(reason));
         }
         for effect in effects {
             self.effect(effect);
@@ -836,9 +845,27 @@ impl Routine {
         }
     }
 
-    /// Time passed, or another step woke this one.
+    /// Time passed, or another step woke this one. A round-trip time due
+    /// for the ranking goes in this step.
     fn tick(&mut self) {
-        self.step(|machine, shared, pool, now| machine.tick(shared, pool, now));
+        match self.due_rtt() {
+            Some(rtt) => self.step(|machine, shared, pool, now| {
+                machine.observe_rtt(shared, pool, rtt, now);
+            }),
+            None => self.step(|machine, shared, pool, now| machine.tick(shared, pool, now)),
+        }
+    }
+
+    /// The connection's round-trip time, if a report is due, and when the
+    /// next one is. A connection with no sample yet reports nothing.
+    fn due_rtt(&mut self) -> Option<Duration> {
+        let reader = self.rtt.as_ref()?;
+        let now = Instant::now();
+        if now < self.rtt_due {
+            return None;
+        }
+        self.rtt_due = now + RANK_INTERVAL;
+        reader.rtt().filter(|rtt| !rtt.is_zero())
     }
 
     /// What this routine does after each input: sends announcements and
@@ -857,14 +884,18 @@ impl Routine {
     }
 
     /// When this routine next has something due: the machine's deadline,
-    /// which covers its next `Inv` try.
+    /// which covers its next `Inv` try, or its next round-trip time report.
     fn next_wake(&self) -> Instant {
         let far = Instant::now() + Duration::from_secs(3600);
         let machine = {
             let node = self.wiring.node.lock().expect("the node is never poisoned");
             self.machine.next_deadline(&node.shared)
         };
-        machine.map_or(far, |at| self.wiring.base + at)
+        let machine = machine.map_or(far, |at| self.wiring.base + at);
+        match self.rtt {
+            Some(_) => machine.min(self.rtt_due),
+            None => machine,
+        }
     }
 
     /// Handles one frame from the peer. Returns `false` for a frame that
@@ -876,8 +907,7 @@ impl Routine {
                 true
             }
             Err(_) => {
-                // Row 3 of the close table.
-                self.io.close.close("tx-relay: malformed frame");
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
                 false
             }
         }
@@ -1107,7 +1137,7 @@ impl Routine {
             }
             RelayEffect::Close { session, reason } => {
                 if session == self.machine.session() {
-                    self.io.close.close(close_reason(reason));
+                    self.io.close.close(close_outcome(reason));
                 }
             }
             // Ending the session leaves the connection, and its other
@@ -1421,7 +1451,7 @@ fn ended_result(
         wake.notify_one();
     }
     for (close, reason) in closes {
-        close.close(close_reason(reason));
+        close.close(close_outcome(reason));
     }
 }
 
@@ -1467,19 +1497,51 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
     }
 }
 
-/// The recorded cause for a close the machine asked for, as the close
+/// A fault of `row` on the `tx-relay` session, which its first stream
+/// names.
+fn fault(row: CloseRow) -> CloseOutcome {
+    let [primary, _] = TX_RELAY_STREAMS;
+    CloseOutcome::fault(primary.kind, primary.version, row)
+}
+
+/// The recorded outcome for a close the machine asked for, as the close
 /// table's row for it gives.
-fn close_reason(reason: CloseReason) -> &'static str {
+///
+/// A request past the `Hello`'s limit, or for an id already outstanding,
+/// depends on when this node's writer freed the earlier request's place,
+/// which no peer sees, so those closes stay neutral. So do the pool's
+/// verdicts on a body, which a conformant peer can relay.
+fn close_outcome(reason: CloseReason) -> CloseOutcome {
+    use NeutralCause::{LocalCancellation, ResourceRefusal, StallPolicy};
     match reason {
-        CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",
-        CloseReason::Violation(Violation::RequestedTwice) => "tx-relay: id requested twice",
-        CloseReason::Violation(Violation::TooManyRequests) => "tx-relay: too many requests",
-        CloseReason::Violation(_) => "tx-relay: protocol violation",
-        CloseReason::Ban => "tx-relay: banned transaction",
-        CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",
-        CloseReason::CooldownsFull => "tx-relay: cooldown table full",
-        CloseReason::Unresponsive => "tx-relay: unanswered request",
-        CloseReason::StoppedReading => "tx-relay: peer stopped reading",
+        CloseReason::Violation(violation) => match violation {
+            Violation::HelloTwice => fault(CloseRow::RELAY_CLOSE_4),
+            Violation::BadHello => fault(CloseRow::RELAY_CLOSE_5),
+            Violation::NoHelloFirst => fault(CloseRow::RELAY_CLOSE_6),
+            Violation::Unrequested => fault(CloseRow::RELAY_CLOSE_9),
+            Violation::WrongSize => fault(CloseRow::RELAY_CLOSE_10),
+            Violation::WrongId => fault(CloseRow::RELAY_CLOSE_11),
+            Violation::Undecodable => fault(CloseRow::RELAY_CLOSE_12),
+            Violation::RequestedTwice => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: id requested twice")
+            }
+            Violation::TooManyRequests => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: too many requests")
+            }
+        },
+        CloseReason::Ban => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: banned transaction")
+        }
+        CloseReason::RepeatedCooldown => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: repeated cooldown")
+        }
+        CloseReason::CooldownsFull => {
+            CloseOutcome::neutral(ResourceRefusal, "tx-relay: cooldown table full")
+        }
+        CloseReason::Unresponsive => CloseOutcome::stall_policy("tx-relay: unanswered request"),
+        CloseReason::StoppedReading => {
+            CloseOutcome::neutral(StallPolicy, "tx-relay: peer stopped reading")
+        }
     }
 }
 

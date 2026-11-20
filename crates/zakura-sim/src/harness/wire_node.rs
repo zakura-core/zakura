@@ -1331,13 +1331,7 @@ impl TransportTap {
                 remote,
                 conn_id,
                 cause,
-            } => (
-                conn_id,
-                remote,
-                TransportFact::CloseDecided {
-                    cause: cause.map(str::to_owned),
-                },
-            ),
+            } => (conn_id, remote, TransportFact::CloseDecided { cause }),
             TransportEvent::TornDown { conn_id } => (
                 Some(conn_id),
                 self.remote(conn_id)?,

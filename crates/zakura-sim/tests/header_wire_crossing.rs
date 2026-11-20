@@ -27,7 +27,7 @@ use zakura_sim::{
         wire_plans::{act_scenario, SavedPlan},
         HarnessError, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::StreamId,
     peer::adversary::{Act, Row},
     seed, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
@@ -188,7 +188,7 @@ fn judged_at(observations: &[Observation], frame: &Frame) -> usize {
 /// cause or a `Misbehavior`.
 fn punished(observation: &Observation) -> Option<u64> {
     match observation {
-        Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+        Observation::ConnectionClosed { connection, cause } if cause.is_fault() => {
             Some(*connection)
         }
         Observation::Misbehavior { connection } => Some(*connection),
@@ -269,6 +269,6 @@ fn an_over_window_crossing_grant_is_bad_cursor_and_closed() {
         })
         .unwrap_or_else(|| panic!("connection {} never closed", update.connection));
     assert!(closed > judged, "closed with {cause} before the judgment");
-    assert!(is_fault_cause(cause), "closed with {cause}");
+    assert!(cause.is_fault(), "closed with {cause}");
     held_applied(&report, BAD_CURSOR_CLOSES);
 }

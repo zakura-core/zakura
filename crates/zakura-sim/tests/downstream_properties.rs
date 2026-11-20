@@ -11,7 +11,9 @@ use support::{
     feed::FEED,
     script::{run_under, Node, OBSERVED},
 };
-use zakura_network::zakura::{testkit::regulation::TEST_FAMILY, Stream};
+use zakura_network::zakura::{
+    testkit::regulation::TEST_FAMILY, CloseOutcome, CloseRow, NeutralCause, Stream,
+};
 use zakura_sim::{
     model::Label,
     observe::{RowAt, StreamId},
@@ -19,6 +21,13 @@ use zakura_sim::{
     table::{downstream_properties, table_properties, Effect, GeneratedId, Template},
     HarnessFailure, Observation, Outcome, PropertyOutcome, RunReport,
 };
+
+/// A fault close.
+const FAULT: CloseOutcome =
+    CloseOutcome::fault(TEST_STREAM.kind, TEST_STREAM.version, CloseRow::REG_CLOSE_2);
+
+/// A neutral idle-timeout close.
+const IDLE: CloseOutcome = CloseOutcome::neutral(NeutralCause::Timeout, "idle_timeout");
 
 /// The `feed` stream: the `watch` subscription, its `item` pages and its
 /// `ended` terminal outcome.
@@ -106,10 +115,10 @@ fn judged(stream: Stream, seq: u64) -> Observation {
 }
 
 /// The node closing connection 1 with `cause`.
-fn closed(cause: &str) -> Observation {
+fn closed(cause: CloseOutcome) -> Observation {
     Observation::ConnectionClosed {
         connection: 1,
-        cause: cause.to_owned(),
+        cause,
     }
 }
 
@@ -248,11 +257,7 @@ fn authorized_work_holds() {
 fn work_from_a_rejected_frame_fails_despite_the_close() {
     let report = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Unsolicited, 7, 20)],
-        vec![
-            judged(TEST_STREAM, 0),
-            part_work(0, 20),
-            closed("service_protocol_reject"),
-        ],
+        vec![judged(TEST_STREAM, 0), part_work(0, 20), closed(FAULT)],
     ]);
     assert!(held(&report, UNSOLICITED), "{:?}", report.properties);
     let violation = report.end.violation.expect("the work was unauthorized");
@@ -305,11 +310,7 @@ fn work_spends_only_its_own_frames_bytes() {
             vec![frame(TEST_STREAM, 1, "done", Label::Conformant, 7, 4)],
             vec![judged(TEST_STREAM, 1)],
             vec![frame(TEST_STREAM, 2, "part", Label::Unsolicited, 7, 10)],
-            vec![
-                judged(TEST_STREAM, 2),
-                late_work,
-                closed("service_protocol_reject"),
-            ],
+            vec![judged(TEST_STREAM, 2), late_work, closed(FAULT)],
         ]
     };
     let rejected = run_script(script(part_work(2, 10)));
@@ -339,7 +340,7 @@ fn stale_owner_work_after_close_fails() {
         vec![judged(TEST_STREAM, 0)],
         vec![frame(TEST_STREAM, 1, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 1)],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
         vec![part_work(0, 4)],
     ]);
     let violation = report
@@ -360,7 +361,7 @@ fn the_frame_in_hand_at_a_close_may_finish() {
     let report = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 0)],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
         vec![part_work(0, 4)],
     ]);
     assert_eq!(report.end.violation, None, "{:?}", report.end);
@@ -374,7 +375,7 @@ fn more_work_from_a_handed_off_frame_after_close_fails() {
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 0)],
         vec![part_work(0, 2)],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
         vec![part_work(0, 2)],
     ]);
     let violation = report
@@ -569,11 +570,7 @@ fn serving_is_bounded_by_conformant_requests() {
 
     let over_margin = run_script(vec![
         vec![frame(TEST_STREAM, 0, "get", Label::OverMargin, 1, 4)],
-        vec![
-            judged(TEST_STREAM, 0),
-            serving(1),
-            closed("request_protocol_reject"),
-        ],
+        vec![judged(TEST_STREAM, 0), serving(1), closed(FAULT)],
     ]);
     assert!(
         held(&over_margin, OVER_MARGIN),
@@ -625,7 +622,7 @@ fn owners_outliving_their_requests_fail() {
     let closed_under = run_script(vec![
         vec![frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4)],
         vec![judged(TEST_STREAM, 0), serving(1)],
-        vec![closed("idle_timeout")],
+        vec![closed(IDLE)],
     ]);
     assert_eq!(
         closed_under.end.violation.map(|v| v.property).as_deref(),
@@ -720,7 +717,7 @@ fn output_above_what_is_owed_fails() {
             "after the connection closed",
             vec![
                 requested(2, 40),
-                vec![closed("idle_timeout")],
+                vec![closed(IDLE)],
                 vec![output("part", 8)],
             ],
             QUANTITY,
@@ -748,7 +745,7 @@ fn answering_an_over_margin_request_fails() {
             judged(TEST_STREAM, 0),
             owed(2, 40),
             output("done", 4),
-            closed("request_protocol_reject"),
+            closed(FAULT),
         ],
     ]);
     assert!(held(&report, OVER_MARGIN), "{:?}", report.properties);

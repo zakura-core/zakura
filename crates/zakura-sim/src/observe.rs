@@ -3,7 +3,8 @@
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
 //! that appended it. Step 0 is setup, before the first pick.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+use zakura_network::zakura::CloseOutcome;
 
 use crate::model::Label;
 
@@ -254,9 +255,10 @@ pub enum Observation {
     ConnectionClosed {
         /// The connection.
         connection: u64,
-        /// The first cause the node recorded, such as
-        /// `service_protocol_reject`.
-        cause: String,
+        /// The first cause the node recorded, such as a fault of
+        /// `bsync-close-3`.
+        #[serde(serialize_with = "close_outcome")]
+        cause: CloseOutcome,
     },
     /// The node asked storage to punish the peer on a connection.
     Misbehavior {
@@ -2319,8 +2321,10 @@ pub enum TransportFact {
     /// The node decided to close the connection: its first recorded close
     /// cause, or `None` for a cancellation with no cause recorded first.
     CloseDecided {
-        /// The first recorded cause, such as `unexpected_stream`.
-        cause: Option<String>,
+        /// The first recorded cause, such as a neutral
+        /// `unexpected_stream`.
+        #[serde(serialize_with = "optional_close_outcome")]
+        cause: Option<CloseOutcome>,
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
@@ -2386,6 +2390,23 @@ pub struct KindLoad {
 
 /// Whether `bytes` is 0, so a row omits the field and an honest run's log
 /// keeps its form.
+/// Writes a close outcome as its label: a fault's row ID, or a neutral
+/// close's site.
+fn close_outcome<S: Serializer>(cause: &CloseOutcome, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(cause.label())
+}
+
+/// Writes an optional close outcome as its label, or null.
+fn optional_close_outcome<S: Serializer>(
+    cause: &Option<CloseOutcome>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match cause {
+        Some(cause) => serializer.serialize_str(cause.label()),
+        None => serializer.serialize_none(),
+    }
+}
+
 fn is_zero(bytes: &u64) -> bool {
     *bytes == 0
 }

@@ -60,6 +60,9 @@ pub fn syncing(
         },
         controls,
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -264,6 +267,9 @@ pub fn release_after_apply() -> StorageScenario {
             Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
         )],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -287,6 +293,9 @@ pub fn reply_hold() -> StorageScenario {
         },
         controls: Vec::new(),
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -376,6 +385,9 @@ pub fn peer_lease_denied() -> StorageScenario {
             ),
         ],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -399,6 +411,9 @@ pub fn fault(kind: OpKind, fault: Allow, after: u64) -> StorageScenario {
         },
         controls: Vec::new(),
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -422,6 +437,9 @@ fn forks(len_1: u32, len_2: u32, weights: Weights) -> StorageScenario {
         weights,
         policy: Policy::converging(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -628,4 +646,46 @@ pub fn fault_stem(kind: OpKind, outcome: &str) -> String {
         "header-storage-w-fault-{}-{outcome}",
         format!("{kind:?}").to_lowercase()
     )
+}
+
+/// fuzz-12 item 7's witness scenarios, `header-storage-w-*`, by name: each
+/// action and overlap the fuzz-12 controls added, then the fault witnesses
+/// ([`fault_witnesses`]), the recovery classes ([`recovery_witnesses`]) and
+/// hdr-13's owed recoveries ([`owed_recovery_witnesses`]).
+pub fn witness_scenarios() -> Vec<(String, StorageScenario)> {
+    type Named = (&'static str, fn() -> StorageScenario);
+    let named: [Named; 15] = [
+        ("hold-succeeds", StorageScenario::holds),
+        ("reset-locator", reset_held_locator),
+        ("reset-prepare", reset_held_prepare),
+        ("reset-apply", reset_held_apply),
+        ("reset-reply", reset_reply_hold),
+        ("reconsider", invalidate_reconsider),
+        ("release", release_after_apply),
+        ("reply-hold", reply_hold),
+        ("reply-after-shutdown", reply_after_shutdown),
+        ("reply-after-close", reply_after_close),
+        ("stop-storage", stop_with_held_apply),
+        ("peer-lease-denied", peer_lease_denied),
+        ("equal-forks", equal_forks),
+        ("longer-fork", longer_fork),
+        ("weighted-fork", weighted_fork),
+    ];
+    let mut scenarios: Vec<(String, StorageScenario)> = named
+        .into_iter()
+        .map(|(name, scenario)| (format!("header-storage-w-{name}"), scenario()))
+        .collect();
+    for (kind, allow, outcome, after) in fault_witnesses() {
+        scenarios.push((fault_stem(kind, outcome), fault_witness(kind, allow, after)));
+    }
+    for (prefix, classes) in [
+        ("recover", recovery_witnesses()),
+        ("owed", owed_recovery_witnesses()),
+    ] {
+        for (class, scenario) in classes {
+            let name = format!("header-storage-w-{prefix}-{}", class.replace(' ', "-"));
+            scenarios.push((name, scenario));
+        }
+    }
+    scenarios
 }

@@ -152,7 +152,16 @@ still delivering the earlier response.
 **An unbounded wait wedges a peer.** Every outbound request MUST have a finite network
 deadline. Admission bounds the outstanding byte estimate, and the minimum rate bounds
 its transfer allowance. The separate block-progress deadline still retires a silent
-session even when queued responses have later individual deadlines.
+session even when queued responses have later individual deadlines. It starts with the
+first request or the last accepted body. It adds the base liveness allowance of four
+request timeouts, transfer time at 256 KiB/s for the next owed body, and up to one
+request timeout of local-write grace. Responses share an ordered stream, so the next
+accepted body is at most one protocol-maximum body away. The owed bytes come from the
+live response authorizations, so a range whose request timed out keeps counting while
+the peer may still answer it. They are capped by the remaining response-byte
+authorization and by the remaining bodies at the maximum body size. Completed ranges
+stop counting at once, and later requests add no time. A range that owes only its
+ending uses the separate ending deadline.
 
 **A peer accepts requests but never delivers bodies (probe-first).** Admission in front
 of the window MUST enforce a no-progress policy:
@@ -160,15 +169,13 @@ of the window MUST enforce a no-progress policy:
 - An **unproven** peer MUST get at most `initial_block_probe_requests` (1) before its
   first accepted body, so the cold-start window isn't spent as one burst.
 - Once proven, `max_requests_without_block_progress` (64) caps requests without an
-  accepted body before the liveness deadline disconnects it (then parked for
-  `no_progress_peer_cooldown`, 180 s).
+  accepted body. At the liveness deadline the first stall parks the session for
+  `no_progress_peer_cooldown` (180 s). A second stall closes the same connection.
 - The streak resets on any accepted body; only genuine silence is penalised:
   - a body accepted through the late/unmatched path MUST count as progress;
   - a destructive view reset MUST clear the streak so an unproven peer can re-probe;
-  - a would-be disconnect attributable to **local** outbound backpressure MAY extend the
-    deadline, but only while the outbound queue has been full for less than
-    `request_timeout`; beyond that the peer MUST be disconnected regardless (an unbounded
-    extend would let a non-reading peer dodge the timer until the transport idle timeout).
+  - **local** outbound backpressure MAY add one `request_timeout` per no-progress episode,
+    while the queue has been full for less than `request_timeout`.
 
 **<a id="wedged-vs-slow"></a>Distinguishing a wedged peer from a merely-slow one.** Both
 miss deadlines; only the wedged one is disconnected, with no slowness-based disconnect:

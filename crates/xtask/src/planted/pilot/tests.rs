@@ -2451,8 +2451,8 @@ fn committed_list() -> feedback::List {
 }
 
 /// The committed case list resolves each case to its planted patch, case
-/// file and production files, and freezes ten seeds in both arms: ten cases
-/// on five targets, 300 campaigns of 600 s.
+/// file and production files, and freezes ten seeds in both arms: nine cases
+/// on four targets, 260 campaigns of 600 s.
 #[test]
 fn the_feedback_list_plans_paired_arms() {
     let list = committed_list();
@@ -2487,7 +2487,7 @@ fn the_feedback_list_plans_paired_arms() {
             targets.len(),
             originals + cases.len() * planned.len()
         ),
-        (10, 5, 300)
+        (9, 4, 260)
     );
 }
 

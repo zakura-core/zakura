@@ -1,7 +1,11 @@
 //! A node that runs one layout, two siblings, and a real handler over QUIC.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, PoisonError},
+};
 
+use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 use zakura_chain::parameters::Network;
 use zakura_quic::{NodeAddr, QuicEndpoint};
@@ -12,9 +16,10 @@ use super::{
 };
 use crate::{
     zakura::{
-        handler::serve_native_dial_connection, testkit::LocalEndpointFactory, Service,
-        ServiceRegistry, Stream, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle,
+        handler::serve_native_dial_connection, regulation::SessionKey,
+        testkit::LocalEndpointFactory, Service, ServiceRegistry, SessionStep, Stream,
+        TransportEvent, TransportObserver, ZakuraConnId, ZakuraEndpoint, ZakuraHandshakeConfig,
+        ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle,
     },
     BoxError, Config,
 };
@@ -28,6 +33,27 @@ pub(crate) struct LayoutNode<A: StreamConformance> {
     pub(crate) siblings: [Arc<SiblingService>; 2],
     pub(crate) limits: ZakuraLocalLimits,
     dials: Mutex<Vec<AbortOnDropHandle<()>>>,
+    exited: Arc<ExitedGenerations>,
+}
+
+/// The session generations whose workers have all exited, by connection, as
+/// the node's transport records them.
+#[derive(Debug)]
+struct ExitedGenerations(watch::Sender<HashSet<(ZakuraConnId, u64)>>);
+
+impl TransportObserver for ExitedGenerations {
+    fn observe(&self, event: TransportEvent) {
+        if let TransportEvent::SessionLifecycle {
+            conn_id,
+            step: SessionStep::GenerationExited { generation, .. },
+            ..
+        } = event
+        {
+            self.0.send_modify(|exited| {
+                exited.insert((conn_id, generation));
+            });
+        }
+    }
 }
 
 /// Production limits.
@@ -53,6 +79,7 @@ impl<A: StreamConformance> LayoutNode<A> {
         let supervisor = ZakuraSupervisorHandle::new(16);
         let service = Arc::new(LayoutService::<A>::new(layout));
         let siblings = SIBLINGS.map(|stream| Arc::new(SiblingService::new(stream)));
+        let exited = Arc::new(ExitedGenerations(watch::channel(HashSet::new()).0));
         let services: Vec<Arc<dyn Service>> =
             vec![service.clone(), siblings[0].clone(), siblings[1].clone()];
         let handler = ZakuraProtocolHandler::new_with_registry(
@@ -62,7 +89,8 @@ impl<A: StreamConformance> LayoutNode<A> {
             limits.clone(),
             Arc::new(ServiceRegistry::new(services)?),
         )
-        .with_local_node_id(endpoint.local_id());
+        .with_local_node_id(endpoint.local_id())
+        .with_transport_observer(exited.clone());
         endpoint.serve(handler.clone())?;
         Ok(Self {
             endpoint: endpoint.clone(),
@@ -71,6 +99,7 @@ impl<A: StreamConformance> LayoutNode<A> {
             siblings,
             limits,
             dials: Mutex::new(Vec::new()),
+            exited,
         })
     }
 
@@ -145,6 +174,23 @@ impl<A: StreamConformance> LayoutNode<A> {
         })
         .await
         .map_err(|_| "timed out waiting for a layout session")?
+    }
+
+    /// Wait until this node's transport has released session `key`: every
+    /// worker exited and the transport recorded the exit.
+    ///
+    /// Until then the transport drops the peer's next offer of the layout,
+    /// because the old session still holds its slot. A peer seeing each
+    /// member end does not prove the release.
+    pub(crate) async fn wait_released(&self, key: SessionKey) -> Result<(), BoxError> {
+        let mut exited = self.exited.0.subscribe();
+        tokio::time::timeout(
+            CONFORMANCE_DEADLINE,
+            exited.wait_for(|exited| exited.contains(&(key.conn_id, key.session_id))),
+        )
+        .await
+        .map_err(|_| "timed out waiting for the transport to release a session")??;
+        Ok(())
     }
 
     /// Download `exchanges` of the layout's first request row and `pages`

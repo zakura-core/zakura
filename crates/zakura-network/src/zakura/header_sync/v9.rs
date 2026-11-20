@@ -12,7 +12,7 @@ mod wire;
 
 #[cfg(all(test, not(zakura_sim)))]
 pub(crate) use publisher::FakePort;
-pub(crate) use publisher::{LeaseOwner, PageLimits, Publisher};
+pub(crate) use publisher::{LeaseOwner, PageLimits, Publisher, OPEN_WALKS};
 #[cfg(any(test, zakura_sim))]
 pub(crate) use subscriber::CreditTap;
 pub(crate) use subscriber::{Admitted, Ended, SubscribeError, Subscriber};

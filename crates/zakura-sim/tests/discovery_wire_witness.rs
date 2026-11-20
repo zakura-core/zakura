@@ -18,7 +18,8 @@ use std::{
 
 use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
-    wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
+    wire_codec::WireMessage, CloseOutcome, DiscoveryMessage, MAX_NODE_RECORD_BYTES,
+    MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::NaReason;
 use zakura_sim::{
@@ -30,7 +31,7 @@ use zakura_sim::{
         },
         run_prepared, HarnessError, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{StreamId, TransportFact},
     peer::{
         discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
@@ -282,21 +283,19 @@ fn over_owed_at_its_cap(scenario: &WireScenario, report: &RunReport) {
     assert_eq!(read.map(|len| len as usize), Some(cap + 1));
     let fault = entries.iter().any(|entry| {
         matches!(&entry.obs, Observation::ConnectionClosed { connection: on, cause }
-            if *on == connection && is_fault_cause(cause))
+            if *on == connection && cause.is_fault())
     });
     assert!(fault, "the node admitted a Peers over its cap");
 }
 
 /// The node's fault closes in `report`, by cause.
-fn fault_closes(report: &RunReport) -> Vec<String> {
+fn fault_closes(report: &RunReport) -> Vec<CloseOutcome> {
     report
         .log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
-            Observation::ConnectionClosed { cause, .. } if is_fault_cause(cause) => {
-                Some(cause.clone())
-            }
+            Observation::ConnectionClosed { cause, .. } if cause.is_fault() => Some(*cause),
             _ => None,
         })
         .collect()
@@ -324,7 +323,7 @@ fn every_discovery_property_applies_in_its_witness() {
     let report = run(&WireScenario::default());
     let honest: Vec<String> = HONEST.iter().map(|suffix| id(suffix)).collect();
     witnessed(&report, "honest", &honest);
-    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(fault_closes(&report), Vec::<CloseOutcome>::new());
 }
 
 /// `discovery/wire` draws each act witness, each asking witness of
@@ -388,7 +387,11 @@ fn answers_within_their_requests_hold_sender_within_owed() {
     for (suffix, request) in OWED {
         let (report, node) = run_node(&asking_scenario(request));
         witnessed(&report, request, &[id(suffix)]);
-        assert_eq!(fault_closes(&report), Vec::<String>::new(), "{request:?}");
+        assert_eq!(
+            fault_closes(&report),
+            Vec::<CloseOutcome>::new(),
+            "{request:?}"
+        );
         if request == Request::GetOnePeer {
             assert_eq!(
                 confirmed_public_records(&node),
@@ -499,7 +502,11 @@ fn conformant_controls_hold_conformant_never_closes() {
             _ => Vec::new(),
         };
         witnessed(&report, control, &ids);
-        assert_eq!(fault_closes(&report), Vec::<String>::new(), "{control:?}");
+        assert_eq!(
+            fault_closes(&report),
+            Vec::<CloseOutcome>::new(),
+            "{control:?}"
+        );
         let labels: BTreeSet<&str> = report
             .log
             .entries()
@@ -610,7 +617,7 @@ fn late_response_admitted_applies_in_its_saved_plan() {
         "late-response",
         &[LATE_RESPONSE_ADMITTED.to_owned()],
     );
-    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(fault_closes(&report), Vec::<CloseOutcome>::new());
     assert_eq!(
         *outcome(&run(&WireScenario::default()), LATE_RESPONSE_ADMITTED),
         PropertyOutcome::not_applicable(NaReason::NeverApplied)

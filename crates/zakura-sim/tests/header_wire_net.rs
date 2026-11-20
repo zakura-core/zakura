@@ -30,7 +30,7 @@ use zakura_sim::{
         header_sync::{HeaderWire, WirePorts, WireScenario},
         run_prepared, HarnessError, LinkEntry, LinkSpec, NetScenario, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{DatagramOutcome, Entry, TransportFact},
     peer::{
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
@@ -215,7 +215,7 @@ fn assert_conformant(report: &RunReport, ports: &WirePorts, tip: u32) {
             Observation::Transport {
                 event: TransportFact::CloseDecided { cause: Some(cause) },
                 ..
-            } => assert!(!is_fault_cause(cause), "a fault close: {cause}"),
+            } => assert!(!cause.is_fault(), "a fault close: {cause}"),
             Observation::Misbehavior { .. } => panic!("misbehavior: {:?}", entry.obs),
             _ => {}
         }

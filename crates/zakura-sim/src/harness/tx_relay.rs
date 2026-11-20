@@ -83,7 +83,7 @@ pub const MAX_PEERS: usize = 5;
 pub const LOCAL: usize = MAX_PEERS * HELD;
 
 /// The most bodies this node holds itself.
-pub const MAX_LOCAL: usize = 20;
+pub const MAX_LOCAL: usize = 24;
 
 /// The universe's first bad body. Peer `i` holds bad bodies
 /// `BAD + 2 * i` and `BAD + 2 * i + 1`.
@@ -92,10 +92,10 @@ pub const BAD: usize = LOCAL + MAX_LOCAL;
 /// The universe's size.
 pub const UNIVERSE: usize = BAD + 2 * MAX_PEERS;
 
-/// The lock script size of the bodies this node holds itself: past what a
-/// peer's QUIC receive window and the node's send buffers hold, so a peer
-/// that stops reading blocks the node's writer within one body.
-const LOCAL_SCRIPT: usize = 1024 * 1024;
+/// The lock script size of the bodies this node holds itself: past a
+/// peer's QUIC receive window, so a peer that stops reading blocks the
+/// node's writer within a few bodies.
+const LOCAL_SCRIPT: usize = 80 * 1024;
 
 /// The universe's bodies: transparent V4 transactions, each with its own
 /// output value. The peers' and the bad bodies are of one small size, and
@@ -523,7 +523,7 @@ fn answers(faults: bool) -> Vec<Answer> {
 /// - Byte 0, the node and its pool: the verification delay (bits 0 and 1:
 ///   10, 200, 2,000 or 6,000 ms), the bad bodies' verdict (bits 2 and 3:
 ///   [`BadVerdict`] in order), the node's own bodies (bits 4 and 5: 0, 4,
-///   16 or 20) and the links' delays (bits 6 and 7: 1 to 20 ms, 1 to 100
+///   16 or 24) and the links' delays (bits 6 and 7: 1 to 20 ms, 1 to 100
 ///   ms, 20 to 200 ms, or 1 to 1,000 ms).
 /// - Byte 1, the peers: their count (bits 0 and 1, 1 to 4), an honest
 ///   helper peer after them (bit 2), whether each holds its two bad bodies
@@ -621,7 +621,7 @@ pub fn composed_scenario(prefix: &[u8]) -> RelayScenario {
             BadVerdict::Cooldown,
             BadVerdict::Ban,
         ][usize::from((node >> 2) & 3)],
-        local: [0, 4, 16, 20][usize::from((node >> 4) & 3)],
+        local: [0, 4, 16, MAX_LOCAL][usize::from((node >> 4) & 3)],
         peers: specs,
     }
 }
@@ -838,10 +838,10 @@ const _: () = assert!(
 /// past any scenario.
 pub const NEUTRAL_WITNESSES: [(&str, Prefix); 5] = [
     ("tx-relay: id requested twice", || {
-        // A body of this node's, announced to the peer first, asked for
-        // twice in one write.
+        // Sixteen bodies of this node's, announced to the peer first, the
+        // last of eight asked for twice while the peer reads nothing.
         composed_prefix(
-            0x10,
+            0x20,
             ROW_PEERS,
             0,
             &[
@@ -852,7 +852,7 @@ pub const NEUTRAL_WITNESSES: [(&str, Prefix); 5] = [
         .expect("the witness fits its grammar")
     }),
     ("tx-relay: too many requests", || {
-        // Twenty bodies of this node's, announced to the peer first.
+        // Twenty-four bodies of this node's, announced to the peer first.
         composed_prefix(
             0x30,
             ROW_PEERS,
@@ -927,9 +927,9 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
     (properties::REQUESTS_WITHIN_LIMIT, || {
         steps_prefix(0x02, 0, 0, &[RelayStep::AnnounceAll, WAIT_LONG])
     }),
-    // Twenty bodies of the node's, announced, then eighteen asked for at
-    // once while the peer reads nothing: sixteen wait unstarted, and the
-    // last closes the connection.
+    // Twenty-four bodies of the node's, announced, then asked for at once
+    // while the peer reads nothing: sixteen wait unstarted, and the last
+    // closes the connection.
     (properties::SERVING_WITHIN_LIMIT, || {
         steps_prefix(
             0x30,
@@ -1013,7 +1013,7 @@ pub const BUDGET: u64 = 150_000;
 /// The budget of a scenario whose peer never answers, or that fills a
 /// pending set or a skip set: room for a park's three minutes, or for tens
 /// of thousands of ids.
-pub const LONG_BUDGET: u64 = 400_000;
+pub const LONG_BUDGET: u64 = 1_200_000;
 
 impl Subsystem for TxRelayWire {
     const NAME: &'static str = "tx-relay/wire";

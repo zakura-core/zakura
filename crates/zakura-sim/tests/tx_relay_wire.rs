@@ -25,7 +25,7 @@ use zakura_sim::{
             composed_prefix, read_log, wire_properties, RelayScenario, TxRelayWire, COMPOSED_BYTES,
             DOMAIN_WITNESSES, NEUTRAL_WITNESSES, ROW_WITNESSES, STALL_WITNESS,
         },
-        Subsystem,
+        HarnessError, Subsystem,
     },
     model::Label,
     peer::tx_relay::{header_fault, Answer, HeaderFault, HelloMode, RelayRow, RelayStep},
@@ -45,7 +45,12 @@ fn run(prefix: &[u8]) -> (RunReport, SharedRelay) {
         &mut NullSink,
         None,
     )
-    .unwrap_or_else(|error| panic!("{prefix:02x?}: {error:?}"));
+    .unwrap_or_else(|error| match error {
+        HarnessError::Run { failure, report } => {
+            panic!("{prefix:02x?}: {failure:?} at {:?}", report.end)
+        }
+        other => panic!("{prefix:02x?}: {other:?}"),
+    });
     assert_ne!(
         report.end.outcome,
         Outcome::Harness,

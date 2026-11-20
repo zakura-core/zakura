@@ -223,12 +223,12 @@ pub enum RelayStep {
         /// Which stream.
         data: bool,
     },
-    /// `GetTxs` for three ids the node announced, the third twice, in one
-    /// write, while the peer stops reading its data stream: row 7, neutral.
+    /// `GetTxs` for ids the node announced, the last twice, in one write,
+    /// while the peer stops reading its data stream: row 7, neutral.
     RequestTwice,
-    /// Three more `GetTxs` than the node's `Hello` serves, in one write,
-    /// for ids it announced, while the peer stops reading its data stream:
-    /// row 8, neutral.
+    /// More `GetTxs` than the node's `Hello` serves and its writer starts,
+    /// in one write, for ids it announced, while the peer stops reading its
+    /// data stream: row 8, neutral.
     TooManyRequests,
 }
 
@@ -369,6 +369,11 @@ const RECEIVE_WINDOW: u32 = 64 * 1024;
 /// minutes, since a parked peer's connection carries no other service's
 /// frames here.
 pub const IDLE_TIMEOUT_SECS: u32 = 600;
+
+/// The most answers the node starts while its peer reads nothing: the body
+/// the peer's reader was reading, the one the node's writer blocks on, the
+/// four the data stream's outbound queue holds, and one to spare.
+const STARTED_WHILE_PAUSED: usize = 7;
 
 /// How long a peer stops reading its data stream while it asks for a burst
 /// of bodies, so the node's answers queue unstarted.
@@ -1297,28 +1302,30 @@ impl RelayPeer {
                 if !hello {
                     return Some(true);
                 }
-                // Three ids the node announced, the third asked for twice
-                // while the peer reads nothing. The peer's reader finishes
-                // the first body, and the node's writer blocks on the
-                // second, so the third's request is still unanswered when
-                // it comes again.
-                if !hello || session.announced.len() < 3 {
+                // Ids the node announced, the last asked for twice while
+                // the peer reads nothing. The node starts the answers it
+                // can write or queue on the stream, at most
+                // [`STARTED_WHILE_PAUSED`], and the last one's request is
+                // still unanswered when it comes again.
+                if !hello || session.announced.len() < STARTED_WHILE_PAUSED + 1 {
                     return Some(true);
                 }
-                let ids: Vec<UnminedTxId> = session.announced.drain(..3).collect();
+                let mut ids: Vec<UnminedTxId> =
+                    session.announced.drain(..=STARTED_WHILE_PAUSED).collect();
+                ids.push(*ids.last().expect("a few ids"));
                 pause_reads(session);
-                let asks = [ids[0], ids[1], ids[2], ids[2]];
-                (Vec::new(), asks.into_iter().map(ask).collect())
+                (Vec::new(), ids.into_iter().map(ask).collect())
             }
             RelayStep::TooManyRequests => {
-                // While the peer reads nothing, its reader finishes the
-                // first body, the node's writer blocks on the second, and
-                // the rest queue unstarted: the last request is past what
-                // the node's `Hello` serves.
-                if !hello || session.announced.len() < MAX_SERVES + 3 {
+                // While the peer reads nothing, the node starts at most
+                // [`STARTED_WHILE_PAUSED`] answers, and the rest queue
+                // unstarted: the last request is past what the node's
+                // `Hello` serves.
+                let count = MAX_SERVES + STARTED_WHILE_PAUSED + 1;
+                if !hello || session.announced.len() < count {
                     return Some(true);
                 }
-                let ids: Vec<UnminedTxId> = session.announced.drain(..MAX_SERVES + 3).collect();
+                let ids: Vec<UnminedTxId> = session.announced.drain(..count).collect();
                 pause_reads(session);
                 (Vec::new(), ids.into_iter().map(ask).collect())
             }

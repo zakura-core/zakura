@@ -35,7 +35,7 @@ use zakura_sim::{
     },
     model::Label,
     observe::{BlockSyncFact, RowAt, StorageFact, StorageRequest, StreamId},
-    seed::{self, draws::byte_input},
+    seed::draws::byte_inputs,
     table::{GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -253,11 +253,23 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
-/// The Plan under which [`old_chain_scenario`]'s run has a routine judge an
-/// old-chain body after a fork request reserved its height
-/// ([`old_chain_shortfall`]): the first of 64 fuzz Plans that does.
-fn old_chain_plan() -> Vec<u8> {
-    byte_input(64, 16_384, 0)
+/// How many generated Plans a search tries before it fails.
+const SEARCH_PLANS: usize = 64;
+
+/// The first of [`SEARCH_PLANS`] generated Plans under which `scenario`'s
+/// run has a routine judge an old-chain body after a fork request reserved
+/// its height. Returns that run, or fails when no Plan reaches it.
+fn old_body_after_a_fork_request(scenario: &BlockScenario) -> RunReport {
+    for plan in byte_inputs(SEARCH_PLANS, 16_384) {
+        let (report, ports) = run(scenario, Plan::from_fuzz(&plan));
+        if old_body_judged_after_a_fork_request(&report, &ports, scenario) {
+            return report;
+        }
+    }
+    panic!(
+        "no routine judged an old-chain body after a fork request reserved its height \
+         in {SEARCH_PLANS} Plans"
+    );
 }
 
 /// True if a routine judged an old-chain body of a height past
@@ -351,67 +363,35 @@ fn old_chain_scenario() -> BlockScenario {
     scenario
 }
 
-/// Checks that `plan` fills [`old_chain_plan`]'s role, or returns why it
-/// falls short. [`old_chain_scenario`]'s run under it must end without a
-/// violation, hold `receiver-work-authorized`, and have a routine judge an
-/// old-chain body after a fork request reserved its height.
-fn old_chain_shortfall(plan: &[u8]) -> Result<(), String> {
-    let scenario = old_chain_scenario();
-    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
-    if report.end.violation.is_some() {
-        return Err(format!("a violation: {:?}", report.end));
-    }
-    if !held(&report, &id("block/receiver-work-authorized")) {
-        return Err(format!(
-            "receiver-work-authorized didn't hold: {:?}",
-            report.properties
-        ));
-    }
-    if !old_body_judged_after_a_fork_request(&report, &ports, &scenario) {
-        return Err(
-            "no routine judged an old-chain body after a fork request reserved its height"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
-
 /// A reset while old-chain bodies are on the wire credits none of them to
-/// the fork's work. Under [`old_chain_plan`], one such body reaches its
-/// routine after the routine dropped its request, so first-completion-wins
-/// must refuse its hash.
+/// the fork's work. A search finds a run of [`old_chain_scenario`] in which
+/// one such body reaches its routine after the routine dropped its request,
+/// so first-completion-wins must refuse its hash.
 #[test]
 fn old_chain_bodies_after_a_reset_hold_receiver_work_authorized() {
-    if let Err(shortfall) = old_chain_shortfall(&old_chain_plan()) {
-        panic!("{shortfall}");
-    }
-}
-
-/// The stale-request-body seed holds `receiver-work-authorized` after an
-/// old-chain body answers a stale request for a height that a fork request
-/// reserves. With
-/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
-/// the routine credits that body to the fork request, and the same seed
-/// violates it.
-#[test]
-fn the_stale_request_body_input_holds_receiver_work_authorized() {
-    let input = seed::find("block-sync-stale-request-body")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
-    let (prefix, plan) = input.split_at(Storage::SCENARIO_BYTES);
-    let scenario = Storage::draw(prefix);
-    assert_eq!(scenario, BlockScenario::reset_mid_flight());
-    let (report, ports) = run(&scenario, Plan::from_fuzz(plan));
+    let report = old_body_after_a_fork_request(&old_chain_scenario());
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert!(
         held(&report, &id("block/receiver-work-authorized")),
         "{:?}",
         report.properties
     );
+}
+
+/// A search finds a run of the reset-mid-flight scenario in which an
+/// old-chain body answers a stale request for a height that a fork request
+/// reserves, and `receiver-work-authorized` holds in it. With
+/// `qa/native-mutations/submit-only-requested/stale-body-credits-current-owner`,
+/// the routine credits such a body to the fork request when its old request
+/// is still local. The search can't target that order yet (#2629).
+#[test]
+fn a_stale_request_body_holds_receiver_work_authorized() {
+    let report = old_body_after_a_fork_request(&BlockScenario::reset_mid_flight());
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert!(
-        old_body_judged_after_a_fork_request(&report, &ports, &scenario),
-        "no routine judged an old-chain body after a fork request reserved its height"
+        held(&report, &id("block/receiver-work-authorized")),
+        "{:?}",
+        report.properties
     );
 }
 

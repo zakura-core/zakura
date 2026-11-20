@@ -279,11 +279,11 @@ fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The stale-body seed runs the saved `reorg` scenario and still makes the
-/// sequencer refuse an old-epoch body, so a block-sync change that moves it
-/// off that order fails here instead of weakening the planted case. When
-/// it does, search [`zakura_sim::seed::draws::byte_inputs`] for a Plan
-/// that passes [`stale_body_shortfall`] and build the seed from it.
+/// The stale-body seed's search finds a Plan for the saved `reorg` scenario
+/// whose run makes the sequencer refuse an old-epoch body, which the
+/// cross checker's own record confirms here. The planted case runs the
+/// same input, so a block-sync change that moves the search off that order
+/// fails here instead of weakening the planted case.
 #[test]
 fn the_stale_body_input_refuses_an_old_epoch_body() {
     let input = seed::find(REORG_STALE_BODY)

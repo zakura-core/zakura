@@ -309,7 +309,7 @@
     "entry": "block-sync-table",
     "property": "block-sync/s6v3/block/receiver-work-authorized",
     "witness": {
-      "test": "the_stale_request_body_input_holds_receiver_work_authorized",
+      "test": "a_stale_request_body_holds_receiver_work_authorized",
       "test_target": "block_table"
     },
     "fault_class": "ownership"

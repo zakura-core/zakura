@@ -1358,17 +1358,24 @@ where
         // Boxed with an explicit `Send` bound, because this future can spawn another task built
         // by this same function.
         let fut: BoxFuture<'static, _> = async move {
-            // Check if the full block body is already in the state. `KnownBlock`
-            // can be true for header-only Zakura sync state, but inbound gossip
-            // still needs to fetch and verify the block body in that case.
+            // A block committed to a chain is not fetched again. The state decides this from
+            // its block index, which outlives a pruned body, so a pruned node skips its old
+            // finalized blocks too. A header that only header sync knows has no index entry,
+            // and a commit that is still pending can fail, so both still need the body.
             match spawner
                 .state
                 .clone()
-                .oneshot(zs::Request::AnyChainBlock(hash.into()))
+                .oneshot(zs::Request::KnownBlock(hash))
                 .await
             {
-                Ok(zs::Response::Block(None)) => Ok(()),
-                Ok(zs::Response::Block(Some(_))) => Err("already present".into()),
+                Ok(zs::Response::KnownBlock(Some(
+                    zs::KnownBlock::Finalized
+                    | zs::KnownBlock::BestChain
+                    | zs::KnownBlock::SideChain,
+                ))) => Err("already present".into()),
+                Ok(zs::Response::KnownBlock(
+                    Some(zs::KnownBlock::WriteChannel | zs::KnownBlock::Queue) | None,
+                )) => Ok(()),
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(e),
             }
@@ -1783,6 +1790,9 @@ mod missing_parent_tests;
 mod hedge_tests;
 
 #[cfg(test)]
+mod known_block_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt as _;
@@ -2059,7 +2069,7 @@ mod tests {
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2170,7 +2180,7 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2775,7 +2785,7 @@ mod tests {
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2844,7 +2854,7 @@ mod tests {
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -2930,7 +2940,7 @@ mod tests {
                 async move {
                     let _permit = gate.acquire().await?;
                     match request {
-                        zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                        zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                         request => Err(format!("unexpected state request: {request:?}").into()),
                     }
                 }
@@ -3081,7 +3091,7 @@ mod tests {
             // height check runs. Answering `None` lets the download proceed.
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),

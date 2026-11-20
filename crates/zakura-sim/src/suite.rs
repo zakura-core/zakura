@@ -587,6 +587,8 @@ pub struct HarnessRow {
     pub seed_set: String,
     /// Its missing-target row, if no target runs it.
     pub missing_target: Option<String>,
+    /// Its excluded-harness row, if no target runs it by design.
+    pub excluded: Option<String>,
 }
 
 /// A property one harness reports.
@@ -2002,6 +2004,7 @@ impl Builder<'_> {
                 targets: running,
                 seed_set,
                 missing_target: missing,
+                excluded: excluded.then(|| format!("excluded/harness/{}", entry.name)),
             });
         }
         (harnesses, properties)

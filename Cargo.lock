@@ -3504,6 +3504,7 @@ dependencies = [
 name = "zakura-state"
 version = "18.0.0"
 dependencies = [
+ "blake2b_simd",
  "chrono",
  "derive-new",
  "eyre",

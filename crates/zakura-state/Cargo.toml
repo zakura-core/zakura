@@ -53,6 +53,7 @@ proptest-impl = [
 ]
 
 [dependencies]
+blake2b_simd = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }

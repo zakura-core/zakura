@@ -171,7 +171,12 @@ fn interrupted_appends_are_cut_back_on_open() {
 
     // Simulate a crash after the data and offsets were written, before the config.
     let base = jar_base(&dir.path().join(STATIC_FILE_DIR), 0, 999);
-    for path in [base.clone(), suffixed(&base, "off"), suffixed(&base, "blk")] {
+    for path in [
+        base.clone(),
+        suffixed(&base, "off"),
+        suffixed(&base, "blk"),
+        suffixed(&base, "sum"),
+    ] {
         let file = OpenOptions::new().append(true).open(&path).unwrap();
         std::io::Write::write_all(&mut &file, &[0xAB; 24]).unwrap();
     }
@@ -353,6 +358,47 @@ fn repeated_offsets_are_corrupt() {
         reopened.block_transactions(Height(2)),
         Err(StaticFileError::Corrupt { .. })
     ));
+}
+
+#[test]
+fn a_changed_transaction_byte_fails_its_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = blocks(0..5);
+    let static_files = open(dir.path(), 1_000);
+    static_files.append_blocks(&expected).unwrap();
+    drop(static_files);
+
+    // Flip one byte of block 2's first transaction, keeping every offset and length.
+    let base = jar_base(&dir.path().join(STATIC_FILE_DIR), 0, 999);
+    let data = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&base)
+        .unwrap();
+    let before: usize = expected[..2]
+        .iter()
+        .flat_map(|(_, transactions)| transactions)
+        .map(|transaction| transaction.raw_bytes().len())
+        .sum();
+    let mut byte = [0];
+    read_exact_at(&data, &mut byte, before as u64).unwrap();
+    write_all_at(&data, &[byte[0] ^ 1], before as u64).unwrap();
+
+    let reopened = open(dir.path(), 1_000);
+    assert!(matches!(
+        reopened.block_transactions(Height(2)),
+        Err(StaticFileError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        reopened.transaction(Height(2), 0),
+        Err(StaticFileError::Corrupt { .. })
+    ));
+    // Other transactions still pass their checksums.
+    assert_blocks(&reopened, &expected[..2]);
+    assert_eq!(
+        reopened.transaction(Height(2), 1).unwrap().as_ref(),
+        expected[2].1.get(1),
+    );
 }
 
 #[test]
@@ -538,7 +584,7 @@ fn read_only_rescans_keep_open_jars_a_prune_hid() {
 
         for (first, end) in hidden {
             let base = jar_base(&static_dir, *first, *end);
-            for suffix in ["conf", "off", "blk"] {
+            for suffix in ["conf", "off", "blk", "sum"] {
                 fs::remove_file(suffixed(&base, suffix)).unwrap();
             }
             fs::remove_file(base).unwrap();
@@ -570,7 +616,7 @@ fn symlink_dir(target: &Path, link: &Path) {
 #[cfg(any(unix, windows))]
 #[test]
 fn linked_jar_files_are_rejected_without_touching_the_target() {
-    for suffix in [None, Some("off"), Some("blk")] {
+    for suffix in [None, Some("off"), Some("blk"), Some("sum")] {
         let dir = tempfile::tempdir().unwrap();
         let static_dir = dir.path().join(STATIC_FILE_DIR);
         open(dir.path(), 1_000)

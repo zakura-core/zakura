@@ -18,6 +18,10 @@
 //! - `.blk` holds one offset width byte (8), then the first transaction row of
 //!   each block, then the row count. Reth keeps this block index in its database.
 //!   Zcash transaction locations are per block, so it lives with the rows here.
+//! - `.sum` holds one width byte (8), then one little-endian `u64` checksum per
+//!   transaction, see [`row_checksum`]. RocksDB checks its table blocks when it
+//!   reads them, and this keeps that for bodies, so a changed byte inside a
+//!   transaction reads as corrupt instead of as different bytes.
 //! - `.conf` holds the committed [`JarConfig`]. It is written last, atomically,
 //!   so it is the commit marker.
 //!
@@ -27,8 +31,8 @@
 //!
 //! # Crash consistency
 //!
-//! Like reth, a commit syncs the data, offsets and block index files before it
-//! replaces the config. Files longer than their config are interrupted appends
+//! Like reth, a commit syncs the data, offsets, block index and checksum files
+//! before it replaces the config. Files longer than their config are interrupted appends
 //! or truncations, and [`StaticFiles::repair`] cuts them back. Files shorter
 //! than their config are corrupt.
 //!
@@ -96,11 +100,14 @@ const CONFIG_MAGIC: [u8; 4] = *b"ZKSF";
 /// The length of an encoded `.conf` file.
 const CONFIG_LEN: usize = 36;
 
-/// The offset width byte that starts `.off` and `.blk` files.
+/// The entry width byte that starts `.off`, `.blk` and `.sum` files.
 const OFFSET_WIDTH: u8 = 8;
 
-/// The length of the width byte that starts `.off` and `.blk` files.
+/// The length of the width byte that starts `.off`, `.blk` and `.sum` files.
 const INDEX_HEADER_LEN: u64 = 1;
+
+/// The BLAKE2b personalization for [`row_checksum`].
+const ROW_CHECKSUM_PERSONALIZATION: &[u8; 16] = b"ZakuraTxRowCheck";
 
 /// The largest row count a config may claim. It keeps index file lengths far
 /// from `u64` overflow while allowing many times more transactions than any
@@ -161,6 +168,22 @@ pub enum StaticFileError {
         /// The highest block already in static files.
         tip: Option<Height>,
     },
+}
+
+/// Returns the checksum of one stored transaction: the first 8 bytes of its
+/// personalized BLAKE2b-64 hash, as a little-endian `u64`. BLAKE2b is already a
+/// dependency, and runs at about 1 GB/s per core, so the check adds far less
+/// than a disk read to a cold body read.
+fn row_checksum(transaction: &[u8]) -> u64 {
+    let hash = blake2b_simd::Params::new()
+        .hash_length(8)
+        .personal(ROW_CHECKSUM_PERSONALIZATION)
+        .hash(transaction);
+    u64::from_le_bytes(
+        hash.as_bytes()
+            .try_into()
+            .expect("the hash length is set to 8 bytes"),
+    )
 }
 
 /// Returns a closure that wraps an I/O error with `path`.
@@ -263,6 +286,12 @@ impl JarConfig {
         INDEX_HEADER_LEN + 8 * (u64::from(self.blocks) + 1)
     }
 
+    /// Returns the committed `.sum` length: the width byte and `rows` checksums.
+    fn sum_len(&self) -> u64 {
+        // `validate` bounds `rows` by `MAX_ROWS`, so this can't overflow.
+        INDEX_HEADER_LEN + 8 * self.rows
+    }
+
     /// Checks that this config read from `path` is well formed and matches its
     /// file name's `first_block` and `expected_end`.
     fn validate(
@@ -303,6 +332,7 @@ struct JarFiles {
     data: File,
     off: File,
     blk: File,
+    sum: File,
 }
 
 /// One committed jar: its open files and committed config.
@@ -517,7 +547,7 @@ fn delete_jar_files(base: &Path) -> Result<(), StaticFileError> {
         base.parent()
             .expect("jar paths are inside the static file directory"),
     )?;
-    for suffix in ["off", "blk", "conf.tmp"] {
+    for suffix in ["off", "blk", "sum", "conf.tmp"] {
         remove_file(&suffixed(base, suffix))?;
     }
     remove_file(base)
@@ -555,10 +585,12 @@ impl Jar {
         let open = |path: &Path| open_regular_file(path, writable).map_err(io_error(path));
         let off_path = suffixed(&base, "off");
         let blk_path = suffixed(&base, "blk");
+        let sum_path = suffixed(&base, "sum");
         let files = JarFiles {
             data: open(&base)?,
             off: open(&off_path)?,
             blk: open(&blk_path)?,
+            sum: open(&sum_path)?,
             base,
         };
 
@@ -566,6 +598,7 @@ impl Jar {
             (&files.data, files.base.as_path(), config.data_len),
             (&files.off, off_path.as_path(), config.off_len()),
             (&files.blk, blk_path.as_path(), config.blk_len()),
+            (&files.sum, sum_path.as_path(), config.sum_len()),
         ] {
             let len = file.metadata().map_err(io_error(path))?.len();
             if len < committed_len {
@@ -576,7 +609,11 @@ impl Jar {
             }
         }
 
-        for (file, path) in [(&files.off, &off_path), (&files.blk, &blk_path)] {
+        for (file, path) in [
+            (&files.off, &off_path),
+            (&files.blk, &blk_path),
+            (&files.sum, &sum_path),
+        ] {
             let mut width = [0];
             read_exact_at(file, &mut width, 0).map_err(io_error(path))?;
             if width[0] != OFFSET_WIDTH {
@@ -607,6 +644,7 @@ impl Jar {
             data: create(&base, &[])?,
             off: create(&suffixed(&base, "off"), &empty_index)?,
             blk: create(&suffixed(&base, "blk"), &empty_index)?,
+            sum: create(&suffixed(&base, "sum"), &[OFFSET_WIDTH])?,
             base,
         };
 
@@ -635,6 +673,11 @@ impl Jar {
         suffixed(&self.files.base, "blk")
     }
 
+    /// Returns the `.sum` path.
+    fn sum_path(&self) -> PathBuf {
+        suffixed(&self.files.base, "sum")
+    }
+
     /// Returns the transaction rows of committed block `height`.
     fn block_rows(&self, height: u32) -> Result<Option<Range<u64>>, StaticFileError> {
         if !self.config.contains(height) {
@@ -655,7 +698,8 @@ impl Jar {
         Ok(Some(start..end))
     }
 
-    /// Reads transaction `rows`, which must be committed rows of a single block.
+    /// Reads transaction `rows`, which must be committed rows of a single block,
+    /// and checks each one against its checksum.
     fn read_rows(&self, rows: Range<u64>) -> Result<Vec<RawBytes>, StaticFileError> {
         let count = rows.end - rows.start;
         if count == 0 {
@@ -686,20 +730,29 @@ impl Jar {
         // The length was just checked against the maximum block size.
         let mut data = vec![0; (end - start) as usize];
         read_exact_at(&self.files.data, &mut data, start).map_err(io_error(&self.files.base))?;
+        let checksums = read_entries(&self.files.sum, &self.sum_path(), rows.start, count)?;
 
-        Ok(offsets
+        offsets
             .windows(2)
-            // Offsets are within `start..=end`, and that span fits in `data`.
-            .map(|pair| {
-                RawBytes::new_raw_bytes(
-                    data[(pair[0] - start) as usize..(pair[1] - start) as usize].to_vec(),
-                )
+            .zip(checksums)
+            .zip(rows)
+            .map(|((pair, checksum), row)| {
+                // Offsets are within `start..=end`, and that span fits in `data`.
+                let transaction = &data[(pair[0] - start) as usize..(pair[1] - start) as usize];
+                if row_checksum(transaction) != checksum {
+                    return Err(corrupt(
+                        &self.files.base,
+                        format!("transaction row {row} doesn't match its checksum"),
+                    ));
+                }
+                Ok(RawBytes::new_raw_bytes(transaction.to_vec()))
             })
-            .collect())
+            .collect()
     }
 
     /// Appends `blocks` after this jar's committed blocks and commits them like
-    /// reth: data, offsets and block index synced in that order, then the config.
+    /// reth: data, offsets, block index and checksums synced in that order, then
+    /// the config.
     ///
     /// Each block is its transactions, and the caller checks heights follow on.
     fn commit(&self, blocks: &[&[RawBytes]]) -> Result<Jar, StaticFileError> {
@@ -707,9 +760,11 @@ impl Jar {
         let mut data = Vec::new();
         let mut offsets = Vec::new();
         let mut block_ends = Vec::new();
+        let mut checksums = Vec::new();
         for transactions in blocks {
             for transaction in *transactions {
                 data.extend_from_slice(transaction.raw_bytes());
+                checksums.push(row_checksum(transaction.raw_bytes()));
                 // Data lengths fit in a `u64`.
                 offsets.push(config.data_len + data.len() as u64);
             }
@@ -739,6 +794,16 @@ impl Jar {
             .blk
             .sync_data()
             .map_err(io_error(&self.blk_path()))?;
+        write_all_at(
+            &self.files.sum,
+            &encode_entries(&checksums),
+            config.sum_len(),
+        )
+        .map_err(io_error(&self.sum_path()))?;
+        self.files
+            .sum
+            .sync_data()
+            .map_err(io_error(&self.sum_path()))?;
 
         // Block counts per jar fit in a `u32`, because they fit in the jar's range.
         config.blocks += blocks.len() as u32;
@@ -763,6 +828,7 @@ impl Jar {
             ),
             (&self.files.off, self.off_path(), self.config.off_len()),
             (&self.files.blk, self.blk_path(), self.config.blk_len()),
+            (&self.files.sum, self.sum_path(), self.config.sum_len()),
         ] {
             let len = file.metadata().map_err(io_error(&path))?.len();
             if len > committed_len {
@@ -812,6 +878,7 @@ impl Jar {
             (&self.files.data, self.files.base.clone(), config.data_len),
             (&self.files.off, self.off_path(), config.off_len()),
             (&self.files.blk, self.blk_path(), config.blk_len()),
+            (&self.files.sum, self.sum_path(), config.sum_len()),
         ] {
             file.set_len(len).map_err(io_error(&path))?;
             file.sync_all().map_err(io_error(&path))?;
@@ -1004,7 +1071,8 @@ impl StaticFiles {
         &self.dir
     }
 
-    /// Returns the committed bytes of every jar's data, offsets, block index and config.
+    /// Returns the committed bytes of every jar's data, offsets, block index,
+    /// checksums and config.
     pub fn committed_bytes(&self) -> u64 {
         let jars = self
             .jars
@@ -1016,6 +1084,7 @@ impl StaticFiles {
                 jar.config.data_len
                     + jar.config.off_len()
                     + jar.config.blk_len()
+                    + jar.config.sum_len()
                     + CONFIG_LEN as u64
             })
             .sum()

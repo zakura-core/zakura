@@ -1,13 +1,12 @@
 //! Receipt priority for concurrent deliveries of complete blocks.
 //!
 //! A block's receipt order is normally drawn when its complete body reaches the verifier. A block
-//! announced first, by native header sync admitting its header or by a legacy peer's first `inv`
-//! for it, can instead keep the order reserved for that announcement, provided its body follows
+//! announced first, by native header sync admitting its header by a legacy peer's first `inv`, or by the start
+//! of a legacy block transfer, can instead keep the order reserved for that announcement, provided its body follows
 //! within a deadline that is the same for every block size. That stops a small body from
 //! overtaking a larger one announced earlier.
 //!
-//! A block can hold both a native header claim and a legacy announcement claim. Repeated
-//! announcements preserve the original order of each held claim. Reading a claim does not
+//! The verifier compares the eligible header, inventory and block-transfer claims together. Reading a claim does not
 //! consume it, so a failed delivery cannot take that order from a later valid body.
 //!
 //! - `claims`: the claim table header sync and legacy `inv`s write, the body deadline, and the

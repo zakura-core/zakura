@@ -22,6 +22,7 @@ fn reserving_codec() -> (Codec, Arc<AtomicU64>) {
         Some(BlockReservation {
             order: FIRST_ORDER + counter.fetch_add(1, Ordering::Relaxed),
             verified_tip: TIP,
+            floor: TIP,
             started_at: Instant::now(),
         })
     });

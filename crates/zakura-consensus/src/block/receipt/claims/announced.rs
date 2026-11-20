@@ -1,5 +1,4 @@
-//! The earliest legacy announcement seen for each block, kept briefly so its body can take that
-//! order.
+//! Legacy reservations, kept independently until the verifier can check their eligibility.
 //!
 //! A block is announced by its first `inv`, or by the start of a `block` message carrying it,
 //! whichever reserved the earlier order.
@@ -8,8 +7,9 @@ use std::{collections::HashMap, time::Duration};
 
 use tokio::time::Instant;
 use zakura_chain::block;
+use zakura_node_services::block_receipt::BlockReservation;
 
-use super::{super::order, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
+use super::{super::order, in_claim_window, resolution::ClaimSource, CLAIM_BODY_DEADLINE};
 
 /// The most announced blocks the store holds.
 ///
@@ -25,107 +25,125 @@ pub(in crate::block::receipt) const MAX_ANNOUNCED_BLOCKS: usize = 512;
 /// expired rather than unclaimed.
 const ANNOUNCEMENT_LIFETIME: Duration = CLAIM_BODY_DEADLINE.saturating_mul(2);
 
-/// Receipt order, time and highest verified tip at the block's earliest legacy announcement.
+/// One legacy sighting, with its own order, deadline origin and height eligibility.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct Announcement {
     pub(super) order: u64,
     pub(super) seen_at: Instant,
-    pub(super) tip_at_announcement: block::Height,
-    pub(super) source: ClaimSource,
+    height: AnnouncementHeight,
 }
 
-/// Earliest announcements by block hash, bounded by [`MAX_ANNOUNCED_BLOCKS`].
-///
-/// Announcements carry no height, so they expire by age rather than by the verified tip.
+/// An inventory hash has no height until the verifier sees a body. For a block message,
+/// admission already checked the decoded coinbase height against the starting tip and floor.
+#[derive(Copy, Clone, Debug)]
+enum AnnouncementHeight {
+    InventoryAtTip(block::Height),
+    BlockAtHeight(block::Height),
+}
+
+impl Announcement {
+    pub(super) fn source_at(&self, height: block::Height) -> Option<ClaimSource> {
+        match self.height {
+            AnnouncementHeight::InventoryAtTip(tip) if in_claim_window(height, tip) => {
+                Some(ClaimSource::Inv)
+            }
+            AnnouncementHeight::BlockAtHeight(actual) if actual == height => {
+                Some(ClaimSource::BlockMessage)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The first inventory announcement and each admitted block delivery have independent deadlines.
 #[derive(Debug, Default)]
-pub(super) struct Announcements(HashMap<block::Hash, Announcement>);
+struct Candidates {
+    inv: Option<Announcement>,
+    blocks: Vec<Announcement>,
+}
+
+/// Both the number of distinct hashes and the total number of block-message candidates are
+/// bounded by `MAX_ANNOUNCED_BLOCKS`. Inventory sightings never consume the delivery budget.
+#[derive(Debug, Default)]
+pub(super) struct Announcements(HashMap<block::Hash, Candidates>);
 
 impl Announcements {
-    /// Records `hash` as first announced by an `inv` at `now`, unless it already has an
-    /// announcement, which is necessarily earlier.
-    ///
-    /// Returns `false` if the store is full of unexpired announcements and refused `hash`.
+    /// Records the first inventory sighting for this hash. Duplicates do not renew its deadline.
     pub(super) fn note(
         &mut self,
         hash: block::Hash,
         tip_at_announcement: block::Height,
         now: Instant,
     ) -> bool {
-        if self.0.contains_key(&hash) {
+        if self
+            .0
+            .get(&hash)
+            .is_some_and(|candidates| candidates.inv.is_some())
+        {
             return true;
         }
-        self.insert(hash, now, || Announcement {
+        self.prune(now);
+        let Some(candidates) = self.admit(hash) else {
+            return false;
+        };
+        candidates.inv = Some(Announcement {
             order: order::next(),
             seen_at: now,
-            tip_at_announcement,
-            source: ClaimSource::Inv,
-        })
-    }
-
-    /// Records that a `block` message carrying `hash` reserved `order` when it started arriving
-    /// at `started_at`, with the verified tip at `tip_at_announcement`, and completed at `now`.
-    ///
-    /// Of this reservation and an existing announcement, the block keeps the earlier one that
-    /// is still inside its deadline at `now`, so it is never ranked behind an announcement that
-    /// came after its message started, and an expired claim never displaces a usable one. If
-    /// neither is usable, the existing one is kept. A replaced announcement takes this tip, which
-    /// was read when its new order was reserved.
-    ///
-    /// Taking a later but usable reservation over an expired announcement gives the block no
-    /// more than a block message without that announcement would get.
-    ///
-    /// Returns `false` if the store is full of unexpired announcements and refused `hash`.
-    pub(super) fn note_block_message(
-        &mut self,
-        hash: block::Hash,
-        tip_at_announcement: block::Height,
-        order: u64,
-        started_at: Instant,
-        now: Instant,
-    ) -> bool {
-        let usable = |seen_at| now.saturating_duration_since(seen_at) <= CLAIM_BODY_DEADLINE;
-        if let Some(announced) = self.0.get_mut(&hash) {
-            let replace =
-                usable(started_at) && (order < announced.order || !usable(announced.seen_at));
-            if replace {
-                *announced = Announcement {
-                    order,
-                    seen_at: started_at,
-                    tip_at_announcement,
-                    source: ClaimSource::BlockMessage,
-                };
-            }
-            return true;
-        }
-        self.insert(hash, now, || Announcement {
-            order,
-            seen_at: started_at,
-            tip_at_announcement,
-            source: ClaimSource::BlockMessage,
-        })
-    }
-
-    /// Inserts the announcement `announced` makes for `hash`, after dropping expired ones,
-    /// unless the store is still full.
-    fn insert(
-        &mut self,
-        hash: block::Hash,
-        now: Instant,
-        announced: impl FnOnce() -> Announcement,
-    ) -> bool {
-        self.0.retain(|_, announced| {
-            now.saturating_duration_since(announced.seen_at) <= ANNOUNCEMENT_LIFETIME
+            height: AnnouncementHeight::InventoryAtTip(tip_at_announcement),
         });
-        if self.0.len() >= MAX_ANNOUNCED_BLOCKS {
-            return false;
-        }
-        self.0.insert(hash, announced());
         true
     }
 
-    /// The earliest announcement of `hash`, if one is held.
-    pub(super) fn get(&self, hash: block::Hash) -> Option<Announcement> {
-        self.0.get(&hash).copied()
+    /// Retains the candidate until receipt. Even a later delivery may still be eligible after an
+    /// earlier one's deadline, or while an earlier claim is voided by a local mining submission.
+    pub(super) fn note_block_message(
+        &mut self,
+        hash: block::Hash,
+        height: block::Height,
+        reservation: BlockReservation,
+        now: Instant,
+    ) -> bool {
+        if self.prune(now) >= MAX_ANNOUNCED_BLOCKS {
+            return false;
+        }
+        let Some(candidates) = self.admit(hash) else {
+            return false;
+        };
+        candidates.blocks.push(Announcement {
+            order: reservation.order,
+            seen_at: reservation.started_at,
+            height: AnnouncementHeight::BlockAtHeight(height),
+        });
+        true
+    }
+
+    /// Drops old sightings individually and counts the remaining delivery candidates.
+    fn prune(&mut self, now: Instant) -> usize {
+        let retained = |candidate: &Announcement| {
+            now.saturating_duration_since(candidate.seen_at) <= ANNOUNCEMENT_LIFETIME
+        };
+        let mut block_count = 0;
+        self.0.retain(|_, candidates| {
+            candidates.inv = candidates.inv.filter(retained);
+            candidates.blocks.retain(retained);
+            block_count += candidates.blocks.len();
+            candidates.inv.is_some() || !candidates.blocks.is_empty()
+        });
+        block_count
+    }
+
+    fn admit(&mut self, hash: block::Hash) -> Option<&mut Candidates> {
+        if self.0.len() >= MAX_ANNOUNCED_BLOCKS {
+            return self.0.get_mut(&hash);
+        }
+        Some(self.0.entry(hash).or_default())
+    }
+
+    pub(super) fn get(&self, hash: block::Hash) -> impl Iterator<Item = &Announcement> {
+        self.0
+            .get(&hash)
+            .into_iter()
+            .flat_map(|candidates| candidates.inv.iter().chain(&candidates.blocks))
     }
 
     /// Discards an `inv` saved as a fallback for this earlier header reservation.

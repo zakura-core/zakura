@@ -1,6 +1,7 @@
 //! How a legacy `block` message claims receipt order from the moment it started arriving.
 
 use super::*;
+use zakura_node_services::block_receipt::BlockReservation;
 
 /// The source and order a body of `hash` at `height` takes when it arrives at `now`.
 fn used(
@@ -24,14 +25,24 @@ fn receive(
     started_at: Instant,
     now: Instant,
 ) {
-    assert!(claims.note_block_message_at(hash, Some(CLAIMED), reserved, TIP, started_at, now));
+    assert!(claims.note_block_message_at(
+        hash,
+        Some(CLAIMED),
+        BlockReservation {
+            order: reserved,
+            verified_tip: TIP,
+            floor: TIP,
+            started_at
+        },
+        now
+    ));
 }
 
 #[test]
 fn a_block_message_started_before_a_rival_inv_outranks_it_though_it_completes_later() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
 
     // The rival is announced and its body arrives while the pushed block is still arriving.
     let rival_at = started_at + Duration::from_millis(300);
@@ -51,7 +62,7 @@ fn a_block_message_started_before_a_rival_inv_outranks_it_though_it_completes_la
 fn a_block_message_deadline_counts_from_its_start() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     let completed_at = started_at + Duration::from_millis(1_500);
     receive(&claims, hash(1), reserved, started_at, completed_at);
 
@@ -81,7 +92,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     let inv = claims
         .announced_order(hash(1))
         .expect("the inv is recorded");
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     receive(&claims, hash(1), reserved, later, later);
     assert_eq!(claims.announced_order(hash(1)), Some(inv));
     assert!(matches!(
@@ -91,7 +102,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     ));
 
     // The message starts before the inv, which arrives while the message is still arriving.
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     announce(&claims, hash(2), later);
     let inv = claims
         .announced_order(hash(2))
@@ -106,7 +117,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     ));
 
     // A later delivery of the same block does not move it back.
-    let again = AnnouncementClaims::reserve_order();
+    let again = order::next();
     receive(&claims, hash(2), again, completed_at, completed_at);
     announce(&claims, hash(2), completed_at);
     assert_eq!(claims.announced_order(hash(2)), Some(reserved));
@@ -122,20 +133,14 @@ fn a_block_keeps_the_earlier_of_its_header_claim_and_its_block_message() {
     let header = claims
         .claimed_order(hash(1))
         .expect("the header is claimed");
-    receive(
-        &claims,
-        hash(1),
-        AnnouncementClaims::reserve_order(),
-        now,
-        now,
-    );
+    receive(&claims, hash(1), order::next(), now, now);
     assert_eq!(
         used(&claims, hash(1), CLAIMED, now),
         Some((ClaimSource::Header, header))
     );
 
     // The message started before the header was claimed.
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     claim(&claims, hash(2), now);
     receive(&claims, hash(2), reserved, now, now);
     assert_eq!(
@@ -149,7 +154,7 @@ fn a_block_message_outlives_an_earlier_header_claim_that_is_not_applied() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     receive(&claims, hash(1), reserved, now, now);
     assert!(claims
         .claimed_order(hash(1))
@@ -166,7 +171,7 @@ fn a_block_message_outlives_an_earlier_header_claim_that_is_not_applied() {
 fn a_rival_committed_while_a_block_arrives_does_not_move_it_out_of_the_window() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
 
     // The rival at the same height commits and raises the tip before the block completes.
     let rival_at = started_at + Duration::from_millis(300);
@@ -185,14 +190,7 @@ fn only_block_messages_just_above_the_tip_at_their_start_are_recorded() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     let note = |index, height: Option<block::Height>| {
-        claims.note_block_message_at(
-            hash(index),
-            height,
-            AnnouncementClaims::reserve_order(),
-            TIP,
-            now,
-            now,
-        )
+        claims.note_block_message_at(hash(index), height, claims.reserve_block_message(TIP), now)
     };
 
     for (index, height) in [None, Some(99), Some(100), Some(103), Some(5_000)]
@@ -220,7 +218,7 @@ fn only_block_messages_just_above_the_tip_at_their_start_are_recorded() {
 fn a_mined_block_outranks_an_earlier_block_message_at_its_height() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     receive(&claims, hash(1), reserved, now, now);
 
     let mined = claims.mark_mined(hash(3), CLAIMED, order::next());
@@ -243,7 +241,7 @@ fn a_mined_block_outranks_an_earlier_block_message_at_its_height() {
 fn a_reservation_that_is_never_noted_has_no_effect() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    let unused = AnnouncementClaims::reserve_order();
+    let unused = order::next();
 
     announce(&claims, hash(1), now);
     let inv = claims
@@ -267,13 +265,7 @@ fn a_full_store_refuses_a_new_block_message() {
     for index in 0..MAX_ANNOUNCED_BLOCKS {
         announce(&claims, hash(index), now);
     }
-    receive(
-        &claims,
-        hash(MAX_ANNOUNCED_BLOCKS),
-        AnnouncementClaims::reserve_order(),
-        now,
-        now,
-    );
+    receive(&claims, hash(MAX_ANNOUNCED_BLOCKS), order::next(), now, now);
     assert_eq!(claims.announced_order(hash(MAX_ANNOUNCED_BLOCKS)), None);
 }
 
@@ -281,7 +273,7 @@ fn a_full_store_refuses_a_new_block_message() {
 fn a_block_message_taking_over_a_later_inv_keeps_the_tip_at_its_start() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
 
     // A rival at the same height commits, then another peer announces this block at the new tip.
     let inv_at = started_at + Duration::from_millis(500);
@@ -299,9 +291,9 @@ fn a_block_message_taking_over_a_later_inv_keeps_the_tip_at_its_start() {
 fn an_expired_reservation_does_not_displace_a_usable_one() {
     let claims = AnnouncementClaims::default();
     let slow_start = Instant::now();
-    let slow = AnnouncementClaims::reserve_order();
+    let slow = order::next();
     let fast_start = slow_start + Duration::from_millis(300);
-    let fast = AnnouncementClaims::reserve_order();
+    let fast = order::next();
     receive(
         &claims,
         hash(1),
@@ -329,7 +321,7 @@ fn a_usable_block_message_replaces_an_expired_inv() {
         .expect("the inv is recorded");
 
     let started_at = inv_at + Duration::from_millis(1_500);
-    let reserved = AnnouncementClaims::reserve_order();
+    let reserved = order::next();
     let completed_at = inv_at + CLAIM_BODY_DEADLINE + Duration::from_millis(500);
     receive(&claims, hash(1), reserved, started_at, completed_at);
     assert!(inv < reserved);
@@ -337,5 +329,114 @@ fn a_usable_block_message_replaces_an_expired_inv() {
         used(&claims, hash(1), CLAIMED, completed_at),
         Some((ClaimSource::BlockMessage, reserved)),
         "the block ranks as if it had never been announced by inv",
+    );
+}
+
+/// Exercise the same verifier decision with every pair of sources in both arrival orders.
+#[tokio::test(start_paused = true)]
+async fn verifier_uses_the_later_sighting_after_the_earlier_deadline() {
+    use ClaimSource::{BlockMessage, Header, Inv};
+    for (first, second) in [
+        (BlockMessage, Inv),
+        (Inv, BlockMessage),
+        (Header, Inv),
+        (Inv, Header),
+        (Header, BlockMessage),
+        (BlockMessage, Header),
+        (BlockMessage, BlockMessage),
+    ] {
+        let claims = AnnouncementClaims::default();
+        let hash = hash(1);
+        let observe = |source| match source {
+            Header => {
+                claims.begin([(hash, CLAIMED)], TIP).commit();
+                None
+            }
+            Inv => {
+                claims.note_announcement(hash, TIP);
+                None
+            }
+            BlockMessage => Some(claims.reserve_block_message(TIP)),
+        };
+        let first_transfer = observe(first);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let second_transfer = observe(second);
+        tokio::time::advance(Duration::from_millis(450)).await;
+        for transfer in [first_transfer, second_transfer].into_iter().flatten() {
+            assert!(claims.note_block_message(hash, Some(CLAIMED), transfer));
+        }
+        let (source, early) = used(&claims, hash, CLAIMED, Instant::now()).unwrap();
+        assert_eq!(source, first);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let (source, later) = used(&claims, hash, CLAIMED, Instant::now()).unwrap();
+        assert_eq!(source, second);
+        assert!(
+            later > early,
+            "the expired order from {first:?} must yield to {second:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rollback_distinguishes_new_transfers_from_those_already_in_flight() {
+    let claims = AnnouncementClaims::default();
+    let in_flight = claims.reserve_block_message(TIP);
+    claims.note_announcement(hash(5), CLAIMED);
+    // Same current best tip for both transfers; only the second started after the rollback.
+    let after_rollback = claims.reserve_block_message(TIP);
+    assert!(claims.note_block_message(hash(1), Some(CLAIMED), in_flight));
+    assert!(!claims.note_block_message(hash(2), Some(CLAIMED), after_rollback));
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, Instant::now()),
+        Some((ClaimSource::BlockMessage, in_flight.order))
+    );
+    assert_eq!(used(&claims, hash(2), CLAIMED, Instant::now()), None);
+    // A block above the remembered floor can qualify during the rollback.
+    let higher = block::Height(TIP.0 + 2);
+    assert!(claims.note_block_message(hash(3), Some(higher), claims.reserve_block_message(TIP)));
+    assert!(used(&claims, hash(3), higher, Instant::now()).is_some());
+    assert_eq!(used(&claims, hash(3), CLAIMED, Instant::now()), None);
+}
+
+#[test]
+fn an_inventory_sighting_outside_its_window_allows_an_eligible_transfer() {
+    let claims = AnnouncementClaims::default();
+    let height = block::Height(103);
+    claims.note_announcement(hash(1), block::Height(100));
+    let transfer = claims.reserve_block_message(block::Height(101));
+    assert!(claims.note_block_message(hash(1), Some(height), transfer));
+    assert_eq!(
+        used(&claims, hash(1), height, Instant::now()),
+        Some((ClaimSource::BlockMessage, transfer.order))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_transfers_share_a_bounded_budget_and_leave_room_for_inventory() {
+    let claims = AnnouncementClaims::default();
+    for _ in 0..MAX_ANNOUNCED_BLOCKS {
+        assert!(claims.note_block_message(
+            hash(1),
+            Some(CLAIMED),
+            claims.reserve_block_message(TIP)
+        ));
+    }
+    let complete =
+        |hash| claims.note_block_message(hash, Some(CLAIMED), claims.reserve_block_message(TIP));
+    assert!(
+        complete(hash(2)),
+        "a refused near-tip delivery counts against the connection limit"
+    );
+    assert_eq!(used(&claims, hash(2), CLAIMED, Instant::now()), None);
+    claims.note_announcement(hash(2), TIP);
+    assert_eq!(
+        used(&claims, hash(2), CLAIMED, Instant::now()).unwrap().0,
+        ClaimSource::Inv
+    );
+    tokio::time::advance(CLAIM_BODY_DEADLINE * 2 + Duration::from_millis(1)).await;
+    assert!(complete(hash(3)));
+    assert_eq!(
+        used(&claims, hash(3), CLAIMED, Instant::now()).unwrap().0,
+        ClaimSource::BlockMessage
     );
 }

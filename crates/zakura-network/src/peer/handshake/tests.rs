@@ -1411,6 +1411,7 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
     let reservation = |order| BlockReservation {
         order,
         verified_tip: block::Height(0),
+        floor: block::Height(0),
         started_at: tokio::time::Instant::now(),
     };
     let deliver = |connection: &mut ConnectionAnnouncements,

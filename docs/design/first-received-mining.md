@@ -50,9 +50,10 @@ The reservation is called a claim. Six rules define it:
   the verified tip.
 - **A legacy `block` message claims from its start.** When the 24-byte header
   of a `block` message is read, before its body arrives, the connection
-  reserves the next order and notes the time and the verified tip. Once the
+  reserves the next order and notes the time, current tip, and highest tip seen. Once the
   whole message has passed its checksum and decoded, a block whose coinbase
-  height is one or two above that tip is recorded with that order and time,
+  height is one or two above the starting tip and strictly above the floor
+  at that time is recorded with that order and time,
   under the same deadline, floor and mined-block rules as an `inv`. The
   deadline counts from the message start, and the window uses the tip at the
   start, so a rival committed while the block arrives does not push it out.
@@ -73,32 +74,25 @@ The reservation is called a claim. Six rules define it:
   the transfer. The body must reach the verifier within two seconds of the
   receiver reading the message header. Only a fully verified block can use
   that credit in an equal-work tie.
-- **Each block keeps its earliest claim of each kind, and neither is
-  renewed.** A header claim, once made, is never replaced or renewed by
-  delivering the header again. An `inv` for a block that already has a header
-  claim or a legacy record records nothing. A `block` message that is still
-  inside its deadline replaces a legacy record that reserved a later order or
-  has expired, so a block is never ranked behind an announcement that arrived
-  while its body was still arriving, a later delivery cannot move it back, and
-  an expired claim never displaces a usable one. Taking a later reservation
-  over an expired `inv` gives the block only what the `block` message alone
-  would. It is recorded even next to an earlier header claim, so it still
-  applies if that header's apply fails.
-  Reading a claim does not use it up, so an invalid body under the same hash
-  cannot take it. A body whose block holds both kinds takes the earlier order
-  among those still in force, so a legacy record never makes the outcome worse
-  than the header claim alone.
+- **The verifier chooses the earliest eligible claim when the body arrives.**
+  The first native header, the first single-block `inv`, and each admitted
+  block transfer retain their own order and deadline. Repeated headers and
+  inventory announcements keep their original deadlines. A later claim can
+  still be valid when an earlier one expires between decode and verification.
+  Reading a claim leaves it available for another delivery. A transfer that
+  began before a rival advanced the floor to its height can still win the tie.
+  A new transfer at that same height after a rollback receives no claim.
 
   The header table holds 64 claims. When it is full it refuses new claims and
   never drops old ones. A claim is removed when no apply covering it
-  succeeds, or at the first header apply or legacy `inv` after the verified
-  tip passes its height, where no new claim can be made. That floor is the
+  succeeds, or when a later observation raises the verified tip above its height, where no new claim can be made. That floor is the
   highest verified tip seen and never goes down, so after a rollback blocks at
   or below it get no claim and are ranked by arrival until the tip passes it
   again.
 
-  The legacy store, shared by `inv`s and `block` messages, holds 512 blocks. Entries older than 4 seconds, twice the
-  body deadline, are dropped when a new block is recorded, so a late body is
+  The legacy store holds up to 512 distinct hashes and 512 block-transfer
+  candidates in total. Each hash can also have its first inventory sighting.
+  Candidates older than four seconds are pruned on insertion, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
   Each legacy connection passes at most 4 `inv`s and near-tip `block`
   messages, together, per 2 seconds to the store, leaving room for both

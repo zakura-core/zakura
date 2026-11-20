@@ -4,7 +4,7 @@ use std::{error::Error, fmt};
 use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::{DateTime, Utc};
-use tokio::time::Instant;
+pub use zakura_node_services::block_receipt::BlockReservation;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::sync::Arc;
@@ -27,18 +27,6 @@ use proptest_derive::Arbitrary;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::serialization::arbitrary::datetime_full;
-
-/// A place in the node's block receipt order, reserved when a received `block` message started
-/// arriving. See [`crate::BlockAnnouncements::block_started`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BlockReservation {
-    /// The receipt order the node reserved.
-    pub order: u64,
-    /// The node's verified tip when the order was reserved.
-    pub verified_tip: block::Height,
-    /// When the order was reserved, which is when the message's header was read.
-    pub started_at: Instant,
-}
 
 /// A block in a `block` message, with its hash computed once when the message is made.
 ///

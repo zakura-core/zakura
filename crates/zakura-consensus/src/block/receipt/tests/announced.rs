@@ -116,13 +116,15 @@ fn the_earlier_of_a_header_claim_and_an_inv_wins() {
         Some((ClaimSource::Inv, inv))
     );
 
-    // The header arrives before the inv, which then records nothing.
+    // The header arrives first; the inventory sighting is retained as a fallback.
     claim(&claims, hash(2), now);
     announce(&claims, hash(2), later);
     let header = claims
         .claimed_order(hash(2))
         .expect("the header is claimed");
-    assert_eq!(claims.announced_order(hash(2)), None);
+    assert!(claims
+        .announced_order(hash(2))
+        .is_some_and(|inv| header < inv));
     assert_eq!(
         used(&claims, hash(2), CLAIMED, later),
         Some((ClaimSource::Header, header))

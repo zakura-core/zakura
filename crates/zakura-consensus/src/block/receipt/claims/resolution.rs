@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use zakura_chain::block;
 
-use super::super::order::BodyArrival;
-use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
+use super::{AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
     /// Gives a body the earliest usable reservation for its hash, without consuming it.
@@ -38,37 +37,31 @@ impl AnnouncementClaims {
             }
         };
 
-        let announced = height
-            .zip(table.announced.get(hash))
-            .filter(|(height, announced)| {
-                *height >= table.floor && in_claim_window(*height, announced.tip_at_announcement)
+        let legacy = table.announced.get(hash).filter_map(|candidate| {
+            let height = height.filter(|height| *height >= table.floor)?;
+            Some((
+                candidate.source_at(height)?,
+                height,
+                candidate.order,
+                candidate.seen_at,
+            ))
+        });
+        let header = table.by_hash.get(&hash).map(|header| {
+            (
+                ClaimSource::Header,
+                header.height,
+                header.order,
+                header.seen_at,
+            )
+        });
+        legacy
+            .chain(header)
+            .map(|(source, height, order, seen_at)| {
+                (order, classify(source, height, order, seen_at))
             })
-            .map_or(Unclaimed, |(height, announced)| {
-                classify(announced.source, height, announced.order, announced.seen_at)
-            });
-        let Some(header) = table.by_hash.get(&hash) else {
-            return announced;
-        };
-        let header = classify(
-            ClaimSource::Header,
-            header.height,
-            header.order,
-            header.seen_at,
-        );
-        // A `block` message can record a legacy reservation later than a header claim, so the
-        // body takes the earlier usable order. A usable claim ranks ahead of a failed one, and
-        // a failed one ahead of none, so metrics report a failure when no claim is usable. On a
-        // tie the legacy claim is reported.
-        let rank = |claim: &ClaimOutcome| match claim {
-            Used { order, .. } => (0, *order),
-            Expired { .. } | Voided { .. } => (1, 0),
-            Unclaimed => (2, 0),
-        };
-        if rank(&header) < rank(&announced) {
-            header
-        } else {
-            announced
-        }
+            // Prefer a usable claim. If all failed, report the earliest eligible sighting for metrics.
+            .min_by_key(|(order, outcome)| (outcome.claimed_order().is_none(), *order))
+            .map_or(Unclaimed, |(_, outcome)| outcome)
     }
 }
 

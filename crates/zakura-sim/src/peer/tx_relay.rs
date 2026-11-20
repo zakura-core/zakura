@@ -5,7 +5,9 @@
 //! A peer sends its `Hello` as its [`HelloMode`] says, answers each of the
 //! node's `GetTxs` as its [`Answer`] says, and runs its steps one after
 //! another. Its `Inv`s pay its own byte bucket, as a conformant sender's
-//! do, unless a step floods them.
+//! do. No step floods them past the node's bucket: the node refills that
+//! bucket while it reads a flood, by an amount the run's schedule sets, so
+//! no peer can tell which frame overran it.
 //!
 //! Every frame a peer writes is labelled before the write, as the header
 //! and discovery peers' are: the frame model over the stream's rows for the
@@ -221,8 +223,6 @@ pub enum RelayStep {
         /// Which stream.
         data: bool,
     },
-    /// Unpaced `Inv`s past the node's byte bucket.
-    InvFlood,
     /// `GetTxs` for two ids the node announced, the second twice, in one
     /// write, while the peer stops reading its data stream: row 7, neutral.
     RequestTwice,
@@ -257,14 +257,13 @@ impl RelayStep {
     /// the harness's generator. The bound fillers come last: they announce
     /// tens of thousands of ids. The header faults close at once, one per
     /// row and fault.
-    pub const FAULTS: [RelayStep; 26] = [
+    pub const FAULTS: [RelayStep; 25] = [
         RelayStep::BadHello,
         RelayStep::UnrequestedTx { tx: 0 },
         RelayStep::UnrequestedNotFound,
         RelayStep::MalformedInv,
         RelayStep::UndeclaredType { data: true },
         RelayStep::UndeclaredType { data: false },
-        RelayStep::InvFlood,
         RelayStep::RequestTwice,
         RelayStep::TooManyRequests,
         RelayStep::FillPending,
@@ -402,7 +401,7 @@ const STEP_GAP: Duration = Duration::from_millis(250);
 /// How long a peer waits after its session ended before it opens the
 /// next: well inside the node's stream open rate, and long enough that a
 /// park's refusals stay few.
-const REOPEN_WAIT: Duration = Duration::from_secs(30);
+const REOPEN_WAIT: Duration = Duration::from_secs(10);
 
 /// How long a scripted reopen waits between ending a session and opening
 /// the next.
@@ -1287,25 +1286,6 @@ impl RelayPeer {
                 } else {
                     (Vec::new(), vec![out])
                 }
-            }
-            RelayStep::InvFlood => {
-                let at = now();
-                let mut frames = Vec::new();
-                let mut over = 0;
-                // Past the bucket by 32 frames, about 2 MB, so the node's
-                // refill while it reads the write can't cover the overrun.
-                while over < 32 {
-                    let ids: Vec<(UnminedTxId, u32)> = (0..MAX_INV_ENTRIES)
-                        .map(|_| (self.fresh(connection), FAKE_SIZE))
-                        .collect();
-                    let mut out = Out::conformant(&TxRelayMessage::Inv(ids));
-                    if !connection.receiver.try_pay(out.payload.len() as u64, at) {
-                        out.family = Labels::of(Label::OverRate);
-                        over += 1;
-                    }
-                    frames.push(out);
-                }
-                (frames, Vec::new())
             }
             RelayStep::RequestTwice => {
                 if !hello {

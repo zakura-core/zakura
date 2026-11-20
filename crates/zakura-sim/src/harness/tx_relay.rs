@@ -182,11 +182,12 @@ impl Default for RelayScenario {
 }
 
 /// The node's config: production defaults on Regtest, with `tx-relay` on,
-/// and block sync's congestion window and the default stream window cut to
-/// 1 MiB. Neither service runs here, but the largest kind's share sets every
-/// stream's receive window, which is the bulk of the `Inv` bucket's depth.
-/// So a peer that floods its `Inv`s overruns the bucket after a few
-/// megabytes, not after the tens of megabytes production's shares allow.
+/// block sync's congestion window and the default stream window cut to
+/// 1 MiB, and the smallest QUIC send window. Block sync doesn't run here,
+/// but the largest kind's share sets every stream's receive window, which
+/// is the bulk of the `Inv` bucket's depth. The send window holds the
+/// node's data writer on a body a peer doesn't read, so the answers behind
+/// it queue unstarted.
 pub fn node_config() -> Config {
     let mut config = Config {
         network: Network::new_regtest(Default::default()),
@@ -196,6 +197,7 @@ pub fn node_config() -> Config {
     config.zakura.quic.stream_receive_window_bytes = 1024 * 1024;
     config.zakura.block_sync.bbr_max_cwnd_bytes = 1024 * 1024;
     config.zakura.block_sync.floor_bypass_slots = 0;
+    config.zakura.quic.send_window_bytes = 64 * 1024;
     config
 }
 
@@ -889,14 +891,24 @@ pub const NEUTRAL_WITNESSES: [(&str, Prefix); 5] = [
 /// A peer that never answers: its first stall parks its session, and the
 /// session its park readmits stalls again, which closes its connection.
 pub const STALL_WITNESS: Prefix = || {
-    let never = answers(false)
-        .iter()
-        .position(|answer| *answer == Answer::Never)
-        .expect("every answer is listed");
-    let never = u8::try_from(never).expect("a few answers");
-    composed_prefix(0, 4, never | 0x40, &[(0, RelayStep::AnnounceAll)])
-        .expect("the witness fits its grammar")
+    composed_prefix(
+        0,
+        4,
+        answer_bits(Answer::Never, false) | 0x40,
+        &[(0, RelayStep::AnnounceAll)],
+    )
+    .expect("the witness fits its grammar")
 };
+
+/// The answer byte's bits that pick `chosen` among the answers a peer
+/// with `faults` draws from.
+fn answer_bits(chosen: Answer, faults: bool) -> u8 {
+    let index = answers(faults)
+        .iter()
+        .position(|answer| *answer == chosen)
+        .expect("every answer is listed");
+    u8::try_from(index).expect("a few answers")
+}
 
 /// Peer 0's `steps` under node byte `node`, peers byte `peers` and answer
 /// byte `answer`, with no helper unless `peers` asks for one.
@@ -926,11 +938,23 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
             &[WAIT_LONG, RelayStep::TooManyRequests, WAIT_LONG],
         )
     }),
+    // The peer never answers, so the node's requests drain nothing from
+    // the set before its first stall parks the peer.
     (properties::PENDING_WITHIN_BOUND, || {
-        steps_prefix(0, 0x80, 0, &[RelayStep::FillPending, WAIT_LONG])
+        steps_prefix(
+            0,
+            0x80,
+            answer_bits(Answer::Never, true),
+            &[RelayStep::FillPending, WAIT_LONG],
+        )
     }),
     (properties::SKIP_SET_WITHIN_BOUND, || {
-        steps_prefix(0, 0x80, 0, &[RelayStep::FillKnown, WAIT_LONG])
+        steps_prefix(
+            0,
+            0x80,
+            answer_bits(Answer::Never, true),
+            &[RelayStep::FillKnown, WAIT_LONG],
+        )
     }),
     // A body under another id than the one requested, which the node must
     // not submit.
@@ -983,12 +1007,13 @@ pub const DOMAIN_WITNESSES: [(&str, Prefix); 11] = [
 ];
 
 /// `tx-relay/wire`'s step budget: room for a script of [`COMPOSED_SLOTS`]
-/// steps and a park's three minutes.
-pub const BUDGET: u64 = 400_000;
+/// steps.
+pub const BUDGET: u64 = 150_000;
 
-/// The budget of a scenario that fills a pending set or a skip set, or
-/// floods: each moves tens of thousands of ids.
-pub const FLOOD_BUDGET: u64 = 1_500_000;
+/// The budget of a scenario whose peer never answers, or that fills a
+/// pending set or a skip set: room for a park's three minutes, or for tens
+/// of thousands of ids.
+pub const LONG_BUDGET: u64 = 400_000;
 
 impl Subsystem for TxRelayWire {
     const NAME: &'static str = "tx-relay/wire";
@@ -998,19 +1023,18 @@ impl Subsystem for TxRelayWire {
     type Scenario = RelayScenario;
     type Prepared = SharedRelay;
 
-    /// The default scheduler, [`BUDGET`] or [`FLOOD_BUDGET`] steps, and a
+    /// The default scheduler, [`BUDGET`] or [`LONG_BUDGET`] steps, and a
     /// timer cap past a park, so the drain still reaches a readmitted
     /// session's stall.
     fn config(scenario: &RelayScenario) -> RunConfig {
-        let floods = scenario.peers.iter().any(|peer| {
-            peer.steps.iter().any(|step| {
-                matches!(
-                    step,
-                    RelayStep::InvFlood | RelayStep::FillPending | RelayStep::FillKnown
-                )
-            })
+        let long = scenario.peers.iter().any(|peer| {
+            peer.answer == Answer::Never
+                || peer
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, RelayStep::FillPending | RelayStep::FillKnown))
         });
-        let budget = if floods { FLOOD_BUDGET } else { BUDGET };
+        let budget = if long { LONG_BUDGET } else { BUDGET };
         RunConfig {
             scheduler: SchedulerConfig::default(),
             budget,

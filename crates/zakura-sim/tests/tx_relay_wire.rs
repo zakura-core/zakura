@@ -269,7 +269,7 @@ fn each_neutral_close_closes_in_its_witness() {
 const UNREACHED: [(&str, &str); 0] = [];
 
 /// The witnesses of the generated IDs: the row witnesses, a header fault
-/// of each row, an undeclared type on each stream, an `Inv` flood, and an
+/// of each row, an undeclared type on each stream, and an
 /// honest exchange.
 fn generated_witnesses() -> Vec<[u8; COMPOSED_BYTES]> {
     let mut witnesses: Vec<[u8; COMPOSED_BYTES]> = ROW_WITNESSES
@@ -293,7 +293,6 @@ fn generated_witnesses() -> Vec<[u8; COMPOSED_BYTES]> {
             &[RelayStep::UndeclaredType { data }, WAIT],
         ));
     }
-    witnesses.push(prefix(0, 0x80, 0, &[RelayStep::InvFlood, WAIT]));
     witnesses.push(prefix(0, 0x80, 0, &[RelayStep::UnrequestedNotFound, WAIT]));
     witnesses.push(prefix(
         0,

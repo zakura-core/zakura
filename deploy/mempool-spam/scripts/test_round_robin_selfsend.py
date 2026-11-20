@@ -51,7 +51,7 @@ class FirstSeenMatrix(unittest.TestCase):
         rpc = fake_rpc({"http://a": "mempool", "http://dead": "dead", "http://b": "mempool"})
         with mock.patch.object(harness, "rpc_call", rpc), \
                 mock.patch.object(harness, "POLL_RPC_TIMEOUT", 0.5):
-            in_mempool, in_block = harness.first_seen_matrix(
+            in_mempool, in_block, _ = harness.first_seen_matrix(
                 nodes, TXID, duration=1.5, interval=0.05
             )
 
@@ -64,23 +64,24 @@ class FirstSeenMatrix(unittest.TestCase):
         nodes = [node("a"), node("late"), node("side")]
         rpc = fake_rpc({"http://a": "mempool", "http://late": "block", "http://side": "side"})
         with mock.patch.object(harness, "rpc_call", rpc):
-            in_mempool, in_block = harness.first_seen_matrix(
+            in_mempool, in_block, _ = harness.first_seen_matrix(
                 nodes, TXID, duration=1.0, interval=0.05
             )
 
         self.assertEqual(set(in_mempool), {"a"})
         self.assertEqual(set(in_block), {"late", "side"})
 
-    def test_an_answer_after_the_window_is_a_miss(self):
+    def test_an_answer_after_the_window_is_not_a_sighting(self):
         # The mempool check takes 0.2 s of a 0.3 s window, so the fallback
         # check gets only what's left and can't count a sighting at 0.4 s.
+        # The cut-short check settles nothing, so the node is unobserved.
         rpc = fake_rpc({"http://slow": "slow"})
         with mock.patch.object(harness, "rpc_call", rpc):
-            in_mempool, in_block = harness.first_seen_matrix(
+            in_mempool, in_block, unobserved = harness.first_seen_matrix(
                 [node("slow")], TXID, duration=0.3, interval=0.05
             )
 
-        self.assertEqual((in_mempool, in_block), ({}, {}))
+        self.assertEqual((in_mempool, in_block, unobserved), ({}, {}, ["slow"]))
 
 
 class Report(unittest.TestCase):
@@ -94,6 +95,7 @@ class Report(unittest.TestCase):
                 "impl": "zakura",
                 "first_seen": {"a": 0.0, "b": 1.5},
                 "seen_in_block": {"late": 21.0},
+                "unobserved": [],
                 "missing": [],
                 "seen_all": True,
             },
@@ -101,6 +103,7 @@ class Report(unittest.TestCase):
 
         summary = build_report(events)["summary"]
 
+        self.assertEqual(summary["seen_all"], 1)
         self.assertEqual(summary["missed"], 0)
         self.assertEqual(summary["mempool_all"], 0)
         self.assertEqual(summary["block_first_by_node"], {"late": 1})

@@ -91,6 +91,8 @@ struct Shared {
     /// Undecided transactions from each peer, counted from the reservation to
     /// the verdict.
     per_peer: std::sync::Mutex<HashMap<QueueSource, usize>>,
+    /// Items this adapter is bringing in, by id. See [`Fetching`].
+    fetching: std::sync::Mutex<HashMap<UnminedTxId, usize>>,
     /// For the already-mined check before a fetch. The read state service
     /// is not `Sync`, so each fetch clones it under this lock.
     read_state: std::sync::Mutex<ReadState>,
@@ -133,6 +135,7 @@ impl CoreMempool {
                 best_tip,
                 max_transaction_bytes,
                 per_peer: std::sync::Mutex::new(HashMap::new()),
+                fetching: std::sync::Mutex::new(HashMap::new()),
                 read_state: std::sync::Mutex::new(read_state),
                 expose_peer_addresses,
                 misbehavior,
@@ -186,7 +189,8 @@ async fn queue_request(shared: Arc<Shared>, items: Vec<Gossip>) -> Result<Respon
     let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
     let mut answers = Vec::with_capacity(items.len());
     for item in items {
-        answers.push(queue(shared.clone(), item, None, None, deadline).await);
+        let (fetching, _) = Fetching::start(&shared, item.id());
+        answers.push(queue(shared.clone(), item, None, None, fetching, deadline).await);
     }
     Ok(Response::Queued(answers))
 }
@@ -238,23 +242,32 @@ async fn peer_batch(
     // queues a batch at once: at most the peer's limit of them, and the rest
     // are dropped without asking the core. Slots that free up while the
     // batch is worked on take nothing more from it.
-    let held: Vec<(Gossip, PeerSlot)> = fresh
-        .into_iter()
-        .filter(|item| !rejected.contains(&item.id()))
-        .filter_map(|item| match PeerSlot::take(&shared, &source) {
-            Some(slot) => Some((item, slot)),
-            None => {
-                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
-                None
-            }
-        })
-        .collect();
-    for (item, slot) in held {
+    let mut held = Vec::new();
+    for item in fresh {
+        let id = item.id();
+        if rejected.contains(&id) {
+            continue;
+        }
+        // Today's pool answers an id it is already bringing in as queued,
+        // before its limits, so such an id takes none of the peer's slots and
+        // is none of its refusals. This looks after the lookup, so a fetch
+        // that ended while it waited no longer hides the id.
+        let (fetching, already) = Fetching::start(&shared, id);
+        if already {
+            continue;
+        }
+        match PeerSlot::take(&shared, &source) {
+            Some(slot) => held.push((item, slot, fetching)),
+            None => metrics::counter!("mempool.full_queue.per_peer.total").increment(1),
+        }
+    }
+    for (item, slot, fetching) in held {
         let _ = queue(
             shared.clone(),
             item,
             Some(source.clone()),
             Some(slot),
+            fetching,
             deadline,
         )
         .await;
@@ -480,13 +493,15 @@ fn timed_out() -> BoxError {
 
 /// Queues `item`: reserves its slot in the core and answers the first stage,
 /// and leaves a task that brings the body in and answers the second. `slot`
-/// is its peer's slot, held until the second stage is answered. Every wait
-/// for the core ends at `deadline`.
+/// is its peer's slot and `fetching` its record as being brought in, both
+/// held until the second stage is answered. Every wait for the core ends at
+/// `deadline`.
 async fn queue(
     shared: Arc<Shared>,
     item: Gossip,
     from: Option<QueueSource>,
     slot: Option<PeerSlot>,
+    fetching: Fetching,
     deadline: tokio::time::Instant,
 ) -> Result<Receiver, BoxError> {
     let reserved = shared.handle.reserve(item.id(), deadline).await;
@@ -503,9 +518,56 @@ async fn queue(
         // So does this.
         let result = bring_in(shared, reservation, item, from, deadline).await;
         drop(slot);
+        drop(fetching);
         let _ = answer.send(result);
     });
     Ok(receiver)
+}
+
+/// One item this adapter is bringing in, from when it takes its slots until
+/// its second stage is answered: today's downloader's queued set, which it
+/// checks before a peer's limit. Dropping it forgets the item.
+struct Fetching {
+    shared: Arc<Shared>,
+    id: UnminedTxId,
+}
+
+impl Fetching {
+    /// Records that an item with id `id` is being brought in, and says
+    /// whether another item already was.
+    fn start(shared: &Arc<Shared>, id: UnminedTxId) -> (Self, bool) {
+        let mut fetching = shared
+            .fetching
+            .lock()
+            .expect("no code panics while holding the fetching ids");
+        let count = fetching.entry(id).or_default();
+        let already = *count > 0;
+        *count += 1;
+        (
+            Self {
+                shared: shared.clone(),
+                id,
+            },
+            already,
+        )
+    }
+}
+
+impl Drop for Fetching {
+    /// Forgets the item, and the id once no item has it.
+    fn drop(&mut self) {
+        let mut fetching = self
+            .shared
+            .fetching
+            .lock()
+            .expect("no code panics while holding the fetching ids");
+        if let Some(count) = fetching.get_mut(&self.id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                fetching.remove(&self.id);
+            }
+        }
+    }
 }
 
 /// One undecided transaction counted against a peer, from its reservation
@@ -893,8 +955,98 @@ mod tests {
             Some(peer) => Some(PeerSlot::take(&shared, peer).ok_or(MempoolError::FullQueue)?),
             None => None,
         };
+        let (fetching, _) = Fetching::start(&shared, item.id());
         let deadline = tokio::time::Instant::now() + RATE_LIMIT_DELAY;
-        super::queue(shared, item, from, slot, deadline).await
+        super::queue(shared, item, from, slot, fetching, deadline).await
+    }
+
+    /// A distinct id for the `n`th id a test needs.
+    fn filler_id(n: usize) -> UnminedTxId {
+        let mut hash = [0xf0; 32];
+        hash[..8].copy_from_slice(
+            &u64::try_from(n)
+                .expect("a test's id count fits")
+                .to_be_bytes(),
+        );
+        UnminedTxId::Legacy(zakura_chain::transaction::Hash(hash))
+    }
+
+    /// `peer`'s whole share of undecided transactions, taken by the test.
+    fn fill_share(core: &CoreMempool, peer: &QueueSource) -> Vec<PeerSlot> {
+        (0..MAX_INBOUND_CONCURRENCY_PER_PEER)
+            .map(|_| PeerSlot::take(&core.shared, peer).expect("room in the share"))
+            .collect()
+    }
+
+    /// An id this adapter is already bringing in takes no slot of a peer
+    /// that advertises it too and counts no full-queue refusal, as today's
+    /// pool answers it as queued before its limits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_id_being_brought_in_takes_no_slot() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let readings = super::super::super::tests::Readings::default();
+        let _recording = metrics::set_default_local_recorder(&readings);
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let (_fetching, _) = Fetching::start(&core.shared, filler_id(1));
+        let _share = fill_share(&core, &peer);
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(filler_id(1))],
+            source: peer.clone(),
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its id up");
+        };
+        let _ = reply.send(Default::default());
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
+        assert_eq!(readings.get("mempool.full_queue.per_peer.total"), None);
+        assert_eq!(
+            core.shared
+                .per_peer
+                .lock()
+                .expect("no test panics holding the per-peer counts")
+                .get(&peer)
+                .copied(),
+            Some(MAX_INBOUND_CONCURRENCY_PER_PEER),
+            "only the test's own share is taken"
+        );
+    }
+
+    /// An id whose fetch ends while the batch waits on its lookup is no
+    /// longer being brought in, so the batch reserves it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fetch_that_ends_during_the_lookup_does_not_hide_its_id() {
+        use zakura_node_services::mempool::port::{pool_port, PoolCommand};
+
+        let (handle, mut inbox) = pool_port();
+        let mut core = adapter_on(handle);
+        publish_empty(&inbox);
+        let peer = QueueSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let (fetching, _) = Fetching::start(&core.shared, filler_id(1));
+        let request = tokio::spawn(core.call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Id(filler_id(1))],
+            source: peer,
+        }));
+        let Some(PoolCommand::RejectedIds { reply, .. }) = inbox.next().await else {
+            panic!("the batch looks its id up");
+        };
+        // The other fetch fails while the lookup waits.
+        drop(fetching);
+        let _ = reply.send(Default::default());
+        let reserve = tokio::time::timeout(std::time::Duration::from_secs(5), inbox.next())
+            .await
+            .expect("the batch reserves the id rather than skipping it");
+        let Some(PoolCommand::Reserve { tx_id, .. }) = reserve else {
+            panic!("the batch reserves the id");
+        };
+        assert_eq!(tx_id, filler_id(1));
+        // The reply is dropped, so the core reads as stopped and the batch ends.
+        let answer = request.await.expect("the task does not panic");
+        assert!(matches!(answer, Ok(Response::Queued(_))));
     }
 
     /// A snapshot at height 1 with nothing pooled, so the adapter is on.

@@ -3995,18 +3995,19 @@ impl ZakuraProtocolHandler {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
-                let admitted_capabilities =
-                    self.registry
-                        .add_escalated_peer(Peer::new_with_service_streams(
-                            conn_id,
-                            peer_id.clone(),
-                            remote_ip,
-                            opened_capabilities,
-                            context.direction,
-                            std::mem::take(&mut service_streams),
-                            connection_token.clone(),
-                            close_cause.clone(),
-                        ));
+                let admitted_capabilities = self.registry.add_escalated_peer(
+                    Peer::new_with_service_streams(
+                        conn_id,
+                        peer_id.clone(),
+                        remote_ip,
+                        opened_capabilities,
+                        context.direction,
+                        std::mem::take(&mut service_streams),
+                        connection_token.clone(),
+                        close_cause.clone(),
+                    )
+                    .with_rtt_reader(Some(connection.rtt_reader())),
+                );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
@@ -4125,7 +4126,8 @@ impl ZakuraProtocolHandler {
                                     service_streams,
                                     connection_token.clone(),
                                     close_cause.clone(),
-                                ),
+                                )
+                                .with_rtt_reader(Some(connection.rtt_reader())),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
@@ -4249,7 +4251,8 @@ impl ZakuraProtocolHandler {
                                 service_streams,
                                 connection_token.clone(),
                                 close_cause.clone(),
-                            ),
+                            )
+                            .with_rtt_reader(Some(connection.rtt_reader())),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                     }

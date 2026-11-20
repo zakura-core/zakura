@@ -59,9 +59,8 @@ fn storage(name: &str, source: &str, scenario: &StorageScenario, plan: &[u8]) ->
 /// the stream, so a fuzz campaign starts from inputs that use the whole
 /// action grammar. `header-storage-stale-prepare` is the trigger scenario
 /// under the slice whose run ends a prepare after its round retired, while
-/// the same peer's next round is active. The locator-dropped, apply-at-close
-/// and competing-mirrors seeds are witnesses `tests/explore_state.rs` draws.
-/// `header-sync-storage-default` is the default scenario's bare prefix.
+/// the same peer's next round is active. `header-sync-storage-default` is
+/// the default scenario's bare prefix.
 fn storage_seeds() -> Vec<Seed> {
     let scenarios: [(&str, StorageScenario, usize); 9] = [
         ("header-storage-default", StorageScenario::default(), 0),
@@ -120,53 +119,26 @@ fn storage_seeds() -> Vec<Seed> {
     seeds
 }
 
-/// fuzz-12 item 7's witness seeds, `header-storage-w-*`: each action and
-/// overlap the fuzz-12 controls added, under the slice whose run shows it.
-/// Most use slice 16. The hold, the reconsider, the release and two forks
-/// use a slice whose run orders their overlap that way.
+/// fuzz-12 item 7's witness seeds, `header-storage-w-*`: each witness
+/// scenario ([`witnesses::witness_scenarios`]) under a slice of the stream,
+/// so a fuzz campaign starts from it. Most use slice 16. The hold, the
+/// reconsider, the release and the weighted fork use a slice whose run
+/// ordered their overlap that way when the seed was built. The tests search
+/// for each overlap rather than trust a slice, so a seed is a starting
+/// point, not a pinned witness. The longer fork has no seed, since its
+/// slice stopped preparing the longer branch first.
 fn witness_seeds() -> Vec<Seed> {
-    type Named = (&'static str, fn() -> StorageScenario, usize);
-    let named: [Named; 15] = [
-        ("hold-succeeds", StorageScenario::holds, 2),
-        ("reset-locator", witnesses::reset_held_locator, 16),
-        ("reset-prepare", witnesses::reset_held_prepare, 16),
-        ("reset-apply", witnesses::reset_held_apply, 16),
-        ("reset-reply", witnesses::reset_reply_hold, 16),
-        ("reconsider", witnesses::invalidate_reconsider, 20),
-        ("release", witnesses::release_after_apply, 17),
-        ("reply-hold", witnesses::reply_hold, 16),
-        ("reply-after-shutdown", witnesses::reply_after_shutdown, 16),
-        ("reply-after-close", witnesses::reply_after_close, 16),
-        ("stop-storage", witnesses::stop_with_held_apply, 16),
-        ("peer-lease-denied", witnesses::peer_lease_denied, 16),
-        ("equal-forks", witnesses::equal_forks, 16),
-        ("longer-fork", witnesses::longer_fork, 17),
-        ("weighted-fork", witnesses::weighted_fork, 17),
-    ];
-    let mut scenarios: Vec<(String, StorageScenario, usize)> = named
-        .into_iter()
-        .map(|(name, scenario, slice)| (format!("header-storage-w-{name}"), scenario(), slice))
-        .collect();
-    for (kind, allow, outcome, after) in witnesses::fault_witnesses() {
-        scenarios.push((
-            witnesses::fault_stem(kind, outcome),
-            witnesses::fault_witness(kind, allow, after),
-            16,
-        ));
-    }
-    for (prefix, classes) in [
-        ("recover", witnesses::recovery_witnesses()),
-        ("owed", witnesses::owed_recovery_witnesses()),
-    ] {
-        for (class, scenario) in classes {
-            let name = format!("header-storage-w-{prefix}-{}", class.replace(' ', "-"));
-            scenarios.push((name, scenario, 16));
-        }
-    }
     let source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs";
-    scenarios
+    witnesses::witness_scenarios()
         .into_iter()
-        .map(|(name, scenario, slice)| {
+        .filter(|(name, _)| name != "header-storage-w-longer-fork")
+        .map(|(name, scenario)| {
+            let slice = match name.as_str() {
+                "header-storage-w-hold-succeeds" => 2,
+                "header-storage-w-reconsider" => 20,
+                "header-storage-w-release" | "header-storage-w-weighted-fork" => 17,
+                _ => 16,
+            };
             let seed = storage(&name, source, &scenario, &storage_plan(slice));
             match name.as_str() {
                 "header-storage-w-stop-storage" => {

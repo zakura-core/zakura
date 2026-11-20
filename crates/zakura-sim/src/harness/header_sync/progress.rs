@@ -401,12 +401,10 @@ impl Subsystem for HeaderProgress {
             .holds_when(|progress, assume| wire_holds(&progress.0, assume))
     }
 
-    /// Each fixed mix's prefix ([`Mix::prefix`]).
+    /// One family, `drawn`, whose tag is [`PROGRESS_VERSION`]: the bytes
+    /// after it draw every mix, the fixed ones ([`Mix::prefix`]) among them.
     fn families() -> Vec<ScenarioFamily> {
-        Mix::ALL
-            .into_iter()
-            .map(|mix| ScenarioFamily::new(mix.name(), mix.prefix()))
-            .collect()
+        vec![ScenarioFamily::new("drawn", vec![PROGRESS_VERSION])]
     }
 
     /// Whether `prefix` starts with [`PROGRESS_VERSION`].

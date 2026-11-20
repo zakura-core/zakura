@@ -16,8 +16,8 @@ use support::script::{run_under, Node, OBSERVED};
 use zakura_chain::transaction::{self, UnminedTxId};
 use zakura_network::zakura::{
     tx_relay_sim::{
-        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_REQUESTS_PER_PEER, MAX_SERVES,
-        PENDING_PER_PEER, TX_RELAY_STREAMS,
+        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_SERVES, PENDING_PER_PEER,
+        TX_RELAY_STREAMS,
     },
     CloseOutcome, CloseRow, ZakuraPeerId,
 };
@@ -327,7 +327,7 @@ fn submitted(body: UnminedTxId, cooling: bool) -> Vec<TxRelayEvent> {
 #[test]
 fn requests_within_limit_breaks_in_its_bypass() {
     let state = SimState {
-        in_flight: MAX_REQUESTS_PER_PEER + 1,
+        in_flight: MAX_SERVES + 1,
         ..SimState::default()
     };
     breaks_in_its_bypass(

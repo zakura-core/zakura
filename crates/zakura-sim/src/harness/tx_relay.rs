@@ -335,6 +335,15 @@ impl TestPool {
                     let at = now() + self.verify;
                     self.deciding.push_back((at, reply, transaction));
                 }
+                PoolCommand::KnownIds { ids, reply } => {
+                    let known = self
+                        .admitted
+                        .iter()
+                        .map(|verified| verified.transaction.id())
+                        .filter(|id| ids.contains(id))
+                        .collect();
+                    let _ = reply.send(known);
+                }
                 PoolCommand::RejectedIds { reply, .. } => {
                     let _ = reply.send(Default::default());
                 }

@@ -1233,6 +1233,7 @@ impl Routine {
             effects,
             state: SimState {
                 hello_serves: state.hello.map(|hello| hello.serves),
+                window: state.window,
                 asking: state.requests.len().saturating_add(state.reserving.len()),
                 in_flight: state.in_flight(),
                 unsettled: shared.reactor.unsettled_count(peer),

@@ -10,8 +10,8 @@
 //! transport tap's log.
 //!
 //! Each property's bound or rule comes from production's constants
-//! ([`MAX_REQUESTS_PER_PEER`], [`MAX_SERVES`], [`PENDING_PER_PEER`],
-//! [`KNOWN_CAP`]), which the hook re-exports, and its wording from the
+//! ([`MAX_SERVES`], [`PENDING_PER_PEER`], [`KNOWN_CAP`]) or from the
+//! session's state, which the hook reports, and its wording from the
 //! `tx-relay` rows of the property catalogue.
 
 use std::{
@@ -23,8 +23,7 @@ use std::{
 use zakura_chain::transaction::UnminedTxId;
 use zakura_network::zakura::{
     tx_relay_sim::{
-        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_REQUESTS_PER_PEER, MAX_SERVES,
-        PENDING_PER_PEER,
+        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_SERVES, PENDING_PER_PEER,
     },
     CloseOutcome, CloseRow, NeutralCause, ZakuraPeerId,
 };
@@ -39,8 +38,8 @@ use crate::{
 };
 
 /// Ids reserving, requested or awaiting a verdict stay within
-/// [`MAX_REQUESTS_PER_PEER`] per peer, and requests within the peer's
-/// `Hello`.
+/// [`MAX_SERVES`] per peer, and requests within the peer's `Hello`. The
+/// witness fills the session's request window.
 pub const REQUESTS_WITHIN_LIMIT: &str = "tx-relay/requests-within-limit";
 /// The peer's requests the node holds unanswered stay within
 /// [`MAX_SERVES`].
@@ -85,7 +84,7 @@ pub const IDS: [&str; 11] = [
 
 /// Each property's claim, in [`IDS`] order.
 const CLAIMS: [&str; 11] = [
-    "a peer's ids reserving, requested or awaiting a verdict stay within 5 across its sessions, and a session's requests within the peer's Hello",
+    "a peer's ids reserving, requested or awaiting a verdict stay within 16 across its sessions, and a session's requests within the peer's Hello",
     "the peer's requests the node holds unanswered on a session stay within 16, the Hello the node sends",
     "a session holds at most 8,000 ids for its peer, pending or waiting for the peer's Hello",
     "a session's skip set holds at most 24,000 ids",
@@ -520,8 +519,8 @@ impl RelayEvidence {
         peak.known = peak.known.max(state.known);
         checks.push((
             REQUESTS_WITHIN_LIMIT,
-            requests >= MAX_REQUESTS_PER_PEER,
-            requests > MAX_REQUESTS_PER_PEER
+            requests >= state.window,
+            requests > MAX_SERVES
                 || state
                     .hello_serves
                     .is_some_and(|serves| state.asking > serves),

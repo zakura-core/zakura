@@ -25,10 +25,8 @@ use crate::zakura::{CloseOutcome, CustomService, ZakuraPeerId};
 /// The protocol's largest transaction, which our `Hello` names.
 pub const MAX_TX_BYTES: u32 = super::wire::MAX_TX_BYTES;
 
-/// Ids requested or awaiting a verdict for one peer, at most.
-pub const MAX_REQUESTS_PER_PEER: usize = machine::MAX_REQUESTS_PER_PEER;
-
-/// The most requests a peer may have whose answers the IO has not started.
+/// The most requests a peer may have whose answers the IO has not started,
+/// and the largest request window a session can have.
 pub const MAX_SERVES: usize = machine::MAX_SERVES;
 
 /// Ids one session may hold pending.
@@ -134,6 +132,8 @@ pub enum SimEffect {
 pub struct SimState {
     /// The requests the peer's `Hello` serves, once it arrived.
     pub hello_serves: Option<usize>,
+    /// The session's request window.
+    pub window: usize,
     /// Ids reserving or requested on the session.
     pub asking: usize,
     /// Ids reserving, requested or awaiting a verdict on the session.

@@ -387,19 +387,59 @@ pub(super) enum Unclaimed {
 /// so a claim reads what its own query asked.
 #[derive(Debug)]
 struct LiveQueries {
-    reservations: Reservations<QueryKind>,
+    reservations: Ledger,
     state: QueryState,
-    /// [`Queries::retire`] replaced this session's queries.
-    retired: bool,
 }
 
 impl LiveQueries {
     fn new() -> Self {
         Self {
-            reservations: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
+            reservations: Ledger {
+                map: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
+                retired: false,
+            },
             state: QueryState::default(),
-            retired: false,
         }
+    }
+}
+
+/// A session's reservations, and whether [`Queries::retire`] replaced them.
+///
+/// The session's end cancels its streams, then retires its queries. A
+/// transport reader already inside a read can still check one answer's
+/// header after the retirement, and the session's reader can still claim
+/// an answer it took before. Neither judges the answer: the peer sent it to
+/// a query this node asked, and the reader drops it ([`Unclaimed::Retired`]).
+/// The cancelled stream stops the transport reader at its next read, so a
+/// retired ledger lets through at most the answer in flight.
+#[derive(Debug)]
+struct Ledger {
+    map: Reservations<QueryKind>,
+    retired: bool,
+}
+
+impl Ledger {
+    /// [`Reservations::admit`] on a live ledger. A retired ledger lets an
+    /// answer through uncharged, for the reader to drop.
+    fn admit(&mut self, message_type: u16, payload_len: usize) -> Result<(), ClaimRefused> {
+        if self.retired && QueryKind::answered_by(message_type).is_some() {
+            return Ok(());
+        }
+        self.map.admit(message_type, payload_len)
+    }
+}
+
+impl std::ops::Deref for Ledger {
+    type Target = Reservations<QueryKind>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for Ledger {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
     }
 }
 
@@ -540,7 +580,7 @@ impl Queries {
     ) -> Result<ClaimedAnswer, Unclaimed> {
         // Retirement dropped the ledger that the transport reader charged
         // this frame to, so there is nothing to take or claim.
-        if live.retired {
+        if live.reservations.retired {
             return Err(Unclaimed::Retired);
         }
         if self.transport_admits {
@@ -622,17 +662,13 @@ impl Queries {
     /// Ends the session's queries: an unwritten query is skipped, and an
     /// unanswered written query resets the session. The reservations
     /// return to the pool, even while the transport reader outlives the
-    /// session. An answer the transport reader already queued claims
-    /// nothing ([`Unclaimed::Retired`]).
+    /// session. An answer that reaches the reservations after this claims
+    /// nothing ([`Ledger`]).
     pub(super) fn retire(&self) {
         self.fence.retire();
-        let retired = std::mem::replace(
-            &mut *self.lock(),
-            LiveQueries {
-                retired: true,
-                ..LiveQueries::new()
-            },
-        );
+        let mut replacement = LiveQueries::new();
+        replacement.reservations.retired = true;
+        let retired = std::mem::replace(&mut *self.lock(), replacement);
         // The exchanges take the fence's lock as they drop.
         drop(retired);
     }

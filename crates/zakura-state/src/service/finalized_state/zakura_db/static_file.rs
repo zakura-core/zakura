@@ -57,6 +57,12 @@ const MAX_STATIC_FILE_MOVE_BLOCKS: u32 = 1_000;
 /// The most body bytes one move takes, for the same reason.
 const MAX_STATIC_FILE_MOVE_BYTES: usize = 64 * 1024 * 1024;
 
+/// How many times a secondary rescans static files and retries a failed read
+/// before it treats the files as damaged. Each race with the primary ends once
+/// a rescan sees the primary's committed configs, so one rescan usually
+/// suffices; the rest cover a primary that changes the files again meanwhile.
+const SECONDARY_STATIC_FILE_RESCANS: usize = 3;
+
 /// The key of the static file tip in the [`PRUNING_METADATA`] column family.
 ///
 /// Its bytes are distinct from the other keys in that column family.
@@ -341,35 +347,38 @@ impl ZakuraDb {
         self.lowest_retained_height().unwrap_or(Height(0))
     }
 
-    /// Runs a static file `read`. The primary panics on an error, because only
-    /// damaged files cause one. A secondary can also race the primary's prunes,
-    /// truncations and crash recovery, so it rescans once and retries, then
-    /// reports the body as missing, never wrong.
+    /// Runs a static file `read`, and panics if it fails, because only damaged
+    /// files make it fail. A secondary can also race the primary's prunes,
+    /// truncations and crash recovery, so it first rescans and retries up to
+    /// [`SECONDARY_STATIC_FILE_RESCANS`] times. It doesn't report the body as
+    /// missing instead, because a reader could take damage for a pruned body or
+    /// the end of history.
     fn read_static_file<T>(
         &self,
         read: impl Fn() -> Result<Option<T>, StaticFileError>,
     ) -> Option<T> {
-        match read() {
-            Ok(found) => found,
-            Err(error) if self.db.is_read_only_secondary() => {
+        let mut result = read();
+        if self.db.is_read_only_secondary() {
+            for _ in 0..SECONDARY_STATIC_FILE_RESCANS {
+                let Err(error) = &result else {
+                    break;
+                };
                 tracing::debug!(
                     ?error,
                     "rescanning secondary static files after a failed read"
                 );
-                let retried = self
+                result = self
                     .static_files
                     .rescan(self.secondary_keep_from())
                     .and_then(|()| read());
-                retried.unwrap_or_else(|error| {
-                    tracing::warn!(?error, "a secondary static file read failed after a rescan");
-                    None
-                })
             }
-            Err(error) => panic!(
-                "static file reads check offsets against configs written by this node; an \
-                 error means the files were damaged: {error}"
-            ),
         }
+        result.unwrap_or_else(|error| {
+            panic!(
+                "static file reads check offsets and checksums against configs the primary \
+                 committed; an error that outlasts rescans means the files were damaged: {error}"
+            )
+        })
     }
 
     /// Returns `true` if `height`'s body was moved to static files, by the

@@ -428,6 +428,44 @@ fn a_secondary_reports_a_jar_that_shrank_under_it_as_missing() {
 }
 
 #[test]
+fn a_secondary_panics_on_a_damaged_body_instead_of_reporting_it_missing() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+
+    let mut primary = FinalizedState::new(&config, &network).expect("state opens");
+    commit(&mut primary, &blocks);
+    let static_dir = primary.db.path().join(STATIC_FILE_DIR);
+    let (_read_state, secondary, _non_finalized) =
+        crate::init_read_only(config, &network).expect("secondary opens alongside the primary");
+    drop(primary);
+
+    // Flip a byte inside block 1's body, in the jar data file, which is the
+    // file without a suffix.
+    let data = std::fs::read_dir(&static_dir)
+        .expect("static file dir lists")
+        .map(|entry| entry.expect("entry reads").path())
+        .find(|path| path.extension().is_none())
+        .expect("the jar has a data file");
+    let mut bytes = std::fs::read(&data).expect("data file reads");
+    bytes[10] ^= 1;
+    std::fs::write(&data, bytes).expect("data file writes");
+
+    // Rescans can't fix a damaged byte, so the read panics, as on the primary.
+    // The panic is caught so both databases still close normally.
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        secondary.block(Height(1).into())
+    }));
+    let message = read.expect_err("the read panics");
+    let message = message
+        .downcast_ref::<String>()
+        .expect("the panic message is a string");
+    assert!(message.contains("the files were damaged"), "{message}");
+}
+
+#[test]
 fn the_mover_frees_moved_files_after_the_delay_without_more_commits() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;

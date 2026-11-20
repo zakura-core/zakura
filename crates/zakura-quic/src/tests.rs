@@ -200,7 +200,7 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.local_id(), &[ALPN])
+        .client_config(server.local_id().key(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -1113,7 +1113,7 @@ fn raw_client_builder(
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(
-            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id()),
+            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id().key()),
         ))
 }
 
@@ -1928,8 +1928,9 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let victim = NodeSecretKey::generate().public();
-        let cert =
-            rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
+        let cert = rustls_pki_types::CertificateDer::from(
+            crate::tls::ed25519_spki(&victim.key()).to_vec(),
+        );
         let key = Arc::new(rustls::sign::CertifiedKey::new(
             vec![cert],
             Arc::new(Impostor(NodeSecretKey::generate())),

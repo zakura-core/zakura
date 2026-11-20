@@ -346,6 +346,7 @@ impl ZakuraNodeRecord {
         // never authenticate a dial, so its record is useless to the book.
         self.body
             .node_id
+            .key()
             .verify_strict(&body_bytes, &self.signature)
             .map_err(|_| DiscoveryRecordError::InvalidSignature)?;
         validate_record_context(&self.body, context)

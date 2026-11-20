@@ -75,7 +75,7 @@ impl SecondRequestReason {
 /// Before the first, the time left on the first request only shrinks, so a candidate that does
 /// not qualify now will not qualify by waiting. Between the two, nothing changes with time.
 fn decision_times(first_score: Duration) -> [Duration; 2] {
-    [first_score, first_score + STALL_SLACK]
+    [first_score, first_score.saturating_add(STALL_SLACK)]
 }
 
 /// Decides whether to send a second request for a block.
@@ -120,7 +120,8 @@ pub(super) fn second_request_reason(
         first_score - waited
     };
     let margin = MIN_MARGIN.max(first_score / MARGIN_SHARE);
-    (best_candidate_score + margin < remaining).then_some(SecondRequestReason::Predicted)
+    (best_candidate_score.saturating_add(margin) < remaining)
+        .then_some(SecondRequestReason::Predicted)
 }
 
 /// The result a download awaits for its second request.
@@ -180,19 +181,18 @@ impl HeldSecondRequest {
 
 /// The first request's next overdue or stall deadline after `considered_at`, capped by the
 /// window end. An announcer's miss can bring the next decision forward.
-pub(super) fn next_decision_after(attempt: &BlockHedge, considered_at: Instant) -> Instant {
-    let window_end = attempt.window_end();
-    let Some(first) = attempt.first_dispatch() else {
-        return window_end;
-    };
-    let Some(first_score) = first.score else {
-        return window_end;
-    };
+pub(super) fn next_decision_after(
+    sent_at: Instant,
+    first_score: Duration,
+    considered_at: Instant,
+    window_end: Instant,
+) -> Instant {
     decision_times(first_score)
         .into_iter()
-        .map(|after| first.at + after)
+        .filter(|after| *after < window_end.saturating_duration_since(sent_at))
+        .map(|after| sent_at + after)
         .find(|at| *at > considered_at)
-        .map_or(window_end, |at| at.min(window_end))
+        .unwrap_or(window_end)
 }
 
 #[cfg(test)]
@@ -280,27 +280,19 @@ mod tests {
     /// not be considered again until it stalled.
     #[tokio::test(start_paused = true)]
     async fn a_decision_time_that_arrives_while_deciding_is_not_skipped() {
-        let attempt = BlockHedge::new(Instant::now());
         let sent_at = Instant::now();
-        attempt
-            .dispatch_if_needed(None, Some(ms(242)), || ())
-            .expect("an open download accepts its first request");
+        let window_end = sent_at + BlockHedge::WINDOW;
+        let next = |at| next_decision_after(sent_at, ms(242), at, window_end);
 
         let considered_at = sent_at + ms(241);
         tokio::time::advance(ms(243)).await;
         assert_eq!(
-            next_decision_after(&attempt, considered_at),
+            next(considered_at),
             sent_at + ms(242),
             "the overdue time passed after the decision, so it is still due"
         );
-        assert_eq!(
-            next_decision_after(&attempt, sent_at + ms(242)),
-            sent_at + ms(742)
-        );
-        assert_eq!(
-            next_decision_after(&attempt, sent_at + ms(742)),
-            attempt.window_end()
-        );
+        assert_eq!(next(sent_at + ms(242)), sent_at + ms(742));
+        assert_eq!(next(sent_at + ms(742)), window_end);
     }
 
     #[test]

@@ -2241,7 +2241,7 @@ async fn queued_and_active_primaries_observe_only_their_own_block() {
     .await
     .expect("the decoder observed A");
     assert_eq!(
-        a_size.get().copied(),
+        a_size.get(),
         Some(u64::try_from(BLOCK_MAINNET_1_BYTES.len()).unwrap())
     );
     assert_eq!(b_size.get(), None);
@@ -2267,7 +2267,7 @@ async fn queued_and_active_primaries_observe_only_their_own_block() {
     wire.write_all(&b_frame).await.unwrap();
     b_response.await.unwrap().unwrap();
     assert_eq!(
-        b_size.get().copied(),
+        b_size.get(),
         Some(u64::try_from(BLOCK_MAINNET_2_BYTES.len()).unwrap())
     );
     conn_task.abort();

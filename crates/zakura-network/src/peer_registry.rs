@@ -366,7 +366,8 @@ impl PeerRegistryUpdater {
         let after = *estimate;
         drop(state);
 
-        self.delivery_trace.sample(kind, sample, round_trip_before, &after);
+        self.delivery_trace
+            .sample(kind, sample, round_trip_before, &after);
         self.score_waker.wake();
     }
 

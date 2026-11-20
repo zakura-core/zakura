@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -14,7 +14,7 @@ use zakura_chain::{
 };
 use zakura_node_services::block_memory::BlockHandle;
 
-use super::super::types::Nonce;
+use super::super::{external::codec::BlockReplySize, types::Nonce};
 use crate::{peer_registry::DeliveryEstimate, zakura::ZakuraPeerId, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -66,7 +66,7 @@ pub(crate) struct FirstDispatch {
     pub(crate) legacy_peer: Option<PeerSocketAddr>,
     pub(crate) estimate: DeliveryEstimate,
     /// Published once the decoder recognizes the requested block on this exchange.
-    pub(crate) block_size: Arc<OnceLock<u64>>,
+    pub(crate) block_size: Arc<BlockReplySize>,
 }
 
 impl BlockHedge {
@@ -139,7 +139,7 @@ impl BlockHedge {
 
     /// Records the write for deadline accounting. While a second request can still be sent,
     /// returns the destination for the first reply's size.
-    pub(crate) fn legacy_request_written(&self) -> Option<Arc<OnceLock<u64>>> {
+    pub(crate) fn legacy_request_written(&self) -> Option<Arc<BlockReplySize>> {
         let mut state = self.state();
         state.legacy_written_before_timeout = !state.legacy_timed_out;
         if !state.can_dispatch_hedge(self.started.elapsed()) {

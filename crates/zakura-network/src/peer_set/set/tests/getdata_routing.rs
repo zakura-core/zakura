@@ -1954,7 +1954,8 @@ async fn a_slow_large_block_does_not_rush_the_next_second_request_to_a_far_peer(
     );
     announce_block(&mut peer_set, &mut guard, &far).await;
 
-    assert_not_yet(request_block_again(&mut peer_set, &attempt, 70).await).await;
+    let mut second = request_second(&mut peer_set, &attempt, 70).await;
+    assert_held(&mut second);
     assert_eq!(
         far.written_now().await,
         None,
@@ -1962,7 +1963,7 @@ async fn a_slow_large_block_does_not_rush_the_next_second_request_to_a_far_peer(
     );
 
     // 750 ms is the stall point for a peer expected to answer in 250 ms.
-    let _second = request_block_again(&mut peer_set, &attempt, 680).await;
+    maintain_after(&mut peer_set, 680).await;
     assert_eq!(
         far.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
@@ -2005,8 +2006,7 @@ async fn request_large_block_from(
         .first_dispatch()
         .expect("first request was routed")
         .block_size
-        .set(LARGE_BLOCK_BYTES)
-        .expect("first size report");
+        .publish(LARGE_BLOCK_BYTES);
     (attempt, first_request)
 }
 
@@ -2032,9 +2032,21 @@ async fn for_a_large_block_a_nearby_announcer_is_asked_and_a_far_one_is_not() {
     announce_block(&mut peer_set, &mut guard, &far).await;
 
     // 1.5 MB is expected to take the first peer about 1,670 ms and the far peer about 1,610 ms.
-    assert_not_yet(request_block_again(&mut peer_set, &attempt, 70).await).await;
+    let mut second = request_second(&mut peer_set, &attempt, 70).await;
+    assert_held(&mut second);
+    let first_dispatch = attempt.first_dispatch().unwrap();
+    let expected = first_dispatch
+        .estimate
+        .expected(Some(LARGE_BLOCK_BYTES))
+        .unwrap();
+    assert_eq!(
+        peer_set.second_request_timer.as_ref().unwrap().deadline(),
+        first_dispatch.at + expected,
+        "the held request wakes at the overdue time for this block size"
+    );
     // For a block that fits one round trip, 750 ms would be a stall.
-    assert_not_yet(request_block_again(&mut peer_set, &attempt, 730).await).await;
+    maintain_after(&mut peer_set, 730).await;
+    assert_held(&mut second);
     assert_eq!(
         far.written_now().await,
         None,
@@ -2042,7 +2054,7 @@ async fn for_a_large_block_a_nearby_announcer_is_asked_and_a_far_one_is_not() {
     );
 
     announce_block(&mut peer_set, &mut guard, &near).await;
-    let _second = request_block_again(&mut peer_set, &attempt, 10).await;
+    maintain_after(&mut peer_set, 10).await;
     assert_eq!(
         near.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
@@ -2063,31 +2075,22 @@ async fn a_first_peer_slow_on_large_blocks_gives_way_to_a_far_peer_once_the_size
     let _far_measured = measured_peer(&mut far, &registry, Some(240));
     // About five times what a new connection with a 100 ms round trip would need.
     record_large_block(&first_samples, 3_350);
-    let (mut peer_set, mut guard) = peer_set_with_second_requests(&mut [&mut first, &mut far]);
-
-    announce_block(&mut peer_set, &mut guard, &first).await;
-    let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
-    let _first_request = request_primary(&mut peer_set, &attempt).await;
-    assert_eq!(
-        first.written_now().await,
-        Some(Message::GetData(vec![BLOCK_HASH.into()]))
-    );
-    announce_block(&mut peer_set, &mut guard, &far).await;
-
-    assert_not_yet(request_block_again(&mut peer_set, &attempt, 30).await).await;
+    let mut peers = OwnedPeerSet::spawn(&mut [&mut first, &mut far]);
+    peers.announce(BLOCK_HASH, &first);
+    let (attempt, _primary, _second) = peers.download(BLOCK_HASH, &mut first).await;
+    peers.announce(BLOCK_HASH, &far);
     assert_eq!(
         far.written_now().await,
         None,
         "with the size unknown, the first peer's 100 ms round trip beats the far peer's 240 ms"
     );
 
+    // Only the new size can wake the owner. The clock stays before the first deadline.
     attempt
         .first_dispatch()
-        .expect("first request was routed")
+        .unwrap()
         .block_size
-        .set(LARGE_BLOCK_BYTES)
-        .expect("first size report");
-    let _second = request_block_again(&mut peer_set, &attempt, 40).await;
+        .publish(LARGE_BLOCK_BYTES);
     assert_eq!(
         far.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
@@ -2117,7 +2120,7 @@ async fn of_two_far_announcers_the_one_faster_on_large_blocks_is_asked() {
     announce_block(&mut peer_set, &mut guard, &cold).await;
     announce_block(&mut peer_set, &mut guard, &warm).await;
 
-    let _second = request_block_again(&mut peer_set, &attempt, 70).await;
+    let _second = request_second(&mut peer_set, &attempt, 70).await;
     assert_eq!(
         warm.written_now().await,
         Some(Message::GetData(vec![BLOCK_HASH.into()])),
@@ -2779,7 +2782,7 @@ async fn a_held_second_request_is_sent_when_an_announcers_miss_expires() {
         .unwrap()
         .call_routed(
             Request::BlocksByHash([OTHER_BLOCK_HASH].into()),
-            Some(crate::peer::AdvertisedBlockRequest::Primary),
+            Some(crate::peer::BlockRequestKind::Primary),
         );
     assert_eq!(
         near.written_now().await,

@@ -1657,7 +1657,7 @@ where
     /// each request that stays, registers `cx` to be woken by everything that can change the
     /// decision:
     ///
-    /// - a new announcement, through the inventory registry;
+    /// - the first peer's matching block header revealing the size, or a new announcement;
     /// - an announcer becoming a better source, through its connection (see
     ///   [`Self::choose_second_request`]). A busy announcer the peer set itself is waiting on
     ///   wakes this task when it becomes ready, as any unready peer does;
@@ -1681,9 +1681,15 @@ where
             if !held.poll_open(cx) {
                 continue;
             }
-            let mut next_decision = next_decision_after(held.attempt(), considered_at);
+            let mut next_decision = held.attempt().window_end();
             let chosen = self
-                .choose_second_request(held.hash(), held.attempt(), cx, &mut next_decision)
+                .choose_second_request(
+                    held.hash(),
+                    held.attempt(),
+                    cx,
+                    considered_at,
+                    &mut next_decision,
+                )
                 // A download gets one second request, and none once it stops accepting one.
                 .filter(|_| held.attempt().claim_dispatch());
             match chosen {
@@ -1732,19 +1738,24 @@ where
         hash: block::Hash,
         attempt: &crate::BlockHedge,
         cx: &Context<'_>,
+        considered_at: tokio::time::Instant,
         next_decision: &mut tokio::time::Instant,
     ) -> Option<(D::Key, SecondRequestChoice)> {
         let first = attempt.first_dispatch()?;
         let first_peer = first.legacy_peer;
-        let block_bytes = first.block_size.get().copied();
+        let block_bytes = first.block_size.read_for_routing(cx);
         let first_score = first.estimate.expected(block_bytes)?;
+        *next_decision = next_decision_after(first.at, first_score, considered_at, *next_decision);
         let candidates: Vec<_> = self
             .inventory_registry
             .advertising_peers(InventoryHash::from(hash))
             .filter(|addr| Some(**addr) != first_peer)
             .filter_map(|addr| {
                 let svc = self.ready_services.get(addr)?;
-                Some((*addr, svc.second_request_score(cx, next_decision)?))
+                Some((
+                    *addr,
+                    svc.second_request_score(cx, block_bytes, next_decision)?,
+                ))
             })
             .collect();
         let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {

@@ -260,11 +260,36 @@ fn serialized_block_checksum(block: &BlockHandle) -> sha256d::Checksum {
 /// The command of a `block` message, as it appears in a message header.
 const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
 
+/// The first matching frame publishes its size and wakes the peer set holding the hedge.
+#[derive(Debug, Default)]
+pub(crate) struct BlockReplySize {
+    bytes: OnceLock<u64>,
+    waker: futures::task::AtomicWaker,
+}
+
+impl BlockReplySize {
+    pub(crate) fn publish(&self, bytes: u64) {
+        if self.bytes.set(bytes).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<u64> {
+        self.bytes.get().copied()
+    }
+
+    /// Register before reading so that a size learned during a routing decision wakes it.
+    pub(crate) fn read_for_routing(&self, cx: &std::task::Context<'_>) -> Option<u64> {
+        self.waker.register(cx.waker());
+        self.get()
+    }
+}
+
 /// A request's destination for the size declared by its matching block message.
 #[derive(Clone, Debug)]
 struct RequestedBlockSize {
     hash: block::Hash,
-    bytes: Arc<OnceLock<u64>>,
+    bytes: Arc<BlockReplySize>,
 }
 
 /// Shares the active primary request between the connection and its decoder.
@@ -273,7 +298,7 @@ pub(crate) struct InboundBlockSize(Arc<Mutex<Option<RequestedBlockSize>>>);
 
 impl InboundBlockSize {
     /// Called after the connection writes a single-block request.
-    pub(crate) fn watch(&self, hash: block::Hash, bytes: Arc<OnceLock<u64>>) {
+    pub(crate) fn watch(&self, hash: block::Hash, bytes: Arc<BlockReplySize>) {
         *self.0.lock().expect("block size lock is never poisoned") =
             Some(RequestedBlockSize { hash, bytes });
     }
@@ -789,7 +814,7 @@ impl Decoder for Codec {
                                 .is_ok_and(|header| header.hash() == requested.hash)
                             {
                                 // The transport length was read from a u32.
-                                let _ = requested.bytes.set(body_len as u64);
+                                requested.bytes.publish(body_len as u64);
                             }
                         }
                     }

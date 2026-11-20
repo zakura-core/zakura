@@ -165,6 +165,7 @@ impl LoadTrackedClient {
     pub(crate) fn second_request_score(
         &self,
         cx: &Context<'_>,
+        block_bytes: Option<u64>,
         next_decision: &mut tokio::time::Instant,
     ) -> Option<std::time::Duration> {
         self.request_slot.notify_when_usable(cx);
@@ -174,7 +175,10 @@ impl LoadTrackedClient {
         if !self.is_preferred_block_source(false) {
             return None;
         }
-        let score = self.block_gossip.delivery_score()?;
+        let score = self
+            .block_gossip
+            .delivery_estimate()
+            .expected(block_bytes)?;
         if let Some(expiry) = self.request_slot.announced_block_miss_expiry() {
             *next_decision = (*next_decision).min(expiry);
             return None;

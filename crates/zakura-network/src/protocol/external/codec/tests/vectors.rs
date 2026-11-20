@@ -201,7 +201,7 @@ fn a_partial_frame_reports_only_the_requested_block_size() {
         let mut codec = Codec::builder()
             .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
             .finish();
-        let size = Arc::new(OnceLock::new());
+        let size = Arc::new(BlockReplySize::default());
         codec
             .inbound_block_size()
             .watch(requested_hash, size.clone());
@@ -213,7 +213,7 @@ fn a_partial_frame_reports_only_the_requested_block_size() {
         received.extend_from_slice(&message[prefix - 1..prefix]);
         assert!(codec.decode(&mut received).unwrap().is_none());
         assert_eq!(
-            size.get().copied(),
+            size.get(),
             matches.then_some(u64::try_from(body.len()).unwrap())
         );
     }
@@ -229,7 +229,7 @@ fn a_partial_block_size_hint_respects_the_block_limit() {
         let mut codec = Codec::builder()
             .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
             .finish();
-        let size = Arc::new(OnceLock::new());
+        let size = Arc::new(BlockReplySize::default());
         codec.inbound_block_size().watch(hash, size.clone());
         let mut prefix = wire_message(*BLOCK_COMMAND, body);
         // Only the transport header and the matching block header have arrived.
@@ -239,7 +239,7 @@ fn a_partial_block_size_hint_respects_the_block_limit() {
             .decode(&mut BytesMut::from(prefix.as_slice()))
             .unwrap()
             .is_none());
-        assert_eq!(size.get().copied(), expected);
+        assert_eq!(size.get(), expected);
     }
 }
 
@@ -252,21 +252,18 @@ fn a_frame_keeps_the_size_destination_it_started_with() {
         .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
         .finish();
     let observation = codec.inbound_block_size();
-    let original = Arc::new(OnceLock::new());
+    let original = Arc::new(BlockReplySize::default());
     observation.watch(hash, original.clone());
     let message = wire_message(*BLOCK_COMMAND, body);
     let mut received = BytesMut::from(&message[..HEADER_LEN]);
     assert!(codec.decode(&mut received).unwrap().is_none());
 
     observation.clear();
-    let retry = Arc::new(OnceLock::new());
+    let retry = Arc::new(BlockReplySize::default());
     observation.watch(hash, retry.clone());
     received.extend_from_slice(&message[HEADER_LEN..message.len() - 1]);
     assert!(codec.decode(&mut received).unwrap().is_none());
-    assert_eq!(
-        original.get().copied(),
-        Some(u64::try_from(body.len()).unwrap())
-    );
+    assert_eq!(original.get(), Some(u64::try_from(body.len()).unwrap()));
     assert_eq!(retry.get(), None);
 }
 

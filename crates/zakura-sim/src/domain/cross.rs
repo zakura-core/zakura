@@ -93,6 +93,18 @@ impl Dag {
     pub fn descends(&self, tip: Frontier, ancestor: Frontier) -> bool {
         self.ancestor(&hash(tip.hash), ancestor.height.0) == Some(hash(ancestor.hash).as_str())
     }
+
+    /// The last block shared by the two paths in the fixture DAG.
+    fn shared_block(&self, left: Frontier, right: Frontier) -> Option<&str> {
+        let height = left.height.0.min(right.height.0);
+        let mut left = self.ancestor(&hash(left.hash), height)?;
+        let mut right = self.ancestor(&hash(right.hash), height)?;
+        while left != right {
+            left = &self.parents.get(left)?.1;
+            right = &self.parents.get(right)?.1;
+        }
+        Some(left)
+    }
 }
 
 /// The engine's committed view, as the harness read it after a step.
@@ -263,16 +275,22 @@ impl CrossModel {
             if let Some(last) = &self.last {
                 let selection_kept = self.dag.descends(sample.header_best, last.header_best);
                 let verified_kept = self.dag.descends(sample.verified_best, last.verified_best);
-                let verified_left = sample.verified_best != last.verified_best
-                    && !self.dag.descends(sample.header_best, sample.verified_best);
+                let divergent_work_changed = sample.verified_best != last.verified_best
+                    && !self.dag.descends(sample.header_best, sample.verified_best)
+                    && (sample.header_best != last.header_best
+                        || self
+                            .dag
+                            .shared_block(sample.header_best, sample.verified_best)
+                            != self.dag.shared_block(last.header_best, last.verified_best));
                 self.saw_replaced_selection |= !selection_kept;
-                if (!selection_kept || !verified_kept || verified_left)
+                if (!selection_kept || !verified_kept || divergent_work_changed)
                     && sample.epoch <= last.epoch
                 {
                     self.tip_findings.push(Finding {
                         expected: "a view whose selected or verified path replaced the last \
-                                   one's, or whose verified tip left the selected chain, starts \
-                                   a new body-work epoch"
+                                   one's, or whose verified tip advanced off the selected chain \
+                                   with a different selected tip or shared block, starts a new \
+                                   body-work epoch"
                             .to_owned(),
                         actual: format!(
                             "epoch {} after {} ({:?}, {:?}) moved to ({:?}, {:?}) at state \
@@ -546,8 +564,9 @@ pub trait CrossView {
 /// The engine's views, as the harness samples them after each step, agree
 /// with the fixture DAG: every tip is a block the run made, and a view whose
 /// selected or verified path replaced the last sampled one's starts a new
-/// body-work epoch. A view the engine replaces within one step goes
-/// unjudged.
+/// body-work epoch. Advancing the verified tip off the selected chain also
+/// requires a new epoch if the selected tip or last shared block changed.
+/// A view the engine replaces within one step goes unjudged.
 pub const TIPS_CONSISTENT: &str = "sync/tips-consistent";
 
 /// Every block request the node publishes names heights on its owner's
@@ -577,8 +596,8 @@ where
             claim: "each committed view the harness samples after a step has a header tip \
                     and a verified tip that are blocks the run made, and a sampled view whose \
                     selected path or verified path doesn't extend the last sampled one's, or \
-                    whose verified tip moved off its selected chain, starts a new body-work \
-                    epoch",
+                    whose verified tip advanced off the selected chain with a different selected \
+                    tip or shared block, starts a new body-work epoch",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,

@@ -99,7 +99,11 @@ fn committed(spec: &Spec) -> CommittedHeaderChainView {
             ..AlarmSet::default()
         },
     };
-    let mut view = CommittedHeaderChainView::new(snapshot, BodyWorkEpoch::new(spec.epoch));
+    let mut view = CommittedHeaderChainView::new(
+        snapshot.frontiers.verified_best,
+        snapshot,
+        BodyWorkEpoch::new(spec.epoch),
+    );
     view.body_size_hint_revision = spec.hint_revision;
     view.body_size_hint_batches = spec.first_batch.map(|first| {
         (first..=spec.hint_revision.max(first))

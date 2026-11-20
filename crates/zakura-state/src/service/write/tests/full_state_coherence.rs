@@ -659,6 +659,18 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
     let snapshot = writer.runtime.publisher().snapshot();
     assert_eq!(snapshot.frontiers.header_best, tied_frontier);
     assert_eq!(snapshot.frontiers.verified_best, incumbent);
+    let shared = Frontier::new(block::Height(39), chain[39].hash());
+    assert_eq!(
+        writer.runtime.publisher().view().body_download_anchor,
+        shared
+    );
+    drop(writer);
+    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized_state, &live)
+        .expect("the diverged selected and verified tips reopen");
+    let reopened = writer.runtime.publisher().view();
+    assert_eq!(reopened.frontiers.header_best, tied_frontier);
+    assert_eq!(reopened.frontiers.verified_best, incumbent);
+    assert_eq!(reopened.body_download_anchor, shared);
     let mut staged = live.clone();
     staged.invalidate_block(tied_frontier.hash).unwrap();
     commit_operator_change(&writer, &mut live, staged, tied_frontier.hash, true).unwrap();

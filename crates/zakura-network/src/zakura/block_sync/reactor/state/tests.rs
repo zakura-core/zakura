@@ -60,6 +60,7 @@ fn authority_view(generation: u8) -> CommittedHeaderChainView {
         hash: header_hash(VIEW_HEADER_TIP),
     };
     CommittedHeaderChainView::new(
+        frontier,
         EngineSnapshot {
             mode: EngineMode::Integrated,
             state_version: StateVersion::new(1),
@@ -362,7 +363,13 @@ fn view_with_unchanged_reaction_epoch_only_refreshes_mirrors() {
     assert_eq!(state.progress.verified_block_tip, block::Height(7));
     assert_eq!(state.progress.verified_block_hash, verified_hash(7));
     assert_eq!(state.progress.request_floor, block::Height(3));
-    assert_eq!(state.progress.servable_high, block::Height(7));
+    let status = state
+        .progress
+        .local_status(&ZakuraBlockSyncConfig::default(), state.committed_view());
+    assert_eq!(
+        (status.servable_high, status.tip_hash),
+        (block::Height(7), verified_hash(7))
+    );
     assert_eq!(state.progress.last_view, changed);
     assert_eq!(state.queries.pending(), Some(a));
 
@@ -1584,10 +1591,9 @@ fn a_broken_owner_invariant_is_a_property_failure() {
     for input in decode(WITNESS) {
         driver.apply(input);
     }
-    let progress = &mut driver.state.progress;
-    progress.servable_high = block::Height(progress.verified_block_tip.0 + 1);
+    driver.state.needed_heights = vec![block::Height(1), block::Height(1)];
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.check()))
-        .expect_err("the advertised tip left the verified tip");
+        .expect_err("duplicate needed heights break the reactor invariant");
     let failure =
         WorkOwnershipFailure::from_panic(payload.as_ref(), WorkOwnershipPhase::Invariant, PROPERTY);
     assert!(failure.property_failure, "{}", failure.message);

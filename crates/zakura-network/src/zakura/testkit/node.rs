@@ -743,7 +743,7 @@ pub(crate) fn startup_committed_view(
     };
     let (_views, views) =
         tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
-            snapshot,
+            snapshot.frontiers.verified_best, snapshot,
             zakura_header_chain::BodyWorkEpoch::default(),
         )));
     views

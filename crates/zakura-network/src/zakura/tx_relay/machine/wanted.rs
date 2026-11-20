@@ -135,6 +135,7 @@ impl WantedIds {
     }
 
     /// How many ids the node wants.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

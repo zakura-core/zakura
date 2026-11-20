@@ -16,7 +16,7 @@ use zakura_rt::collections::{HashMap, HashSet};
 
 use super::{
     file,
-    peer::{Hello, PeerState, Pending, PendingSet, Reserving},
+    peer::{Hello, PeerState, Pending, Reserving},
     reactor::SessionAdmission,
     wanted::{Admission, Changes},
     CallId, CloseReason, EntryGen, Granted, InvRoom, Logged, Mail, NodeEffect, Paid, PeerKey,
@@ -79,8 +79,6 @@ pub(crate) struct PeerMachine {
     readmitted: bool,
     /// It ended, and handed what it held to the table and the reactor.
     ended: bool,
-    /// Its pending references that [`Shared::pending`] counts.
-    counted: usize,
 }
 
 impl PeerMachine {
@@ -108,7 +106,6 @@ impl PeerMachine {
             ring_cursor: shared.wanted.ring_end(),
             readmitted: admission == SessionAdmission::Readmitted,
             ended: false,
-            counted: 0,
         };
         if admission == SessionAdmission::Parked {
             // It never joins the reactor, so it has nothing to hand back.
@@ -161,7 +158,9 @@ impl PeerMachine {
             // Announcements it made before can join the table now, if it
             // has the go.
             if shared.reactor.has_go(self.state.peer, self.session) {
-                let waiting = self.take_waiting(shared);
+                let waiting: Vec<(UnminedTxId, u32)> = std::mem::take(&mut self.state.waiting)
+                    .into_iter()
+                    .collect();
                 self.take_ids(shared, pool, &waiting);
             }
         }
@@ -203,23 +202,8 @@ impl PeerMachine {
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
-                // As `take_ids` admits pending ids: an id no session holds or
-                // waits on yet is its first source, which copies of other
-                // ids never crowd out.
-                let first =
-                    shared.wanted.entry(id).is_none() && !shared.waiting_ids.contains_key(&id);
-                let node = if first {
-                    shared.waiting_ids.len() < PENDING_CAP
-                        && shared.waiting < PENDING_CAP.saturating_mul(2)
-                } else {
-                    shared.waiting < PENDING_CAP
-                };
-                let fits = state.waiting.len() < PENDING_PER_PEER
-                    && (node || state.waiting.len() < PENDING_SHARE);
-                if fits {
+                if state.waiting.len() < PENDING_PER_PEER {
                     state.waiting.insert(id, size);
-                    shared.waiting = shared.waiting.saturating_add(1);
-                    *shared.waiting_ids.entry(id).or_default() += 1;
                 } else {
                     state.overflow = state.overflow.saturating_add(1);
                 }
@@ -654,9 +638,6 @@ impl PeerMachine {
                 self.state.mark_known(id, short, pool.last_seq());
             }
         }
-        // The go can take waiting ids in, and the next session to read its
-        // mail must see them counted.
-        self.count_pending(shared);
     }
 
     // Outputs and observations.
@@ -800,11 +781,11 @@ impl PeerMachine {
     /// Files again what the wanted table's ring says changed, then claims
     /// what it can.
     pub(crate) fn settle(&mut self, shared: &mut Shared, pool: &dyn PoolView) {
-        if !self.ended {
-            self.fill(shared, pool);
-            self.drop_stale_timers();
+        if self.ended {
+            return;
         }
-        self.count_pending(shared);
+        self.fill(shared, pool);
+        self.drop_stale_timers();
     }
 
     /// Ends this session if a charge in this step closed its peer.
@@ -1016,7 +997,6 @@ impl PeerMachine {
             return;
         }
         self.ended = true;
-        self.take_waiting(shared);
         let (peer, session, now) = (self.state.peer, self.session, self.now);
         // Ending with a claim out is the peer's try at that entry, so neither
         // a replacement session nor a later announcement asks it again.
@@ -1066,8 +1046,7 @@ impl PeerMachine {
         for pending in self.state.pending.iter() {
             shared.wanted.unhold(pending.id, pending.generation);
         }
-        self.state.pending = PendingSet::default();
-        self.count_pending(shared);
+        self.state.pending.clear(&mut shared.pending);
         for (waiter, submitted) in self.submitted_at.drain() {
             shared.ended_submitted.insert(waiter, submitted);
         }
@@ -1117,25 +1096,11 @@ impl PeerMachine {
         // Without a `Hello` it could never be asked, so its announcements
         // wait for one.
         if state.hello.is_some() {
-            let waiting = self.take_waiting(shared);
+            let waiting: Vec<(UnminedTxId, u32)> = std::mem::take(&mut self.state.waiting)
+                .into_iter()
+                .collect();
             self.take_ids(shared, pool, &waiting);
         }
-    }
-
-    /// Takes the announcements this session kept while it waited, out of
-    /// the node's count of them.
-    fn take_waiting(&mut self, shared: &mut Shared) -> Vec<(UnminedTxId, u32)> {
-        let waiting = std::mem::take(&mut self.state.waiting);
-        shared.waiting = shared.waiting.saturating_sub(waiting.len());
-        for id in waiting.keys() {
-            if let Some(count) = shared.waiting_ids.get_mut(id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    shared.waiting_ids.remove(id);
-                }
-            }
-        }
-        waiting.into_iter().collect()
     }
 
     /// Takes announced ids into this session, which has the go: its pending
@@ -1187,24 +1152,13 @@ impl PeerMachine {
             fresh.push((id, size, current.is_none()));
         }
         // Each id's room is decided before the table changes, so an id that
-        // does not fit leaves no holder behind. An id nobody holds yet is
-        // its first fetchable source, so it is taken while the node wants
-        // fewer than the cap's ids, however many references to other ids
-        // sessions hold, and while they hold fewer than twice the cap's
-        // references, since a decided id leaves the table before its holders
-        // drop their references. Another reference to an id someone holds
-        // is taken only while sessions hold fewer than the cap's references.
-        // Past both, a session still holds its share, so peers that fill the
-        // cap crowd out nobody else's first ids.
+        // does not fit leaves no holder behind. See `PENDING_CAP` for the
+        // rule.
         let mut dropped: u64 = 0;
         for (id, size, first) in fresh {
             let share = self.state.pending.len() < PENDING_SHARE;
-            let slots = self.pending_slots(shared);
-            let node = if first {
-                shared.wanted.len() < PENDING_CAP && slots < PENDING_CAP.saturating_mul(2)
-            } else {
-                slots < PENDING_CAP
-            };
+            let records = shared.pending;
+            let node = records < PENDING_CAP || (first && records < 2 * PENDING_CAP);
             if self.state.room() == 0 || !(share || node) {
                 dropped = dropped.saturating_add(1);
                 continue;
@@ -1216,31 +1170,17 @@ impl PeerMachine {
                 self.drop_decided(shared, id, stale.generation);
             }
             let generation = shared.wanted.hold(id, self.now);
-            self.state.pending.push(Pending {
-                id,
-                generation,
-                size,
-            });
+            self.state.pending.push(
+                Pending {
+                    id,
+                    generation,
+                    size,
+                },
+                &mut shared.pending,
+            );
             file(&mut self.state, &shared.wanted, id);
         }
         self.state.overflow = self.state.overflow.saturating_add(dropped);
-    }
-
-    /// Pending references every live session holds, counting this
-    /// session's as they are now: what [`PENDING_CAP`] bounds. A session's
-    /// own count joins [`Shared::pending`] when it settles.
-    fn pending_slots(&self, shared: &Shared) -> usize {
-        shared
-            .pending
-            .saturating_sub(self.counted)
-            .saturating_add(self.state.pending.len())
-    }
-
-    /// Brings [`Shared::pending`] up to date with this session's pending
-    /// set.
-    fn count_pending(&mut self, shared: &mut Shared) {
-        shared.pending = self.pending_slots(shared);
-        self.counted = self.state.pending.len();
     }
 
     /// Reconsiders announcing `id` to its peer, as a read of its admission
@@ -1322,7 +1262,11 @@ impl PeerMachine {
     /// Drops this session's pending reference to `id` in `generation`,
     /// which its peer tried.
     fn drop_tried_reference(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
-        if self.state.take_pending_of(id, generation).is_some() {
+        if self
+            .state
+            .take_pending_of(id, generation, &mut shared.pending)
+            .is_some()
+        {
             shared.wanted.unhold(id, generation);
         }
     }
@@ -1668,7 +1612,7 @@ impl PeerMachine {
     /// Drops this session's references to `id` in `generation`, which was
     /// decided, and gives back a fetch of it the session still had.
     fn drop_decided(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
-        self.state.drop_decided(id, generation);
+        self.state.drop_decided(id, generation, &mut shared.pending);
         if let Some(reservation) = self
             .state
             .requests

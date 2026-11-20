@@ -163,26 +163,28 @@ impl PeerState {
     }
 
     /// Takes `id` out of the pending set if it is pending in `generation`.
+    /// `records` is the node's count of pending records; see [`PendingSet`].
     pub(crate) fn take_pending_of(
         &mut self,
         id: UnminedTxId,
         generation: EntryGen,
+        records: &mut usize,
     ) -> Option<Pending> {
         if !self.holds(id, generation) {
             return None;
         }
-        self.take_pending(id)
-    }
-
-    /// Takes `id` out of the pending set, returning what it held.
-    pub(crate) fn take_pending(&mut self, id: UnminedTxId) -> Option<Pending> {
-        self.pending.take(id)
+        self.pending.take(id, records)
     }
 
     /// Drops every pending reference to `id` in `generation`, because it was
-    /// decided.
-    pub(crate) fn drop_decided(&mut self, id: UnminedTxId, generation: EntryGen) {
-        self.pending.drop_entry(id, generation);
+    /// decided. `records` is the node's count of pending records.
+    pub(crate) fn drop_decided(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+        records: &mut usize,
+    ) {
+        self.pending.drop_entry(id, generation, records);
     }
 
     /// Records that it announced or supplied `id`, whose short id is
@@ -435,6 +437,11 @@ pub(crate) type ReadyKey = (Time, u64);
 /// Both maps are B-trees: at a full set a hash map rounds up to twice the
 /// buckets it needs, and the ordered walk keeps every pass over the set
 /// deterministic.
+///
+/// Every insert and removal takes the node's count of pending records, so
+/// that count is always the records every session holds, released only
+/// when one leaves its set. The node-wide cap reads it; see
+/// `PENDING_CAP`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PendingSet {
     held: BTreeMap<OrdId, PendingSlot>,
@@ -489,9 +496,10 @@ impl PendingSet {
         self.held.len()
     }
 
-    /// Adds `pending`, unfiled until the machine files it. The set must not
-    /// already hold its id: a stale reference goes first.
-    pub(crate) fn push(&mut self, pending: Pending) {
+    /// Adds `pending`, unfiled until the machine files it, and counts it in
+    /// `records`. The set must not already hold its id: a stale reference
+    /// goes first.
+    pub(crate) fn push(&mut self, pending: Pending, records: &mut usize) {
         let old = self.held.insert(
             OrdId(pending.id),
             PendingSlot {
@@ -501,6 +509,9 @@ impl PendingSet {
             },
         );
         debug_assert!(old.is_none(), "one reference per id");
+        if old.is_none() {
+            *records = records.saturating_add(1);
+        }
     }
 
     /// Whether `id` is pending, in any generation.
@@ -520,20 +531,34 @@ impl PendingSet {
         self.held.get(&OrdId(id)).map(|held| held.pending(id))
     }
 
-    /// Takes the pending reference to `id` out, and unfiles it.
-    pub(crate) fn take(&mut self, id: UnminedTxId) -> Option<Pending> {
+    /// Takes the pending reference to `id` out, unfiles it, and uncounts it
+    /// from `records`.
+    pub(crate) fn take(&mut self, id: UnminedTxId, records: &mut usize) -> Option<Pending> {
         let held = self.held.remove(&OrdId(id))?;
         if let Some(key) = held.filed {
             self.ready.remove(&key);
         }
+        *records = records.saturating_sub(1);
         Some(held.pending(id))
     }
 
     /// Drops the pending reference to `id` if it is in `generation`.
-    pub(crate) fn drop_entry(&mut self, id: UnminedTxId, generation: EntryGen) {
+    pub(crate) fn drop_entry(
+        &mut self,
+        id: UnminedTxId,
+        generation: EntryGen,
+        records: &mut usize,
+    ) {
         if self.holds(id, generation) {
-            self.take(id);
+            self.take(id, records);
         }
+    }
+
+    /// Drops every pending reference, uncounting them from `records`.
+    pub(crate) fn clear(&mut self, records: &mut usize) {
+        *records = records.saturating_sub(self.held.len());
+        self.held.clear();
+        self.ready.clear();
     }
 
     /// Files `id` at `key`, in place of any earlier filing of it. The set

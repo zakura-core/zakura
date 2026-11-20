@@ -148,9 +148,9 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         assert_eq!(state.overflow, overflow, "session {n}'s overflow");
     }
     // Sessions that have not sent their `Hello` keep what they were
-    // announced while they wait, in a budget of its own, so the full
-    // pending cap crowds none of it out, and past that budget a session
-    // keeps its share.
+    // announced while they wait, within their own pending bound, and that
+    // leaves what fetchable sessions may take alone.
+    let records = machine.shared.pending;
     let silent: Vec<_> = (0..=full)
         .map(|n| {
             let peer = SESSIONS + u64::try_from(n).expect("small");
@@ -161,18 +161,14 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         .collect();
     for (n, session) in silent.iter().enumerate() {
         let state = machine.session(*session).expect("live");
-        let waiting = if n < full {
-            PENDING_PER_PEER
-        } else {
-            PENDING_SHARE
-        };
-        assert_eq!(state.waiting.len(), waiting, "silent session {n} waits");
+        assert_eq!(state.waiting.len(), PENDING_PER_PEER, "silent session {n}");
     }
-    // Once one may fetch, what it kept while it waited joins its pending
-    // set as any announcement would. Every id already has a source, so
-    // past the full pending cap it keeps its share, and sessions that
-    // announce before their `Hello` one after another add no more than
-    // their shares however their waiting room frees.
+    assert_eq!(machine.shared.pending, records, "waiting holds no record");
+    // Once one may fetch, what it kept joins its pending set by the same
+    // rule as any announcement. Every id already has a source, so past the
+    // full cap it keeps its share and no id loses its source. Sessions that
+    // announce before their `Hello`, one after another, stay within the
+    // cap's bound however they order it.
     machine.hello(silent[0], hello(), now);
     let state = machine.session(silent[0]).expect("live");
     assert_eq!(state.pending.len(), PENDING_SHARE, "its share of held ids");
@@ -183,9 +179,9 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         machine.hello(session, hello(), now);
         late.push(session);
     }
-    let promoted = silent.len() + late.len();
-    let bound = PENDING_CAP + (sessions.len() + promoted) * PENDING_SHARE;
-    assert!(machine.shared.pending <= bound, "references stay bounded");
+    let live = sessions.len() + silent.len() + late.len();
+    let bound = 2 * PENDING_CAP + live * PENDING_SHARE;
+    assert!(machine.shared.pending <= bound, "records stay bounded");
     for session in silent.into_iter().chain(late) {
         machine.end(session, now);
     }
@@ -313,9 +309,9 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
 
 /// Honest peers that all announce the same full pool in wire-sized frames,
 /// interleaved, every peer's first two before any `Hello`, leave every id a
-/// session that can fetch it, however full the waiting and pending caps
-/// get: an id nobody holds or waits on yet is its first source, which the
-/// caps on references never drop.
+/// session that can fetch it, however full the pending cap gets: an id no
+/// session holds yet is its first source, which copies of other ids never
+/// crowd out.
 #[test]
 fn interleaved_full_pools_leave_every_id_a_source() {
     let script = script_len();

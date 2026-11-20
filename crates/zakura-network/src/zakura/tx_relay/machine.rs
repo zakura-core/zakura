@@ -171,18 +171,13 @@
 //!   its reservation whatever happens next: a decision, a cancelled fetch,
 //!   or the session ending. The pool answers it, which frees the slot.
 //! - **Overflow is counted and is never a violation.** An announcement
-//!   that finds its session's pending set full is dropped. So is one past
-//!   the node-wide cap while its session holds [`PENDING_SHARE`] or more:
-//!   an id nobody holds yet once the node wants [`PENDING_CAP`] ids or
-//!   sessions hold twice that many references, and another reference to
-//!   an id someone holds once sessions hold [`PENDING_CAP`] references, each
-//!   counted until its session drops it. So an id's first fetchable source
-//!   is never crowded out by references to other ids, and peers that fill
-//!   the cap leave every other session its share. Announcements sessions
-//!   keep while they wait for the go or a `Hello` are bounded the same way,
-//!   in a budget of their own, with an id no session holds or waits on as
-//!   its first source, so ids that can't be fetched yet never crowd out
-//!   ones that can.
+//!   that finds its session's pending set full is dropped, and so is one
+//!   [`PENDING_CAP`] turns away. That cap stops copies of ids some session
+//!   holds before it stops an id's first source, so when peers announce
+//!   the same pool, copies of its early ids never cost a later id its only
+//!   source. Ids a session keeps while it waits for the go or a `Hello` are
+//!   bounded by its own pending bound, and join the table by the same rule
+//!   once it may fetch.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
 //!   body the reactor holds for it, and the supplier's sessions mark an id
@@ -290,12 +285,14 @@ pub(crate) const MAX_OUTSTANDING_BYTES: u64 = INITIAL_WINDOW as u64 * MAX_TX_BYT
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
 
-/// The node-wide pending cap: eight full pending sets (*provisional*). A
-/// session takes an id nobody holds while the node wants fewer ids than
-/// this, and another reference to an id someone holds while sessions hold
-/// fewer references than this. Past both it takes no more than
-/// [`PENDING_SHARE`]. Announcements sessions keep while they wait for the
-/// go or a `Hello` have a budget of the same size and share.
+/// The node-wide pending cap, eight full pending sets (*provisional*). A
+/// session with room takes an announced id while it holds fewer than
+/// [`PENDING_SHARE`], while every session holds fewer pending records than
+/// this, or, if no session holds the id yet, fewer than twice this. So an
+/// id's first source is crowded out only by twice the cap's records, and
+/// records stay within twice the cap plus every session's share. A record
+/// counts from when its set takes it until it leaves the set, however its
+/// entry ends.
 pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 
 /// Ids every session may hold pending however many the others hold
@@ -792,15 +789,9 @@ pub(crate) struct Shared {
     /// `tx-relay` was told the core stopped, so it claims nothing more and
     /// a slot given back is no room.
     pub(crate) stopped: bool,
-    /// Pending references live sessions hold, summed, as each last
-    /// settled. Each counts until its session drops it, not when its entry
-    /// is decided. See [`PENDING_CAP`].
+    /// The pending records every session holds, which each pending set
+    /// counts as it changes. See [`PENDING_CAP`].
     pub(crate) pending: usize,
-    /// Announcements live sessions keep while they wait for the go or a
-    /// `Hello`, summed. They have a [`PENDING_CAP`] of their own.
-    pub(crate) waiting: usize,
-    /// How many live sessions wait on each of those ids.
-    pub(crate) waiting_ids: HashMap<UnminedTxId, usize>,
     /// How many sessions hear of an admission at once, and when the rest do.
     pub(crate) fan_out: FanOut,
     /// The parameters of the keyed short-id hash.
@@ -837,8 +828,6 @@ impl Shared {
             current: true,
             stopped: false,
             pending: 0,
-            waiting: 0,
-            waiting_ids: HashMap::default(),
             fan_out: config.fan_out,
             short_id,
             log_read: 0,
@@ -1920,21 +1909,6 @@ impl RelayMachine {
             .map(|machine| machine.state.pending.len())
             .sum();
         assert_eq!(self.shared.pending, pending, "relay/pending-count");
-        let waiting: usize = self
-            .machines
-            .values()
-            .filter(|machine| !machine.is_ended())
-            .map(|machine| machine.state.waiting.len())
-            .sum();
-        assert_eq!(self.shared.waiting, waiting, "relay/waiting-count");
-        let mut waiting_ids: HashMap<UnminedTxId, usize> = HashMap::default();
-        for machine in self.machines.values().filter(|machine| !machine.is_ended()) {
-            for id in machine.state.waiting.keys() {
-                *waiting_ids.entry(*id).or_default() += 1;
-            }
-        }
-        assert_eq!(self.shared.waiting_ids, waiting_ids, "relay/waiting-ids");
-
         // The table keeps nothing without a holder or a claim.
         for (id, entry) in wanted.entries() {
             let counted = references.get(&(*id, entry.generation)).copied();

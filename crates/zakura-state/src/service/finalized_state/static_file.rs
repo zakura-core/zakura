@@ -21,7 +21,8 @@
 //! - `.sum` holds one width byte (8), then one little-endian `u64` checksum per
 //!   transaction, see [`row_checksum`]. RocksDB checks its table blocks when it
 //!   reads them, and this keeps that for bodies, so a changed byte inside a
-//!   transaction reads as corrupt instead of as different bytes.
+//!   transaction, or a block index entry that points a block at the wrong rows,
+//!   reads as corrupt instead of as different bytes.
 //! - `.conf` holds the committed [`JarConfig`]. It is written last, atomically,
 //!   so it is the commit marker.
 //!
@@ -170,15 +171,24 @@ pub enum StaticFileError {
     },
 }
 
-/// Returns the checksum of one stored transaction: the first 8 bytes of its
-/// personalized BLAKE2b-64 hash, as a little-endian `u64`. BLAKE2b is already a
-/// dependency, and runs at about 1 GB/s per core, so the check adds far less
-/// than a disk read to a cold body read.
-fn row_checksum(transaction: &[u8]) -> u64 {
+/// Returns the checksum of transaction `index` of the `block_rows` transactions
+/// in block `height`: the first 8 bytes of a personalized BLAKE2b-64 hash of
+/// that position and the transaction's bytes, as a little-endian `u64`.
+///
+/// Hashing the position means a damaged block index that gives a block the
+/// wrong rows, or the wrong number of rows, fails the check like a damaged
+/// byte does. BLAKE2b is already a dependency, and runs at about 1 GB/s per
+/// core, so the check adds far less than a disk read to a cold body read.
+fn row_checksum(height: u32, index: u64, block_rows: u64, transaction: &[u8]) -> u64 {
     let hash = blake2b_simd::Params::new()
         .hash_length(8)
         .personal(ROW_CHECKSUM_PERSONALIZATION)
-        .hash(transaction);
+        .to_state()
+        .update(&height.to_le_bytes())
+        .update(&index.to_le_bytes())
+        .update(&block_rows.to_le_bytes())
+        .update(transaction)
+        .finalize();
     u64::from_le_bytes(
         hash.as_bytes()
             .try_into()
@@ -698,9 +708,15 @@ impl Jar {
         Ok(Some(start..end))
     }
 
-    /// Reads transaction `rows`, which must be committed rows of a single block,
-    /// and checks each one against its checksum.
-    fn read_rows(&self, rows: Range<u64>) -> Result<Vec<RawBytes>, StaticFileError> {
+    /// Reads transaction `rows` of block `height`, whose committed rows are
+    /// `block`, and checks each one against its checksum.
+    fn read_rows(
+        &self,
+        height: u32,
+        block: &Range<u64>,
+        rows: Range<u64>,
+    ) -> Result<Vec<RawBytes>, StaticFileError> {
+        debug_assert!(block.start <= rows.start && rows.end <= block.end);
         let count = rows.end - rows.start;
         if count == 0 {
             return Ok(Vec::new());
@@ -739,7 +755,8 @@ impl Jar {
             .map(|((pair, checksum), row)| {
                 // Offsets are within `start..=end`, and that span fits in `data`.
                 let transaction = &data[(pair[0] - start) as usize..(pair[1] - start) as usize];
-                if row_checksum(transaction) != checksum {
+                let index = row - block.start;
+                if row_checksum(height, index, block.end - block.start, transaction) != checksum {
                     return Err(corrupt(
                         &self.files.base,
                         format!("transaction row {row} doesn't match its checksum"),
@@ -761,10 +778,18 @@ impl Jar {
         let mut offsets = Vec::new();
         let mut block_ends = Vec::new();
         let mut checksums = Vec::new();
-        for transactions in blocks {
-            for transaction in *transactions {
+        for (block, transactions) in blocks.iter().enumerate() {
+            // Block counts per jar fit in a `u32`, because they fit in the jar's range.
+            let height = config.first_block + config.blocks + block as u32;
+            for (index, transaction) in transactions.iter().enumerate() {
                 data.extend_from_slice(transaction.raw_bytes());
-                checksums.push(row_checksum(transaction.raw_bytes()));
+                // Transaction counts fit in a `u64`.
+                checksums.push(row_checksum(
+                    height,
+                    index as u64,
+                    transactions.len() as u64,
+                    transaction.raw_bytes(),
+                ));
                 // Data lengths fit in a `u64`.
                 offsets.push(config.data_len + data.len() as u64);
             }
@@ -1273,7 +1298,7 @@ impl StaticFiles {
                 format!("block {height:?} has no transactions"),
             ));
         }
-        jar.read_rows(rows).map(Some)
+        jar.read_rows(height.0, &rows, rows.clone()).map(Some)
     }
 
     /// Returns raw transaction `index` of block `height`, or `None` if it isn't in static files.
@@ -1288,15 +1313,25 @@ impl StaticFiles {
         let Some(rows) = jar.block_rows(height.0)? else {
             return Ok(None);
         };
+        if rows.is_empty() {
+            return Err(corrupt(
+                &jar.blk_path(),
+                format!("block {height:?} has no transactions"),
+            ));
+        }
         // Transaction indexes fit in a `u64`.
         let Some(row) = rows
             .start
             .checked_add(index as u64)
             .filter(|row| *row < rows.end)
         else {
+            // A block index that cut the block short would hide the
+            // transaction, so check the block's last row before saying it's
+            // missing.
+            jar.read_rows(height.0, &rows, rows.end - 1..rows.end)?;
             return Ok(None);
         };
-        Ok(jar.read_rows(row..row + 1)?.pop())
+        Ok(jar.read_rows(height.0, &rows, row..row + 1)?.pop())
     }
 
     /// Returns `true` if block `height` is in static files.

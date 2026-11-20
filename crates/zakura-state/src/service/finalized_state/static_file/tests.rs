@@ -402,6 +402,45 @@ fn a_changed_transaction_byte_fails_its_checksum() {
 }
 
 #[test]
+fn a_shifted_block_boundary_fails_the_checksums() {
+    let dir = tempfile::tempdir().unwrap();
+    // Blocks 1 and 2 have 2 and 3 transactions, at rows 1..3 and 3..6.
+    let expected = blocks(0..5);
+    let static_files = open(dir.path(), 1_000);
+    static_files.append_blocks(&expected).unwrap();
+    drop(static_files);
+
+    // Move the boundary between blocks 1 and 2 back one row, so block 1 loses
+    // its last transaction to block 2. Every row's bytes stay intact.
+    let base = jar_base(&dir.path().join(STATIC_FILE_DIR), 0, 999);
+    let blk = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(suffixed(&base, "blk"))
+        .unwrap();
+    write_all_at(&blk, &2u64.to_le_bytes(), INDEX_HEADER_LEN + 2 * 8).unwrap();
+
+    let reopened = open(dir.path(), 1_000);
+    for height in [Height(1), Height(2)] {
+        assert!(matches!(
+            reopened.block_transactions(height),
+            Err(StaticFileError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            reopened.transaction(height, 0),
+            Err(StaticFileError::Corrupt { .. })
+        ));
+    }
+    // Block 1's lost transaction reads as corrupt, not missing.
+    assert!(matches!(
+        reopened.transaction(Height(1), 1),
+        Err(StaticFileError::Corrupt { .. })
+    ));
+    assert_blocks(&reopened, &expected[..1]);
+    assert_blocks(&reopened, &expected[3..]);
+}
+
+#[test]
 fn blocks_over_the_transaction_cap_are_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let static_files = open(dir.path(), 1_000);

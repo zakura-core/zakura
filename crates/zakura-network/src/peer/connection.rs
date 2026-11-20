@@ -1548,18 +1548,25 @@ where
 
             (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
                 self.remember_requested_blocks(&hashes);
-                self
-                    .peer_tx
-                    .send(Message::GetData(
-                        hashes.iter().map(|h| (*h).into()).collect(),
-                    ))
+                self.peer_tx
+                    .send(Message::GetData(hashes.iter().map(|h| (*h).into()).collect()))
                     .await
-                    .map(|()|
-                         Handler::BlocksByHash {
-                             blocks: Vec::with_capacity(hashes.len()),
-                             pending_hashes: hashes.into_iter().collect(),
-                         }
-                    )
+                    .map(|()| {
+                        if let Some(super::BlockRequestKind::TrackedPrimary { attempt, .. }) =
+                            &tx.block_request
+                        {
+                            if let Some(size) = attempt.legacy_request_written() {
+                                let hash = hashes
+                                    .first()
+                                    .expect("a tracked primary requests exactly one block");
+                                self.inbound_block_size.watch(*hash, size);
+                            }
+                        }
+                        Handler::BlocksByHash {
+                            blocks: Vec::with_capacity(hashes.len()),
+                            pending_hashes: hashes.into_iter().collect(),
+                        }
+                    })
             }
             (AwaitingRequest, TransactionsById(ids) | TransactionsByIdFrom { ids, .. }) => {
                 self
@@ -1649,21 +1656,6 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
-                if let Some(super::BlockRequestKind::TrackedPrimary { attempt, .. }) =
-                    &tx.block_request
-                {
-                    let reply_size = attempt.legacy_request_written();
-                    if let (Handler::BlocksByHash { pending_hashes, .. }, Some(bytes)) =
-                        (&handler, reply_size)
-                    {
-                        // A tracked primary requests exactly one hash.
-                        let hash = pending_hashes
-                            .iter()
-                            .next()
-                            .expect("a primary requests one block");
-                        self.inbound_block_size.watch(*hash, bytes);
-                    }
-                }
                 self.state = AwaitingResponse { handler, span, tx };
                 self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
             }

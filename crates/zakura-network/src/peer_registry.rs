@@ -331,6 +331,18 @@ impl PeerRegistryUpdater {
         self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
     }
 
+    /// Classifies a block reply at receipt. Only a large reply needs the connection's current estimate.
+    pub(crate) fn prepare_block_sample(&self, wire_bytes: u64) -> DeliverySampleKind {
+        if wire_bytes <= delivery::ROUND_TRIP_REPLY_BYTES {
+            DeliverySampleKind::SmallBlock { wire_bytes }
+        } else {
+            DeliverySampleKind::LargeBlock {
+                wire_bytes,
+                prediction: self.delivery_estimate().large_block_prediction(wire_bytes),
+            }
+        }
+    }
+
     /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
     ///
     /// [`DeliveryEstimate::record`] decides what the sample updates: the peer's round trip, or
@@ -504,7 +516,7 @@ mod tests {
         drop(guard);
         assert_eq!(updater.delivery_estimate().round_trip(), None);
         updater.record_delivery_sample(
-            DeliverySampleKind::block(1_700, || updater.delivery_estimate()),
+            updater.prepare_block_sample(1_700),
             Duration::from_millis(5),
             Instant::now(),
         );
@@ -529,7 +541,7 @@ mod tests {
         let now = Instant::now();
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
         updater.record_delivery_sample(
-            DeliverySampleKind::block(1_700, || updater.delivery_estimate()),
+            updater.prepare_block_sample(1_700),
             Duration::from_millis(30),
             now,
         );
@@ -576,6 +588,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_block_reply_is_a_round_trip_up_to_the_size_limit() {
+        use delivery::ROUND_TRIP_REPLY_BYTES;
+
+        let registry = PeerRegistry::default();
+        let (_guard, updater) = registry.register_legacy(peer(1));
+        for bytes in [1_700, ROUND_TRIP_REPLY_BYTES] {
+            let kind = updater.prepare_block_sample(bytes);
+            assert!(matches!(kind, DeliverySampleKind::SmallBlock { .. }));
+        }
+        assert!(matches!(
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES + 1),
+            DeliverySampleKind::LargeBlock { .. }
+        ));
+        assert_eq!(ROUND_TRIP_REPLY_BYTES, 14_600);
+    }
+
     #[tokio::test]
     async fn a_large_block_reply_is_traced_and_leaves_the_score_alone() {
         use delivery::ROUND_TRIP_REPLY_BYTES;
@@ -588,10 +617,13 @@ mod tests {
             zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
             7,
         ));
-        let block = |bytes| DeliverySampleKind::block(bytes, || updater.delivery_estimate());
         let now = Instant::now();
 
-        updater.record_delivery_sample(block(1_200_000), Duration::from_secs(4), now);
+        updater.record_delivery_sample(
+            updater.prepare_block_sample(1_200_000),
+            Duration::from_secs(4),
+            now,
+        );
         assert_eq!(
             updater.delivery_estimate().round_trip(),
             None,
@@ -600,7 +632,7 @@ mod tests {
 
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
         updater.record_delivery_sample(
-            block(ROUND_TRIP_REPLY_BYTES),
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES),
             Duration::from_millis(30),
             now,
         );
@@ -611,7 +643,7 @@ mod tests {
         );
 
         updater.record_delivery_sample(
-            block(ROUND_TRIP_REPLY_BYTES + 1),
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES + 1),
             Duration::from_secs(5),
             now,
         );

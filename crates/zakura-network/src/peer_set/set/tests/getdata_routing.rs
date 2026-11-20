@@ -1937,9 +1937,7 @@ async fn a_slow_large_block_does_not_rush_the_next_second_request_to_a_far_peer(
     let _far_measured = measured_peer(&mut far, &registry, Some(240));
     // The first peer took five seconds to deliver the previous, 1.2 MB block.
     first_samples.record_delivery_sample(
-        crate::peer_registry::DeliverySampleKind::block(1_200_000, || {
-            first_samples.delivery_estimate()
-        }),
+        first_samples.prepare_block_sample(1_200_000),
         Duration::from_secs(5),
         std::time::Instant::now(),
     );
@@ -1977,9 +1975,7 @@ const LARGE_BLOCK_BYTES: u64 = 1_500_000;
 /// Records that the peer behind `samples` took `answer_ms` to deliver a 1.5 MB block.
 fn record_large_block(samples: &crate::peer_registry::PeerRegistryUpdater, answer_ms: u64) {
     samples.record_delivery_sample(
-        crate::peer_registry::DeliverySampleKind::block(LARGE_BLOCK_BYTES, || {
-            samples.delivery_estimate()
-        }),
+        samples.prepare_block_sample(LARGE_BLOCK_BYTES),
         Duration::from_millis(answer_ms),
         std::time::Instant::now(),
     );

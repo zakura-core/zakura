@@ -255,7 +255,7 @@ impl Response {
                 })
                 .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
                 .fold(0, u64::saturating_add);
-            let kind = DeliverySampleKind::block(wire_bytes, || registry.delivery_estimate());
+            let kind = registry.prepare_block_sample(wire_bytes);
             (registry, kind)
         });
         let observation = Arc::new(BlockObservation {

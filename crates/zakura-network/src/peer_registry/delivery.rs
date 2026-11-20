@@ -57,20 +57,6 @@ pub(crate) struct LargeBlockPrediction {
     pub(super) expected: Duration,
 }
 
-impl DeliverySampleKind {
-    /// Only large replies need a snapshot of the connection's estimate.
-    pub(crate) fn block(wire_bytes: u64, estimate: impl FnOnce() -> DeliveryEstimate) -> Self {
-        if wire_bytes <= ROUND_TRIP_REPLY_BYTES {
-            Self::SmallBlock { wire_bytes }
-        } else {
-            Self::LargeBlock {
-                wire_bytes,
-                prediction: estimate().large_block_prediction(wire_bytes),
-            }
-        }
-    }
-}
-
 /// How many round trips a new connection needs to deliver `wire_bytes`.
 ///
 /// A new connection sends [`ROUND_TRIP_REPLY_BYTES`] in its first round trip and doubles the
@@ -157,7 +143,7 @@ impl DeliveryEstimate {
         }
     }
 
-    fn large_block_prediction(&self, wire_bytes: u64) -> Option<LargeBlockPrediction> {
+    pub(super) fn large_block_prediction(&self, wire_bytes: u64) -> Option<LargeBlockPrediction> {
         let rtt = self.round_trip.value()?;
         let trips = round_trips(wire_bytes);
         let slowdown = self.large_block_slowdown().unwrap_or(1.0);
@@ -220,7 +206,10 @@ mod tests {
     }
 
     fn large_reply(estimate: DeliveryEstimate) -> DeliverySampleKind {
-        DeliverySampleKind::block(LARGE, || estimate)
+        DeliverySampleKind::LargeBlock {
+            wire_bytes: LARGE,
+            prediction: estimate.large_block_prediction(LARGE),
+        }
     }
 
     /// An estimate with one 100 ms round trip, measured at the returned time.
@@ -361,20 +350,6 @@ mod tests {
         delayed.record(PING, ms(200), early);
         assert_eq!(delayed.round_trip(), chronological.round_trip());
         assert_eq!(delayed.weight(), chronological.weight());
-    }
-
-    #[test]
-    fn a_block_reply_is_a_round_trip_up_to_the_size_limit() {
-        for bytes in [1_700, ROUND_TRIP_REPLY_BYTES] {
-            let kind =
-                DeliverySampleKind::block(bytes, || panic!("small replies need no estimate"));
-            assert!(matches!(kind, DeliverySampleKind::SmallBlock { .. }));
-        }
-        assert!(matches!(
-            DeliverySampleKind::block(ROUND_TRIP_REPLY_BYTES + 1, DeliveryEstimate::default),
-            DeliverySampleKind::LargeBlock { .. }
-        ));
-        assert_eq!(ROUND_TRIP_REPLY_BYTES, 14_600);
     }
 
     #[test]

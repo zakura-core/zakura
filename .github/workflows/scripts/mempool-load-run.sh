@@ -239,13 +239,19 @@ run_leg() {
 RC=0
 if [ -n "${BASELINE_REF}" ]; then
   # Baseline first, so the target ref's numbers are the ones left in a warm
-  # page cache -- and record both even if the baseline itself fails.
-  run_leg baseline "${BASELINE_REF}" "${BASELINE_PROFILE}" || true
-  run_leg target "${SHA}" "${TARGET_PROFILE}" || RC=$?
+  # page cache. Both legs and the comparison always run, so the record is
+  # complete, and the run fails with the first of them that did.
+  BASE_RC=0; TARGET_RC=0; COMPARE_RC=0
+  run_leg baseline "${BASELINE_REF}" "${BASELINE_PROFILE}" || BASE_RC=$?
+  run_leg target "${SHA}" "${TARGET_PROFILE}" || TARGET_RC=$?
   python3 "$SCRIPTS/mempool-load-compare.py" \
     --baseline "$OUT_DIR/baseline/summary.json" \
     --target "$OUT_DIR/target/summary.json" \
-    --out "$OUT_DIR/summary.md" || true
+    --out "$OUT_DIR/summary.md" || COMPARE_RC=$?
+  echo "baseline rc=${BASE_RC} target rc=${TARGET_RC} compare rc=${COMPARE_RC}"
+  for rc in "$TARGET_RC" "$BASE_RC" "$COMPARE_RC"; do
+    if [ "$RC" -eq 0 ] && [ "$rc" -ne 0 ]; then RC=$rc; fi
+  done
 else
   run_leg target "${SHA}" "${TARGET_PROFILE}" || RC=$?
   cp "$OUT_DIR/target/summary.md" "$OUT_DIR/summary.md" 2>/dev/null || true

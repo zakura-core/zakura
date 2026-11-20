@@ -1482,10 +1482,8 @@ async fn an_idle_peer_hears_of_an_admission() -> Result<(), BoxError> {
 /// Fan-out: with 40 peers, a small transaction goes at once to the 16
 /// sessions of its window and to the other 24 after the advert delay.
 ///
-/// The node has no round-trip times yet, so its ranking is session order
-/// with a random session in every fourth place. The peers connect one at a
-/// time, so the first twelve to connect always fill the window's places
-/// that are not random.
+/// Which 16 depends on the round-trip times QUIC measures on loopback, so
+/// only the counts are checked.
 #[tokio::test]
 async fn a_small_transaction_reaches_the_window_at_once_and_the_rest_after_the_delay(
 ) -> Result<(), BoxError> {
@@ -1517,10 +1515,6 @@ async fn a_small_transaction_reaches_the_window_at_once_and_the_rest_after_the_d
         .filter(|n| heard[*n] < ADVERT_DELAY / 2)
         .collect();
     assert_eq!(at_once.len(), WINDOW_SMALL, "heard: {heard:?}");
-    assert!(
-        (0..12).all(|n| at_once.contains(&n)),
-        "the window's places in session order: {at_once:?}"
-    );
     for (n, wait) in heard.iter().enumerate() {
         if !at_once.contains(&n) {
             assert!(

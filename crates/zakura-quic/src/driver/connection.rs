@@ -461,6 +461,7 @@ impl<S: UdpIo> ConnTask<S> {
         load.udp_rx = stats.udp_rx;
         load.frame_rx = stats.frame_rx;
         load.send_errors = self.counters.send_errors;
+        load.rtt = stats.path.rtt;
         load
     }
 

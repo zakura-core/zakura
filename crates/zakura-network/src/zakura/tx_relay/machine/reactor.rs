@@ -73,7 +73,7 @@ pub(crate) struct Reactor {
     /// the entry generation they were fetched in. No peer has an empty map.
     unsettled: HashMap<PeerKey, BTreeMap<WaiterId, (UnminedTxId, EntryGen)>>,
     /// Reserve calls whose session ended before the pool answered, by peer.
-    /// They count against the peer's 5 until answered, so a peer that ends
+    /// They count against the peer's window until answered, so a peer that ends
     /// and reopens sessions while the pool is slow can't pile up calls. No
     /// peer has a count of zero.
     ended_calls: HashMap<PeerKey, usize>,

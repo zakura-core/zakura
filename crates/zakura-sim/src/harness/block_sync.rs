@@ -170,6 +170,12 @@ pub struct BlockScenario {
     /// keep their digests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sessions: bool,
+    /// The drain's step bound. `None` keeps [`storage_config`]'s. A bound
+    /// below what the peers' work needs ends the drain with tasks still
+    /// ready, as a harness failure. Left out of the scenario's JSON when
+    /// unset, so earlier scenarios keep their digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_steps: Option<u64>,
 }
 
 /// Pauses each routine that hands a body to the sequencer, after the send
@@ -226,6 +232,7 @@ impl Default for BlockScenario {
             handoff_pause: None,
             sequencer_pause: None,
             sessions: false,
+            drain_steps: None,
         }
     }
 }
@@ -1018,7 +1025,7 @@ pub fn storage_config(scenario: &BlockScenario) -> RunConfig {
             .unwrap_or(8_000 + STEPS_PER_BLOCK * (u64::from(scenario.blocks) + changed)),
         // The longest drain measured on the committed inputs, which runs the
         // peers' timers to the harness timer cap, is about 12,800 steps.
-        drain_bound: 60_000,
+        drain_bound: scenario.drain_steps.unwrap_or(60_000),
         ..RunConfig::default()
     }
 }

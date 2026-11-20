@@ -1,5 +1,6 @@
 //! Native Zakura discovery service and dial supervision.
 
+mod book_file;
 mod candidate_dialer;
 #[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
@@ -32,6 +33,9 @@ pub(crate) mod wire;
 #[cfg(test)]
 mod wire_tests;
 
+pub(crate) use book_file::{
+    load_saved_discovery_book, spawn_discovery_book_saver, DiscoveryBookFile,
+};
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use candidate_dialer::run_native_discovery_dialer;
 pub(crate) use candidate_dialer::{

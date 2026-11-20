@@ -243,6 +243,32 @@ fn a_partial_block_size_hint_respects_the_block_limit() {
     }
 }
 
+/// A block frame too short to hold a block header cannot be the requested block, even when
+/// its bytes are the start of that block's header.
+#[test]
+fn a_block_frame_shorter_than_a_header_reports_no_size() {
+    let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let header = block::Header::zcash_deserialize(block).unwrap();
+    let header_len = header.zcash_serialized_size();
+    for body_len in [0, 1, header_len - 1] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(BlockReplySize::default());
+        codec
+            .inbound_block_size()
+            .watch(header.hash(), size.clone());
+        let message = wire_message(*BLOCK_COMMAND, &block[..body_len]);
+        // The whole frame arrives, and fails to decode as a block.
+        let decoded = codec.decode(&mut BytesMut::from(message.as_slice()));
+        assert!(
+            !matches!(decoded, Ok(Some(Message::Block(_)))),
+            "{body_len} bytes are not a block"
+        );
+        assert_eq!(size.get(), None);
+    }
+}
+
 /// A fragmented transport header can publish only to a watch active from its first bytes.
 #[test]
 fn a_fragmented_header_cannot_supply_a_size_to_a_new_watch() {

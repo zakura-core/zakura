@@ -6,7 +6,7 @@ use std::{
 };
 
 use zakura_chain::{
-    block::Block,
+    block::{self, Block},
     serialization::{CompactSize64, ZcashDeserializeInto, ZcashSerialize},
     transparent::Script,
 };
@@ -14,7 +14,7 @@ use zakura_chain::{
 use crate::{
     peer::RequestSlot,
     peer_registry::{DeliverySampleKind, DeliveryTrace, PeerRegistry},
-    InventoryResponse::Available,
+    InventoryResponse::{Available, Missing},
     Response,
 };
 
@@ -112,4 +112,63 @@ async fn verified_large_replies_use_the_prediction_at_receipt() {
         })
         .collect();
     assert_eq!(predictions, [(1, Some(669)), (2, Some(669)), (3, None)]);
+}
+
+/// A reply with several blocks is one transfer. Its size is the sum of the blocks it delivered,
+/// which decides what it measures, and it earns one sample however many of its blocks verify.
+#[tokio::test]
+async fn a_batch_reply_is_one_sample_of_the_bytes_it_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
+    let emitter = zakura_jsonl_trace::JsonlEventEmitter::new(trace.tracer(), "receipt-test");
+    let registry = PeerRegistry::default();
+    let small: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let small_bytes = u64::try_from(small.zcash_serialized_size()).unwrap();
+    let mut expected = Vec::new();
+
+    for (id, second, kind, wire_bytes) in [
+        (1u16, small.clone(), "block", 2 * small_bytes),
+        (2, large_block(), "large_block", small_bytes + BLOCK_BYTES),
+    ] {
+        let (_guard, updater) = registry.register_legacy(super::peer(id));
+        let updater = updater.with_delivery_trace(DeliveryTrace::new(emitter.clone(), id.into()));
+        let mut response = Response::Blocks(vec![
+            Available((small.clone().into(), None)),
+            Missing(block::Hash([7; 32])),
+            Available((second.into(), None)),
+        ]);
+        response.observe_block_delivery(
+            &RequestSlot::default(),
+            Some(updater),
+            Duration::from_millis(670),
+            Instant::now(),
+        );
+        let Response::Blocks(blocks) = response else {
+            unreachable!()
+        };
+        for entry in &blocks {
+            if let Some((received, _)) = entry.available() {
+                received.record_verified();
+            }
+        }
+        expected.push((u64::from(id), kind.to_string(), wire_bytes));
+    }
+
+    drop(emitter);
+    trace.shutdown().await;
+    let rows = std::fs::read_to_string(dir.path().join("delivery_score.jsonl")).unwrap();
+    let samples: Vec<_> = rows
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|row| {
+            (
+                row["connection_id"].as_u64().unwrap(),
+                row["kind"].as_str().unwrap().to_string(),
+                row["wire_bytes"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(samples, expected, "one sample for each whole reply");
 }

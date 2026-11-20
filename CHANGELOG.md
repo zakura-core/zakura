@@ -15,6 +15,31 @@ independently.
 
 ### Added
 
+- Mining nodes push newly mined blocks to peers in the initial announcement
+  group that advertise `NODE_BLOCK_PUSH`, saving one request round trip.
+  The opt-in `network.push_relayed_blocks` setting also pushes blocks this
+  node relays after it commits them, which can send an extra copy to a
+  peer that already has the block
+  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
+- Added the binary `/submittrustedblock` endpoint, enabled through
+  `rpc.enable_trusted_block_submission`. It can start relaying a new block
+  before local validation and follows the RPC listener's cookie-authentication
+  setting. Submit only final block bytes verified by a trusted full node,
+  because peers can ban a relay that sends an invalid block. Zakura withdraws
+  pending announcements and responses when a submission is rejected or
+  times out. The endpoint returns `inconclusive` when it cannot establish
+  the result, so the caller can retry
+  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
+- Added the opt-in `[network.block_download_score_and_hedge]` setting.
+  With `enabled = true`, Zakura picks a legacy peer using recent response
+  times and can send one backup request when a later announcer is likely
+  to deliver sooner or the first request stalls. Peer and request events
+  can trigger the backup. If you tried the feature in a development build,
+  replace `[network.block_source_score]` and remove its `second_request`
+  key
+  ([#2572](https://github.com/zakura-core/zakura/pull/2572),
+  [#2595](https://github.com/zakura-core/zakura/pull/2595),
+  [#2596](https://github.com/zakura-core/zakura/pull/2596)).
 - Added the `[mempool] implementation` setting. `default` and `classic` keep
   the pool nodes run today. `core` runs the new pool core, which is
   experimental
@@ -37,67 +62,6 @@ independently.
 - Added `zakura.p2p.tx_relay.registered`, which says whether the node
   registered `tx-relay`
   ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
-- Added the opt-in binary `/submittrustedblock` endpoint, which follows the
-  primary listener's `enable_cookie_auth` setting.
-  When the relay quickly confirms the block's parent and that the block is new,
-  it begins relay before local validation. A block that is already committed
-  returns `duplicate` without relay. If the verifier reports a duplicate and
-  the relay cannot confirm a committed copy within five seconds, it returns
-  `inconclusive`. A verifier outage or failed state read also returns
-  `inconclusive` so the caller can retry. Peers can fetch a pending body only
-  when early relay is authorized. Once the request head is accepted, a client disconnect does not
-  abandon a submission whose body reaches the relay. On the plain HTTP listener
-  this includes a client that closes immediately after sending the whole
-  request. A TLS client must stay connected until it has read the response.
-  Committed broadcasts reuse active early announcements to avoid duplicate
-  inventories on healthy peer connections. Operators should validate the exact
-  final block bytes on a trusted full node first: receivers can ban a relay that
-  sends an invalid block. Invalid submissions do not disable later trusted
-  submissions
-  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
-
-- Rejection and timeout withdraw queued legacy TCP announcements and block-body
-  responses at the write boundary, including bodies fetched before rejection.
-  The v2 compatibility adapter withdraws block-body responses when it encodes
-  them. Successful commitment, or a duplicate whose body equals the committed
-  block, preserves active delivery; same-header retries retain separate
-  submission permissions. Peers requesting a committed block always receive the
-  committed body, never a pending one with the same header hash. Ordinary
-  `submitblock` early relay applies the same withdrawal when contextual
-  validation fails and retains shared checksum warmup for state-admitted bodies
-  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
-- Mining nodes push each block they mine to peers in the initial advert group
-  that advertise the new `NODE_BLOCK_PUSH` service bit (`1 << 26`), which saves
-  those peers the `getdata` round trip. Nodes now verify blocks that peers push
-  without advertising them first, and advertise `NODE_BLOCK_PUSH`
-  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
-- Experimental `network.push_relayed_blocks` setting, off by default, also
-  pushes relayed blocks to those peers after this node commits them. A peer
-  that already has the block still receives a full copy, so enable it only on
-  a few well-connected relays.
-- `[network.block_source_score]`, off by default: when several idle legacy peers announced a
-  block, the node asks the one expected to answer sooner, from its recent ping and block answer
-  times (blocks of any size), instead of the less loaded one. The node records a miss when an
-  announcer fails to deliver its block. Only with scoring enabled does routing pass over that
-  peer, until a later body from the same connection verifies or 10 minutes elapse.
-  A delayed verification can clear only the miss that preceded the delivery on that connection.
-  The legacy peer trace records each choice (`candidates`, `score_ms`, `best_score_ms`) and each delivered block's size
-  (`block_bytes`). With a `trace_dir`, every sample that changes a peer's score is written to
-  `delivery_score.jsonl`, with the score before and after it, along with each announced block a
-  peer did not deliver ([#2572](https://github.com/zakura-core/zakura/pull/2572)).
-- `[network.block_source_score] second_request`, off by default: while a gossiped block's first
-  legacy request is outstanding, the node also asks one other idle peer that announced it, but
-  only when that peer is expected to deliver it clearly sooner, or when the first request has
-  stalled, 500 ms past its expected time. Both peers must have measured answer times. A miss
-  spends the single second request. A queued second request expires after five seconds or when the first request finishes. Switching to a native
-  fallback also closes that window. A legacy request already sent can still deliver the block.
-  Stall timing starts when the first request reaches its selected peer queue.
-  The first reply that matches the requested hash and passes the tip-child height check goes to
-  verification and suppresses further native fallback attempts. If the body falls outside the local height window,
-  disagrees with a header commitment, or contains duplicate transactions, the node tries the
-  other already-requested copy once. The legacy peer trace writes these as `hedge` rows with `hedge_reason`,
-  `first_request_waited_ms` and `first_score_ms`
-  ([#2572](https://github.com/zakura-core/zakura/pull/2572)).
 
 ### Changed
 
@@ -108,49 +72,23 @@ independently.
   address under the same setting, and its user agent. The rows' `peer_id` column is now
   `connection_id`, the same number the connection's `legacy_gossip.jsonl` rows carry
   ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
-- Serving the same block to several legacy-protocol peers uses less CPU: a block
-  sent again is serialized once instead of twice, and each block's header is
-  hashed once per send instead of twice
-  ([#2556](https://github.com/zakura-core/zakura/pull/2556)).
-- Nodes relay large blocks to legacy peers sooner. When the node announces a block, it
-  computes the block message's checksum on a background thread before peers request the
-  block. Peers that request the same block at the same moment now share one checksum
-  calculation instead of each hashing the block. New `peer.block_checksum.*` metrics count
-  checksums reused, hashed while sending, and precomputed
-  ([#2557](https://github.com/zakura-core/zakura/pull/2557)).
-- A node that is still verifying a block it received through its own submission,
-  such as an optimistic `submitblock` announcement, no longer downloads and
-  verifies a peer's copy of the same block. It downloads the peer's copy only
-  if its own submission fails or is still unresolved after 5 seconds
+- Serving a block to several legacy peers uses less CPU by reusing its
+  serialized bytes and sharing its checksum across requests
+  ([#2556](https://github.com/zakura-core/zakura/pull/2556),
+  [#2557](https://github.com/zakura-core/zakura/pull/2557)).
+- When Zakura is still verifying a locally submitted block, it waits to
+  download a peer's copy until local verification fails or five seconds
+  pass. The wait leaves the peer-download slot available. Its duration
+  and outcome are recorded in metrics and, when enabled, in
+  `commit_state.jsonl`
   ([#2562](https://github.com/zakura-core/zakura/pull/2562)).
-- Waiting for a local submission no longer reserves a peer-download slot. Failed
-  or timed-out submissions enter normal download admission when capacity is
-  available, while missing-parent recovery bypasses the wait. Cancelled waiters
-  cannot displace a newer wait for the same block when seeking admission.
-- Completed waits report their duration and outcome in metrics and, when tracing
-  is enabled, a per-block `local_submission_wait_finished` event in
-  `commit_state.jsonl` for correlation with peer downloads.
-- The experimental core pool (`[mempool] implementation = "core"`) builds
-  each published snapshot from the previous one instead of copying the
-  whole pool, so a full pool no longer costs most of a CPU under load. In
-  `zakura-node-services`, `PoolSnapshot::transactions` is now a method
-  that walks the mining order, and `PoolSnapshot::after` builds a snapshot
-  from the one before it
+- The experimental core mempool builds each snapshot from the previous one,
+  reducing CPU use as the pool fills
   ([#2591](https://github.com/zakura-core/zakura/pull/2591)).
-- `[network.block_source_score]` is now
-  `[network.block_download_score_and_hedge]`, and its `enabled` setting turns
-  on both the score-based choice of announcer and second block requests. The
-  separate `second_request` setting is removed, so a config that sets it, or
-  the old section name, must be updated
-  ([#2595](https://github.com/zakura-core/zakura/pull/2595)).
-- With `[network.block_download_score_and_hedge] enabled` on, a block download no longer asks the
-  peer set every 10 ms whether to send a second request. It asks once, and the peer set sends
-  the request as soon as another peer announces the block, an announcer becomes free or is
-  measured again, an announcer's previous miss expires, or the first request becomes overdue
-  or stalls. The conditions for sending one are unchanged. The `pool.route_inv.hedge.not_yet.count` and
-  `pool.route_inv.hedge.no_candidate.count` counters now count these decisions instead of
-  10 ms checks, and the new `pool.route_inv.hedge.held` gauge reports how many downloads
-  are waiting for a second request
+- The `pool.route_inv.hedge.not_yet.count` and
+  `pool.route_inv.hedge.no_candidate.count` metrics count decisions to send
+  a backup block request. `pool.route_inv.hedge.held` shows how many
+  downloads are waiting for one
   ([#2596](https://github.com/zakura-core/zakura/pull/2596)).
 - A stalled v2 frame read now resets its session or one-shot request. Sibling
   services can keep using the connection. Header sync counts an unanswered
@@ -167,13 +105,10 @@ independently.
   Header sync meters peer `Status` messages and locator walks for new
   subscriptions per connection, so reopening a session gets no fresh burst
   ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
-- With the experimental `[network.zakura.tx_relay]` enabled, its bookkeeping at
-  92 full peers uses about 400 MiB instead of about 1.3 GiB: past 256
-  pending transaction ids a peer, the node takes more while peers hold fewer
-  than 64,000 together, or 128,000 for an id no peer holds yet. A peer is asked for up to 16 transactions at once instead of 5,
-  growing from 5 as its transactions are admitted and halving when it misses
-  a deadline, and new transactions go first to the peers with the lowest
-  round-trip times ([#2623](https://github.com/zakura-core/zakura/pull/2623)).
+- The experimental `tx-relay` service uses less memory with many connected
+  peers. It sizes each peer's request window based on recent deliveries
+  and announces new transactions to the lowest-latency peers first
+  ([#2623](https://github.com/zakura-core/zakura/pull/2623)).
 
 ### Fixed
 
@@ -199,9 +134,6 @@ independently.
   with a long or delayed return path cannot hold a closing-connection slot for
   three of its probe timeouts
   ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
-
-The PR also adds internal handshake property tests and extracts admission
-accounting into a production machine the simulator drives.
 - Nodes start successfully when `ZAKURA_TRACE_PEER_NAMES` names fleet peers for
   the gossip trace, instead of rejecting it as an unknown configuration field
   ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
@@ -212,9 +144,8 @@ accounting into a production machine the simulator drives.
 - On macOS, the raw trace endpoint returns HTTP 403 when a requested table is a
   Unix socket ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
 - Preserve a concurrent block announcement from another peer when a pushed
-  body is rejected, so a malformed push cannot consume that announcement.
-
-<!-- zakura-network 19.0.0 covers the new exhaustive Request::PushBlock variant. -->
+  body is rejected
+  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
 - Fixed Windows nodes ignoring the existing state database after a major
   database format upgrade and syncing from genesis instead
   ([#2563](https://github.com/zakura-core/zakura/pull/2563)).

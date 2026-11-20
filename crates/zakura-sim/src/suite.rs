@@ -2119,9 +2119,9 @@ impl CargoTarget {
 /// Whether a required state of the feature family named `id` still waits
 /// for a collector or a witness ([`REQUIRED`]).
 fn feature_waits(id: &str) -> bool {
-    REQUIRED.iter().any(|row| {
-        row.family.name() == id && matches!(row.coverage, Coverage::Waiting { .. })
-    })
+    REQUIRED
+        .iter()
+        .any(|row| row.family.name() == id && matches!(row.coverage, Coverage::Waiting { .. }))
 }
 
 /// Every property ID any harness reports.

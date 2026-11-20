@@ -1471,7 +1471,12 @@ impl PeerTask {
         let discovery = match (self.spec.discovery.clone(), discovery) {
             (Some(script), Some(stream)) => {
                 let secret = SeededInputs::node_key(self.seed, key_index(self.index));
-                match DiscoveryPeer::new(stream, script, secret, self.spec.listen_addr(self.index, 0)) {
+                match DiscoveryPeer::new(
+                    stream,
+                    script,
+                    secret,
+                    self.spec.listen_addr(self.index, 0),
+                ) {
                     Ok(mut peer) => {
                         peer.lenient = self.spec.skip_stale_acts;
                         Some(peer)

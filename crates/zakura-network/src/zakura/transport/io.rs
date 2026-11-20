@@ -1329,7 +1329,10 @@ mod tests {
             seq,
         };
         assert_eq!(
-            *observer.rows.lock().expect("no test panics while holding it"),
+            *observer
+                .rows
+                .lock()
+                .expect("no test panics while holding it"),
             [
                 (held(0), 2 * bytes),
                 (released(0), 2 * bytes),

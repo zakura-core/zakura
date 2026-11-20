@@ -1712,15 +1712,12 @@ where
             span: tracing::Span::current(),
             reply,
         });
-        metrics::counter!("pool.route_inv.held.count").increment(1);
 
         async move {
-            match routed.await {
-                Ok(response) => response.await,
-                Err(oneshot::Canceled) => {
-                    Err("peer set shut down before routing a held request".into())
-                }
-            }
+            let response = routed
+                .await
+                .map_err(|_| "peer set shut down before routing a held request")?;
+            response.await
         }
         .boxed()
     }
@@ -1755,40 +1752,28 @@ where
                 continue;
             }
 
-            let route = if self.has_ready_advertiser(held.hash) {
-                Some(true)
-            } else if held.deadline > now && self.has_busy_advertiser(held.hash) {
+            let to_advertiser = self.has_ready_advertiser(held.hash);
+            if !to_advertiser && held.deadline > now && self.has_busy_advertiser(held.hash) {
                 // Every request waits as long, so the oldest has the earliest deadline.
                 next_deadline.get_or_insert(held.deadline);
-                None
-            } else if !self.ready_services.is_empty() {
-                Some(false)
-            } else {
-                // Like a new request, wait until a peer is ready.
-                None
-            };
-
-            match route {
-                Some(to_advertiser) => {
-                    let HeldTxRequest {
-                        req,
-                        hash,
-                        span,
-                        reply,
-                        ..
-                    } = held;
-                    let response = span.in_scope(|| {
-                        if to_advertiser {
-                            self.route_inv(req, hash, None)
-                        } else {
-                            self.route_inv_to_any_peer(req, hash, None)
-                        }
-                    });
-                    let _ = reply.send(response);
-                    routed = true;
-                }
-                None => self.held_tx_requests.push_back(held),
+                self.held_tx_requests.push_back(held);
+                continue;
             }
+            if !to_advertiser && self.ready_services.is_empty() {
+                // Like a new request, wait until a peer is ready.
+                self.held_tx_requests.push_back(held);
+                continue;
+            }
+
+            let response = held.span.in_scope(|| {
+                if to_advertiser {
+                    self.route_inv(held.req, held.hash, None)
+                } else {
+                    self.route_inv_to_any_peer(held.req, held.hash, None)
+                }
+            });
+            let _ = held.reply.send(response);
+            routed = true;
         }
 
         match (next_deadline, self.held_tx_timer.as_mut()) {

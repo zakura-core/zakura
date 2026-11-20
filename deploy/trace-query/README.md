@@ -62,6 +62,35 @@ python3 trace_query.py dump --url http://127.0.0.1:9009 --table commit_state | j
 | `fetched_unix` | The collector's wall clock when it stored the row. |
 | `row` | The row's JSON. |
 
+A row's wall-clock time, the only time that can be compared across nodes, is
+the start time in its `process_trace_id` plus its `ts`. The id is
+`<pid>-<unix nanoseconds when ts started>`, so in microseconds:
+
+```sql
+CAST(substr(process_trace_id, instr(process_trace_id, '-') + 1) AS INTEGER) / 1000 + ts
+```
+
+This holds only for rows written by v1.8.8 or later. Older builds read the
+id's time some seconds after `ts` started, with the same id format, so pick
+those processes out by their deploy records rather than by the id.
+
+## Clock offset
+
+A difference between two nodes' wall-clock times includes the offset between
+their clocks, so record it with the traces. Before and after a collection
+window, on each host:
+
+```sh
+timedatectl timesync-status | grep -E 'Offset|Root distance'
+```
+
+`Offset` is that host's last measured offset from its NTP server, and `Root
+distance` bounds its error. The two hosts' offset from each other is at most
+the sum of each one's `|Offset|` and `Root distance`. Keep that bound in the
+record, and treat any lag smaller than it as no lag. On a host running chrony,
+use `chronyc tracking`: its `System time` is the offset, and its root distance
+is `Root dispersion` plus half the `Root delay`.
+
 ## Remote nodes
 
 The endpoint binds loopback only. Reach a remote node through an

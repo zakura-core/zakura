@@ -5278,7 +5278,10 @@ async fn completed_mined_verification_precedes_admission() {
             if committed {
                 Ok::<_, BoxError>(block.hash())
             } else {
-                Err("contextual verification rejected the block".into())
+                Err(RouterError::from(zakura_consensus::VerifyBlockError::from(
+                    zakura_consensus::BlockError::DuplicateTransaction,
+                ))
+                .into())
             }
         });
         let channel = types::submit_block::EarlyMinedBlockChannel::new();

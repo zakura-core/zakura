@@ -2484,7 +2484,10 @@ async fn production_ingress_status_flood_observes_snapshots() -> Result<(), crat
         outbound.push(other);
     }
     let mut peers = Vec::new();
+    let handshake_refill = crate::zakura::transport::node_handshake_cadence().refill_interval;
     for index in 0..64_u64 {
+        // Wait for an inbound handshake token before dialing the next loopback peer.
+        tokio::time::sleep(handshake_refill).await;
         peers.push(Arc::new(
             HostilePeer::connect_native_with_capabilities(
                 &node,

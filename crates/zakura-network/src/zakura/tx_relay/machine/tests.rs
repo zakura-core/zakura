@@ -29,8 +29,8 @@ use zakura_node_services::mempool::port::{
 use self::tracker::{Cause, Tracker};
 use super::{
     peer::Hello, CallId, CloseReason, FanOut, Granted, InvRoom, Paid, PeerKey, RelayConfig,
-    RelayEffect, RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId,
-    MAX_REQUESTS_PER_PEER, MAX_SERVES, MAX_TX_BYTES,
+    RelayEffect, RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId, MAX_SERVES,
+    MAX_TX_BYTES,
 };
 
 mod random;
@@ -69,11 +69,11 @@ pub(super) fn ids(ns: impl IntoIterator<Item = u32>) -> Vec<UnminedTxId> {
     ns.into_iter().map(|n| body(n, script).id()).collect()
 }
 
-/// A peer's `Hello`: it serves as many requests as one peer may have out,
-/// and takes the protocol's largest transaction.
+/// A peer's `Hello`, as today's nodes send it: it serves as many requests
+/// as the table allows, and takes the protocol's largest transaction.
 pub(super) fn hello() -> Hello {
     Hello {
-        serves: MAX_REQUESTS_PER_PEER,
+        serves: MAX_SERVES,
         max_tx_bytes: MAX_TX_BYTES,
     }
 }

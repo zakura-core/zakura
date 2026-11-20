@@ -172,10 +172,13 @@
 //!   or the session ending. The pool answers it, which frees the slot.
 //! - **Overflow is counted and is never a violation.** An announcement
 //!   that finds its session's pending set full is dropped, and so is one
-//!   that finds every session's pending ids, with the announcements
-//!   sessions keep while they wait for the go or a `Hello`, past
-//!   [`PENDING_CAP`] while its own session holds [`PENDING_SHARE`] or more. So peers that fill the
-//!   cap leave every other session its share.
+//!   that finds every session's pending ids past [`PENDING_CAP`] while its
+//!   own session holds [`PENDING_SHARE`] or more. So peers that fill the cap
+//!   leave every other session its share. Announcements sessions keep while
+//!   they wait for the go or a `Hello` are bounded the same way, in a budget
+//!   of their own, so ids that can't be fetched yet never crowd out ones
+//!   that can, and the waiting ids a session takes in once it may fetch
+//!   keep the room they were counted in.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
 //!   body the reactor holds for it, and the supplier's sessions mark an id
@@ -283,9 +286,10 @@ pub(crate) const MAX_OUTSTANDING_BYTES: u64 = INITIAL_WINDOW as u64 * MAX_TX_BYT
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
 
-/// Ids every session holds pending or keeps while it waits for the go or a
-/// `Hello`, summed, past which a session takes no more than
-/// [`PENDING_SHARE`]: eight full pending sets (*provisional*).
+/// Ids every session holds pending, summed, past which a session takes no
+/// more than [`PENDING_SHARE`]: eight full pending sets (*provisional*).
+/// Announcements sessions keep while they wait for the go or a `Hello` have
+/// a budget of the same size and share.
 pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 
 /// Ids every session may hold pending however many the others hold
@@ -783,8 +787,7 @@ pub(crate) struct Shared {
     /// a slot given back is no room.
     pub(crate) stopped: bool,
     /// Announcements live sessions keep while they wait for the go or a
-    /// `Hello`, summed. They count against [`PENDING_CAP`] as pending ids
-    /// do.
+    /// `Hello`, summed. They have a [`PENDING_CAP`] of their own.
     pub(crate) waiting: usize,
     /// How many sessions hear of an admission at once, and when the rest do.
     pub(crate) fan_out: FanOut,
@@ -808,12 +811,6 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// Pending ids every session holds, and announcements live sessions
-    /// keep while they wait: what [`PENDING_CAP`] bounds.
-    pub(crate) fn pending_total(&self) -> usize {
-        self.wanted.held().saturating_add(self.waiting)
-    }
-
     /// The shared state of a new `tx-relay`.
     pub(crate) fn new(config: RelayConfig) -> Self {
         let mut short_id = blake2b_simd::Params::new();

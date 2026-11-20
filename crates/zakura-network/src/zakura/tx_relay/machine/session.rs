@@ -159,7 +159,7 @@ impl PeerMachine {
             // has the go.
             if shared.reactor.has_go(self.state.peer, self.session) {
                 let waiting = self.take_waiting(shared);
-                self.take_ids(shared, pool, &waiting);
+                self.take_ids(shared, pool, &waiting, waiting.len());
             }
         }
         self.settle(shared, pool);
@@ -187,7 +187,7 @@ impl PeerMachine {
         }
         let hello = self.state.hello.is_some();
         if shared.reactor.has_go(peer, self.session) && hello {
-            self.take_ids(shared, pool, entries);
+            self.take_ids(shared, pool, entries, 0);
         } else {
             // A session waiting for the go keeps its announcements to itself,
             // filtered and bounded as the pending set is, so one peer never
@@ -200,7 +200,7 @@ impl PeerMachine {
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
-                let node_room = PENDING_CAP.saturating_sub(shared.pending_total());
+                let node_room = PENDING_CAP.saturating_sub(shared.waiting);
                 let fits = state.waiting.len() < PENDING_PER_PEER
                     && (node_room > 0 || state.waiting.len() < PENDING_SHARE);
                 if fits {
@@ -372,7 +372,7 @@ impl PeerMachine {
             // The announcement that overtook this answer is taken now, as
             // it would have been had it come after. One try per entry still
             // holds: if the entry lives on, this peer has tried it.
-            Some(size) => self.take_ids(shared, pool, &[(id, size)]),
+            Some(size) => self.take_ids(shared, pool, &[(id, size)], 0),
             // If the pool already holds the id, an admission this session
             // skipped while the request was out is announced now.
             None => self.reconsider_advert(shared, pool, id, request.admission_seen),
@@ -1099,7 +1099,7 @@ impl PeerMachine {
         // wait for one.
         if state.hello.is_some() {
             let waiting = self.take_waiting(shared);
-            self.take_ids(shared, pool, &waiting);
+            self.take_ids(shared, pool, &waiting, waiting.len());
         }
     }
 
@@ -1112,12 +1112,14 @@ impl PeerMachine {
     }
 
     /// Takes announced ids into this session, which has the go: its pending
-    /// set, and the table.
+    /// set, and the table. The first `carried` of them were counted while
+    /// the session waited, so they keep that room past the node-wide cap.
     fn take_ids(
         &mut self,
         shared: &mut Shared,
         pool: &dyn PoolView,
         entries: &[(UnminedTxId, u32)],
+        carried: usize,
     ) {
         let mut fresh = Vec::new();
         let mut taken: HashSet<UnminedTxId> = HashSet::default();
@@ -1163,9 +1165,12 @@ impl PeerMachine {
         // fit leaves no holder behind. Past the node-wide cap a session
         // still holds its share, so peers that fill the cap crowd out
         // nobody else's first ids.
-        let node_room = PENDING_CAP.saturating_sub(shared.pending_total());
+        let node_room = PENDING_CAP.saturating_sub(shared.wanted.held());
         let share_room = PENDING_SHARE.saturating_sub(state.pending.len());
-        let fits = state.room().min(node_room.max(share_room)).min(fresh.len());
+        let fits = state
+            .room()
+            .min(node_room.max(share_room).max(carried))
+            .min(fresh.len());
         let dropped = fresh.len().saturating_sub(fits);
         state.overflow = state
             .overflow

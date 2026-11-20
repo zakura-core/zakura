@@ -146,18 +146,35 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         assert_eq!(state.pending.len(), held, "session {n}'s pending set");
         assert_eq!(state.overflow, overflow, "session {n}'s overflow");
     }
-    // A session that has not sent its `Hello` keeps what it was announced
-    // while it waits, and that counts against the cap too.
-    let silent = machine.connect(PeerKey(SESSIONS), false, now);
-    machine.inv(silent, &ids, now);
-    let state = machine.session(silent).expect("live");
-    assert_eq!(
-        state.waiting.len(),
-        PENDING_SHARE,
-        "its share while it waits"
-    );
-    assert_eq!(state.overflow, dropped);
-    machine.end(silent, now);
+    // Sessions that have not sent their `Hello` keep what they were
+    // announced while they wait, in a budget of its own, so the full
+    // pending cap crowds none of it out, and past that budget a session
+    // keeps its share.
+    let silent: Vec<_> = (0..=full)
+        .map(|n| {
+            let peer = SESSIONS + u64::try_from(n).expect("small");
+            let session = machine.connect(PeerKey(peer), false, now);
+            machine.inv(session, &ids, now);
+            session
+        })
+        .collect();
+    for (n, session) in silent.iter().enumerate() {
+        let state = machine.session(*session).expect("live");
+        let waiting = if n < full {
+            PENDING_PER_PEER
+        } else {
+            PENDING_SHARE
+        };
+        assert_eq!(state.waiting.len(), waiting, "silent session {n} waits");
+    }
+    // Once one may fetch, what it kept while it waited joins its pending
+    // set in the room it was counted in, past the full pending cap.
+    machine.hello(silent[0], hello(), now);
+    let state = machine.session(silent[0]).expect("live");
+    assert_eq!(state.pending.len(), PENDING_PER_PEER, "none of it is lost");
+    for session in silent {
+        machine.end(session, now);
+    }
     assert_eq!(machine.wanted().len(), PENDING_PER_PEER);
     let sessions_count = usize::try_from(SESSIONS).expect("small");
 

@@ -284,6 +284,11 @@ impl<F: SocketFactory> EndpointTask<F> {
         let (control_tx, control) = mpsc::unbounded_channel();
         let (handshake_tx, handshake) = oneshot::channel();
         let shared = ConnShared::new(canonical_addr(admitted), self.queued_total.clone());
+        #[cfg(zakura_sim)]
+        shared
+            .slot_release
+            .set(slot.release.clone())
+            .expect("a new connection has no slot probe");
         self.conns.insert(
             handle,
             ConnEntry {
@@ -480,6 +485,15 @@ impl<F: SocketFactory> EndpointTask<F> {
             pending_from_ip: self.shared.pending.for_ip(pending_group),
         };
         let decision = decide(&self.shared.config, acceptor.as_ref(), &info);
+        #[cfg(zakura_sim)]
+        self.shared
+            .pending
+            .record(crate::HandshakeEvent::Admission {
+                incoming: info,
+                decision,
+                max_pending_per_ip: self.shared.config.max_pending_per_ip,
+                retry_threshold: self.shared.config.retry_threshold,
+            });
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
         self.response_buf.clear();
         match decision {
@@ -487,14 +501,13 @@ impl<F: SocketFactory> EndpointTask<F> {
                 // ADM-12: a live slot. Closed connections draining hold their
                 // own allowance, so they don't count here (ADM-13).
                 let Some(slot) = self.shared.connections.claim_inbound() else {
+                    acceptor.cancel_admission(&info);
                     metrics::counter!("zakura.quic.incoming.refused").increment(1);
                     tracing::trace!(target: "zakura_quic", remote = %info.remote, "connection cap full");
                     let transmit = self.endpoint.refuse(incoming, &mut self.response_buf);
                     self.send_response(&transmit, io);
                     return;
                 };
-                // ADM-7: count the handshake from Accept until it finishes.
-                let pending = self.shared.pending.enter(pending_group);
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));
@@ -505,13 +518,24 @@ impl<F: SocketFactory> EndpointTask<F> {
                     Some(Arc::new(server)),
                 ) {
                     Ok((handle, conn)) => {
+                        // ADM-7: count the handshake from Accept until it finishes.
+                        let pending = self.shared.pending.enter(pending_group, acceptor.clone());
+                        #[cfg(zakura_sim)]
+                        self.shared
+                            .observe_handshake_attempt(remote, info.validated);
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Started {
+                            remote: raw_remote,
+                            deadline: self.shared.config.handshake_timeout(),
+                        });
                         self.tasks.spawn_named(
                             "quic.inbound_handshake",
                             inbound_handshake(
                                 connecting,
+                                info.validated,
                                 self.shared.config.handshake_timeout(),
                                 pending,
                                 acceptor,
@@ -519,6 +543,14 @@ impl<F: SocketFactory> EndpointTask<F> {
                         );
                     }
                     Err(error) => {
+                        // The first packet failed before a handshake started,
+                        // so a spoofed source pays no application charge.
+                        acceptor.cancel_admission(&info);
+                        #[cfg(zakura_sim)]
+                        self.shared.pending.record(crate::HandshakeEvent::Finished {
+                            remote: raw_remote,
+                            error: Some(error.cause.to_string()),
+                        });
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);
                         tracing::trace!(target: "zakura_quic", cause = %error.cause, "accept failed");
                         if let Some(transmit) = error.response {
@@ -667,6 +699,8 @@ mod tests {
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
+            #[cfg(zakura_sim)]
+            admission_observer: std::sync::Mutex::new(None),
             connections: ConnectionSlots::new(16, 0, None, 16),
             hooks: Arc::default(),
             shutdown: watch::Sender::new(false),

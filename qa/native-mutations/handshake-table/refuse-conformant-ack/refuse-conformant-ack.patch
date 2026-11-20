@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1206,7 +1206,7 @@
+         requested_limits: &ZakuraInitialLimits,
+         local: &ZakuraHandshakeConfig,
+     ) -> Result<(), ZakuraValidationError> {
+-        if self.magic != CONTROL_ACK_MAGIC || self.control_version < CONTROL_VERSION {
++        if self.magic == CONTROL_ACK_MAGIC || self.control_version < CONTROL_VERSION {
+             return Err(ZakuraValidationError::MalformedControl);
+         }
+         if self.selected_zakura_protocol != selected_zakura_protocol {

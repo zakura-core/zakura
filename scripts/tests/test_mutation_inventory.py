@@ -95,16 +95,13 @@ class InventoryTests(unittest.TestCase):
             f"{inventory.WITNESSES} own-1.example: selector service::selected lies outside module service::tests",
         ])
 
-    def test_wrong_property_witness_fails(self):
+    def test_seed_case_names_its_seed_and_checks(self):
         self.write("qa/planted/right/example.patch", "unused")
-        self.write("qa/planted/right/example.toml", 'input = "input.bin"\n')
-        self.write("input.bin", "input")
-        digest = inventory.sha256(self.root / "input.bin")
-        self.write("input.toml", f'harness = "harness"\ngenerator = 1\nsha256 = "{digest}"\n[[witness]]\nproperty = "wrong"\nexpect = "holds"\n')
-        self.write("qa/fuzz/sim/Cargo.toml", '[package.metadata.zakura-sim.targets]\n[[bin]]\nname = "unrelated"\npath = "unrelated.rs"\n')
+        self.write("qa/planted/right/example.toml", 'seed = "example-seed"\nchecks = ["absent"]\n')
         row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
-        self.assertEqual(row["errors"], ["sidecar has no holds witness for the intended property"])
-        self.assertEqual(row["discovery_target"], "missing")
+        self.assertEqual(row["seed"], "example-seed")
+        self.assertEqual(row["errors"], ["missing dependency path: absent"])
+        self.assertEqual(row["discovery_target"], "unchecked: the seed registry names the harness")
 
     def test_typed_case_checks_its_files_and_has_no_target(self):
         self.write("qa/planted/right/example.patch", "unused")
@@ -118,10 +115,14 @@ class InventoryTests(unittest.TestCase):
         self.write("p.bin", "plan")
         row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
         self.assertEqual(row["errors"], [])
+        # Without Plan bytes, the case runs the empty Plan.
+        self.write("qa/planted/right/example.toml", '[typed]\nharness = "harness"\nscenario = "s.json"\n')
+        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        self.assertEqual((row["errors"], row["plan"]), ([], None))
 
     def test_case_with_both_forms_is_refused(self):
         self.write("qa/planted/right/example.patch", "unused")
-        self.write("qa/planted/right/example.toml", 'input = "input.bin"\n[typed]\nharness = "h"\nscenario = "s"\nplan = "p"\n')
+        self.write("qa/planted/right/example.toml", 'seed = "s"\n[typed]\nharness = "h"\nscenario = "s"\nplan = "p"\n')
         with self.assertRaises(ValueError):
             inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
 
@@ -167,7 +168,7 @@ class LoopTests(unittest.TestCase):
         self.write("crates/zakura-sim/Cargo.toml", '[package]\nname = "zakura-sim"\n')
         self.write("crates/zakura-sim/src/lib.rs", "pub fn check() {}\n")
         self.write("crates/zakura-sim/tests/props.rs", "#[test]\nfn selected() {}\n")
-        self.write("qa/planted/fixture/bound/case.toml", 'input = "input.bin"\n')
+        self.write("qa/planted/fixture/bound/case.toml", 'seed = "bound-seed"\n')
         self.write(inventory.WORK_LIST, WORK_LIST)
         self.write("qa/native-mutations/bounds/raise/raise.patch", PATCH)
         self.readme("Required failure: the run ends at `fixture/bound` with\nits bound passed.\n")
@@ -219,10 +220,10 @@ class LoopTests(unittest.TestCase):
         self.assertIn("the README names no required failure", self.errors())
 
     def test_a_case_names_exactly_one_witness(self):
-        self.case["witness"]["input"] = "input.bin"
+        self.case["witness"]["seed"] = "bound-seed"
         self.write_cases([self.case])
         self.assertEqual(self.errors(), [
-            "fixture/bound: a witness names exactly one of planted, input or test, not ['planted', 'input']",
+            "fixture/bound: a witness names exactly one of planted, seed or test, not ['planted', 'seed']",
         ])
 
     def test_a_test_witness_needs_its_function(self):

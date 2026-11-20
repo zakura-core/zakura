@@ -1061,6 +1061,67 @@ fn cache_reuse_requires_every_intermediate_major_upgrade() {
     assert!(current_path.exists());
 }
 
+/// Cache reuse moves the database a relative symlink points to, not the symlink itself: the
+/// moved symlink would resolve against its new parent directory and miss the checked database.
+#[cfg(unix)]
+#[test]
+fn cache_reuse_moves_the_target_of_a_relative_symlink() {
+    use crate::service::finalized_state::disk_db::DiskDb;
+
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
+    let current = state_database_format_version_in_code();
+    let previous = semver::Version::new(current.major - 1, 0, 0);
+    let current_path = config.db_path(STATE_DATABASE_KIND, current.major, &chain.network);
+    let previous_path = config.db_path(STATE_DATABASE_KIND, previous.major, &chain.network);
+    let previous_parent = previous_path
+        .parent()
+        .expect("version directory has a parent");
+    let previous_target = previous_parent.join("mainnet-data");
+    {
+        let mut state = open(&config, &chain.network);
+        commit_checkpoint(&mut state, &chain.blocks[..3]);
+        crate::write_database_format_version_to_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            current.major,
+            &previous,
+            &chain.network,
+        )
+        .expect("fixture version is written");
+    }
+    std::fs::create_dir_all(previous_parent).expect("older version parent exists");
+    std::fs::rename(&current_path, &previous_target)
+        .expect("fixture moves to the older version directory");
+    // `mainnet-data` resolves against the symlink's parent, so a moved symlink would point at a
+    // missing `state/v<current>/mainnet-data`.
+    std::os::unix::fs::symlink("mainnet-data", &previous_path)
+        .expect("relative symlink to the older database is created");
+
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[current.major],
+            &current,
+            &config,
+            STATE_DATABASE_KIND,
+            &chain.network
+        ),
+        Some(previous),
+    );
+    assert!(!previous_target.exists(), "the checked database moved");
+    assert!(
+        !std::fs::symlink_metadata(&current_path)
+            .expect("the current database exists")
+            .file_type()
+            .is_symlink(),
+        "the database itself moved, not the symlink to it"
+    );
+    let state = open(&config, &chain.network);
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(2)));
+}
+
 /// Offline rollback reverses the canonical UTXO set of a database without transparent indexes,
 /// keeps its marker, and decides that from durable state rather than the checkpoint setting.
 #[test]

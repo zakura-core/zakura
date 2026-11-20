@@ -38,16 +38,18 @@ use zakura_network::zakura::{
 };
 use zakura_quic::{sim::SeededInputs, NodeAddr};
 use zakura_rt::sync::watch;
-use zakura_scheduler::{At, TaskId};
+use zakura_scheduler::{At, SimInstant, TaskId};
 
 use super::{
     block_node::{
-        policy::{self as block_policy, Trigger},
+        control::Fork,
+        policy::{self as block_policy, Predicates, Trigger},
         tap::TapRoutines,
         view::BlockSyncView,
         LateHandle,
     },
     header_sync::Dialer,
+    policy::LinkEffect,
     sync::{
         spawn_actors, sync_config, sync_properties, Control, QuicLinks, SavedSync, SyncAction,
         SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView,
@@ -65,9 +67,12 @@ use crate::{
         header_sync::TeardownView as _,
         session,
     },
-    peer::{key_index, peer_addr, peer_id, NODE_ADDR},
+    observe::TransportFact,
+    peer::{key_index, peer_addr, peer_id, peer_of, NODE_ADDR},
     property::{Capture, HasView, Property, PropertyId, Source, Sources},
-    RunConfig, Sim, TaskHold,
+    witness::Expect,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, RecoveryOffer, RunConfig, Sim,
+    TaskHold,
 };
 
 /// How long a dialer waits after its connection ends before it dials
@@ -76,7 +81,7 @@ use crate::{
 pub const REDIAL_SETTLE: Duration = Duration::from_secs(10);
 
 /// The most connections one dialer makes over a run.
-const MAX_INCARNATIONS: usize = 4;
+const MAX_INCARNATIONS: u32 = 4;
 
 /// The `sync/wire` scenario: a `sync/storage` scenario on a simulated
 /// network.
@@ -119,6 +124,7 @@ pub struct WireWindows {
 /// behind its replacement's admission. The routine's drop then makes its
 /// generation-gated registry writes against the replacement's entry.
 ///
+/// The routine still runs while another task is parked on a lock it holds.
 /// The hold ends, for good, at that admission, or, with `until_claimed`,
 /// once the replacement's routine reports a published claim, or `steps`
 /// steps after the close. The routine also runs whenever nothing else can,
@@ -188,6 +194,14 @@ impl TaskHold for HeldSuperseded {
             .routine(task)
             .is_some_and(|(routine, generation)| routine == *peer && generation <= *superseded)
     }
+
+    /// The routine runs while a task is parked on a lock it holds. Held
+    /// inside its writer fence's lock, it would keep the closed connection's
+    /// teardown from taking the fence, so the redial would never start and
+    /// the clock would run on until the other connections idle out.
+    fn holds_while_waited_on(&self) -> bool {
+        false
+    }
 }
 
 /// The node under test, with header sync, block sync and discovery behind
@@ -244,6 +258,70 @@ struct Unobserved;
 
 impl TransportObserver for Unobserved {
     fn observe(&self, _: TransportEvent) {}
+}
+
+/// Counts each connection the node registers as a link to the mirror it
+/// comes from, for the block policy's [`Trigger::Linked`]. A wire run's
+/// dialers make its connections, so no `sync/storage` link records them.
+/// It's added after the node's tap, so a connection counts in the step the
+/// tap logs its registration.
+struct RegisteredLinks {
+    predicates: Rc<RefCell<Predicates>>,
+    /// Each mirror's name, by index.
+    names: Vec<String>,
+    /// The log entries already read.
+    seen: usize,
+}
+
+impl ActionSource for RegisteredLinks {
+    /// Nothing.
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    /// Nothing.
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    /// Never called, since it offers nothing.
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        unreachable!("the link count offers no action")
+    }
+
+    /// Records a [`LinkEffect::Linked`] for each `registered` row logged
+    /// since the last observation. A row from no mirror's address fails the
+    /// run.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let entries = log.entries();
+        for entry in &entries[self.seen..] {
+            if let Observation::Transport {
+                remote,
+                event: TransportFact::Registered,
+                ..
+            } = &entry.obs
+            {
+                let name = remote
+                    .parse()
+                    .ok()
+                    .and_then(peer_of)
+                    .and_then(|index| self.names.get(index))
+                    .ok_or_else(|| format!("AmbiguousIdentity: no mirror binds {remote}"))?;
+                self.predicates
+                    .borrow_mut()
+                    .record_link(LinkEffect::Linked, name);
+            }
+        }
+        self.seen = entries.len();
+        Ok(())
+    }
+
+    /// Nothing: it finishes no submitted work.
+    fn recovery(&self, _now: SimInstant, _out: &mut RecoveryOffer) {}
+
+    /// Nothing: it has no holds.
+    fn enter_drain(&mut self, _log: &mut ObservationLog) {}
+
+    /// None: it holds no submitted work.
+    fn holds_work(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Live steps a wire run allows per fixture block, past
@@ -378,8 +456,9 @@ impl Subsystem for SyncWire {
     }
 
     /// Adds the network, spawns `sync/storage`'s actors, puts each behind a
-    /// handler on its own endpoint, the node's tapped, and starts each
-    /// connection's dialer. Then adds the `Control` source.
+    /// handler on its own endpoint, the node's tapped and its connections
+    /// counted as links ([`RegisteredLinks`]), and starts each connection's
+    /// dialer. Then adds the `Control` source.
     fn build(sim: &mut Sim, scenario: &SyncWireScenario, ports: SyncPorts) -> Self {
         let net = scenario.net.net();
         sim.add_source(Box::new(net.clone()));
@@ -395,6 +474,11 @@ impl Subsystem for SyncWire {
         };
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
+        sim.add_source(Box::new(RegisteredLinks {
+            predicates: predicates.clone(),
+            names: names.clone(),
+            seen: 0,
+        }));
         let mut mirror_observers = Vec::new();
         if scenario.windows.is_some() {
             for name in &names {
@@ -465,6 +549,7 @@ impl Subsystem for SyncWire {
                 net.sim(),
                 seed,
                 peer,
+                None,
                 observer,
                 dials,
                 move |supervisor, limits| {
@@ -516,24 +601,9 @@ impl Subsystem for SyncWire {
         }
     }
 
-    /// [`sync_properties`] that the wire tier can run, then the session
-    /// properties the shared connection reaches, then the connection
-    /// properties a run with sampling taps reaches. A property that reads
-    /// frames or closes, which the wire tier excludes ([`Self::sources`]),
-    /// runs on `block-sync/storage` and `sync/storage` instead, and so does
-    /// block sync's teardown rule, since no wire scenario stops the node.
+    /// [`wire_harness_properties`].
     fn properties() -> Vec<Property<Self>> {
-        let sources = Self::sources();
-        let mut properties: Vec<Property<Self>> = sync_properties()
-            .into_iter()
-            .filter(|property| {
-                sources.observes_all(property.needs)
-                    && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
-            })
-            .collect();
-        properties.extend(session::wire_properties());
-        properties.extend(connection::wire_properties());
-        properties
+        wire_harness_properties()
     }
 
     /// `sync/storage`'s sources ([`storage_sources`](super::block_sync::storage_sources))
@@ -579,8 +649,8 @@ impl Subsystem for SyncWire {
     }
 }
 
-/// A saved scenario of `sync/wire`. Each has a committed input under
-/// `tests/fixtures/sync-wire-<name>.bin`.
+/// A saved scenario of `sync/wire`. Each is the seed `sync-wire-<name>`:
+/// its tag and the empty Plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavedWire {
     /// Eight blocks from two mirrors, one dialing each way.
@@ -663,7 +733,7 @@ impl SavedWire {
         SavedWire::ReplaceClaims,
     ];
 
-    /// The fixture's name, `sync-wire-<name>.bin`.
+    /// Its name, which names its seed `sync-wire-<name>`.
     pub fn name(self) -> &'static str {
         match self {
             SavedWire::Honest => "honest",
@@ -692,20 +762,19 @@ impl SavedWire {
             .find(|saved| prefix.get(..2) == Some(&saved.tag()[..]))
     }
 
-    /// The properties whose trigger history its committed input reaches,
-    /// each with the outcome the unpatched run gives, for its sidecar's
-    /// `[[witness]]` entries.
-    pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
+    /// The properties whose trigger history its seed reaches, each with the
+    /// outcome the unpatched run gives.
+    pub fn witnesses(self) -> &'static [(&'static str, Expect)] {
         match self {
             SavedWire::Honest => &[],
             SavedWire::Replace | SavedWire::ReplaceClaims => {
-                &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, "holds")]
+                &[(session::REPLACEMENT_PRESERVES_AUTHORIZATION, Expect::Holds)]
             }
-            SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, "holds")],
+            SavedWire::StalledBlocks => &[(session::STALLED_SERVICE_ISOLATED, Expect::Holds)],
             SavedWire::Saturated => &[
-                (connection::CREDIT_ISOLATED, "holds"),
-                (connection::SEND_ISOLATED, "holds"),
-                (connection::CONNECTION_SHARES_BOUND, "holds"),
+                (connection::CREDIT_ISOLATED, Expect::Holds),
+                (connection::SEND_ISOLATED, Expect::Holds),
+                (connection::CONNECTION_SHARES_BOUND, Expect::Holds),
             ],
         }
     }
@@ -838,8 +907,8 @@ pub const REPLACE_GROWTH_MS: u64 = 11_000;
 pub const REPLACE_GROWTH: u32 = 4;
 
 /// Curated combinations for the `sync_wire` fuzz target's seeds, each a
-/// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each has a
-/// committed input under `tests/fixtures/sync-wire-<name>.bin`.
+/// [`COMBINED_TAG`] prefix of [`combined`]'s actions, by name. Each is the
+/// seed `sync-wire-<name>`: its prefix and the empty Plan.
 pub const CURATED: [(&str, [u8; 2]); 4] = [
     // The fork while storage holds a submission, and the node's
     // connection to mirror-1 replaced once storage admits two bodies.
@@ -919,5 +988,286 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
         sync,
         windows: None,
         superseded_hold: None,
+    }
+}
+
+/// [`sync_properties`] that the wire tier can run, then the session
+/// properties the shared connection reaches, then the connection properties
+/// a run with sampling taps reaches. A property that reads frames or closes,
+/// which the wire tier excludes ([`SyncWire::sources`]), runs on
+/// `block-sync/storage` and `sync/storage` instead, and so does block
+/// sync's teardown rule, since the wire tier's teardown isn't judged.
+fn wire_harness_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
+    let sources = SyncWire::sources();
+    let mut properties: Vec<Property<S>> = sync_properties()
+        .into_iter()
+        .filter(|property| {
+            sources.observes_all(property.needs)
+                && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
+        })
+        .collect();
+    properties.extend(session::wire_properties());
+    properties.extend(connection::wire_properties());
+    properties
+}
+
+/// The event slots of a `sync/composed` prefix.
+pub const SYNC_COMPOSED_SLOTS: usize = 8;
+
+/// The first byte of every `sync/composed` prefix that [`sync_composed`]
+/// reads: [`SyncComposed`]'s generator. Any other first byte draws
+/// [`SavedWire::Honest`], as `header-sync/storage`'s grammar does.
+pub const SYNC_COMPOSED_VERSION: u8 = 1;
+
+/// The length of a `sync/composed` prefix: its version byte, a topology
+/// byte, a chain byte, then three bytes per event slot.
+pub const SYNC_COMPOSED_BYTES: usize = 3 + 3 * SYNC_COMPOSED_SLOTS;
+
+/// How long a composed hold keeps each operation it holds, in milliseconds
+/// after that operation's submission, as [`Trigger::VirtualTime`] counts in
+/// a hold: from a short stall to past block sync's 8-second request timeout.
+const HOLD_UNTIL_MS: [u64; 8] = [1_000, 3_000, 6_000, 9_000, 10_000, 12_000, 16_000, 24_000];
+
+/// The scenario the bytes after a `sync/composed` prefix's version byte
+/// encode, in fixed slots so a change to one byte changes one choice
+/// (fuzz-11). Counting from the byte after the version:
+///
+/// - Byte 0, the topology: 1, 2, 2 or 3 mirrors (bits 0 and 1), whether
+///   the node dials mirror `i` rather than the mirror dialing it (bit
+///   `2 + i`), and the links' delays (bits 5 and 6: 0 to 100 ms, 1 to 5
+///   ms, 50 to 400 ms, or 0 to 1,000 ms).
+/// - Byte 1, the chain: 6 to 13 blocks (bits 0 to 2), of 2,000, 8,000,
+///   32,000 or 64,000 bytes each (bits 3 and 4).
+/// - Then [`SYNC_COMPOSED_SLOTS`] events of three bytes, a kind, `a` and
+///   `b`, each read in order until one ends the list. By the kind's value
+///   modulo 8: 0 ends it; 1 and 2 close mirror `a`'s connection, which its
+///   dialer redials; 3 grows every mirror's chain by 1 to 4 blocks; 4
+///   resets every mirror to a fork below the tip that ends above it; 5 and
+///   6 hold block operations ([`composed_hold`]); 7 tears the node down
+///   and ends the list. A control step's trigger comes from `b`
+///   ([`composed_trigger`]), and control steps run in order.
+///
+/// A close waits until its mirror has one more link than it has had
+/// composed closes, since no relink runs on the wire tier. A dialer makes
+/// at most [`MAX_INCARNATIONS`] connections, so a mirror's closes past that
+/// many are skipped: each would wait forever and hold back every later
+/// step. A close is a [`SyncAction::CloseIfLinked`], since the node may
+/// have closed the connection itself first.
+pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
+    let byte = |index: usize| grammar.get(index).copied().unwrap_or(0);
+    let (topology, chain) = (byte(0), byte(1));
+    let mirrors = [1, 2, 2, 3][usize::from(topology & 3)];
+    let mut net = NetScenario::default();
+    (net.default_link.min_delay_ms, net.default_link.max_delay_ms) = match (topology >> 5) & 3 {
+        0 => (0, 100),
+        1 => (1, 5),
+        2 => (50, 400),
+        _ => (0, 1_000),
+    };
+    let blocks = 6 + u32::from(chain & 7);
+    let mut sync = SyncScenario {
+        blocks,
+        body_bytes: [2_000, 8_000, 32_000, 64_000][usize::from((chain >> 3) & 3)],
+        mirrors: (0..mirrors)
+            .map(|index| SyncMirror {
+                dialer: if topology & (4 << index) != 0 {
+                    Dialer::Node
+                } else {
+                    Dialer::Mirror
+                },
+            })
+            .collect(),
+        ..SyncScenario::default()
+    };
+    let mut tip = blocks;
+    let mut closes = vec![0u32; mirrors];
+    let mut branch = 0u8;
+    for slot in 0..SYNC_COMPOSED_SLOTS {
+        let at = 2 + 3 * slot;
+        let (kind, a, b) = (byte(at), byte(at + 1), byte(at + 2));
+        let when = composed_trigger(b);
+        match kind % 8 {
+            0 => break,
+            1 | 2 => {
+                let mirror = usize::from(a) % mirrors;
+                if closes[mirror] == MAX_INCARNATIONS {
+                    continue;
+                }
+                closes[mirror] += 1;
+                let peer = format!("mirror-{mirror}");
+                let live = Trigger::Count(closes[mirror], Box::new(Trigger::Linked(peer.clone())));
+                sync.control.push(SyncStep {
+                    action: SyncAction::CloseIfLinked { peer },
+                    when: Some(match when {
+                        Some(when) => Trigger::All(vec![live, when]),
+                        None => live,
+                    }),
+                });
+            }
+            3 => {
+                let len = 1 + u32::from(a % 4);
+                tip += len;
+                sync.control.push(SyncStep {
+                    action: SyncAction::Grow { len },
+                    when,
+                });
+            }
+            4 => {
+                branch += 1;
+                let at = 1 + u32::from(a) % (tip - 1);
+                let len = tip - at + 1 + u32::from(a >> 6);
+                tip = at + len;
+                sync.control.push(SyncStep {
+                    action: SyncAction::Reset {
+                        fork: Fork { branch, at, len },
+                    },
+                    when,
+                });
+            }
+            5 | 6 => sync.block_policy.holds.push(composed_hold(a, b)),
+            _ => {
+                sync.control.push(SyncStep {
+                    action: SyncAction::Teardown,
+                    when,
+                });
+                break;
+            }
+        }
+    }
+    SyncWireScenario {
+        net,
+        sync,
+        windows: None,
+        superseded_hold: None,
+    }
+}
+
+/// A control step's trigger from its slot's `b`: none, or the first to
+/// fourth (bits 0 and 1) admission, mirror range read, needed-block query
+/// or apply submitted, or that many seconds into the run (bits 2 and up,
+/// modulo 6).
+fn composed_trigger(b: u8) -> Option<Trigger> {
+    let nth = 1 + u32::from(b & 3);
+    let submitted = |kind| Some(Trigger::Submitted(block_policy::Select::nth(kind, nth)));
+    match (b >> 2) % 6 {
+        0 => None,
+        1 => Some(super::sync::admitted(nth)),
+        2 => submitted(block_policy::BlockKind::MirrorRead),
+        3 => submitted(block_policy::BlockKind::Query),
+        4 => submitted(block_policy::BlockKind::Apply),
+        _ => Some(Trigger::VirtualTime(1_000 * u64::from(nth))),
+    }
+}
+
+/// A block hold from its slot's `a` and `b`: it holds mirror range reads,
+/// needed-block queries, admissions or applies (`a` bits 0 and 1), each
+/// one or only the first to fourth (bit 2 clear, then bits 3 and 4), each
+/// for [`HOLD_UNTIL_MS`] at `b` modulo 8 after its submission, then offers
+/// the operation's ordinary outcome.
+fn composed_hold(a: u8, b: u8) -> block_policy::Hold {
+    use block_policy::{BlockAllow, BlockKind, Select};
+    let (kind, then) = match a & 3 {
+        0 => (BlockKind::MirrorRead, BlockAllow::Serve),
+        1 => (BlockKind::Query, BlockAllow::Answer),
+        2 => (BlockKind::Admit, BlockAllow::Admit),
+        _ => (BlockKind::Apply, BlockAllow::Committed),
+    };
+    let select = if a & 4 != 0 {
+        Select {
+            kind: Some(kind),
+            ..Select::default()
+        }
+    } else {
+        Select::nth(kind, 1 + u32::from((a >> 3) & 3))
+    };
+    block_policy::Hold {
+        select,
+        until: Trigger::VirtualTime(HOLD_UNTIL_MS[usize::from(b & 7)]),
+        then: vec![then],
+        deadline_ms: None,
+    }
+}
+
+/// `sync/wire`'s node, mirrors and properties with the chain, topology,
+/// links, control steps and block holds a prefix composes
+/// ([`sync_composed`]), so the fuzzer chooses how many reorgs, closes,
+/// stalls and growths a run takes and in what order, where `sync/wire`
+/// picks one saved scenario or one combined byte.
+pub struct SyncComposed(SyncWire);
+
+impl HasView for SyncComposed {
+    type View = SyncView;
+
+    /// [`SyncWire`]'s.
+    fn ended(&self, end: &crate::RunEnd) {
+        self.0.ended(end);
+    }
+
+    /// [`SyncWire`]'s.
+    fn end_violations(&self, log: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
+        self.0.end_violations(log)
+    }
+
+    /// [`SyncWire`]'s.
+    fn view(&self) -> SyncView {
+        self.0.view()
+    }
+
+    /// [`SyncWire`]'s.
+    fn captured(&self) -> Capture {
+        self.0.captured()
+    }
+}
+
+impl Subsystem for SyncComposed {
+    const NAME: &'static str = "sync/composed";
+    // A u8 always fits in a u32.
+    const GENERATOR: u32 = SYNC_COMPOSED_VERSION as u32;
+    const SCENARIO_BYTES: usize = SYNC_COMPOSED_BYTES;
+    type Scenario = SyncWireScenario;
+    type Prepared = SyncPorts;
+
+    /// [`wire_config`].
+    fn config(scenario: &SyncWireScenario) -> RunConfig {
+        wire_config(scenario)
+    }
+
+    /// [`SyncWire`]'s.
+    fn prepare(scenario: &SyncWireScenario) -> SyncPorts {
+        SyncWire::prepare(scenario)
+    }
+
+    /// [`SyncWire`]'s.
+    fn build(sim: &mut Sim, scenario: &SyncWireScenario, ports: SyncPorts) -> Self {
+        SyncComposed(SyncWire::build(sim, scenario, ports))
+    }
+
+    /// [`wire_harness_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        wire_harness_properties()
+    }
+
+    /// [`SyncWire`]'s.
+    fn sources() -> Sources {
+        SyncWire::sources()
+    }
+
+    /// One family, the grammar, whose tag is [`SYNC_COMPOSED_VERSION`].
+    fn families() -> Vec<ScenarioFamily> {
+        vec![ScenarioFamily::new("composed", [SYNC_COMPOSED_VERSION])]
+    }
+
+    /// Whether `prefix` starts with [`SYNC_COMPOSED_VERSION`].
+    fn accepts(prefix: &[u8]) -> bool {
+        prefix.first() == Some(&SYNC_COMPOSED_VERSION)
+    }
+
+    /// [`sync_composed`] of the bytes after [`SYNC_COMPOSED_VERSION`], or
+    /// [`SavedWire::Honest`] for a prefix with another first byte.
+    fn draw(prefix: &[u8]) -> SyncWireScenario {
+        match prefix.split_first() {
+            Some((&SYNC_COMPOSED_VERSION, grammar)) => sync_composed(grammar),
+            _ => SavedWire::Honest.scenario(),
+        }
     }
 }

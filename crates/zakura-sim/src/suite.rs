@@ -56,7 +56,7 @@ use crate::{
     planted::{self, PLANTED_DIR},
     property::Status,
     record::{CONTRACT_VERSION, FORMAT_VERSION},
-    seed::{self, sha256},
+    seed::{self, sha256, SeedSet},
     trace::BuildInfo,
 };
 
@@ -83,9 +83,6 @@ pub const FUZZ_DIR: &str = "qa/fuzz";
 /// The fuzz package under [`FUZZ_DIR`] whose targets run harnesses in the
 /// simulator.
 pub const SIM_FUZZ_PACKAGE: &str = "sim";
-
-/// Where the committed seeds live, relative to the repository's root.
-pub const FIXTURES_DIR: &str = "crates/zakura-sim/tests/fixtures";
 
 /// What a command's `{evidence}` stands for.
 pub const EVIDENCE: &str = "{evidence}";
@@ -639,8 +636,8 @@ pub struct TestRow {
 pub struct WitnessRow {
     /// `witness/<property>/passing` or `witness/<property>/bypass`.
     pub id: String,
-    /// [`Expect::Pass`], or [`Expect::Unimplemented`] for a pending
-    /// bypass.
+    /// [`Expect::Pass`], [`Expect::Unimplemented`] for a pending bypass,
+    /// or [`Expect::Excluded`] for a separate native mutation campaign.
     pub expect: Expect,
     /// The property.
     pub property: String,
@@ -653,7 +650,7 @@ pub struct WitnessRow {
     pub unreachable: Option<&'static str>,
     /// For a planted bypass, the patch's name.
     pub patch: Option<&'static str>,
-    /// For a pending bypass, what its check is missing.
+    /// Why the bypass is pending or runs outside this suite.
     pub pending: Option<&'static str>,
     /// The row whose run decides it: the test binary, the on-demand test
     /// or the planted cases.
@@ -682,12 +679,11 @@ pub struct PlantedRow {
 pub struct SeedSetRow {
     /// `seeds/<harness>`.
     pub id: String,
-    /// [`Expect::Pass`]: `cargo xtask sim-seeds` admits every required
-    /// seed.
+    /// [`Expect::Pass`]: `cargo xtask sim-seeds` admits every seed.
     pub expect: Expect,
     /// The harness.
     pub harness: String,
-    /// The admitted seeds' files, relative to the repository's root.
+    /// The admitted seeds' names.
     pub seeds: Vec<String>,
     /// The command, which writes the full inputs to `{evidence}/corpus`.
     pub command: String,
@@ -695,14 +691,14 @@ pub struct SeedSetRow {
     pub timeout_secs: u64,
 }
 
-/// A witness a committed seed carries.
+/// A witness a corpus seed carries.
 #[derive(Clone, Debug, Serialize)]
 pub struct SeedWitnessRow {
     /// `seed-witness/<seed>/<property>`.
     pub id: String,
     /// [`Expect::Pass`]: the witness test passes.
     pub expect: Expect,
-    /// The seed's file, relative to the repository's root.
+    /// The seed's name.
     pub seed: String,
     /// The harness.
     pub harness: String,
@@ -1374,26 +1370,14 @@ impl Builder<'_> {
         rows
     }
 
-    /// One seed-set row per harness, one row per witness an admitted seed
-    /// carries, and the seed report. A rejected seed is a problem.
+    /// One seed-set row per harness, one row per witness an admitted corpus
+    /// seed carries, and the seed report. A rejected seed is a problem.
     fn seeds(&mut self) -> (Vec<SeedSetRow>, Vec<SeedWitnessRow>, seed::Report) {
-        let fixtures = vec![self.root.join(FIXTURES_DIR)];
-        let report = match seed::load(&fixtures, None) {
-            Ok(report) => report,
-            Err(error) => {
-                self.problem(format!("listing {FIXTURES_DIR}: {error}"));
-                return (
-                    Vec::new(),
-                    Vec::new(),
-                    seed::SeedReport::default().rows(None, &[]),
-                );
-            }
-        };
+        let report = seed::load(SeedSet::Corpus, None);
         for failed in &report.rejected {
             self.problem(format!(
-                "the required seed {} fails validation: {}",
-                relative(self.root, &failed.path),
-                failed.error
+                "the seed {} fails validation: {}",
+                failed.seed.name, failed.error
             ));
         }
         let mut sets = Vec::new();
@@ -1401,8 +1385,8 @@ impl Builder<'_> {
             let seeds: Vec<String> = report
                 .admitted
                 .iter()
-                .filter(|seed| seed.sidecar.harness == entry.name)
-                .map(|seed| relative(self.root, &seed.path))
+                .filter(|seed| seed.harness == entry.name)
+                .map(|seed| seed.name.clone())
                 .collect();
             let id = self.id(format!("seeds/{}", entry.name));
             sets.push(SeedSetRow {
@@ -1416,45 +1400,35 @@ impl Builder<'_> {
         }
         let mut witnesses = Vec::new();
         for seed in &report.admitted {
-            let file = relative(self.root, &seed.path);
-            if !self.root.join(&seed.sidecar.source).exists() {
+            if !self.root.join(&seed.source).exists() {
                 self.problem(format!(
-                    "the seed {file} names the source `{}`, which doesn't exist",
-                    seed.sidecar.source
+                    "the seed {} names the source `{}`, which doesn't exist",
+                    seed.name, seed.source
                 ));
             }
-            let stem = seed
-                .path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            for witness in &seed.sidecar.witness {
-                let id = self.id(format!("seed-witness/{stem}/{}", witness.property));
-                let record = Build::SimPlanted.command(
+            for witness in &seed.witness {
+                let id = self.id(format!("seed-witness/{}/{}", seed.name, witness.property));
+                let command = Build::SimPlanted.command(
                     "run",
                     &format!(
-                        "--locked -p zakura-sim --bin zakura-sim -- record --sim {} \
-                         --input {EVIDENCE}/corpus/{} --out {EVIDENCE}/trace --witness {} \
-                         --expect {}",
-                        seed.sidecar.harness,
-                        seed.input_sha256(),
-                        witness.property,
-                        witness.expect
+                        "--locked -p zakura-sim --bin zakura-sim -- record --seed {} \
+                         --out {EVIDENCE}/trace --witness {} --expect {}",
+                        seed.name, witness.property, witness.expect
                     ),
                 );
                 witnesses.push(SeedWitnessRow {
                     id,
                     expect: Expect::Pass,
-                    seed: file.clone(),
-                    harness: seed.sidecar.harness.clone(),
+                    seed: seed.name.clone(),
+                    harness: seed.harness.clone(),
                     property: witness.property.clone(),
                     witness: witness.expect.clone(),
-                    command: format!("{} && {record}", seed_corpus(&seed.sidecar.harness)),
+                    command,
                     timeout_secs: self.suite.seed_timeout_secs,
                 });
             }
         }
-        let rows = report.rows(None, &[PathBuf::from(FIXTURES_DIR)]);
+        let rows = report.rows(None, SeedSet::Corpus);
         (sets, witnesses, rows)
     }
 
@@ -1788,6 +1762,17 @@ impl Builder<'_> {
                     unreachable: None,
                     patch: None,
                     pending: Some(reason),
+                    decided_by: None,
+                },
+                Bypass::Native(name) => WitnessRow {
+                    id,
+                    expect: Expect::Excluded,
+                    property: row.property.to_owned(),
+                    role: "bypass",
+                    test: None,
+                    unreachable: None,
+                    patch: Some(name),
+                    pending: Some("The separate droplet mutation campaign runs this native patch and records its classification in the PR."),
                     decided_by: None,
                 },
             };

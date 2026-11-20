@@ -353,20 +353,19 @@ impl Tracker {
         let snapshot = machine.snapshot(ChangeSeq(self.logged));
         assert_eq!(snapshot.active, machine.is_active());
         let offered: HashSet<UnminedTxId> = snapshot
-            .transactions
-            .iter()
+            .transactions()
             .map(|tx| tx.transaction.id())
             .collect();
         assert_eq!(
             offered.len(),
-            snapshot.transactions.len(),
+            snapshot.len(),
             "a snapshot offers each transaction once"
         );
         assert_eq!(offered, self.pool, "a snapshot offers exactly the pool");
         // Each pooled transaction depends on exactly the pooled transactions
         // whose outputs it spends.
         let pooled_effects = self.pooled_effects();
-        for tx in &snapshot.transactions {
+        for tx in snapshot.transactions() {
             let parents: BTreeSet<[u8; 32]> = tx
                 .transaction
                 .transaction()

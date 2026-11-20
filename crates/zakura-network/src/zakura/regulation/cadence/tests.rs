@@ -114,7 +114,9 @@ fn a_sender_faster_than_the_refill_exhausts_only_after_its_capacity() {
         match buckets.charge(LAYOUT, &STATUS) {
             CadenceCharge::Admit => admitted += 1,
             CadenceCharge::Exhausted => break,
-            CadenceCharge::Exempt => unreachable!("STATUS declares a cadence"),
+            CadenceCharge::Exempt | CadenceCharge::Overrun => {
+                unreachable!("STATUS declares a cadence")
+            }
         }
         assert!(admitted < 1000, "a fast sender must exhaust the bucket");
         clock.advance(Duration::from_millis(13_500));
@@ -471,6 +473,184 @@ proptest! {
             actual.assert_invariants(now);
             prop_assert_eq!(actual.tokens, bucket.tokens);
         }
+    }
+}
+
+/// A metered row: 10,000 bytes a second, a 50,000 byte opening allowance and
+/// 20,000 bytes the sender may hold unwritten.
+const METERED_RATE: ByteRate = ByteRate {
+    bytes_per_second: 10_000,
+    opening_allowance: 50_000,
+    sender_allowance: 20_000,
+};
+
+const METERED: MessageRule = MessageRule {
+    name: "metered",
+    message_type: 40,
+    payload: crate::zakura::PayloadLen::between(1, 10_000),
+    role: MessageRole::Metered { rate: METERED_RATE },
+};
+
+/// The stream receive window the metered tests grant.
+const WINDOW: u64 = 30_000;
+
+#[test]
+fn a_byte_bucket_pays_its_depth_then_refills_at_its_rate() {
+    let start = Instant::now();
+    let mut bucket = ByteBucket::sender(METERED_RATE, start);
+    assert!(bucket.try_pay(50_000, start));
+    assert!(!bucket.try_pay(1, start));
+    assert_eq!(bucket.ready_at(1_000, start), Some(start + secs(1) / 10));
+    assert_eq!(bucket.ready_at(50_001, start), None);
+
+    // A tenth of a second earns 1,000 bytes, in ten steps or in one.
+    let mut stepped = bucket.clone();
+    for step in 1..=10 {
+        stepped.refill(start + Duration::from_millis(10 * step));
+    }
+    bucket.refill(start + secs(1) / 10);
+    assert_eq!(bucket.tokens(), 1_000);
+    assert_eq!(stepped.tokens(), 1_000);
+
+    // It refills to its depth and no further.
+    assert!(!bucket.try_pay(50_001, start + secs(60)));
+    assert!(bucket.try_pay(50_000, start + secs(60)));
+}
+
+/// A metered sender pays its connection's bucket before a frame goes, so
+/// two senders on one connection share its allowance, and each keeps at
+/// most one of its frames unwritten.
+#[test]
+fn a_metered_sender_pays_first_and_keeps_one_frame_unwritten() {
+    let start = Instant::now();
+    let bucket = Arc::new(Mutex::new(ByteBucket::sender(METERED_RATE, start)));
+    let (mut first, mut second) = (
+        MeteredSender::new(bucket.clone()),
+        MeteredSender::new(bucket),
+    );
+    assert_eq!(first.ready(30_000, start), MeteredReady::Now);
+    let written = first.pay(30_000, start).expect("the bucket holds it");
+    assert_eq!(first.ready(1, start), MeteredReady::Unwritten);
+    assert!(first.pay(1, start).is_none(), "one frame unwritten at most");
+
+    // The other sender finds what the first left.
+    let at = start + secs(1);
+    assert_eq!(second.ready(30_000, start), MeteredReady::At(at));
+    assert!(second.pay(30_000, start).is_none());
+    assert!(second.pay(30_000, at).is_some());
+
+    // Once the transport writes the first frame, the next may go.
+    drop(written);
+    assert_eq!(first.ready(1, at), MeteredReady::At(at + secs(1) / 10_000));
+}
+
+#[test]
+fn a_metered_row_overruns_only_past_the_receivers_depth() {
+    let (buckets, clock) = buckets();
+    let mut buckets = buckets.with_receive_window(WINDOW);
+    let depth = METERED_RATE.receiver_depth(WINDOW);
+    assert_eq!(depth, 100_000);
+    for _ in 0..depth / 10_000 {
+        assert_eq!(
+            buckets.charge_frame(LAYOUT, &METERED, 10_000),
+            CadenceCharge::Admit
+        );
+    }
+    assert_eq!(
+        buckets.charge_frame(LAYOUT, &METERED, 1),
+        CadenceCharge::Overrun
+    );
+    // The receiver refills an eighth faster than the sender's rate.
+    clock.advance(secs(1));
+    assert_eq!(
+        buckets.charge_frame(LAYOUT, &METERED, 11_250),
+        CadenceCharge::Admit
+    );
+    assert_eq!(
+        buckets.charge_frame(LAYOUT, &METERED, 1),
+        CadenceCharge::Overrun
+    );
+}
+
+/// A sender that pays its own bucket and keeps at most its sender allowance
+/// plus the stream window unread, through a stall of `stall` that starts at
+/// `stall_at`, after which the receiver reads everything at once. Returns
+/// the bytes the receiver read.
+fn stall_and_resume(stall_at: Duration, stall: Duration, frame: u64) -> u64 {
+    let start = Instant::now();
+    let (receiver, clock) = buckets();
+    let mut receiver = receiver.with_receive_window(WINDOW);
+    let mut sender = ByteBucket::sender(METERED_RATE, start);
+    let limit = u64::from(METERED_RATE.sender_allowance) + WINDOW;
+    let step = Duration::from_millis(10);
+    let mut unread: Vec<u64> = Vec::new();
+    let mut read = 0;
+    let mut at = Duration::ZERO;
+    while at < stall_at + stall + secs(120) {
+        let now = start + at;
+        let buffered: u64 = unread.iter().sum();
+        if buffered + frame <= limit && sender.try_pay(frame, now) {
+            unread.push(frame);
+        }
+        let stalled = at >= stall_at && at < stall_at + stall;
+        if !stalled {
+            for bytes in unread.drain(..) {
+                let charge = receiver.charge_frame(
+                    LAYOUT,
+                    &METERED,
+                    usize::try_from(bytes).expect("test frames fit usize"),
+                );
+                assert_eq!(charge, CadenceCharge::Admit, "at {at:?}");
+                read += bytes;
+            }
+        }
+        at += step;
+        clock.advance(step);
+    }
+    read
+}
+
+#[test]
+fn a_sender_that_stalls_and_resumes_never_overruns_the_receiver() {
+    // Stalls short and long, at the start and later, fill the window and the
+    // sender's buffers and let its bucket refill before the resume.
+    for (stall_at, stall) in [
+        (secs(0), secs(5)),
+        (secs(3), secs(60)),
+        (secs(30), secs(600)),
+    ] {
+        for frame in [1, 700, 10_000] {
+            assert!(stall_and_resume(stall_at, stall, frame) > 0);
+        }
+    }
+}
+
+proptest! {
+    /// A peer that sends a burst, ends its session and reopens it, twenty
+    /// times, on one connection. The connection's bucket outlives each
+    /// session, so the bytes admitted stay within its depth plus the rate
+    /// times the time elapsed.
+    #[test]
+    fn reopening_sessions_on_one_connection_buys_no_bytes(
+        gaps in proptest::collection::vec(0u64..2_000, 20),
+    ) {
+        let (buckets, clock) = buckets();
+        let mut buckets = buckets.with_receive_window(WINDOW);
+        let mut admitted = 0u64;
+        let mut elapsed = Duration::ZERO;
+        for gap in gaps {
+            // A burst until the bucket refuses it.
+            while buckets.charge_frame(LAYOUT, &METERED, 1_000) == CadenceCharge::Admit {
+                admitted += 1_000;
+            }
+            // The session ends and reopens after `gap` milliseconds.
+            clock.advance(Duration::from_millis(gap));
+            elapsed += Duration::from_millis(gap);
+        }
+        let earned = elapsed.as_millis() * u128::from(METERED_RATE.receiver_bytes_per_second()) / 1_000;
+        prop_assert!(
+            u128::from(admitted) <= u128::from(METERED_RATE.receiver_depth(WINDOW)) + earned
+        );
     }
 }
 

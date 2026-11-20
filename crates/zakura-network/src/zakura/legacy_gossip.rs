@@ -45,6 +45,7 @@ use crate::{
 
 use super::trace::BlockBodySource;
 use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
+use super::TxRelaySessions;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
@@ -265,6 +266,105 @@ static FIRST_SEEN_BY_SUPERVISOR: OnceLock<std::sync::Mutex<HashMap<u64, FirstSee
     OnceLock::new();
 static NEXT_LEGACY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The adapter's switch for transaction traffic. It holds `tx-relay`'s
+/// live-session record, or `None` when `tx-relay` is not registered, and
+/// then every check is one branch on the empty option.
+///
+/// With a live session, the adapter stops moving that peer's transactions.
+/// It checks when a message arrives from the peer, and when it chooses the
+/// peers an advert goes to or a request may ask. Work queued or chosen
+/// before the session went live still runs. Each check looks at the message
+/// kind first, so block traffic never reads the record.
+#[derive(Clone, Debug, Default)]
+struct TxRelaySwitch(Option<TxRelaySessions>);
+
+impl TxRelaySwitch {
+    /// The switch for adapters built from `supervisor`.
+    fn for_supervisor(supervisor: &ZakuraSupervisorHandle) -> Self {
+        Self(supervisor.tx_relay_sessions().cloned())
+    }
+
+    /// Whether `tx-relay` has a live session for `peer`. Callers check the
+    /// message kind first.
+    fn relays(&self, peer: &ZakuraPeerId) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|sessions| sessions.is_live(peer))
+    }
+
+    /// Whether the adapter drops `frame` from or to `peer`: a transaction id
+    /// advert while `peer` has a live `tx-relay` session.
+    fn drops_advert(&self, peer: &ZakuraPeerId, frame: &LegacyGossipFrame) -> bool {
+        self.0.is_some()
+            && matches!(frame, LegacyGossipFrame::AdvertiseTransactionIds(_))
+            && self.relays(peer)
+    }
+
+    /// The answer the adapter gives in place of serving `frame` from `peer`,
+    /// when it is a transaction request and `peer` has a live `tx-relay`
+    /// session. `None` means serve it as usual.
+    fn answer_for(&self, peer: &ZakuraPeerId, frame: &LegacyRequestFrame) -> Option<Response> {
+        self.0.as_ref()?;
+        if !frame.kind().is_transaction() || !self.relays(peer) {
+            return None;
+        }
+        frame.tx_relay_answer()
+    }
+
+    /// Whether the adapter must not send a request of `kind` to `peer`.
+    fn skips_request(&self, peer: &ZakuraPeerId, kind: LegacyRequestKind) -> bool {
+        self.0.is_some() && kind.is_transaction() && self.relays(peer)
+    }
+}
+
+/// Counts `count` transaction messages of `message_type` received on the
+/// adapter, with `tx-relay` on or off. Each decoded wire message counts once
+/// by its type: a chunked transaction once its chunks are reassembled, and a
+/// `Nil` answer to a mempool request as an empty id list (type 16).
+fn count_received_tx_messages(message_type: u16, count: u64) {
+    metrics::counter!(
+        "zakura.p2p.legacy.inbound.tx_messages",
+        "type" => message_type_label(message_type),
+    )
+    .increment(count);
+}
+
+/// Counts one adapter frame of `message_type` dropped at the full inbound
+/// queue, as `work`, gossip or request.
+fn count_queue_full(work: &'static str, message_type: u16) {
+    metrics::counter!(
+        "zakura.p2p.legacy.inbound.queue_full",
+        "work" => work,
+        "type" => message_type_label(message_type),
+    )
+    .increment(1);
+}
+
+/// A metric label for a legacy message type.
+fn message_type_label(message_type: u16) -> &'static str {
+    match message_type {
+        MSG_ADVERTISE_BLOCK => "1",
+        MSG_ADVERTISE_TX_IDS => "2",
+        MSG_REQUEST_BLOCKS_BY_HASH => "3",
+        MSG_REQUEST_TRANSACTIONS_BY_ID => "4",
+        MSG_RESPONSE_BLOCK => "5",
+        MSG_RESPONSE_TRANSACTION => "6",
+        MSG_RESPONSE_MISSING_BLOCKS => "7",
+        MSG_RESPONSE_MISSING_TRANSACTIONS => "8",
+        MSG_REQUEST_FIND_BLOCKS => "9",
+        MSG_REQUEST_FIND_HEADERS => "10",
+        MSG_REQUEST_MEMPOOL_TRANSACTION_IDS => "11",
+        MSG_REQUEST_PING => "12",
+        MSG_REQUEST_PUSH_TRANSACTION => "13",
+        MSG_RESPONSE_BLOCK_HASHES => "14",
+        MSG_RESPONSE_BLOCK_HEADERS => "15",
+        MSG_RESPONSE_TRANSACTION_IDS => "16",
+        MSG_RESPONSE_PONG => "17",
+        MSG_RESPONSE_NIL => "18",
+        _ => "other",
+    }
+}
+
 /// A typed legacy gossip frame carried by Zakura stream kind 2.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyGossipFrame {
@@ -345,6 +445,14 @@ impl LegacyGossipFrame {
         }
     }
 
+    /// This frame's wire message type.
+    fn message_type(&self) -> u16 {
+        match self {
+            Self::AdvertiseBlock(_) => MSG_ADVERTISE_BLOCK,
+            Self::AdvertiseTransactionIds(_) => MSG_ADVERTISE_TX_IDS,
+        }
+    }
+
     fn into_request(self, peer_id: ZakuraPeerId) -> Request {
         match self {
             Self::AdvertiseBlock(hash) => {
@@ -401,6 +509,9 @@ impl LegacyRequestFrame {
     /// Convert a legacy network request into an inventory request frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
+            Request::BlockByHashPrimary { hash, .. } => {
+                Ok(Self::BlocksByHash(std::iter::once(hash).collect()))
+            }
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 let hashes = truncate_to_inventory_cap(hashes)?;
                 Ok(Self::BlocksByHash(hashes))
@@ -562,6 +673,27 @@ impl LegacyRequestFrame {
         }
     }
 
+    /// The answer this node gives in place of serving a transaction request
+    /// whose peer's transactions belong to `tx-relay`: every id missing, an
+    /// empty mempool, or done for a push, whose body is dropped. `None` for
+    /// other requests.
+    fn tx_relay_answer(&self) -> Option<Response> {
+        match self {
+            Self::TransactionsById(ids) => Some(Response::Transactions(
+                ids.iter()
+                    .copied()
+                    .map(InventoryResponse::Missing)
+                    .collect(),
+            )),
+            Self::MempoolTransactionIds => Some(Response::TransactionIds(Vec::new())),
+            Self::PushTransaction(_) => Some(Response::Nil),
+            Self::BlocksByHash(_)
+            | Self::FindBlocks { .. }
+            | Self::FindHeaders { .. }
+            | Self::Ping => None,
+        }
+    }
+
     fn kind(&self) -> LegacyRequestKind {
         match self {
             Self::BlocksByHash(_) => LegacyRequestKind::Blocks,
@@ -572,6 +704,29 @@ impl LegacyRequestFrame {
             Self::Ping => LegacyRequestKind::Ping,
             Self::PushTransaction(_) => LegacyRequestKind::PushTransaction,
         }
+    }
+}
+
+#[cfg(test)]
+impl LegacyRequestFrame {
+    /// Decodes `frames`, the answer to this request sent as `request_id`, as
+    /// the request client decodes an answer: bound to the inventory it asked
+    /// for. A test seam for `tx-relay`'s adapter tests.
+    pub(super) fn decode_answer(
+        &self,
+        request_id: u64,
+        frames: Vec<Frame>,
+    ) -> Result<Response, LegacyGossipError> {
+        let requested = match self {
+            Self::BlocksByHash(hashes) => {
+                Some(RequestedInventory::Blocks(hashes.iter().copied().collect()))
+            }
+            Self::TransactionsById(ids) => Some(RequestedInventory::Transactions(
+                ids.iter().copied().collect(),
+            )),
+            _ => None,
+        };
+        LegacyResponseCodec::decode_response(request_id, self.kind(), frames, requested.as_ref())
     }
 }
 
@@ -587,6 +742,15 @@ pub(super) enum LegacyRequestKind {
 }
 
 impl LegacyRequestKind {
+    /// Whether this kind moves transactions, so `tx-relay` takes it over for
+    /// a peer with a live session.
+    fn is_transaction(self) -> bool {
+        match self {
+            Self::Transactions | Self::MempoolTransactionIds | Self::PushTransaction => true,
+            Self::Blocks | Self::FindBlocks | Self::FindHeaders | Self::Ping => false,
+        }
+    }
+
     /// Distinct peers one request of this kind tries before giving up.
     fn max_attempts(self) -> usize {
         match self {
@@ -851,6 +1015,7 @@ impl LegacyResponseCodec {
                         }
                     }
                     transactions.push(InventoryResponse::Available((transaction, None)));
+                    count_received_tx_messages(MSG_RESPONSE_TRANSACTION, 1);
                 }
                 LegacyResponseItem::Frame(frame) => match frame.message_type {
                     MSG_RESPONSE_MISSING_BLOCKS => {
@@ -883,6 +1048,7 @@ impl LegacyResponseCodec {
                             }
                             transactions.push(InventoryResponse::Missing(id));
                         }
+                        count_received_tx_messages(MSG_RESPONSE_MISSING_TRANSACTIONS, 1);
                     }
                     MSG_RESPONSE_BLOCK_HASHES => {
                         if request_kind != LegacyRequestKind::FindBlocks {
@@ -904,6 +1070,7 @@ impl LegacyResponseCodec {
                         }
                         reassembler.reject_if_active()?;
                         transaction_ids.extend(decode_tx_ids_response(request_id, frame.payload)?);
+                        count_received_tx_messages(MSG_RESPONSE_TRANSACTION_IDS, 1);
                     }
                     MSG_RESPONSE_PONG => {
                         if request_kind != LegacyRequestKind::Ping {
@@ -937,6 +1104,11 @@ impl LegacyResponseCodec {
                         }
                         reassembler.reject_if_active()?;
                         decode_id_only_response(request_id, frame.payload)?;
+                        // An empty mempool answer, which counts as the id list
+                        // it stands for.
+                        if request_kind == LegacyRequestKind::MempoolTransactionIds {
+                            count_received_tx_messages(MSG_RESPONSE_TRANSACTION_IDS, 1);
+                        }
                         saw_nil = true;
                     }
                     message_type => {
@@ -1490,6 +1662,7 @@ fn reject_trailing(reader: &Cursor<&[u8]>) -> Result<(), LegacyGossipError> {
 pub struct ZakuraGossipBroadcast {
     first_seen: FirstSeenCache,
     outbound: LegacyGossipOutbound,
+    switch: TxRelaySwitch,
 }
 
 impl ZakuraGossipBroadcast {
@@ -1500,6 +1673,7 @@ impl ZakuraGossipBroadcast {
         Self {
             first_seen,
             outbound,
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
         }
     }
 
@@ -1509,7 +1683,9 @@ impl ZakuraGossipBroadcast {
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
         self.outbound.remember_latest_block(&frame);
-        self.outbound.send_to_peers(frame, exclude).await
+        self.outbound
+            .send_to_peers(frame, exclude, &self.switch)
+            .await
     }
 
     async fn record_first_seen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
@@ -1753,12 +1929,15 @@ impl LegacyGossipOutbound {
         session.try_send_advertise_block(hash).map_err(Into::into)
     }
 
+    /// Queues `frame` to every session except `exclude`'s, and except peers
+    /// whose transaction adverts `switch` leaves to `tx-relay`.
     async fn send_to_peers(
         &self,
         frame: LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
+        switch: &TxRelaySwitch,
     ) -> Result<(), BoxError> {
-        let sessions: Vec<_> = {
+        let mut sessions: Vec<_> = {
             let state = self
                 .state
                 .lock()
@@ -1770,6 +1949,8 @@ impl LegacyGossipOutbound {
                 .map(|(_peer_id, session)| session.clone())
                 .collect()
         };
+        // Checked outside the session lock, so the two locks never nest.
+        sessions.retain(|session| !switch.drops_advert(session.peer_id(), &frame));
 
         send_to_sessions(sessions, frame)
     }
@@ -2022,7 +2203,13 @@ impl Service<Request> for LegacyRequestAdapter {
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let client = self.client.clone();
+        let mut client = self.client.clone();
+        if let Request::BlockByHashPrimary { attempt, .. } = &request {
+            // The primary is now using native peers. Its former legacy peer's score
+            // no longer predicts its arrival, but a hedge already sent can still win.
+            attempt.close();
+            client.block_attempt = Some(attempt.clone());
+        }
         Box::pin(async move {
             let source = request.inventory_source();
             let retry_source_missing = source.is_some();
@@ -2045,6 +2232,10 @@ enum DualStackRoute {
     /// legacy peer set and stalls (its syncer can never obtain tips or fetch
     /// blocks). The set mirrors `LegacyRequestFrame::from_request`.
     LegacyFirstThenZakura,
+    /// A second request for a slow legacy block download: legacy peer set only, because the
+    /// peer set picks a legacy peer that announced the block. A block it returns counts as
+    /// received over legacy.
+    LegacyBlockHedge,
     /// Anything the Zakura adapter cannot serve (e.g. peer-address discovery):
     /// legacy peer set only.
     Passthrough,
@@ -2145,7 +2336,8 @@ where
             | Request::AdvertiseBlockToAll(..)
             | Request::AdvertiseMinedBlock(..)
             | Request::AdvertiseTransactionIds(..) => DualStackRoute::Advertise,
-            Request::BlocksByHash(..)
+            Request::BlockByHashPrimary { .. }
+            | Request::BlocksByHash(..)
             | Request::BlocksByHashFrom { .. }
             | Request::TransactionsById(..)
             | Request::TransactionsByIdFrom { .. }
@@ -2153,6 +2345,7 @@ where
             | Request::FindHeaders { .. }
             | Request::MempoolTransactionIds
             | Request::PushTransaction(..) => DualStackRoute::LegacyFirstThenZakura,
+            Request::BlockByHashHedge { .. } => DualStackRoute::LegacyBlockHedge,
             _ => DualStackRoute::Passthrough,
         };
 
@@ -2160,6 +2353,9 @@ where
         let requested_block_hashes = match &request {
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 Some(hashes.clone())
+            }
+            Request::BlockByHashHedge { hash, .. } | Request::BlockByHashPrimary { hash, .. } => {
+                Some(IndexSet::from([*hash]))
             }
             _ => None,
         };
@@ -2220,10 +2416,39 @@ where
                     // even when it has no ready peer (e.g. every legacy peer was
                     // upgraded to Zakura). Bound the legacy attempt so we fall
                     // back to the Zakura path instead of blocking forever.
-                    let legacy_attempt = timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, async {
-                        legacy.ready().await?.call(request.clone()).await
-                    })
-                    .await;
+                    let (legacy_request, deadline) = match &request {
+                        Request::BlockByHashPrimary { attempt, .. } => {
+                            (request.clone(), Some(attempt.clone()))
+                        }
+                        Request::BlocksByHash(hashes)
+                        | Request::BlocksByHashFrom { hashes, .. }
+                            if hashes.len() == 1 =>
+                        {
+                            let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+                            attempt.close();
+                            (
+                                Request::BlockByHashPrimary {
+                                    hash: hashes[0],
+                                    source: request.inventory_source(),
+                                    attempt: attempt.clone(),
+                                },
+                                Some(attempt),
+                            )
+                        }
+                        _ => (request.clone(), None),
+                    };
+                    let legacy_attempt = {
+                        let pending = async { legacy.ready().await?.call(legacy_request).await };
+                        tokio::pin!(pending);
+                        let outcome =
+                            timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, &mut pending).await;
+                        if outcome.is_err() {
+                            if let Some(deadline) = deadline {
+                                deadline.legacy_timeout();
+                            }
+                        }
+                        outcome
+                    };
                     match legacy_attempt {
                         Ok(Ok(response)) if !all_inventory_missing(&response) => {
                             Ok(record_source(response, BlockBodySource::Legacy))
@@ -2245,6 +2470,12 @@ where
                             .map(|response| record_source(response, BlockBodySource::Zakura)),
                     }
                 }
+                DualStackRoute::LegacyBlockHedge => legacy
+                    .ready()
+                    .await?
+                    .call(request)
+                    .await
+                    .map(|response| record_source(response, BlockBodySource::Legacy)),
                 DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
             }
         })
@@ -2277,11 +2508,14 @@ fn record_block_response_source(
 #[derive(Clone, Debug)]
 pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
+    switch: TxRelaySwitch,
     request_timeout: Duration,
     slots: LegacyClientSlots,
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    /// Set only on the per-call clone for a block with a competing download.
+    block_attempt: Option<crate::BlockHedge>,
 }
 
 impl ZakuraRequestClient {
@@ -2310,6 +2544,7 @@ impl ZakuraRequestClient {
             .unwrap_or(1)
             .max(1);
         Self {
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
             slots: LegacyClientSlots::new(
@@ -2319,6 +2554,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            block_attempt: None,
         }
     }
 
@@ -2340,12 +2576,24 @@ impl ZakuraRequestClient {
         *next_request_at = request_at + self.request_interval;
     }
 
+    fn ensure_still_needed(&self) -> Result<(), BoxError> {
+        if self
+            .block_attempt
+            .as_ref()
+            .is_some_and(crate::BlockHedge::is_satisfied)
+        {
+            return Err("block already delivered".into());
+        }
+        Ok(())
+    }
+
     async fn request(
         &self,
         frame: LegacyRequestFrame,
         source: Option<PeerSource>,
         retry_source_missing: bool,
     ) -> Result<Response, BoxError> {
+        self.ensure_still_needed()?;
         let preferred = match source {
             Some(PeerSource::Zakura(peer_id)) => Some(peer_id),
             _ => None,
@@ -2356,7 +2604,9 @@ impl ZakuraRequestClient {
         let _slot = timeout(self.request_timeout, self.slots.acquire(request_kind))
             .await
             .map_err(|_| -> BoxError { "Zakura legacy request client is at capacity".into() })?;
-        let handles = self.ready_handles().await?;
+        let mut handles = self.ready_handles().await?;
+        // A peer whose transactions belong to `tx-relay` is not asked.
+        handles.retain(|handle| !self.switch.skips_request(handle.peer_id(), request_kind));
         let candidates = request_candidates(
             &handles,
             preferred.as_ref(),
@@ -2401,6 +2651,7 @@ impl ZakuraRequestClient {
     ) -> Result<Response, BoxError> {
         let mut last_response = initial_response;
         for _ in 0..SOURCE_INVENTORY_MISSING_RETRIES {
+            self.ensure_still_needed()?;
             sleep(SOURCE_INVENTORY_MISSING_RETRY_DELAY).await;
             match self
                 .request_one(handle.clone(), frame.clone(), request_kind)
@@ -2439,7 +2690,9 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        self.ensure_still_needed()?;
         self.wait_for_request_slot().await;
+        self.ensure_still_needed()?;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
         // so the response can be bound to IDs we actually asked for.
@@ -2470,13 +2723,12 @@ impl ZakuraRequestClient {
             }
             _ => (None, None),
         };
-        let exchange = handle.request(
+        let exchange = handle.request_frame(
             ZAKURA_STREAM_LEGACY_REQUESTS,
             request_id,
-            frame.message_type,
-            frame.flags,
-            frame.payload,
+            frame,
             started,
+            self.block_attempt.as_ref(),
         );
         // A transaction attempt is also cut off `LEGACY_TRANSACTION_ATTEMPT_TIMEOUT`
         // after the connection starts its exchange. It yields `None` when that
@@ -2748,6 +3000,7 @@ pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
     inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
+    switch: TxRelaySwitch,
     trace: ZakuraTrace,
 }
 
@@ -2788,21 +3041,39 @@ impl LegacyGossipSink {
             inbound_tx,
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
+            switch: TxRelaySwitch::for_supervisor(&supervisor),
             trace,
         }
     }
 }
 
 impl LegacyGossipSink {
+    /// Decodes a gossip frame from `peer_id` and queues it for the worker.
+    /// A frame over the retained-byte budget or the queue is dropped, and a
+    /// transaction advert from a peer `switch` leaves to `tx-relay` is
+    /// dropped with no penalty.
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
         inbound_budget: &InboundBudget,
+        switch: &TxRelaySwitch,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
         let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+        let message_type = frame.message_type();
+        if message_type == MSG_ADVERTISE_TX_IDS {
+            count_received_tx_messages(message_type, 1);
+        }
+        if switch.drops_advert(&peer_id, &frame) {
+            return Ok(());
+        }
         let Some(charge) = inbound_budget.try_charge(frame.retained_bytes()) else {
-            metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "gossip").increment(1);
+            metrics::counter!(
+                "zakura.p2p.legacy.inbound.refused",
+                "work" => "gossip",
+                "type" => message_type_label(message_type),
+            )
+            .increment(1);
             debug!("legacy gossip inbound bytes exhausted: dropping frame");
             return Ok(());
         };
@@ -2813,6 +3084,7 @@ impl LegacyGossipSink {
         })) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
+                count_queue_full("gossip", message_type);
                 debug!("legacy gossip inbound queue full: dropping frame");
                 Ok(())
             }
@@ -2832,7 +3104,13 @@ impl LegacyGossipSink {
             return Ok(());
         }
 
-        Self::enqueue_gossip_frame(&self.inbound_tx, &self.inbound_budget, peer_id, frame)
+        Self::enqueue_gossip_frame(
+            &self.inbound_tx,
+            &self.inbound_budget,
+            &self.switch,
+            peer_id,
+            frame,
+        )
     }
 
     /// Every protocol check a request meets before `request` does any work.
@@ -2859,9 +3137,28 @@ impl LegacyGossipSink {
             let request = Self::decode_request(stream_kind, &frame)?;
             // The block owns `frame` until the response, so free its payload now.
             drop(frame);
+            let message_type = request.kind().message_type();
+            if request.kind().is_transaction() {
+                count_received_tx_messages(message_type, 1);
+            }
+            // `tx-relay` owns this peer's transactions, so answer it here
+            // with no penalty.
+            if let Some(answer) = self.switch.answer_for(&peer_id, &request) {
+                return LegacyResponseCodec::encode_response(
+                    request_id,
+                    answer,
+                    max_frame_bytes,
+                    max_message_bytes,
+                )
+                .map_err(SinkReject::local);
+            }
             let Some(charge) = self.inbound_budget.try_charge(request.retained_bytes()) else {
-                metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "request")
-                    .increment(1);
+                metrics::counter!(
+                    "zakura.p2p.legacy.inbound.refused",
+                    "work" => "request",
+                    "type" => message_type_label(message_type),
+                )
+                .increment(1);
                 return Err(SinkReject::local("legacy request inbound bytes exhausted"));
             };
             let (response_tx, response_rx) = oneshot::channel();
@@ -2876,6 +3173,7 @@ impl LegacyGossipSink {
                 })) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    count_queue_full("request", message_type);
                     return Err(SinkReject::local("legacy request inbound queue full"));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -2955,6 +3253,7 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let inbound_budget = self.inbound_budget.clone();
+        let switch = self.switch.clone();
         let peer_id = peer.id.clone();
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
@@ -3042,6 +3341,7 @@ impl ZakuraService for LegacyGossipSink {
                     match Self::enqueue_gossip_frame(
                         &inbound_tx,
                         &inbound_budget,
+                        &switch,
                         peer_id.clone(),
                         frame,
                     ) {
@@ -3817,6 +4117,16 @@ mod tests {
                             .collect(),
                     )
                 }
+                // The legacy peer set answers a hedge with the block, like `BlocksByHash`.
+                Request::BlockByHashHedge { hash, .. }
+                | Request::BlockByHashPrimary { hash, .. }
+                    if hash == self.block.hash() =>
+                {
+                    Response::Blocks(vec![InventoryResponse::Available((
+                        self.block.clone().into(),
+                        None,
+                    ))])
+                }
                 request => {
                     return std::future::ready(Err(format!(
                         "unexpected block inventory request: {request:?}"
@@ -3913,6 +4223,7 @@ mod tests {
             inbound_tx,
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
+            switch: TxRelaySwitch::default(),
             trace: ZakuraTrace::noop(),
         }
     }
@@ -4147,6 +4458,87 @@ mod tests {
         assert_eq!(least_available, LEGACY_CLIENT_INVENTORY_SLOTS - 1);
         assert!(all_inventory_missing(&retried.await??));
         assert_eq!(inventory.available_permits(), LEGACY_CLIENT_INVENTORY_SLOTS);
+        Ok(())
+    }
+
+    /// A native peer handoff competes with completion even after the client has
+    /// selected the peer and is waiting for its outbound queue.
+    #[tokio::test(start_paused = true)]
+    async fn native_block_dispatch_rechecks_completion_after_queue_capacity() -> Result<(), BoxError>
+    {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let occupied = sender.clone().reserve_owned().await?;
+        let handle = ZakuraPeerHandle::new_for_tests(ZakuraPeerId::new(vec![1; 32])?, sender);
+        let mut client = ZakuraRequestClient::new(ZakuraSupervisorHandle::new(1));
+        let attempt = crate::BlockHedge::new(Instant::now());
+        client.block_attempt = Some(attempt.clone());
+        let request = client.request_one(
+            handle,
+            LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+            LegacyRequestKind::Blocks,
+        );
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        // Drive the pacing timer before checking the blocked send.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(attempt.first_dispatch().is_none());
+        attempt.mark_satisfied();
+        drop(occupied);
+        assert!(request
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already delivered"));
+        assert!(receiver.try_recv().is_err());
+        assert!(attempt.first_dispatch().is_none());
+        Ok(())
+    }
+
+    /// A native exchange already handed to a peer drains, but its missing reply
+    /// cannot trigger another attempt once the legacy peer supplied the block.
+    #[tokio::test(start_paused = true)]
+    async fn completed_download_drains_native_exchange_without_retrying_source(
+    ) -> Result<(), BoxError> {
+        let hash = block_hash(1);
+        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let supervisor = ZakuraSupervisorHandle::new(8);
+        let (sender, mut outbound) = mpsc::channel(2);
+        supervisor
+            .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(peer.clone(), sender))
+            .await;
+        let attempt = crate::BlockHedge::new(Instant::now());
+        let mut client = ZakuraRequestClient::new(supervisor);
+        client.block_attempt = Some(attempt.clone());
+        let result = tokio::spawn(async move {
+            client
+                .request(
+                    LegacyRequestFrame::BlocksByHash(vec![hash]),
+                    Some(PeerSource::Zakura(peer)),
+                    true,
+                )
+                .await
+        });
+        let crate::zakura::ZakuraOutboundFrame::Request {
+            request_id,
+            completion,
+            ..
+        } = timeout(Duration::from_secs(1), outbound.recv())
+            .await?
+            .unwrap();
+        assert!(attempt.first_dispatch().is_some());
+        attempt.mark_satisfied();
+        let missing = Response::Blocks(vec![InventoryResponse::Missing(hash)]);
+        let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let frames = LegacyResponseCodec::encode_response(request_id, missing, cap, cap)?;
+        assert!(
+            completion
+                .send(Ok(ResponseFrames::with_zero_grant_for_tests(frames).await))
+                .is_ok(),
+            "the exchange can still hand off its response"
+        );
+        assert!(timeout(Duration::from_secs(1), result).await??.is_err());
+        assert!(outbound.try_recv().is_err());
         Ok(())
     }
 
@@ -8209,6 +8601,14 @@ mod tests {
                     }
                     Response::Blocks(hashes.into_iter().map(InventoryResponse::Missing).collect())
                 }
+                Request::BlockByHashPrimary { hash, .. } => match self.inventory {
+                    StubInventory::Error => {
+                        return std::future::ready(Err("legacy inventory unavailable".into()))
+                    }
+                    StubInventory::Missing => {
+                        Response::Blocks(vec![InventoryResponse::Missing(hash)])
+                    }
+                },
                 _ => Response::Nil,
             };
             std::future::ready(Ok(response))
@@ -8346,6 +8746,48 @@ mod tests {
         assert_eq!(
             trace.first_block_body_source(hash),
             Some(BlockBodySource::Legacy)
+        );
+
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_stack_block_hedge_counts_its_block_as_received_over_legacy(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let requester = ZakuraTestNode::builder(9221).spawn().await?;
+
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
+            BlockInventoryResponder { block },
+            requester.supervisor(),
+            true,
+            trace.clone(),
+            1,
+        );
+
+        let response = composite
+            .ready()
+            .await?
+            .call(Request::BlockByHashHedge {
+                hash,
+                attempt: crate::BlockHedge::new(tokio::time::Instant::now()),
+            })
+            .await?;
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Legacy),
+            "a later answer to the first request must not count as the first arrival"
         );
 
         requester.shutdown().await;

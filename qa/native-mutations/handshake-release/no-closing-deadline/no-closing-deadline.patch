@@ -1,0 +1,11 @@
+--- a/crates/zakura-quic/src/driver/connection.rs
++++ b/crates/zakura-quic/src/driver/connection.rs
+@@ -282,7 +282,7 @@
+             // RTT sets. Cap the drain at SHUTDOWN_DRAIN so a slow or delaying
+             // peer can't hold a closing slot longer (ADM-13). A late packet
+             // after the cap at worst draws a stateless reset.
+-            closing_deadline = Some(now() + super::endpoint::SHUTDOWN_DRAIN);
++            closing_deadline = None;
+             if !task.enter_closing(&mut datagrams) {
+                 // ADM-13: the closing allowance is full, so drop the state
+                 // now. Dropping the task reports the connection drained.

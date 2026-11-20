@@ -3,12 +3,15 @@
 
 Takes the summary.json from a baseline leg and a target leg (same droplet, same
 workload, run back to back) and reports the deltas that matter for a mempool
-change: throughput, propagation latency, rejects, and backpressure.
+change: propagation latency, reach, rejects, and backpressure, with throughput
+and block timing for context.
 
 Stdlib only, mirroring deploy/deployer/deploy.py.
 
-Exit status is always 0: this script reports, it does not gate. The per-leg
-verdict from mempool-load-monitor.py is what fails a run.
+Exit status gates the run: 0 when both legs passed and no graded metric got
+worse or went missing, 1 when a leg failed, a graded metric is missing from
+either leg or one regressed, and 3 when neither failed but a leg was too thin
+to grade (`degraded` or `inconclusive`).
 """
 
 from __future__ import annotations
@@ -22,10 +25,15 @@ from pathlib import Path
 # ratio-scale quantities, which is every metric here.
 # (label, json path, lower_is_better, how to read it)
 COMPARISONS = (
-    ("Transactions submitted", ("throughput", "submitted"), False,
-     "Proving-bound, so treat small moves as noise."),
-    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), False,
-     "Same figure per second. A real drop shows up here and above together."),
+    # The blaster keeps a fixed number of transactions in flight and each waits
+    # for a block, so throughput follows blocks mined, which swings with mining
+    # luck. Reported for context, never graded, like confirm delay below.
+    ("Transactions submitted", ("throughput", "submitted"), None,
+     "Follows blocks mined (below). Informational, not graded."),
+    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), None,
+     "Same figure per second. Informational, not graded."),
+    ("Blocks mined in window", ("convergence", "blocks_mined"), None,
+     "Mining luck. Throughput and confirm delay follow it."),
     ("Reject rate", ("throughput", "reject_rate"), True,
      "Node rejects only. 0 -> non-zero is the most actionable regression here."),
     # Confirm delay is bounded by when the next block lands, so its percentiles
@@ -39,17 +47,47 @@ COMPARISONS = (
      "Typical gossip spread across nodes."),
     ("Propagation p95 (s)", ("propagation", "spread_p95_secs"), True,
      "Tail gossip spread. **The number to watch for advertisement/retry changes.**"),
-    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), False,
-     "Full-network reach. A drop means transactions are not getting everywhere."),
-    ("Peak mempool depth", ("peak_mempool_txs",), False,
-     "Higher can mean slower draining, or simply more submitted; read with the rows above."),
+    # The count follows how many were submitted, like throughput, so the
+    # share of observed txids is what gets graded.
+    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), None,
+     "Follows how many were submitted. Informational, not graded."),
+    ("Share reaching all nodes", ("propagation", "all_nodes_share"), False,
+     "Full-network reach per observed txid. A drop means transactions are not getting everywhere."),
+    # A shallower peak can mean faster draining or fewer submitted, so it
+    # never decides a run on its own.
+    ("Peak mempool depth", ("peak_mempool_txs",), None,
+     "Higher can mean slower draining, or simply more submitted; informational, not graded."),
 )
 
 # Below this, run-to-run noise dominates and a delta is not worth flagging.
 NOISE_FLOOR_PCT = 10.0
 
+# Spreads measured by polling. A change smaller than the coarser leg's
+# sampling resolution (the monitor's median gap between two samples of one
+# node) is below what either leg can see, so it is no change.
+POLLED_SPREADS = {("propagation", "spread_p50_secs"), ("propagation", "spread_p95_secs")}
+
+
+def all_nodes_share(leg: dict) -> float | None:
+    """The share of a leg's observed txids that reached every node.
+
+    A leg that observed nothing reached nothing, so it reads 0.0 rather than
+    missing. The leg's own verdict already marks it too thin to grade.
+    """
+    reached = dig(leg, ("propagation", "txids_on_all_nodes"))
+    observed = dig(leg, ("propagation", "txids_observed"))
+    if not isinstance(reached, (int, float)) or not isinstance(observed, (int, float)):
+        return None
+    return reached / observed if observed else 0.0
+
+
+# Metrics a summary doesn't carry, derived from the ones it does.
+DERIVED = {("propagation", "all_nodes_share"): all_nodes_share}
+
 
 def dig(data: dict, path: tuple[str, ...]):
+    if path in DERIVED:
+        return DERIVED[path](data)
     for key in path:
         if not isinstance(data, dict):
             return None
@@ -82,12 +120,15 @@ def classify(delta_pct: float | None, lower_is_better: bool, baseline=None, targ
         return "info"
     if delta_pct is None:
         if not isinstance(baseline, (int, float)) or not isinstance(target, (int, float)):
-            return "="
+            # A graded number absent from either leg is no comparison at all.
+            return "MISSING"
         if baseline == 0 and target != 0:
             # Moving off a clean baseline in the bad direction.
             return "WORSE" if lower_is_better else "better"
         return "="
-    if abs(delta_pct) < NOISE_FLOOR_PCT:
+    # Rounded so a delta that is exactly the floor, such as a share falling
+    # from 1.0 to 0.9, isn't read as just under it by float error.
+    if round(abs(delta_pct), 9) < NOISE_FLOOR_PCT:
         return "="
     improved = (delta_pct < 0) if lower_is_better else (delta_pct > 0)
     return "better" if improved else "WORSE"
@@ -106,22 +147,62 @@ def fmt_delta(delta_pct: float | None) -> str:
 
 
 def build_rows(baseline: dict, target: dict) -> list[dict]:
+    """One row per comparison, with its delta and verdict. See `POLLED_SPREADS`."""
+    resolutions = [
+        value
+        for value in (dig(leg, ("propagation", "resolution_secs")) for leg in (baseline, target))
+        if isinstance(value, (int, float))
+    ]
+    resolution = max(resolutions, default=0.0)
     rows = []
     for label, path, lower_is_better, hint in COMPARISONS:
         base_value = dig(baseline, path)
         target_value = dig(target, path)
         delta = pct_delta(base_value, target_value)
+        verdict = classify(delta, lower_is_better, base_value, target_value)
+        if (
+            path in POLLED_SPREADS
+            and verdict in ("WORSE", "better")
+            and abs(target_value - base_value) < resolution
+        ):
+            verdict = "="
         rows.append(
             {
                 "metric": label,
                 "baseline": base_value,
                 "target": target_value,
                 "delta_pct": delta,
-                "verdict": classify(delta, lower_is_better, base_value, target_value),
+                "verdict": verdict,
                 "hint": hint,
             }
         )
     return rows
+
+
+def gate(baseline: dict, target: dict, rows: list[dict]) -> tuple[str, list[str]]:
+    """Return the comparison's status, `pass`, `fail` or `inconclusive`, and why.
+
+    A failed leg or a missing graded metric fails the run. A leg too thin to
+    grade makes it inconclusive before any delta is read, since a thin leg's
+    deltas are noise. Only then does a regressed metric fail it.
+    """
+    reasons = []
+    verdicts = {"baseline": baseline.get("verdict"), "target": target.get("verdict")}
+    for leg, verdict in verdicts.items():
+        if verdict not in ("ok", "degraded", "inconclusive"):
+            reasons.append(f"the {leg} leg's verdict is {verdict or 'missing'}")
+    for row in rows:
+        if row["verdict"] == "MISSING":
+            reasons.append(f"{row['metric']}: MISSING")
+    if reasons:
+        return "fail", reasons
+    thin = [leg for leg, verdict in verdicts.items() if verdict != "ok"]
+    if thin:
+        return "inconclusive", [f"the {leg} leg is {verdicts[leg]}" for leg in thin]
+    worse = [f"{row['metric']}: WORSE" for row in rows if row["verdict"] == "WORSE"]
+    if worse:
+        return "fail", worse
+    return "pass", []
 
 
 def render(baseline: dict, target: dict, rows: list[dict]) -> str:
@@ -132,9 +213,9 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     lines = [
         "## Zakura mempool load: baseline vs target",
         "",
-        f"baseline `{base_meta.get('sha', 'unknown')}` "
+        f"baseline `{base_meta.get('sha', 'unknown')}` {base_meta.get('profile', 'default')} "
         f"({baseline.get('verdict', 'unknown')}) "
-        f"vs target `{target_meta.get('sha', 'unknown')}` "
+        f"vs target `{target_meta.get('sha', 'unknown')}` {target_meta.get('profile', 'default')} "
         f"({target.get('verdict', 'unknown')})",
         "",
         f"{target_meta.get('node_count', '?')} nodes | "
@@ -162,31 +243,38 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+EXIT_STATUS = {"pass": 0, "fail": 1, "inconclusive": 3}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Compare two legs' summaries, write the report, and return the gate's status."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--out", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         baseline = json.loads(Path(args.baseline).read_text())
         target = json.loads(Path(args.target).read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        # A missing leg is not a comparison failure to hard-stop the run on;
-        # the per-leg verdict already covers it.
+        # A leg with no summary measured nothing, so the comparison fails.
         Path(args.out).write_text(
             f"## Zakura mempool load\n\nComparison unavailable: {exc}\n"
         )
         print(f"comparison unavailable: {exc}", file=sys.stderr)
-        return 0
+        return EXIT_STATUS["fail"]
 
     rows = build_rows(baseline, target)
+    status, reasons = gate(baseline, target, rows)
     report = render(baseline, target, rows)
+    report += f"\n**Comparison: {status}**" + "".join(f"\n- {r}" for r in reasons) + "\n"
     Path(args.out).write_text(report)
-    Path(args.out).with_suffix(".json").write_text(json.dumps(rows, indent=2) + "\n")
+    Path(args.out).with_suffix(".json").write_text(
+        json.dumps({"status": status, "reasons": reasons, "rows": rows}, indent=2) + "\n"
+    )
     print(report)
-    return 0
+    return EXIT_STATUS[status]
 
 
 if __name__ == "__main__":

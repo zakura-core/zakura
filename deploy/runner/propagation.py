@@ -14,6 +14,8 @@ A node that is allowed to write its peers' addresses also reports, for every att
 to download a block, the peer's IP address and the software it says it runs. Those
 peers are listed by address, except the ones the caller says must stay private: they
 are reduced to "a private peer" here, before anything is summarised or returned.
+Only the peers that may be shown are then located (`locate`), so a private peer never
+has a location either.
 """
 
 import hashlib
@@ -303,11 +305,11 @@ def summarize(blocks, node_names):
     }
 
 
-def summarize_downloads(blocks):
+def summarize_downloads(blocks, locate):
     """`(outside peers, outside software, slowest downloads)` over `blocks`.
 
-    An outside peer is one row per IP address: the software it last said it runs, which
-    of our nodes downloaded from it, how many attempts there were and how many failed,
+    An outside peer is one row per IP address: the software it last said it runs, where
+    it is (`locate(ip)`, `None` when unknown), which of our nodes downloaded from it, how many attempts there were and how many failed,
     and the median, 9-in-10 and slowest time of the ones that delivered the block. The
     slowest downloads are single attempts, whoever served them, each with the node that
     made it and the block's height, hash and size.
@@ -359,6 +361,9 @@ def summarize_downloads(blocks):
     ]  # fmt: skip
     # Slowest first; a peer that never delivered a block has no time and comes last.
     outside.sort(key=lambda peer: (peer["p90_ms"] is None, -(peer["p90_ms"] or 0), peer["ip"]))
+    outside = outside[:MAX_OUTSIDE_PEERS]
+    for peer in outside:
+        peer["location"] = locate(peer["ip"])
     versions = [
         {
             "agent": group["agent"], "peers": len(group["peers"]), "nodes": sorted(group["nodes"]),
@@ -371,10 +376,10 @@ def summarize_downloads(blocks):
     # The software most peers run first.
     versions.sort(key=lambda group: (-group["peers"], -group["downloads"], group["agent"] or ""))
     attempts.sort(key=lambda attempt: (-attempt["ms"], attempt["node"]))
-    return outside[:MAX_OUTSIDE_PEERS], versions[:MAX_OUTSIDE_PEERS], attempts[:SLOWEST_DOWNLOADS]
+    return outside, versions[:MAX_OUTSIDE_PEERS], attempts[:SLOWEST_DOWNLOADS]
 
 
-def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_private=None):
+def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_private=None, locate=None):
     """The cluster view from `{node name: its profiler's propagation report, or None}`.
 
     `node_ids` maps every fleet node name to its Zakura node id (empty when it has
@@ -384,12 +389,15 @@ def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_privat
     `fleet_addresses` maps the IP address of each fleet node to its name, so a download
     from one of them is shown under that name. `is_private` says whether an IP address
     must never be shown; such a peer appears only as a private peer, without its
-    address or software.
+    address or software. `locate` gives an outside peer's location from its address
+    (see `peer_location.open_locator`); it is only ever asked about peers that may be
+    shown.
     """
     fleet = fleet_peers(node_ids)
     addresses = {canonical_ip(ip): name for ip, name in (fleet_addresses or {}).items()}
     addresses.pop(None, None)
     is_private = is_private or (lambda ip: False)
+    locate = locate or (lambda ip: None)
     by_hash = {}
     for node, report in reports.items():
         if not isinstance(report, dict):
@@ -399,7 +407,7 @@ def join(reports, node_ids, limit=100, now=None, fleet_addresses=None, is_privat
     blocks = [joined_block(block_hash, records) for block_hash, records in by_hash.items()]
     blocks.sort(key=lambda block: (block["height"] or 0, block["origin"]), reverse=True)
     blocks = blocks[:limit]
-    outside_peers, outside_software, slowest_downloads = summarize_downloads(blocks)
+    outside_peers, outside_software, slowest_downloads = summarize_downloads(blocks, locate)
     return {
         "generated_at": round(time.time() if now is None else now, 3),
         "nodes": list(node_ids),

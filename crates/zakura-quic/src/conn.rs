@@ -13,7 +13,7 @@ use quinn_proto::{ConnectionError, ConnectionStats, StreamId, VarInt};
 use zakura_rt::sync::{oneshot, Mutex, PoisonError};
 
 use crate::{
-    driver::{ConnCmd, ConnRef},
+    driver::{ConnCmd, ConnRef, ConnShared},
     key::NodeId,
     stream::{RecvStream, SendStream},
 };
@@ -190,6 +190,8 @@ pub struct ConnLoad {
     pub frame_rx: quinn_proto::FrameStats,
     /// Sends that failed with an error other than `WouldBlock`.
     pub send_errors: u64,
+    /// Smoothed round-trip time, which [`RttReader`] reads.
+    pub(crate) rtt: Duration,
 }
 
 /// The longest a [`ConnLoad`] snapshot lags while the connection is active.
@@ -211,7 +213,25 @@ impl ConnLoad {
             udp_rx: quinn_proto::UdpStats::default(),
             frame_rx: quinn_proto::FrameStats::default(),
             send_errors: 0,
+            rtt: Duration::ZERO,
         }
+    }
+}
+
+/// Reads one connection's smoothed round-trip time from its latest
+/// [`ConnLoad`] without keeping the connection open, so a service can hold
+/// it for as long as its session runs.
+#[derive(Clone, Debug)]
+pub struct RttReader(zakura_rt::sync::Weak<ConnShared>);
+
+impl RttReader {
+    /// The smoothed round-trip time in the connection's latest snapshot,
+    /// which lags by at most [`LOAD_INTERVAL`] while the connection is
+    /// active. `None` once the connection is gone.
+    pub fn rtt(&self) -> Option<Duration> {
+        let shared = self.0.upgrade()?;
+        let rtt = shared.load.borrow().rtt;
+        Some(rtt)
     }
 }
 
@@ -257,6 +277,7 @@ pub struct Conn {
     inner: ConnRef,
     remote_id: NodeId,
     admitted_addr: SocketAddr,
+    source_validated: bool,
     alpn: Arc<[u8]>,
 }
 
@@ -265,6 +286,7 @@ impl fmt::Debug for Conn {
         f.debug_struct("Conn")
             .field("remote_id", &self.remote_id)
             .field("admitted_addr", &self.admitted_addr)
+            .field("source_validated", &self.source_validated)
             .field("alpn", &String::from_utf8_lossy(&self.alpn))
             .finish()
     }
@@ -275,12 +297,14 @@ impl Conn {
         inner: ConnRef,
         remote_id: NodeId,
         admitted_addr: SocketAddr,
+        source_validated: bool,
         alpn: Vec<u8>,
     ) -> Self {
         Self {
             inner,
             remote_id,
             admitted_addr,
+            source_validated,
             alpn: alpn.into(),
         }
     }
@@ -298,6 +322,15 @@ impl Conn {
     /// The socket address admitted at accept or dial time.
     pub fn admitted_addr(&self) -> SocketAddr {
         self.admitted_addr
+    }
+
+    /// Whether the source address was validated before TLS started: by a
+    /// Retry token for an inbound connection ([`IncomingInfo::validated`]),
+    /// and always for an outbound one, whose address this node dialed.
+    ///
+    /// [`IncomingInfo::validated`]: crate::IncomingInfo::validated
+    pub fn source_validated(&self) -> bool {
+        self.source_validated
     }
 
     /// The negotiated ALPN.
@@ -361,11 +394,28 @@ impl Conn {
         *self.inner.shared.load.borrow()
     }
 
+    /// A reader of this connection's smoothed round-trip time that does not
+    /// hold the connection open.
+    pub fn rtt_reader(&self) -> RttReader {
+        RttReader(zakura_rt::sync::downgrade(&self.inner.shared))
+    }
+
     /// A probe that reads [`Self::load`]'s snapshot without holding the
     /// connection open, for the simulator's transport taps.
     #[cfg(zakura_sim)]
     pub fn load_probe(&self) -> crate::LoadProbe {
         crate::LoadProbe::of(&self.inner.shared)
+    }
+
+    /// Observes the release of this connection's admission slot after shutdown drain.
+    #[cfg(zakura_sim)]
+    pub fn slot_probe(&self) -> crate::SlotProbe {
+        self.inner
+            .shared
+            .slot_release
+            .get()
+            .expect("the endpoint installs the slot probe before spawning the connection")
+            .clone()
     }
 
     /// Changes this connection's runtime limits (API-9). Returns the close

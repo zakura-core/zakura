@@ -16,7 +16,7 @@ to detach.
 ## Witness
 
 The witness is `qa/planted/block-sync/detached-submission-bounded/forget-on-reset.toml`, which runs
-`crates/zakura-sim/tests/fixtures/block-sync-stalled-reset.bin`.
+the seed `block-sync-stalled-reset`.
 
 The input's storage never answers a submission, and a reset to a fork
 from height 2 arrives once the first is submitted. The reset rolls that

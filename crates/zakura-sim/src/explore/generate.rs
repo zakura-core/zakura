@@ -33,6 +33,11 @@
 //! of the families or no tag, uniformly, from the seed and the run's index,
 //! and writes the family's tag over the input's first bytes. The input
 //! stays the whole run, so replay, shrink and confirm read it unchanged.
+//!
+//! A uniform pick repeats families long before it has drawn them all, so a
+//! slow harness's short search misses most of them. [`DrawPolicy::Cycle`]
+//! instead visits every family, each of its variants and one untagged run
+//! once per block of runs ([`draws_with`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,7 +50,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Bucket, ExploreOutcome, Worker};
+use super::{pct::Pct, Bucket, Classified, ExploreOutcome, ExploreRun, Worker};
 use crate::{
     check::PropertyOutcome,
     harness::{HarnessEntry, ScenarioFamily, HARNESSES},
@@ -72,7 +77,9 @@ pub struct GenerateOptions {
     pub runs: u64,
     /// The longest input to draw.
     pub max_bytes: usize,
-    /// The SHA-256 digests, in lowercase hex, of the inputs to skip.
+    /// The SHA-256 digests, in lowercase hex, of the drawn inputs to skip:
+    /// a report's [`GenerateReport::draw_sha256`], or its `input_sha256`
+    /// when it has none.
     pub exclude: BTreeSet<String>,
     /// Where the report and the stopping run's input go.
     pub out: PathBuf,
@@ -80,6 +87,51 @@ pub struct GenerateOptions {
     pub records: Option<PathBuf>,
     /// How many abandoned runs the search takes before it stops.
     pub abandon_limit: usize,
+    /// How each run's scenario family is drawn.
+    pub draw_policy: DrawPolicy,
+    /// What makes each run's live picks.
+    pub schedule: Schedule,
+}
+
+/// What makes a search's live picks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Schedule {
+    /// The input's Plan bytes, then round-robin once they run out.
+    #[default]
+    Plan,
+    /// A PCT steer the input seeds ([`super::pct`]). The search saves the
+    /// input that replays a stopping run with no steer, so every later
+    /// command reads it as a plain input.
+    Pct,
+}
+
+impl Schedule {
+    /// True for [`Schedule::Plan`], which a report leaves out.
+    fn is_plan(&self) -> bool {
+        *self == Schedule::Plan
+    }
+}
+
+/// How [`draws_with`] picks each run's scenario family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrawPolicy {
+    /// Each run's family, or no tag, is uniform from the seed and the run's
+    /// index alone, as before policies existed, so a seed keeps its runs.
+    #[default]
+    Uniform,
+    /// Each block of runs visits every family's variants and one untagged
+    /// run once, in an order the seed and the block shuffle. A search no
+    /// longer than one block draws no slot twice.
+    Cycle,
+}
+
+impl DrawPolicy {
+    /// True for [`DrawPolicy::Uniform`], which a report leaves out.
+    fn is_uniform(&self) -> bool {
+        *self == DrawPolicy::Uniform
+    }
 }
 
 /// Why a search stopped.
@@ -161,6 +213,13 @@ pub struct GenerateReport {
     pub runs: u64,
     /// The longest input it could draw.
     pub max_bytes: usize,
+    /// How each run's scenario family was drawn. Left out for
+    /// [`DrawPolicy::Uniform`], so earlier reports read the same.
+    #[serde(default, skip_serializing_if = "DrawPolicy::is_uniform")]
+    pub draw_policy: DrawPolicy,
+    /// What made each run's live picks. Left out for [`Schedule::Plan`].
+    #[serde(default, skip_serializing_if = "Schedule::is_plan")]
+    pub schedule: Schedule,
     /// Inputs it ran.
     pub executed: u64,
     /// Inputs it skipped as excluded.
@@ -182,6 +241,11 @@ pub struct GenerateReport {
     /// Its SHA-256.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
+    /// The SHA-256 of the drawn input whose run stopped the search, which
+    /// `--exclude` takes. Left out when it is `input_sha256`: a steered run
+    /// saves its replay, whose bytes differ from its draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw_sha256: Option<String>,
     /// The scenario family whose tag starts that input, or [`UNTAGGED`].
     /// `None` for a harness without families, or a clean search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,26 +299,91 @@ pub fn draws(
     max_bytes: usize,
     families: Vec<ScenarioFamily>,
 ) -> impl Iterator<Item = (Option<&'static str>, Vec<u8>)> {
+    draws_with(seed, max_bytes, families, DrawPolicy::Uniform)
+}
+
+/// [`draws`] under `policy`. [`DrawPolicy::Uniform`] gives [`draws`]'
+/// inputs. [`DrawPolicy::Cycle`] gives each input one slot: a family with
+/// a value of the byte after its tag below its variant count, which it
+/// writes there when the family has more than one variant, or no tag. Run
+/// `index` takes a slot of block `index / slots`, whose runs visit every
+/// slot once ([`cycled`]). Either way the bytes past what the slot writes
+/// are [`inputs`]' own.
+pub fn draws_with(
+    seed: u64,
+    max_bytes: usize,
+    families: Vec<ScenarioFamily>,
+    policy: DrawPolicy,
+) -> impl Iterator<Item = (Option<&'static str>, Vec<u8>)> {
     // A usize always fits in a u64 on supported targets.
     let choices = families.len() as u64 + 1;
+    let slots: Vec<Option<(usize, u8)>> = families
+        .iter()
+        .enumerate()
+        .flat_map(|(family, listed)| {
+            (0..listed.variants).map(move |variant| {
+                Some((
+                    family,
+                    u8::try_from(variant).expect("a family has at most 256 variants"),
+                ))
+            })
+        })
+        .chain([None])
+        .collect();
     inputs(seed, max_bytes)
         .zip(0u64..)
         .map(move |(mut input, index)| {
             if families.is_empty() {
                 return (None, input);
             }
-            // The remainder is below `choices`, the families' count plus 1.
-            match families.get((mix(seed.rotate_left(32) ^ index) % choices) as usize) {
-                Some(family) => {
-                    if input.len() < family.tag.len() {
-                        input.resize(family.tag.len(), 0);
+            let (family, variant) = match policy {
+                // The remainder is below `choices`, the families' count plus 1.
+                DrawPolicy::Uniform => (
+                    families.get((mix(seed.rotate_left(32) ^ index) % choices) as usize),
+                    None,
+                ),
+                DrawPolicy::Cycle => match slots[cycled(seed, index, slots.len())] {
+                    Some((family, variant)) => {
+                        let listed = &families[family];
+                        (Some(listed), (listed.variants > 1).then_some(variant))
                     }
-                    input[..family.tag.len()].copy_from_slice(&family.tag);
+                    None => (None, None),
+                },
+            };
+            match family {
+                Some(family) => {
+                    let tag = family.tag.len();
+                    let written = tag + usize::from(variant.is_some());
+                    if input.len() < written {
+                        input.resize(written, 0);
+                    }
+                    input[..tag].copy_from_slice(&family.tag);
+                    if let Some(variant) = variant {
+                        input[tag] = variant;
+                    }
                     (Some(family.name), input)
                 }
                 None => (Some(UNTAGGED), input),
             }
         })
+}
+
+/// The slot run `index` of a cycle draw takes, out of `count`. Run `index`
+/// falls in block `index / count`, whose runs visit the slots in an order a
+/// Fisher-Yates shuffle draws from `seed` and the block alone, so a run's
+/// slot doesn't depend on which earlier inputs a search skipped.
+fn cycled(seed: u64, index: u64, count: usize) -> usize {
+    // A usize always fits in a u64 on supported targets.
+    let span = count as u64;
+    let mut order: Vec<usize> = (0..count).collect();
+    let mut state = mix(seed.rotate_left(16) ^ (index / span));
+    for last in (1..count).rev() {
+        state = mix(state);
+        // The remainder is at most `last`, a usize.
+        order.swap(last, (state % (last as u64 + 1)) as usize);
+    }
+    // The remainder is below `span`, a usize.
+    order[(index % span) as usize]
 }
 
 /// SplitMix64's finalizer: a well-mixed function of `x`.
@@ -307,6 +436,35 @@ struct Ran {
     properties: Vec<(String, PropertyOutcome)>,
     /// The run's end record, if the run stops the search.
     end: Option<EndRecord>,
+    /// The input that replays the run with no steer, which the search
+    /// saves if the run stops it: the drawn input itself, unless a steer
+    /// made the picks.
+    replay: Vec<u8>,
+}
+
+/// What `run` left for the search to count, with `replay` the input that
+/// replays it.
+fn summarize(replay: &[u8], run: &ExploreRun, classified: &Classified) -> Ran {
+    let stops = !matches!(
+        classified.outcome,
+        ExploreOutcome::Clean | ExploreOutcome::Abandoned { .. }
+    ) || classified.leaked > 0;
+    Ran {
+        outcome: classified.outcome.clone(),
+        notes: classified.notes.clone(),
+        leaked: classified.leaked,
+        properties: run.report().map_or_else(Vec::new, |report| {
+            report
+                .properties
+                .iter()
+                .map(|report| (report.property.clone(), report.outcome.clone()))
+                .collect()
+        }),
+        end: stops
+            .then(|| run.report().map(|report| report.end_record()))
+            .flatten(),
+        replay: replay.to_vec(),
+    }
 }
 
 /// Searches `entry`'s harness as `options` say, and writes the report to
@@ -326,6 +484,8 @@ pub fn generate(
         seed: options.seed,
         runs: options.runs,
         max_bytes: options.max_bytes,
+        draw_policy: options.draw_policy,
+        schedule: options.schedule,
         executed: 0,
         skipped: 0,
         millis: 0,
@@ -334,6 +494,7 @@ pub fn generate(
         violated: None,
         input: None,
         input_sha256: None,
+        draw_sha256: None,
         family: None,
         families: BTreeMap::new(),
         record: false,
@@ -343,7 +504,12 @@ pub fn generate(
     };
     let mut worker = Worker::new();
     let mut stopped = None;
-    let drawn = draws(options.seed, options.max_bytes, (entry.families)());
+    let drawn = draws_with(
+        options.seed,
+        options.max_bytes,
+        (entry.families)(),
+        options.draw_policy,
+    );
     for (index, (family, input)) in (0..options.runs).zip(drawn) {
         let digest = hex(&Sha256::digest(&input));
         if options.exclude.contains(&digest) {
@@ -354,28 +520,9 @@ pub fn generate(
         if let Some(family) = family {
             *report.families.entry(family.to_owned()).or_default() += 1;
         }
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
-            worker.explore(entry, &input, |_, run, classified| {
-                let stops = !matches!(
-                    classified.outcome,
-                    ExploreOutcome::Clean | ExploreOutcome::Abandoned { .. }
-                ) || classified.leaked > 0;
-                Ran {
-                    outcome: classified.outcome.clone(),
-                    notes: classified.notes.clone(),
-                    leaked: classified.leaked,
-                    properties: run.report().map_or_else(Vec::new, |report| {
-                        report
-                            .properties
-                            .iter()
-                            .map(|report| (report.property.clone(), report.outcome.clone()))
-                            .collect()
-                    }),
-                    end: stops
-                        .then(|| run.report().map(|report| report.end_record()))
-                        .flatten(),
-                }
-            })
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| match options.schedule {
+            Schedule::Plan => worker.explore(entry, &input, summarize),
+            Schedule::Pct => worker.explore_steered(entry, &input, Pct::for_input, summarize),
         }));
         let ran = match ran {
             Ok(ran) => ran,
@@ -385,7 +532,15 @@ pub fn generate(
                     .map(|text| (*text).to_owned())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
-                stopped = Some((index, family, input, digest, Stop::Panic { message }, None));
+                stopped = Some((
+                    index,
+                    family,
+                    input,
+                    digest,
+                    None,
+                    Stop::Panic { message },
+                    None,
+                ));
                 break;
             }
         };
@@ -418,11 +573,13 @@ pub fn generate(
             ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => None,
         };
         if let Some(stop) = stop {
-            stopped = Some((index, family, input, digest, stop, ran.end));
+            let saved = hex(&Sha256::digest(&ran.replay));
+            let draw = (saved != digest).then_some(digest);
+            stopped = Some((index, family, ran.replay, saved, draw, stop, ran.end));
             break;
         }
     }
-    if let Some((index, family, input, digest, stop, end)) = stopped {
+    if let Some((index, family, input, digest, draw, stop, end)) = stopped {
         // The input goes to disk before anything else, as a fuzz target
         // saves its failures.
         let path = options.out.join(format!("{digest}.bin"));
@@ -437,6 +594,7 @@ pub fn generate(
         report.kill_run = Some(index);
         report.input = Some(path);
         report.input_sha256 = Some(digest);
+        report.draw_sha256 = draw;
         report.family = family.map(str::to_owned);
         report.stop = stop;
     }

@@ -2,7 +2,7 @@
 # Runs ON the ephemeral mempool-load droplet (zakura-mempool-load.yml): checks
 # out the target commit in the baked repo clone, builds zakurad and the Kresko
 # load generator, brings up an isolated local-genesis testnet, blasts funded
-# Orchard transactions at it, and grades the result.
+# shielded transactions at it, and grades the result.
 #
 # Config via /root/run.env (sourced by the caller before exec):
 #   GH_REPO / GH_CLONE_TOKEN  repo slug + per-run token for the ref fetch
@@ -11,7 +11,9 @@
 #   NODE_COUNT                zakurad nodes on the loopback testnet
 #   TX_RATE                   target transactions per second
 #   DURATION_SECS             how long to sustain the blast
-#   BASELINE_REF              optional second commit to A/B against ("" to skip)
+#   BASELINE_REF              commit for the baseline leg ("" to skip that leg)
+#   TARGET_PROFILE            node setup for the target leg (legacy or v2)
+#   BASELINE_PROFILE          node setup for the baseline leg (legacy or v2)
 set -euo pipefail
 
 # Paths are overridable so this script can be exercised outside a droplet.
@@ -32,6 +34,9 @@ CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/root/cargo-target}
 # (the local rehearsal), so the fetch/build phases are skipped.
 SKIP_SOURCE_FETCH=${SKIP_SOURCE_FETCH:-0}
 SKIP_KRESKO_BUILD=${SKIP_KRESKO_BUILD:-0}
+# See NODE_PROFILES in mempool-load-lab.py for what each setup changes.
+TARGET_PROFILE=${TARGET_PROFILE:-v2}
+BASELINE_PROFILE=${BASELINE_PROFILE:-legacy}
 # How long the blast may spend proving its initial Orchard lane inventory
 # before the measured window opens. Observed at ~25s for 24 lanes on a small
 # box; this leaves headroom without stalling a failed bootstrap forever.
@@ -130,10 +135,11 @@ run_leg() {
   # same statement that defines it is an unbound-variable error under `set -u`.
   local label="$1"
   local commit="$2"
+  local profile="$3"
   local leg_out="$OUT_DIR/$label"
   mkdir -p "$leg_out"
 
-  echo "=== leg ${label}: building ${commit} ==="
+  echo "=== leg ${label}: building ${commit} for the ${profile} setup ==="
   # Explicit `|| return` rather than relying on `set -e`: bash disables errexit
   # for the whole body of a function called in a `||` list, which both call
   # sites below are. Without these guards a failed checkout or build would fall
@@ -173,7 +179,7 @@ run_leg() {
   echo "=== leg ${label}: starting ${NODE_COUNT} nodes ==="
   python3 "$SCRIPTS/mempool-load-lab.py" \
     --lab-dir "$LAB_DIR" --zakurad-binary "$zakurad_bin" \
-    --kresko-binary "$KRESKO_BIN" --node-count "$NODE_COUNT" up || {
+    --kresko-binary "$KRESKO_BIN" --node-count "$NODE_COUNT" up --profile "$profile" || {
     echo "leg ${label}: nodes failed to start" >&2
     python3 "$SCRIPTS/mempool-load-lab.py" --lab-dir "$LAB_DIR" down || true
     return 94
@@ -210,7 +216,7 @@ run_leg() {
   python3 "$SCRIPTS/mempool-load-monitor.py" \
     --lab-dir "$LAB_DIR" --node-count "$NODE_COUNT" \
     --duration-secs "$DURATION_SECS" --out "$leg_out" \
-    --meta "sha=${commit},tx_rate=${TX_RATE},leg=${label}" &
+    --meta "sha=${commit},tx_rate=${TX_RATE},leg=${label},profile=${profile}" &
   local monitor_pid=$!
 
   local leg_rc=0
@@ -233,15 +239,21 @@ run_leg() {
 RC=0
 if [ -n "${BASELINE_REF}" ]; then
   # Baseline first, so the target ref's numbers are the ones left in a warm
-  # page cache -- and record both even if the baseline itself fails.
-  run_leg baseline "${BASELINE_REF}" || true
-  run_leg target "${SHA}" || RC=$?
+  # page cache. Both legs and the comparison always run, so the record is
+  # complete, and the run fails with the first of them that did.
+  BASE_RC=0; TARGET_RC=0; COMPARE_RC=0
+  run_leg baseline "${BASELINE_REF}" "${BASELINE_PROFILE}" || BASE_RC=$?
+  run_leg target "${SHA}" "${TARGET_PROFILE}" || TARGET_RC=$?
   python3 "$SCRIPTS/mempool-load-compare.py" \
     --baseline "$OUT_DIR/baseline/summary.json" \
     --target "$OUT_DIR/target/summary.json" \
-    --out "$OUT_DIR/summary.md" || true
+    --out "$OUT_DIR/summary.md" || COMPARE_RC=$?
+  echo "baseline rc=${BASE_RC} target rc=${TARGET_RC} compare rc=${COMPARE_RC}"
+  for rc in "$TARGET_RC" "$BASE_RC" "$COMPARE_RC"; do
+    if [ "$RC" -eq 0 ] && [ "$rc" -ne 0 ]; then RC=$rc; fi
+  done
 else
-  run_leg target "${SHA}" || RC=$?
+  run_leg target "${SHA}" "${TARGET_PROFILE}" || RC=$?
   cp "$OUT_DIR/target/summary.md" "$OUT_DIR/summary.md" 2>/dev/null || true
 fi
 

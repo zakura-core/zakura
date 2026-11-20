@@ -10,7 +10,7 @@ mod support;
 
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -344,11 +344,6 @@ fn committed_witnesses() -> [(&'static str, LivenessScenario); 3] {
     ]
 }
 
-/// The Plan bytes every committed witness runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture `header-publication-<name>.<extension>`.
 fn fixture(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -356,8 +351,8 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-publication-{name}.{extension}"))
 }
 
-/// Each committed witness is its fixture, as JSON, with the fixed Plan
-/// bytes, and holds and applies under them.
+/// Each committed witness is its fixture, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_witnesses_match_their_fixtures() {
     for (name, scenario) in committed_witnesses() {
@@ -366,30 +361,9 @@ fn the_committed_witnesses_match_their_fixtures() {
                 .unwrap_or_else(|error| panic!("{name}: {error}")),
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            committed, scenario,
-            "{name}: run `regenerate_liveness_witnesses`"
-        );
-        let plan =
-            fs::read(fixture(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_liveness_witnesses`"
-        );
-        let (report, _) = run_reading(scenario, zakura_sim::Plan::from_fuzz(&plan));
+        assert_eq!(committed, scenario, "{name}");
+        let (report, _) = run_reading(scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert_holds_and_applies(scenario, &report);
-    }
-}
-
-/// Rewrites the committed witnesses from their fixtures.
-#[test]
-#[ignore = "rewrites the committed liveness witnesses"]
-fn regenerate_liveness_witnesses() {
-    for (name, scenario) in committed_witnesses() {
-        let json = serde_json::to_string_pretty(&scenario).expect("scenarios serialize");
-        fs::write(fixture(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture(name, "plan"), committed_plan()).expect("the fixture directory exists");
     }
 }
 
@@ -414,8 +388,6 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             Liveness::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture(name, "plan").to_str().expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

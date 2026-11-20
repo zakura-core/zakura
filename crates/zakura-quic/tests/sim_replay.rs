@@ -472,7 +472,7 @@ fn transcript_digest(events: &[NetEvent], bytes: &BTreeMap<DatagramId, Vec<u8>>)
     let mut digest = Sha256::new();
     for event in events {
         match event {
-            NetEvent::Sent { id, len } => {
+            NetEvent::Sent { id, len, .. } => {
                 let sent = &bytes[id];
                 assert_eq!(
                     sent.len(),

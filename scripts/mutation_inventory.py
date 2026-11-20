@@ -37,11 +37,15 @@ def sha256(path):
 
 
 def typed_binding(root, patch, case):
-    """Check a typed case's committed scenario and Plan bytes. No fuzz target runs one."""
+    """Check a typed case's committed scenario and Plan bytes, if any. No fuzz target runs one.
+
+    A typed case without Plan bytes runs the empty Plan."""
     typed = case["typed"]
     errors = []
     files = {}
     for name in ("scenario", "plan"):
+        if name not in typed:
+            continue
         path = root / typed[name]
         if path.is_file():
             files[name] = sha256(path)
@@ -52,55 +56,42 @@ def typed_binding(root, patch, case):
             errors.append(f"missing dependency path: {check}")
     return {
         "property": patch.parent.relative_to(root / "qa/planted").as_posix(),
-        "input": None,
+        "seed": None,
         "scenario": typed["scenario"],
         "scenario_sha256": files.get("scenario"),
-        "plan": typed["plan"],
+        "plan": typed.get("plan"),
         "plan_sha256": files.get("plan"),
         "harness": typed["harness"],
         "fuzz_targets": [],
-        "discovery_target": "not applicable: a typed case has no fuzz input",
+        "discovery_target": "not applicable: a typed case has no seed",
         "errors": errors,
     }
 
 
 def planted_binding(root, patch):
-    """Check the case, committed input, witness declaration, and fuzz target mapping."""
+    """Check the case's form, its typed files or seed name, and its checks.
+
+    A seed case names a seed of the simulator's registry, which builds the
+    seed's input and names its harness and witnesses in code. Only a built
+    simulator lists the registry, so this static inventory leaves the
+    seed's harness, witness and fuzz target to `cargo xtask planted`."""
     case = tomllib.loads(patch.with_suffix(".toml").read_text())
-    if ("input" in case) == ("typed" in case):
-        raise ValueError("a case names either `input` or `[typed]`")
+    if ("seed" in case) == ("typed" in case):
+        raise ValueError("a case names either `seed` or `[typed]`")
     if "typed" in case:
         return typed_binding(root, patch, case)
-    source = root / case["input"]
-    sidecar = tomllib.loads(source.with_suffix(".toml").read_text())
-    property_id = patch.parent.relative_to(root / "qa/planted").as_posix()
     errors = []
-    if sha256(source) != sidecar["sha256"]:
-        errors.append("input hash differs from sidecar")
-    if not any(
-        witness["property"] == property_id and witness["expect"] == "holds"
-        for witness in sidecar.get("witness", [])
-    ):
-        errors.append("sidecar has no holds witness for the intended property")
-    manifest = tomllib.loads((root / "qa/fuzz/sim/Cargo.toml").read_text())
-    targets = manifest["package"]["metadata"]["zakura-sim"]["targets"]
-    names = sorted(name for name, harness in targets.items() if harness == sidecar["harness"])
-    binaries = {item["name"]: item for item in manifest["bin"]}
-    for name in names:
-        binary = binaries.get(name)
-        if binary is None or not (root / "qa/fuzz/sim" / binary["path"]).is_file():
-            errors.append(f"target {name} has no binary source")
+    if not case["seed"].strip():
+        errors.append("the case names an empty seed")
     for check in case.get("checks", []):
         if not (root / check).exists():
             errors.append(f"missing dependency path: {check}")
     return {
-        "property": property_id,
-        "input": case["input"],
-        "input_sha256": sha256(source),
-        "harness": sidecar["harness"],
-        "generator": sidecar["generator"],
-        "fuzz_targets": names,
-        "discovery_target": "mapped, not executed" if names else "missing",
+        "property": patch.parent.relative_to(root / "qa/planted").as_posix(),
+        "seed": case["seed"],
+        "harness": None,
+        "fuzz_targets": [],
+        "discovery_target": "unchecked: the seed registry names the harness",
         "errors": errors,
     }
 
@@ -285,23 +276,22 @@ def work_list_ids(work_list):
 
 
 def witness_binding(root, witness):
-    """Check one loop witness: a planted case's witness, a committed input,
-    or one `zakura-sim` integration test. Returns its errors."""
-    forms = [key for key in ("planted", "input", "test") if key in witness]
+    """Check one loop witness: a planted case's witness, a seed by name, or
+    one `zakura-sim` integration test. Returns its errors."""
+    forms = [key for key in ("planted", "seed", "test") if key in witness]
     if len(forms) != 1:
-        return [f"a witness names exactly one of planted, input or test, not {forms}"]
+        return [f"a witness names exactly one of planted, seed or test, not {forms}"]
     if "planted" in witness:
         path = root / witness["planted"]
         if not path.is_file():
             return [f"missing planted case: {witness['planted']}"]
         case = tomllib.loads(path.read_text())
-        if ("input" in case) == ("typed" in case):
-            return [f"{witness['planted']} names neither or both of input and typed"]
+        if ("seed" in case) == ("typed" in case):
+            return [f"{witness['planted']} names neither or both of seed and typed"]
         return []
-    if "input" in witness:
-        path = root / witness["input"]
-        if not path.is_file() or not path.with_suffix(".toml").is_file():
-            return [f"missing input or sidecar: {witness['input']}"]
+    if "seed" in witness:
+        if not witness["seed"].strip():
+            return ["a seed witness names an empty seed"]
         return []
     if "test_target" not in witness:
         return ["a test witness names its test_target"]

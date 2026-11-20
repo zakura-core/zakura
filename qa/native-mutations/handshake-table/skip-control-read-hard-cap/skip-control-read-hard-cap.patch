@@ -1,0 +1,10 @@
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -6818,7 +6818,6 @@
+     //
+     // `MAX_CONTROL_PAYLOAD_BYTES` (16 KiB) is a small compile-time constant, so the
+     // cast to u32 cannot truncate; `.min` also preserves any tighter negotiated cap.
+-    let max_bytes = max_bytes.min(MAX_CONTROL_PAYLOAD_BYTES as u32);
+     let mut len_bytes = [0; CONTROL_LENGTH_BYTES];
+     timeout(read_timeout, recv.read_exact(&mut len_bytes))
+         .await

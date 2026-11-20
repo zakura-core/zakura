@@ -450,6 +450,9 @@ fn act_fixtures(
 }
 
 #[cfg(test)]
+mod adapter;
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 

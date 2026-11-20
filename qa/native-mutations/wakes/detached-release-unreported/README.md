@@ -14,7 +14,7 @@ detached submission's verdict frees room and wakes nothing.
 ## Witness
 
 The witness is `qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml`, which runs
-`crates/zakura-sim/tests/fixtures/slow-seeds/block-sync-capacity-frontier-first.bin`.
+the seed `block-sync-capacity-frontier-first`.
 
 The input fills the 401-submission window, then resets to a fork from
 height 1, which detaches it. Storage commits height 1, block sync handles

@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 380293f644..c4e0056dab 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -388,7 +388,8 @@ impl SubscriberState {
+             }
+             // Only the target is at its height on the path to it, so a page
+             // that reaches that height elsewhere never reaches the target.
+-            if !reaches && height >= live.target_height.0 {
++            // Mutation: a page that reaches the target is refused as past it.
++            if height >= live.target_height.0 {
+                 return Err(SubscriberFault::PastTarget);
+             }
+             if reaches && height != live.target_height.0 {

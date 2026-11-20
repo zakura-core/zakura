@@ -82,6 +82,7 @@ impl Reached {
 }
 
 const BOOK: Machine = Machine {
+    rules: &[],
     name: "discovery/record-book",
     identity: "discovery-book",
     claim: "After each operation, the book keeps its record and relay limits, its entries agree with the install, replacement and eviction facts it reported, each eviction takes the first eligible tier, and each signed sample discloses only vouched live records inside its requester's disclosure window.",
@@ -105,6 +106,7 @@ const BOOK: Machine = Machine {
 };
 
 const STATE: Machine = Machine {
+    rules: &[],
     name: "discovery/session-installation",
     identity: "discovery-state",
     claim: "After each operation, admitted sessions stay within their caps and change only by a later session or a removal, a superseded verification result changes nothing, and retained service hints come only from current results of connected peers.",

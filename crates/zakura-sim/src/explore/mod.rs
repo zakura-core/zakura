@@ -30,6 +30,7 @@
 
 pub mod feedback;
 pub mod generate;
+pub mod pct;
 mod process;
 mod save;
 pub mod state;
@@ -57,10 +58,10 @@ pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
 
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport},
-    harness::{run_harness, HarnessEntry, HarnessError, Subsystem},
+    harness::{self, run_harness, HarnessEntry, HarnessError, Subsystem},
     property::Status,
     record::EndRecord,
-    Plan, RecordSink, RunReport,
+    Plan, RecordSink, RunReport, Steer,
 };
 
 /// One run of a fuzz input.
@@ -112,6 +113,45 @@ pub fn run_bytes<S: Subsystem>(
     prefix[..n].copy_from_slice(&input[..n]);
     let scenario = S::draw(&prefix);
     let result = run_harness::<S>(&scenario, Plan::from_fuzz(&input[n..]), sink, extra);
+    explored::<S>(&scenario, result)
+}
+
+/// [`run_bytes`] with `steer` making the live picks in place of the Plan
+/// bytes, which still answer the run's draws. Also returns the input that
+/// replays the run with no steer: the zero-padded prefix, then the Plan
+/// bytes the steered run recorded ([`crate::Sim::steer`]), up to a harness
+/// failure if one ended it. That is `input` itself if the harness couldn't
+/// set the run up.
+pub fn run_steered_bytes<S: Subsystem>(
+    input: &[u8],
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (ExploreRun, Vec<u8>) {
+    let mut prefix = vec![0u8; S::SCENARIO_BYTES];
+    let n = input.len().min(S::SCENARIO_BYTES);
+    prefix[..n].copy_from_slice(&input[..n]);
+    let scenario = S::draw(&prefix);
+    let (result, bytes) = harness::run_steered_keeping::<S>(
+        &scenario,
+        S::prepare(&scenario),
+        Plan::from_fuzz(&input[n..]),
+        sink,
+        steer,
+    );
+    let replay = match bytes {
+        Some(bytes) => [prefix, bytes].concat(),
+        None => input.to_vec(),
+    };
+    (explored::<S>(&scenario, result), replay)
+}
+
+/// The run `result` of `scenario`, with the scenario kept for a run
+/// [`classify`] may not call clean: one that reports a violation, failed,
+/// or abandoned tasks.
+fn explored<S: Subsystem>(
+    scenario: &S::Scenario,
+    result: Result<RunReport, HarnessError>,
+) -> ExploreRun {
     let unclean = match &result {
         Ok(report) => {
             report.cleanup.leaked > 0
@@ -122,7 +162,7 @@ pub fn run_bytes<S: Subsystem>(
     };
     ExploreRun {
         scenario: unclean.then(|| {
-            serde_json::to_value(&scenario)
+            serde_json::to_value(scenario)
                 .expect("scenarios are plain data, and serde_json serializes plain data")
         }),
         result,
@@ -308,16 +348,27 @@ fn classify_parts(
     leaked: usize,
 ) -> Classified {
     let status = |property: &str| entry.status(property).unwrap_or(Status::Active);
+    // A violation of a property that isn't `Active` is a note in its
+    // status's bucket.
+    let note = |property: &str| match status(property) {
+        Status::Active => None,
+        Status::Known { .. } => Some((property.to_owned(), Bucket::Known)),
+        Status::Draft => Some((property.to_owned(), Bucket::Draft)),
+    };
     let mut notes: Vec<(String, Bucket)> = properties
         .iter()
         .filter(|report| violated(report))
-        .filter_map(|report| match status(&report.property) {
-            Status::Active => None,
-            Status::Known { .. } => Some((report.property.clone(), Bucket::Known)),
-            Status::Draft => Some((report.property.clone(), Bucket::Draft)),
-        })
+        .filter_map(|report| note(&report.property))
         .collect();
-    let failed = violation.map(str::to_owned).or_else(|| {
+    // The step loop ends a run at its own violation, a livelock, whatever
+    // that property's status, so one that isn't `Active` is a note too.
+    if let Some(noted) = violation.and_then(note) {
+        if !notes.contains(&noted) {
+            notes.push(noted);
+        }
+    }
+    let ended = violation.filter(|property| status(property) == Status::Active);
+    let failed = ended.map(str::to_owned).or_else(|| {
         properties
             .iter()
             .find(|report| violated(report) && status(&report.property) == Status::Active)

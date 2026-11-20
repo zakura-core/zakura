@@ -163,6 +163,17 @@ impl Step {
     }
 }
 
+/// What the pool holds, for its size gauges. See
+/// [`MempoolState::pool_counts`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolCounts {
+    /// Transactions in the pool, which readers and templates see.
+    pub pooled: usize,
+    /// Transactions a reset took out of the pool that are not back yet:
+    /// waiting for a slot, or being verified again.
+    pub readmitting: usize,
+}
+
 /// The machine's limits. Production uses the port's constants. Tests use
 /// smaller ones so a short run reaches every full state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -726,8 +737,10 @@ impl<E: VerifyError> MempoolState<E> {
         self.tip
     }
 
-    /// The pool as a snapshot, for the change log position `last_change`.
-    pub fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
+    /// The pool as a snapshot, for the change log position `last_change`,
+    /// built from scratch, as tests' reference for [`Self::next_snapshot`].
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self, last_change: ChangeSeq) -> PoolSnapshot {
         if !self.active {
             return PoolSnapshot::inactive(self.tip, last_change);
         }
@@ -739,9 +752,39 @@ impl<E: VerifyError> MempoolState<E> {
         )
     }
 
+    /// The snapshot after `changes`, the step's changes, built from
+    /// `previous`, the snapshot published before them. See
+    /// [`PoolSnapshot::after`].
+    pub fn next_snapshot(
+        &self,
+        previous: &PoolSnapshot,
+        changes: &[Change],
+        last_change: ChangeSeq,
+    ) -> PoolSnapshot {
+        if !self.active {
+            return PoolSnapshot::inactive(self.tip, last_change);
+        }
+        previous.after(
+            self.tip,
+            last_change,
+            changes,
+            |id| self.storage.transactions().get(id),
+            self.storage.mining_order().collect(),
+            self.storage.transaction_dependencies().clone(),
+        )
+    }
+
     /// What storage holds, for the pool's metrics.
     pub fn storage_stats(&self) -> StorageStats {
         self.storage.stats()
+    }
+
+    /// What the pool holds, for its size gauges.
+    pub fn pool_counts(&self) -> PoolCounts {
+        PoolCounts {
+            pooled: self.pool.len(),
+            readmitting: self.queue.len().saturating_add(self.readmitting),
+        }
     }
 
     /// The earliest time an input would apply a deadline, if any is set.
@@ -819,8 +862,7 @@ impl<E: VerifyError> MempoolState<E> {
         if self.active {
             assert!(
                 snapshot
-                    .transactions
-                    .iter()
+                    .transactions()
                     .eq(self.storage.mining_transactions()),
                 "a snapshot holds the storage's mining transactions, in mining order, with their stamps"
             );

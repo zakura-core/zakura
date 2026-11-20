@@ -385,8 +385,11 @@ impl StartCmd {
     ///
     /// Pruned nodes advertise block service so peers can discover and reconnect to them.
     /// Requests for block bodies outside their retention window still return `notfound`.
+    ///
+    /// Every node advertises [`PeerServices::NODE_BLOCK_PUSH`], because the inbound block
+    /// downloader verifies blocks that peers push without a request.
     fn advertised_services(config: &ZakuradConfig) -> PeerServices {
-        let mut services = PeerServices::NODE_NETWORK;
+        let mut services = PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH;
         if matches!(config.state.storage_mode, StorageMode::Pruned(_)) {
             services |= PeerServices::NODE_PRUNED;
         }
@@ -419,7 +422,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        custom_services: Vec<zakura_network::zakura::CustomService>,
+        mut custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -660,6 +663,17 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        // Submission waits, the mempool and getblocktemplate share one bounded trace writer.
+        let template_path_trace = JsonlEventEmitter::new(
+            config
+                .network
+                .zakura
+                .trace_dir
+                .clone()
+                .map(JsonlTracer::spawn)
+                .unwrap_or_else(JsonlTracer::noop),
+            zakura_jsonl_trace::node_id(),
+        );
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -669,7 +683,9 @@ impl StartCmd {
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,
                 )
-                .with_pending_blocks(pending_blocks.clone()),
+                .with_pending_blocks(pending_blocks.clone())
+                .with_second_block_request(config.network.block_download_score_and_hedge.enabled)
+                .with_trace(template_path_trace.clone()),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
@@ -677,9 +693,49 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
+        // The pool is chosen once, at startup. `tx-relay` needs the pool
+        // core's port before the network starts, so it is built here and
+        // handed to the core below.
+        let pool_implementation = config.mempool.implementation.resolve();
+        let tx_relay_port = if config.network.zakura.tx_relay.enabled {
+            if pool_implementation == mempool::config::Implementation::Core {
+                let port = mempool::core::TxRelayPort::new();
+                custom_services.push(zakura_network::zakura::tx_relay_service(
+                    port.handle(),
+                    port.may_cool(),
+                    &config.network.zakura.tx_relay,
+                    config.network.unconditional_peers.clone(),
+                ));
+                Some(port)
+            } else {
+                warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
+                None
+            }
+        } else {
+            None
+        };
+
+        // The network counts `tx-relay`'s memory shares only when it is
+        // registered, not merely enabled.
+        let mut network_config = config.network.clone();
+        network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+        // The service is registered on the v2 endpoint, which a legacy-only
+        // stack never starts.
+        let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
+        info!(
+            configured = config.network.zakura.tx_relay.enabled,
+            registered = tx_relay_registered,
+            "tx-relay"
+        );
+        metrics::gauge!("zakura.p2p.tx_relay.registered").set(if tx_relay_registered {
+            1.0
+        } else {
+            0.0
+        });
+
         let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
-                config.network.clone(),
+                network_config,
                 inbound,
                 latest_chain_tip.clone(),
                 user_agent(),
@@ -779,22 +835,18 @@ impl StartCmd {
             misbehavior.clone(),
         );
 
-        // The mempool and `getblocktemplate` trace the path from a new tip to a mining template.
-        // They share one writer.
-        let template_path_trace = JsonlEventEmitter::new(
-            config
-                .network
-                .zakura
-                .trace_dir
-                .clone()
-                .map(JsonlTracer::spawn)
-                .unwrap_or_else(JsonlTracer::noop),
-            zakura_jsonl_trace::node_id(),
+        info!(
+            configured = config.mempool.implementation.as_str(),
+            resolved = pool_implementation.as_str(),
+            "initializing mempool"
         );
-
-        // The pool is chosen once, at startup.
-        let pool_implementation = config.mempool.implementation.resolve();
-        info!(?pool_implementation, "initializing mempool");
+        // A canary's effective pool, read from its metrics rather than from
+        // a config that says `default`.
+        metrics::gauge!(
+            "mempool.implementation",
+            "implementation" => pool_implementation.as_str(),
+        )
+        .set(1.0);
         let (mempool, mempool_transaction_subscriber, verifier_pool, mempool_tasks) =
             if pool_implementation == mempool::config::Implementation::Core {
                 let parts = mempool::core::start(
@@ -815,6 +867,7 @@ impl StartCmd {
                         unconditional: config.network.unconditional_peers.clone(),
                     },
                     template_path_trace.clone(),
+                    tx_relay_port,
                 );
                 (
                     parts.mempool,

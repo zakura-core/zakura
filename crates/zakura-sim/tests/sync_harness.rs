@@ -4,8 +4,8 @@
 //! sync, which follows the engine's committed views. No test injects
 //! pending work.
 //!
-//! Each saved scenario has a committed input. It replays to its pinned end
-//! record, repeats A/A and A/B/A, and replays Exact in a fresh process
+//! Each saved scenario is a seed. It runs to its step budget holding its
+//! witnesses, repeats A/A and A/B/A, and replays Exact in a fresh process
 //! through `zakura-sim replay`.
 #![cfg(zakura_sim)]
 
@@ -13,19 +13,22 @@ mod support;
 
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
 };
 
 use support::inputs;
 use tempfile::TempDir;
 use zakura_sim::{
+    domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
     harness::{
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncScenario, SyncStorage},
         HarnessError, Subsystem,
     },
-    seed, MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
+    observe::BlockSyncFact,
+    seed, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome,
+    RunReport,
 };
 
 /// Runs `scenario` under `input`, and returns the report with its records
@@ -46,7 +49,7 @@ fn run(scenario: &SyncScenario, input: PlanInput) -> (RunReport, Vec<String>, Sy
     (report, sink.lines(), ports)
 }
 
-/// Runs a committed input as `zakura-sim record --input` does: its prefix
+/// Runs a full fuzz input as `zakura-sim record --seed` does: its prefix
 /// picks the scenario, and the rest is the Plan.
 fn replay(input: &[u8]) -> (RunReport, Vec<String>, SyncPorts) {
     let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
@@ -69,26 +72,6 @@ fn held(report: &RunReport) -> Vec<String> {
         }
     }
     held
-}
-
-/// The committed fixture directory.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// Saved scenario `saved`'s fixture path, without an extension.
-fn base(saved: SavedSync) -> PathBuf {
-    fixtures().join(format!("sync-storage-{}", saved.name()))
-}
-
-/// Saved scenario `saved`'s committed input and pinned end record.
-fn committed(saved: SavedSync) -> (Vec<u8>, String) {
-    let base = base(saved);
-    let input = fs::read(base.with_extension("bin"))
-        .unwrap_or_else(|error| panic!("{}: {error}", saved.name()));
-    let end = fs::read_to_string(base.with_extension("end.json"))
-        .unwrap_or_else(|error| panic!("{}: {error}", saved.name()));
-    (input, end.trim_end().to_owned())
 }
 
 /// A run's end record: its last line.
@@ -134,21 +117,46 @@ fn a_header_reorg_reaches_block_sync_through_the_engine() {
     }
 }
 
-/// Each saved scenario's committed input replays to its pinned end record,
-/// with both of the node's tips at the mirrors' tip unless the node shuts
-/// down.
+/// Each saved scenario's seed, its tag and the empty Plan, runs to its step
+/// budget with no property violated, its drain runs dry, and cleanup finds
+/// no panic, failed unwind or leaked task. Each of its witnesses applies
+/// and holds, and both of the node's tips reach the mirrors' tip unless the
+/// node shuts down.
 #[test]
-fn saved_scenarios_replay_their_end_records() {
+fn saved_scenarios_run_to_their_budget_holding_their_witnesses() {
     for saved in SavedSync::ALL {
         let name = saved.name();
-        let (input, pinned) = committed(saved);
+        let input = saved.tag();
+        assert_eq!(SyncStorage::draw(&input), saved.scenario(), "{name}");
+        let (report, _, ports) = replay(&input);
         assert_eq!(
-            SyncStorage::draw(&input[..SyncStorage::SCENARIO_BYTES]),
-            saved.scenario(),
-            "{name}"
+            report.end.outcome,
+            Outcome::Budget,
+            "{name}: {:?}",
+            report.end
         );
-        let (_, lines, ports) = replay(&input);
-        assert_eq!(end(&lines), pinned, "{name}");
+        assert!(
+            report
+                .end
+                .drain
+                .as_ref()
+                .is_some_and(|drain| !drain.exhausted),
+            "{name}: {:?}",
+            report.end
+        );
+        let cleanup = &report.cleanup;
+        assert_eq!(
+            (cleanup.panicked, cleanup.unwind_failures, cleanup.leaked),
+            (0, 0, 0),
+            "{name}: {cleanup:?}"
+        );
+        let held = held(&report);
+        for (property, _) in saved.witnesses() {
+            assert!(
+                held.iter().any(|id| id == property),
+                "{name}: {property}: {held:?}"
+            );
+        }
         // A node that shuts down early stops short of the tip.
         let torn_down = matches!(
             saved,
@@ -168,7 +176,7 @@ fn saved_scenarios_repeat_a_a_and_a_b_a() {
         let b = SavedSync::ALL[(index + 1) % SavedSync::ALL.len()];
         let runs: Vec<Vec<String>> = [a, a, b, a]
             .into_iter()
-            .map(|saved| replay(&committed(saved).0).1)
+            .map(|saved| replay(&saved.tag()).1)
             .collect();
         assert_eq!(runs[0], runs[1], "{} twice", a.name());
         assert_eq!(
@@ -196,27 +204,25 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record` runs each saved scenario's committed input in one
-/// process, to its pinned end record, and `zakura-sim replay` reruns its
-/// trace Exact in another.
+/// `zakura-sim record --seed` runs each saved scenario's seed in another
+/// process to the end record this process's run gives, and `zakura-sim
+/// replay` reruns its trace Exact in a third.
 #[test]
 fn saved_scenarios_replay_exact_in_a_fresh_process() {
     for saved in SavedSync::ALL {
         let name = saved.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
-        let input = base(saved).with_extension("bin");
         let recorded = zakura_sim(&[
             "record",
-            "--sim",
-            SyncStorage::NAME,
-            "--input",
-            input.to_str().unwrap(),
+            "--seed",
+            &format!("sync-storage-{name}"),
             "--out",
             trace.to_str().unwrap(),
         ]);
         assert!(recorded.status.success(), "{name}: {recorded:?}");
-        assert_eq!(trace_end(&trace), committed(saved).1, "{name}");
+        let (_, lines, _) = replay(&saved.tag());
+        assert_eq!(trace_end(&trace), end(&lines), "{name}");
         let replayed = zakura_sim(&["replay", trace.to_str().unwrap()]);
         let stdout = String::from_utf8_lossy(&replayed.stdout);
         assert!(
@@ -227,45 +233,113 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
     }
 }
 
-/// Rewrites every saved scenario's input, sidecar and end record. Each
-/// input is its tag and the default Plan. Run it with `RUSTFLAGS="--cfg
-/// zakura_sim" cargo test --manifest-path crates/zakura-sim/Cargo.toml
-/// --test sync_harness -- --ignored regenerate_saved_scenarios`.
-#[test]
-#[ignore = "rewrites the committed saved scenarios"]
-fn regenerate_saved_scenarios() {
-    for saved in SavedSync::ALL {
-        let input = saved.tag().to_vec();
-        let (_, lines, _) = replay(&input);
-        let base = base(saved);
-        fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let scenario = serde_json::to_value(saved.scenario()).expect("scenarios serialize");
-        let mut sidecar = format!(
-            "# The committed fuzz input `sync-storage-{name}.bin`: the harness that\n\
-             # runs it, the generator version it was built for, and its SHA-256. Its\n\
-             # first two bytes pick the saved `{name}` scenario, and\n\
-             # `sync-storage-{name}.end.json` is its pinned end record.\n\
-             harness = \"{harness}\"\n\
-             generator = {generator}\n\
-             sha256 = \"{digest}\"\n\
-             scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/sync_harness.rs\"\n",
-            name = saved.name(),
-            harness = SyncStorage::NAME,
-            generator = SyncStorage::GENERATOR,
-            digest = seed::sha256(&input),
-            scenario = seed::scenario_sha256(&scenario),
-        );
-        for (property, expect) in saved.witnesses() {
-            sidecar.push_str(&format!(
-                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"{expect}\"\n"
-            ));
-        }
-        fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
-        fs::write(
-            base.with_extension("end.json"),
-            format!("{}\n", end(&lines)),
-        )
-        .expect("the fixture directory exists");
+/// The seed of `sync/header-reorg-retires-block-work`'s planted case: the
+/// saved `reorg` scenario under a fuzz Plan whose run delivers an old-epoch
+/// body after the sequencer applied the new epoch.
+const REORG_STALE_BODY: &str = "sync-storage-reorg-stale-body";
+
+/// Checks that `input` fills the stale-body input's role, or returns why it
+/// falls short. Its run must hold every property, apply
+/// `sync/header-reorg-retires-block-work`, and have the sequencer refuse an
+/// older epoch's body after it applied a newer one. That refused body is
+/// the one `accept-stale-scope-bodies.patch` buffers instead.
+fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
+    let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
+    let scenario = SyncStorage::draw(prefix);
+    let ports = SyncStorage::prepare(&scenario);
+    let mut sink = MemorySink::default();
+    let report = run_prepared::<SyncStorage>(
+        &scenario,
+        ports.clone(),
+        Plan::from_fuzz(plan),
+        &mut sink,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(violation) = &report.end.violation {
+        return Err(format!("the run violated {violation:?}"));
     }
+    if let Some(violated) = report
+        .properties
+        .iter()
+        .find(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
+    {
+        return Err(format!("{} was violated", violated.property));
+    }
+    let applied = report.properties.iter().any(|property| {
+        property.property == HEADER_REORG_RETIRES_BLOCK_WORK
+            && matches!(property.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
+    });
+    if !applied {
+        return Err(format!("{HEADER_REORG_RETIRES_BLOCK_WORK} never applied"));
+    }
+    if !ports.cross.borrow().saw_stale_body_refused {
+        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
+    }
+    Ok(())
+}
+
+/// The stale-body seed runs the saved `reorg` scenario and still makes the
+/// sequencer refuse an old-epoch body, so a block-sync change that moves it
+/// off that order fails here instead of weakening the planted case. When
+/// it does, search [`zakura_sim::seed::draws::byte_inputs`] for a Plan
+/// that passes [`stale_body_shortfall`] and build the seed from it.
+#[test]
+fn the_stale_body_input_refuses_an_old_epoch_body() {
+    let input = seed::find(REORG_STALE_BODY)
+        .expect("the seed is registered")
+        .input()
+        .to_vec();
+    assert_eq!(
+        SyncStorage::draw(&input[..SyncStorage::SCENARIO_BYTES]),
+        SavedSync::Reorg.scenario()
+    );
+    if let Err(shortfall) = stale_body_shortfall(&input) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Whether the sequencer applied a new body-work epoch while the work queue
+/// still held an older epoch's taken work above the new verified tip: work
+/// the reset that comes with the apply retires. The queue reports that
+/// reset after the sequencer reports the apply, so its last snapshot before
+/// the apply is the work the reset finds.
+fn reset_finds_stale_work(log: &ObservationLog) -> bool {
+    let mut queue = &Vec::new();
+    log.entries().iter().any(|entry| match &entry.obs {
+        Observation::BlockSync {
+            event: BlockSyncFact::WorkQueue { items },
+            ..
+        } => {
+            queue = items;
+            false
+        }
+        Observation::BlockSync {
+            event:
+                BlockSyncFact::EpochApplied {
+                    epoch,
+                    verified_tip,
+                },
+            ..
+        } => queue.iter().any(|item| {
+            item.height > *verified_tip
+                && item
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| owner.body_work_epoch)
+                    .is_some_and(|own| own < *epoch)
+        }),
+        _ => false,
+    })
+}
+
+/// `omit-work-reset`'s seed, the saved `reorg-request` scenario, still has
+/// the sequencer apply the new epoch while the work queue holds the old
+/// epoch's taken work above the verified tip, which the held range read
+/// keeps there. Without that work the case's bypass leaves nothing behind,
+/// as #2321 left `sync-storage-reorg.bin`.
+#[test]
+fn the_reorg_request_input_resets_old_epoch_work() {
+    let (report, _, _) = replay(&SavedSync::ReorgRequest.tag());
+    assert!(reset_finds_stale_work(&report.log), "{:?}", report.end);
 }

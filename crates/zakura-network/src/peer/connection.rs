@@ -7,6 +7,7 @@
 //! And it's unclear if these assumptions match the `zcashd` implementation.
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
+use indexmap::IndexSet;
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -45,6 +46,7 @@ use crate::{
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
+    peer_registry::PeerRegistryUpdater,
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, HashedBlock, InventoryHash, Message},
@@ -363,7 +365,7 @@ impl Handler {
                     // If we got everything we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     Handler::Finished(Ok(Response::Blocks(available.collect())))
                 } else {
                     // Keep on waiting for all the blocks we wanted, until we get them or time out.
@@ -409,7 +411,7 @@ impl Handler {
                     // If we got some of what we wanted, let the internal client know.
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block.into(), transient_addr)));
                     let missing = pending_hashes.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Blocks(available.chain(missing).collect())))
@@ -598,6 +600,11 @@ impl From<Request> for InboundMessage {
 /// reads slowly can hold its connection's loop for minutes with one message.
 const WAITING_ADVERT_PRIORITY_DELAY: Duration = BLOCK_REQUEST_WAIT.checked_div(3).unwrap();
 
+/// How many requested block hashes a connection remembers, to tell late responses from pushes.
+///
+/// A connection writes one request at a time, so late responses come from its last few requests.
+const REQUESTED_BLOCK_MEMORY: usize = 64;
+
 /// Where a connection reads our requests from, and the authorization it rechecks before
 /// writing a block advert.
 pub(crate) struct ConnectionRequests<C> {
@@ -691,6 +698,12 @@ where
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
 
+    /// The latest [`REQUESTED_BLOCK_MEMORY`] block hashes this connection requested.
+    ///
+    /// An unrequested block is a push. A block with one of these hashes is a late response to
+    /// a canceled or timed-out request, which the requester has already given up on.
+    requested_blocks: IndexSet<block::Hash>,
+
     /// Records the block announcements this connection writes, and the blocks the peer
     /// asks for and is sent, when the node writes trace files.
     gossip_trace: super::gossip_trace::PeerGossipTrace,
@@ -727,6 +740,13 @@ where
 
     /// Funds the payloads of the current client request's response until its handoff.
     response_charge: Option<InboundCharge>,
+
+    /// Where this connection records how long the peer takes to answer, for choosing block
+    /// sources. `None` when the node keeps no peer registry.
+    delivery_samples: Option<PeerRegistryUpdater>,
+
+    /// When the current client request started being written, if one is outstanding.
+    request_started_at: Option<tokio::time::Instant>,
 }
 
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
@@ -831,6 +851,7 @@ where
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            requested_blocks: IndexSet::new(),
             gossip_trace: Default::default(),
             request_slot: Default::default(),
             connection_tracker,
@@ -839,7 +860,18 @@ where
             last_overload_time: None,
             inbound_budget,
             response_charge: None,
+            delivery_samples: None,
+            request_started_at: None,
         }
+    }
+
+    /// Makes this connection record how long the peer takes to answer in `delivery_samples`.
+    pub(super) fn with_delivery_samples(
+        mut self,
+        delivery_samples: Option<PeerRegistryUpdater>,
+    ) -> Self {
+        self.delivery_samples = delivery_samples;
+        self
     }
 
     /// Makes this connection write its block gossip to `gossip_trace`.
@@ -999,6 +1031,7 @@ where
                         Either::Right(Some(req)) => {
                             // The request may wait for the peer writer before the state changes.
                             self.request_slot.set_busy(true);
+                            self.request_started_at = Some(tokio::time::Instant::now());
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -1051,6 +1084,11 @@ where
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
+                            let timed_out = matches!(&tx.advertised_block,
+                                Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) if attempt.timed_out_after_write());
+                            if timed_out {
+                                self.record_advertised_block_miss(Some(&super::AdvertisedBlockRequest::Primary));
+                            }
                             self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
                             continue;
@@ -1078,6 +1116,7 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
+                                    self.record_advertised_block_miss(tx.advertised_block.as_ref());
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -1231,6 +1270,10 @@ where
     /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
     /// acknowledges it once the local write completes.
     ///
+    /// If the advert pushes the block, the connection writes the block before its `inv`. A peer
+    /// that verifies the pushed block ignores the `inv`, and any other peer requests the block.
+    /// If the inbound service cannot supply the block, the connection writes only the `inv`.
+    ///
     /// `overdue_wait` is how long the queue had waited when this turn decided that the advert
     /// goes before the next peer message, or `None` when it goes out in a gap between them.
     ///
@@ -1260,39 +1303,116 @@ where
         )
         .increment(1);
 
+        let BlockAdvert { hash, push, result } = advert;
+        let mut result = Some(result);
+
+        if push {
+            match self.advertised_block_body(hash).await {
+                Some(block) => {
+                    if !self
+                        .send_advert_message(
+                            Message::Block(HashedBlock::from(block)),
+                            hash,
+                            &mut result,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    // The push stands in for the peer's getdata and our response.
+                    self.block_uploads.advertised(hash);
+                    self.block_uploads.requested(hash);
+                    self.block_uploads.written(hash);
+                    self.gossip_trace.block_sent(hash);
+                    metrics::counter!("peer.block_gossip.block_pushes").increment(1);
+                }
+                None => {
+                    metrics::counter!("peer.block_gossip.block_push_unavailable").increment(1);
+                }
+            }
+        }
+
+        let inv = Message::Inv(vec![InventoryHash::Block(hash)]);
+        if self.send_advert_message(inv, hash, &mut result).await {
+            // Mark the write before reading the peer's next message, which can be its getdata.
+            self.block_uploads.advertised(hash);
+            self.gossip_trace.block_inv_sent(hash);
+            if let Some(result) = result {
+                let _ = result.send(Ok(()));
+            }
+        }
+    }
+
+    /// Remembers `hashes` as requested, forgetting the oldest hashes beyond
+    /// [`REQUESTED_BLOCK_MEMORY`].
+    fn remember_requested_blocks(&mut self, hashes: &IndexSet<block::Hash>) {
+        for hash in hashes {
+            self.requested_blocks.shift_remove(hash);
+            if self.requested_blocks.len() == REQUESTED_BLOCK_MEMORY {
+                self.requested_blocks.shift_remove_index(0);
+            }
+            self.requested_blocks.insert(*hash);
+        }
+    }
+
+    /// Writes one message of the advert for `hash`, after rechecking the peer's live
+    /// authorization.
+    ///
+    /// Returns true if the message was written. Otherwise, takes `result` to send it the
+    /// failure, and closes the connection if the write failed.
+    async fn send_advert_message(
+        &mut self,
+        msg: Message,
+        hash: block::Hash,
+        result: &mut Option<tokio::sync::oneshot::Sender<Result<(), BlockAdvertError>>>,
+    ) -> bool {
         let address = self.connection_info.connected_addr.get_transient_addr();
         let version = self.connection_info.remote.version;
         let minimum = &mut self.minimum_peer_version;
         let bans = &self.bans;
         let delivery = self
             .peer_tx
-            .send_authorized(
-                Message::Inv(vec![InventoryHash::Block(advert.hash)]),
-                || {
-                    version >= minimum.current()
-                        && !address.is_some_and(|addr| bans.contains(addr.ip()))
-                },
-            )
+            .send_authorized(msg, || {
+                version >= minimum.current()
+                    && !address.is_some_and(|addr| bans.contains(addr.ip()))
+            })
             .await;
         match delivery {
-            Ok(true) => {
-                // Mark the write before reading the peer's next message, which can be its getdata.
-                self.block_uploads.advertised(advert.hash);
-                self.gossip_trace.block_inv_sent(advert.hash);
-                let _ = advert.result.send(Ok(()));
-            }
+            Ok(true) => true,
             Ok(false) => {
-                debug!(hash = ?advert.hash, "not advertising block: peer authorization was revoked");
-                let _ = advert
-                    .result
-                    .send(Err(BlockAdvertError::AuthorizationRevoked));
+                debug!(
+                    ?hash,
+                    "not advertising block: peer authorization was revoked"
+                );
+                if let Some(result) = result.take() {
+                    let _ = result.send(Err(BlockAdvertError::AuthorizationRevoked));
+                }
+                false
             }
             Err(error) => {
                 let error = SharedPeerError::from(error);
-                let _ = advert.result.send(Err(error.clone().into()));
+                if let Some(result) = result.take() {
+                    let _ = result.send(Err(error.clone().into()));
+                }
                 self.fail_with(error).await;
+                false
             }
         }
+    }
+
+    /// Returns the body of the advertised block `hash` from the inbound service.
+    ///
+    /// The inbound service serves a mined block before it commits, and a relayed block from
+    /// state. Returns `None` if the service fails, or no longer has the block.
+    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<BlockHandle> {
+        let request = Request::BlocksByHash(std::iter::once(hash).collect());
+        // The inbound service has its own timeout layer.
+        let response = self.svc.ready().await.ok()?.call(request).await.ok()?;
+        let Response::Blocks(blocks) = response else {
+            return None;
+        };
+        let (block, _) = blocks.first()?.available()?;
+        Some(block.into_block())
     }
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
@@ -1360,8 +1480,13 @@ where
             // Block adverts reach the connection through its advert queue, which the peer set's
             // block advertiser fills. A `Client` caller that sends one as an ordinary request,
             // such as an isolated connection, gets an error instead of an `inv`.
-            (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
+            // Pushes are an option of these adverts.
+            (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_) | PushBlock(..)) => {
                 Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
+            }
+            // The peer set picks the peer for a hedge and sends it an ordinary `BlocksByHash`.
+            (_, BlockByHashPrimary { .. } | BlockByHashHedge { .. }) => {
+                Ok(Handler::Finished(Err(PeerError::HedgeRequiresPeerSet)))
             }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
@@ -1408,6 +1533,7 @@ where
             }
 
             (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
+                self.remember_requested_blocks(&hashes);
                 self
                     .peer_tx
                     .send(Message::GetData(
@@ -1509,6 +1635,11 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
+                if let Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) =
+                    &tx.advertised_block
+                {
+                    attempt.legacy_request_written();
+                }
                 self.state = AwaitingResponse { handler, span, tx };
                 self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
             }
@@ -1536,7 +1667,7 @@ where
 
         let Some(_unsolicited_charge) = self.charge_unsolicited(&msg) else {
             metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget").increment(1);
-            debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
+            debug!("TCP inbound bytes exhausted: dropping unsolicited transaction or block");
             return None;
         };
 
@@ -1587,10 +1718,18 @@ where
                     Unused
                 }
             }
-            Message::Block(_) => {
-                debug!(%msg, "got block message unsolicited or from canceled request");
+            Message::Block(ref block) if self.requested_blocks.contains(&block.hash()) => {
+                debug!(%msg, "got block message from canceled request");
                 Unused
             }
+            Message::Block(ref block) => Request::PushBlock(
+                block.clone().into_block(),
+                self.connection_info
+                    .connected_addr
+                    .get_transient_addr()
+                    .map(Into::into),
+            )
+            .into(),
             Message::Headers(_) => {
                 debug!(%msg, "got headers message unsolicited or from canceled request");
                 Unused
@@ -1780,12 +1919,12 @@ where
 
     /// Charge an unsolicited message until its handler ends, or refuse it.
     ///
-    /// Only a transaction carries a charge. An unsolicited block has no retained owner.
+    /// Only a pushed transaction or block carries a charge.
     /// Nothing waits for unsolicited work, so a saturated budget refuses it, as a full
     /// queue does.
     fn charge_unsolicited(&self, msg: &Message) -> Option<InboundCharge> {
         let bytes = match msg {
-            Message::Tx(_) => decoded_payload_bytes(msg),
+            Message::Tx(_) | Message::Block(_) => decoded_payload_bytes(msg),
             _ => 0,
         };
         self.inbound_budget.try_charge(bytes)
@@ -1828,7 +1967,7 @@ where
         let tmp_state = std::mem::replace(&mut self.state, State::Failed);
 
         if let State::AwaitingResponse {
-            handler: Handler::Finished(response),
+            handler: Handler::Finished(mut response),
             tx,
             span,
         } = tmp_state
@@ -1852,6 +1991,19 @@ where
 
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
+            }
+            // Capture transfer time here. Only the verifier can credit this particular body.
+            let started = self.request_started_at.take();
+            if let Ok(reply @ Response::Blocks(_)) = &mut response {
+                if let Some(started) = started {
+                    reply.observe_block_delivery(
+                        &self.request_slot,
+                        self.delivery_samples.clone(),
+                        started.elapsed(),
+                    );
+                }
+            } else {
+                self.record_advertised_block_miss(tx.advertised_block.as_ref());
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -1994,7 +2146,7 @@ where
                     match block {
                         Available((block, _)) => {
                             // The message hashes the block once, for the encoder and for us.
-                            let block = HashedBlock::from(block);
+                            let block = HashedBlock::from(block.into_block());
                             let hash = block.hash();
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
@@ -2194,6 +2346,16 @@ impl<S, Tx, C> Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
+    /// Record a dispatched advertiser's miss before another request can update the same slot.
+    fn record_advertised_block_miss(&self, advertised: Option<&super::AdvertisedBlockRequest>) {
+        if let Some(route) = advertised {
+            self.request_slot.mark_announced_block_missed();
+            if let Some(registry) = &self.delivery_samples {
+                registry.trace_block_missed(*route == super::AdvertisedBlockRequest::Hedge);
+            }
+        }
+    }
+
     /// Update the connection state metrics for this connection,
     /// using `extra_state_info` as additional state information.
     ///
@@ -2308,6 +2470,9 @@ where
             // Accessing the error slot locks a threaded std::sync::Mutex, which
             // can block the current async task thread. We briefly lock the mutex
             // to clone the error.
+            if !tx.is_canceled() {
+                self.record_advertised_block_miss(tx.advertised_block.as_ref());
+            }
             let _ = tx.send(Err(error.clone()));
         }
 

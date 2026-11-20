@@ -448,6 +448,8 @@ impl NodeResources {
             });
         ConnectionResources {
             owners: self.owners.clone(),
+            #[cfg(zakura_sim)]
+            stream_owners: Default::default(),
             receive_window: self
                 .shares
                 .receive_window(gates.iter().map(|(kind, _)| *kind)),
@@ -492,6 +494,9 @@ fn byte_budget(bytes: u64) -> OutputByteBudget {
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionResources {
     owners: OwnerLedger,
+    // Simulation observations count these owners without adding scheduling points.
+    #[cfg(zakura_sim)]
+    stream_owners: Arc<[AtomicUsize; OWNER_PHASES]>,
     gates: Arc<[(u16, KindGates)]>,
     receive_window: u64,
     /// Funds this connection's outbound compatibility exchanges.
@@ -508,10 +513,18 @@ impl ConnectionResources {
     /// A probe of this connection's gates and of `quic`, the connection's
     /// QUIC load.
     #[cfg(zakura_sim)]
-    pub(crate) fn probe(&self, quic: zakura_quic::LoadProbe) -> super::ConnectionProbe {
+    pub(crate) fn probe(
+        &self,
+        quic: zakura_quic::LoadProbe,
+        streams: &Arc<zakura_rt::sync::Semaphore>,
+        limits: super::super::ZakuraConnectionLimits,
+    ) -> super::ConnectionProbe {
         super::ConnectionProbe::new(
             quic,
             self.receive_window,
+            streams,
+            &self.stream_owners,
+            limits,
             self.gates
                 .iter()
                 .map(|(kind, gates)| (*kind, &gates.raw.budget, &gates.output.budget)),
@@ -520,7 +533,16 @@ impl ConnectionResources {
 
     /// Count one stream that entered setup, before its kind is known.
     pub(crate) fn owner(&self) -> OwnerGuard {
-        self.owners.enter(OwnerPhase::Setup)
+        let owner = self.owners.enter(OwnerPhase::Setup);
+        #[cfg(zakura_sim)]
+        let owner = {
+            let mut owner = owner;
+            // `OwnerPhase` discriminants are 0..OWNER_PHASES, so the cast indexes in bounds.
+            self.stream_owners[OwnerPhase::Setup as usize].fetch_add(1, Ordering::Relaxed);
+            owner.stream_owners = Some(self.stream_owners.clone());
+            owner
+        };
+        owner
     }
 
     /// The gates of a stream of `kind` that `owner` counts, or `None` if this
@@ -591,6 +613,8 @@ impl ConnectionResources {
         };
         Self {
             owners: OwnerLedger::default(),
+            #[cfg(zakura_sim)]
+            stream_owners: Default::default(),
             gates: kinds
                 .iter()
                 .map(|kind| (*kind, KindGates::new(share)))
@@ -727,7 +751,7 @@ pub(crate) enum OwnerPhase {
     Retiring = 3,
 }
 
-const OWNER_PHASES: usize = 4;
+pub(super) const OWNER_PHASES: usize = 4;
 
 impl OwnerPhase {
     fn label(self) -> &'static str {
@@ -878,6 +902,8 @@ impl OwnerLedger {
         OwnerGuard {
             ledger: self.clone(),
             phase: AtomicUsize::new(phase as usize),
+            #[cfg(zakura_sim)]
+            stream_owners: None,
         }
     }
 
@@ -915,6 +941,8 @@ pub(crate) struct OwnerGuard {
     /// The current [`OwnerPhase`] as its discriminant. The owner's context is
     /// shared with its reader, so moves take a shared reference.
     phase: AtomicUsize,
+    #[cfg(zakura_sim)]
+    stream_owners: Option<Arc<[AtomicUsize; OWNER_PHASES]>>,
 }
 
 impl OwnerGuard {
@@ -923,13 +951,23 @@ impl OwnerGuard {
         let previous = self.phase.swap(phase as usize, Ordering::Relaxed);
         self.ledger.add(phase);
         self.ledger.remove(owner_phase(previous));
+        #[cfg(zakura_sim)]
+        if let Some(owners) = &self.stream_owners {
+            owners[previous].fetch_sub(1, Ordering::Relaxed);
+            // `OwnerPhase` discriminants are 0..OWNER_PHASES, so the cast indexes in bounds.
+            owners[phase as usize].fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 impl Drop for OwnerGuard {
     fn drop(&mut self) {
-        self.ledger
-            .remove(owner_phase(self.phase.load(Ordering::Relaxed)));
+        let phase = self.phase.load(Ordering::Relaxed);
+        #[cfg(zakura_sim)]
+        if let Some(owners) = &self.stream_owners {
+            owners[phase].fetch_sub(1, Ordering::Relaxed);
+        }
+        self.ledger.remove(owner_phase(phase));
     }
 }
 

@@ -8,7 +8,7 @@ mod support;
 
 use std::{cell::RefCell, collections::HashSet, fs, path::PathBuf, process::Command};
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::Frontier;
 use zakura_sim::{
@@ -64,6 +64,9 @@ fn fork_fixture(mirrors: Vec<MirrorSpec>, weights: Weights) -> StorageScenario {
         weights,
         policy: fork_policy(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -144,6 +147,9 @@ pub fn heavier_offered_to_longer() -> StorageScenario {
         weights: heavier_short(),
         policy: Policy::converging(),
         controls: Vec::new(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -177,6 +183,9 @@ pub fn invalidated_then_reconsidered() -> StorageScenario {
                 Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
             ),
         ],
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -195,6 +204,9 @@ pub fn harness_commit() -> StorageScenario {
         policy: Policy::converging(),
         controls: vec![node_step(ControlAction::Commit { len: 2 }, None)],
         weights: Weights::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -493,8 +505,8 @@ fn the_fork_fixture_settles_on_the_heaviest_tip() {
 }
 
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-selection-<name>.json` with its Plan bytes
-/// beside it in `header-selection-<name>.plan`.
+/// as `tests/fixtures/header-selection-<name>.json`.
+/// Each runs under the empty Plan.
 fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     [
         ("stronger-first", stronger_first()),
@@ -504,11 +516,6 @@ fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     ]
 }
 
-/// The Plan bytes every committed witness runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture `header-selection-<name>.<extension>`.
 fn fixture(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -516,8 +523,8 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-selection-{name}.{extension}"))
 }
 
-/// Each committed witness is its builder's scenario, as JSON, with the
-/// fixed Plan bytes, and holds and applies under them.
+/// Each committed witness is its builder's scenario, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_witnesses_match_their_builders() {
     for (name, scenario) in committed_witnesses() {
@@ -529,16 +536,9 @@ fn the_committed_witnesses_match_their_builders() {
         assert_eq!(
             serde_json::to_value(&committed).expect("scenarios serialize"),
             serde_json::to_value(&scenario).expect("scenarios serialize"),
-            "{name}: run `regenerate_selection_witnesses`"
+            "{name}"
         );
-        let plan =
-            fs::read(fixture(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_selection_witnesses`"
-        );
-        let ran = run(&scenario, zakura_sim::Plan::from_fuzz(&plan));
+        let ran = run(&scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert!(ran.holds_every_mirror_tip, "{name}");
         assert!(
             matches!(
@@ -550,24 +550,13 @@ fn the_committed_witnesses_match_their_builders() {
     }
 }
 
-/// Rewrites the committed witnesses from their builders.
-#[test]
-#[ignore = "rewrites the committed selection witnesses"]
-fn regenerate_selection_witnesses() {
-    for (name, scenario) in committed_witnesses() {
-        let json = serde_json::to_string_pretty(&scenario).expect("scenarios serialize");
-        fs::write(fixture(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture(name, "plan"), committed_plan()).expect("the fixture directory exists");
-    }
-}
-
 /// The stronger-first witness's log and the property's report depend only
 /// on the scenario and the plan: plan A twice, then B, then A again, gives
 /// A's every time, and B's log differs.
 #[test]
 fn the_selection_witness_repeats_a_a_and_a_b_a() {
     let scenario = stronger_first();
-    let plans = [committed_plan(), vec![7; 256]];
+    let plans = [Vec::new(), vec![7; 256]];
     let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
         .into_iter()
         .map(|plan| {
@@ -604,8 +593,6 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             Storage::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture(name, "plan").to_str().expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

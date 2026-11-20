@@ -16,7 +16,7 @@ rolled-back submission, but no holder charges it any more.
 ## Witness
 
 The witness is `qa/planted/block-sync/stale-completion-inert/release-by-height.toml`, which runs
-`crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin`.
+the seed `block-sync-stale-beside-current`.
 
 The input resets the chain to a fork from height 2 while storage holds
 the first submission at height 2. The detached submission's retryable

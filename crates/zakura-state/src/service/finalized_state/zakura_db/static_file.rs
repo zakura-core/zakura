@@ -750,7 +750,18 @@ impl MoverWorker {
                             Self::free_due_files(db, &mut file_deletes);
                         }
                         Ok(false) => break,
-                        // The bodies are still in `tx_by_loc`, so the next commit retries.
+                        // The bodies are still in `tx_by_loc`. A failed static file
+                        // write, such as a full disk, stops moves until a restart
+                        // reconciles the files, so freeing space alone doesn't
+                        // resume them. Other failures retry on the next commit.
+                        Err(error) if db.static_files.has_failed() => {
+                            tracing::error!(
+                                ?error,
+                                "failed to move finalized transactions to static files; moves \
+                                 stop until zakurad restarts, so free disk space and restart it"
+                            );
+                            break;
+                        }
                         Err(error) => {
                             tracing::error!(
                                 ?error,

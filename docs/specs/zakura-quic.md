@@ -54,7 +54,8 @@ groups, so recorded traffic between two upgraded nodes stays secret from a
 later quantum computer; it changes DEP-2, TLS-9, ADM-1, API-3, SEC-1, SEC-2
 and the OBS-1 outcome counters, and adds §16 rows; §17u lists each change.
 Version 0.24 names the Ed25519 public key `NodeKey`, apart from the `NodeId`
-that holds it; it changes ID-1, API-1 and API-4, and §17v lists each change.
+that holds it. It updates ID-1, TLS-6 through TLS-8, API-1 and API-4. See
+§17v.
 
 ## 0. Conventions
 
@@ -188,12 +189,13 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-4.** The only signature scheme is `ED25519`.
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
-- **TLS-6.** The client MUST NOT send SNI. It passes the expected `NodeId` to
-  its verifier in memory.
-- **TLS-7.** The client verifier MUST abort unless the server's key equals the
-  dialed `NodeId`.
-- **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
-  `Conn::remote_id()` MUST return only a key proven this way.
+- **TLS-6.** The client MUST NOT send SNI. It passes the `NodeKey` from the
+  dialed `NodeId` to its verifier in memory.
+- **TLS-7.** The client verifier MUST abort unless the server presents the
+  expected `NodeKey`.
+- **TLS-8.** Each endpoint MUST derive the peer's `NodeId` from the
+  `NodeKey` the peer proved in the TLS handshake. `Conn::remote_key()`
+  returns that key, and `Conn::remote_id()` returns the derived ID.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites and one added key-exchange group, X25519MLKEM768
   (`draft-ietf-tls-ecdhe-mlkem`, group 0x11ec), offered ahead of ring's
@@ -1750,8 +1752,10 @@ Changed:
 
 - **ID-1.** Defines `NodeKey` as the Ed25519 public key and `NodeId` as the
   node's `NodeKey`. The construction checks are the same for both.
-- **API-1.** Adds `NodeKey`. Signature verification moves from `NodeId` to
-  `NodeKey`; `NodeId::key()` returns the key and
-  `NodeSecretKey::public_key()` returns the local one.
+- **TLS-6 through TLS-8.** The client verifier takes an expected `NodeKey`.
+  Both endpoints derive the peer's ID from the key proved in TLS.
+- **API-1.** Adds `NodeKey`, `NodeId::key()` and
+  `NodeSecretKey::public_key()`. `NodeId::verify_strict()` delegates
+  to `NodeKey::verify_strict()`.
 - **API-4.** Adds `Conn::remote_key()`, the key the peer proved in the TLS
   handshake.

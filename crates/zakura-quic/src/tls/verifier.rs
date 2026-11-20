@@ -106,7 +106,7 @@ impl ServerCertVerifier for ServerCertificateVerifier {
 /// Requires a client raw public key (TLS-5).
 ///
 /// rustls verifies the handshake signature against the presented key, which
-/// proves the client's node ID (TLS-8).
+/// proves possession of the key that determines the client's node ID (TLS-8).
 #[derive(Debug, Default)]
 pub(super) struct ClientCertificateVerifier;
 

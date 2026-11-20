@@ -196,6 +196,36 @@ fn a_repeated_inv_does_not_renew_or_move_the_claim() {
 }
 
 #[test]
+fn a_reannounced_block_gets_a_fresh_place_behind_its_rival() {
+    let claims = AnnouncementClaims::default();
+    let (block, rival) = (hash(1), hash(2));
+    let start = Instant::now();
+    announce(&claims, block, start);
+    assert!(claims.announced_order(block).is_some());
+
+    // Recording the rival also prunes the first block's old announcement.
+    let rival_at = start + CLAIM_BODY_DEADLINE * 2 + Duration::from_millis(1);
+    announce(&claims, rival, rival_at);
+    assert_eq!(claims.announced_order(block), None);
+    let again = rival_at + Duration::from_millis(100);
+    announce(&claims, block, again);
+
+    // Both bodies qualify for their announcements, even though the rival's body arrives last.
+    let Some((ClaimSource::Inv, block_order)) = used(&claims, block, CLAIMED, again) else {
+        panic!("the re-announced block should qualify for its fresh announcement");
+    };
+    let Some((ClaimSource::Inv, rival_order)) =
+        used(&claims, rival, CLAIMED, again + Duration::from_millis(100))
+    else {
+        panic!("the rival should still qualify for its announcement");
+    };
+    assert!(
+        rival_order < block_order,
+        "the rival keeps its earlier place"
+    );
+}
+
+#[test]
 fn a_full_inv_store_refuses_new_blocks_until_old_entries_expire() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();

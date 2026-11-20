@@ -1055,13 +1055,15 @@ fn a_parent_that_enters_again_costs_no_retry() {
     assert_eq!(rerun.len(), 1, "the other parent still runs the child");
 }
 
-/// A parent that leaves before the check it started looks for it, and then
-/// enters again, still runs a child that waits on nothing else.
+/// A parent that leaves before the check it started ends, and then enters
+/// again, runs the child again. The verifier also reports the child's
+/// confirmed spend as missing, which is not a parent still to come.
 #[test]
 fn a_parent_that_left_before_its_check_runs_the_child_when_it_returns() {
     let mut runner = TestRunner::deterministic();
     let parent = build(&mut runner, &[], 1, None);
-    let child = build(&mut runner, &[parent.outpoint(0)], 1, None);
+    let spends = vec![coin(0xc1), parent.outpoint(0)];
+    let child = build(&mut runner, &spends, 1, None);
     let fillers = unrelated(&mut runner, 2);
     let mut bench = Bench::with(
         Config {
@@ -1071,20 +1073,20 @@ fn a_parent_that_left_before_its_check_runs_the_child_when_it_returns() {
         Limits::default(),
     );
     let (_, job) = bench.start(&child);
-    assert!(bench.missing(job, vec![parent.outpoint(0)]).is_empty());
+    assert!(bench.missing(job, spends.clone()).is_empty());
 
     let rerun = admit_parent(&mut bench, &paying(&parent, 500_000));
     assert_eq!(rerun.len(), 1);
     // The parent is pushed out before that check looks for it.
     bench.admit(&paying(&fillers[0], 100_000_000));
     bench.admit(&paying(&fillers[1], 200_000_000));
-    assert!(bench.missing(rerun[0], vec![parent.outpoint(0)]).is_empty());
+    assert!(bench.missing(rerun[0], spends.clone()).is_empty());
 
     let again = paying(&twin(&parent), 300_000_000);
     assert_eq!(
         admit_parent(&mut bench, &again).len(),
         1,
-        "the child waits on nothing else, so its parent runs it again"
+        "no check saw the parent, so it runs the child again"
     );
 }
 

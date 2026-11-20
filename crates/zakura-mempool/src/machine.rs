@@ -60,25 +60,34 @@ use crate::{
 /// child with one bogus input again, until its wait ends.
 const MAX_PARENT_RETRIES: usize = MAX_MEMPOOL_ANCESTORS;
 
-/// The parent among `arrived` that may run a transaction waiting on
-/// `waiting` again, given `retried_for`, the parent of each earlier run, or
-/// `None` if none may. A parent new to `retried_for` may while retries are
-/// left. One already in it was usually in the pool for that run's check, so
-/// it may only when no other parent in `waiting` is still to come: it may
-/// have left before the verifier looked.
+/// A parent whose entry into the pool ran a waiting transaction again.
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    parent: transaction::Hash,
+    /// Whether a check of the transaction ended with the parent still in the
+    /// pool, so the check saw it.
+    seen: bool,
+}
+
+/// The parent among `arrived` that may run a waiting transaction again,
+/// given the runs in `retried_for`: one no check of it has seen yet, while
+/// retries are left. A parent a check saw that leaves and enters again, as
+/// an evicted parent can, brings it nothing new.
 fn parent_to_retry(
-    retried_for: &[transaction::Hash],
+    retried_for: &[Retry],
     arrived: &[transaction::Hash],
-    waiting: &[transaction::Hash],
 ) -> Option<transaction::Hash> {
     if retried_for.len() >= MAX_PARENT_RETRIES {
         return None;
     }
-    if let Some(new) = arrived.iter().find(|parent| !retried_for.contains(parent)) {
-        return Some(*new);
-    }
-    let nothing_new_to_come = waiting.iter().all(|parent| retried_for.contains(parent));
-    arrived.first().copied().filter(|_| nothing_new_to_come)
+    arrived
+        .iter()
+        .find(|parent| {
+            !retried_for
+                .iter()
+                .any(|retry| retry.seen && retry.parent == **parent)
+        })
+        .copied()
 }
 
 #[cfg(test)]
@@ -245,7 +254,7 @@ struct Admission<E> {
     /// The parent whose entry into the pool ran it again, once per run since
     /// the tip changed, at most [`MAX_PARENT_RETRIES`]. See
     /// [`parent_to_retry`].
-    retried_for: Vec<transaction::Hash>,
+    retried_for: Vec<Retry>,
     /// Whether a parent arrived that the cap did not let run it again. If
     /// so, the wait ends with the one last check rather than the missing
     /// inputs it last saw.
@@ -1308,7 +1317,17 @@ impl<E: VerifyError> MempoolState<E> {
                     .filter(|outpoint| self.arrived_since(outpoint, started_at))
                     .map(|outpoint| outpoint.hash)
                     .collect();
+                // The parents of its runs that are still pooled were there
+                // for this check.
+                let seen: Vec<bool> = self.admissions[&key]
+                    .retried_for
+                    .iter()
+                    .map(|retry| retry.seen || self.pooled.contains_key(&retry.parent))
+                    .collect();
                 let admission = self.admission_at(key);
+                for (retry, seen) in admission.retried_for.iter_mut().zip(seen) {
+                    retry.seen = seen;
+                }
                 admission.missing_error = Some(error.clone());
                 let since = *admission.missing_since.get_or_insert(now);
                 let wait_over = since + T_PARK <= now;
@@ -1318,13 +1337,14 @@ impl<E: VerifyError> MempoolState<E> {
                 if last_check {
                     admission.last_check_used = true;
                 }
-                let waiting: Vec<transaction::Hash> =
-                    missing.iter().map(|outpoint| outpoint.hash).collect();
-                let parent = parent_to_retry(&admission.retried_for, &arrived, &waiting)
-                    .filter(|_| !wait_over);
+                let parent =
+                    parent_to_retry(&admission.retried_for, &arrived).filter(|_| !wait_over);
                 let retry = parent.is_some();
                 if let Some(parent) = parent {
-                    admission.retried_for.push(parent);
+                    admission.retried_for.push(Retry {
+                        parent,
+                        seen: false,
+                    });
                 }
                 if retry || last_check {
                     self.start_admission(key);
@@ -1551,8 +1571,11 @@ impl<E: VerifyError> MempoolState<E> {
             if !on.contains(&parent) {
                 continue;
             }
-            if let Some(parent) = parent_to_retry(&admission.retried_for, &[parent], on) {
-                admission.retried_for.push(parent);
+            if let Some(parent) = parent_to_retry(&admission.retried_for, &[parent]) {
+                admission.retried_for.push(Retry {
+                    parent,
+                    seen: false,
+                });
                 woken.push(*key);
             } else {
                 admission.retry_owed = true;

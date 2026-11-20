@@ -93,9 +93,6 @@ pub(crate) enum Admission {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WantedIds {
     entries: HashMap<UnminedTxId, Entry>,
-    /// The entries' holders, summed: the pending references every session
-    /// holds to a current entry.
-    held: usize,
     next_generation: u64,
     /// The next place in line to hand out.
     next_order: u64,
@@ -138,7 +135,6 @@ impl WantedIds {
     }
 
     /// How many ids the node wants.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -167,13 +163,7 @@ impl WantedIds {
             }
         });
         entry.holders = entry.holders.saturating_add(1);
-        self.held = self.held.saturating_add(1);
         entry.generation
-    }
-
-    /// The pending references every session holds to a current entry.
-    pub(crate) fn held(&self) -> usize {
-        self.held
     }
 
     /// A pending set gives `id` up: it tried it, or its session ended. An
@@ -190,7 +180,6 @@ impl WantedIds {
             .holders
             .checked_sub(1)
             .expect("a pending reference counts as one holder");
-        self.held = self.held.saturating_sub(1);
         self.collect(id);
     }
 
@@ -317,10 +306,7 @@ impl WantedIds {
             .get(&id)
             .is_some_and(|entry| entry.generation == generation)
         {
-            if let Some(entry) = self.entries.remove(&id) {
-                // Its holders drop their references as they read the ring.
-                self.held = self.held.saturating_sub(entry.holders);
-            }
+            self.entries.remove(&id);
             self.note(id);
             true
         } else {

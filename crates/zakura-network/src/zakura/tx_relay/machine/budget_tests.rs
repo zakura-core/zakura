@@ -8,9 +8,10 @@ use zakura_chain::transaction::UnminedTxId;
 
 use super::{
     tests::{body, hello, on, script_len, SIZE},
-    CallId, Granted, PeerKey, RelayConfig, RelayEffect, RelayMachine, Unreserved, MAX_SERVES,
-    NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
+    CallId, Granted, Mirror, PeerKey, PeerMachine, RelayConfig, RelayEffect, RelayMachine, Shared,
+    Unreserved, MAX_SERVES, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
 };
+use crate::zakura::tx_relay::wire::MAX_INV_ENTRIES;
 
 /// The number of sessions the bounds are for.
 const SESSIONS: u64 = 100;
@@ -168,13 +169,13 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         assert_eq!(state.waiting.len(), waiting, "silent session {n} waits");
     }
     // Once one may fetch, what it kept while it waited joins its pending
-    // set in the room it was counted in, past the full pending cap. That
-    // frees its waiting room for others, so sessions that announce before
-    // their `Hello` one after another carry ids past the cap only up to
-    // twice it, plus their shares.
+    // set as any announcement would. Every id already has a source, so
+    // past the full pending cap it keeps its share, and sessions that
+    // announce before their `Hello` one after another add no more than
+    // their shares however their waiting room frees.
     machine.hello(silent[0], hello(), now);
     let state = machine.session(silent[0]).expect("live");
-    assert_eq!(state.pending.len(), PENDING_PER_PEER, "none of it is lost");
+    assert_eq!(state.pending.len(), PENDING_SHARE, "its share of held ids");
     let mut late = Vec::new();
     for n in 0..SESSIONS {
         let session = machine.connect(PeerKey(2 * SESSIONS + n), false, now);
@@ -183,8 +184,8 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         late.push(session);
     }
     let promoted = silent.len() + late.len();
-    let bound = 2 * PENDING_CAP + (sessions.len() + promoted) * PENDING_SHARE;
-    assert!(machine.wanted().held() <= bound, "carried ids stay bounded");
+    let bound = PENDING_CAP + (sessions.len() + promoted) * PENDING_SHARE;
+    assert!(machine.shared.pending <= bound, "references stay bounded");
     for session in silent.into_iter().chain(late) {
         machine.end(session, now);
     }
@@ -308,4 +309,80 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         );
     }
     machine.assert_invariants();
+}
+
+/// Honest peers that all announce the same full pool in wire-sized frames,
+/// interleaved, half of them before their `Hello`, leave every id a session
+/// that can fetch it, however full the pending cap gets: an id nobody
+/// holds yet is its first source, which the cap on references never
+/// drops.
+#[test]
+fn interleaved_full_pools_leave_every_id_a_source() {
+    let script = script_len();
+    let pool_size = u32::try_from(PENDING_PER_PEER).expect("small");
+    let ids: Vec<(UnminedTxId, u32)> = (0..pool_size)
+        .map(|n| (body(n, script).id(), SIZE))
+        .collect();
+    let config = RelayConfig {
+        fan_out: super::FanOut::default(),
+        short_id_key: 7,
+    };
+    let mut machine = RelayMachine::new(config, on(Vec::new()), Vec::new());
+    let now = Duration::ZERO;
+    let sessions: Vec<_> = (0..92)
+        .map(|peer| {
+            let session = machine.connect(PeerKey(peer), false, now);
+            if peer % 2 == 0 {
+                machine.hello(session, hello(), now);
+            }
+            session
+        })
+        .collect();
+    for (frame, chunk) in ids.chunks(MAX_INV_ENTRIES).enumerate() {
+        for (n, session) in sessions.iter().enumerate() {
+            machine.inv(*session, chunk, now);
+            if frame == 0 && n % 2 == 1 {
+                machine.hello(*session, hello(), now);
+            }
+        }
+    }
+    assert!(machine.shared.pending >= PENDING_CAP, "the cap filled");
+    assert_eq!(
+        machine.wanted().len(),
+        PENDING_PER_PEER,
+        "every id a source"
+    );
+    machine.assert_invariants();
+}
+
+/// A decided id stays counted against the pending cap until each session
+/// that held it drops its reference, not when the entry ends, so sessions
+/// that read the decision late never let others past the cap.
+#[test]
+fn a_decided_reference_counts_until_its_session_drops_it() {
+    let script = script_len();
+    let ids: Vec<(UnminedTxId, u32)> = (0..10).map(|n| (body(n, script).id(), SIZE)).collect();
+    let config = RelayConfig {
+        fan_out: super::FanOut::default(),
+        short_id_key: 7,
+    };
+    let mut shared = Shared::new(config);
+    let pool = Mirror::new(&on(Vec::new()), Vec::new());
+    let now = Duration::ZERO;
+    let mut holder = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
+    holder.hello(&mut shared, &pool, hello(), now);
+    holder.inv(&mut shared, &pool, &ids, now);
+    assert_eq!(shared.pending, ids.len());
+
+    for (id, _) in &ids {
+        let generation = shared.wanted.entry(*id).expect("wanted").generation;
+        shared.wanted.decide(*id, generation);
+    }
+    assert_eq!(
+        shared.pending,
+        ids.len(),
+        "still held until it reads the ring"
+    );
+    holder.tick(&mut shared, &pool, now);
+    assert_eq!(shared.pending, 0, "dropped once it read the decisions");
 }

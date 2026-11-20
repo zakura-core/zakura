@@ -358,8 +358,7 @@ async fn answer(
     Ok(match request {
         Request::TransactionIds => Response::TransactionIds(
             snapshot
-                .transactions
-                .iter()
+                .transactions()
                 .map(|tx| tx.transaction.id())
                 .collect(),
         ),
@@ -404,7 +403,7 @@ async fn answer(
             None => return Err(OutputNotInPool.into()),
         },
         Request::FullTransactions => Response::FullTransactions {
-            transactions: snapshot.transactions.clone(),
+            transactions: snapshot.transactions().cloned().collect(),
             transaction_dependencies: snapshot.dependencies.clone(),
             last_seen_tip_hash: snapshot.tip.hash,
         },
@@ -426,12 +425,11 @@ async fn answer(
         Request::CheckForVerifiedTransactions => Response::CheckedForVerifiedTransactions,
         Request::QueueStats => {
             let bytes = snapshot
-                .transactions
-                .iter()
+                .transactions()
                 .map(|tx| tx.transaction.size())
                 .sum();
             Response::QueueStats {
-                size: snapshot.transactions.len(),
+                size: snapshot.len(),
                 bytes,
                 // Today's pool reports the serialized size here too.
                 usage: bytes,

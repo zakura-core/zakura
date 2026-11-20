@@ -154,6 +154,9 @@ impl RepairScenario {
             },
             controls,
             weights: Weights::default(),
+            node_settings: Default::default(),
+            page_delays: Vec::new(),
+            budget: None,
         }
     }
 }

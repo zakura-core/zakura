@@ -92,6 +92,30 @@ impl GetBlockchainInfoBalance {
         Self::new_internal("ironwood", amount, delta)
     }
 
+    /// Creates a [`GetBlockchainInfoBalance`] for the NSM value balance after the block at
+    /// `height`. It is `monitored` from NU7 - 1, where [ZIP 237] sets it to
+    /// `INITIAL_NSM_VALUE_BALANCE`. It is not a value pool, so it is not in [`Self::chain_supply`].
+    ///
+    /// [ZIP 237]: https://zips.z.cash/zip-0237
+    pub fn nsm(
+        network: &zakura_chain::parameters::Network,
+        height: zakura_chain::block::Height,
+        amount: Amount<NonNegative>,
+        delta: Option<Amount<NegativeAllowed>>,
+    ) -> Self {
+        Self {
+            // The next block is at or after NU7 activation.
+            monitored: zakura_chain::parameters::NetworkUpgrade::Nu7
+                .activation_height(network)
+                .is_some_and(|activation_height| {
+                    height
+                        .next()
+                        .map_or(true, |next_height| next_height >= activation_height)
+                }),
+            ..Self::new_internal("nsm", amount, delta)
+        }
+    }
+
     /// Creates a [`GetBlockchainInfoBalance`] for the Lockbox pool.
     pub fn deferred(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
         Self::new_internal("lockbox", amount, delta)

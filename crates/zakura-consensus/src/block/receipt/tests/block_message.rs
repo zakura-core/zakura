@@ -15,8 +15,8 @@ fn used(
     }
 }
 
-/// Records that a `block` message for `hash`, which reserved `reserved` at `started_at`,
-/// completed at `now`, with the verified tip at [`TIP`].
+/// Records that a `block` message for `hash` at [`CLAIMED`], which reserved `reserved` at
+/// `started_at` with the verified tip at [`TIP`], completed at `now`.
 fn receive(
     claims: &AnnouncementClaims,
     hash: block::Hash,
@@ -24,14 +24,14 @@ fn receive(
     started_at: Instant,
     now: Instant,
 ) {
-    claims.note_block_message_at(hash, reserved, started_at, TIP, now);
+    assert!(claims.note_block_message_at(hash, Some(CLAIMED), reserved, TIP, started_at, now));
 }
 
 #[test]
 fn a_block_message_started_before_a_rival_inv_outranks_it_though_it_completes_later() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
 
     // The rival is announced and its body arrives while the pushed block is still arriving.
     let rival_at = started_at + Duration::from_millis(300);
@@ -51,7 +51,7 @@ fn a_block_message_started_before_a_rival_inv_outranks_it_though_it_completes_la
 fn a_block_message_deadline_counts_from_its_start() {
     let claims = AnnouncementClaims::default();
     let started_at = Instant::now();
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
     let completed_at = started_at + Duration::from_millis(1_500);
     receive(&claims, hash(1), reserved, started_at, completed_at);
 
@@ -81,7 +81,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     let inv = claims
         .announced_order(hash(1))
         .expect("the inv is recorded");
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
     receive(&claims, hash(1), reserved, later, later);
     assert_eq!(claims.announced_order(hash(1)), Some(inv));
     assert!(matches!(
@@ -91,7 +91,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     ));
 
     // The message starts before the inv, which arrives while the message is still arriving.
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
     announce(&claims, hash(2), later);
     let inv = claims
         .announced_order(hash(2))
@@ -106,7 +106,7 @@ fn a_block_keeps_the_earlier_of_its_inv_and_its_block_message() {
     ));
 
     // A later delivery of the same block does not move it back.
-    let again = claims.reserve_order();
+    let again = AnnouncementClaims::reserve_order();
     receive(&claims, hash(2), again, completed_at, completed_at);
     announce(&claims, hash(2), completed_at);
     assert_eq!(claims.announced_order(hash(2)), Some(reserved));
@@ -117,20 +117,25 @@ fn a_block_keeps_the_earlier_of_its_header_claim_and_its_block_message() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
 
-    // The header is claimed first, so the message records nothing.
+    // The header is claimed first, so it keeps the block's place.
     claim(&claims, hash(1), now);
     let header = claims
         .claimed_order(hash(1))
         .expect("the header is claimed");
-    receive(&claims, hash(1), claims.reserve_order(), now, now);
-    assert_eq!(claims.announced_order(hash(1)), None);
+    receive(
+        &claims,
+        hash(1),
+        AnnouncementClaims::reserve_order(),
+        now,
+        now,
+    );
     assert_eq!(
         used(&claims, hash(1), CLAIMED, now),
         Some((ClaimSource::Header, header))
     );
 
     // The message started before the header was claimed.
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
     claim(&claims, hash(2), now);
     receive(&claims, hash(2), reserved, now, now);
     assert_eq!(
@@ -140,38 +145,82 @@ fn a_block_keeps_the_earlier_of_its_header_claim_and_its_block_message() {
 }
 
 #[test]
-fn a_block_message_claims_only_bodies_just_above_the_verified_tip() {
+fn a_block_message_outlives_an_earlier_header_claim_that_is_not_applied() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    receive(&claims, hash(1), claims.reserve_order(), now, now);
+    let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    let reserved = AnnouncementClaims::reserve_order();
+    receive(&claims, hash(1), reserved, now, now);
+    assert!(claims
+        .claimed_order(hash(1))
+        .is_some_and(|header| header < reserved));
 
-    for height in [99, 100, 103, 5_000].map(block::Height) {
-        assert_eq!(
-            claims.resolve(hash(1), Some(height), now),
-            ClaimOutcome::Unclaimed,
-            "a body at {height:?} is not racing at the tip",
+    drop(pending);
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, now),
+        Some((ClaimSource::BlockMessage, reserved))
+    );
+}
+
+#[test]
+fn a_rival_committed_while_a_block_arrives_does_not_move_it_out_of_the_window() {
+    let claims = AnnouncementClaims::default();
+    let started_at = Instant::now();
+    let reserved = AnnouncementClaims::reserve_order();
+
+    // The rival at the same height commits and raises the tip before the block completes.
+    let rival_at = started_at + Duration::from_millis(300);
+    claims.note_announcement_at(hash(2), CLAIMED, rival_at);
+
+    let completed_at = started_at + Duration::from_millis(800);
+    receive(&claims, hash(1), reserved, started_at, completed_at);
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, completed_at),
+        Some((ClaimSource::BlockMessage, reserved))
+    );
+}
+
+#[test]
+fn only_block_messages_just_above_the_tip_at_their_start_are_recorded() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let note = |index, height: Option<block::Height>| {
+        claims.note_block_message_at(
+            hash(index),
+            height,
+            AnnouncementClaims::reserve_order(),
+            TIP,
+            now,
+            now,
+        )
+    };
+
+    for (index, height) in [None, Some(99), Some(100), Some(103), Some(5_000)]
+        .into_iter()
+        .enumerate()
+    {
+        let height = height.map(block::Height);
+        assert!(
+            !note(index, height),
+            "a body at {height:?} is not racing at the tip"
         );
+        assert_eq!(claims.announced_order(hash(index)), None);
     }
-    for height in [101, 102].map(block::Height) {
-        assert!(used(&claims, hash(1), height, now).is_some());
+    for (index, height) in [(10, 101), (11, 102)] {
+        assert!(note(index, Some(block::Height(height))));
+        assert!(used(&claims, hash(index), block::Height(height), now).is_some());
     }
 
     // Once the tip passes height 101, a tie there can no longer be decided.
-    claims.note_block_message_at(
-        hash(2),
-        claims.reserve_order(),
-        now,
-        block::Height(102),
-        now,
-    );
-    assert_eq!(used(&claims, hash(1), CLAIMED, now), None);
+    claims.note_announcement_at(hash(20), block::Height(102), now);
+    assert_eq!(used(&claims, hash(10), CLAIMED, now), None);
 }
 
 #[test]
 fn a_mined_block_outranks_an_earlier_block_message_at_its_height() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    let reserved = claims.reserve_order();
+    let reserved = AnnouncementClaims::reserve_order();
     receive(&claims, hash(1), reserved, now, now);
 
     let mined = claims.mark_mined(hash(3), CLAIMED, order::next());
@@ -194,7 +243,7 @@ fn a_mined_block_outranks_an_earlier_block_message_at_its_height() {
 fn a_reservation_that_is_never_noted_has_no_effect() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
-    let unused = claims.reserve_order();
+    let unused = AnnouncementClaims::reserve_order();
 
     announce(&claims, hash(1), now);
     let inv = claims
@@ -221,7 +270,7 @@ fn a_full_store_refuses_a_new_block_message() {
     receive(
         &claims,
         hash(MAX_ANNOUNCED_BLOCKS),
-        claims.reserve_order(),
+        AnnouncementClaims::reserve_order(),
         now,
         now,
     );

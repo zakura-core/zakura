@@ -235,9 +235,8 @@ fn legacy_block_announcement_hook(
     announcement_claims: zakura_consensus::AnnouncementClaims,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
 ) -> zakura_network::BlockAnnouncementHook {
-    let reserving_claims = announcement_claims.clone();
     let block_message_claims = announcement_claims.clone();
-    let block_message_tip = latest_chain_tip.clone();
+    let reserving_tip = latest_chain_tip.clone();
     zakura_network::BlockAnnouncementHook::new(move |hash| {
         // Before the first block is committed there is no tip to place a claim above.
         if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
@@ -245,16 +244,24 @@ fn legacy_block_announcement_hook(
         }
     })
     .with_block_messages(
-        move || reserving_claims.reserve_order(),
-        move |hash, reservation| {
-            if let Some(verified_tip) = block_message_tip.best_tip_height() {
-                block_message_claims.note_block_message(
-                    hash,
-                    reservation.order,
-                    reservation.started_at,
+        // The tip is read at the message start, so a rival committed while this block
+        // arrives does not move it out of the claim window.
+        move || {
+            reserving_tip.best_tip_height().map(|verified_tip| {
+                (
+                    zakura_consensus::AnnouncementClaims::reserve_order(),
                     verified_tip,
-                );
-            }
+                )
+            })
+        },
+        move |hash, height, reservation| {
+            block_message_claims.note_block_message(
+                hash,
+                height,
+                reservation.order,
+                reservation.verified_tip,
+                reservation.started_at,
+            )
         },
     )
 }

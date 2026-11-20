@@ -2116,7 +2116,11 @@ pub(crate) fn register_inventory_status(
         }
         Ok(Message::Block(block)) => {
             if let Some(reservation) = block.reservation() {
-                block_announcements.block_received(block.hash(), reservation);
+                block_announcements.block_received(
+                    block.hash(),
+                    block.coinbase_height(),
+                    reservation,
+                );
             }
         }
         // A request for the body or a missing response contradicts an earlier announcement.

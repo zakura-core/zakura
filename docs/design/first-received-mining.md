@@ -50,14 +50,17 @@ The reservation is called a claim. Six rules define it:
   the verified tip.
 - **A legacy `block` message claims from its start.** When the 24-byte header
   of a `block` message is read, before its body arrives, the connection
-  reserves the next order and notes the time. Once the whole message has
-  passed its checksum and decoded, the block's hash is recorded with that
-  order and time, under the same height window, deadline and mined-block rules
-  as an `inv`. The deadline counts from the message start. A message that
-  fails its checksum or decode records nothing, and its unused order is only a
-  gap: orders are compared, never counted. This applies to every `block`
-  message, requested or pushed, because the earlier claim always wins and the
-  height window excludes catch-up blocks.
+  reserves the next order and notes the time and the verified tip. Once the
+  whole message has passed its checksum and decoded, a block whose coinbase
+  height is one or two above that tip is recorded with that order and time,
+  under the same deadline, floor and mined-block rules as an `inv`. The
+  deadline counts from the message start, and the window uses the tip at the
+  start, so a rival committed while the block arrives does not push it out.
+  Other blocks, such as those fetched during catch-up, record nothing. A
+  message that fails its checksum or decode records nothing either, and its
+  unused order is only a gap: orders are compared, never counted. This
+  applies to every `block` message, requested or pushed, because the earlier
+  claim always wins.
 
   Without it, a miner's own neighbours could switch to a rival. A Zakura miner
   pushes the full block to its first peers before its `inv`, so they had no
@@ -75,10 +78,12 @@ The reservation is called a claim. Six rules define it:
 - **Each block keeps its earliest claim of each kind, and neither is
   renewed.** A header claim, once made, is never replaced or renewed by
   delivering the header again. An `inv` for a block that already has a header
-  claim or a legacy record records nothing. A `block` message records its
-  start only if no header claim or legacy record of the block has an earlier
-  order, so a block is never ranked behind an announcement that arrived while
-  its body was still arriving, and a later delivery cannot move it back.
+  claim or a legacy record records nothing. A `block` message replaces a
+  legacy record only if it reserved an earlier order, so a block is never
+  ranked behind an announcement that arrived while its body was still
+  arriving, and a later delivery cannot move it back. It is recorded even
+  next to an earlier header claim, so it still applies if that header's apply
+  fails.
   Reading a claim does not use it up, so an invalid body under the same hash
   cannot take it. A body whose block holds both kinds takes the earlier order
   among those still in force, so a legacy record never makes the outcome worse
@@ -95,10 +100,12 @@ The reservation is called a claim. Six rules define it:
   The legacy store, shared by `inv`s and `block` messages, holds 512 blocks. Entries older than 4 seconds, twice the
   body deadline, are dropped when a new block is recorded, so a late body is
   still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 4 `inv`s and 4 `block` messages per
-  2 seconds to the store, leaving room for both blocks in a tip race and for
-  repeated or bunched announcements. The two are limited separately, so
-  blocks a peer serves during catch-up cannot use up its next announcement. One connection cannot fill the store. A sustained flood can
+  Each legacy connection passes at most 4 `inv`s and 4 near-tip `block`
+  messages per 2 seconds to the store, leaving room for both blocks in a tip
+  race and for repeated or bunched announcements. The two are limited
+  separately, and blocks outside the height window are neither recorded nor
+  counted, so blocks a peer serves during catch-up cannot use up its next
+  announcement. One connection cannot fill the store. A sustained flood can
   at worst return blocks to arrival order. An announcement after its entry was
   dropped counts as a new sighting, which gives a withholder nothing it could
   not get by announcing late.

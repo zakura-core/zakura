@@ -151,8 +151,8 @@ impl ClaimTable {
 /// Header sync creates claims with [`AnnouncementClaims::begin`], legacy block `inv`s with
 /// [`AnnouncementClaims::note_announcement`], legacy `block` messages with
 /// [`AnnouncementClaims::note_block_message`], and the block verifier reads them by block hash,
-/// so every body transport follows the same rule. A claim, once made, is never renewed, and is
-/// only replaced by a `block` message that reserved an earlier order.
+/// so every body transport follows the same rule. A claim, once made, is never renewed. A
+/// legacy one is only replaced by a `block` message that reserved an earlier order.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
@@ -276,20 +276,25 @@ impl AnnouncementClaims {
     /// still arriving gets a later order. Pass it to [`AnnouncementClaims::note_block_message`]
     /// once the message is complete. A reservation that is never noted leaves an unused order,
     /// which is harmless because orders are only compared.
-    pub fn reserve_order(&self) -> u64 {
+    pub fn reserve_order() -> u64 {
         order::next()
     }
 
-    /// Records that a legacy `block` message carrying `hash` arrived complete, after reserving
-    /// `reserved_order` with [`AnnouncementClaims::reserve_order`] when it started arriving at
-    /// `started_at`. Raises the verified tip to `verified_tip` as
-    /// [`AnnouncementClaims::begin`] does.
+    /// Records that a legacy `block` message carrying `hash`, with coinbase height `height`,
+    /// arrived complete. When it started arriving at `started_at`, it reserved `reserved_order`
+    /// with [`AnnouncementClaims::reserve_order`], and the verified tip was `tip_at_start`.
     ///
-    /// The block keeps the earliest of this reservation, its first `inv` and its header claim,
-    /// so its own body never ranks it behind an announcement made after the message started.
-    /// The body takes the reserved order under the same rules as an `inv`: it must reach the
-    /// verifier within the deadline counted from `started_at`, its height must be one or two
-    /// above the tip, and no block this node mined at that height outranks it.
+    /// Returns whether the block was one or two above `tip_at_start`. Only such a block is
+    /// looked up or recorded, so callers can limit just those calls, and the many blocks
+    /// fetched during catch-up cost nothing here.
+    ///
+    /// The block keeps the earliest of this reservation and its first `inv`, so its own body
+    /// never ranks it behind an announcement made after the message started. Its body takes
+    /// the reserved order under the same rules as an `inv`: it must reach the verifier within
+    /// the deadline counted from `started_at`, the highest tip seen since the start must not
+    /// have passed its height, and no block this node mined at that height outranks it. The
+    /// window is checked against the tip at the start, so a rival committed while this block
+    /// was arriving does not push it out.
     ///
     /// No header check is needed here: the message passed its payload checksum, so its sender
     /// held the whole block, proof of work included, when the message started. The order only
@@ -297,15 +302,17 @@ impl AnnouncementClaims {
     pub fn note_block_message(
         &self,
         hash: block::Hash,
+        height: Option<block::Height>,
         reserved_order: u64,
+        tip_at_start: block::Height,
         started_at: Instant,
-        verified_tip: block::Height,
-    ) {
+    ) -> bool {
         self.note_block_message_at(
             hash,
+            height,
             reserved_order,
+            tip_at_start,
             started_at,
-            verified_tip,
             Instant::now(),
         )
     }
@@ -313,35 +320,28 @@ impl AnnouncementClaims {
     pub(super) fn note_block_message_at(
         &self,
         hash: block::Hash,
+        height: Option<block::Height>,
         reserved_order: u64,
+        tip_at_start: block::Height,
         started_at: Instant,
-        verified_tip: block::Height,
         now: Instant,
-    ) {
-        let mut table = self.table();
-        table.raise_floor(verified_tip);
-        // A header claim with an earlier order already outranks this reservation.
-        if table
-            .by_hash
-            .get(&hash)
-            .is_some_and(|claim| claim.order < reserved_order)
-        {
-            return;
+    ) -> bool {
+        if !height.is_some_and(|height| in_claim_window(height, tip_at_start)) {
+            return false;
         }
-        let tip_at_announcement = table.floor;
-        let noted = table.announced.note_block_message(
-            hash,
-            tip_at_announcement,
-            reserved_order,
-            started_at,
-            now,
-        );
+        let mut table = self.table();
+        table.raise_floor(tip_at_start);
+        let noted =
+            table
+                .announced
+                .note_block_message(hash, tip_at_start, reserved_order, started_at, now);
         drop(table);
 
         if !noted {
             metrics::counter!("sync.block.announcement_claim.refused", "source" => "block")
                 .increment(1);
         }
+        true
     }
 
     /// Records that the locally mined block `hash` at `height` took `order`, so that a rival's

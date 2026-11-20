@@ -283,8 +283,9 @@ pub struct Builder {
     reserve_block_order: Option<ReserveBlockOrder>,
 }
 
-/// Reserves a place in the node's block receipt order, returning the order.
-pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> u64 + Send + Sync>;
+/// Reserves a place in the node's block receipt order, returning the order and the node's
+/// verified tip, or `None` if the node cannot rank blocks yet.
+pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> Option<(u64, block::Height)> + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -399,7 +400,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } => b"block\0\0\0\0\0\0\0",
+            Block { .. } => BLOCK_COMMAND,
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -739,10 +740,13 @@ impl Decoder for Codec {
                     // Reserve before waiting for the body, so a rival announced while this
                     // block arrives ranks behind it.
                     let reservation = match &self.builder.reserve_block_order {
-                        Some(reserve) if command == *BLOCK_COMMAND => Some(BlockReservation {
-                            order: reserve(),
-                            started_at: Instant::now(),
-                        }),
+                        Some(reserve) if command == *BLOCK_COMMAND => {
+                            reserve().map(|(order, verified_tip)| BlockReservation {
+                                order,
+                                verified_tip,
+                                started_at: Instant::now(),
+                            })
+                        }
                         _ => None,
                     };
 

@@ -34,6 +34,8 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 pub struct BlockReservation {
     /// The receipt order the node reserved.
     pub order: u64,
+    /// The node's verified tip when the order was reserved.
+    pub verified_tip: block::Height,
     /// When the message's header was read.
     pub started_at: Instant,
 }

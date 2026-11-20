@@ -38,9 +38,6 @@ impl AnnouncementClaims {
             }
         };
 
-        // A legacy announcement is only recorded while the hash has no header claim with an
-        // earlier order. When both are present the legacy reservation therefore has the
-        // earlier order.
         let announced = height
             .zip(table.announced.get(hash))
             .filter(|(height, announced)| {
@@ -49,10 +46,6 @@ impl AnnouncementClaims {
             .map_or(Unclaimed, |(height, announced)| {
                 classify(announced.source, height, announced.order, announced.seen_at)
             });
-        if matches!(announced, Used { .. }) {
-            return announced;
-        }
-
         let Some(header) = table.by_hash.get(&hash) else {
             return announced;
         };
@@ -62,7 +55,20 @@ impl AnnouncementClaims {
             header.order,
             header.seen_at,
         );
+        // A `block` message can record a legacy reservation later than a header claim, so
+        // when both are usable the earlier order wins.
         match (announced, header) {
+            (
+                Used {
+                    order: legacy_order,
+                    ..
+                },
+                Used {
+                    order: header_order,
+                    ..
+                },
+            ) if header_order < legacy_order => header,
+            (Used { .. }, _) => announced,
             (_, Used { .. }) | (Unclaimed, _) => header,
             _ => announced,
         }
@@ -76,7 +82,8 @@ pub(in crate::block::receipt) enum ClaimSource {
     Header,
     /// A legacy peer sent the first `inv` for the block.
     Inv,
-    /// A legacy `block` message carrying the block started arriving before any `inv` for it.
+    /// A legacy `block` message carrying the block, counted from when it started arriving,
+    /// holds the earliest legacy reservation. It need not have been pushed or preceded an `inv`.
     BlockMessage,
 }
 

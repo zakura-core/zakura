@@ -1394,17 +1394,22 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
     assert_eq!(count(), 9, "a new window allows four more announcements");
 }
 
-/// A completed `block` message that reserved an order reaches the hook with its reservation,
-/// at most four times per connection per window, without using up the `inv` allowance. A
-/// message without a reservation, or one that failed to decode, does not reach it.
+/// A completed `block` message that reserved an order reaches the hook with its height and
+/// reservation. Only calls the hook reports as near the tip count against the connection's
+/// four per window, separately from the `inv` allowance. A message without a reservation, or
+/// one that failed to decode, does not reach it.
 #[tokio::test(start_paused = true)]
 async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = received.clone();
     let (hook, announced) = recording_hook();
+    // The hook reports odd orders as near the tip.
     let hook = hook.with_block_messages(
         || unreachable!("only the codec reserves"),
-        move |hash, reservation| recorded.lock().unwrap().push((hash, reservation)),
+        move |hash, height, reservation: BlockReservation| {
+            recorded.lock().unwrap().push((hash, height, reservation));
+            reservation.order % 2 == 1
+        },
     );
     let mut connection = hook.for_connection();
     let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1412,6 +1417,7 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
         .expect("block test vector should deserialize");
     let reservation = |order| BlockReservation {
         order,
+        verified_tip: block::Height(0),
         started_at: tokio::time::Instant::now(),
     };
     let deliver = |connection: &mut ConnectionAnnouncements,
@@ -1430,7 +1436,14 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
             HashedBlock::from(block.clone()).with_reservation(order.map(reservation)),
         ))
     };
-    let count = || received.lock().unwrap().len();
+    let orders = || -> Vec<u64> {
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, reservation)| reservation.order)
+            .collect()
+    };
 
     let _ = deliver(&mut connection, block_message(None));
     let _ = deliver(
@@ -1438,21 +1451,21 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
         Err(SerializationError::Parse("bad checksum")),
     );
     assert_eq!(
-        count(),
-        0,
+        orders(),
+        [0; 0],
         "only a decoded block with a reservation is passed on"
     );
 
-    for order in 1..=5 {
+    for order in 1..=10 {
         deliver(&mut connection, block_message(Some(order))).expect("passed through");
     }
     assert_eq!(
-        *received.lock().unwrap(),
-        (1..=4)
-            .map(|order| (block.hash(), reservation(order)))
-            .collect::<Vec<_>>(),
-        "the fifth block message in the window does not reach the hook",
+        orders(),
+        (1..=7).collect::<Vec<_>>(),
+        "blocks the hook reports as far from the tip do not use the allowance",
     );
+    let (hash, height, _) = received.lock().unwrap()[0];
+    assert_eq!((hash, height), (block.hash(), block.coinbase_height()));
 
     deliver(
         &mut connection,
@@ -1466,8 +1479,8 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
     );
 
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    deliver(&mut connection, block_message(Some(6))).expect("passed through");
-    assert_eq!(count(), 5, "a new window allows more block messages");
+    deliver(&mut connection, block_message(Some(11))).expect("passed through");
+    assert_eq!(orders().len(), 8, "a new window allows more block messages");
 }
 
 /// A hook that records the hashes it is called with.

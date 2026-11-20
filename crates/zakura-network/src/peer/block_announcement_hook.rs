@@ -15,8 +15,8 @@ use crate::protocol::external::{BlockReservation, ReserveBlockOrder};
 ///
 /// Four calls leave room for both blocks in a tip race and for repeated or bunched
 /// announcements, while bounding one connection's share of the hook's work. `inv`s and `block`
-/// messages are limited separately, so blocks a peer serves during catch-up cannot use up the
-/// calls for its next announcement.
+/// messages are limited separately, and only `block` messages the hook reports as near the tip
+/// count, so blocks a peer serves during catch-up cannot use up its next announcement.
 const MAX_ANNOUNCEMENTS_PER_WINDOW: u32 = 4;
 
 /// The window [`MAX_ANNOUNCEMENTS_PER_WINDOW`] applies to.
@@ -37,7 +37,8 @@ pub struct BlockAnnouncementHook {
 #[derive(Clone)]
 struct BlockMessageHook {
     reserve: ReserveBlockOrder,
-    received: Arc<dyn Fn(block::Hash, BlockReservation) + Send + Sync>,
+    received:
+        Arc<dyn Fn(block::Hash, Option<block::Height>, BlockReservation) -> bool + Send + Sync>,
 }
 
 impl BlockAnnouncementHook {
@@ -52,17 +53,22 @@ impl BlockAnnouncementHook {
     }
 
     /// Also calls `reserve` when the header of each received `block` message is read, and
-    /// `received` with the block's hash and that reservation once the whole message has passed
-    /// its checksum and decoded. A message that fails either is not passed on, so its
-    /// reservation goes unused.
+    /// `received` with the block's hash, coinbase height and that reservation once the whole
+    /// message has passed its checksum and decoded. A message that fails either is not passed
+    /// on, so its reservation goes unused.
     ///
-    /// Every `block` message reserves, whether it was requested or pushed, but `received` is
-    /// limited per connection like announcements. Both run on the connection's inbound path, so
-    /// they must return quickly.
+    /// `reserve` returns the reserved order and the node's verified tip, or `None` if the node
+    /// cannot rank blocks yet. `received` returns whether the block was near enough to the tip
+    /// to need a claim. Every `block` message reserves, whether it was requested or pushed, but
+    /// the calls to `received` that return `true` are limited per connection like
+    /// announcements. Both run on the connection's inbound path, so they must return quickly.
     pub fn with_block_messages(
         mut self,
-        reserve: impl Fn() -> u64 + Send + Sync + 'static,
-        received: impl Fn(block::Hash, BlockReservation) + Send + Sync + 'static,
+        reserve: impl Fn() -> Option<(u64, block::Height)> + Send + Sync + 'static,
+        received: impl Fn(block::Hash, Option<block::Height>, BlockReservation) -> bool
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.block_messages = Some(BlockMessageHook {
             reserve: Arc::new(reserve),
@@ -120,26 +126,33 @@ impl ConnectionAnnouncements {
         let Some(hook) = &self.hook.announced else {
             return;
         };
-        if self.announcement_window.admit(Instant::now()) {
+        self.announcement_window.call(Instant::now(), || {
             hook(hash);
-        }
+            true
+        });
     }
 
-    /// Passes the block `hash`, received in a `block` message that reserved `reservation`, to
-    /// the hook, unless this connection has used its share of the current window.
-    pub(crate) fn block_received(&mut self, hash: block::Hash, reservation: BlockReservation) {
+    /// Passes the block `hash` at coinbase `height`, received in a `block` message that
+    /// reserved `reservation`, to the hook, unless this connection has used its share of the
+    /// current window.
+    pub(crate) fn block_received(
+        &mut self,
+        hash: block::Hash,
+        height: Option<block::Height>,
+        reservation: BlockReservation,
+    ) {
         let Some(block_messages) = &self.hook.block_messages else {
             return;
         };
-        if self.block_message_window.admit(Instant::now()) {
-            (block_messages.received)(hash, reservation);
-        }
+        self.block_message_window.call(Instant::now(), || {
+            (block_messages.received)(hash, height, reservation)
+        });
     }
 }
 
 impl Window {
-    /// Counts a call at `now`, returning whether it fits in the window.
-    fn admit(&mut self, now: Instant) -> bool {
+    /// Runs `call` at `now` if it fits in the window, and counts it if it returns `true`.
+    fn call(&mut self, now: Instant, call: impl FnOnce() -> bool) {
         let expired = self
             .started
             .is_none_or(|started| now.saturating_duration_since(started) >= ANNOUNCEMENT_WINDOW);
@@ -148,9 +161,10 @@ impl Window {
             self.calls = 0;
         }
         if self.calls >= MAX_ANNOUNCEMENTS_PER_WINDOW {
-            return false;
+            return;
         }
-        self.calls += 1;
-        true
+        if call() {
+            self.calls += 1;
+        }
     }
 }

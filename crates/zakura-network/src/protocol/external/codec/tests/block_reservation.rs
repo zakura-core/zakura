@@ -8,13 +8,16 @@ use crate::protocol::external::InventoryHash;
 /// The first order [`reserving_codec`] hands out.
 const FIRST_ORDER: u64 = 100;
 
+/// The verified tip [`reserving_codec`] reports.
+const TIP: block::Height = block::Height(7);
+
 /// A codec after its handshake that reserves increasing orders, and a count of its
 /// reservations.
 fn reserving_codec() -> (Codec, Arc<AtomicU64>) {
     let reserved = Arc::new(AtomicU64::new(0));
     let counter = reserved.clone();
     let reserve: ReserveBlockOrder =
-        Arc::new(move || FIRST_ORDER + counter.fetch_add(1, Ordering::Relaxed));
+        Arc::new(move || Some((FIRST_ORDER + counter.fetch_add(1, Ordering::Relaxed), TIP)));
     let mut codec = Codec::builder()
         .with_block_order_reservation(Some(reserve))
         .finish();
@@ -71,6 +74,7 @@ fn a_block_message_reserves_its_order_when_its_header_is_read() {
         .reservation()
         .expect("the decoded block carries its reservation");
     assert_eq!(reservation.order, FIRST_ORDER);
+    assert_eq!(reservation.verified_tip, TIP);
     assert!(
         (before_header..=after_header).contains(&reservation.started_at),
         "the start is when the header was read",
@@ -101,14 +105,20 @@ fn only_block_messages_reserve_an_order() {
     }
     assert_eq!(reserved.load(Ordering::Relaxed), 0);
 
-    // A codec without a reservation function decodes blocks without one.
-    let mut codec = Codec::builder().finish();
-    codec.reconfigure_full_body_len();
-    let mut src = frame(Message::Block(block.into()));
-    let Some(Message::Block(received)) = codec.decode(&mut src).expect("block decodes") else {
-        panic!("a block frame decodes to a block message");
-    };
-    assert_eq!(received.reservation(), None);
+    // A codec without a reservation function, or whose node cannot rank blocks yet, decodes
+    // blocks without one.
+    let no_tip: ReserveBlockOrder = Arc::new(|| None);
+    for reserve in [None, Some(no_tip)] {
+        let mut codec = Codec::builder()
+            .with_block_order_reservation(reserve)
+            .finish();
+        codec.reconfigure_full_body_len();
+        let mut src = frame(Message::Block(block.clone().into()));
+        let Some(Message::Block(received)) = codec.decode(&mut src).expect("block decodes") else {
+            panic!("a block frame decodes to a block message");
+        };
+        assert_eq!(received.reservation(), None);
+    }
 }
 
 #[test]

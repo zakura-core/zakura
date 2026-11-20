@@ -37,8 +37,8 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 pub struct HashedBlock {
     hash: block::Hash,
     block: BlockHandle,
-    /// The receipt order reserved when this message started arriving, if it was received from a
-    /// connection that reserves them.
+    /// The receipt order reserved for this block when its header arrived, if it was received
+    /// from a connection that reserves them.
     reservation: Option<BlockReservation>,
 }
 
@@ -57,14 +57,15 @@ impl HashedBlock {
         self.hash
     }
 
-    /// The receipt order reserved when this message started arriving, if one was.
+    /// The receipt order reserved for this block when its header arrived, if one was.
     pub fn reservation(&self) -> Option<BlockReservation> {
         self.reservation
     }
 
-    /// This block, received in a message that reserved `reservation` when it started arriving.
+    /// This block, received in a message that reserved `reservation` when its block header
+    /// arrived. A reservation made for another block's hash is dropped.
     pub(crate) fn with_reservation(mut self, reservation: Option<BlockReservation>) -> Self {
-        self.reservation = reservation;
+        self.reservation = reservation.filter(|reservation| reservation.hash == self.hash);
         self
     }
 

@@ -2096,8 +2096,8 @@ fn serialization_error_metric_label(error: &SerializationError) -> &'static str 
 ///
 /// An `inv` that names exactly one block is a new block announcement, and is passed to
 /// `block_announcements` and written to `gossip_trace`. One that names several is the answer to
-/// a query. A `block` message whose codec reserved a receipt order when it started arriving is
-/// also passed to `block_announcements`.
+/// a query. A `block` message whose codec reserved a receipt order when its block header arrived
+/// is also passed to `block_announcements`.
 pub(crate) fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
@@ -2116,11 +2116,7 @@ pub(crate) fn register_inventory_status(
         }
         Ok(Message::Block(block)) => {
             if let Some(reservation) = block.reservation() {
-                block_announcements.block_received(
-                    block.hash(),
-                    block.coinbase_height(),
-                    reservation,
-                );
+                block_announcements.block_received(block.coinbase_height(), reservation);
             }
         }
         // A request for the body or a missing response contradicts an earlier announcement.

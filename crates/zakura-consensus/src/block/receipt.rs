@@ -1,8 +1,8 @@
 //! Receipt priority for concurrent deliveries of complete blocks.
 //!
 //! A complete body that reaches the verifier normally draws a new order. A native header,
-//! a single-block legacy inventory announcement, or the start of a legacy block transfer can
-//! reserve an earlier place. The verifier picks the earliest eligible reservation still within
+//! a single-block legacy inventory announcement, or the block header at the start of a legacy
+//! block transfer can reserve an earlier place. The verifier picks the earliest eligible reservation still within
 //! its deadline. Reading a claim leaves it available to other bodies under the same hash.
 //!
 //! - `claims`: header, inventory and transfer reservations, their deadline, and locally mined

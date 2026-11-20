@@ -72,8 +72,8 @@ pub(in crate::block::receipt) enum ClaimSource {
     Header,
     /// A legacy peer sent the first `inv` for the block.
     Inv,
-    /// A legacy `block` message carrying the block, counted from when it started arriving,
-    /// holds the earliest legacy reservation. It need not have been pushed or preceded an `inv`.
+    /// A legacy `block` message carrying the block, counted from when its block header
+    /// arrived, holds the earliest legacy reservation. It need not have been pushed or preceded an `inv`.
     BlockMessage,
 }
 

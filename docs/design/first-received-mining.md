@@ -15,8 +15,8 @@ A block's receipt order is drawn when its complete body reaches the full-block
 verifier. A block announced first keeps the order reserved for that
 announcement instead, provided its body reaches the verifier within a fixed
 deadline. A block is announced when native header sync admits its header,
-when a legacy peer sends the first `inv` for it, or when a legacy `block`
-message carrying it starts arriving.
+when a legacy peer sends the first `inv` for it, or when the block header at
+the start of a legacy `block` message carrying it arrives.
 
 Without this, a block full of transactions can lose an equal-work race to an
 empty block announced later, because the larger body takes longer to transfer.
@@ -48,15 +48,16 @@ The reservation is called a claim. Six rules define it:
   once the highest verified tip passes the body's height. On a node
   without native header sync, the best chain tip at `inv` time stands in for
   the verified tip.
-- **A legacy `block` message claims from its start.** When the 24-byte header
-  of a `block` message is read, before its body arrives, the connection
-  reserves the next order and notes the time, current tip, and highest tip seen. Once the
-  whole message has passed its checksum and decoded, a block whose coinbase
-  height is one or two above the starting tip and strictly above the floor
-  at that time is recorded with that order and time,
+- **A legacy `block` message claims from its block header.** The block
+  header is the first 1,487 bytes of the message body. When it has arrived,
+  before the transactions, the connection hashes it, reserves the next order
+  for that hash, and notes the time, current tip, and highest tip seen. Once
+  the whole message has passed its checksum and decoded, a block whose
+  coinbase height is one or two above the starting tip and strictly above the
+  floor at that time is recorded under that hash with that order and time,
   under the same deadline, floor and mined-block rules as an `inv`. The
-  deadline counts from the message start, and the window uses the tip at the
-  start, so a rival committed while the block arrives does not push it out.
+  deadline counts from the reservation, and the window uses the tip at that
+  time, so a rival committed while the block arrives does not push it out.
   Other blocks, such as those fetched during catch-up, record nothing. A
   message that fails its checksum or decode records nothing either, and its
   unused order is only a gap: orders are compared, never counted. This
@@ -70,10 +71,15 @@ The reservation is called a claim. Six rules define it:
   0.8 s of transfer, the miner's neighbour kept the miner's block in 0 of 10
   races with claims on, and 10 of 10 with claims off.
 
-  The reservation gives the block credit for when this node first observed
-  the transfer. The body must reach the verifier within two seconds of the
-  receiver reading the message header. Only a fully verified block can use
-  that credit in an equal-work tie.
+  This is as safe as an `inv` claim, for the same reason. The reservation is
+  made for one block hash, read from header bytes the node already holds, and
+  is never used for another. The hash of a valid block cannot be known before
+  its proof of work is done, so a peer cannot reserve a place and fill it in
+  with a block it mines later. The 24-byte message header would not be
+  enough: it ties the message to its body only by a four-byte checksum, which
+  a sender can match by padding a later block. The body must reach the
+  verifier within two seconds of the reservation, and only a fully verified
+  block can use the place in an equal-work tie.
 - **The verifier chooses the earliest eligible claim when the body arrives.**
   The first native header, the first single-block `inv`, and each admitted
   block transfer retain their own order and deadline. Repeated headers and

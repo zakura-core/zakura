@@ -26,9 +26,9 @@ fn receive(
     now: Instant,
 ) {
     assert!(claims.note_block_message_at(
-        hash,
         Some(CLAIMED),
         BlockReservation {
+            hash,
             order: reserved,
             verified_tip: TIP,
             floor: TIP,
@@ -190,7 +190,7 @@ fn only_block_messages_just_above_the_tip_at_their_start_are_recorded() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();
     let note = |index, height: Option<block::Height>| {
-        claims.note_block_message_at(hash(index), height, claims.reserve_block_message(TIP), now)
+        claims.note_block_message_at(height, claims.reserve_block_message(hash(index), TIP), now)
     };
 
     for (index, height) in [None, Some(99), Some(100), Some(103), Some(5_000)]
@@ -356,14 +356,14 @@ async fn verifier_uses_the_later_sighting_after_the_earlier_deadline() {
                 claims.note_announcement(hash, TIP);
                 None
             }
-            BlockMessage => Some(claims.reserve_block_message(TIP)),
+            BlockMessage => Some(claims.reserve_block_message(hash, TIP)),
         };
         let first_transfer = observe(first);
         tokio::time::advance(Duration::from_millis(1500)).await;
         let second_transfer = observe(second);
         tokio::time::advance(Duration::from_millis(450)).await;
         for transfer in [first_transfer, second_transfer].into_iter().flatten() {
-            assert!(claims.note_block_message(hash, Some(CLAIMED), transfer));
+            assert!(claims.note_block_message(Some(CLAIMED), transfer));
         }
         let (source, early) = used(&claims, hash, CLAIMED, Instant::now()).unwrap();
         assert_eq!(source, first);
@@ -380,12 +380,12 @@ async fn verifier_uses_the_later_sighting_after_the_earlier_deadline() {
 #[test]
 fn a_rollback_distinguishes_new_transfers_from_those_already_in_flight() {
     let claims = AnnouncementClaims::default();
-    let in_flight = claims.reserve_block_message(TIP);
+    let in_flight = claims.reserve_block_message(hash(1), TIP);
     claims.note_announcement(hash(5), CLAIMED);
     // Same current best tip for both transfers; only the second started after the rollback.
-    let after_rollback = claims.reserve_block_message(TIP);
-    assert!(claims.note_block_message(hash(1), Some(CLAIMED), in_flight));
-    assert!(!claims.note_block_message(hash(2), Some(CLAIMED), after_rollback));
+    let after_rollback = claims.reserve_block_message(hash(2), TIP);
+    assert!(claims.note_block_message(Some(CLAIMED), in_flight));
+    assert!(!claims.note_block_message(Some(CLAIMED), after_rollback));
     assert_eq!(
         used(&claims, hash(1), CLAIMED, Instant::now()),
         Some((ClaimSource::BlockMessage, in_flight.order))
@@ -393,7 +393,7 @@ fn a_rollback_distinguishes_new_transfers_from_those_already_in_flight() {
     assert_eq!(used(&claims, hash(2), CLAIMED, Instant::now()), None);
     // A block above the remembered floor can qualify during the rollback.
     let higher = block::Height(TIP.0 + 2);
-    assert!(claims.note_block_message(hash(3), Some(higher), claims.reserve_block_message(TIP)));
+    assert!(claims.note_block_message(Some(higher), claims.reserve_block_message(hash(3), TIP)));
     assert!(used(&claims, hash(3), higher, Instant::now()).is_some());
     assert_eq!(used(&claims, hash(3), CLAIMED, Instant::now()), None);
 }
@@ -403,8 +403,8 @@ fn an_inventory_sighting_outside_its_window_allows_an_eligible_transfer() {
     let claims = AnnouncementClaims::default();
     let height = block::Height(103);
     claims.note_announcement(hash(1), block::Height(100));
-    let transfer = claims.reserve_block_message(block::Height(101));
-    assert!(claims.note_block_message(hash(1), Some(height), transfer));
+    let transfer = claims.reserve_block_message(hash(1), block::Height(101));
+    assert!(claims.note_block_message(Some(height), transfer));
     assert_eq!(
         used(&claims, hash(1), height, Instant::now()),
         Some((ClaimSource::BlockMessage, transfer.order))
@@ -415,14 +415,12 @@ fn an_inventory_sighting_outside_its_window_allows_an_eligible_transfer() {
 async fn duplicate_transfers_share_a_bounded_budget_and_leave_room_for_inventory() {
     let claims = AnnouncementClaims::default();
     for _ in 0..MAX_ANNOUNCED_BLOCKS {
-        assert!(claims.note_block_message(
-            hash(1),
-            Some(CLAIMED),
-            claims.reserve_block_message(TIP)
-        ));
+        assert!(
+            claims.note_block_message(Some(CLAIMED), claims.reserve_block_message(hash(1), TIP))
+        );
     }
     let complete =
-        |hash| claims.note_block_message(hash, Some(CLAIMED), claims.reserve_block_message(TIP));
+        |hash| claims.note_block_message(Some(CLAIMED), claims.reserve_block_message(hash, TIP));
     assert!(
         complete(hash(2)),
         "a refused near-tip delivery counts against the connection limit"
@@ -438,5 +436,26 @@ async fn duplicate_transfers_share_a_bounded_budget_and_leave_room_for_inventory
     assert_eq!(
         used(&claims, hash(3), CLAIMED, Instant::now()).unwrap().0,
         ClaimSource::BlockMessage
+    );
+}
+
+/// A reservation names the block whose header the node held when it was made, so it cannot be
+/// handed to a block that was found afterwards.
+#[test]
+fn a_reservation_ranks_only_the_block_it_was_reserved_for() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let reservation = claims.reserve_block_message(hash(1), TIP);
+    assert_eq!(reservation.hash, hash(1));
+    assert!(claims.note_block_message_at(Some(CLAIMED), reservation, now));
+
+    assert_eq!(
+        used(&claims, hash(1), CLAIMED, now),
+        Some((ClaimSource::BlockMessage, reservation.order)),
+    );
+    assert_eq!(
+        used(&claims, hash(2), CLAIMED, now),
+        None,
+        "a later block at the same height gets no place from this reservation",
     );
 }

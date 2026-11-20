@@ -1397,8 +1397,8 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
 
 /// A completed `block` message that reserved an order reaches the hook with its height and
 /// reservation. Only calls the hook reports as near the tip count against the connection's
-/// four per window, which `inv`s share. A message without a reservation, or one that failed to
-/// decode, does not reach it.
+/// four per window, which `inv`s share. A message without a reservation, one whose reservation
+/// was made for another block, or one that failed to decode, does not reach it.
 #[tokio::test(start_paused = true)]
 async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connection() {
     let node = RecordingNode::default();
@@ -1409,6 +1409,7 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
         .zcash_deserialize_into()
         .expect("block test vector should deserialize");
     let reservation = |order| BlockReservation {
+        hash: block.hash(),
         order,
         verified_tip: block::Height(0),
         floor: block::Height(0),
@@ -1435,11 +1436,21 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, _, reservation)| reservation.order)
+            .map(|(_, reservation)| reservation.order)
             .collect()
     };
 
     let _ = deliver(&mut connection, block_message(None));
+    let for_another_block = BlockReservation {
+        hash: block::Hash([7; 32]),
+        ..reservation(1)
+    };
+    let _ = deliver(
+        &mut connection,
+        Ok(Message::Block(
+            HashedBlock::from(block.clone()).with_reservation(Some(for_another_block)),
+        )),
+    );
     let _ = deliver(
         &mut connection,
         Err(SerializationError::Parse("bad checksum")),
@@ -1447,7 +1458,7 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
     assert_eq!(
         orders(),
         [0; 0],
-        "only a decoded block with a reservation is passed on"
+        "only a decoded block with a reservation made for it is passed on"
     );
 
     // One announcement leaves three calls for near-tip blocks.
@@ -1465,8 +1476,11 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
         (1..=5).collect::<Vec<_>>(),
         "blocks the hook reports as far from the tip do not use the allowance",
     );
-    let (hash, height, _) = received.lock().unwrap()[0];
-    assert_eq!((hash, height), (block.hash(), block.coinbase_height()));
+    let (height, reserved) = received.lock().unwrap()[0];
+    assert_eq!(
+        (reserved.hash, height),
+        (block.hash(), block.coinbase_height())
+    );
 
     deliver(
         &mut connection,
@@ -1489,7 +1503,7 @@ async fn block_messages_reach_the_hook_with_their_reservation_limited_per_connec
 #[derive(Clone, Default)]
 struct RecordingNode {
     announced: Arc<std::sync::Mutex<Vec<block::Hash>>>,
-    received: Arc<std::sync::Mutex<Vec<(block::Hash, Option<block::Height>, BlockReservation)>>>,
+    received: Arc<std::sync::Mutex<Vec<(Option<block::Height>, BlockReservation)>>>,
 }
 
 impl BlockAnnouncements for RecordingNode {
@@ -1497,20 +1511,12 @@ impl BlockAnnouncements for RecordingNode {
         self.announced.lock().unwrap().push(hash);
     }
 
-    fn block_started(&self) -> Option<BlockReservation> {
+    fn block_started(&self, _hash: block::Hash) -> Option<BlockReservation> {
         unreachable!("only the codec reserves")
     }
 
-    fn block_received(
-        &self,
-        hash: block::Hash,
-        height: Option<block::Height>,
-        reservation: BlockReservation,
-    ) -> bool {
-        self.received
-            .lock()
-            .unwrap()
-            .push((hash, height, reservation));
+    fn block_received(&self, height: Option<block::Height>, reservation: BlockReservation) -> bool {
+        self.received.lock().unwrap().push((height, reservation));
         reservation.order % 2 == 1
     }
 }

@@ -31,24 +31,22 @@ pub trait BlockAnnouncements: Send + Sync {
     /// A multi-block `inv` is a reply to a query, not an announcement, so it is not passed on.
     fn announced(&self, hash: block::Hash);
 
-    /// The header of a `block` message was read, before any of its body was waited for.
+    /// The block header at the start of a `block` message arrived, before its transactions,
+    /// and hashes to `hash`.
     ///
-    /// Returns the place the node reserves for the block, or `None` if the node cannot rank
-    /// blocks yet. Every `block` message reserves, whether it was requested or pushed.
-    fn block_started(&self) -> Option<BlockReservation>;
+    /// Returns the place the node reserves for that block, or `None` if the node cannot rank
+    /// blocks yet. Every `block` message reserves, whether it was requested or pushed. The
+    /// reservation is only ever used for `hash`, so a peer cannot reserve a place before it
+    /// has the block.
+    fn block_started(&self, hash: block::Hash) -> Option<BlockReservation>;
 
     /// The `block` message that reserved `reservation` passed its checksum and decoded to the
-    /// block `hash` at coinbase `height`. A message that fails either is not passed on, so its
-    /// reservation goes unused.
+    /// block it was reserved for, at coinbase `height`. A message that fails either is not
+    /// passed on, so its reservation goes unused.
     ///
     /// Returns whether the block was near enough to the tip to need a claim. The calls that
     /// return `true` share each connection's announcement allowance.
-    fn block_received(
-        &self,
-        hash: block::Hash,
-        height: Option<block::Height>,
-        reservation: BlockReservation,
-    ) -> bool;
+    fn block_received(&self, height: Option<block::Height>, reservation: BlockReservation) -> bool;
 }
 
 /// The node's [`BlockAnnouncements`], shared by every legacy connection. The default hook does
@@ -62,11 +60,11 @@ impl BlockAnnouncementHook {
         Self(Some(Arc::new(node)))
     }
 
-    /// The function a connection's codec calls when a `block` message starts arriving, if this
-    /// hook is set.
+    /// The function a connection's codec calls when the block header of a `block` message has
+    /// arrived, if this hook is set.
     pub(crate) fn block_order_reservation(&self) -> Option<ReserveBlockOrder> {
         let node = self.0.clone()?;
-        Some(Arc::new(move || node.block_started()))
+        Some(Arc::new(move |hash| node.block_started(hash)))
     }
 
     /// This hook as one connection uses it, limited per connection.
@@ -113,21 +111,19 @@ impl ConnectionAnnouncements {
         });
     }
 
-    /// Passes the block `hash` at coinbase `height`, received in a `block` message that
-    /// reserved `reservation`, to the hook, unless this connection has used its share of the
+    /// Passes the block at coinbase `height`, received in a `block` message that reserved
+    /// `reservation` for it, to the hook, unless this connection has used its share of the
     /// current window.
     pub(crate) fn block_received(
         &mut self,
-        hash: block::Hash,
         height: Option<block::Height>,
         reservation: BlockReservation,
     ) {
         let Some(node) = &self.hook.0 else {
             return;
         };
-        self.window.call(Instant::now(), || {
-            node.block_received(hash, height, reservation)
-        });
+        self.window
+            .call(Instant::now(), || node.block_received(height, reservation));
     }
 }
 

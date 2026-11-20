@@ -282,9 +282,10 @@ pub struct Builder {
     reserve_block_order: Option<ReserveBlockOrder>,
 }
 
-/// Reserves a place in the node's block receipt order, or returns `None` if the node does not
-/// reserve one for this message.
-pub(crate) type ReserveBlockOrder = Arc<dyn Fn() -> Option<BlockReservation> + Send + Sync>;
+/// Reserves a place in the node's block receipt order for the block with this hash, or returns
+/// `None` if the node does not reserve one for this message.
+pub(crate) type ReserveBlockOrder =
+    Arc<dyn Fn(block::Hash) -> Option<BlockReservation> + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -343,11 +344,14 @@ impl Builder {
         self
     }
 
-    /// Call `reserve_block_order` when the header of each received `block` message is read,
-    /// and carry the reservation on the decoded block. Does nothing if it is `None`.
+    /// Call `reserve_block_order` with the block hash once the block header of each received
+    /// `block` message has arrived, and carry the reservation on the decoded block. Does
+    /// nothing if it is `None`.
     ///
-    /// Reserving at the header, before the body arrives, lets a large block rank ahead of
-    /// announcements that arrive while it is still being received.
+    /// Reserving at the block header, before the transactions arrive, lets a large block rank
+    /// ahead of announcements that arrive while it is still being received. Waiting for the
+    /// block header, not just the message header, ties the reservation to a block that already
+    /// exists.
     pub(crate) fn with_block_order_reservation(
         mut self,
         reserve_block_order: Option<ReserveBlockOrder>,
@@ -652,7 +656,9 @@ enum DecodeState {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
-        /// The receipt order reserved when a `block` message's header was read.
+        /// Whether this is a `block` message that has not yet been offered a receipt order.
+        reserve_pending: bool,
+        /// The receipt order reserved for a `block` message once its block header arrived.
         reservation: Option<BlockReservation>,
     },
 }
@@ -665,12 +671,14 @@ impl fmt::Debug for DecodeState {
                 body_len,
                 command,
                 checksum,
+                reserve_pending,
                 reservation,
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
                 .field("command", &String::from_utf8_lossy(command))
                 .field("checksum", &checksum)
+                .field("reserve_pending", &reserve_pending)
                 .field("reservation", &reservation)
                 .finish(),
         }
@@ -691,6 +699,7 @@ impl Decoder for Codec {
         // `max_len`, and one call only discards bytes already buffered, so the work
         // per call stays bounded without a separate count.
         'messages: loop {
+            self.reserve_block_order(src);
             match self.state {
                 DecodeState::Head => {
                     // First check that the src buffer contains an entire header.
@@ -736,18 +745,13 @@ impl Decoder for Codec {
                     // Reserve buffer space for the next arriving bytes, not the claimed body.
                     src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
-                    // Reserve before waiting for the body, so a rival announced while this
-                    // block arrives ranks behind it.
-                    let reservation = match &self.builder.reserve_block_order {
-                        Some(reserve) if command == *BLOCK_COMMAND => reserve(),
-                        _ => None,
-                    };
-
                     self.state = DecodeState::Body {
                         body_len,
                         command,
                         checksum,
-                        reservation,
+                        reserve_pending: command == *BLOCK_COMMAND
+                            && self.builder.reserve_block_order.is_some(),
+                        reservation: None,
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -758,6 +762,7 @@ impl Decoder for Codec {
                     command,
                     checksum,
                     reservation,
+                    ..
                 } => {
                     if src.len() < body_len {
                         // Need to wait for the full body
@@ -1060,6 +1065,42 @@ impl Codec {
 
     fn read_getaddr<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
         Ok(Message::GetAddr)
+    }
+
+    /// Offers the node a receipt order for the `block` message being received, once the first
+    /// bytes of its body, which are the block header, are in `src`. Does nothing for other
+    /// messages, and runs at most once per message however slowly the bytes arrive.
+    ///
+    /// The order is reserved for that header's hash and no other. A peer therefore cannot
+    /// reserve a place and fill it in with a block mined later: the hash of a valid block is
+    /// not known before its proof of work is done. The message header alone would not do,
+    /// because its four-byte checksum can be matched by padding a later block.
+    ///
+    /// Regtest headers are shorter than [`block::MAX_SERIALIZED_HEADER_BYTES`], so a Regtest
+    /// block smaller than that reserves when its whole body has arrived.
+    fn reserve_block_order(&mut self, src: &BytesMut) {
+        let DecodeState::Body {
+            body_len,
+            reserve_pending,
+            reservation,
+            ..
+        } = &mut self.state
+        else {
+            return;
+        };
+        if !*reserve_pending || src.len() < (*body_len).min(block::MAX_SERIALIZED_HEADER_BYTES) {
+            return;
+        }
+        *reserve_pending = false;
+
+        let Some(reserve) = &self.builder.reserve_block_order else {
+            return;
+        };
+        // A body that does not start with a block header reserves nothing. Decoding the whole
+        // message reports the error.
+        if let Ok(header) = block::Header::zcash_deserialize(&src[..]) {
+            *reservation = reserve(header.hash());
+        }
     }
 
     fn read_block(

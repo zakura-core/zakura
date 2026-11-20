@@ -1,8 +1,8 @@
 //! Claims on receipt order made when a block is announced, and the deadline for its body.
 //!
 //! A block is announced when native header sync admits its header, when a legacy peer first
-//! sends an `inv` for it, or when a legacy `block` message carrying it starts arriving. The
-//! `announced` child holds the legacy sightings.
+//! sends an `inv` for it, or when the block header at the start of a legacy `block` message
+//! carrying it arrives. The `announced` child holds the legacy sightings.
 
 use std::{
     collections::HashMap,
@@ -264,15 +264,26 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Reserves an order when the receiver reads the 24-byte legacy block message header.
+    /// Reserves an order for the block `hash` once the receiver holds its header, the first
+    /// bytes of a legacy `block` message, and before the rest of the block arrives.
+    ///
+    /// The reservation is for `hash` alone. As with an `inv`, no header check is needed: a
+    /// valid block hash cannot exist before its proof of work, so a place cannot be reserved
+    /// for a block that is mined later.
+    ///
     /// Snapshot the floor together with the order: a rollback before the transfer and a rival
     /// advancing the tip during the transfer have different eligibility rules.
-    pub fn reserve_block_message(&self, verified_tip: block::Height) -> BlockReservation {
+    pub fn reserve_block_message(
+        &self,
+        hash: block::Hash,
+        verified_tip: block::Height,
+    ) -> BlockReservation {
         let mut table = self.table();
         if verified_tip > table.floor {
             table.raise_floor(verified_tip);
         }
         BlockReservation {
+            hash,
             order: order::next(),
             verified_tip,
             floor: table.floor,
@@ -280,21 +291,20 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Records a decoded block's reservation if its height qualified when the transfer began.
+    /// Records a decoded block's reservation, under the hash it was reserved for, if its
+    /// coinbase `height` qualified when the transfer began.
     /// Returns whether the transfer counts against the connection's near-tip allowance, even
     /// when the store is full. Only fully verified blocks can use this credit in an equal-work tie.
     pub fn note_block_message(
         &self,
-        hash: block::Hash,
         height: Option<block::Height>,
         reservation: BlockReservation,
     ) -> bool {
-        self.note_block_message_at(hash, height, reservation, Instant::now())
+        self.note_block_message_at(height, reservation, Instant::now())
     }
 
     pub(super) fn note_block_message_at(
         &self,
-        hash: block::Hash,
         height: Option<block::Height>,
         reservation: BlockReservation,
         now: Instant,
@@ -307,7 +317,7 @@ impl AnnouncementClaims {
         if !self
             .table()
             .announced
-            .note_block_message(hash, height, reservation, now)
+            .note_block_message(height, reservation, now)
         {
             metrics::counter!("sync.block.announcement_claim.refused", "source" => "block")
                 .increment(1);

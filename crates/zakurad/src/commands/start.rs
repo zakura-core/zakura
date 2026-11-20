@@ -244,20 +244,19 @@ impl<Tip: ChainTip + Send + Sync> zakura_network::BlockAnnouncements for LegacyB
         }
     }
 
-    fn block_started(&self) -> Option<zakura_network::BlockReservation> {
-        // The tip is read at the message start, so a rival committed while this block arrives
-        // does not move it out of the claim window.
+    fn block_started(&self, hash: block::Hash) -> Option<zakura_network::BlockReservation> {
+        // The tip is read when the block header arrives, so a rival committed while the rest
+        // of this block arrives does not move it out of the claim window.
         let verified_tip = self.latest_chain_tip.best_tip_height()?;
-        Some(self.claims.reserve_block_message(verified_tip))
+        Some(self.claims.reserve_block_message(hash, verified_tip))
     }
 
     fn block_received(
         &self,
-        hash: block::Hash,
         height: Option<block::Height>,
         reservation: zakura_network::BlockReservation,
     ) -> bool {
-        self.claims.note_block_message(hash, height, reservation)
+        self.claims.note_block_message(height, reservation)
     }
 }
 

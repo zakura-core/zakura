@@ -98,7 +98,6 @@ impl Announcements {
     /// earlier one's deadline, or while an earlier claim is voided by a local mining submission.
     pub(super) fn note_block_message(
         &mut self,
-        hash: block::Hash,
         height: block::Height,
         reservation: BlockReservation,
         now: Instant,
@@ -106,7 +105,7 @@ impl Announcements {
         if self.prune(now) >= MAX_ANNOUNCED_BLOCKS {
             return false;
         }
-        let Some(candidates) = self.admit(hash) else {
+        let Some(candidates) = self.admit(reservation.hash) else {
             return false;
         };
         candidates.blocks.push(Announcement {

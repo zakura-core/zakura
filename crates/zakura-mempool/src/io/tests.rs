@@ -540,6 +540,43 @@ async fn a_submitters_deadline_ends_a_parked_child_before_a_late_parent() {
         .is_some_and(|snapshot| snapshot.transaction(&child.id().mined_id()).is_none()));
 }
 
+/// A lookup applies the deadlines it finds due before it answers, so a
+/// stream of lookups, which the core handles before its timer, cannot keep
+/// an admission past its submitter's deadline.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_applies_a_due_deadline_before_it_answers() {
+    let (parent, child) = parent_and_child();
+    let harness = Harness::start(&[parent, child.clone()]);
+    let reservation = harness
+        .handle
+        .reserve(child.id(), far())
+        .await
+        .expect("the test's deadline is far off")
+        .expect("the core grants a reservation")
+        .give_up_at(zakura_rt::time::Instant::now() + Duration::from_millis(100));
+    let handle = harness.handle.clone();
+    let body = child.real.transaction.clone();
+    let verdict = tokio::spawn(async move { handle.submit(reservation, body, far()).await });
+    harness.calls_reach(&child, 1).await;
+
+    // The lookup is queued before the deadline passes, so the core sees both
+    // at once and takes the command first.
+    let lookup = harness.handle.known_ids([child.id()].into(), far());
+    tokio::pin!(lookup);
+    assert!(futures::poll!(&mut lookup).is_pending());
+    tokio::time::advance(Duration::from_millis(200)).await;
+    let known = lookup.await.expect("the test's deadline is far off");
+    assert!(known.is_empty(), "the child's deadline had passed");
+    let verdict = verdict
+        .await
+        .expect("the task does not panic")
+        .expect("the test's deadline is far off");
+    assert!(
+        matches!(verdict, Verdict::LocalFault(LocalFault::VerifyTimeout)),
+        "{verdict:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_block_that_mines_a_pooled_transaction_removes_it() {
     let (parent, child) = parent_and_child();

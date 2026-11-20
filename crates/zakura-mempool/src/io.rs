@@ -303,10 +303,14 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                 if reply.is_closed() {
                     return;
                 }
+                // An admission whose deadline is due is not known any more,
+                // even while lookups keep the timer from running.
+                let step = self.machine.tick(now);
                 let answer = self.machine.known_ids(ids, now);
                 self.reply(move || {
                     let _ = reply.send(answer);
                 });
+                self.finish(step);
             }
             PoolCommand::RejectedIds { ids, reply } => {
                 // A caller that gave up on the lookup costs the core no scan.

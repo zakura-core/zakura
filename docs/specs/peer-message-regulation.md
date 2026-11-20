@@ -1059,10 +1059,11 @@ charge.
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
   - requester's pending ids: at most 8,000 per session. Past 256 in a session, an id nobody
-    holds is taken only while the node wants fewer than 64,000 ids, and another reference to an
-    id someone holds only while sessions hold fewer than 64,000 references, all provisional. Ids
-    a session keeps before its `Hello` or the go have a budget of their own with the same limits.
-    The rest is dropped, never a violation
+    holds is taken only while the node wants fewer than 64,000 ids and sessions hold fewer than
+    128,000 references, and another reference to an id someone holds only while sessions hold
+    fewer than 64,000 references, all provisional. Ids a session keeps before its `Hello` or the
+    go have a budget of their own with the same limits, where an id no session holds or waits on
+    is the first source. The rest is dropped, never a violation
   - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each
     request waits on its data writer as an id, and the writer builds the body from the pool as it
     is when it reaches it, so the data stream's output share bounds the bytes queued to the peer,

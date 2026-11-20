@@ -173,14 +173,16 @@
 //! - **Overflow is counted and is never a violation.** An announcement
 //!   that finds its session's pending set full is dropped. So is one past
 //!   the node-wide cap while its session holds [`PENDING_SHARE`] or more:
-//!   an id nobody holds yet once the node wants [`PENDING_CAP`] ids, and
-//!   another reference to an id someone holds once sessions hold that many
-//!   references, each counted until its session drops it. So an id's first
-//!   fetchable source is never crowded out by references to other ids, and
-//!   peers that fill the cap leave every other session its share.
-//!   Announcements sessions keep while they wait for the go or a `Hello`
-//!   are bounded the same way, in a budget of their own, so ids that can't
-//!   be fetched yet never crowd out ones that can.
+//!   an id nobody holds yet once the node wants [`PENDING_CAP`] ids or
+//!   sessions hold twice that many references, and another reference to
+//!   an id someone holds once sessions hold [`PENDING_CAP`] references, each
+//!   counted until its session drops it. So an id's first fetchable source
+//!   is never crowded out by references to other ids, and peers that fill
+//!   the cap leave every other session its share. Announcements sessions
+//!   keep while they wait for the go or a `Hello` are bounded the same way,
+//!   in a budget of their own, with an id no session holds or waits on as
+//!   its first source, so ids that can't be fetched yet never crowd out
+//!   ones that can.
 //! - **The skip set is bounded.** A session never tells its peer about an
 //!   id the peer still has pending or in flight, on this session or in a
 //!   body the reactor holds for it, and the supplier's sessions mark an id
@@ -797,6 +799,8 @@ pub(crate) struct Shared {
     /// Announcements live sessions keep while they wait for the go or a
     /// `Hello`, summed. They have a [`PENDING_CAP`] of their own.
     pub(crate) waiting: usize,
+    /// How many live sessions wait on each of those ids.
+    pub(crate) waiting_ids: HashMap<UnminedTxId, usize>,
     /// How many sessions hear of an admission at once, and when the rest do.
     pub(crate) fan_out: FanOut,
     /// The parameters of the keyed short-id hash.
@@ -834,6 +838,7 @@ impl Shared {
             stopped: false,
             pending: 0,
             waiting: 0,
+            waiting_ids: HashMap::default(),
             fan_out: config.fan_out,
             short_id,
             log_read: 0,
@@ -1922,6 +1927,13 @@ impl RelayMachine {
             .map(|machine| machine.state.waiting.len())
             .sum();
         assert_eq!(self.shared.waiting, waiting, "relay/waiting-count");
+        let mut waiting_ids: HashMap<UnminedTxId, usize> = HashMap::default();
+        for machine in self.machines.values().filter(|machine| !machine.is_ended()) {
+            for id in machine.state.waiting.keys() {
+                *waiting_ids.entry(*id).or_default() += 1;
+            }
+        }
+        assert_eq!(self.shared.waiting_ids, waiting_ids, "relay/waiting-ids");
 
         // The table keeps nothing without a holder or a claim.
         for (id, entry) in wanted.entries() {

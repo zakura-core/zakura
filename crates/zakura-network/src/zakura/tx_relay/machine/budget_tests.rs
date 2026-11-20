@@ -4,12 +4,12 @@
 
 use std::time::Duration;
 
-use zakura_chain::transaction::UnminedTxId;
+use zakura_chain::transaction::{self, UnminedTxId};
 
 use super::{
     tests::{body, hello, on, script_len, SIZE},
-    CallId, Granted, Mirror, PeerKey, PeerMachine, RelayConfig, RelayEffect, RelayMachine, Shared,
-    Unreserved, MAX_SERVES, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
+    CallId, Granted, Mail, Mirror, PeerKey, PeerMachine, RelayConfig, RelayEffect, RelayMachine,
+    Shared, Unreserved, MAX_SERVES, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
 };
 use crate::zakura::tx_relay::wire::MAX_INV_ENTRIES;
 
@@ -312,10 +312,10 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
 }
 
 /// Honest peers that all announce the same full pool in wire-sized frames,
-/// interleaved, half of them before their `Hello`, leave every id a session
-/// that can fetch it, however full the pending cap gets: an id nobody
-/// holds yet is its first source, which the cap on references never
-/// drops.
+/// interleaved, every peer's first two before any `Hello`, leave every id a
+/// session that can fetch it, however full the waiting and pending caps
+/// get: an id nobody holds or waits on yet is its first source, which the
+/// caps on references never drop.
 #[test]
 fn interleaved_full_pools_leave_every_id_a_source() {
     let script = script_len();
@@ -330,20 +330,16 @@ fn interleaved_full_pools_leave_every_id_a_source() {
     let mut machine = RelayMachine::new(config, on(Vec::new()), Vec::new());
     let now = Duration::ZERO;
     let sessions: Vec<_> = (0..92)
-        .map(|peer| {
-            let session = machine.connect(PeerKey(peer), false, now);
-            if peer % 2 == 0 {
-                machine.hello(session, hello(), now);
-            }
-            session
-        })
+        .map(|peer| machine.connect(PeerKey(peer), false, now))
         .collect();
     for (frame, chunk) in ids.chunks(MAX_INV_ENTRIES).enumerate() {
-        for (n, session) in sessions.iter().enumerate() {
-            machine.inv(*session, chunk, now);
-            if frame == 0 && n % 2 == 1 {
+        if frame == 2 {
+            for session in &sessions {
                 machine.hello(*session, hello(), now);
             }
+        }
+        for session in &sessions {
+            machine.inv(*session, chunk, now);
         }
     }
     assert!(machine.shared.pending >= PENDING_CAP, "the cap filled");
@@ -385,4 +381,81 @@ fn a_decided_reference_counts_until_its_session_drops_it() {
     );
     holder.tick(&mut shared, &pool, now);
     assert_eq!(shared.pending, 0, "dropped once it read the decisions");
+}
+
+/// A cheap distinct id: the machine only keys on ids.
+fn plain_id(n: u64) -> UnminedTxId {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&n.to_le_bytes());
+    UnminedTxId::from_legacy_id(transaction::Hash(bytes))
+}
+
+/// Sessions that read decisions late still hold their references, so
+/// first sources stop at twice the cap's references however fast the table
+/// empties: holders of decided ids they have not read yet, and each next
+/// session taking fresh ids, stay within that plus their shares.
+#[test]
+fn late_readers_keep_first_sources_within_twice_the_cap() {
+    let config = RelayConfig {
+        fan_out: super::FanOut::default(),
+        short_id_key: 7,
+    };
+    let mut shared = Shared::new(config);
+    let pool = Mirror::new(&on(Vec::new()), Vec::new());
+    let now = Duration::ZERO;
+    let per = u64::try_from(PENDING_PER_PEER).expect("small");
+    let holders = 20;
+    let mut machines = Vec::new();
+    for peer in 0..holders {
+        let ids: Vec<(UnminedTxId, u32)> =
+            (0..per).map(|n| (plain_id(peer * per + n), SIZE)).collect();
+        let mut holder = PeerMachine::connect(&mut shared, &pool, PeerKey(peer), now);
+        holder.hello(&mut shared, &pool, hello(), now);
+        holder.inv(&mut shared, &pool, &ids, now);
+        // Its ids are decided before it reads the ring.
+        for (id, _) in &ids {
+            if let Some(entry) = shared.wanted.entry(*id) {
+                let generation = entry.generation;
+                shared.wanted.decide(*id, generation);
+            }
+        }
+        machines.push(holder);
+    }
+    let shares = usize::try_from(holders).expect("small") * PENDING_SHARE;
+    assert!(
+        shared.pending <= 2 * PENDING_CAP + shares,
+        "{}",
+        shared.pending
+    );
+}
+
+/// A session that gets the go takes its waiting ids in and counts them
+/// before any other session reads its mail, so two replacements never
+/// spend the same room.
+#[test]
+fn the_go_counts_the_ids_it_takes_in() {
+    let script = script_len();
+    let ids: Vec<(UnminedTxId, u32)> = (0..3).map(|n| (body(n, script).id(), SIZE)).collect();
+    let config = RelayConfig {
+        fan_out: super::FanOut::default(),
+        short_id_key: 7,
+    };
+    let mut shared = Shared::new(config);
+    let pool = Mirror::new(&on(Vec::new()), Vec::new());
+    let now = Duration::ZERO;
+    let mut first = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
+    first.hello(&mut shared, &pool, hello(), now);
+    let mut second = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
+    second.hello(&mut shared, &pool, hello(), now);
+    second.inv(&mut shared, &pool, &ids, now);
+    assert_eq!(second.state.waiting.len(), ids.len(), "it waits for the go");
+
+    first.end_session(&mut shared);
+    second.read_mail(&mut shared, &pool, Mail::Go);
+    assert_eq!(second.state.pending.len(), ids.len());
+    assert_eq!(
+        shared.pending,
+        ids.len(),
+        "counted before anyone else reads"
+    );
 }

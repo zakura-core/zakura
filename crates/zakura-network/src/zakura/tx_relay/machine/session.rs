@@ -203,12 +203,23 @@ impl PeerMachine {
                 if pool.holds(&id) || size > MAX_TX_BYTES || state.waiting.contains_key(&id) {
                     continue;
                 }
-                let node_room = PENDING_CAP.saturating_sub(shared.waiting);
+                // As `take_ids` admits pending ids: an id no session holds or
+                // waits on yet is its first source, which copies of other
+                // ids never crowd out.
+                let first =
+                    shared.wanted.entry(id).is_none() && !shared.waiting_ids.contains_key(&id);
+                let node = if first {
+                    shared.waiting_ids.len() < PENDING_CAP
+                        && shared.waiting < PENDING_CAP.saturating_mul(2)
+                } else {
+                    shared.waiting < PENDING_CAP
+                };
                 let fits = state.waiting.len() < PENDING_PER_PEER
-                    && (node_room > 0 || state.waiting.len() < PENDING_SHARE);
+                    && (node || state.waiting.len() < PENDING_SHARE);
                 if fits {
                     state.waiting.insert(id, size);
                     shared.waiting = shared.waiting.saturating_add(1);
+                    *shared.waiting_ids.entry(id).or_default() += 1;
                 } else {
                     state.overflow = state.overflow.saturating_add(1);
                 }
@@ -643,6 +654,9 @@ impl PeerMachine {
                 self.state.mark_known(id, short, pool.last_seq());
             }
         }
+        // The go can take waiting ids in, and the next session to read its
+        // mail must see them counted.
+        self.count_pending(shared);
     }
 
     // Outputs and observations.
@@ -1113,6 +1127,14 @@ impl PeerMachine {
     fn take_waiting(&mut self, shared: &mut Shared) -> Vec<(UnminedTxId, u32)> {
         let waiting = std::mem::take(&mut self.state.waiting);
         shared.waiting = shared.waiting.saturating_sub(waiting.len());
+        for id in waiting.keys() {
+            if let Some(count) = shared.waiting_ids.get_mut(id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    shared.waiting_ids.remove(id);
+                }
+            }
+        }
         waiting.into_iter().collect()
     }
 
@@ -1168,17 +1190,20 @@ impl PeerMachine {
         // does not fit leaves no holder behind. An id nobody holds yet is
         // its first fetchable source, so it is taken while the node wants
         // fewer than the cap's ids, however many references to other ids
-        // sessions hold. Another reference to an id someone holds is taken
-        // only while sessions hold fewer than the cap's references. Past
-        // both, a session still holds its share, so peers that fill the cap
-        // crowd out nobody else's first ids.
+        // sessions hold, and while they hold fewer than twice the cap's
+        // references, since a decided id leaves the table before its holders
+        // drop their references. Another reference to an id someone holds
+        // is taken only while sessions hold fewer than the cap's references.
+        // Past both, a session still holds its share, so peers that fill the
+        // cap crowd out nobody else's first ids.
         let mut dropped: u64 = 0;
         for (id, size, first) in fresh {
             let share = self.state.pending.len() < PENDING_SHARE;
+            let slots = self.pending_slots(shared);
             let node = if first {
-                shared.wanted.len() < PENDING_CAP
+                shared.wanted.len() < PENDING_CAP && slots < PENDING_CAP.saturating_mul(2)
             } else {
-                self.pending_slots(shared) < PENDING_CAP
+                slots < PENDING_CAP
             };
             if self.state.room() == 0 || !(share || node) {
                 dropped = dropped.saturating_add(1);

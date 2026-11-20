@@ -89,7 +89,8 @@ impl Service<Request> for Client {
             // well as the reply so that such a request cannot wait on an abandoned queue: the
             // error watch fires at once for a failure that happened before this first poll. A
             // reply that was already dispatched wins over a later failure, because its response
-            // future runs on the connection, not on the owner.
+            // future runs on the connection, not on the owner. A held transaction request's
+            // future fails instead if the owner stops before routing it.
             let future = tokio::select! {
                 biased;
                 response = response => response.map_err(|_| closed(&error))?,
@@ -154,7 +155,10 @@ where
                             match incoming.poll_recv(cx) {
                                 Poll::Ready(Some(request)) => pending = Some(request),
                                 Poll::Ready(None) => return Poll::Ready(Ok::<_, BoxError>(false)),
-                                Poll::Pending => return Poll::Pending,
+                                Poll::Pending => {
+                                    peers.route_held_tx_requests(cx)?;
+                                    return Poll::Pending;
+                                }
                             }
                         }
                         let request = pending.as_mut().expect("a pending request was just installed");
@@ -167,6 +171,8 @@ where
                         let request = pending.take().expect("readiness does not remove the request");
                         let response = request.span.in_scope(|| peers.call(request.request));
                         let _ = request.reply.send(response);
+                        // After the new request, so that a held request can't take its peer.
+                        peers.route_held_tx_requests(cx)?;
                         Poll::Ready(Ok(true))
                     }) => { if !running? { break; } }
                 }

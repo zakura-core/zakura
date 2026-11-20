@@ -95,7 +95,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert,
     fmt::Debug,
     marker::PhantomData,
@@ -154,6 +154,28 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+/// How long a transaction request waits for a busy peer that advertised it, before it is routed
+/// to any ready peer as if no peer had advertised it.
+///
+/// Shorter than the dual stack's 3 s legacy attempt, so that the fallback still has time to run.
+const TX_ADVERTISER_WAIT: Duration = Duration::from_secs(2);
+
+/// The most transaction requests held for busy advertisers at once. Further requests are routed
+/// without waiting.
+const MAX_HELD_TX_REQUESTS: usize = 64;
+
+/// A single-transaction request waiting for a busy peer that advertised the transaction.
+struct HeldTxRequest {
+    req: Request,
+    hash: InventoryHash,
+    /// When the request stops waiting for an advertiser.
+    deadline: tokio::time::Instant,
+    /// The caller's span, which routing runs in.
+    span: tracing::Span,
+    /// Receives the routed request's response future.
+    reply: oneshot::Sender<futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
+}
 
 /// A signal sent by the [`PeerSet`] when it has no ready peers, and gets a request from Zebra.
 ///
@@ -267,6 +289,12 @@ where
 
     /// Channels used to cancel the request that an unready service is doing.
     cancel_handles: HashMap<D::Key, oneshot::Sender<CancelClientWork>>,
+
+    /// Transaction requests waiting for a busy advertiser, oldest first. See
+    /// [`Self::route_held_tx_requests`].
+    held_tx_requests: VecDeque<HeldTxRequest>,
+    /// Wakes the owner at the earliest deadline in `held_tx_requests`.
+    held_tx_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
     // Peer Validation
     //
@@ -413,6 +441,8 @@ where
             // Busy peers
             unready_services: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
+            held_tx_requests: VecDeque::new(),
+            held_tx_timer: None,
 
             // Peer validation
             minimum_peer_version,
@@ -522,6 +552,10 @@ where
             let _ = handle.send(CancelClientWork);
         }
         self.unready_services = FuturesUnordered::new();
+
+        // Dropping held requests fails their waiting callers.
+        self.held_tx_requests.clear();
+        self.held_tx_timer = None;
 
         // Close the MorePeers channel for all senders,
         // so we don't add more peers to a shut down peer set.
@@ -1432,6 +1466,9 @@ where
     /// Tries to route a request to a ready peer that advertised that inventory,
     /// falling back to a ready peer that isn't missing the inventory.
     ///
+    /// A transaction request whose advertisers are all busy waits for one of them instead, see
+    /// [`Self::route_held_tx_requests`]. Another peer usually doesn't have the transaction yet.
+    ///
     /// If all ready peers are missing the inventory,
     /// returns a synthetic [`NotFoundRegistry`](PeerError::NotFoundRegistry) error.
     ///
@@ -1514,6 +1551,27 @@ where
             return fut.map_err(Into::into).boxed();
         }
 
+        if !matches!(hash, InventoryHash::Block(_))
+            && self.held_tx_requests.len() < MAX_HELD_TX_REQUESTS
+            && self.has_busy_advertiser(hash)
+        {
+            return self.hold_tx_request(req, hash);
+        }
+
+        self.route_inv_to_any_peer(req, hash, attempt)
+    }
+
+    /// Routes an inventory request to a ready peer that isn't missing the inventory, without
+    /// preferring a peer that advertised it.
+    ///
+    /// If all ready peers are missing the inventory, returns a synthetic
+    /// [`NotFoundRegistry`](PeerError::NotFoundRegistry) error.
+    fn route_inv_to_any_peer(
+        &mut self,
+        req: Request,
+        hash: InventoryHash,
+        attempt: Option<crate::BlockHedge>,
+    ) -> <Self as tower::Service<Request>>::Future {
         let missing_peer_list: HashSet<PeerSocketAddr> = self
             .inventory_registry
             .missing_peers(hash)
@@ -1623,6 +1681,117 @@ where
         }
         .map_err(Into::into)
         .boxed()
+    }
+
+    /// Returns true if a peer that advertised `hash` is busy with a request.
+    fn has_busy_advertiser(&self, hash: InventoryHash) -> bool {
+        self.inventory_registry
+            .advertising_peers(hash)
+            .any(|addr| self.cancel_handles.contains_key(addr))
+    }
+
+    /// Returns true if a peer that advertised `hash` is ready.
+    fn has_ready_advertiser(&self, hash: InventoryHash) -> bool {
+        self.inventory_registry
+            .advertising_peers(hash)
+            .any(|addr| self.ready_services.contains_key(addr))
+    }
+
+    /// Queues a transaction request for a busy advertiser, and returns a future that waits for
+    /// the routed request's response.
+    fn hold_tx_request(
+        &mut self,
+        req: Request,
+        hash: InventoryHash,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let (reply, routed) = oneshot::channel();
+        self.held_tx_requests.push_back(HeldTxRequest {
+            req,
+            hash,
+            deadline: tokio::time::Instant::now() + TX_ADVERTISER_WAIT,
+            span: tracing::Span::current(),
+            reply,
+        });
+
+        async move {
+            let response = routed
+                .await
+                .map_err(|_| "peer set shut down before routing a held request")?;
+            response.await
+        }
+        .boxed()
+    }
+
+    /// Routes the transaction requests held for busy advertisers that can go now. The peer set's
+    /// owner calls this after routing each new request, so a waiting request never takes a peer
+    /// from it, and when no new request is waiting.
+    ///
+    /// A held request goes to its advertiser once one is ready. Once it has waited
+    /// [`TX_ADVERTISER_WAIT`], or no advertiser is connected, it is routed as if no peer had
+    /// advertised it, as soon as any peer is ready. A request whose caller gave up is dropped.
+    ///
+    /// Wakes the owner after routing a request, so it polls the newly busy peer, and at the
+    /// earliest deadline.
+    pub(super) fn route_held_tx_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        if self.held_tx_requests.is_empty() {
+            return Ok(());
+        }
+
+        // Adverts that arrived while requests were held are only read here and while routing.
+        let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
+
+        let now = tokio::time::Instant::now();
+        let mut routed = false;
+        let mut next_deadline = None;
+        for _ in 0..self.held_tx_requests.len() {
+            let held = self
+                .held_tx_requests
+                .pop_front()
+                .expect("the loop runs once per held request");
+            if held.reply.is_canceled() {
+                continue;
+            }
+
+            let to_advertiser = self.has_ready_advertiser(held.hash);
+            if !to_advertiser && held.deadline > now && self.has_busy_advertiser(held.hash) {
+                // Every request waits as long, so the oldest has the earliest deadline.
+                next_deadline.get_or_insert(held.deadline);
+                self.held_tx_requests.push_back(held);
+                continue;
+            }
+            if !to_advertiser && self.ready_services.is_empty() {
+                // Like a new request, wait until a peer is ready.
+                self.held_tx_requests.push_back(held);
+                continue;
+            }
+
+            let response = held.span.in_scope(|| {
+                if to_advertiser {
+                    self.route_inv(held.req, held.hash, None)
+                } else {
+                    self.route_inv_to_any_peer(held.req, held.hash, None)
+                }
+            });
+            let _ = held.reply.send(response);
+            routed = true;
+        }
+
+        match (next_deadline, self.held_tx_timer.as_mut()) {
+            (Some(deadline), Some(timer)) => timer.as_mut().reset(deadline),
+            (Some(deadline), None) => {
+                self.held_tx_timer = Some(Box::pin(tokio::time::sleep_until(deadline)))
+            }
+            (None, _) => self.held_tx_timer = None,
+        }
+        let timer_expired = self
+            .held_tx_timer
+            .as_mut()
+            .is_some_and(|timer| timer.as_mut().poll(cx).is_ready());
+        if routed || timer_expired {
+            cx.waker().wake_by_ref();
+        }
+
+        Ok(())
     }
 
     /// Holds a download's request for a second copy of a gossiped block until another announcer

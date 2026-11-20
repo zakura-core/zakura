@@ -1,0 +1,31 @@
+# LAB ONLY: one node of the announcement-window lab.
+[network]
+network = { params = { activation_heights = { NU5 = 1 } } }
+listen_addr = "0.0.0.0:18233"
+p2p_stack = "@STACK@"
+cache_dir = false
+initial_testnet_peers = []
+max_connections_per_ip = 10
+zakura_node_secret_key = "@KEY@"
+
+[network.zakura]
+listen_addr = "0.0.0.0:18234"
+bootstrap_peers = [@BOOTSTRAP@]
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "0.0.0.0:19000"
+
+[mining]
+internal_miner = false
+miner_address = "@MINER@"
+
+[tracing]
+use_color = false
+filter = "warn,zakura_consensus::block::receipt=info"

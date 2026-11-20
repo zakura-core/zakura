@@ -86,10 +86,18 @@ impl Announcements {
         if self.0.len() >= MAX_ANNOUNCED_BLOCKS {
             return false;
         }
+        let order = order::next();
+        tracing::info!(
+            "LAB claim_drawn unix_ms={} hash={} source={} order={} apply_ms=0",
+            super::lab_unix_ms(),
+            hash,
+            source.label(),
+            order,
+        );
         self.0.insert(
             hash,
             Announcement {
-                order: order::next(),
+                order,
                 seen_at: now,
                 tip_at_announcement,
                 source,

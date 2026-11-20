@@ -21,6 +21,10 @@ impl BlockRangeSource for StateBlockRangeSource {
     ) -> BoxFuture<'static, Result<BlockRangeReadResult, zakura_network::BoxError>> {
         let mut state = self.state.clone();
         Box::pin(async move {
+            // LAB ONLY: the withholding peer sits on the body.
+            if let Some(delay) = zakura_consensus::lab_knob("body_delay_ms") {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             let mut started = false;
             // No timeout: the blocking read keeps the execution lease until it
             // finishes, so abandoning this wait could not free the slot.

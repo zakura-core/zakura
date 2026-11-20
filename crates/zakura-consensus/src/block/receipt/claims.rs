@@ -224,6 +224,12 @@ impl AnnouncementClaims {
                 applies: 1,
                 accepted: false,
             };
+            tracing::info!(
+                "LAB claim_drawn unix_ms={} hash={} source=header order={} apply_ms=0",
+                lab_unix_ms(),
+                hash,
+                claim.order,
+            );
             table.by_hash.insert(hash, claim);
             covered.push(hash);
         }
@@ -464,4 +470,26 @@ impl Drop for MinedGuard {
             table.mined.remove(&self.hash);
         }
     }
+}
+
+/// LAB ONLY: a millisecond value read from `$CLAIM_LAB_DIR/<name>` on every call.
+pub fn lab_knob(name: &str) -> Option<u64> {
+    let dir = std::env::var_os("CLAIM_LAB_DIR")?;
+    std::fs::read_to_string(std::path::Path::new(&dir).join(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// LAB ONLY: the deadline in force; `window_ms` replaces it when present.
+pub(crate) fn lab_deadline() -> Duration {
+    lab_knob("window_ms").map_or(CLAIM_BODY_DEADLINE, Duration::from_millis)
+}
+
+/// LAB ONLY: wall-clock milliseconds since the Unix epoch.
+pub(crate) fn lab_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
 }

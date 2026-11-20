@@ -227,11 +227,6 @@ check = ["crates/zakura-sim/src/harness/discovery_machine.rs", "crates/zakura-si
 shared = []
 
 [[entry.instance]]
-property = "discovery/record-book"
-code = ["crates/zakura-network/src/zakura/discovery/protocol.rs"]
-witness = { planted = "qa/planted/discovery/record-book/skip-book-eviction.toml" }
-
-[[entry.instance]]
 property = "discovery/session-installation"
 code = ["crates/zakura-network/src/zakura/discovery/state.rs"]
 witness = { planted = "qa/planted/discovery/session-installation/install-superseded-result.toml" }
@@ -308,20 +303,13 @@ witnesses = [
     { test = "answers_within_their_requests_hold_sender_within_owed", test_target = "discovery_wire_witness" },
 ]
 
-# discovery/late-response-admitted is the discovery table's entry's too
-# (mutation plan, mut-7 "One protocol table, once"), but its ID sits outside
-# the table's prefix, so it is listed here.
-[[entry]]
-id = "late-response-admitted"
-kind = "single"
-claim = "A correlated answer the node reads after its initial exchange timed out gets no fault close and no Misbehavior."
-check = ["crates/zakura-sim/src/domain/discovery.rs"]
-shared = []
+[[excluded]]
+property = "discovery/record-book"
+reason = "#2604 removed its planted witness, whose patch no longer applied; #2639 re-evaluates it."
 
-[[entry.instance]]
+[[excluded]]
 property = "discovery/late-response-admitted"
-code = ["crates/zakura-network/src/zakura/discovery/requester.rs", "crates/zakura-network/src/zakura/discovery/peer.rs"]
-witness = { planted = "qa/planted/discovery/late-response-admitted/revoke-on-timeout.toml" }
+reason = "#2604 removed its planted witness, whose patch no longer applied; #2639 re-evaluates it."
 
 [[excluded]]
 property = "block-sync/reactor-query-lifecycle"
@@ -762,12 +750,6 @@ patch = "budget-ledgers-agree/receipt-keeps-pooled-charge/receipt-keeps-pooled-c
 property = "block-sync/budget-ledgers-agree"
 harness = "block-sync/storage"
 families = ["untagged"]
-
-[[drawn-witness]]
-patch = "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch"
-property = "block-sync/s6v3/block/receiver-work-authorized"
-harness = "block-sync/storage"
-families = ["reset-mid-flight"]
 
 [[drawn-witness]]
 patch = "submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch"

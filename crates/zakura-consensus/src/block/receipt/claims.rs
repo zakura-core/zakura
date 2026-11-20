@@ -125,7 +125,13 @@ impl ClaimTable {
     fn raise_floor(&mut self, verified_tip: block::Height) {
         self.floor = self.floor.max(verified_tip);
         let floor = self.floor;
-        self.by_hash.retain(|_, claim| claim.height >= floor);
+        self.by_hash.retain(|hash, claim| {
+            if claim.height < floor {
+                self.announced.discard_after_header(*hash, claim.order);
+                return false;
+            }
+            true
+        });
     }
 
     /// Drops the mined blocks recorded more than [`MINED_RECORD_LIFETIME`] before `now` that
@@ -227,8 +233,9 @@ impl AnnouncementClaims {
     /// Records the first legacy `inv` for `hash`, so its body can take the order it was announced
     /// in, and raises the verified tip to `verified_tip` as [`AnnouncementClaims::begin`] does.
     ///
-    /// A block that already has a header claim or an announcement keeps it, so announcing a block
-    /// again never renews its claim. The body later takes the announcement's order only if it
+    /// An accepted header needs no announcement. An `inv` received during a pending header apply
+    /// is a fallback if every apply fails. Repeats keep the original announcement. The body
+    /// takes the announcement's order only if it
     /// arrives within the deadline, its height was one or two above the tip at announcement,
     /// and the highest tip seen since then has not passed that height.
     ///
@@ -246,7 +253,7 @@ impl AnnouncementClaims {
     ) {
         let mut table = self.table();
         table.raise_floor(verified_tip);
-        if table.by_hash.contains_key(&hash) {
+        if table.by_hash.get(&hash).is_some_and(|claim| claim.accepted) {
             return;
         }
         let tip_at_announcement = table.floor;
@@ -354,7 +361,10 @@ impl PendingClaims {
             };
             claim.applies = claim.applies.saturating_sub(1);
             claim.accepted |= accepted;
-            if claim.applies == 0 && !claim.accepted {
+            if accepted {
+                let header_order = claim.order;
+                table.announced.discard_after_header(hash, header_order);
+            } else if claim.applies == 0 && !claim.accepted {
                 table.by_hash.remove(&hash);
             }
         }

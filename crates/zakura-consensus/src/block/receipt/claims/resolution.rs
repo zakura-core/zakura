@@ -33,12 +33,14 @@ impl AnnouncementClaims {
             }
         };
 
-        // A legacy announcement is only recorded while the hash has no header claim.
-        // When both are present the legacy reservation therefore has the earlier order.
+        let header = table.by_hash.get(&hash);
+        // An inv received during an earlier header apply is usable only if every apply fails.
         let inv = height
             .zip(table.announced.get(hash))
             .filter(|(height, inv)| {
-                *height >= table.floor && in_claim_window(*height, inv.tip_at_announcement)
+                header.is_none_or(|header| inv.order < header.order)
+                    && *height >= table.floor
+                    && in_claim_window(*height, inv.tip_at_announcement)
             })
             .map_or(Unclaimed, |(height, inv)| {
                 classify(ClaimSource::Inv, height, inv.order, inv.seen_at)
@@ -47,7 +49,7 @@ impl AnnouncementClaims {
             return inv;
         }
 
-        let Some(header) = table.by_hash.get(&hash) else {
+        let Some(header) = header else {
             return inv;
         };
         let header = classify(

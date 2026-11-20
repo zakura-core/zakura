@@ -49,9 +49,11 @@ The reservation is called a claim. Five rules define it:
   the verified tip.
 - **Each block keeps its first claim of each kind, and neither is renewed.** A
   header claim, once made, is never replaced or renewed by delivering the
-  header again. An `inv` for a block that already has a header claim or an
-  `inv` record records nothing. Reading a claim does not use it up, so an
-  invalid body under the same hash cannot take it. A body whose block holds
+  header again. An accepted header ignores later `inv`s. While a header apply
+  is pending, the first later `inv` is saved with its original order, time and
+  observed tip. It becomes usable if every apply fails and is discarded if
+  any succeeds. Repeated `inv`s keep the original record. Reading a claim
+  does not use it up, so an invalid body under the same hash cannot take it. A body whose block holds
   both takes the earlier order among those still in force, so an `inv` never
   makes the outcome worse than the header claim alone.
 

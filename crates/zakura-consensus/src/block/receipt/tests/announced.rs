@@ -130,6 +130,73 @@ fn the_earlier_of_a_header_claim_and_an_inv_wins() {
 }
 
 #[test]
+fn an_inv_during_a_failed_header_apply_keeps_its_place_and_deadline() {
+    let claims = AnnouncementClaims::default();
+    let start = Instant::now();
+    let pending = || claims.begin_at([(hash(1), CLAIMED)], TIP, start);
+    let (first, second) = (pending(), pending());
+    let inv_at = start + Duration::from_secs(1);
+    announce(&claims, hash(1), inv_at);
+    let rival = body_order(&claims, hash(2), inv_at);
+    let deadline = inv_at + CLAIM_BODY_DEADLINE;
+    drop(first);
+    announce(&claims, hash(1), deadline);
+    assert_eq!(used(&claims, hash(1), CLAIMED, deadline), None);
+
+    drop(second);
+    assert!(body_order(&claims, hash(1), deadline) < rival);
+    assert!(body_order(&claims, hash(1), deadline + Duration::from_nanos(1)) > rival);
+}
+
+#[test]
+fn accepting_any_header_apply_discards_its_later_inv() {
+    for accept_first in [true, false] {
+        let claims = AnnouncementClaims::default();
+        let start = Instant::now();
+        let pending = || claims.begin_at([(hash(1), CLAIMED)], TIP, start);
+        let (accepted, cancelled) = (pending(), pending());
+        let inv_at = start + Duration::from_secs(1);
+        announce(&claims, hash(1), inv_at);
+        let header = claims.claimed_order(hash(1)).unwrap();
+        assert!(claims.announced_order(hash(1)).unwrap() > header);
+        assert_eq!(
+            used(&claims, hash(1), CLAIMED, inv_at),
+            Some((ClaimSource::Header, header))
+        );
+        if accept_first {
+            accepted.commit();
+            drop(cancelled);
+        } else {
+            drop(cancelled);
+            accepted.commit();
+        }
+        assert_eq!(claims.announced_order(hash(1)), None);
+        assert_eq!(
+            used(&claims, hash(1), CLAIMED, inv_at),
+            Some((ClaimSource::Header, header))
+        );
+        assert_eq!(
+            used(&claims, hash(1), CLAIMED, inv_at + CLAIM_BODY_DEADLINE),
+            None
+        );
+    }
+}
+
+#[test]
+fn advancing_past_a_pending_header_discards_its_fallback() {
+    let claims = AnnouncementClaims::default();
+    let now = Instant::now();
+    let pending = claims.begin_at([(hash(1), CLAIMED)], TIP, now);
+    announce(&claims, hash(1), now);
+    assert!(claims.announced_order(hash(1)).is_some());
+    claims
+        .begin_at([], block::Height(CLAIMED.0 + 1), now)
+        .commit();
+    drop(pending);
+    assert_eq!(claims.announced_order(hash(1)), None);
+}
+
+#[test]
 fn an_expired_inv_does_not_cost_a_later_header_claim_its_deadline() {
     let claims = AnnouncementClaims::default();
     let now = Instant::now();

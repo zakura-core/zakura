@@ -241,7 +241,7 @@ async fn connection_run_loop_message_ok() {
     // Simulate a message send and receive
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -308,7 +308,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -327,7 +327,7 @@ async fn empty_mempool_reply_unblocks_queued_block_request() {
     let (block_tx, block_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::BlocksByHash(IndexSet::from([hash])),
             tx: block_tx,
             inv_collector: None,
@@ -369,7 +369,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (mempool_tx, mempool_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::MempoolTransactionIds,
             tx: mempool_tx,
             inv_collector: None,
@@ -388,7 +388,7 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
     let (find_tx, mut find_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::FindBlocks {
                 known_blocks: Vec::new(),
                 stop: None,
@@ -749,7 +749,7 @@ async fn connection_run_loop_send_timeout_nil_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::AdvertiseTransactionIds(HashSet::new(), None),
         tx: request_tx,
         inv_collector: None,
@@ -824,7 +824,7 @@ async fn connection_run_loop_send_timeout_expect_response() {
     // Simulate a message send timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -899,7 +899,7 @@ async fn connection_run_loop_receive_timeout() {
     // Simulate a message receive timeout
     let (request_tx, mut request_rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request: Request::Peers,
         tx: request_tx,
         inv_collector: None,
@@ -1297,7 +1297,7 @@ async fn connection_ping_pong_round_trip() {
 
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::Ping(nonce),
             tx: response_tx,
             inv_collector: None,
@@ -1757,7 +1757,7 @@ impl BudgetedConnection {
         let (tx, response) = oneshot::channel();
         self.client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::BlocksByHash(blocks.iter().map(|block| block.hash()).collect()),
                 tx,
                 inv_collector: None,
@@ -2038,7 +2038,7 @@ fn client_request(
 ) {
     let (tx, rx) = oneshot::channel();
     let request = ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request,
         tx,
         inv_collector: None,
@@ -2169,6 +2169,110 @@ async fn request_slot_tracks_responses_and_notfound() {
     connection_task.abort();
 }
 
+/// A queued primary stays unknown while an earlier block arrives on its connection. After
+/// its getdata is written, only a matching partial block frame can publish its size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_and_active_primaries_observe_only_their_own_block() {
+    use crate::{
+        peer::BlockRequestKind,
+        peer_registry::{DeliveryEstimate, DeliverySampleKind},
+        protocol::external::Codec,
+        BlockHedge,
+    };
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{Encoder, FramedRead};
+    use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
+    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+    let _init_guard = zakura_test::init();
+    let codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    let (connection, mut client, _inbound, mut outbound, _error) = new_test_connection();
+    let connection = connection.with_inbound_block_size(codec.inbound_block_size());
+    let (mut wire, reader) = tokio::io::duplex(16 * 1024);
+    let conn_task = tokio::spawn(connection.run(FramedRead::new(reader, codec)));
+
+    let primary = |mut body: &[u8], advertised| {
+        let block = block::Block::zcash_deserialize_bounded(&mut body).unwrap();
+        let hash = block.hash();
+        let attempt = BlockHedge::new(tokio::time::Instant::now());
+        let mut estimate = DeliveryEstimate::default();
+        estimate.record(
+            DeliverySampleKind::Ping,
+            Duration::from_millis(250),
+            Instant::now(),
+        );
+        let (mut request, response) = client_request(Request::block_by_hash(hash, None));
+        request.block_request = Some(BlockRequestKind::TrackedPrimary {
+            attempt: attempt.clone(),
+            advertised,
+        });
+        attempt
+            .dispatch_if_needed(Some("127.0.0.1:8233".parse().unwrap()), estimate, || ())
+            .unwrap();
+        let size = attempt.first_dispatch().unwrap().block_size;
+        let mut frame = BytesMut::new();
+        Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish()
+            .encode(Message::Block(Arc::new(block).into()), &mut frame)
+            .unwrap();
+        (request, response, size, frame, hash)
+    };
+    let (a, a_response, a_size, a_frame, a_hash) = primary(&BLOCK_MAINNET_1_BYTES, true);
+    let (b, b_response, b_size, b_frame, b_hash) = primary(&BLOCK_MAINNET_2_BYTES, false);
+    client.send(a).await.unwrap();
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![a_hash.into()]))
+    );
+    client.try_send(b).expect("B fits in the queue behind A");
+
+    // Leave a single byte outstanding so the connection cannot take B yet.
+    let last = a_frame.len() - 1;
+    wire.write_all(&a_frame[..last]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while a_size.get().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the decoder observed A");
+    assert_eq!(
+        a_size.get(),
+        Some(u64::try_from(BLOCK_MAINNET_1_BYTES.len()).unwrap())
+    );
+    assert_eq!(b_size.get(), None);
+    wire.write_all(&a_frame[last..]).await.unwrap();
+    a_response.await.unwrap().unwrap();
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![b_hash.into()]))
+    );
+
+    // A late copy of A arrives while B is active. A valid B frame must still fill B's cell.
+    wire.write_all(&a_frame).await.unwrap();
+    // The pong confirms the connection has processed the late frame.
+    let nonce = Nonce::default();
+    let mut ping = BytesMut::new();
+    Codec::builder()
+        .finish()
+        .encode(Message::Ping(nonce), &mut ping)
+        .unwrap();
+    wire.write_all(&ping).await.unwrap();
+    assert_eq!(outbound.next().await, Some(Message::Pong(nonce)));
+    assert_eq!(b_size.get(), None);
+    wire.write_all(&b_frame).await.unwrap();
+    b_response.await.unwrap().unwrap();
+    assert_eq!(
+        b_size.get(),
+        Some(u64::try_from(BLOCK_MAINNET_2_BYTES.len()).unwrap())
+    );
+    conn_task.abort();
+}
+
 /// Cancellation and timeouts free the request slot, and a disconnect leaves it busy.
 #[tokio::test(start_paused = true)]
 async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
@@ -2212,7 +2316,7 @@ async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
 
     // A disconnect fails the outstanding request and leaves the slot busy.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     assert_eq!(
         outbound.next().await,
@@ -2260,7 +2364,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // An early cancellation says nothing about the peer.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2276,7 +2380,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // A downloader's own timeout usually cancels just before the connection's timer fires.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Primary);
+    request.block_request = Some(crate::peer::BlockRequestKind::Primary);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2308,7 +2412,7 @@ async fn request_slot_records_unanswered_block_requests() {
 
     // The connection's own timeout also records the request.
     let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-    request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::Hedge);
+    request.block_request = Some(crate::peer::BlockRequestKind::Hedge);
     client_tx.send(request).await.expect("connection is open");
     outbound.next().await.expect("request is written");
     settle().await;
@@ -2328,17 +2432,22 @@ async fn request_slot_records_unanswered_block_requests() {
 /// Only a dual-stack deadline that interrupts a written advertiser request counts as a miss.
 #[tokio::test(start_paused = true)]
 async fn legacy_deadline_charges_only_a_written_advertised_request() {
-    for written in [false, true] {
+    for (written, advertised) in [(false, true), (true, true), (true, false)] {
         let (mut peer_tx, peer_rx) = mpsc::channel(4);
         let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
         let slot = connection.request_slot.clone();
         let task = tokio::spawn(connection.run(peer_rx));
         let (tx, block) = response_vectors();
         let attempt = crate::BlockHedge::new(tokio::time::Instant::now());
+        if !advertised {
+            // The dual-stack deadline still tracks the fallback write with hedging closed.
+            attempt.close();
+        }
         let (mut request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
-        request.advertised_block = Some(crate::peer::AdvertisedBlockRequest::TimedPrimary(
-            attempt.clone(),
-        ));
+        request.block_request = Some(crate::peer::BlockRequestKind::TrackedPrimary {
+            attempt: attempt.clone(),
+            advertised,
+        });
         if written {
             client_tx.send(request).await.unwrap();
             outbound.next().await.unwrap();
@@ -2369,7 +2478,8 @@ async fn legacy_deadline_charges_only_a_written_advertised_request() {
             );
         }
         settle().await;
-        assert_eq!(slot.announced_block_missed(), written);
+        assert_eq!(attempt.timed_out_after_write(), written);
+        assert_eq!(slot.announced_block_missed(), written && advertised);
         assert!(!slot.block_request_unanswered());
         task.abort();
     }
@@ -2577,7 +2687,7 @@ async fn block_advert_while_awaiting_response() {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![idle_hash],
                     stop: None,
@@ -2654,7 +2764,7 @@ async fn block_advert_as_ordinary_request_is_an_error() {
         let (request_tx, request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::AdvertiseBlock(block::Hash([5; 32]).into(), None),
                 tx: request_tx,
                 inv_collector: None,
@@ -2918,7 +3028,7 @@ async fn send_find_blocks(
     let (request_tx, request_rx) = oneshot::channel();
     client_tx
         .try_send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::FindBlocks {
                 known_blocks: vec![block::Hash([1; 32])],
                 stop: None,
@@ -3159,7 +3269,7 @@ async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
             let (request_tx, request_rx) = oneshot::channel();
             client_tx
                 .try_send(ClientRequest {
-                    advertised_block: None,
+                    block_request: None,
                     request: Request::TransactionsById(HashSet::from([requested.id(), missing])),
                     tx: request_tx,
                     inv_collector: None,
@@ -3288,7 +3398,7 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {
-                advertised_block: None,
+                block_request: None,
                 request: Request::FindBlocks {
                     known_blocks: vec![block::Hash([1; 32])],
                     stop: None,
@@ -3320,8 +3430,79 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     .expect("the revoked advert is answered before the request timeout");
 }
 
+/// A verified block too large to arrive in one round trip still clears the connection's missed
+/// block, but its download time does not change the peer's expected answer time.
+#[tokio::test(start_paused = true)]
+async fn a_large_verified_block_clears_a_miss_and_keeps_the_expected_answer_time() {
+    use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
+    let _init_guard = zakura_test::init();
+
+    let registry = crate::peer_registry::PeerRegistry::default();
+    let (_registry_guard, delivery_samples) = registry.register_legacy(crate::ConnectedPeer {
+        addr: "192.0.2.7:8233".parse().expect("valid address"),
+        user_agent: "/Zakura:1.8.9/".into(),
+        version: crate::protocol::external::types::Version(170_100),
+        start_height: block::Height(1),
+        is_inbound: false,
+        rtt: None,
+        ping_sent_at: None,
+    });
+    delivery_samples.record_response(Duration::from_millis(30));
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let connection = connection.with_delivery_samples(Some(delivery_samples.clone()));
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    assert!(
+        block.zcash_serialized_size() > 14_600,
+        "the test block does not fit one round trip"
+    );
+    slot.mark_announced_block_missed();
+    settle().await;
+
+    let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
+    client_tx.send(request).await.expect("connection is open");
+    assert!(matches!(outbound.next().await, Some(Message::GetData(_))));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    peer_tx
+        .send(Ok(Message::Block(BlockHandle::from(block).into())))
+        .await
+        .expect("connection is open");
+    let Response::Blocks(blocks) = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block")
+    else {
+        panic!("expected a block response");
+    };
+    let (received, _) = blocks[0].available().expect("the block was delivered");
+    assert!(
+        slot.announced_block_missed(),
+        "receipt alone does not clear the miss"
+    );
+
+    received.record_verified();
+    assert!(
+        !slot.announced_block_missed(),
+        "a verified large block clears the miss like any other block"
+    );
+    assert_eq!(
+        delivery_samples.delivery_estimate().round_trip(),
+        Some(Duration::from_millis(30)),
+        "a five-second download of a large block does not raise the expected answer time"
+    );
+
+    connection_task.abort();
+}
+
 /// Answers to block requests are timed from when the request was written, and recorded as the
-/// peer's delivery samples, whatever the block's size. Block-hash and transaction answers are not.
+/// peer's delivery samples. The block here is small enough to arrive in one round trip, so its
+/// sample sets the expected answer time. Block-hash and transaction answers are not recorded.
 #[tokio::test(start_paused = true)]
 async fn block_answers_are_timed_as_delivery_samples() {
     let _init_guard = zakura_test::init();
@@ -3368,7 +3549,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent hashes");
     settle().await;
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
 
     // A transaction answer is not either: the peer chooses how many transactions it announces.
     let (request, response) = client_request(Request::TransactionsById([txid].into()));
@@ -3384,7 +3565,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         .expect("connection responds")
         .expect("peer sent the transaction");
     settle().await;
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
 
     // A block answer 10 ms after the request is.
     let (request, response) = client_request(Request::BlocksByHash(IndexSet::from([block.hash()])));
@@ -3403,7 +3584,7 @@ async fn block_answers_are_timed_as_delivery_samples() {
         panic!("expected a block response");
     };
     let (received, _) = blocks[0].available().unwrap();
-    assert_eq!(delivery_samples.delivery_score(), None);
+    assert_eq!(delivery_samples.delivery_estimate().round_trip(), None);
     tokio::time::advance(Duration::from_secs(1)).await;
     let other_body: BlockHandle = Arc::new(block::Block {
         header: block.header.clone(),
@@ -3413,14 +3594,14 @@ async fn block_answers_are_timed_as_delivery_samples() {
     assert_eq!(received.hash(), other_body.hash());
     received.record_verified_copy(&other_body);
     assert_eq!(
-        delivery_samples.delivery_score(),
+        delivery_samples.delivery_estimate().round_trip(),
         None,
         "an equal header does not confirm the body"
     );
     received.record_verified_copy(&block.into());
     received.record_verified();
     assert_eq!(
-        delivery_samples.delivery_score(),
+        delivery_samples.delivery_estimate().round_trip(),
         Some(Duration::from_millis(10))
     );
 

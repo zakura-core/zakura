@@ -8,13 +8,19 @@ use serde::{Deserialize, Serialize};
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled:
 ///
 /// - it asks the one expected to answer sooner, from how long each peer has recently taken to
-///   answer pings and block requests. The node records missed announcements in either mode, but
-///   only when enabled does it pass over an announcer that missed, until a later body from the
-///   same connection verifies or 10 minutes elapse;
+///   answer pings and requests for blocks small enough to arrive in one round trip (14,600
+///   bytes). The node records missed announcements in either mode, but only when enabled does
+///   it pass over an announcer that missed, until a later body from the same connection
+///   verifies or 10 minutes elapse;
 /// - a block that the first request has not delivered yet is also requested from one other idle
 ///   peer that announced it, but only when that peer is expected to deliver it clearly sooner
 ///   than the first, or when the first request has run well past its expected time. Both peers
-///   must have measured answer times. The first reply that passes the requested-hash and
+///   must have measured answer times. Once the first peer starts sending the requested block and its header
+///   hash matches, the expected times are for a block of that size: the peer's round trip, times
+///   the round trips the size needs on a new connection, times how the peer's earlier large
+///   blocks compared with that, with a minimum of one round trip. The size is the first peer's
+///   claim until the whole block has arrived, so however large it is, a first request that
+///   stops is still noticed while a second request can be sent. The first reply that passes the requested-hash and
 ///   tip-child height checks is tried first. If its height falls outside the local window or
 ///   verification rejects its commitments or duplicate transactions, the node tries the other
 ///   already-requested copy once.

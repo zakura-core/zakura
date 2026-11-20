@@ -57,7 +57,7 @@ async fn warmup_pong_is_delivered_while_a_heartbeat_is_pending() {
     let (heartbeat_tx, heartbeat_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::Ping(heartbeat_nonce),
             tx: heartbeat_tx,
             inv_collector: None,
@@ -155,7 +155,7 @@ async fn warmup_pong_is_delivered_while_a_block_request_is_pending() {
     let (block_tx, mut block_rx) = oneshot::channel();
     client_tx
         .send(ClientRequest {
-            advertised_block: None,
+            block_request: None,
             request: Request::BlocksByHash(IndexSet::from([hash])),
             tx: block_tx,
             inv_collector: None,

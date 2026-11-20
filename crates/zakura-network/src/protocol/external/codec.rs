@@ -257,10 +257,94 @@ fn serialized_block_checksum(block: &BlockHandle) -> sha256d::Checksum {
     sha256d_checksum_of_digest(first)
 }
 
+/// The command of a `block` message, as it appears in a message header.
+const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
+
+/// The first matching frame publishes its size and wakes the peer set holding the hedge.
+#[derive(Debug, Default)]
+pub(crate) struct BlockReplySize {
+    bytes: OnceLock<u64>,
+    waker: futures::task::AtomicWaker,
+}
+
+impl BlockReplySize {
+    pub(crate) fn publish(&self, bytes: u64) {
+        if self.bytes.set(bytes).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<u64> {
+        self.bytes.get().copied()
+    }
+
+    /// Register before reading so that a size learned during a routing decision wakes it.
+    pub(crate) fn read_for_routing(&self, cx: &std::task::Context<'_>) -> Option<u64> {
+        self.waker.register(cx.waker());
+        self.get()
+    }
+}
+
+/// A request's destination for the size declared by its matching block message.
+#[derive(Clone, Debug)]
+struct RequestedBlockSize {
+    hash: block::Hash,
+    bytes: Arc<BlockReplySize>,
+    /// Set if this watch was active when the decoder first saw a fragmented transport header.
+    saw_header_start: bool,
+}
+
+/// Shares the active primary request between the connection and its decoder.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InboundBlockSize(Arc<Mutex<Option<RequestedBlockSize>>>);
+
+impl InboundBlockSize {
+    /// Called after the connection writes a single-block request.
+    pub(crate) fn watch(&self, hash: block::Hash, bytes: Arc<BlockReplySize>) {
+        *self.0.lock().expect("block size lock is never poisoned") = Some(RequestedBlockSize {
+            hash,
+            bytes,
+            saw_header_start: false,
+        });
+    }
+
+    /// Mark the current watch without capturing a size destination before the command and length are known.
+    fn mark_header_start(&self) {
+        if let Some(request) = self
+            .0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .as_mut()
+        {
+            request.saw_header_start = true;
+        }
+    }
+
+    /// A watch installed after a partial header arrived cannot own that frame.
+    fn snapshot(&self, fragmented_header: bool) -> Option<RequestedBlockSize> {
+        self.0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .as_ref()
+            .filter(|request| !fragmented_header || request.saw_header_start)
+            .cloned()
+    }
+
+    /// Stop observing this request when the connection becomes idle.
+    pub(crate) fn clear(&self) {
+        self.0
+            .lock()
+            .expect("block size lock is never poisoned")
+            .take();
+    }
+}
+
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
+    /// The request to observe when the next block message starts.
+    inbound_block_size: InboundBlockSize,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
 }
@@ -288,6 +372,11 @@ impl Codec {
         }
     }
 
+    /// Connect the request handler to this decoder before splitting the framed transport.
+    pub(crate) fn inbound_block_size(&self) -> InboundBlockSize {
+        self.inbound_block_size.clone()
+    }
+
     /// Reconfigure the version used by the codec, e.g., after completing a handshake.
     pub fn reconfigure_version(&mut self, version: Version) {
         self.builder.version = version;
@@ -307,7 +396,8 @@ impl Builder {
     pub fn finish(self) -> Codec {
         Codec {
             builder: self,
-            state: DecodeState::Head,
+            state: DecodeState::Head { fragmented: false },
+            inbound_block_size: InboundBlockSize::default(),
             #[cfg(test)]
             body_decode_panic: Cell::new(None),
         }
@@ -376,7 +466,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } => b"block\0\0\0\0\0\0\0",
+            Block { .. } => BLOCK_COMMAND,
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -624,22 +714,26 @@ impl Codec {
 // ======== Decoding =========
 
 enum DecodeState {
-    Head,
+    Head {
+        fragmented: bool,
+    },
     Body {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
+        requested_size: Option<RequestedBlockSize>,
     },
 }
 
 impl fmt::Debug for DecodeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            DecodeState::Head => write!(f, "DecodeState::Head"),
+            DecodeState::Head { .. } => write!(f, "DecodeState::Head"),
             DecodeState::Body {
                 body_len,
                 command,
                 checksum,
+                ..
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
@@ -665,9 +759,13 @@ impl Decoder for Codec {
         // per call stays bounded without a separate count.
         'messages: loop {
             match self.state {
-                DecodeState::Head => {
+                DecodeState::Head { fragmented } => {
                     // First check that the src buffer contains an entire header.
                     if src.len() < HEADER_LEN {
+                        if !fragmented && !src.is_empty() {
+                            self.inbound_block_size.mark_header_start();
+                            self.state = DecodeState::Head { fragmented: true };
+                        }
                         trace!(?self.state, "src buffer does not have an entire header, waiting");
                         // Signal that decoding requires more data.
                         return Ok(None);
@@ -680,7 +778,8 @@ impl Decoder for Codec {
                     let mut header_reader = Cursor::new(&header);
                     let magic = Magic(header_reader.read_4_bytes()?);
                     let command = header_reader.read_12_bytes()?;
-                    let body_len = header_reader.read_u32::<LittleEndian>()? as usize;
+                    let declared_len = header_reader.read_u32::<LittleEndian>()?;
+                    let body_len = declared_len as usize; // Supported targets have at least 32-bit usize.
                     let checksum = sha256d::Checksum(header_reader.read_4_bytes()?);
                     trace!(
                         ?self.state,
@@ -713,6 +812,13 @@ impl Decoder for Codec {
                         body_len,
                         command,
                         checksum,
+                        requested_size: if command == *BLOCK_COMMAND
+                            && u64::from(declared_len) <= block::MAX_BLOCK_BYTES
+                        {
+                            self.inbound_block_size.snapshot(fragmented)
+                        } else {
+                            None
+                        },
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -722,7 +828,21 @@ impl Decoder for Codec {
                     body_len,
                     command,
                     checksum,
+                    ref mut requested_size,
                 } => {
+                    // Inspect at most one bounded header per observed frame, even if it arrives
+                    // one byte at a time. The full decoder still checks the checksum and body.
+                    let prefix_len = body_len.min(block::MAX_SERIALIZED_HEADER_BYTES);
+                    if src.len() >= prefix_len {
+                        if let Some(requested) = requested_size.take() {
+                            if block::Header::zcash_deserialize(&src[..prefix_len])
+                                .is_ok_and(|header| header.hash() == requested.hash)
+                            {
+                                // The transport length was read from a u32.
+                                requested.bytes.publish(body_len as u64);
+                            }
+                        }
+                    }
                     if src.len() < body_len {
                         // Need to wait for the full body
                         trace!(?self.state, len = src.len(), "src buffer does not have an entire body, waiting");
@@ -733,7 +853,7 @@ impl Decoder for Codec {
                     // and reset the decoder state for the next message. Otherwise
                     // we will attempt to read the next header as the current body.
                     let body = src.split_to(body_len);
-                    self.state = DecodeState::Head;
+                    self.state = DecodeState::Head { fragmented: false };
 
                     if checksum != message_checksum(&body[..]) {
                         return Err(Parse(
@@ -774,7 +894,7 @@ impl Decoder for Codec {
                             b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
                             b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                             b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                            b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                            BLOCK_COMMAND => self.read_block(&mut body_reader),
                             b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
                             b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
                             b"getheaders\0\0" => self.read_getheaders(&mut body_reader),

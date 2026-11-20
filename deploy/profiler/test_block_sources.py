@@ -142,6 +142,19 @@ class MissedBlockTest(unittest.TestCase):
         self.assertEqual(summary["samples"]["counts"]["carried_over"], 1)
         self.assertEqual(summary["samples"]["weight"]["p50"], 1.0)
 
+    def test_large_delivery_clears_a_miss_without_adding_a_round_trip_sample(self):
+        for score in (None, 50):
+            with self.subTest(score=score):
+                large = sample(20, 1, "large_block", score, score, weight=0.0)
+                if score is None:
+                    del large["score_ms"]
+                summary = sources_at(100, [missed(10, 1, "first"), large]).summary(1)
+                recovered = summary["missed_blocks"]["first"]
+                self.assertEqual(recovered["delivered_again"], 1)
+                self.assertEqual(recovered["delivered_again_s"]["p50"], 10)
+                self.assertEqual(sum(summary["samples"]["counts"].values()), 0)
+                self.assertEqual(summary["samples"]["weight"]["n"], 0)
+
     def test_a_miss_reports_when_the_peer_delivered_a_block_again(self):
         sources = sources_at(2000, [
             missed(20, 1, "second"),

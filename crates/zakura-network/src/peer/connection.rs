@@ -711,6 +711,9 @@ where
     /// Tells the client and peer set whether this connection is free to write a new request.
     pub(super) request_slot: super::client::RequestSlot,
 
+    /// Publishes block sizes from the decoder to the active primary request.
+    inbound_block_size: crate::protocol::external::InboundBlockSize,
+
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
@@ -854,6 +857,7 @@ where
             requested_blocks: IndexSet::new(),
             gossip_trace: Default::default(),
             request_slot: Default::default(),
+            inbound_block_size: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -871,6 +875,15 @@ where
         delivery_samples: Option<PeerRegistryUpdater>,
     ) -> Self {
         self.delivery_samples = delivery_samples;
+        self
+    }
+
+    /// Connects this request handler to its wire decoder.
+    pub(super) fn with_inbound_block_size(
+        mut self,
+        inbound_block_size: crate::protocol::external::InboundBlockSize,
+    ) -> Self {
+        self.inbound_block_size = inbound_block_size;
         self
     }
 
@@ -942,6 +955,7 @@ where
             let advert_due = overdue_advert_wait.is_some();
             match self.state {
                 State::AwaitingRequest => {
+                    self.inbound_block_size.clear();
                     trace!("awaiting client request or peer message");
                     // # Correctness
                     //
@@ -1084,10 +1098,10 @@ where
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
-                            let timed_out = matches!(&tx.advertised_block,
-                                Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) if attempt.timed_out_after_write());
+                            let timed_out = matches!(&tx.block_request,
+                                Some(super::BlockRequestKind::TrackedPrimary { attempt, advertised: true }) if attempt.timed_out_after_write());
                             if timed_out {
-                                self.record_advertised_block_miss(Some(&super::AdvertisedBlockRequest::Primary));
+                                self.record_advertised_block_miss(Some(&super::BlockRequestKind::Primary));
                             }
                             self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
@@ -1116,7 +1130,7 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
-                                    self.record_advertised_block_miss(tx.advertised_block.as_ref());
+                                    self.record_advertised_block_miss(tx.block_request.as_ref());
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -1534,18 +1548,25 @@ where
 
             (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
                 self.remember_requested_blocks(&hashes);
-                self
-                    .peer_tx
-                    .send(Message::GetData(
-                        hashes.iter().map(|h| (*h).into()).collect(),
-                    ))
+                self.peer_tx
+                    .send(Message::GetData(hashes.iter().map(|h| (*h).into()).collect()))
                     .await
-                    .map(|()|
-                         Handler::BlocksByHash {
-                             blocks: Vec::with_capacity(hashes.len()),
-                             pending_hashes: hashes.into_iter().collect(),
-                         }
-                    )
+                    .map(|()| {
+                        if let Some(super::BlockRequestKind::TrackedPrimary { attempt, .. }) =
+                            &tx.block_request
+                        {
+                            if let Some(size) = attempt.legacy_request_written() {
+                                let hash = hashes
+                                    .first()
+                                    .expect("a tracked primary requests exactly one block");
+                                self.inbound_block_size.watch(*hash, size);
+                            }
+                        }
+                        Handler::BlocksByHash {
+                            blocks: Vec::with_capacity(hashes.len()),
+                            pending_hashes: hashes.into_iter().collect(),
+                        }
+                    })
             }
             (AwaitingRequest, TransactionsById(ids) | TransactionsByIdFrom { ids, .. }) => {
                 self
@@ -1635,11 +1656,6 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
-                if let Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) =
-                    &tx.advertised_block
-                {
-                    attempt.legacy_request_written();
-                }
                 self.state = AwaitingResponse { handler, span, tx };
                 self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
             }
@@ -2000,10 +2016,11 @@ where
                         &self.request_slot,
                         self.delivery_samples.clone(),
                         started.elapsed(),
+                        std::time::Instant::now(),
                     );
                 }
             } else {
-                self.record_advertised_block_miss(tx.advertised_block.as_ref());
+                self.record_advertised_block_miss(tx.block_request.as_ref());
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -2347,11 +2364,18 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Record a dispatched advertiser's miss before another request can update the same slot.
-    fn record_advertised_block_miss(&self, advertised: Option<&super::AdvertisedBlockRequest>) {
-        if let Some(route) = advertised {
+    fn record_advertised_block_miss(&self, advertised: Option<&super::BlockRequestKind>) {
+        if let Some(
+            route @ (super::BlockRequestKind::Primary
+            | super::BlockRequestKind::TrackedPrimary {
+                advertised: true, ..
+            }
+            | super::BlockRequestKind::Hedge),
+        ) = advertised
+        {
             self.request_slot.mark_announced_block_missed();
             if let Some(registry) = &self.delivery_samples {
-                registry.trace_block_missed(*route == super::AdvertisedBlockRequest::Hedge);
+                registry.trace_block_missed(*route == super::BlockRequestKind::Hedge);
             }
         }
     }
@@ -2471,7 +2495,7 @@ where
             // can block the current async task thread. We briefly lock the mutex
             // to clone the error.
             if !tx.is_canceled() {
-                self.record_advertised_block_miss(tx.advertised_block.as_ref());
+                self.record_advertised_block_miss(tx.block_request.as_ref());
             }
             let _ = tx.send(Err(error.clone()));
         }

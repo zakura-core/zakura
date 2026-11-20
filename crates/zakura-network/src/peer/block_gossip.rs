@@ -28,7 +28,7 @@ use zakura_chain::{block, chain_tip::ChainTip};
 use crate::{
     constants::{BLOCK_GOSSIP_TIMEOUT, REQUEST_TIMEOUT},
     peer::{AnnouncedBlocks, MinimumPeerVersion, SharedPeerError},
-    peer_registry::PeerRegistryUpdater,
+    peer_registry::{DeliveryEstimate, PeerRegistryUpdater},
     protocol::external::types::Version,
     AdvertisedBlock, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
@@ -378,11 +378,13 @@ impl BlockGossipPeer {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
 
-    /// The expected time for this peer to answer a block request, from its recent answers.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+    /// What is known about how long this peer takes to deliver a block: its round trip and its
+    /// record on large blocks. Empty for a peer with no measured answers.
+    pub(crate) fn delivery_estimate(&self) -> DeliveryEstimate {
         self.registry
             .as_ref()
-            .and_then(PeerRegistryUpdater::delivery_score)
+            .map(PeerRegistryUpdater::delivery_estimate)
+            .unwrap_or_default()
     }
 
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.

@@ -186,6 +186,159 @@ fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     assert!(bytes.is_empty(), "all complete messages should be consumed");
 }
 
+/// The declared length becomes visible only after the block header identifies the request.
+#[test]
+fn a_partial_frame_reports_only_the_requested_block_size() {
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+    let body = BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    for (command, requested_hash, matches) in [
+        (*BLOCK_COMMAND, hash, true),
+        (*BLOCK_COMMAND, block::Hash([0; 32]), false),
+        (*b"tx\0\0\0\0\0\0\0\0\0\0", hash, false),
+    ] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(BlockReplySize::default());
+        codec
+            .inbound_block_size()
+            .watch(requested_hash, size.clone());
+        let message = wire_message(command, body);
+        let prefix = HEADER_LEN + block::MAX_SERIALIZED_HEADER_BYTES;
+        let mut received = BytesMut::from(&message[..prefix - 1]);
+        assert!(codec.decode(&mut received).unwrap().is_none());
+        assert_eq!(size.get(), None);
+        received.extend_from_slice(&message[prefix - 1..prefix]);
+        assert!(codec.decode(&mut received).unwrap().is_none());
+        assert_eq!(
+            size.get(),
+            matches.then_some(u64::try_from(body.len()).unwrap())
+        );
+    }
+}
+
+/// A partial reply may inform routing up to the block limit, inclusive.
+#[test]
+fn a_partial_block_size_hint_respects_the_block_limit() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    let limit = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    for (length, expected) in [(limit, Some(block::MAX_BLOCK_BYTES)), (limit + 1, None)] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(BlockReplySize::default());
+        codec.inbound_block_size().watch(hash, size.clone());
+        let mut prefix = wire_message(*BLOCK_COMMAND, body);
+        // Only the transport header and the matching block header have arrived.
+        prefix[16..20].copy_from_slice(&length.to_le_bytes());
+        prefix.truncate(HEADER_LEN + block::MAX_SERIALIZED_HEADER_BYTES);
+        assert!(codec
+            .decode(&mut BytesMut::from(prefix.as_slice()))
+            .unwrap()
+            .is_none());
+        assert_eq!(size.get(), expected);
+    }
+}
+
+/// A block frame too short to hold a block header cannot be the requested block, even when
+/// its bytes are the start of that block's header.
+#[test]
+fn a_block_frame_shorter_than_a_header_reports_no_size() {
+    let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let header = block::Header::zcash_deserialize(block).unwrap();
+    let header_len = header.zcash_serialized_size();
+    for body_len in [0, 1, header_len - 1] {
+        let mut codec = Codec::builder()
+            .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+            .finish();
+        let size = Arc::new(BlockReplySize::default());
+        codec
+            .inbound_block_size()
+            .watch(header.hash(), size.clone());
+        let message = wire_message(*BLOCK_COMMAND, &block[..body_len]);
+        // The whole frame arrives, and fails to decode as a block.
+        let decoded = codec.decode(&mut BytesMut::from(message.as_slice()));
+        assert!(
+            !matches!(decoded, Ok(Some(Message::Block(_)))),
+            "{body_len} bytes are not a block"
+        );
+        assert_eq!(size.get(), None);
+    }
+}
+
+/// A fragmented transport header can publish only to a watch active from its first bytes.
+#[test]
+fn a_fragmented_header_cannot_supply_a_size_to_a_new_watch() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    let message = wire_message(*BLOCK_COMMAND, body);
+    let size = u64::try_from(body.len()).unwrap();
+
+    for split in 1..HEADER_LEN {
+        for (watch_at_start, install_new_watch) in [(true, false), (true, true), (false, true)] {
+            let mut codec = Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish();
+            let observer = codec.inbound_block_size();
+            let original = Arc::new(BlockReplySize::default());
+            let current = Arc::new(BlockReplySize::default());
+            if watch_at_start {
+                observer.watch(hash, original.clone());
+            }
+            let mut received = BytesMut::from(&message[..split]);
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            if install_new_watch {
+                observer.clear();
+                observer.watch(hash, current.clone());
+            }
+            // Poll the same prefix again, as can happen while the connection changes requests.
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            received.extend_from_slice(&message[split..message.len() - 1]);
+            assert!(codec.decode(&mut received).unwrap().is_none());
+            assert_eq!(original.get(), (!install_new_watch).then_some(size));
+            assert_eq!(current.get(), None);
+            if install_new_watch {
+                received.extend_from_slice(&message[message.len() - 1..]);
+                assert!(codec.decode(&mut received).unwrap().is_some());
+                received.extend_from_slice(&message[..message.len() - 1]);
+                assert!(codec.decode(&mut received).unwrap().is_none());
+                assert_eq!(
+                    current.get(),
+                    Some(size),
+                    "the next frame belongs to the new watch"
+                );
+            }
+        }
+    }
+}
+
+/// Cancelling and re-requesting even the same hash cannot redirect a partially read frame.
+#[test]
+fn a_frame_keeps_the_size_destination_it_started_with() {
+    let body = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice();
+    let hash = block::Header::zcash_deserialize(body).unwrap().hash();
+    let mut codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    let observation = codec.inbound_block_size();
+    let original = Arc::new(BlockReplySize::default());
+    observation.watch(hash, original.clone());
+    let message = wire_message(*BLOCK_COMMAND, body);
+    let mut received = BytesMut::from(&message[..HEADER_LEN]);
+    assert!(codec.decode(&mut received).unwrap().is_none());
+
+    observation.clear();
+    let retry = Arc::new(BlockReplySize::default());
+    observation.watch(hash, retry.clone());
+    received.extend_from_slice(&message[HEADER_LEN..message.len() - 1]);
+    assert!(codec.decode(&mut received).unwrap().is_none());
+    assert_eq!(original.get(), Some(u64::try_from(body.len()).unwrap()));
+    assert_eq!(retry.get(), None);
+}
+
 fn wire_message(command: [u8; 12], body: &[u8]) -> Vec<u8> {
     let body_len = u32::try_from(body.len()).expect("test message body fits in a u32");
     let mut bytes = Vec::with_capacity(HEADER_LEN + body.len());

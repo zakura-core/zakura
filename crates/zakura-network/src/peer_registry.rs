@@ -13,8 +13,8 @@ use zakura_chain::block;
 mod delivery;
 mod delivery_trace;
 
-use delivery::DeliveryEstimate;
-pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
+pub(crate) use delivery::{DeliveryEstimate, DeliverySampleKind};
+pub(crate) use delivery_trace::DeliveryTrace;
 
 use crate::{
     peer::ConnectionInfo,
@@ -331,12 +331,27 @@ impl PeerRegistryUpdater {
         self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
     }
 
+    /// Classifies a block reply at receipt. Only a large reply needs the connection's current estimate.
+    pub(crate) fn prepare_block_sample(&self, wire_bytes: u64) -> DeliverySampleKind {
+        if wire_bytes <= delivery::ROUND_TRIP_REPLY_BYTES {
+            DeliverySampleKind::SmallBlock { wire_bytes }
+        } else {
+            DeliverySampleKind::LargeBlock {
+                wire_bytes,
+                prediction: self.delivery_estimate().large_block_prediction(wire_bytes),
+            }
+        }
+    }
+
     /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
+    ///
+    /// [`DeliveryEstimate::record`] decides what the sample updates: the peer's round trip, or
+    /// its record on large blocks.
     ///
     /// Does nothing once the connection has closed, or for a native connection, whose blocks
     /// are not chosen this way.
     ///
-    /// Each recorded sample is written to the connection's delivery trace.
+    /// Every sample is written to the connection's delivery trace.
     pub(crate) fn record_delivery_sample(
         &self,
         kind: DeliverySampleKind,
@@ -358,23 +373,20 @@ impl PeerRegistryUpdater {
             .delivery_estimates
             .entry(self.key.clone())
             .or_default();
-        let score_before = estimate.score();
-        estimate.record(sample, now);
-        let estimate = *estimate;
+        let round_trip_before = estimate.round_trip();
+        estimate.record(kind, sample, now);
+        let after = *estimate;
         drop(state);
 
-        let score = estimate
-            .score()
-            .expect("an estimate that just recorded a sample has a score");
         self.delivery_trace
-            .sample(kind, sample, score_before, score, estimate.weight());
+            .sample(kind, sample, round_trip_before, &after);
         self.score_waker.wake();
     }
 
     /// Registers the task polling with `cx` to be woken the next time a delivery sample is
     /// recorded for this connection. Only the last registered task is woken, once.
     ///
-    /// Register before reading [`Self::delivery_score`], so that a sample recorded between the
+    /// Register before reading [`Self::delivery_estimate`], so that a sample recorded between the
     /// read and the task going to sleep still wakes it.
     pub(crate) fn notify_when_score_changes(&self, cx: &std::task::Context<'_>) {
         self.score_waker.register(cx.waker());
@@ -386,16 +398,17 @@ impl PeerRegistryUpdater {
         self.delivery_trace.block_missed(second_request);
     }
 
-    /// The expected time for this peer to answer a block request, from its recent answers, or
-    /// `None` before its first measured answer.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+    /// What is known about how long this peer takes to deliver a block: its round trip and its
+    /// record on large blocks. Empty before its first measured answer.
+    pub(crate) fn delivery_estimate(&self) -> DeliveryEstimate {
         self.registry
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned")
             .delivery_estimates
             .get(&self.key)
-            .and_then(DeliveryEstimate::score)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -440,6 +453,8 @@ pub(crate) fn trace_user_agent(user_agent: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod receipt;
+
     use super::*;
 
     fn peer(port: u16) -> ConnectedPeer {
@@ -490,20 +505,23 @@ mod tests {
     fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
         let registry = PeerRegistry::default();
         let (guard, updater) = registry.register_legacy(peer(1));
-        assert_eq!(updater.delivery_score(), None);
+        assert_eq!(updater.delivery_estimate().round_trip(), None);
 
         updater.record_response(Duration::from_millis(30));
-        assert_eq!(updater.delivery_score(), Some(Duration::from_millis(30)));
+        assert_eq!(
+            updater.delivery_estimate().round_trip(),
+            Some(Duration::from_millis(30))
+        );
 
         drop(guard);
-        assert_eq!(updater.delivery_score(), None);
+        assert_eq!(updater.delivery_estimate().round_trip(), None);
         updater.record_delivery_sample(
-            DeliverySampleKind::Block,
+            updater.prepare_block_sample(1_700),
             Duration::from_millis(5),
             Instant::now(),
         );
         assert_eq!(
-            updater.delivery_score(),
+            updater.delivery_estimate().round_trip(),
             None,
             "a closed connection keeps no estimate"
         );
@@ -522,7 +540,11 @@ mod tests {
 
         let now = Instant::now();
         updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
-        updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
+        updater.record_delivery_sample(
+            updater.prepare_block_sample(1_700),
+            Duration::from_millis(30),
+            now,
+        );
         updater.trace_block_missed(true);
         drop(updater);
         guard.shutdown().await;
@@ -544,8 +566,13 @@ mod tests {
         );
         assert_eq!(rows[0]["score_ms"], 10);
         assert_eq!(rows[0]["weight"], 1.0);
+        assert!(
+            rows[0].get("wire_bytes").is_none(),
+            "a ping has no block size"
+        );
         assert_eq!(rows[1]["kind"], "block");
         assert_eq!(rows[1]["sample_ms"], 30);
+        assert_eq!(rows[1]["wire_bytes"], 1_700);
         assert_eq!(rows[1]["score_before_ms"], 10);
         assert_eq!(
             rows[1]["score_ms"], 20,
@@ -558,6 +585,124 @@ mod tests {
         assert!(
             rows[2].get("score_ms").is_none(),
             "a missed block leaves the score alone"
+        );
+    }
+
+    #[test]
+    fn a_block_reply_is_a_round_trip_up_to_the_size_limit() {
+        use delivery::ROUND_TRIP_REPLY_BYTES;
+
+        let registry = PeerRegistry::default();
+        let (_guard, updater) = registry.register_legacy(peer(1));
+        for bytes in [1_700, ROUND_TRIP_REPLY_BYTES] {
+            let kind = updater.prepare_block_sample(bytes);
+            assert!(matches!(kind, DeliverySampleKind::SmallBlock { .. }));
+        }
+        assert!(matches!(
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES + 1),
+            DeliverySampleKind::LargeBlock { .. }
+        ));
+        assert_eq!(ROUND_TRIP_REPLY_BYTES, 14_600);
+    }
+
+    #[tokio::test]
+    async fn a_large_block_reply_is_traced_and_leaves_the_score_alone() {
+        use delivery::ROUND_TRIP_REPLY_BYTES;
+
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let registry = PeerRegistry::default();
+        let (_connection, updater) = registry.register_legacy(peer(1));
+        let updater = updater.with_delivery_trace(DeliveryTrace::new(
+            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            7,
+        ));
+        let now = Instant::now();
+
+        updater.record_delivery_sample(
+            updater.prepare_block_sample(1_200_000),
+            Duration::from_secs(4),
+            now,
+        );
+        assert_eq!(
+            updater.delivery_estimate().round_trip(),
+            None,
+            "a large block alone does not give a peer an expected answer time"
+        );
+
+        updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
+        updater.record_delivery_sample(
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES),
+            Duration::from_millis(30),
+            now,
+        );
+        assert_eq!(
+            updater.delivery_estimate().round_trip(),
+            Some(Duration::from_millis(20)),
+            "a block of exactly the size limit counts like a ping"
+        );
+
+        updater.record_delivery_sample(
+            updater.prepare_block_sample(ROUND_TRIP_REPLY_BYTES + 1),
+            Duration::from_secs(5),
+            now,
+        );
+        assert_eq!(
+            updater.delivery_estimate().round_trip(),
+            Some(Duration::from_millis(20)),
+            "a slow download of a block over the size limit does not raise the expected answer time"
+        );
+        drop(updater);
+        guard.shutdown().await;
+
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("delivery_score.jsonl"))
+                .expect("delivery trace is written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+                .collect();
+        assert_eq!(rows.len(), 4, "every sample is traced, counted or not");
+
+        assert_eq!(rows[0]["event"], "delivery_sample");
+        assert_eq!(rows[0]["kind"], "large_block");
+        assert_eq!(rows[0]["sample_ms"], 4_000);
+        assert_eq!(rows[0]["wire_bytes"], 1_200_000);
+        assert!(
+            rows[0].get("score_before_ms").is_none() && rows[0].get("score_ms").is_none(),
+            "an unmeasured peer still has no score after a large block"
+        );
+        assert_eq!(rows[0]["weight"], 0.0);
+        assert!(
+            rows[0].get("expected_ms").is_none() && rows[0].get("slowdown").is_none(),
+            "without a round trip there is nothing to expect or to compare the reply with"
+        );
+
+        assert_eq!(rows[2]["kind"], "block");
+        assert!(
+            rows[2].get("expected_ms").is_none() && rows[2].get("slowdown").is_none(),
+            "only large blocks carry the large-block expectation"
+        );
+        assert_eq!(rows[2]["wire_bytes"], ROUND_TRIP_REPLY_BYTES);
+        assert_eq!(rows[2]["score_ms"], 20);
+        assert_eq!(rows[2]["weight"], 2.0);
+
+        assert_eq!(rows[3]["kind"], "large_block");
+        assert_eq!(rows[3]["sample_ms"], 5_000);
+        assert_eq!(rows[3]["wire_bytes"], ROUND_TRIP_REPLY_BYTES + 1);
+        assert_eq!(rows[3]["score_before_ms"], 20);
+        assert_eq!(rows[3]["score_ms"], 20, "the score is unchanged");
+        assert_eq!(
+            rows[3]["weight"], 2.0,
+            "the score rests on the same samples as before"
+        );
+        assert_eq!(
+            rows[3]["expected_ms"], 20,
+            "one byte over the limit was expected in barely more than one round trip"
+        );
+        let slowdown = rows[3]["slowdown"].as_f64().expect("slowdown is traced");
+        assert!(
+            (slowdown - 250.0).abs() < 0.1,
+            "five seconds is 250 times the 20 ms expected: {slowdown}"
         );
     }
 

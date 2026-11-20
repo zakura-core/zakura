@@ -215,13 +215,16 @@ impl RequestSlot {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CancelHeartbeatTask;
 
-/// Why the peer set chose this advertiser for a single-block request.
+/// How the peer set routed a single-block request.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AdvertisedBlockRequest {
+pub(crate) enum BlockRequestKind {
     /// The ordinary request to an announcer.
     Primary,
-    /// A primary whose dual-stack caller can report its legacy deadline.
-    TimedPrimary(crate::BlockHedge),
+    /// A primary tracked by the downloader; only an announcer can miss its own advertisement.
+    TrackedPrimary {
+        attempt: crate::BlockHedge,
+        advertised: bool,
+    },
     /// The competing request to a later announcer.
     Hedge,
 }
@@ -232,8 +235,8 @@ pub(crate) struct ClientRequest {
     /// The actual network request for the peer.
     pub request: Request,
 
-    /// Set only when routing selected a peer that advertised the requested block.
-    pub advertised_block: Option<AdvertisedBlockRequest>,
+    /// Routing information for an announced block download, including fallback peers.
+    pub block_request: Option<BlockRequestKind>,
 
     /// The response `Message` channel, included because `peer::Client::call`
     /// returns a future that may be moved around before it resolves.
@@ -301,8 +304,8 @@ pub(super) struct InProgressClientRequest {
 #[derive(Debug)]
 #[must_use = "tx.send() must be called before drop"]
 pub(super) struct MustUseClientResponseSender {
-    /// Whether this response completes a request to a block advertiser.
-    pub(super) advertised_block: Option<AdvertisedBlockRequest>,
+    /// Routing information for the block request this response completes.
+    pub(super) block_request: Option<BlockRequestKind>,
 
     /// The sender for the oneshot client response channel.
     ///
@@ -347,7 +350,7 @@ impl From<ClientRequest> for InProgressClientRequest {
     fn from(client_request: ClientRequest) -> Self {
         let ClientRequest {
             request,
-            advertised_block,
+            block_request,
             tx,
             inv_collector,
             transient_addr,
@@ -359,7 +362,7 @@ impl From<ClientRequest> for InProgressClientRequest {
             &request,
             inv_collector,
             transient_addr,
-            advertised_block,
+            block_request,
         );
 
         InProgressClientRequest { request, tx, span }
@@ -433,10 +436,10 @@ impl MustUseClientResponseSender {
         request: &Request,
         inv_collector: Option<broadcast::Sender<InventoryChange>>,
         transient_addr: Option<PeerSocketAddr>,
-        advertised_block: Option<AdvertisedBlockRequest>,
+        block_request: Option<BlockRequestKind>,
     ) -> Self {
         Self {
-            advertised_block,
+            block_request,
             tx: Some(tx),
             missing_inv: MissingInventoryCollector::new(request, inv_collector, transient_addr),
         }
@@ -813,7 +816,7 @@ impl Client {
     pub(super) fn send_request(
         &mut self,
         request: Request,
-        advertised_block: Option<AdvertisedBlockRequest>,
+        block_request: Option<BlockRequestKind>,
     ) -> <Self as Service<Request>>::Future {
         let (tx, rx) = oneshot::channel();
         // get the current Span to propagate it to the peer connection task.
@@ -828,7 +831,7 @@ impl Client {
 
         match self.server_tx.try_send(ClientRequest {
             request,
-            advertised_block,
+            block_request,
             tx,
             inv_collector: Some(self.inv_collector.clone()),
             transient_addr: self.connection_info.connected_addr.get_transient_addr(),

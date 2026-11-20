@@ -13,9 +13,11 @@ use zakura_chain::block::Block;
 
 use zakura_chain::{
     block::{self},
+    serialization::ZcashSerialize,
     transaction::{UnminedTx, UnminedTxId},
 };
 
+use crate::peer_registry::{DeliverySampleKind, PeerRegistryUpdater};
 use crate::{meta_addr::MetaAddr, protocol::internal::InventoryResponse, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -37,7 +39,7 @@ struct BlockObservation {
     recorded: OnceLock<()>,
     slot: crate::peer::RequestSlot,
     missed: Option<Arc<tokio::time::Instant>>,
-    registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+    delivery: Option<(PeerRegistryUpdater, DeliverySampleKind)>,
     duration: Duration,
     received_at: Instant,
 }
@@ -48,7 +50,9 @@ impl DeliveredBlock {
         self.block
     }
 
-    /// Credits a legacy delivery once its exact body has passed verification.
+    /// Credits a legacy delivery once its exact body has passed verification: clears the miss
+    /// the connection had when the reply arrived, and records the reply's time and size for
+    /// the peer's round-trip or large-block estimate.
     /// Clones share the same observation. Other transports carry no observation.
     pub fn record_verified(&self) {
         if let Some(observation) = &self.observation {
@@ -56,9 +60,9 @@ impl DeliveredBlock {
                 if let Some(missed) = &observation.missed {
                     observation.slot.clear_miss_at_receipt(missed);
                 }
-                if let Some(registry) = &observation.registry {
+                if let Some((registry, kind)) = &observation.delivery {
                     registry.record_delivery_sample(
-                        crate::peer_registry::DeliverySampleKind::Block,
+                        *kind,
                         observation.duration,
                         observation.received_at,
                     );
@@ -232,21 +236,35 @@ impl Response {
     pub(crate) fn observe_block_delivery(
         &mut self,
         slot: &crate::peer::RequestSlot,
-        registry: Option<crate::peer_registry::PeerRegistryUpdater>,
+        registry: Option<PeerRegistryUpdater>,
         duration: Duration,
+        received_at: Instant,
     ) {
         let Self::Blocks(blocks) = self else { return };
         let missed = slot.miss_at_receipt();
         if missed.is_none() && registry.is_none() {
             return;
         }
+        // Only the registry reads the size, so a reply that can only clear a miss is not measured.
+        let delivery = registry.map(|registry| {
+            let wire_bytes = blocks
+                .iter()
+                .filter_map(|entry| match entry {
+                    Available((block, _)) => Some(block.zcash_serialized_size()),
+                    Missing(_) => None,
+                })
+                .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
+                .fold(0, u64::saturating_add);
+            let kind = registry.prepare_block_sample(wire_bytes);
+            (registry, kind)
+        });
         let observation = Arc::new(BlockObservation {
             recorded: OnceLock::new(),
             slot: slot.clone(),
             missed,
-            registry,
+            delivery,
             duration,
-            received_at: Instant::now(),
+            received_at,
         });
         for entry in blocks {
             if let Available((block, _)) = entry {

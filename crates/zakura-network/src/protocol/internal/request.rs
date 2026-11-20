@@ -14,8 +14,8 @@ use zakura_chain::{
 };
 use zakura_node_services::block_memory::BlockHandle;
 
-use super::super::types::Nonce;
-use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
+use super::super::{external::codec::BlockReplySize, types::Nonce};
+use crate::{peer_registry::DeliveryEstimate, zakura::ZakuraPeerId, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest::{arbitrary::any, collection::vec, strategy::Strategy};
@@ -43,6 +43,13 @@ struct BlockDownloadState {
     legacy_written_before_timeout: bool,
 }
 
+impl BlockDownloadState {
+    /// A second request can start only while the download is unsatisfied and within its window.
+    fn can_dispatch_hedge(&self, age: Duration) -> bool {
+        self.hedge == HedgeDispatch::Open && !self.satisfied && age < BlockHedge::WINDOW
+    }
+}
+
 #[derive(Debug, Default, Eq, PartialEq)]
 enum HedgeDispatch {
     #[default]
@@ -51,12 +58,17 @@ enum HedgeDispatch {
     Dispatched,
 }
 
-/// The first handoff of this download to a peer. Native peers have no legacy address or score.
-#[derive(Clone, Copy, Debug)]
+/// The first handoff of this download to a peer. Native peers have no legacy address and no
+/// expected answer time.
+#[derive(Clone, Debug)]
 pub(crate) struct FirstDispatch {
     pub(crate) at: Instant,
     pub(crate) legacy_peer: Option<PeerSocketAddr>,
-    pub(crate) score: Option<Duration>,
+    pub(crate) estimate: DeliveryEstimate,
+    /// Published once the decoder recognizes the requested block on this exchange. A download
+    /// is handed to at most one legacy peer, so the connection that writes its request, and
+    /// takes this destination, is the one `estimate` describes.
+    pub(crate) block_size: Arc<BlockReplySize>,
 }
 
 impl BlockHedge {
@@ -91,17 +103,13 @@ impl BlockHedge {
     pub fn elapsed_if_open(&self) -> Option<Duration> {
         let state = self.state();
         let age = self.started.elapsed();
-        (state.hedge == HedgeDispatch::Open && !state.satisfied && age < Self::WINDOW)
-            .then_some(age)
+        state.can_dispatch_hedge(age).then_some(age)
     }
 
     /// Claim dispatch at most once, unless completion or expiry has closed the window.
     pub fn claim_dispatch(&self) -> bool {
         let mut state = self.state();
-        if state.hedge != HedgeDispatch::Open
-            || state.satisfied
-            || self.started.elapsed() >= Self::WINDOW
-        {
+        if !state.can_dispatch_hedge(self.started.elapsed()) {
             return false;
         }
         state.hedge = HedgeDispatch::Dispatched;
@@ -118,7 +126,7 @@ impl BlockHedge {
     }
 
     pub(crate) fn first_dispatch(&self) -> Option<FirstDispatch> {
-        self.state().first
+        self.state().first.clone()
     }
 
     /// When the window for dispatching a second request ends, unless it is closed sooner.
@@ -131,9 +139,15 @@ impl BlockHedge {
         self.state().legacy_timed_out = true;
     }
 
-    pub(crate) fn legacy_request_written(&self) {
+    /// Records the write for deadline accounting. While a second request can still be sent,
+    /// returns the destination for the first reply's size.
+    pub(crate) fn legacy_request_written(&self) -> Option<Arc<BlockReplySize>> {
         let mut state = self.state();
         state.legacy_written_before_timeout = !state.legacy_timed_out;
+        if !state.can_dispatch_hedge(self.started.elapsed()) {
+            return None;
+        }
+        Some(state.first.as_ref()?.block_size.clone())
     }
 
     pub(crate) fn timed_out_after_write(&self) -> bool {
@@ -143,10 +157,12 @@ impl BlockHedge {
 
     /// Commit a primary or fallback to its selected peer, ordered against a winning reply.
     /// The closure only enqueues work in a ready service or reserved channel slot.
+    ///
+    /// A first peer with no measured round trip gets no second request.
     pub(crate) fn dispatch_if_needed<T>(
         &self,
         peer: Option<PeerSocketAddr>,
-        score: Option<Duration>,
+        estimate: DeliveryEstimate,
         dispatch: impl FnOnce() -> T,
     ) -> Result<T, crate::BoxError> {
         let mut state = self.state();
@@ -156,15 +172,19 @@ impl BlockHedge {
         if state.satisfied {
             return Err("block already delivered".into());
         }
-        if state.first.is_none() && score.is_none() && state.hedge == HedgeDispatch::Open {
+        if state.first.is_none()
+            && estimate.round_trip().is_none()
+            && state.hedge == HedgeDispatch::Open
+        {
             metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
-            // The first dispatch fixes the score used by every later comparison.
+            // The first dispatch fixes the estimate used by every later comparison.
             state.hedge = HedgeDispatch::Closed;
         }
         state.first.get_or_insert_with(|| FirstDispatch {
             at: Instant::now(),
             legacy_peer: peer,
-            score,
+            estimate,
+            block_size: Arc::default(),
         });
         Ok(dispatch())
     }

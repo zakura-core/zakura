@@ -1804,6 +1804,7 @@ where
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
+            let inbound_block_size = peer_conn.codec().inbound_block_size();
             let (peer_tx, peer_rx) = peer_conn.split();
 
             // Instrument the peer's rx and tx streams.
@@ -1959,7 +1960,8 @@ where
                 inbound_budget,
             )
             .with_gossip_trace(gossip_trace)
-            .with_delivery_samples(peer_registry_updater.clone());
+            .with_delivery_samples(peer_registry_updater.clone())
+            .with_inbound_block_size(inbound_block_size);
 
             let block_uploads = server.block_uploads.clone();
             let request_slot = server.request_slot.clone();
@@ -2304,7 +2306,7 @@ async fn send_one_heartbeat(
     let request = Request::Ping(Nonce::default());
     tracing::trace!(?request, "queueing heartbeat request");
     match server_tx.try_send(ClientRequest {
-        advertised_block: None,
+        block_request: None,
         request,
         tx,
         // we're not requesting inventory, so we don't need to update the registry

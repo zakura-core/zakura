@@ -1856,7 +1856,9 @@ impl ZakuraPeerHandle {
             .await
             .map_err(|_| -> BoxError { "Zakura outbound peer queue closed".into() })?;
         match attempt {
-            Some(attempt) => attempt.dispatch_if_needed(None, None, || slot.send(frame))?,
+            Some(attempt) => {
+                attempt.dispatch_if_needed(None, Default::default(), || slot.send(frame))?
+            }
             None => slot.send(frame),
         }
         completed

@@ -18,6 +18,11 @@ on:
         description: "Self-send amount in ZEC/TAZ"
         required: true
         default: "0.0002"
+  # The live probe on a schedule, Testnet only, with the defaults above. It
+  # spends Testnet funds, so it runs only while the repository variable
+  # MEMPOOL_GOSSIP_SCHEDULE is "testnet".
+  schedule:
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: read
@@ -28,6 +33,7 @@ concurrency:
 
 jobs:
   gossip:
+    if: github.event_name != 'schedule' || vars.MEMPOOL_GOSSIP_SCHEDULE == 'testnet'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

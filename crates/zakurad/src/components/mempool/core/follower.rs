@@ -186,8 +186,7 @@ impl Announcer {
                 tracing::warn!("the pool's change log moved past the announcer, resynchronizing");
                 metrics::counter!("mempool.gossip.lagged.events.total").increment(1);
                 self.pending = snapshot
-                    .transactions
-                    .iter()
+                    .transactions()
                     .map(|tx| tx.transaction.id())
                     .collect();
             }

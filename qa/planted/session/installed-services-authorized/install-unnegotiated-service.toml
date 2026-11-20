@@ -1,0 +1,7 @@
+seed = "handshake-installed-services"
+checks = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-network/src/zakura/transport/registry.rs"]
+# The patch counts discovery as negotiated on every connection, so a peer's
+# discovery stream on a connection that didn't negotiate it opens instead of
+# resetting. The bug also breaks `handshake/prelude/unnegotiated-capability-resets`,
+# which a campaign input's patched run violates instead.
+also_violates = ["handshake/prelude/unnegotiated-capability-resets"]

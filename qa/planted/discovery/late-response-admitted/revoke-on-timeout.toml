@@ -2,7 +2,7 @@
 # wait times out. The input's Plan delivers the held Peers after that, so
 # the reader's precheck refuses it as unsolicited and the node closes the
 # connection with a fault cause.
-input = "crates/zakura-sim/tests/fixtures/discovery-wire-late-response.bin"
+seed = "discovery-wire-late-response"
 # Besides peer.rs and requester.rs, which the patch changes, the rest of
 # discovery and the Zakura transport under it decide when the Peers arrives
 # and when the reader reads it. A change there can move the input off the

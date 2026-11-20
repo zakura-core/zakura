@@ -729,6 +729,12 @@ impl Scheduler {
         self.state(|s| s.mid_poll.clone())
     }
 
+    /// The tasks another task is parked on: each holds a lock that a
+    /// parked task waits for.
+    pub fn waited_on(&self) -> BTreeSet<TaskId> {
+        self.state(|s| s.holders.values().copied().collect())
+    }
+
     /// What the run can do next.
     pub fn status(&self) -> Status {
         self.state(|s| {

@@ -3,7 +3,7 @@
 # work. The input resets the chain mid-flight while two mirrors serve, so
 # an old-epoch body arrives after the reset and the node submits it under a
 # request that never asked for it.
-input = "crates/zakura-sim/tests/fixtures/block-sync-reset-mid-flight.bin"
+seed = "block-sync-reset-mid-flight"
 # Besides sequencer_task.rs, which the patch changes, the rest of block sync
 # decides which bodies arrive after the reset. A change there can move the
 # input off the old-epoch body.

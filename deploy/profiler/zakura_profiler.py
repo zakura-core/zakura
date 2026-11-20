@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import block_sources  # noqa: E402
 import blocks  # noqa: E402
 import stacks  # noqa: E402
 
@@ -489,8 +490,13 @@ class Profiler:
         self.symbols = stacks.SymbolNames()
         self.categorizer = stacks.Categorizer()
         self.log = blocks.FileFollower(args.log_file) if args.log_file else None
+        self.block_sources = block_sources.BlockSources() if args.trace_dir else None
         self.traces = (
-            blocks.TraceFollower(args.trace_dir, args.trace_table_cap_mb * 1024 * 1024)
+            blocks.TraceFollower(
+                args.trace_dir,
+                args.trace_table_cap_mb * 1024 * 1024,
+                also_feed=(self.block_sources.feed,),
+            )
             if args.trace_dir
             else None
         )
@@ -780,6 +786,7 @@ class Profiler:
             "retention_days": HOUR_RETENTION_SECONDS // 86400,
             "block_window_ms": [round(BLOCK_LEAD_SECONDS * 1000), round(BLOCK_TAIL_SECONDS * 1000)],
             "stage_timeline": self.traces is not None,
+            "block_sources": self.block_sources is not None,
             "trace_retention": (
                 {
                     "directory": self.args.trace_dir,
@@ -933,6 +940,13 @@ class Queries:
             ],
         }
 
+    def block_sources(self, hours):
+        """How well the node's legacy block source scores predicted its downloads, over the
+        last `hours` (see `block_sources.py`)."""
+        if self.profiler.block_sources is None:
+            raise KeyError("the node writes no trace tables")
+        return self.profiler.block_sources.summary(hours)
+
     def meta(self):
         """What the page needs before its first query: views, colours, ranges."""
         labels = {c["id"]: c["label"] for c in stacks.CATEGORIES}
@@ -987,6 +1001,8 @@ def make_handler(queries, profiler):
                 if parsed.path == "/api/blocks":
                     limit = max(1, min(int(params.get("limit", "200")), 1000))
                     return self.reply_json(200, queries.block_stages(limit))
+                if parsed.path == "/api/sources":
+                    return self.reply_json(200, queries.block_sources(int(params.get("hours", "6"))))
                 if parsed.path == "/api/propagation":
                     limit = max(1, min(int(params.get("limit", "200")), 1000))
                     return self.reply_json(200, queries.propagation(limit))

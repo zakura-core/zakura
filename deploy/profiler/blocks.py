@@ -166,7 +166,10 @@ TRACE_TABLES = {
     "handshake": ("peer_upgraded",),
     "commit_state": ("commit_start", "commit_finish"),
     "chain_tip": ("tip_published",),
+    # Read only by the block source summary (`block_sources.py`), not by the stage timeline.
+    "delivery_score": ("delivery_sample", "block_missed"),
 }
+STAGE_TABLES = frozenset(TRACE_TABLES) - {"delivery_score"}
 # Rows that say a peer and this node exchanged word of a block, and which step each is:
 # the peer told us ("heard"), we announced the block's header to the peer before having
 # the block ("announced"), we told the peer we had the block ("told"), the peer asked us
@@ -261,6 +264,35 @@ def note_download(seen, download):
     downloads = seen.setdefault("downloads", [])
     if len(downloads) < MAX_DOWNLOADS_PER_BLOCK:
         downloads.append(download)
+
+
+def note_legacy_download(seen, when, row):
+    """Time the first delivery from dispatch, including the primary's lead over a winning hedge.
+
+    Older hedge rows omit that lead. Recover it when the trace shows a primary outstanding
+    at hedge dispatch, even if the primary failed before the hedge delivered.
+    """
+    start = when - round(row["elapsed_ms"] * 1000)
+    if "arrived" not in seen:
+        if row.get("result") != "available":
+            return
+        if row.get("route") == "hedge":
+            waited = row.get("first_request_waited_ms")
+            if isinstance(waited, (int, float)):
+                start -= round(waited * 1000)
+            else:
+                hedge_start = start
+                for attempt in seen.get("downloads", []):
+                    if (attempt["stack"] == PATH_LEGACY and attempt.get("route") != "hedge"
+                            and isinstance(attempt.get("ms"), (int, float))):
+                        primary_start = attempt["when"] - round(attempt["ms"] * 1000)
+                        if primary_start <= hedge_start <= attempt["when"]:
+                            start = min(start, primary_start)
+        seen["arrived"] = when
+        seen["request_start"] = start
+    elif start < seen["request_start"]:
+        seen["request_start"] = start
+    seen["download_ms"] = round((seen["arrived"] - seen["request_start"]) / 1000, 3)
 
 
 def block_downloads(attempts, started, zakura_peers, process):
@@ -467,6 +499,12 @@ class BlockStages:
                     "result": row.get("result"), "route": row.get("route"),
                 },
             )  # fmt: skip
+        requested = row.get("requested_hash") or row.get("returned_hash")
+        if event == "block_request_finish" and isinstance(requested, str):
+            if isinstance(row.get("elapsed_ms"), (int, float)):
+                # Before the failure check below: a request that fails after the block arrived
+                # was still waiting when it did, so it can start the download stage.
+                note_legacy_download(self._by_hash.setdefault((process, requested), {}), when, row)
         if event == "block_body_received" and type(row.get("height")) is int:
             note_download(
                 self._by_height.setdefault((process, row["height"]), {}),
@@ -511,8 +549,6 @@ class BlockStages:
             seen[event] = when
             if event == "block_body_received" and type(row.get("serialized_bytes")) is int:
                 seen["size"] = row["serialized_bytes"]
-            if event == "block_request_finish" and isinstance(row.get("elapsed_ms"), (int, float)):
-                seen["download_ms"] = row["elapsed_ms"]
         if event == "tip_published" and isinstance(block_hash, str) and type(height) is int:
             self._open.append(
                 {
@@ -600,8 +636,10 @@ class TraceFollower:
     waits while bounded reads drain the old file, temporarily allowing a larger table.
     """
 
-    def __init__(self, trace_dir, table_cap_bytes):
+    def __init__(self, trace_dir, table_cap_bytes, also_feed=()):
+        """`also_feed` are functions that also get every parsed row, from every table."""
         self.trim_failure = None
+        self._also_feed = tuple(also_feed)
         self.trace_dir = trace_dir
         self.table_cap_bytes = table_cap_bytes
         self._followers = {}
@@ -629,7 +667,10 @@ class TraceFollower:
                 except ValueError:
                     continue
                 if isinstance(row, dict):
-                    self._stages.feed(row)
+                    if table in STAGE_TABLES:
+                        self._stages.feed(row)
+                    for feed in self._also_feed:
+                        feed(row)
         self._rotate_full_tables()
         return self._stages.finished()
 

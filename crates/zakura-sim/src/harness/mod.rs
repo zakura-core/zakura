@@ -20,6 +20,8 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
+pub mod handshake_counts;
+pub mod handshake_wire;
 pub mod header_node;
 pub mod header_sync;
 pub mod header_work;
@@ -32,7 +34,7 @@ pub mod sync_wire;
 pub mod wire_node;
 pub mod wire_plans;
 
-use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -58,7 +60,7 @@ use crate::{
         BuildInfo, MetaRecord,
     },
     witness::{witness_into, Expect, WitnessError},
-    Observation, ObservationLog, PlanInput, RecordSink, RunConfig, RunReport, Sim,
+    Observation, ObservationLog, PlanInput, RecordSink, RunConfig, RunReport, Sim, Steer,
 };
 
 /// The property a run violates when a task panics. Every harness checks it.
@@ -154,9 +156,8 @@ pub trait Subsystem: HasView + Sized + 'static {
     }
 
     /// Carries a full fuzz input built for an older `generator` to this one
-    /// with its meaning kept, as a seed's `derived_from` claims it was. Fails
-    /// by default: a harness that never changed its generator migrates
-    /// nothing.
+    /// with its meaning kept. Fails by default: a harness that never changed
+    /// its generator migrates nothing.
     fn migrate(_source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
         Err(format!(
             "{} migrates no generator-{generator} input",
@@ -173,15 +174,32 @@ pub struct ScenarioFamily {
     pub name: &'static str,
     /// The bytes at the prefix's start that pick it.
     pub tag: Vec<u8>,
+    /// How many values of the byte after the tag pick distinct scenarios,
+    /// such as one fault each. 1 when that byte picks nothing. Only the
+    /// generator's cycle draws read it ([`DrawPolicy::Cycle`]).
+    ///
+    /// [`DrawPolicy::Cycle`]: crate::explore::generate::DrawPolicy::Cycle
+    pub variants: u16,
 }
 
 impl ScenarioFamily {
-    /// The family `tag` picks, named `name`.
+    /// The family `tag` picks, named `name`, with one variant.
     pub fn new(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
         ScenarioFamily {
             name,
             tag: tag.into(),
+            variants: 1,
         }
+    }
+
+    /// This family, whose byte after the tag picks one of `variants`
+    /// scenarios, from 0.
+    pub fn with_variants(self, variants: usize) -> Self {
+        let variants = u16::try_from(variants)
+            .ok()
+            .filter(|variants| (1..=256).contains(variants))
+            .expect("one byte picks 1 to 256 variants");
+        ScenarioFamily { variants, ..self }
     }
 }
 
@@ -247,6 +265,49 @@ pub fn run_prepared<S: Subsystem>(
     Ok(report)
 }
 
+/// [`run_prepared`] with `steer` making live picks in place of `input`.
+/// Also returns the Plan bytes that replay the run's choices with no steer
+/// ([`Sim::steer`]).
+pub fn run_steered<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> Result<(RunReport, Vec<u8>), HarnessError> {
+    let (run, bytes) = run_steered_keeping::<S>(scenario, prepared, input, sink, steer);
+    let report = run?;
+    Ok((
+        report,
+        bytes.expect("run_set_up sets the Sim up before it runs"),
+    ))
+}
+
+/// [`run_steered`], keeping the Plan bytes the steer recorded even when the
+/// run fails: a harness failure during or after the run keeps the choices
+/// made until then, which replay it. `None` if the harness never set the
+/// Sim up.
+pub(crate) fn run_steered_keeping<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    steer: Box<dyn Steer>,
+) -> (Result<RunReport, HarnessError>, Option<Vec<u8>>) {
+    let mut steered = None;
+    let run = run_set_up::<S, ()>(
+        scenario,
+        prepared,
+        input,
+        sink,
+        None,
+        |sim| steered = Some(sim.steer(steer)),
+        |_, _, _, _| (),
+    )
+    .map(|(report, ())| report);
+    (run, steered.map(|steered| steered.bytes()))
+}
+
 /// [`run_prepared`], also returning what `read` takes from the harness and
 /// the run's final end, reports and log, before the scheduler shuts down
 /// ([`Sim::on_end`]), since shutdown can resume suspended tasks.
@@ -258,11 +319,29 @@ pub(crate) fn run_reading<S: Subsystem, T: 'static>(
     extra: Option<&mut dyn Checker>,
     read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
 ) -> Result<(RunReport, T), HarnessError> {
+    run_set_up(scenario, prepared, input, sink, extra, |_| {}, read)
+}
+
+/// [`run_reading`], with `set_up` called on the Sim before the harness
+/// builds on it.
+fn run_set_up<S: Subsystem, T: 'static>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+    set_up: impl FnOnce(&mut Sim),
+    read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
+) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
+    // Before setup, so a datagram setup sends is hashed only if the run
+    // records its steps.
+    let _records_steps = crate::net::RecordsSteps::set(sink.wants_steps());
     let mut sim = Sim::new(config, input);
+    set_up(&mut sim);
     let this = Rc::new(S::build(&mut sim, scenario, prepared));
     let read_out = Rc::new(RefCell::new(None));
     sim.on_end({
@@ -386,7 +465,53 @@ pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
         },
     ];
     properties.extend(S::properties());
+    let known = treated_as_known();
+    for property in &mut properties {
+        property.status = known_status(&known, property.id.as_str(), property.status);
+    }
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
+}
+
+/// The variable that names properties a run treats as `Known`, comma
+/// separated, each as `<id>` or `<id>=<issue>`, issue 0 when left out. An
+/// `Active` property it names records its violations and lets the run go
+/// on, as a `Known` one does, so a search can look past an open bug it
+/// keeps finding. A trace records each status, so replaying one needs the
+/// same value. Unset, every property keeps its own status.
+pub const KNOWN_VAR: &str = "ZAKURA_SIM_KNOWN";
+
+/// Property `id`'s status `status`, or `Known` at its issue if `known`,
+/// from [`treated_as_known`], names it and `status` is `Active`.
+pub(crate) fn known_status(known: &BTreeMap<String, u32>, id: &str, status: Status) -> Status {
+    match known.get(id) {
+        Some(&issue) if status == Status::Active => Status::Known { issue },
+        _ => status,
+    }
+}
+
+/// The properties [`KNOWN_VAR`] names, each with its issue.
+///
+/// # Panics
+///
+/// If an issue isn't a number, so a mistyped value can't pass silently.
+pub(crate) fn treated_as_known() -> BTreeMap<String, u32> {
+    let Ok(value) = std::env::var(KNOWN_VAR) else {
+        return BTreeMap::new();
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((id, issue)) => (
+                id.to_owned(),
+                issue
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{KNOWN_VAR}: `{issue}` isn't an issue number")),
+            ),
+            None => (entry.to_owned(), 0),
+        })
+        .collect()
 }
 
 /// Checks [`NO_TASK_PANIC`]: violated at a step where a task panicked.
@@ -462,6 +587,9 @@ pub struct HarnessEntry {
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
+    /// [`explore::run_steered_bytes`], for a harness the scheduler runs. A
+    /// machine has none: it makes no picks to steer.
+    pub run_steered_bytes: Option<SteeredRunFn>,
     /// [`Subsystem::accepts`].
     pub accepts: fn(&[u8]) -> bool,
     /// [`Subsystem::families`]. A machine has none.
@@ -474,6 +602,10 @@ pub struct HarnessEntry {
 /// property, the expectation, the expected co-violations and the sink.
 pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &[String], &mut dyn RecordSink) -> Result<(), WitnessError>;
+
+/// [`HarnessEntry::run_steered_bytes`]: a full fuzz input, the sink and the
+/// steer, returning the run and the input that replays it unsteered.
+pub type SteeredRunFn = fn(&[u8], &mut dyn RecordSink, Box<dyn Steer>) -> (ExploreRun, Vec<u8>);
 
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
@@ -535,6 +667,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         properties: registered::<S>,
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
+        run_steered_bytes: Some(explore::run_steered_bytes::<S>),
         accepts: S::accepts,
         families: S::families,
         migrate: S::migrate,
@@ -549,6 +682,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     header_work::REACTOR_ENTRY,
     header_work::PUBLISHER_ENTRY,
     block_work::REACTOR_ENTRY,
+    handshake_counts::ENTRY,
+    entry::<handshake_wire::Wire>(),
     discovery_machine::BOOK_ENTRY,
     discovery_machine::STATE_ENTRY,
     entry::<discovery::VerificationCapacity>(),
@@ -570,8 +705,11 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
     entry::<discovery_service::DiscoveryWire>(),
+    entry::<discovery_service::DiscoveryComposed>(),
+    entry::<discovery_service::DiscoverySpam>(),
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
+    entry::<sync_wire::SyncComposed>(),
 ];
 
 /// The harness named `name`.

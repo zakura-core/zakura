@@ -4,7 +4,7 @@
 # watch, and the reactor takes a third wire event first. The commit comes
 # as the held locator completes, and that completion refreshes the
 # snapshot within two wire events, so the state is adopted in time.
-input = "crates/zakura-sim/tests/fixtures/header-flood-wire.bin"
+seed = "header-flood-wire"
 # Besides reactor.rs, which the patch changes, the session receiver and the
 # queues decide how fast wire events arrive and when the commit lands.
 checks = ["crates/zakura-network/src/zakura/header_sync"]

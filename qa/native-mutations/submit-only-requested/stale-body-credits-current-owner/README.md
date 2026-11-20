@@ -16,7 +16,7 @@ reservation, and the body reaches the sequencer under the current owner.
 
 The witness is the `block_table` test
 `the_stale_request_body_input_holds_receiver_work_authorized`. It runs
-`crates/zakura-sim/tests/fixtures/block-sync-stale-request-body.bin`, which
+the seed `block-sync-stale-request-body`, which
 a seeded random search on the remote host found. The input resets the
 chain to a fork from height 8 once the node submits its third body, while
 two mirrors serve. One routine judges an old-chain body for height 14

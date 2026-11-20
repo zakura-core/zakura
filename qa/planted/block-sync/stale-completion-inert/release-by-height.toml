@@ -5,7 +5,7 @@
 # releases the fork's submission at the same height, which storage still
 # holds. The late verdict is retryable: a commit would start a new body-work
 # epoch, and the release would then break `detached-submission-bounded` too.
-input = "crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin"
+seed = "block-sync-stale-beside-current"
 # Besides sequencer.rs, which the patch changes, the rest of block sync
 # decides when the stale verdict arrives. A change there can move the input
 # off the shared height.

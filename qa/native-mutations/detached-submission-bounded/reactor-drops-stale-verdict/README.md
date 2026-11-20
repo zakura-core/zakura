@@ -14,7 +14,7 @@ bytes stay charged for good.
 ## Witness
 
 The witness is `qa/planted/block-sync/detached-submission-bounded/keep-detached-after-verdict.toml`, which runs
-`crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin`.
+the seed `block-sync-stale-beside-current`.
 
 The input resets the chain while storage holds a submission at height 2,
 which the reset detaches. Its late retryable verdict is stale under the new

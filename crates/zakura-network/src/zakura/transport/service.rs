@@ -330,6 +330,9 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
+    /// Reads the connection's smoothed round-trip time, when the transport
+    /// has a QUIC connection to read it from.
+    rtt: Option<zakura_quic::RttReader>,
 }
 
 impl Peer {
@@ -523,7 +526,20 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            rtt: None,
         }
+    }
+
+    /// This peer, reading its connection's round-trip time from `rtt`.
+    pub(crate) fn with_rtt_reader(mut self, rtt: Option<zakura_quic::RttReader>) -> Self {
+        self.rtt = rtt;
+        self
+    }
+
+    /// The reader of this peer's connection round-trip time, if the
+    /// transport gave one.
+    pub(crate) fn rtt_reader(&self) -> Option<zakura_quic::RttReader> {
+        self.rtt.clone()
     }
 
     /// This peer, with every stream it carries reporting `origin` as where

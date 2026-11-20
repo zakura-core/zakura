@@ -1,0 +1,13 @@
+--- a/crates/zakura-network/src/zakura/handshake.rs
++++ b/crates/zakura-network/src/zakura/handshake.rs
+@@ -1725,9 +1725,7 @@
+ ) -> Result<(), ZakuraRejectReason> {
+     // This negotiated ceiling is wider than most stream kinds need; per-kind
+     // frame handling applies the effective cap before payload allocation.
+-    if !frame_cap_carries_payload(limits.max_frame_bytes)
+-        || limits.max_frame_bytes > local.max_message_bytes
+-        || limits.max_message_bytes == 0
++    if limits.max_message_bytes == 0
+         || limits.max_message_bytes > local.max_message_bytes
+         || limits.max_open_streams == 0
+         || limits.max_open_streams > local.max_open_streams

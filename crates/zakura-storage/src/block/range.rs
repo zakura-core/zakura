@@ -45,7 +45,7 @@ impl BlockRangeSource for ControlledRangeSource {
     ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
         Box::pin(ReadCall {
             service: self.service.clone(),
-            state: ReadState::Unsubmitted(Some(request)),
+            state: ReadState::Unsubmitted(Some(Box::new(request))),
         })
     }
 }
@@ -57,8 +57,9 @@ struct ReadCall {
 }
 
 enum ReadState {
-    /// Not polled yet. A read dropped here never reaches storage.
-    Unsubmitted(Option<BlockRangeRead>),
+    /// Not polled yet. A read dropped here never reaches storage. Boxed
+    /// because the request dwarfs the other variants.
+    Unsubmitted(Option<Box<BlockRangeRead>>),
     /// Submitted as this operation.
     Submitted(OpId),
     /// Polled after shutdown, so never submitted. It never completes.
@@ -77,7 +78,7 @@ impl Future for ReadCall {
                 let read = read.take().expect("an unsubmitted read holds its request");
                 this.state = match this
                     .service
-                    .submit_read(BlockRequest::ReadRange(read), cx.waker().clone())
+                    .submit_read(BlockRequest::ReadRange(*read), cx.waker().clone())
                 {
                     Some(id) => ReadState::Submitted(id),
                     None => ReadState::Orphaned,

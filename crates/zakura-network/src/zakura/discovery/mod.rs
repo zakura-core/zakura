@@ -24,7 +24,7 @@ mod state;
 pub use fuzz::{
     discovery_book_witness_bytes, trace_discovery_book_bytes, trace_discovery_state_bytes,
     AdmittedFact, BookEntryFact, BookFact, BookStep, BookView, DiscoverySessionStep, DriverFailure,
-    EvictionFact, HintFact, ImportFact, InstallFact, SessionView,
+    EvictionFact, HintFact, ImportFact, InstallFact, SessionView, DISCOVERY_STATE_WITNESS,
 };
 mod trace;
 mod verified;

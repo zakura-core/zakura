@@ -18,7 +18,7 @@ reaches the sequencer under its owner.
 The witness is the `block_table` test
 `old_chain_bodies_after_a_reset_hold_receiver_work_authorized`. It runs
 the reset-mid-flight scenario under the plan of
-`crates/zakura-sim/tests/fixtures/block-sync-reset-mid-flight.bin`, but
+the seed `block-sync-reset-mid-flight`, but
 resets once the mirrors have completed 14 range reads. Old-chain bodies of
 heights past the fork are then still on the wire. One reaches its routine
 after the routine dropped its request, at a height that a fork request on

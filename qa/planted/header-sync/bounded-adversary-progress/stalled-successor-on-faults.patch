@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 43cd9b5124..da1a5bd06c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1577,7 +1577,9 @@ impl HeaderSyncReactor {
+                 if bounded_prefix && facts.checkpoint_prefix_ready {
+                     metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
+                 }
+-                self.prepare_staged_work(&peer, bounded_prefix);
++                // Planted: the round never dispatches its prepare once its
++                // last page is staged.
++                let _ = bounded_prefix;
+             }
+             PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+         }

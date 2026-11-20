@@ -434,7 +434,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask sim-versions --sim <name>")?;
     writeln!(
         output,
-        "  cargo xtask sim-seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>] [--quarantine <dir>] [--report <file>]"
+        "  cargo xtask sim-seeds [--sim <name>] [--set <set>] [--out <dir>] [--report <file>]"
     )?;
     writeln!(output, "  cargo xtask sim-suite [--out <file>] [--frozen]")?;
     writeln!(output, "  cargo xtask sim-feedback")?;
@@ -505,7 +505,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "its committed input holds the property unpatched and violates exactly it patched."
+        "its seed or typed scenario holds the property unpatched and violates exactly it patched."
     )?;
     writeln!(
         output,

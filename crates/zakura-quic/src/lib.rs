@@ -43,15 +43,17 @@ pub use config::{
 };
 pub use conn::{
     BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,
-    DriverStats, LOAD_INTERVAL,
+    DriverStats, RttReader, LOAD_INTERVAL,
 };
 pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
+#[cfg(zakura_sim)]
+pub use endpoint::{AdmissionProbe, AdmissionSample, HandshakeEvent};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };
 pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
 #[cfg(zakura_sim)]
-pub use probe::LoadProbe;
+pub use probe::{LoadProbe, SlotProbe};
 pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
 pub use stream::{CreditHold, RecvStream, SendStream};
 

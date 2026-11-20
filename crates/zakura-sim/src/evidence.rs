@@ -130,9 +130,10 @@ pub(crate) enum EvidenceKind {
     /// The scripted peers' records of the node named `node`, a display label
     /// only, as their wire evidence places and projects them
     /// ([`crate::peer::PeerControl`]): every `PeerFrame`, `PeerWritten`,
-    /// `PeerReceived`, `PeerClosed` and `NodeFrame`, and the `FrameJudged`,
-    /// `ConnectionClosed` and `Misbehavior` the node's evidence means. A
-    /// run's peers share one.
+    /// `PeerReceived`, `PeerClosed`, `PeerHandshake`, `PeerStreamReset`,
+    /// `PeerConnectionClosed`, `ActRan`, `ActSkipped` and `NodeFrame`, and
+    /// the `FrameJudged`, `ConnectionClosed` and `Misbehavior` the node's
+    /// evidence means. A run's peers share one.
     Peer {
         /// The node's name.
         node: String,

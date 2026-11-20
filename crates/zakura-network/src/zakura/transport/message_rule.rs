@@ -91,6 +91,18 @@ pub enum MessageRole {
         /// Receiver-side bucket for each `(peer, message_type)`.
         cadence: Cadence,
     },
+    /// Unsolicited state charged by payload bytes rather than by message.
+    ///
+    /// The sender pays its own [`ByteRate`] bucket for each frame before it
+    /// hands the frame on, and keeps at most
+    /// [`ByteRate::sender_allowance`] paid bytes unwritten. The receiver's
+    /// bucket for the connection is deeper by that allowance and by the
+    /// stream receive window it granted, so a conformant sender never
+    /// overruns it. An overrun closes the connection.
+    Metered {
+        /// The row's byte rate.
+        rate: ByteRate,
+    },
     /// A message that asks the receiver to do work and respond.
     Request {
         /// Most exchanges of this request type a peer session may have open.
@@ -314,6 +326,48 @@ impl Cadence {
         } else {
             queued as u32 + 2
         }
+    }
+}
+
+/// The byte rate of a [`MessageRole::Metered`] row.
+///
+/// Memory and burst are separate numbers. The stream's receive share bounds
+/// the bytes a reactor holds. A bucket's depth is a count of tokens and
+/// holds no memory.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ByteRate {
+    /// Payload bytes a second the sender's bucket refills.
+    pub bytes_per_second: u32,
+    /// The sender's bucket depth, which it starts with: the bytes a sender
+    /// may send back to back.
+    pub opening_allowance: u32,
+    /// Most paid payload bytes the sender holds that are not yet written into
+    /// the stream.
+    pub sender_allowance: u32,
+}
+
+impl ByteRate {
+    /// The receiver's bucket depth on a connection whose stream receive
+    /// window is `receive_window`.
+    ///
+    /// Every paid byte not yet read sits in the sender's buffers, at most
+    /// the sender allowance, or in the stream window, which flow control
+    /// caps. So the bytes read in any interval are at most the opening
+    /// allowance plus those two plus the rate times the interval.
+    pub const fn receiver_depth(&self, receive_window: u64) -> u64 {
+        // Widening u32 to u64 is lossless.
+        (self.opening_allowance as u64)
+            .saturating_add(self.sender_allowance as u64)
+            .saturating_add(receive_window)
+    }
+
+    /// The receiver's refill rate in bytes a second: an eighth faster than
+    /// the sender's, so clock drift never empties a conformant sender's
+    /// bucket.
+    pub const fn receiver_bytes_per_second(&self) -> u64 {
+        // Widening u32 to u64 is lossless.
+        let rate = self.bytes_per_second as u64;
+        rate + rate / 8
     }
 }
 

@@ -8,7 +8,7 @@ mod support;
 
 use std::{fs, path::PathBuf, process::Command};
 
-use support::{byte_inputs, inputs};
+use support::inputs;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
@@ -85,6 +85,9 @@ pub fn held_locator() -> StorageScenario {
             Trigger::Completed(Select::nth(OpKind::Locator, 1)),
         ),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -156,6 +159,9 @@ pub fn two_forks() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -238,6 +244,9 @@ pub fn quiet_reset() -> StorageScenario {
             ),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -444,8 +453,8 @@ fn a_round_started_before_adopting_a_reset_retires_obsolete() {
 }
 
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-reset-<name>.json` with its Plan bytes beside
-/// it in `header-reset-<name>.plan`.
+/// as `tests/fixtures/header-reset-<name>.json`.
+/// Each runs under the empty Plan.
 fn committed_witnesses() -> [(&'static str, StorageScenario); 6] {
     [
         ("held-locator", held_locator()),
@@ -457,11 +466,6 @@ fn committed_witnesses() -> [(&'static str, StorageScenario); 6] {
     ]
 }
 
-/// The Plan bytes every committed witness runs under: a fixed draw.
-fn committed_plan() -> Vec<u8> {
-    byte_inputs(2, 256).remove(1)
-}
-
 /// The committed fixture `header-reset-<name>.<extension>`.
 fn fixture(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -469,8 +473,8 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
         .join(format!("header-reset-{name}.{extension}"))
 }
 
-/// Each committed witness is its builder's scenario, as JSON, with the
-/// fixed Plan bytes, and holds and applies under them.
+/// Each committed witness is its builder's scenario, as JSON, and holds
+/// and applies under the empty Plan.
 #[test]
 fn the_committed_witnesses_match_their_builders() {
     for (name, scenario) in committed_witnesses() {
@@ -482,16 +486,9 @@ fn the_committed_witnesses_match_their_builders() {
         assert_eq!(
             serde_json::to_value(&committed).expect("scenarios serialize"),
             serde_json::to_value(&scenario).expect("scenarios serialize"),
-            "{name}: run `regenerate_reset_witnesses`"
+            "{name}"
         );
-        let plan =
-            fs::read(fixture(name, "plan")).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            plan,
-            committed_plan(),
-            "{name}: run `regenerate_reset_witnesses`"
-        );
-        let report = run(&scenario, zakura_sim::Plan::from_fuzz(&plan));
+        let report = run(&scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
                 outcome(&report, RESET_INVALIDATES_WORK),
@@ -502,24 +499,13 @@ fn the_committed_witnesses_match_their_builders() {
     }
 }
 
-/// Rewrites the committed witnesses from their builders.
-#[test]
-#[ignore = "rewrites the committed reset witnesses"]
-fn regenerate_reset_witnesses() {
-    for (name, scenario) in committed_witnesses() {
-        let json = serde_json::to_string_pretty(&scenario).expect("scenarios serialize");
-        fs::write(fixture(name, "json"), json + "\n").expect("the fixture directory exists");
-        fs::write(fixture(name, "plan"), committed_plan()).expect("the fixture directory exists");
-    }
-}
-
 /// The reset property's report and the full log depend only on the
 /// scenario and the plan: the held-prepare witness under plan A twice, then
 /// B, then A again, gives A's every time, and B's log differs.
 #[test]
 fn the_reset_witness_repeats_a_a_and_a_b_a() {
     let scenario = held_prepare();
-    let plans = [committed_plan(), vec![7; 256]];
+    let plans = [Vec::new(), vec![7; 256]];
     let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
         .into_iter()
         .map(|plan| {
@@ -556,8 +542,6 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             Storage::NAME,
             "--scenario",
             &scenario,
-            "--plan",
-            fixture(name, "plan").to_str().expect("the path is UTF-8"),
             "--out",
             trace.to_str().expect("the path is UTF-8"),
             "--witness",

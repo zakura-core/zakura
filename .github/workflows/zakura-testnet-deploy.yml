@@ -31,6 +31,23 @@ on:
         required: false
         options: [auto, dual, zakura, legacy]
         default: auto
+      mempool_implementation:
+        description: "Pool override for one node; auto leaves the node on zakurad's default"
+        type: choice
+        required: false
+        options: [auto, default, classic, core]
+        default: auto
+      tx_relay:
+        description: "Turn on tx-relay for one node; needs mempool_implementation core and a v2 p2p_stack"
+        type: boolean
+        required: false
+        default: false
+      setup:
+        description: "Pool setup for one node: legacy (legacy P2P, classic pool) or v2 (dual P2P, pool core, tx-relay)"
+        type: choice
+        required: false
+        options: [auto, legacy, v2]
+        default: auto
       header_sync_trace:
         description: "Write structured header/block-sync traces to the data volume"
         type: boolean
@@ -80,6 +97,16 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+
+      # The fleet config is rendered by this workflow's own deployer, since an
+      # older deploy ref's deploy.py may not have `ci-overrides`.
+      - name: Checkout this workflow's deployer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: .workflow-deployer
+          sparse-checkout: deploy/deployer
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -135,22 +162,24 @@ jobs:
         working-directory: deploy/deployer
         env:
           HEADER_SYNC_TRACE: ${{ inputs.header_sync_trace }}
+          MEMPOOL_IMPLEMENTATION: ${{ inputs.mempool_implementation }}
+          TX_RELAY: ${{ inputs.tx_relay }}
           NODE: ${{ inputs.node }}
           P2P_STACK: ${{ inputs.p2p_stack }}
           REF: ${{ inputs.ref }}
+          SETUP: ${{ inputs.setup }}
         run: |
           set -euo pipefail
 
-          requested_p2p_stack="${P2P_STACK}"
-          default_p2p_stack="dual"
-
-          if [ "$requested_p2p_stack" != "auto" ]; then
-            if [ -z "${NODE}" ]; then
-              echo "p2p_stack overrides require one explicit node" >&2
-              exit 1
-            fi
-            default_p2p_stack="$requested_p2p_stack"
-          fi
+          # deploy.py's `ci_overrides` says what each input renders and
+          # which need one explicit node.
+          defaults_overrides="$(python3 "${GITHUB_WORKSPACE}/.workflow-deployer/deploy/deployer/deploy.py" ci-overrides \
+            --node "${NODE}" \
+            --p2p-stack "${P2P_STACK}" \
+            --fleet-p2p-stack dual \
+            --mempool-implementation "${MEMPOOL_IMPLEMENTATION}" \
+            --tx-relay "${TX_RELAY}" \
+            --setup "${SETUP:-auto}")"
 
           if [ "${HEADER_SYNC_TRACE}" = "true" ] \
             && [ -z "${NODE}" ]; then
@@ -173,7 +202,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          p2p_stack       = "${default_p2p_stack}"
+          ${defaults_overrides}
           metrics_endpoint = "127.0.0.1:9999"
           health_listen_addr = "127.0.0.1:8080"
           tracing_filter  = "info,zakura_network::zakura=info"

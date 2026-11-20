@@ -8,4 +8,3 @@ checks = ["crates/zakura-network/src/zakura/discovery"]
 [typed]
 harness = "discovery/wire"
 scenario = "qa/planted/discovery/s4v2/get-peers/sender-within-limit/ask-peers-twice.scenario.json"
-plan = "qa/planted/discovery/s4v2/get-peers/sender-within-limit/ask-peers-twice.plan.bin"

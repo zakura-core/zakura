@@ -27,6 +27,7 @@ use crate::{
     Request, Response, VersionMessage,
 };
 
+mod block_advert;
 mod prop;
 mod vectors;
 mod warmup;

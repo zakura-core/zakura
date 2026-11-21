@@ -161,7 +161,11 @@ fn committed_view(
         oldest_retained_height: verified.height,
         alarms,
     };
-    CommittedHeaderChainView::new(snapshot, BodyWorkEpoch::default())
+    CommittedHeaderChainView::new(
+        snapshot.frontiers.verified_best,
+        snapshot,
+        BodyWorkEpoch::default(),
+    )
 }
 
 /// Block-sync startup from `view`, with state queries on and the default

@@ -287,6 +287,83 @@ async fn assert_block_range_selection(header_runtime: bool) {
     }
 }
 
+/// Callers skip a download when `KnownBlock` reports a committed block, so it must not report a
+/// header whose body was never committed.
+#[tokio::test]
+async fn known_block_reports_a_finalized_block_but_not_a_header_without_a_body() {
+    use tower::ServiceExt;
+
+    use crate::{
+        service::StateService, tests::FakeChainHelper, CheckpointVerifiedBlock, Config, KnownBlock,
+        Request, Response,
+    };
+
+    let _guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::ephemeral()
+    };
+    let crate::InitializedState {
+        mut state,
+        read_state,
+        ..
+    } = StateService::new(config, &network, block::Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis.clone(), parent.clone()] {
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let mut header_only = parent.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut header_only).header).time += chrono::Duration::seconds(1);
+    timeout(
+        DEADLINE,
+        insert_header_only(
+            &mut state,
+            &read_state,
+            block::Height(1),
+            parent.hash(),
+            std::slice::from_ref(&header_only.header),
+            1,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let mut known_block = async |hash| {
+        let response = timeout(DEADLINE, (&mut state).oneshot(Request::KnownBlock(hash)))
+            .await
+            .unwrap()
+            .unwrap();
+        let Response::KnownBlock(known) = response else {
+            panic!("unexpected known block response: {response:?}");
+        };
+        known
+    };
+    assert_eq!(
+        known_block(parent.hash()).await,
+        Some(KnownBlock::Finalized),
+        "a finalized block is known"
+    );
+    assert_eq!(
+        known_block(header_only.hash()).await,
+        None,
+        "a header without a committed body is not a known block"
+    );
+    assert_eq!(
+        known_block(block::Hash([0x42; 32])).await,
+        None,
+        "a hash the state has never seen is not a known block"
+    );
+}
+
 /// Commit `headers` as one header-only batch on top of the retained header `parent_hash`.
 async fn insert_header_only(
     state: &mut crate::service::StateService,

@@ -1114,9 +1114,9 @@ this release tolerates, and keep each hard change explicit.
   - small-order `R` points, `R` points with a torsion component, and
     non-canonical `S` scalars refused (ID-6);
   - honest keys and signatures accepted;
-  - Project Wycheproof's ML-KEM-768 vectors for key generation,
-    encapsulation and decapsulation, including encapsulation keys that fail
-    the modulus check (TLS-9).
+  - a subset of Project Wycheproof's ML-KEM-768 vectors for key
+    generation, encapsulation and decapsulation, including encapsulation
+    keys that fail the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
   - a dial that reaches a server with the wrong `NodeId`;
   - a client without a key;
@@ -1174,8 +1174,9 @@ this release tolerates, and keep each hard change explicit.
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
 | `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's with X25519MLKEM768 added first, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
-| ML-KEM-768 gives Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
-| X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; it completes against an independent implementation in both roles; a bad half or a failed random source fails the exchange, and with it the handshake | TLS-9, SEC-2 |
+| ML-KEM-768 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
+| X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; it completes against an independent implementation in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
+| A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | Two production configs negotiate X25519MLKEM768; with a peer that has only ring's groups, as dialer and as listener, the handshake completes on X25519 with no HelloRetryRequest. Over QUIC, a dialer with only ring's groups reaches a production listener, and a production dialer reaches a listener with only ring's groups | TLS-9 |
 | The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A hello with no ALPN in common is cancelled when it fits one datagram and fails as a handshake when it spans two | ADM-1, ADM-3, ADM-7, API-3 |

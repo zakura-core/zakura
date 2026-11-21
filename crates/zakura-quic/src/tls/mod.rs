@@ -394,11 +394,12 @@ mod tests {
         );
     }
 
-    /// A dialer keeps no memory of its last handshake. Every peer shares one
-    /// server name, so a dialer that remembered the group a peer without
-    /// the hybrid chose would open its next dial, to any peer, on X25519
-    /// alone, and each upgraded peer would ask again for the hybrid. The
-    /// client config's disabled resumption is what prevents that.
+    /// A client config keeps no memory of its last handshake. Every peer
+    /// shares one server name, so a config that remembered the group a peer
+    /// without the hybrid chose would open its next dial, to any peer, on
+    /// X25519 alone, and each upgraded peer would ask again for the hybrid.
+    /// The endpoint builds a config per dial today; disabled resumption keeps
+    /// this true if a config is ever reused.
     #[test]
     fn a_dial_to_an_older_peer_leaves_the_next_dial_on_the_hybrid() {
         let dialer_key = NodeSecretKey::generate();
@@ -419,6 +420,94 @@ mod tests {
                 rustls::HandshakeKind::Full
             )
         );
+    }
+
+    /// A dialer's group that sends the production hybrid share altered by
+    /// `alter`, for handshakes that must fail.
+    #[derive(Debug)]
+    struct Altered {
+        alter: fn(Vec<u8>) -> Vec<u8>,
+    }
+
+    impl rustls::crypto::SupportedKxGroup for Altered {
+        fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+            let exchange = hybrid::x25519_mlkem768().start()?;
+            let share = (self.alter)(exchange.pub_key().to_vec());
+            Ok(Box::new(AlteredExchange { exchange, share }))
+        }
+
+        fn name(&self) -> rustls::NamedGroup {
+            rustls::NamedGroup::X25519MLKEM768
+        }
+    }
+
+    /// An exchange of [`Altered`]: the production one, with another share.
+    struct AlteredExchange {
+        exchange: Box<dyn rustls::crypto::ActiveKeyExchange>,
+        share: Vec<u8>,
+    }
+
+    impl rustls::crypto::ActiveKeyExchange for AlteredExchange {
+        fn complete(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete(peer)
+        }
+
+        fn pub_key(&self) -> &[u8] {
+            &self.share
+        }
+
+        fn group(&self) -> rustls::NamedGroup {
+            self.exchange.group()
+        }
+    }
+
+    /// SEC-2: a production listener refuses the handshake when the dialer's
+    /// hybrid share has the wrong length or carries an ML-KEM key that
+    /// fails the modulus check. It doesn't fall back to X25519.
+    #[test]
+    fn a_malformed_hybrid_share_fails_the_handshake() {
+        fn one_byte_short(mut share: Vec<u8>) -> Vec<u8> {
+            share.pop();
+            share
+        }
+        fn coefficient_at_the_modulus_limit(mut share: Vec<u8>) -> Vec<u8> {
+            // The first 12-bit coefficient becomes 4,095, above q = 3,329.
+            share[0] = 0xff;
+            share[1] |= 0x0f;
+            share
+        }
+        let alterations: [fn(Vec<u8>) -> Vec<u8>; 2] =
+            [one_byte_short, coefficient_at_the_modulus_limit];
+        for alter in alterations {
+            let dialer_key = NodeSecretKey::generate();
+            let listener_key = NodeSecretKey::generate();
+            let group: &'static Altered = Box::leak(Box::new(Altered { alter }));
+            let client = TlsConfig::with_inputs(
+                &dialer_key,
+                &EndpointInputs::default().kx_groups(vec![group]),
+            )
+            .unwrap()
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+            let server = TlsConfig::new(&listener_key)
+                .rustls_server(vec![b"a".to_vec()])
+                .unwrap();
+            let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+            let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            let mut hello = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut hello).unwrap();
+            }
+            server.read_tls(&mut hello.as_slice()).unwrap();
+            assert_eq!(
+                server.process_new_packets().unwrap_err(),
+                rustls::Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare)
+            );
+        }
     }
 
     /// A listener that shares neither group the dialer sent a share for asks

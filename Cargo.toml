@@ -96,9 +96,10 @@ itertools = "0.14"
 jubjub = { version = "=5.4.0", package = "zakura-jubjub" }
 async-trait = "0.1.89"
 libc = "0.2"
-# SPEC TLS-9: ML-KEM-768 for the hybrid key-exchange group. Rust with no C,
-# formally verified; its build script also compiles NEON (aarch64) and AVX2
-# (x86_64) paths, picked at run time. Only the 768 parameter set, with its
+# SPEC TLS-9: ML-KEM-768 for the hybrid key-exchange group. Rust with no C;
+# its portable and AVX2 code is formally verified, its NEON code (used on
+# aarch64) is not. Its build script compiles the NEON or AVX2 path for the
+# target, picked at run time. Only the 768 parameter set, with its
 # `rand` feature off: the caller passes the randomness in, so a simulation can
 # seed it.
 libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem768"] }

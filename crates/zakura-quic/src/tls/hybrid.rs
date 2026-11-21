@@ -47,10 +47,12 @@ pub(crate) struct X25519MlKem768 {
 impl X25519MlKem768 {
     /// The hybrid of `x25519`, which must be an X25519 group, and ML-KEM-768
     /// drawing from `mlkem_random`.
-    pub(crate) const fn new(
+    pub(crate) fn new(
         x25519: &'static dyn SupportedKxGroup,
         mlkem_random: &'static dyn SecureRandom,
     ) -> Self {
+        // The share layout fixes a 32-byte classical half.
+        debug_assert_eq!(x25519.name(), NamedGroup::X25519);
         Self {
             x25519,
             mlkem768: MlKem768::new(mlkem_random),

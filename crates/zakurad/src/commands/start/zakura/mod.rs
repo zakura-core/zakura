@@ -28,6 +28,14 @@ pub(crate) use header_sync_driver::{block_roots_cover_range, root_covered_query_
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long native block sync waits for one body commit before it retries the body.
+///
+/// A checkpoint commit resolves only after its whole checkpoint range arrives, so this matches
+/// the legacy syncer's checkpoint verification timeout. It stays below the 10-minute body sync
+/// stall watchdog, so a commit that never resolves frees its submission slot before the watchdog
+/// engages legacy fallback.
+pub(crate) const ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE: Duration = Duration::from_secs(8 * 60);
 pub(crate) const ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn block_verify_error_class<Error>(

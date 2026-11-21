@@ -13,8 +13,8 @@ use zakura_node_services::sync_lifecycle::{
 use super::*;
 use crate::service::{
     write::{
-        BlockWriteNotice, BlockWriteSender, BlockWriteTaskExit, HeaderChainObservers,
-        NonFinalizedWriteMessage, WriteBlockWorkerTask,
+        BlockWriteNotice, BlockWriteSender, BlockWriteTaskExit, FinalizedWriteReset,
+        HeaderChainObservers, NonFinalizedWriteMessage, WriteBlockWorkerTask,
     },
     ChainTipSender,
 };
@@ -24,7 +24,7 @@ type CommitResponse =
 
 struct RunningWriter {
     senders: BlockWriteSender,
-    _invalid_resets: mpsc::UnboundedReceiver<block::Hash>,
+    _invalid_resets: mpsc::UnboundedReceiver<FinalizedWriteReset>,
     task: Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     repair: watch::Receiver<VctRootRepairStatus>,
 }

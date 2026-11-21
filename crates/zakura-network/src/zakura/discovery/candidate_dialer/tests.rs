@@ -579,7 +579,7 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
         connected,
     )?;
     let record = (*candidate.current_self_record()).clone();
-    let node = record.body.node_id;
+    let node = record.body.node_id();
     let dialed = record.body.direct_addrs.first().copied();
     handle
         .import_peer_records([record], Some(node_id(82)))
@@ -1030,6 +1030,7 @@ async fn dial_keeps_the_first_address_of_each_ip() {
         .expect("mapped test address parses");
     let candidate = ZakuraDiscoveryDialCandidate {
         node_id: node_id(5),
+        key: None,
         direct_addrs: vec![
             SocketAddr::new(shared, 8233),
             SocketAddr::new(shared, 8234),

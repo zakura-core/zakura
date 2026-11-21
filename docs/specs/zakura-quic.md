@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-18. Version 0.22.
+Status: draft for review, 2026-11-20. Version 0.25.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -48,7 +48,15 @@ connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
 each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
 charges once TLS starts, and reports when the endpoint admitted a
-connection; it changes ADM-3 and API-4, and §17t lists each change.
+connection; it changes ADM-3 and API-4, and §17t lists each change. Version
+0.23 names the Ed25519 public key `NodeKey`, apart from the `NodeId` that
+holds it. It updates ID-1, TLS-6 through TLS-8, API-1 and API-4. See §17u.
+Version 0.24 has a connection report the key TLS proved, and leaves the
+node ID for the application to bind; it changes TLS-8, ADM-9, OBS-3 and
+API-4, and §17v lists each change. Version 0.25 makes the node ID the hash
+of a tagged key list and moves the ALPN to `p2p-v2/4`; it changes DEP-2,
+ID-1, ID-2, ID-4, ID-7, TLS-6, TLS-7, WIRE-2, CTRL-26, API-1, API-2, API-4,
+SEC-2 and §13, adds ID-8 to ID-11, and §17w lists each change.
 
 ## 0. Conventions
 
@@ -87,7 +95,7 @@ Terms:
 | G3 | Refuse or limit an IP before the handshake allocates state | §7 |
 | G4 | Report transport health per endpoint and per connection | §11 |
 | G5 | Dropped in version 0.6: wire compatibility with Iroh 1.x | §13 |
-| G6 | Keep node identity, key files and bootstrap entries unchanged | §3 |
+| G6 | Keep key files and bootstrap entries unchanged (node IDs changed once, in version 0.25) | §3 |
 | G7 | Never lose application data in the transport, and never drop a packet on a busy socket | §6, §6a |
 
 ## 2. Dependencies
@@ -99,9 +107,9 @@ Terms:
   `ed25519-dalek`, `nix` or `memoffset`. CI enforces the list with
   `cargo tree -e normal -i <pkg>` and fails on any hit.
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
-  `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`, `metrics`,
-  `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`, `socket2`,
-  `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
+  `blake2b_simd`, `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`,
+  `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
+  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -127,27 +135,33 @@ Terms:
 
 ## 3. Identity
 
-- **ID-1.** `NodeId` is a 32-byte compressed Ed25519 public key. Construction
-  MUST reject bytes that:
+- **ID-1.** `NodeKey` is a 32-byte compressed Ed25519 public key.
+  Construction MUST reject bytes that:
   - don't decompress to a curve point;
   - aren't the canonical encoding of that point (the point must recompress to
     the same bytes);
   - encode a small-order point.
 
-  An honest key (A = a·B) always passes, so no existing `NodeId` changes.
-  Construction accepts a mixed-order key (a point with a torsion component),
-  because the torsion check costs a full scalar multiplication and Zakura
-  converts peer IDs to node IDs on hot paths. ID-6 refuses every signature
-  under such a key, so it can never complete a handshake.
-- **ID-2.** `NodeId` text form is 64 lowercase hex characters. Parsing MUST
-  accept upper- and lowercase hex. This matches Iroh's `PublicKey` Display, so
-  existing `id@addr` bootstrap entries keep parsing.
+  An honest key (A = a·B) always passes. Construction accepts a mixed-order
+  key (a point with a torsion component), because the torsion check costs a
+  full scalar multiplication and Zakura decodes key lists on hot paths. ID-6
+  refuses every signature under such a key, so it can never complete a
+  handshake.
+
+  `NodeId`, the name peers know a node by, is 32 opaque bytes: the hash of
+  the node's key list (ID-9). Any 32 bytes construct a `NodeId`.
+- **ID-2.** The text form of a `NodeId` and of a `NodeKey` is 64 lowercase
+  hex characters. Parsing MUST accept upper- and lowercase hex. The two can't
+  be told apart by their text, so a place that accepts either MUST mark one.
+  In Zakura's peer entries a bare value is a `NodeKey`, which is what every
+  entry written before version 0.25 holds, and `id:` followed by the hex is a
+  `NodeId`.
 - **ID-3.** `NodeSecretKey` holds a 32-byte Ed25519 seed. It MUST zeroize on
   drop. Its `Debug`, `Display` and `Serialize` output MUST NOT contain the seed.
   Signing expands the seed into a `ring` key pair for each signature, and
   `ring` does not zeroize that expanded key when it drops.
 - **ID-4.** The public key MUST derive from the seed per RFC 8032, so every
-  existing key file yields the same `NodeId` as on the Iroh backend.
+  existing key file yields the same `NodeKey` as on the Iroh backend.
 - **ID-5.** The identity file stays `<network>.zakura-iroh-secret-key` under
   `network.identity_dir`, holding 64 hex characters. `zakura-quic` MUST read
   existing files. It MUST create missing files with mode `0600`.
@@ -160,7 +174,38 @@ Terms:
   With A and R in the prime-order subgroup, ZIP 215's cofactored equation and
   the cofactorless one agree. The accepted set is therefore a subset of
   `ed25519-dalek`'s `verify_strict`, which also accepts mixed-order keys.
-- **ID-7.** Zakura's own wire formats keep encoding `NodeId` as 32 raw bytes.
+- **ID-7.** Zakura's own wire formats encode a `NodeId` as 32 raw bytes. A
+  format whose reader must verify the node (a discovery record, the control
+  hello and ack, the legacy upgrade prelude) carries the node's encoded key
+  list (ID-8) instead, and the reader derives the ID from it.
+- **ID-8.** A key list holds 1 to 4 entries. An entry is a `u16` tag and 32
+  bytes. The encoding is the entry count as a `u8`, then each entry as its
+  tag (little-endian) and its 32 bytes, so a list is 35 to 137 bytes. Tag 1
+  is Ed25519 and its 32 bytes are a `NodeKey`. Any other nonzero tag is
+  opaque to this release; by convention its 32 bytes are a fingerprint of a
+  larger key. Decoding MUST reject, and only reject:
+  - a count of 0 or above 4;
+  - a length other than 1 + 34 × count bytes;
+  - a tag of 0, or a tag that doesn't exceed the one before it;
+  - an Ed25519 entry that fails an ID-1 check.
+
+  Tags strictly increase, so one set of keys has exactly one encoding.
+- **ID-9.** A node's `NodeId` is the BLAKE2b-256 hash of its encoded key
+  list, personalised `Zakura_NodeId_v1`. The hash covers every entry,
+  including those the reader can't interpret. A node that changes its list
+  has a new `NodeId`.
+- **ID-10.** A reader MUST keep an entry whose tag it doesn't know: it
+  includes the entry in the ID-9 hash and re-encodes it byte for byte. A
+  later release can therefore add a key to a node's list, and this release
+  still connects to that node and agrees on its `NodeId`.
+- **ID-11.** A well-formed list with no entry the reader supports is
+  unverifiable, not malformed. The reader MUST drop a record it can't verify
+  and MUST refuse a connection it can't authenticate, and it MUST NOT
+  disconnect or penalise the peer that relayed the list, because a
+  conformant relay passes on lists it can't read (ID-10). Every later release
+  MUST keep this rule, or a newer node would punish older relays. This
+  release supports only the Ed25519 entry, so it connects only to nodes
+  whose list holds one, and a record carries one Ed25519 signature.
 
 ## 4. TLS profile
 
@@ -178,12 +223,19 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-4.** The only signature scheme is `ED25519`.
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
-- **TLS-6.** The client MUST NOT send SNI. It passes the expected `NodeId` to
-  its verifier in memory.
-- **TLS-7.** The client verifier MUST abort unless the server's key equals the
-  dialed `NodeId`.
-- **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
-  `Conn::remote_id()` MUST return only a key proven this way.
+- **TLS-6.** The client MUST NOT send SNI. It passes the expected `NodeKey`
+  to its verifier in memory, when the dial names one (API-1).
+- **TLS-7.** When the dial names a `NodeKey`, the client verifier MUST abort
+  unless the server's key equals it. A dial that names only a `NodeId`
+  accepts any valid server key in TLS, since the ID is a hash and doesn't
+  reveal the key. The application MUST then confirm the node before it uses
+  the connection: the peer sends its key list, which MUST hold
+  `remote_key()` and hash to the dialed `NodeId` (ID-9). Zakura's control
+  exchange makes this check on every dial, from the key list in the ack.
+- **TLS-8.** The server MUST take the client's `NodeKey` from the client's
+  certificate. `Conn::remote_key()` MUST return only a key proven this way.
+  The handshake proves a key and no node ID: `Conn::remote_id()` is `None`
+  until the application binds an ID (API-4).
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
   `bind_with` MAY replace the provider's random source and key-exchange
@@ -201,7 +253,7 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **WIRE-2.** Production ALPNs are `p2p-v2/N`, one for each Zakura protocol
   version N this release speaks natively, from
   `ZAKURA_PROTOCOL_VERSION_MIN_NATIVE` to `ZAKURA_PROTOCOL_VERSION_CURRENT`
-  (both 3 in this release). A dialer MUST offer every supported ALPN, newest
+  (both 4 in this release). A dialer MUST offer every supported ALPN, newest
   first. The server MUST offer ALPNs in the order the acceptor lists them, not
   sorted, and rustls picks the server's first ALPN that the client also
   offered. The negotiated ALPN fixes the connection's Zakura protocol version.
@@ -387,7 +439,7 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
 ## 7. Admission
 
 Admission runs in two stages. Stage 1 runs on each `Incoming` before any crypto
-work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
+work. Stage 2 runs after TLS proves the peer's `NodeKey` and is today's Zakura logic.
 
 - **ADM-1.** For every `Incoming`, the endpoint task MUST call
   `Acceptor::admit(&IncomingInfo)` before it calls `accept`. `IncomingInfo` holds:
@@ -508,7 +560,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The slot MUST NOT be released earlier.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
-  `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
+  `remote_key()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
@@ -717,7 +769,7 @@ IPv4 address or global IPv6 /64, ADM-3),
   negotiates its streams, the application raises its receive window once
   (API-9) by the receive share of each stream kind it negotiated, so an
   admitted connection holds that window plus `send_window_bytes`:
-  141,937,353 B at the defaults on Mainnet and Testnet. Per-stream receive
+  141,945,123 B at the defaults on Mainnet and Testnet. Per-stream receive
   windows sit inside the connection window and add nothing.
   `zakura_quic::connection_memory_bytes` is the only implementation of the
   handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
@@ -831,7 +883,8 @@ These are not configurable. Changing one needs a spec change.
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
+  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer` (null
+  until the application binds the connection's node ID),
   `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
@@ -877,7 +930,12 @@ These are not configurable. Changing one needs a spec change.
 
 The public surface of `zakura-quic`. Changing it is a semver change of the crate.
 
-- **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
+- **API-1.** Identity: `NodeId`, `NodeKey`, `NodeKeyList`, `NodeSecretKey`
+  and `NodeAddr { id, key: Option<NodeKey>, direct: Vec<SocketAddr> }`.
+  `NodeAddr::key` is the Ed25519 key the dialer expects in TLS (TLS-7), and
+  is empty when the dialer knows only the node's ID. A `NodeSecretKey`
+  carries the node's key list: the one-entry list of its own key, or a list
+  set with `with_key_list`, which MUST hold that key.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
@@ -890,7 +948,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
     `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
     and `SupportedKxGroup`;
-  - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
+  - `local_id()`, `local_key()`, `local_keys()`, `local_addrs()`,
+    `socket_stats()`, `connection_count()`
     and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
     `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
@@ -923,8 +982,13 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     already taken over the attempt's accounting; otherwise the acceptor
     releases what `admit` reserved.
 - **API-4.** `Conn`:
-  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `admitted_at()`,
-    `source_validated()`, `alpn()` and `stable_id()`. `source_validated()` is
+  - `remote_key()`, `local_keys()`, `admitted_ip()`, `admitted_addr()`,
+    `admitted_at()`, `source_validated()`, `alpn()` and `stable_id()`.
+  - `bind_remote_id(NodeId)` and `remote_id()`. The application binds the
+    node ID once it has established which node holds `remote_key()`.
+    `remote_id()` returns it, and `None` before. The first ID bound stays,
+    and every clone of the connection sees it.
+    `source_validated()` is
     `IncomingInfo::validated` for an inbound connection, and true for an
     outbound one. `admitted_at()` is the instant of the endpoint's `Accept`
     for an inbound connection, and the start of the winning attempt for an
@@ -1020,6 +1084,12 @@ fork to `quinn-proto` changes the wire profile (§17d), so the ALPN moved from
 older release reach each other only over the legacy protocol, and
 `p2p_stack = "dual"` nodes bridge the two (COMPAT-7).
 
+Version 0.25 changes what a node ID is (ID-9), so every node's ID changed
+and the ALPN moved from `p2p-v2/3` to `p2p-v2/4` under COMPAT-8. This
+release doesn't keep `p2p-v2/3` in its range as COMPAT-12 suggests, because
+a node would be known by a different ID on each version. Nodes on the two
+ALPNs reach each other over the legacy protocol, as above.
+
 - **COMPAT-4.** A wire break (a WIRE-13 change, a moved `quinn-proto`
   codepoint, or a `quinn-proto` release that changes the transport
   parameters) MUST bump the ALPN to the next `p2p-v2/N`. The endpoint MUST NOT
@@ -1033,7 +1103,7 @@ older release reach each other only over the legacy protocol, and
 
 ### 13.1 Extensibility
 
-The `p2p-v2/3` cohort is the last native hard break that every later change
+The `p2p-v2/4` cohort is the last native hard break that every later change
 has to ride. These rules let a later release make a soft change, one that
 this release tolerates, and keep each hard change explicit.
 
@@ -1077,7 +1147,7 @@ this release tolerates, and keep each hard change explicit.
     non-canonical `S` scalars refused (ID-6);
   - honest keys and signatures accepted.
 - **SEC-2.** These handshakes MUST fail:
-  - a dial that reaches a server with the wrong `NodeId`;
+  - a dial that names a `NodeKey` and reaches a server with another key;
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;
@@ -1121,6 +1191,7 @@ this release tolerates, and keep each hard change explicit.
 | `cargo tree` denylist in CI | DEP-1 |
 | `unsafe` appears only in the DEP-7 items | DEP-7 |
 | Identity known-answer and key-file round trip | ID-1–ID-7, SEC-1 |
+| Key list round trip, each ID-8 refusal, byte-for-byte re-encoding of an unknown entry, and node-ID known answers | ID-8–ID-11 |
 | TLS refusal matrix | TLS-1–TLS-8, SEC-2 |
 | Transport-profile snapshot: the transport, endpoint and server configs match a field-by-field snapshot; the congestion controller follows the config; the TLS configs refuse early data, tickets and SNI | WIRE-5–WIRE-10, WIRE-14, ADM-5, CTRL-3, TLS-10, TLS-11 |
 | Buffer read-back and clamp warning: bind under a lowered `rmem_max` in a user namespace | SOCK-3–SOCK-5 |
@@ -1638,3 +1709,86 @@ Changed:
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
   whole-handshake deadline from admission.
+
+## 17u. Changes in version 0.23
+
+Code that verifies a signature or builds a TLS certificate needs the node's
+Ed25519 public key, and code that names a peer needs its node ID. One type
+served both, so nothing marked which uses depend on the ID being a key.
+`NodeKey` now names the key. The wire, the text forms and every existing
+`NodeId` are unchanged.
+
+Changed:
+
+- **ID-1.** Defines `NodeKey` as the Ed25519 public key and `NodeId` as the
+  node's `NodeKey`. The construction checks are the same for both.
+- **TLS-6 through TLS-8.** The client verifier takes an expected `NodeKey`.
+  Both endpoints derive the peer's ID from the key proved in TLS.
+- **API-1.** Adds `NodeKey`, `NodeId::key()` and
+  `NodeSecretKey::public_key()`. `NodeId::verify_strict()` delegates
+  to `NodeKey::verify_strict()`.
+- **API-4.** Adds `Conn::remote_key()`, the key the peer proved in the TLS
+  handshake.
+
+## 17v. Changes in version 0.24
+
+The TLS handshake proves that the peer holds a key. Which node that key
+belongs to is a separate question, and the application answers it: Zakura's
+responder reads it from the peer's control hello, and its dialer knows which
+node it dialed. The connection reported the key as the node ID, so nothing
+marked the point where the ID became known. A node ID is still its key, so no
+ID and nothing on the wire changes.
+
+Changed:
+
+- **TLS-8.** The handshake yields a `NodeKey`, not a `NodeId`.
+- **ADM-9.** The `Conn` handed to the acceptor has a proven `remote_key()`.
+- **API-4.** `Conn::remote_id()` returns an `Option`, empty until
+  `Conn::bind_remote_id` is called.
+- **OBS-3.** A sample taken before the ID is bound has no `peer`.
+
+## 17w. Changes in version 0.25
+
+A node's ID was its Ed25519 public key, which tied the node's name to one
+signature scheme: adding another scheme would have changed every wire format
+that carries an ID. The ID is now the hash of a short list of tagged keys,
+and a reader keeps list entries it doesn't understand. A later release can
+then add a key to a node's list, and software from this release still
+connects to that node and agrees on its ID. Those two rules are the parts
+deployed software can't learn later, so they ship now. Which scheme comes
+next, and how its key is proven, stays open.
+
+Every node's ID changes once. Key files and existing peer entries don't: a
+bare 64-hex entry still names an Ed25519 key, and the node derives the ID of
+the one-key list itself.
+
+Added:
+
+- **ID-8.** The key list and its one encoding.
+- **ID-9.** The node ID as the personalised BLAKE2b-256 hash of the list.
+- **ID-10.** Unknown entries are kept, hashed and relayed byte for byte.
+- **ID-11.** A list with no supported entry is unverifiable, never malformed.
+
+Changed:
+
+- **DEP-2.** Adds `blake2b_simd`, for ID-9.
+- **ID-1.** A `NodeId` is 32 opaque bytes. The point checks apply to
+  `NodeKey` only.
+- **ID-2.** The two text forms are marked apart where either may appear.
+- **ID-4.** A key file yields the same `NodeKey`; the `NodeId` follows ID-9.
+- **ID-7.** Formats whose reader must verify the node carry the key list.
+- **TLS-6, TLS-7.** The expected key is optional. A dial by ID alone accepts
+  any valid key in TLS and the application confirms the node afterwards.
+- **WIRE-2, §13.** The ALPN moves to `p2p-v2/4` and the Zakura protocol
+  version to 4, a hard break under COMPAT-8 with no overlap with version 3.
+- **API-1.** Adds `NodeKeyList`, `NodeAddr::key` and the key list a
+  `NodeSecretKey` carries. Removes `NodeId::key()`, `NodeId::verify_strict()`
+  and the conversion from a `NodeKey`: a node ID is a hash and holds no key.
+  `NodeKey::node_id()` gives the ID of the one-key list. These break the
+  crate's published API, so its version moves to 2.0.0.
+- **API-2, API-4.** Add `local_key()` and `local_keys()` to the endpoint and
+  `local_keys()` to the connection.
+- **SEC-2.** The wrong-server refusal applies to a dial that names a key.
+- **CTRL-26.** The node record cap grows by 105 bytes to hold a full key
+  list, which raises an admitted connection's memory by 7,770 B, to
+  141,945,123 B at the defaults.

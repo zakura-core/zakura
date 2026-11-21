@@ -1608,7 +1608,6 @@ impl PeerTask {
             };
             let Ok(negotiated) = handshake::initiate(
                 &conn,
-                quic.local_id(),
                 self.spec.capabilities,
                 local,
                 Remote {
@@ -1711,15 +1710,8 @@ impl PeerTask {
                 addr: self.address(0),
                 shared_id: conn.shared_id(),
             };
-            let answered = handshake::respond(
-                &conn,
-                conn.remote_id(),
-                self.spec.capabilities,
-                echo,
-                local,
-                remote,
-            )
-            .await;
+            let answered =
+                handshake::respond(&conn, self.spec.capabilities, echo, local, remote).await;
             let ended = match answered {
                 Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {

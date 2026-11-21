@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zakura_node_services::task::spawn_erased_named;
-use zakura_quic::{NodeAddr, NodeId};
+use zakura_quic::{NodeAddr, NodeKeyList};
 use zakura_rt::sync::CancellationToken;
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod block_sync;
+mod configured_node;
 mod discovery;
 #[cfg(all(test, not(zakura_sim)))]
 mod example_reactor;
@@ -39,6 +40,7 @@ mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;
+pub use configured_node::{ConfiguredNode, ConfiguredNodeError};
 pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;
@@ -325,7 +327,7 @@ impl ZakuraHandshakeConnector {
         }
     }
 
-    /// Returns our local Zakura dial hints (iroh node id, and direct addresses
+    /// Returns our local Zakura dial hints (encoded key list, and direct addresses
     /// each encoded as a `SocketAddr` string) for the legacy upgrade prelude, or
     /// `None` if this node has no live Zakura endpoint.
     pub(crate) async fn local_iroh_hints(&self) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
@@ -333,25 +335,26 @@ impl ZakuraHandshakeConnector {
         Some(endpoint.local_upgrade_hints().await)
     }
 
-    /// Dial a peer over Zakura QUIC using the node id and direct-address hints it
+    /// Dial a peer over Zakura QUIC using the key list and direct-address hints it
     /// advertised in the legacy upgrade prelude, then wait until the connection
-    /// registers with the local supervisor.
+    /// registers with the local supervisor under the node id `keys` hash to.
     ///
     /// The legacy side drops its TCP connection once the upgrade is selected, so
     /// the Zakura request adapter must have a usable outbound handle before the
     /// handoff reports success.
     pub(crate) async fn spawn_zakura_dial_to_hints_and_wait(
         &self,
-        peer_id: &ZakuraPeerId,
-        node_id: &[u8],
+        keys: &NodeKeyList,
         direct_addresses: &[Vec<u8>],
     ) -> ZakuraNativeHandoff {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return ZakuraNativeHandoff::Failed;
         };
-        let Some(node_addr) = node_addr_from_hints(node_id, direct_addresses) else {
+        let Some(node_addr) = node_addr_from_hints(keys, direct_addresses) else {
             return ZakuraNativeHandoff::Failed;
         };
+        let peer_id = ZakuraPeerId::from_node_id(node_addr.id);
+        let peer_id = &peer_id;
         let registration_wait = match endpoint
             .supervisor()
             .begin_connection_registration_wait(peer_id)
@@ -380,16 +383,16 @@ impl ZakuraHandshakeConnector {
             }
         };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
-        match (cancel_guard, conn_id) {
-            // The peer registered, so the dial now owns a live connection.
-            (Some(cancel_guard), Some(conn_id)) => {
-                cancel_guard.disarm();
-                ZakuraNativeHandoff::Registered(conn_id)
-            }
-            (None, Some(_)) => ZakuraNativeHandoff::Duplicate,
-            // A dropped guard cancels the dial this hand-off started.
-            (_, None) => ZakuraNativeHandoff::Failed,
-        }
+        let Some(conn_id) = conn_id else {
+            // Dropping the guard cancels the dial this hand-off started.
+            return ZakuraNativeHandoff::Failed;
+        };
+        let Some(cancel_guard) = cancel_guard else {
+            return ZakuraNativeHandoff::Duplicate;
+        };
+        // The peer registered, so the dial now owns a live connection.
+        cancel_guard.disarm();
+        ZakuraNativeHandoff::Registered(conn_id)
     }
 
     /// Wait until the upgraded peer's inbound native QUIC connection registers
@@ -510,15 +513,16 @@ impl Drop for UpgradeDialCancelGuard<'_> {
     }
 }
 
-/// Builds a dial address from the node id and direct-address hints a peer
-/// advertised in a legacy upgrade prelude.
+/// Builds a dial address from the key list and direct-address hints a peer
+/// advertised in a legacy upgrade prelude. The dial requires the list's
+/// Ed25519 key in TLS.
 ///
 /// Direct addresses are carried as `SocketAddr` strings (the same encoding used
 /// by configured bootstrap peers), so each entry is parsed back into a
-/// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
-/// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
-    let node_id = NodeId::try_from(node_id).ok()?;
+/// `SocketAddr`. Returns `None` if the list holds no Ed25519 key or no direct
+/// address parses, since such a peer cannot be dialed.
+fn node_addr_from_hints(keys: &NodeKeyList, direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+    let key = keys.ed25519()?;
 
     let mut direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
@@ -532,7 +536,7 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
     direct.sort_unstable();
     direct.dedup();
 
-    Some(NodeAddr::with_addrs(node_id, direct))
+    Some(NodeAddr::with_addrs(keys.node_id(), direct).expecting(key))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained

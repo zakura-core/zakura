@@ -10,7 +10,7 @@
 # Lifecycle (one-time / occasional):
 #   perf.sh seed-serving     # deploy the 2 nodes, sync from public mainnet to SEED_HEIGHT
 #   perf.sh status           # watch until both report height >= SEED_HEIGHT
-#   perf.sh peers            # capture each node's node_id@ip:8234 into cohort.env
+#   perf.sh peers            # capture each node's id:node_id@ip:8234 into cohort.env
 #   perf.sh freeze-serving   # cut them off from public, serve the static range
 #
 # Repeated loop:
@@ -130,8 +130,10 @@ cmd_peers() {
   [ -n "$id_a" ] || die "could not read serve-a node_id (is Zakura P2P up? check $LOG_DIR/serve-a.log)"
   [ -n "$id_b" ] || die "could not read serve-b node_id (check $LOG_DIR/serve-b.log)"
 
-  local peer_a="${id_a}@${NODE_A_IP}:${ZAKURA_PORT}"
-  local peer_b="${id_b}@${NODE_B_IP}:${ZAKURA_PORT}"
+  # The log prints the node ID, which a peer entry marks with `id:`. A bare
+  # value in an entry is the node's Ed25519 key.
+  local peer_a="id:${id_a}@${NODE_A_IP}:${ZAKURA_PORT}"
+  local peer_b="id:${id_b}@${NODE_B_IP}:${ZAKURA_PORT}"
   # Persist into cohort.env (single source of truth).
   sed -i -e "s#^NODE_A_PEER=.*#NODE_A_PEER=\"${peer_a}\"#" \
          -e "s#^NODE_B_PEER=.*#NODE_B_PEER=\"${peer_b}\"#" "$ENV_FILE"

@@ -268,14 +268,12 @@ async fn the_control_exchange_gets_what_remains_of_the_admission_deadline() -> R
     // TLS and a slow claim use 600 ms of the deadline. The client never
     // opens the control stream.
     zakura_rt::time::sleep(Duration::from_millis(600)).await;
-    let peer = ZakuraPeerId::new(inbound.remote_id().as_bytes().to_vec())?;
-    let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&inbound), &peer);
+    let mut conn = ZakuraConnTrace::without_peer_on(&handler.trace, trace_conn_id(&inbound));
     let control_started = Instant::now();
     let result = handler
         .run_native_responder_handshake_with_permit(
             &inbound,
-            &peer,
-            &conn,
+            &mut conn,
             handler
                 .claim_pending_handshake(true)
                 .expect("the inbound handshake share has room"),
@@ -335,14 +333,12 @@ async fn registered_reconnects_keep_their_cadence_charge() -> Result<(), BoxErro
         ZakuraHandshakeConfig::for_network(&Network::Mainnet),
         limits.clone(),
     )
-    .with_local_node_id(server.local_id())
     .with_transport_observer(actions.clone());
     server.serve(handler)?;
     let address = LocalEndpointFactory::node_addr(&server).await;
     let client = LocalEndpointFactory::with_limits(&limits)
         .endpoint(0x2_5004)
         .await?;
-    let peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
     let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
 
     let started = Instant::now();
@@ -356,8 +352,13 @@ async fn registered_reconnects_keep_their_cadence_charge() -> Result<(), BoxErro
         {
             Ok(connection) => {
                 entries += 1;
-                run_native_initiator_handshake_without_trace(&connection, &limits, &config, &peer)
-                    .await?;
+                run_native_initiator_handshake_without_trace(
+                    &connection,
+                    &limits,
+                    &config,
+                    address.id,
+                )
+                .await?;
                 connection.close(0u32.into(), b"reconnect");
             }
             Err(zakura_quic::ConnectError::Refused) => {}

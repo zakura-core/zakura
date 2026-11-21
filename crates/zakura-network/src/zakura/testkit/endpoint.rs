@@ -80,15 +80,20 @@ impl LocalEndpointFactory {
 
     /// Bind an endpoint to an OS-assigned loopback port.
     pub async fn endpoint(self, seed: u64) -> Result<QuicEndpoint, BoxError> {
+        self.endpoint_with_key(Self::secret_key(seed)).await
+    }
+
+    /// Bind an endpoint for the node `secret_key` names to an OS-assigned
+    /// loopback port.
+    pub async fn endpoint_with_key(
+        self,
+        secret_key: NodeSecretKey,
+    ) -> Result<QuicEndpoint, BoxError> {
         let bind = QuicBindConfig {
             addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
             ..self.bind
         };
-        Ok(QuicEndpoint::bind(
-            Self::secret_key(seed),
-            &bind,
-            &self.quic,
-        )?)
+        Ok(QuicEndpoint::bind(secret_key, &bind, &self.quic)?)
     }
 
     /// Return the endpoint's direct node address.
@@ -154,7 +159,7 @@ mod tests {
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
         let connection = client.connect(server_addr, &[ALPN]).await?;
-        assert_eq!(connection.remote_id(), server.local_id());
+        assert_eq!(connection.remote_key(), server.local_key());
 
         connection.close(0u32.into(), b"done");
         client.shutdown().await;

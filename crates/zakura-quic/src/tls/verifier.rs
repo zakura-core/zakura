@@ -5,7 +5,7 @@
 //!
 //! One change: Iroh decoded the expected server identity from a synthetic
 //! server name. Zakura builds one verifier per dial that holds the expected
-//! [`NodeId`] in memory (TLS-6), so no name encoding is needed.
+//! [`NodeKey`] in memory (TLS-6), so no name encoding is needed.
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -19,7 +19,7 @@ use rustls_pki_types::{
     SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
 };
 
-use crate::key::NodeId;
+use crate::key::NodeKey;
 
 /// TLS 1.3 is the only version (TLS-1).
 pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
@@ -30,14 +30,16 @@ const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms 
     mapping: &[(SignatureScheme::ED25519, &[&ED25519_STRICT])],
 };
 
-/// Accepts the server only if its raw public key equals the dialed node ID (TLS-7).
+/// Accepts the server only if its raw public key is the key the dialer
+/// expects (TLS-7). A dialer that expects no particular key accepts any valid
+/// Ed25519 key, and learns which one from the handshake.
 #[derive(Debug)]
 pub(crate) struct ServerCertificateVerifier {
-    expected: NodeId,
+    expected: Option<NodeKey>,
 }
 
 impl ServerCertificateVerifier {
-    pub(crate) fn new(expected: NodeId) -> Self {
+    pub(crate) fn new(expected: Option<NodeKey>) -> Self {
         Self { expected }
     }
 }
@@ -57,10 +59,13 @@ impl ServerCertVerifier for ServerCertificateVerifier {
             ));
         }
 
-        // Comparing whole SPKI encodings checks both the constant Ed25519
-        // prefix and the key bytes.
-        let expected = super::ed25519_spki(&self.expected);
-        if expected.as_ref() != end_entity.as_ref() {
+        let acceptable = match &self.expected {
+            // Comparing whole SPKI encodings checks both the constant Ed25519
+            // prefix and the key bytes.
+            Some(expected) => super::ed25519_spki(expected).as_ref() == end_entity.as_ref(),
+            None => super::node_key_from_spki(end_entity.as_ref()).is_some(),
+        };
+        if !acceptable {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
@@ -106,7 +111,7 @@ impl ServerCertVerifier for ServerCertificateVerifier {
 /// Requires a client raw public key (TLS-5).
 ///
 /// rustls verifies the handshake signature against the presented key, which
-/// proves the client's node ID (TLS-8).
+/// proves possession of the key that determines the client's node ID (TLS-8).
 #[derive(Debug, Default)]
 pub(super) struct ClientCertificateVerifier;
 
@@ -130,7 +135,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
                 CertificateError::UnknownIssuer,
             ));
         }
-        if super::node_id_from_spki(end_entity.as_ref()).is_none() {
+        if super::node_key_from_spki(end_entity.as_ref()).is_none() {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::BadEncoding,
             ));
@@ -187,7 +192,7 @@ impl SignatureVerificationAlgorithm for Ed25519Strict {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        let key = NodeId::try_from(public_key).map_err(|_| InvalidSignature)?;
+        let key = NodeKey::try_from(public_key).map_err(|_| InvalidSignature)?;
         key.verify_strict(message, signature)
             .map_err(|_| InvalidSignature)
     }

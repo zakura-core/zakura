@@ -48,7 +48,6 @@ async fn measure_failed_control_handshake_cpu() -> Result<(), BoxError> {
         ZakuraHandshakeConfig::for_network(&Network::Mainnet),
         limits.clone(),
     )
-    .with_local_node_id(server.local_id())
     .with_transport_observer(refusals.clone());
     server.serve(handler)?;
     let address = LocalEndpointFactory::node_addr(&server).await;
@@ -62,12 +61,11 @@ async fn measure_failed_control_handshake_cpu() -> Result<(), BoxError> {
             .endpoint(50_001 + u64::try_from(attempt)?)
             .await?;
         let connection = client.connect(address.clone(), &[P2P_V2_ALPN]).await?;
-        let peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
         assert!(run_native_initiator_handshake_without_trace(
             &connection,
             &limits,
             &wrong_chain,
-            &peer,
+            address.id,
         )
         .await
         .is_err());

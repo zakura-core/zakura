@@ -6,9 +6,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::zakura::ConfiguredNode;
 use ipnet::IpNet;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use zakura_quic::NodeId;
 
 use crate::{
     protocol::external::{canonical_ip, canonical_peer_addr},
@@ -31,7 +31,8 @@ use crate::{
 /// A DNS name stands for the one address that its dialer last resolved it to, see
 /// [`set_resolved_ip`](Self::set_resolved_ip). That address is treated like a listed
 /// single address until the name resolves to another one. A name can be pinned to a
-/// node ID, such as `<node id>@peer.example.com:8233`, see [`UnconditionalPeerName`].
+/// node, by its key (`<key>@peer.example.com:8233`) or by its node ID
+/// (`id:<node id>@peer.example.com:8233`), see [`UnconditionalPeerName`].
 ///
 /// The list is cheap to clone, so every component that needs it can hold a copy. Every
 /// copy sees the latest resolved addresses.
@@ -71,11 +72,13 @@ pub struct UnconditionalPeerName {
     /// The port that Zakura dials at each address of the name.
     pub port: u16,
 
-    /// The node ID that the peer at the name's address must prove, if the entry pins one.
-    pub node_id: Option<NodeId>,
+    /// The node that the peer at the name's address must prove to be, if the entry pins
+    /// one: an Ed25519 public key, or `id:` and a node ID.
+    pub node_id: Option<ConfiguredNode>,
 }
 
-/// Writes the name in its config form, such as `<node id>@peer.example.com:8233`.
+/// Writes the name in its config form, such as `<key>@peer.example.com:8233`, with
+/// the pin in the form it was given.
 impl fmt::Display for UnconditionalPeerName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(node_id) = self.node_id {
@@ -294,7 +297,7 @@ impl FromIterator<IpNet> for UnconditionalPeers {
 
 /// Parses a DNS name with a non-zero port, such as `peer.example.com:8233`, pinned to
 /// `node_id` if it is given.
-fn parse_name(entry: &str, node_id: Option<NodeId>) -> Option<UnconditionalPeerName> {
+fn parse_name(entry: &str, node_id: Option<ConfiguredNode>) -> Option<UnconditionalPeerName> {
     let (name, port) = entry.rsplit_once(':')?;
     let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
 
@@ -394,14 +397,14 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
             if let Some((node_id, name)) = entry.split_once('@') {
                 let node_id = node_id.parse().map_err(|error| {
                     de::Error::custom(format!(
-                        "invalid node ID in network.unconditional_peers entry {entry:?}: {error}"
+                        "invalid node in network.unconditional_peers entry {entry:?}: {error}"
                     ))
                 })?;
                 let name = parse_name(name, Some(node_id)).ok_or_else(|| {
                     de::Error::custom(format!(
-                        "invalid network.unconditional_peers entry {entry:?}: a node ID \
-                         can only pin a DNS name with a port, such as \
-                         <node id>@peer.example.com:8233"
+                        "invalid network.unconditional_peers entry {entry:?}: a key or \
+                         node ID can only pin a DNS name with a port, such as \
+                         <key>@peer.example.com:8233 or id:<node id>@peer.example.com:8233"
                     ))
                 })?;
                 names.push(name);
@@ -413,9 +416,10 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
                 return Err(de::Error::custom(format!(
                     "invalid network.unconditional_peers entry {entry:?}: expected an IP \
                      address, an IP address or DNS name with a port, a DNS name with a port \
-                     and a node ID, or a canonical CIDR range without host bits, such as \
-                     192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
-                     <node id>@peer.example.com:8233 or 2001:db8::/32"
+                     and a key or node ID, or a canonical CIDR range without host bits, such \
+                     as 192.0.2.1, 192.0.2.1:8233, peer.example.com:8233, \
+                     <key>@peer.example.com:8233, id:<node id>@peer.example.com:8233 or \
+                     2001:db8::/32"
                 )));
             }
         }

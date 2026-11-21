@@ -520,8 +520,7 @@ fn bind_node(
         limits.clone(),
         Arc::new(registry),
         ZakuraTrace::noop(),
-    )
-    .with_local_node_id(quic.local_id());
+    );
     let handler = match recorder {
         Some(recorder) => handler.with_transport_observer(recorder),
         None => handler,
@@ -580,7 +579,7 @@ async fn peer_script(
         role: ZakuraControlRole::Initiator,
         network_id: handshake.network_id,
         chain_id: handshake.chain_id,
-        iroh_node_id: quic.local_id().as_bytes().to_vec(),
+        node_keys: quic.local_keys().encode(),
         peer_nonce: [7; 32],
         initiator_upgrade_nonce: [0; 32],
         responder_upgrade_nonce: [0; 32],
@@ -1503,6 +1502,7 @@ impl Acceptor for Responder {
                 magic: CONTROL_ACK_MAGIC,
                 control_version: CONTROL_VERSION,
                 selected_zakura_protocol: hello.selected_zakura_protocol,
+                node_keys: conn.local_keys().encode(),
                 peer_nonce: [9; 32],
                 remote_peer_nonce: hello.peer_nonce,
                 accepted_capabilities: hello.capabilities & ZAKURA_CAP_HEADER_SYNC,

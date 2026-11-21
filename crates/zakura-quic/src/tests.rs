@@ -93,7 +93,7 @@ struct Server {
 
 impl Server {
     fn addr(&self) -> NodeAddr {
-        NodeAddr::with_addrs(self.endpoint.local_id(), self.endpoint.local_addrs())
+        NodeAddr::for_key(self.endpoint.local_key(), self.endpoint.local_addrs())
     }
 }
 
@@ -199,7 +199,7 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.local_id(), &[ALPN])
+        .client_config(Some(server.local_key()), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -243,7 +243,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         let mut server = server();
         let client = client();
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key(), server.endpoint.local_key());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.source_validated(), "this node dialed the address");
@@ -254,8 +254,17 @@ async fn dial_authenticates_both_sides_and_echoes() {
         assert_eq!(echo(&conn, &payload).await, payload);
 
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key(), client.local_key());
         assert!(!inbound.source_validated(), "no Retry validated the source");
+
+        // TLS proves a key; the application binds the node ID, once.
+        assert_eq!(inbound.remote_id(), None);
+        let shared = inbound.clone();
+        inbound.bind_remote_id(client.local_id());
+        inbound.bind_remote_id(server.endpoint.local_id());
+        assert_eq!(shared.remote_id(), Some(client.local_id()));
+        assert_eq!(conn.remote_id(), None, "the dialing side binds its own");
+
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -470,7 +479,7 @@ async fn interface_change_notifies_connections_and_keeps_them() {
 #[tokio::test]
 async fn self_dial_is_refused_before_any_packet() {
     let client = client();
-    let own = NodeAddr::with_addrs(client.local_id(), client.local_addrs());
+    let own = NodeAddr::for_key(client.local_key(), client.local_addrs());
     assert!(matches!(
         client.connect(own, &[ALPN]).await,
         Err(ConnectError::SelfDial)
@@ -481,7 +490,7 @@ async fn self_dial_is_refused_before_any_packet() {
 async fn dial_without_a_matching_family_fails_fast() {
     let server = server();
     let client = client();
-    let v6_only = NodeAddr::with_addrs(server.endpoint.local_id(), ["[::1]:8234".parse().unwrap()]);
+    let v6_only = NodeAddr::for_key(server.endpoint.local_key(), ["[::1]:8234".parse().unwrap()]);
     assert!(matches!(
         client.connect(v6_only, &[ALPN]).await,
         Err(ConnectError::NoUsableAddress)
@@ -527,14 +536,34 @@ async fn wrong_identity_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
-        let impostor = NodeAddr::with_addrs(
-            NodeSecretKey::generate().public(),
+        let impostor = NodeAddr::for_key(
+            NodeSecretKey::generate().public_key(),
             server.endpoint.local_addrs(),
         );
         assert!(matches!(
             client.connect(impostor, &[ALPN]).await,
             Err(ConnectError::WrongIdentity)
         ));
+    })
+    .await
+    .unwrap();
+}
+
+/// A dialer that knows a node's ID but not its key can't check the key in
+/// TLS. The dial succeeds with whatever valid key the server proves, and the
+/// connection reports that key so the caller can decide who it reached.
+#[tokio::test]
+async fn a_dial_without_an_expected_key_reports_the_key_the_server_proved() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = client();
+        let unrelated = NodeSecretKey::generate().public();
+        let by_id = NodeAddr::with_addrs(unrelated, server.endpoint.local_addrs());
+        assert_eq!(by_id.key, None);
+
+        let conn = client.connect(by_id, &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_key(), server.endpoint.local_key());
+        assert_eq!(conn.remote_id(), None, "TLS established no node ID");
     })
     .await
     .unwrap();
@@ -718,7 +747,7 @@ async fn happy_eyeballs_skips_a_black_hole() {
         direct.extend(server.endpoint.local_addrs());
         let conn = client
             .connect(
-                NodeAddr::with_addrs(server.endpoint.local_id(), direct),
+                NodeAddr::for_key(server.endpoint.local_key(), direct),
                 &[ALPN],
             )
             .await
@@ -789,7 +818,7 @@ async fn migration_to_a_banned_ip_closes_the_connection() {
         let client = client();
         let conn = client
             .connect(
-                NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
+                NodeAddr::for_key(server.endpoint.local_key(), [relay.addr]),
                 &[ALPN],
             )
             .await
@@ -835,7 +864,7 @@ async fn ban_after_migration_closes_at_the_next_sample() {
         let client = client();
         let conn = client
             .connect(
-                NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
+                NodeAddr::for_key(server.endpoint.local_key(), [relay.addr]),
                 &[ALPN],
             )
             .await
@@ -873,7 +902,7 @@ async fn migration_to_an_allowed_ip_keeps_the_connection() {
         let client = client();
         let conn = client
             .connect(
-                NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
+                NodeAddr::for_key(server.endpoint.local_key(), [relay.addr]),
                 &[ALPN],
             )
             .await
@@ -910,7 +939,7 @@ async fn shutdown_closes_connections_within_the_bound() {
         // A shut-down endpoint dials nothing.
         assert!(server
             .endpoint
-            .connect(NodeAddr::with_addrs(client.local_id(), client.local_addrs()), &[ALPN])
+            .connect(NodeAddr::for_key(client.local_key(), client.local_addrs()), &[ALPN])
             .await
             .is_err());
     })
@@ -937,7 +966,7 @@ async fn shutdown_releases_the_socket_while_handles_live() {
         drop(inbound);
         assert!(handle
             .connect(
-                NodeAddr::with_addrs(client.local_id(), client.local_addrs()),
+                NodeAddr::for_key(client.local_key(), client.local_addrs()),
                 &[ALPN]
             )
             .await
@@ -1067,7 +1096,7 @@ fn raw_client_builder(
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(
-            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id()),
+            crate::tls::verifier::ServerCertificateVerifier::new(Some(server.endpoint.local_key())),
         ))
 }
 
@@ -1274,7 +1303,7 @@ async fn held_pair_with(
     let (handled, mut inbound) = mpsc::unbounded_channel();
     server.serve(HoldAcceptor { handled }).unwrap();
     let client = QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), config).unwrap();
-    let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+    let addr = NodeAddr::for_key(server.local_key(), server.local_addrs());
     let conn = client.connect(addr, &[ALPN]).await.unwrap();
     let inbound = inbound.recv().await.unwrap();
     (server, client, conn, inbound)
@@ -1782,7 +1811,7 @@ async fn staggered_dial_skips_later_addresses_after_a_fast_win() {
         direct.push(decoy.local_addr().unwrap());
         client
             .connect(
-                NodeAddr::with_addrs(server.endpoint.local_id(), direct),
+                NodeAddr::for_key(server.endpoint.local_key(), direct),
                 &[ALPN],
             )
             .await
@@ -1879,7 +1908,7 @@ impl rustls::client::ResolvesClientCert for ImpostorResolver {
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let victim = NodeSecretKey::generate().public();
+        let victim = NodeSecretKey::generate().public_key();
         let cert =
             rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
         let key = Arc::new(rustls::sign::CertifiedKey::new(
@@ -2026,7 +2055,7 @@ async fn handle_runs_before_the_pending_count_drops() {
             })
             .unwrap();
         let client = client();
-        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let addr = NodeAddr::for_key(server.local_key(), server.local_addrs());
         let _conn = client.connect(addr, &[ALPN]).await.unwrap();
         assert_eq!(pending_at_handle.recv().await, Some(1));
     })
@@ -2097,7 +2126,7 @@ async fn pending_handshakes_count_under_the_acceptor_group() {
         }
 
         let client = client();
-        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let addr = NodeAddr::for_key(server.local_key(), server.local_addrs());
         let _conn = client.connect(addr, &[ALPN]).await.unwrap();
         let seen = admitted.lock().unwrap().clone();
         assert_eq!(seen[0].pending_from_ip, 0);
@@ -2297,7 +2326,7 @@ async fn churn(bind: QuicBindConfig) -> (usize, usize) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
         server.serve(ChurnAcceptor).unwrap();
-        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let addr = NodeAddr::for_key(server.local_key(), server.local_addrs());
 
         let stop = Arc::new(AtomicBool::new(false));
         let peaks = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
@@ -2398,8 +2427,8 @@ async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
         let other = server();
         let server = server();
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = NodeAddr::with_addrs(
-            server.endpoint.local_id(),
+        let addr = NodeAddr::for_key(
+            server.endpoint.local_key(),
             vec![
                 server.endpoint.local_addrs()[0],
                 silent.local_addr().unwrap(),
@@ -2456,8 +2485,8 @@ async fn a_dial_tries_no_more_addresses_than_the_table_holds() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = NodeAddr::with_addrs(
-            server.endpoint.local_id(),
+        let addr = NodeAddr::for_key(
+            server.endpoint.local_key(),
             vec![
                 server.endpoint.local_addrs()[0],
                 silent.local_addr().unwrap(),
@@ -2524,7 +2553,7 @@ async fn slow_closing_conn(
     bound: Duration,
 ) -> (DelayRelay, Conn, Conn) {
     let relay = delay_relay(server.endpoint.local_addrs()[0], Duration::from_millis(750)).await;
-    let via_relay = NodeAddr::with_addrs(server.endpoint.local_id(), vec![relay.addr]);
+    let via_relay = NodeAddr::for_key(server.endpoint.local_key(), vec![relay.addr]);
     let conn = client.connect(via_relay, &[ALPN]).await.unwrap();
     let inbound = server.handled.recv().await.unwrap();
     let rtt = inbound.stats().await.unwrap().connection.path.rtt;
@@ -2656,8 +2685,8 @@ async fn discovery_handles_small_connection_limits() {
                 QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
             let peer = server();
             let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let target = NodeAddr::with_addrs(
-                peer.endpoint.local_id(),
+            let target = NodeAddr::for_key(
+                peer.endpoint.local_key(),
                 vec![peer.endpoint.local_addrs()[0], silent.local_addr().unwrap()],
             );
             assert_eq!(node.has_discovery_capacity(), can_discover);
@@ -2737,8 +2766,8 @@ async fn cancelled_discovery_dials_restore_every_slot() {
 
             // This dial needs both refunded slots, even though its first
             // address answers before the second address needs to finish.
-            let replacement = NodeAddr::with_addrs(
-                peer.endpoint.local_id(),
+            let replacement = NodeAddr::for_key(
+                peer.endpoint.local_key(),
                 [peer.endpoint.local_addrs()[0], second.local_addr().unwrap()],
             );
             let _connected = node.connect_discovery(replacement, &[ALPN]).await.unwrap();
@@ -2820,10 +2849,10 @@ async fn the_driver_runs_over_simnet_without_os_sockets_or_pollers() {
         let client = sim_endpoint(&net, sim_addr(2));
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key(), server.endpoint.local_key());
         assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key(), client.local_key());
         assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
 
         let stats = &server.endpoint.socket_stats()[0];
@@ -3173,12 +3202,15 @@ async fn seeded_inputs_handshake_over_simnet() {
         let client = bind(1, sim_addr(2), &client_inputs);
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), SeededInputs::node_key(SEED, 0).public());
+        assert_eq!(
+            conn.remote_key(),
+            SeededInputs::node_key(SEED, 0).public_key()
+        );
         assert_eq!(echo(&conn, b"seeded").await, b"seeded");
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(
-            inbound.remote_id(),
-            SeededInputs::node_key(SEED, 1).public()
+            inbound.remote_key(),
+            SeededInputs::node_key(SEED, 1).public_key()
         );
         assert!(server
             .seen

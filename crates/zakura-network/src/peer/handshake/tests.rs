@@ -445,7 +445,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
     let mut peer_conn = Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
 
     // A valid `Init` that passes the responder's static, nonce, and protocol
-    // validation, claiming a real 32-byte iroh identity the attacker never
+    // validation, claiming a real key list whose node the attacker never
     // brings online over native QUIC.
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -459,7 +459,9 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
         local_zebra_nonce: nonces.remote_zebra_nonce,
         remote_zebra_nonce: nonces.local_zebra_nonce,
         upgrade_nonce: [9u8; 32],
-        iroh_node_id: vec![7u8; 32],
+        node_keys: zakura_quic::NodeSecretKey::from_bytes(&[7; 32])
+            .key_list()
+            .encode(),
         iroh_direct_addresses: vec![b"192.0.2.1:1".to_vec()],
         iroh_relay_hint: None,
         max_control_frame_bytes: config.max_control_frame_bytes,
@@ -522,6 +524,110 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
          (a neutral Rejected fallback) when the inbound peer sends a valid Init but \
          never registers a native Zakura connection",
     );
+
+    responder_endpoint.shutdown().await;
+}
+
+/// A peer whose upgrade `Init` carries its bare 32-byte key where this
+/// release reads a key list gets a reject and keeps its legacy connection. A
+/// release from before key lists sends exactly that, with an older protocol
+/// version, and must not be disconnected for it.
+#[tokio::test]
+async fn responder_upgrade_keeps_legacy_for_a_peer_that_sends_a_bare_key() {
+    let _init_guard = zakura_test::init();
+
+    let responder_endpoint = start_test_zakura_endpoint().await;
+    let connector = responder_endpoint.connector();
+    let network = test_config(P2pStack::Dual).network;
+    let config = ZakuraHandshakeConfig::for_network(&network);
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
+        remote_zebra_nonce: Nonce(0x2222_2222_2222_2222),
+    };
+    let bare_key = zakura_quic::NodeSecretKey::from_bytes(&[7; 32])
+        .public_key()
+        .as_bytes()
+        .to_vec();
+    let older_protocol = config.zakura_protocol_min - 1;
+
+    for (protocol_min, protocol_max) in [
+        (older_protocol, older_protocol),
+        (config.zakura_protocol_min, config.zakura_protocol_max),
+    ] {
+        let (local_node_keys, local_direct_addresses) = connector
+            .local_iroh_hints()
+            .await
+            .expect("a live Zakura endpoint exposes local upgrade hints");
+        let (responder_stream, peer_stream) = duplex(16 * 1024);
+        let mut responder_conn = Framed::new(
+            responder_stream,
+            Codec::builder().for_network(&network).finish(),
+        );
+        let mut peer_conn =
+            Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
+
+        let init = P2pV2UpgradeInit {
+            magic: PRELUDE_MAGIC,
+            prelude_version: config.prelude_version,
+            zakura_protocol_min: protocol_min,
+            zakura_protocol_max: protocol_max,
+            network_id: config.network_id,
+            chain_id: config.chain_id,
+            capabilities: config.supported_capabilities,
+            local_zebra_nonce: nonces.remote_zebra_nonce,
+            remote_zebra_nonce: nonces.local_zebra_nonce,
+            upgrade_nonce: [9u8; 32],
+            node_keys: bare_key.clone(),
+            iroh_direct_addresses: vec![b"192.0.2.1:1".to_vec()],
+            iroh_relay_hint: None,
+            max_control_frame_bytes: config.max_control_frame_bytes,
+            max_open_streams: config.max_open_streams,
+        };
+        let peer = async move {
+            let init_bytes = P2pV2Upgrade::Init(init)
+                .encode()
+                .expect("an init with a 32-byte identity encodes");
+            peer_conn
+                .send(Message::P2pV2Upgrade(init_bytes))
+                .await
+                .expect("the initiator sends its upgrade init");
+            let reply = peer_conn
+                .next()
+                .await
+                .expect("the responder replies on the legacy stream")
+                .expect("the reply frame decodes");
+            let Message::P2pV2Upgrade(payload) = reply else {
+                panic!("the responder must reply with a p2pv2 upgrade message");
+            };
+            assert!(
+                matches!(P2pV2Upgrade::decode(&payload), Ok(P2pV2Upgrade::Reject(_))),
+                "protocol versions {protocol_min}..={protocol_max}: the responder must reject",
+            );
+            peer_conn
+        };
+        let responder = run_responder_upgrade(
+            &mut responder_conn,
+            &connector,
+            &config,
+            nonces,
+            local_node_keys,
+            local_direct_addresses,
+            ResponderRegistrationWait::TestTimeout(std::time::Duration::from_millis(50)),
+        );
+
+        let (outcome, _held_peer_conn) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(45), responder),
+            peer,
+        );
+        let outcome = outcome
+            .expect("responder upgrade resolves within the time bound")
+            .expect("a bare key is not a malformed prelude");
+        assert!(
+            matches!(outcome, ZakuraUpgradeOutcome::Rejected { .. }),
+            "protocol versions {protocol_min}..={protocol_max}: the responder reported \
+             {outcome:?}; it must keep the legacy connection",
+        );
+    }
 
     responder_endpoint.shutdown().await;
 }
@@ -732,7 +838,7 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         Codec::builder().for_network(&network).finish(),
     );
 
-    // The responder accepts with a real iroh node id at an RFC 5737 TEST-NET-1
+    // The responder accepts with a real key list at an RFC 5737 TEST-NET-1
     // address, so the initiator's native dial never registers.
     let responder_connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
     let responder = run_responder_upgrade(
@@ -740,10 +846,7 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         &responder_connector,
         &config,
         responder_nonces,
-        zakura_quic::NodeSecretKey::generate()
-            .public()
-            .as_bytes()
-            .to_vec(),
+        zakura_quic::NodeSecretKey::generate().key_list().encode(),
         vec![b"192.0.2.1:1".to_vec()],
         ResponderRegistrationWait::Production,
     );

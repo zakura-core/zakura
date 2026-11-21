@@ -16,7 +16,7 @@ Repo-relative paths below are from the repo root `/root/zakura/`.
 
 - `perf.sh` — the one entry point (setup + run loop).
 - `cohort.env` — single source of truth: cohort tag, the two serving hosts, their
-  captured `node_id@ip:8234`, serve commit, seed height, bench binary path.
+  captured `id:node_id@ip:8234`, serve commit, seed height, bench binary path.
 - `zakura-bench-config.toml` — the bench node config (tokenized; `perf.sh` fills
   the cohort tag + peers, `feed_run.sh` fills the per-run tokens).
 - `nodes.toml.tmpl` — deployer config for the two serving nodes.
@@ -37,7 +37,7 @@ cd deploy/runner
 # deploy both nodes (p2p_stack=dual) → sync from public mainnet
 ./perf.sh seed-serving
 ./perf.sh status           # repeat until both heights >= SEED_HEIGHT
-./perf.sh peers            # capture each node_id@ip:8234 from logs into cohort.env
+./perf.sh peers            # capture each id:node_id@ip:8234 from logs into cohort.env
 # redeploy p2p_stack=zakura → static cohort servers
 ./perf.sh freeze-serving
 ```

@@ -12,7 +12,7 @@ use std::{
 
 use proptest::prelude::*;
 use zakura_chain::block;
-use zakura_quic::{NodeId, NodeSecretKey};
+use zakura_quic::{NodeId, NodeKey, NodeKeyList, NodeSecretKey, ED25519_KEY_TAG};
 
 use super::{
     protocol::{
@@ -41,17 +41,37 @@ use crate::zakura::{
 /// A tag no release assigns, so its summary bytes stay opaque.
 const UNKNOWN_TAG: u16 = 0xfff0;
 
-/// Valid node ids in byte order: enough to fill an exclusion list and a
-/// full `Peers` message.
+/// A key tag no release assigns, so the entry's 32 bytes stay opaque.
+const UNKNOWN_KEY_TAG: u16 = 0x7f00;
+
+/// The one-entry key list of the `index`th test node.
+fn keys(index: usize) -> NodeKeyList {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+    NodeSecretKey::from_bytes(&seed).key_list().clone()
+}
+
+/// The `index`th test node's Ed25519 key with three entries of unassigned
+/// tags after it: the longest a key list can be.
+fn longest_keys(index: usize) -> NodeKeyList {
+    let key = keys(index)
+        .ed25519()
+        .expect("a test node's list holds its Ed25519 key");
+    NodeKeyList::from_entries([
+        (ED25519_KEY_TAG, *key.as_bytes()),
+        (UNKNOWN_KEY_TAG, [0x11; 32]),
+        (UNKNOWN_KEY_TAG + 1, [0x22; 32]),
+        (u16::MAX, [0x33; 32]),
+    ])
+    .expect("the tags are nonzero and increasing")
+}
+
+/// Node ids in byte order: enough to fill an exclusion list.
 fn node_ids() -> &'static [NodeId] {
     static NODE_IDS: OnceLock<Vec<NodeId>> = OnceLock::new();
     NODE_IDS.get_or_init(|| {
         let mut ids: Vec<NodeId> = (0..=MAX_DISCOVERY_EXCLUDED_NODE_IDS)
-            .map(|index| {
-                let mut seed = [0u8; 32];
-                seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                NodeSecretKey::from_bytes(&seed).public()
-            })
+            .map(|index| keys(index).node_id())
             .collect();
         ids.sort_by_key(|id| *id.as_bytes());
         ids
@@ -80,9 +100,9 @@ fn record(body: ZakuraNodeRecordBody) -> ZakuraNodeRecord {
     }
 }
 
-fn shortest_body(node_id: NodeId) -> ZakuraNodeRecordBody {
+fn shortest_body(keys: NodeKeyList) -> ZakuraNodeRecordBody {
     ZakuraNodeRecordBody {
-        node_id,
+        keys,
         direct_addrs: Vec::new(),
         services: Vec::new(),
         zakura_protocol_min: 1,
@@ -104,8 +124,9 @@ fn longest_ipv6(index: u8) -> SocketAddr {
     ))
 }
 
-/// A record body with the most and longest addresses and services.
-fn longest_body(node_id: NodeId) -> ZakuraNodeRecordBody {
+/// The `index`th test node's record body with the longest key list and the
+/// most and longest addresses and services.
+fn longest_body(index: usize) -> ZakuraNodeRecordBody {
     ZakuraNodeRecordBody {
         direct_addrs: (0..MAX_DIRECT_ADDRS_PER_RECORD)
             .map(|index| longest_ipv6(index as u8))
@@ -115,7 +136,7 @@ fn longest_body(node_id: NodeId) -> ZakuraNodeRecordBody {
         zakura_protocol_max: u16::MAX,
         sequence: u64::MAX,
         expires_at_unix_secs: u64::MAX,
-        ..shortest_body(node_id)
+        ..shortest_body(longest_keys(index))
     }
 }
 
@@ -134,9 +155,8 @@ fn longest_get_peers() -> DiscoveryMessage {
 
 fn longest_peers() -> DiscoveryMessage {
     DiscoveryMessage::Peers {
-        records: node_ids()[..MAX_DISCOVERY_RECORDS_PER_RESPONSE]
-            .iter()
-            .map(|node_id| record(longest_body(*node_id)))
+        records: (0..MAX_DISCOVERY_RECORDS_PER_RESPONSE)
+            .map(|index| record(longest_body(index)))
             .collect(),
     }
 }
@@ -199,12 +219,36 @@ fn payload(message: &DiscoveryMessage) -> Vec<u8> {
         .payload
 }
 
-/// The bytes of a node id that is not a curve point.
-fn invalid_node_id() -> [u8; 32] {
+/// 32 bytes that are not an Ed25519 public key.
+fn not_a_key() -> [u8; 32] {
     (0..=u8::MAX)
         .map(|byte| [byte; 32])
-        .find(|bytes| NodeId::from_bytes(bytes).is_err())
+        .find(|bytes| NodeKey::from_bytes(bytes).is_err())
         .expect("some repeated byte is not a curve point")
+}
+
+/// Key list bytes written without the codec: the count, then each entry's
+/// tag and 32 bytes.
+fn raw_keys(entries: &[(u16, [u8; 32])]) -> Vec<u8> {
+    let mut out = vec![entries.len() as u8];
+    for (tag, value) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    out
+}
+
+/// The first test node's Ed25519 public key.
+fn valid_key() -> [u8; 32] {
+    *keys(0)
+        .ed25519()
+        .expect("a test node's list holds its Ed25519 key")
+        .as_bytes()
+}
+
+/// The first test node's one-entry key list, encoded.
+fn valid_keys() -> Vec<u8> {
+    raw_keys(&[(ED25519_KEY_TAG, valid_key())])
 }
 
 /// A `Hello` frame around raw body bytes.
@@ -217,8 +261,8 @@ fn hello_with_body(body: &[u8]) -> Frame {
 
 /// A shortest record body whose lists are `lists`: the address count and
 /// addresses, then the service count and service ids.
-fn raw_body(node_id: [u8; 32], lists: &[u8], protocol: (u16, u16), network: u32) -> Vec<u8> {
-    let mut out = node_id.to_vec();
+fn raw_body(keys: &[u8], lists: &[u8], protocol: (u16, u16), network: u32) -> Vec<u8> {
+    let mut out = keys.to_vec();
     out.extend_from_slice(lists);
     out.extend_from_slice(&protocol.0.to_le_bytes());
     out.extend_from_slice(&protocol.1.to_le_bytes());
@@ -306,6 +350,20 @@ fn arbitrary_unique_services(max: usize) -> BoxedStrategy<Vec<ZakuraServiceId>> 
         .boxed()
 }
 
+/// A test node's key list: its Ed25519 key alone, or with entries of
+/// unassigned tags after it.
+fn arbitrary_keys() -> BoxedStrategy<NodeKeyList> {
+    (0..MAX_DISCOVERY_RECORDS_PER_RESPONSE, any::<bool>())
+        .prop_map(|(index, longest)| {
+            if longest {
+                longest_keys(index)
+            } else {
+                keys(index)
+            }
+        })
+        .boxed()
+}
+
 fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
     let network = prop_oneof![
         Just(ZakuraNetworkId::Mainnet),
@@ -314,7 +372,7 @@ fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
         Just(ZakuraNetworkId::Configured),
     ];
     (
-        proptest::sample::select(node_ids().to_vec()),
+        arbitrary_keys(),
         proptest::collection::vec(arbitrary_addr(), 0..=MAX_DIRECT_ADDRS_PER_RECORD),
         proptest::collection::vec(arbitrary_service(), 0..=MAX_SERVICES_PER_RECORD),
         (any::<u16>(), any::<u16>()),
@@ -326,7 +384,7 @@ fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
     )
         .prop_map(
             |(
-                node_id,
+                keys,
                 direct_addrs,
                 services,
                 (a, b),
@@ -337,7 +395,7 @@ fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
                 signature,
             )| {
                 let mut body = ZakuraNodeRecordBody {
-                    node_id,
+                    keys,
                     direct_addrs,
                     services,
                     zakura_protocol_min: a.min(b),
@@ -379,10 +437,10 @@ impl MessageSample for DiscoveryMessage {
     fn samples() -> Vec<Self> {
         vec![
             Self::Hello {
-                record: record(shortest_body(node_ids()[0])),
+                record: record(shortest_body(keys(0))),
             },
             Self::Hello {
-                record: record(longest_body(node_ids()[0])),
+                record: record(longest_body(0)),
             },
             Self::Hello {
                 record: record(ZakuraNodeRecordBody {
@@ -390,7 +448,7 @@ impl MessageSample for DiscoveryMessage {
                     services: vec![ZakuraServiceId::discovery()],
                     // An unknown TLV: type 0x7001, length 3.
                     extensions: vec![0x01, 0x70, 0x03, 0x00, 0xaa, 0xbb, 0xcc],
-                    ..shortest_body(node_ids()[1])
+                    ..shortest_body(keys(1))
                 }),
             },
             Self::GetPeers(GetPeers {
@@ -439,7 +497,7 @@ impl MessageSample for DiscoveryMessage {
                     })
                 }),
             proptest::collection::vec(arbitrary_record(), 0..=4).prop_map(|mut records| {
-                dedup_by_key(&mut records, |record| record.body.node_id);
+                dedup_by_key(&mut records, |record| record.body.node_id());
                 Self::Peers { records }
             }),
             arbitrary_unique_services(MAX_GET_SERVICES_WANTED)
@@ -478,7 +536,7 @@ impl MessageSample for DiscoveryMessage {
         oversize_body.resize(HELLO.payload.max(), 0);
         let mut duplicate_peers = 2u16.to_le_bytes().to_vec();
         let shortest = payload(&Self::Hello {
-            record: record(shortest_body(node_ids()[0])),
+            record: record(shortest_body(keys(0))),
         });
         duplicate_peers.extend_from_slice(&shortest);
         duplicate_peers.extend_from_slice(&shortest);
@@ -575,7 +633,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "record body shorter than its fixed fields",
                 frame: frame(MSG_DISCOVERY_HELLO, {
-                    let mut out = 91u32.to_le_bytes().to_vec();
+                    let mut out = 94u32.to_le_bytes().to_vec();
                     out.resize(HELLO.payload.min(), 0);
                     out
                 }),
@@ -587,24 +645,81 @@ impl MessageSample for DiscoveryMessage {
                 rejected_by: |error| *error == WireError::OutOfRange("record body length"),
             },
             Violation {
-                name: "record node id is not a curve point",
-                frame: hello_with_body(&raw_body(invalid_node_id(), &NO_LISTS, (1, 1), 1)),
-                rejected_by: |error| *error == WireError::OutOfRange("record node id"),
+                name: "record Ed25519 key is not a curve point",
+                frame: hello_with_body(&raw_body(
+                    &raw_keys(&[(ED25519_KEY_TAG, not_a_key())]),
+                    &NO_LISTS,
+                    (1, 1),
+                    1,
+                )),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
+            },
+            Violation {
+                name: "record key list is empty",
+                frame: hello_with_body(&{
+                    // Trailing extension bytes keep the body above its
+                    // shortest length, so the key list check is what fails.
+                    let mut body = raw_body(&raw_keys(&[]), &NO_LISTS, (1, 1), 1);
+                    body.extend_from_slice(&[0; 34]);
+                    body
+                }),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
+            },
+            Violation {
+                name: "record key list holds five entries",
+                frame: hello_with_body(&raw_body(
+                    &raw_keys(&[
+                        (ED25519_KEY_TAG, valid_key()),
+                        (2, [2; 32]),
+                        (3, [3; 32]),
+                        (4, [4; 32]),
+                        (5, [5; 32]),
+                    ]),
+                    &NO_LISTS,
+                    (1, 1),
+                    1,
+                )),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
+            },
+            Violation {
+                name: "record key tag is zero",
+                frame: hello_with_body(&raw_body(&raw_keys(&[(0, [1; 32])]), &NO_LISTS, (1, 1), 1)),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
+            },
+            Violation {
+                name: "record key tags are not increasing",
+                frame: hello_with_body(&raw_body(
+                    &raw_keys(&[(UNKNOWN_KEY_TAG, [1; 32]), (ED25519_KEY_TAG, valid_key())]),
+                    &NO_LISTS,
+                    (1, 1),
+                    1,
+                )),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
+            },
+            Violation {
+                name: "record key tag repeats",
+                frame: hello_with_body(&raw_body(
+                    &raw_keys(&[(UNKNOWN_KEY_TAG, [1; 32]), (UNKNOWN_KEY_TAG, [2; 32])]),
+                    &NO_LISTS,
+                    (1, 1),
+                    1,
+                )),
+                rejected_by: |error| *error == WireError::OutOfRange("record key list"),
             },
             Violation {
                 name: "record protocol range runs backwards",
-                frame: hello_with_body(&raw_body(valid_node_id(), &NO_LISTS, (2, 1), 1)),
+                frame: hello_with_body(&raw_body(&valid_keys(), &NO_LISTS, (2, 1), 1)),
                 rejected_by: |error| *error == WireError::OutOfRange("protocol range"),
             },
             Violation {
                 name: "record network id unknown",
-                frame: hello_with_body(&raw_body(valid_node_id(), &NO_LISTS, (1, 1), 99)),
+                frame: hello_with_body(&raw_body(&valid_keys(), &NO_LISTS, (1, 1), 99)),
                 rejected_by: |error| *error == WireError::OutOfRange("network id"),
             },
             Violation {
                 name: "record address family unknown",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[&1u16.to_le_bytes()[..], &[9, 1, 2, 3, 4, 0, 0], &[0, 0]].concat(),
                     (1, 1),
                     1,
@@ -614,7 +729,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "too many record addresses",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[
                         &((MAX_DIRECT_ADDRS_PER_RECORD + 1) as u16).to_le_bytes()[..],
                         &[0; 2],
@@ -628,7 +743,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "record service id empty",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[&[0, 0][..], &1u16.to_le_bytes(), &[0, 0]].concat(),
                     (1, 1),
                     1,
@@ -638,7 +753,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "record service id too long",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[
                         &[0, 0][..],
                         &1u16.to_le_bytes(),
@@ -654,7 +769,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "record service id not ASCII",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[&[0, 0][..], &1u16.to_le_bytes(), &[1, 0], &[0xff]].concat(),
                     (1, 1),
                     1,
@@ -664,7 +779,7 @@ impl MessageSample for DiscoveryMessage {
             Violation {
                 name: "too many record services",
                 frame: hello_with_body(&raw_body(
-                    valid_node_id(),
+                    &valid_keys(),
                     &[
                         &[0, 0][..],
                         &((MAX_SERVICES_PER_RECORD + 1) as u16).to_le_bytes(),
@@ -756,7 +871,7 @@ fn the_encoder_refuses_what_the_decoder_rejects() {
     let crossed_protocols = record(ZakuraNodeRecordBody {
         zakura_protocol_min: 2,
         zakura_protocol_max: 1,
-        ..shortest_body(ids[0])
+        ..shortest_body(keys(0))
     });
 
     let refused = [
@@ -796,15 +911,14 @@ fn the_encoder_refuses_what_the_decoder_rejects() {
         (
             "a repeated record",
             DiscoveryMessage::Peers {
-                records: vec![record(shortest_body(ids[0])); 2],
+                records: vec![record(shortest_body(keys(0))); 2],
             },
         ),
         (
             "too many records",
             DiscoveryMessage::Peers {
-                records: ids[..=MAX_DISCOVERY_RECORDS_PER_RESPONSE]
-                    .iter()
-                    .map(|node_id| record(shortest_body(*node_id)))
+                records: (0..=MAX_DISCOVERY_RECORDS_PER_RESPONSE)
+                    .map(|index| record(shortest_body(keys(index))))
                     .collect(),
             },
         ),
@@ -940,8 +1054,16 @@ fn fixture_service(index: usize) -> Vec<u8> {
     out
 }
 
-fn fixture_record(node_id: &NodeId) -> Vec<u8> {
-    let mut body = node_id.as_bytes().to_vec();
+fn fixture_record(index: usize) -> Vec<u8> {
+    let key = keys(index)
+        .ed25519()
+        .expect("a test node's list holds its Ed25519 key");
+    let mut body = raw_keys(&[
+        (ED25519_KEY_TAG, *key.as_bytes()),
+        (UNKNOWN_KEY_TAG, [0x11; 32]),
+        (UNKNOWN_KEY_TAG + 1, [0x22; 32]),
+        (u16::MAX, [0x33; 32]),
+    ]);
     body.extend_from_slice(&8u16.to_le_bytes());
     for index in 0..8u8 {
         let SocketAddr::V6(addr) = longest_ipv6(index) else {
@@ -963,24 +1085,24 @@ fn fixture_record(node_id: &NodeId) -> Vec<u8> {
     body.extend_from_slice(&[7; 32]);
     body.extend_from_slice(&u64::MAX.to_le_bytes());
     body.extend_from_slice(&u64::MAX.to_le_bytes());
-    assert_eq!(body.len(), 580);
+    assert_eq!(body.len(), 685);
 
-    let mut out = 580u32.to_le_bytes().to_vec();
+    let mut out = 685u32.to_le_bytes().to_vec();
     out.extend_from_slice(&body);
     out.extend_from_slice(&[0xab; 64]);
     out
 }
 
 #[test]
-fn hello_fixture_is_648_bytes() {
-    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(&node_ids()[0]), 648);
+fn hello_fixture_is_753_bytes() {
+    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(0), 753);
 }
 
 #[test]
-fn shortest_hello_is_160_bytes() {
-    let bytes = hello_with_body(&raw_body(valid_node_id(), &NO_LISTS, (1, 1), 1)).payload;
-    assert_eq!(bytes.len(), 160);
-    assert_eq!(HELLO.payload.min(), 160);
+fn shortest_hello_is_163_bytes() {
+    let bytes = hello_with_body(&raw_body(&valid_keys(), &NO_LISTS, (1, 1), 1)).payload;
+    assert_eq!(bytes.len(), 163);
+    assert_eq!(HELLO.payload.min(), 163);
     let message: DiscoveryMessage =
         decode_frame(&frame(MSG_DISCOVERY_HELLO, bytes.clone())).expect("fixture decodes");
     assert_eq!(payload(&message), bytes);
@@ -1001,12 +1123,12 @@ fn get_peers_fixture_is_8470_bytes() {
 }
 
 #[test]
-fn peers_fixture_is_20738_bytes() {
+fn peers_fixture_is_24098_bytes() {
     let mut bytes = 32u16.to_le_bytes().to_vec();
-    for node_id in &node_ids()[..32] {
-        bytes.extend_from_slice(&fixture_record(node_id));
+    for index in 0..32 {
+        bytes.extend_from_slice(&fixture_record(index));
     }
-    check_fixture(MSG_DISCOVERY_PEERS, bytes, 20_738);
+    check_fixture(MSG_DISCOVERY_PEERS, bytes, 24_098);
 }
 
 #[test]
@@ -1030,4 +1152,21 @@ fn services_fixture_is_2394_bytes() {
         bytes.extend_from_slice(&[0x5a; 256]);
     }
     check_fixture(MSG_DISCOVERY_SERVICES, bytes, 2_394);
+}
+
+/// A key list with no Ed25519 entry is well formed, so its record decodes
+/// and re-encodes byte for byte. Whether the record is usable is decided
+/// after the codec, without blaming the peer that relayed it.
+#[test]
+fn a_record_whose_keys_this_release_cannot_read_decodes() {
+    let keys = raw_keys(&[(UNKNOWN_KEY_TAG, [0x44; 32])]);
+    let bytes = hello_with_body(&raw_body(&keys, &NO_LISTS, (1, 1), 1)).payload;
+    let message: DiscoveryMessage =
+        decode_frame(&frame(MSG_DISCOVERY_HELLO, bytes.clone())).expect("the record decodes");
+    let DiscoveryMessage::Hello { record } = &message else {
+        panic!("a Hello frame decodes as Hello");
+    };
+    assert_eq!(record.body.keys.ed25519(), None);
+    assert_eq!(record.body.keys.encode(), keys);
+    assert_eq!(payload(&message), bytes);
 }

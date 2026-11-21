@@ -29,7 +29,8 @@ use crate::{
     },
     error::{BindError, ConnectError},
     inputs::EndpointInputs,
-    key::{NodeAddr, NodeId, NodeSecretKey},
+    key::{NodeAddr, NodeId, NodeKey, NodeSecretKey},
+    key_list::NodeKeyList,
     socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
     tls::{RuntimeUtc, TlsConfig},
@@ -163,7 +164,9 @@ type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 /// State the handles and every endpoint task share. It holds no command
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
-    pub(crate) id: NodeId,
+    /// The keys this node is known by. Their hash is its node ID.
+    pub(crate) keys: Arc<NodeKeyList>,
+    pub(crate) key: NodeKey,
     pub(crate) config: QuicConfig,
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
@@ -241,7 +244,7 @@ struct SocketHandle {
 impl fmt::Debug for QuicEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuicEndpoint")
-            .field("id", &self.inner.shared.id)
+            .field("id", &self.local_id())
             .field("local_addrs", &self.local_addrs())
             .finish()
     }
@@ -292,7 +295,8 @@ impl QuicEndpoint {
             return Err(BindError::NoConnectionSlots);
         }
         let shared = Arc::new(Shared {
-            id: secret.public(),
+            keys: Arc::new(secret.key_list().clone()),
+            key: secret.public_key(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
@@ -398,7 +402,18 @@ impl QuicEndpoint {
 
     /// This endpoint's node ID.
     pub fn local_id(&self) -> NodeId {
-        self.inner.shared.id
+        self.inner.shared.keys.node_id()
+    }
+
+    /// The keys this endpoint's node is known by. [`Self::local_id`] is
+    /// their hash, and [`Self::local_key`] is the Ed25519 key among them.
+    pub fn local_keys(&self) -> &NodeKeyList {
+        &self.inner.shared.keys
+    }
+
+    /// The Ed25519 key this endpoint proves in every TLS handshake.
+    pub fn local_key(&self) -> NodeKey {
+        self.inner.shared.key
     }
 
     /// The bound socket addresses, canonical (SOCK-10, SOCK-11).
@@ -508,7 +523,7 @@ impl QuicEndpoint {
         // OBS-10.
         tracing::info!(
             target: "zakura_quic",
-            id = %self.inner.shared.id,
+            id = %self.local_id(),
             addrs = ?self.local_addrs(),
             buffers = ?self.socket_stats().iter().map(|s| s.buffers).collect::<Vec<_>>(),
             gso = ?self.socket_stats().iter().map(|s| s.gso).collect::<Vec<_>>(),
@@ -555,7 +570,7 @@ impl QuicEndpoint {
             return Err(ConnectError::AlpnMismatch);
         }
         // DIAL-1.
-        if addr.id == shared.id {
+        if addr.id == shared.keys.node_id() {
             return Err(ConnectError::SelfDial);
         }
         if *shared.shutdown.borrow() {
@@ -581,7 +596,7 @@ impl QuicEndpoint {
             .claim_dial_slots(targets.len(), ceiling)
             .ok_or(ConnectError::ConnectionLimit)?;
 
-        let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
+        let crypto = Arc::new(shared.tls.client_config(addr.key, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();
@@ -610,7 +625,8 @@ impl QuicEndpoint {
                     // Dropping `attempts` drops every other attempt, which
                     // closes those connections with code 0.
                     drop(attempts);
-                    return finish_dial(conn, handshake, addr.id, target, started);
+                    let local_keys = self.inner.shared.keys.clone();
+                    return finish_dial(conn, handshake, addr.key, local_keys, target, started);
                 }
                 Err(error) => {
                     if best.as_ref().is_none_or(|best| error.rank() > best.rank()) {
@@ -775,7 +791,8 @@ impl QuicEndpoint {
 fn finish_dial(
     conn: ConnRef,
     handshake: Handshake,
-    expected: NodeId,
+    expected: Option<NodeKey>,
+    local_keys: Arc<NodeKeyList>,
     target: SocketAddr,
     started: Instant,
 ) -> Result<Conn, ConnectError> {
@@ -786,15 +803,20 @@ fn finish_dial(
         });
     };
     // The verifier already enforced TLS-7; this guards against a verifier bug.
-    if handshake.remote_id != Some(expected) {
+    let Some(remote_key) = handshake
+        .remote_key
+        .filter(|key| expected.is_none_or(|expected| expected == *key))
+    else {
         close(b"identity");
         return Err(ConnectError::WrongIdentity);
-    }
+    };
     let Some(alpn) = handshake.alpn else {
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected, target, started, true, alpn))
+    Ok(Conn::new(
+        conn, remote_key, local_keys, target, started, true, alpn,
+    ))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -822,6 +844,7 @@ pub(crate) async fn inbound_handshake(
     deadline: Option<Duration>,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
+    local_keys: Arc<NodeKeyList>,
 ) {
     let started = Instant::now();
     let remote = connecting.remote;
@@ -840,7 +863,7 @@ pub(crate) async fn inbound_handshake(
         wait_closed(&shared).await;
         return;
     };
-    let (Some(remote_id), Some(alpn)) = (handshake.remote_id, handshake.alpn) else {
+    let (Some(remote_key), Some(alpn)) = (handshake.remote_key, handshake.alpn) else {
         let _ = conn.send(crate::driver::ConnCmd::Close {
             code: VarInt::from_u32(0),
             reason: bytes::Bytes::from_static(b"identity"),
@@ -854,7 +877,8 @@ pub(crate) async fn inbound_handshake(
     let pending = pending.handoff();
     let handled = acceptor.handle(Conn::new(
         conn,
-        remote_id,
+        remote_key,
+        local_keys,
         remote,
         admitted_at,
         source_validated,

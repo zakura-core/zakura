@@ -280,7 +280,7 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
     /// One admitted Mainnet connection at the default windows and shares.
-    const CONNECTION: u64 = 141_937_353;
+    const CONNECTION: u64 = 141_945_123;
     /// One handshake at the default windows.
     const HANDSHAKE: u64 = 64 * MIB;
 
@@ -330,7 +330,7 @@ mod tests {
         );
         assert_eq!(
             default_connection_memory(RegtestMessage::BUDGET).admitted_bytes,
-            144_030_963
+            144_038_733
         );
         let config = ZakuraConfig::default();
         assert_eq!(config.connection_memory(&mainnet(), &[]), mainnet_memory);
@@ -360,7 +360,7 @@ mod tests {
         }
         assert_eq!(
             config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]),
-            15_474_155_580
+            15_474_870_420
         );
         assert_eq!(
             config.quic_memory_bytes(
@@ -368,7 +368,7 @@ mod tests {
                 DEFAULT_ZAKURA_MAX_CONNECTIONS,
                 &[],
             ),
-            15_666_767_700
+            15_667_482_540
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         let config = ZakuraConfig {
             bootstrap_peers: node_ids
                 .iter()
-                .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+                .map(|node_id| format!("id:{node_id}@192.0.2.1:8234"))
                 .collect(),
             peer_memory_budget_bytes: budget_for(30),
             ..ZakuraConfig::default()
@@ -489,7 +489,7 @@ mod tests {
         // Extra addresses for one identity and unparsable entries don't count.
         let config = ZakuraConfig {
             bootstrap_peers: (1..=16)
-                .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
+                .map(|port| format!("id:{}@192.0.2.1:{port}", node_ids[0]))
                 .chain(["not a bootstrap peer".to_string()])
                 .collect(),
             peer_memory_budget_bytes: budget_for(30),
@@ -584,7 +584,7 @@ mod tests {
         let mut config = Config::default();
         config.zakura.bootstrap_peers = node_ids
             .iter()
-            .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+            .map(|node_id| format!("id:{node_id}@192.0.2.1:8234"))
             .collect();
         config.zakura.max_connections = 256;
         config.zakura.peer_memory_budget_bytes = budget_for(18);

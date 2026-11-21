@@ -35,7 +35,7 @@ use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Statu
 const MAX_STEPS: usize = 200_000;
 
 /// The ALPN both endpoints speak.
-const ALPN: &[u8] = b"p2p-v2/3";
+const ALPN: &[u8] = b"p2p-v2/4";
 
 /// What the client sends and the server echoes.
 const PAYLOAD: &[u8] = b"m3 replay payload!";
@@ -316,7 +316,7 @@ async fn handshake_and_echo(scenario: Scenario, factory: Recorder) -> String {
     )
     .expect("the client binds");
 
-    let target = NodeAddr::with_addrs(server.local_id(), [server_addr()]);
+    let target = NodeAddr::for_key(server.local_key(), [server_addr()]);
     let outcome = match client.connect(target, &[ALPN]).await {
         Ok(conn) => {
             let (mut send, mut recv) = conn.open_bi().await.expect("the client opens a stream");
@@ -728,7 +728,7 @@ fn a_rebind_goes_through_the_injected_factory() {
             .unwrap();
             let conn = client
                 .connect(
-                    NodeAddr::with_addrs(server.local_id(), [server_addr()]),
+                    NodeAddr::for_key(server.local_key(), [server_addr()]),
                     &[ALPN],
                 )
                 .await

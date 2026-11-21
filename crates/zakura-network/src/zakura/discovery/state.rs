@@ -6,7 +6,7 @@ use std::{
 };
 
 use thiserror::Error;
-use zakura_quic::NodeId;
+use zakura_quic::{NodeId, NodeKeyList};
 use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
@@ -210,7 +210,7 @@ impl ZakuraActiveServiceEntry {
 /// proposes.
 #[derive(Clone, Debug)]
 pub(super) struct LocalRecordState {
-    node_id: NodeId,
+    keys: NodeKeyList,
     direct_addrs: Vec<SocketAddr>,
     services: Vec<ZakuraServiceId>,
     zakura_protocol_min: u16,
@@ -234,7 +234,7 @@ impl LocalRecordState {
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(0);
         Ok(Self {
-            node_id: config.secret_key.public(),
+            keys: config.secret_key.key_list().clone(),
             direct_addrs: normalize_direct_addrs(config.direct_addrs.clone()),
             services: advertised_services(config.services.clone())?,
             zakura_protocol_min: config.zakura_protocol_min,
@@ -258,7 +258,7 @@ impl LocalRecordState {
         let sequence = self.next_sequence.max(wall_clock_sequence);
         self.next_sequence = sequence.saturating_add(1);
         ZakuraNodeRecordBody {
-            node_id: self.node_id,
+            keys: self.keys.clone(),
             direct_addrs: self.direct_addrs.clone(),
             services: self.services.clone(),
             zakura_protocol_min: self.zakura_protocol_min,
@@ -283,7 +283,7 @@ impl DiscoveryState {
         Self {
             book: ZakuraDiscoveryBook::with_disclosure_key(
                 config.book_limits,
-                Some(local.node_id),
+                Some(local.keys.node_id()),
                 disclosure_key,
             ),
             active_services: HashMap::new(),
@@ -454,7 +454,7 @@ impl DiscoveryState {
             .max_excluded_node_ids
             .min(MAX_DISCOVERY_EXCLUDED_NODE_IDS);
         let mut excluded = Vec::with_capacity(max);
-        push_excluded_node_id(&mut excluded, self.local.node_id, max);
+        push_excluded_node_id(&mut excluded, self.local.keys.node_id(), max);
         for node_id in connected {
             push_excluded_node_id(&mut excluded, *node_id, max);
         }
@@ -478,7 +478,7 @@ impl DiscoveryState {
         &self,
         record: ZakuraNodeRecord,
     ) -> Result<VerifiedRecord, ZakuraNodeRecord> {
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         let record = match self.book.get(&node_id) {
             Some(entry) => match entry.verified_record().covering(record) {
                 Ok(verified) => return Ok(verified),
@@ -576,7 +576,7 @@ impl DiscoveryState {
             });
         }
 
-        let peer_node_id = record.body.node_id;
+        let peer_node_id = record.body.node_id();
         let services = normalize_services(record.body.services.clone());
         let context = self.validation_context(now);
         let import_result = self.book.import_verified_record(

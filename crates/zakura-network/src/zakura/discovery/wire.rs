@@ -10,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use zakura_quic::NodeId;
+use zakura_quic::{
+    NodeId, NodeKeyList, MAX_NODE_KEY_LIST_BYTES, MIN_NODE_KEY_LIST_BYTES, NODE_KEY_ENTRY_BYTES,
+};
 
 use super::protocol::{
     network_id_from_code, summary_tag_service, validate_known_summary_payload,
@@ -53,11 +55,15 @@ const SOCKET_ADDR_V6_BYTES: usize = 1 + 16 + 2 + 4 + 4;
 const SERVICE_ID_MIN_BYTES: usize = 2 + 1;
 const SERVICE_ID_MAX_BYTES: usize = 2 + MAX_ZAKURA_SERVICE_ID_BYTES;
 
-/// A record body's fixed fields: node id, empty address and service lists,
-/// protocol range, network id, chain id, sequence, and expiry.
-pub(crate) const RECORD_BODY_FIXED_BYTES: usize = NODE_ID_BYTES + 2 + 2 + 2 + 2 + 4 + 32 + 8 + 8;
-/// The smallest encoded record: its length, the fixed body, and the signature.
-pub(crate) const NODE_RECORD_MIN_BYTES: usize = 4 + RECORD_BODY_FIXED_BYTES + SIGNATURE_BYTES;
+/// A record body's fields after the author's key list: empty address and
+/// service lists, protocol range, network id, chain id, sequence, and expiry.
+const RECORD_BODY_FIELDS_BYTES: usize = 2 + 2 + 2 + 2 + 4 + 32 + 8 + 8;
+/// The smallest record body: a one-entry key list and the other fields, with
+/// no address, service or extension.
+pub(crate) const RECORD_BODY_MIN_BYTES: usize = MIN_NODE_KEY_LIST_BYTES + RECORD_BODY_FIELDS_BYTES;
+/// The smallest encoded record: its length, the smallest body, and the
+/// signature.
+pub(crate) const NODE_RECORD_MIN_BYTES: usize = 4 + RECORD_BODY_MIN_BYTES + SIGNATURE_BYTES;
 
 /// A `GetPeers` with no wanted services and no exclusions: the limit and both
 /// counts.
@@ -126,10 +132,11 @@ pub(crate) fn services_cap(wanted_len: usize) -> ResponseCap {
     }
 }
 
-// The body cap leaves no extension room in a record with the most and largest
-// addresses and services.
+// The body cap leaves no extension room in a record with the longest key list
+// and the most and largest addresses and services.
 const _: () = assert!(
-    RECORD_BODY_FIXED_BYTES
+    MAX_NODE_KEY_LIST_BYTES
+        + RECORD_BODY_FIELDS_BYTES
         + MAX_DIRECT_ADDRS_PER_RECORD * SOCKET_ADDR_V6_BYTES
         + MAX_SERVICES_PER_RECORD * SERVICE_ID_MAX_BYTES
         == MAX_NODE_RECORD_BODY_BYTES
@@ -251,11 +258,7 @@ impl WireMessage for DiscoveryMessage {
                     out,
                     write_record,
                 )?;
-                check_unique(
-                    records,
-                    |record| &record.body.node_id,
-                    "unique record node ids",
-                )
+                check_unique_authors(records)
             }
             Self::GetServices(query) => {
                 write_wanted(&query.wanted_services, MAX_GET_SERVICES_WANTED, out)
@@ -317,11 +320,7 @@ impl WireMessage for DiscoveryMessage {
                     "record count",
                     read_record,
                 )?;
-                check_unique(
-                    &records,
-                    |record| &record.body.node_id,
-                    "unique record node ids",
-                )?;
+                check_unique_authors(&records)?;
                 Self::Peers { records }
             }
             MSG_DISCOVERY_GET_SERVICES => Self::GetServices(GetServices {
@@ -411,6 +410,17 @@ fn check_unique<T, K: PartialEq>(
         }
     }
     Ok(())
+}
+
+/// Reject a list in which two records have the same author. A node id is the
+/// hash of its key list, so two authors are the same exactly when their key
+/// lists are equal.
+fn check_unique_authors(records: &[ZakuraNodeRecord]) -> Result<(), WireError> {
+    check_unique(
+        records,
+        |record| &record.body.keys,
+        "unique record node ids",
+    )
 }
 
 // Every list bound fits the `u16` count. Widening u16 to usize is lossless.
@@ -506,8 +516,23 @@ fn read_list<'a, T>(
     Ok(items)
 }
 
+/// Reads a record author's key list: a count byte, then that many entries.
+///
+/// Only a malformed list fails here. A list with no key this release can
+/// check still decodes, so its record is dropped later without blaming the
+/// peer that relayed it.
+fn read_key_list(reader: &mut BoundedReader<'_>) -> Result<NodeKeyList, WireError> {
+    const ITEM: &str = "record key list";
+    let [count] = reader.array::<1>(ITEM)?;
+    let entries = reader.bytes(usize::from(count) * NODE_KEY_ENTRY_BYTES, ITEM)?;
+    let mut bytes = Vec::with_capacity(1 + entries.len());
+    bytes.push(count);
+    bytes.extend_from_slice(entries);
+    NodeKeyList::decode(&bytes).map_err(|_| WireError::OutOfRange(ITEM))
+}
+
 fn read_node_id(reader: &mut BoundedReader<'_>, item: &'static str) -> Result<NodeId, WireError> {
-    NodeId::from_bytes(&reader.array(item)?).map_err(|_| WireError::OutOfRange(item))
+    Ok(NodeId::from_bytes(&reader.array(item)?))
 }
 
 /// Write a request's wanted list, whose service ids are unique.
@@ -578,7 +603,7 @@ fn write_record(record: &ZakuraNodeRecord, out: &mut Vec<u8>) -> Result<(), Wire
 /// Write a record body's canonical bytes, which its signature covers. The
 /// caller has checked the body with `validate_record_body_bounds`.
 pub(super) fn write_record_body(body: &ZakuraNodeRecordBody, out: &mut Vec<u8>) {
-    out.extend_from_slice(body.node_id.as_bytes());
+    out.extend_from_slice(&body.keys.encode());
     write_count(body.direct_addrs.len(), out);
     for addr in &body.direct_addrs {
         write_socket_addr(addr, out);
@@ -612,14 +637,19 @@ pub(super) fn record_len(record: &ZakuraNodeRecord) -> usize {
         .iter()
         .map(|service| 2 + service.as_str().len())
         .sum();
-    4 + RECORD_BODY_FIXED_BYTES + addrs + services + body.extensions.len() + SIGNATURE_BYTES
+    4 + body.keys.encoded_len()
+        + RECORD_BODY_FIELDS_BYTES
+        + addrs
+        + services
+        + body.extensions.len()
+        + SIGNATURE_BYTES
 }
 
 fn read_record(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecord, WireError> {
     let body_len = read_u32(reader, "record body length")?;
     let body_len = usize::try_from(body_len)
         .ok()
-        .filter(|&len| (RECORD_BODY_FIXED_BYTES..=MAX_NODE_RECORD_BODY_BYTES).contains(&len))
+        .filter(|&len| (RECORD_BODY_MIN_BYTES..=MAX_NODE_RECORD_BODY_BYTES).contains(&len))
         .ok_or(WireError::OutOfRange("record body length"))?;
     let mut body = BoundedReader::new(reader.bytes(body_len, "record body")?);
     let body = read_record_body(&mut body)?;
@@ -629,7 +659,7 @@ fn read_record(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecord, WireE
 
 /// Read a whole record body: the fixed fields, then the extension area.
 fn read_record_body(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecordBody, WireError> {
-    let node_id = read_node_id(reader, "record node id")?;
+    let keys = read_key_list(reader)?;
     let direct_addrs = read_list(
         reader,
         MAX_DIRECT_ADDRS_PER_RECORD,
@@ -657,7 +687,7 @@ fn read_record_body(reader: &mut BoundedReader<'_>) -> Result<ZakuraNodeRecordBo
     // Every byte after the fixed fields is the signed extension area.
     let extensions = reader.take_remaining().to_vec();
     Ok(ZakuraNodeRecordBody {
-        node_id,
+        keys,
         direct_addrs,
         services,
         zakura_protocol_min,

@@ -20,7 +20,7 @@ use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer, UnixTime};
 
 use crate::{
     inputs::EndpointInputs,
-    key::{NodeId, NodeSecretKey, KEY_LENGTH},
+    key::{NodeKey, NodeSecretKey, KEY_LENGTH},
 };
 
 pub(crate) mod resolver;
@@ -29,7 +29,7 @@ pub(crate) mod verifier;
 /// The server name passed to quinn-proto for every dial.
 ///
 /// SNI is off (TLS-6), so this name never leaves the process. The verifier
-/// checks the dialed node ID instead.
+/// checks the dialed node's key instead.
 pub(crate) const UNSENT_SERVER_NAME: &str = "zakura.invalid";
 
 /// The runtime's UTC clock, `zakura_rt::time::utc_now`, for the Retry token
@@ -119,7 +119,7 @@ impl TlsConfig {
         let tls = Self::with_provider(secret_key, provider);
         #[cfg(any(test, zakura_sim))]
         inputs.provider_built(&tls.provider);
-        tls.client_config(secret_key.public(), &[b"zakura-quic/check"])?;
+        tls.client_config(Some(secret_key.public_key()), &[b"zakura-quic/check"])?;
         Ok(tls)
     }
 
@@ -159,11 +159,12 @@ impl TlsConfig {
         Ok(crypto)
     }
 
-    /// Builds a client config that accepts only `expected` as the server
-    /// (TLS-7) and offers `alpns` in preference order.
+    /// Builds a client config that accepts only a server that proves the key
+    /// `expected` (TLS-7), or any valid key when there is none, and offers
+    /// `alpns` in preference order.
     pub(crate) fn client_config(
         &self,
-        expected: NodeId,
+        expected: Option<NodeKey>,
         alpns: &[&[u8]],
     ) -> Result<QuicClientConfig, TlsConfigError> {
         Ok(QuicClientConfig::try_from(
@@ -173,7 +174,7 @@ impl TlsConfig {
 
     fn rustls_client(
         &self,
-        expected: NodeId,
+        expected: Option<NodeKey>,
         alpns: &[&[u8]],
     ) -> Result<rustls::ClientConfig, TlsConfigError> {
         let mut crypto =
@@ -193,28 +194,28 @@ impl TlsConfig {
 }
 
 /// The DER SubjectPublicKeyInfo for an Ed25519 key, as Iroh encodes it (TLS-3).
-pub(crate) fn ed25519_spki(key: &NodeId) -> SubjectPublicKeyInfoDer<'static> {
+pub(crate) fn ed25519_spki(key: &NodeKey) -> SubjectPublicKeyInfoDer<'static> {
     rustls::sign::public_key_to_spki(&alg_id::ED25519, key.as_bytes())
 }
 
-/// Extracts the node ID from an Ed25519 SubjectPublicKeyInfo.
+/// Extracts the key from an Ed25519 SubjectPublicKeyInfo.
 ///
 /// Returns `None` unless `spki` is exactly the constant Ed25519 prefix
 /// followed by a valid 32-byte key.
-pub(crate) fn node_id_from_spki(spki: &[u8]) -> Option<NodeId> {
-    let key = spki.get(spki.len().checked_sub(KEY_LENGTH)?..)?;
-    let id = NodeId::try_from(key).ok()?;
-    (ed25519_spki(&id).as_ref() == spki).then_some(id)
+pub(crate) fn node_key_from_spki(spki: &[u8]) -> Option<NodeKey> {
+    let bytes = spki.get(spki.len().checked_sub(KEY_LENGTH)?..)?;
+    let key = NodeKey::try_from(bytes).ok()?;
+    (ed25519_spki(&key).as_ref() == spki).then_some(key)
 }
 
-/// Returns the TLS-proven node ID of a connection's peer (TLS-8).
-pub(crate) fn remote_node_id(session: &dyn quinn_proto::crypto::Session) -> Option<NodeId> {
+/// Returns the key a connection's peer proved in the TLS handshake (TLS-8).
+pub(crate) fn remote_node_key(session: &dyn quinn_proto::crypto::Session) -> Option<NodeKey> {
     let certs = session
         .peer_identity()?
         .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
         .ok()?;
     match certs.as_slice() {
-        [cert] => node_id_from_spki(cert.as_ref()),
+        [cert] => node_key_from_spki(cert.as_ref()),
         _ => None,
     }
 }
@@ -253,24 +254,24 @@ mod tests {
 
     #[test]
     fn spki_matches_iroh_encoding() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let spki = ed25519_spki(&id);
+        let key = NodeSecretKey::from_bytes(&[7; 32]).public_key();
+        let spki = ed25519_spki(&key);
         // 30 2a 30 05 06 03 2b 65 70 03 21 00 || key (TLS-3).
         assert_eq!(
             &spki.as_ref()[..12],
             &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]
         );
-        assert_eq!(&spki.as_ref()[12..], id.as_bytes());
-        assert_eq!(node_id_from_spki(spki.as_ref()), Some(id));
+        assert_eq!(&spki.as_ref()[12..], key.as_bytes());
+        assert_eq!(node_key_from_spki(spki.as_ref()), Some(key));
     }
 
     #[test]
     fn spki_with_another_prefix_is_refused() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let mut spki = ed25519_spki(&id).as_ref().to_vec();
+        let key = NodeSecretKey::from_bytes(&[7; 32]).public_key();
+        let mut spki = ed25519_spki(&key).as_ref().to_vec();
         spki[8] = 0x71; // Ed448's OID byte.
-        assert_eq!(node_id_from_spki(&spki), None);
-        assert_eq!(node_id_from_spki(id.as_bytes()), None);
+        assert_eq!(node_key_from_spki(&spki), None);
+        assert_eq!(node_key_from_spki(key.as_bytes()), None);
     }
 
     /// A random source that always fills with 7s.
@@ -373,7 +374,7 @@ mod tests {
         // Writing a ClientHello starts the key share.
         let starts = TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed);
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
+            .rustls_client(Some(NodeSecretKey::generate().public_key()), &[b"a"])
             .unwrap();
         let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
         rustls::ClientConnection::new(Arc::new(client), name).unwrap();
@@ -413,7 +414,7 @@ mod tests {
         let tls = TlsConfig::new(&NodeSecretKey::generate());
         let server = tls.rustls_server(vec![b"a".to_vec()]).unwrap();
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
+            .rustls_client(Some(NodeSecretKey::generate().public_key()), &[b"a"])
             .unwrap();
         assert_eq!(format!("{:?}", server.time_provider), "RuntimeUtc");
         assert_eq!(format!("{:?}", client.time_provider), "RuntimeUtc");
@@ -441,8 +442,8 @@ mod tests {
         assert_eq!(server.send_tls13_tickets, 0);
         assert_eq!(server.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);
 
-        let peer = NodeSecretKey::generate().public();
-        let client = tls.rustls_client(peer, &[b"b", b"a"]).unwrap();
+        let peer = NodeSecretKey::generate().public_key();
+        let client = tls.rustls_client(Some(peer), &[b"b", b"a"]).unwrap();
         assert!(!client.enable_sni);
         assert!(!client.enable_early_data);
         assert_eq!(client.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);

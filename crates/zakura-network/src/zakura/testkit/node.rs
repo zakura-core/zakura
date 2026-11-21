@@ -8,7 +8,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use zakura_jsonl_trace::JsonlTracer;
-use zakura_quic::{NodeAddr, NodeId, QuicConfig};
+use zakura_quic::{
+    NodeAddr, NodeId, NodeKeyList, NodeSecretKey, QuicConfig, ED25519_KEY_TAG, KEY_LENGTH,
+};
 
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
@@ -224,6 +226,7 @@ async fn wait_for_peer_registration(
 /// Builder for [`ZakuraTestNode`].
 pub struct ZakuraTestNodeBuilder {
     seed: u64,
+    extra_key: Option<(u16, [u8; KEY_LENGTH])>,
     limits: ZakuraLocalLimits,
     max_connections_per_ip: usize,
     quic_config: Option<QuicConfig>,
@@ -292,6 +295,7 @@ impl ZakuraTestNodeBuilder {
         let config = Config::default();
         Self {
             seed,
+            extra_key: None,
             limits,
             max_connections_per_ip: config.zakura.max_connections_per_ip(),
             quic_config: None,
@@ -315,6 +319,26 @@ impl ZakuraTestNodeBuilder {
             #[cfg(test)]
             transport_observer: None,
         }
+    }
+
+    /// Add an entry with `tag`, above the Ed25519 tag, to this node's key
+    /// list after its Ed25519 key. The node's ID then covers both entries.
+    pub fn extra_key(mut self, tag: u16, value: [u8; KEY_LENGTH]) -> Self {
+        self.extra_key = Some((tag, value));
+        self
+    }
+
+    /// The secret key of the node this builder spawns, with its key list.
+    fn secret_key(&self) -> Result<NodeSecretKey, BoxError> {
+        let secret_key = LocalEndpointFactory::secret_key(self.seed);
+        let Some(extra_key) = self.extra_key else {
+            return Ok(secret_key);
+        };
+        let keys = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *secret_key.public_key().as_bytes()),
+            extra_key,
+        ])?;
+        Ok(secret_key.with_key_list(keys)?)
     }
 
     /// Advertise these direct addresses in this node's discovery self-record.
@@ -488,7 +512,8 @@ impl ZakuraTestNodeBuilder {
         if let Some(quic) = self.quic_config.clone() {
             factory = factory.quic_config(quic);
         }
-        let endpoint = factory.endpoint(self.seed).await?;
+        let secret_key = self.secret_key()?;
+        let endpoint = factory.endpoint_with_key(secret_key.clone()).await?;
         let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip)
             .with_tx_relay_sessions(
                 self.custom_services
@@ -506,7 +531,7 @@ impl ZakuraTestNodeBuilder {
         let mut advertised_services = crate::zakura::discovery::default_advertised_services();
         advertised_services.extend(self.extra_advertised_services.clone());
         let discovery = build_discovery_handle(
-            LocalEndpointFactory::secret_key(self.seed),
+            secret_key,
             None,
             self.discovery_direct_addrs.clone(),
             advertised_services,
@@ -673,7 +698,6 @@ impl ZakuraTestNodeBuilder {
         if let Some(observer) = self.transport_observer {
             handler = handler.with_transport_observer(observer);
         }
-        let handler = handler.with_local_node_id(endpoint.local_id());
         endpoint.serve(handler.clone())?;
         let quic = endpoint;
         let endpoint = if let (Some(header_handle), Some(block_handle), Some((shutdown, actions))) =
@@ -978,5 +1002,201 @@ mod tests {
             node.shutdown().await;
         }
         peer.shutdown().await;
+    }
+
+    /// Starts a dial from `node` to `peer_addr` and returns the task with the
+    /// two channels the dial reports on.
+    fn reported_dial(
+        node: &ZakuraTestNode,
+        peer_addr: NodeAddr,
+    ) -> (
+        JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
+        tokio::sync::oneshot::Receiver<SocketAddr>,
+        tokio::sync::oneshot::Receiver<crate::zakura::handler::DialRegistration>,
+    ) {
+        use crate::zakura::handler::{
+            serve_reported_native_dial_connection, DialReport, NativeDialKind,
+        };
+
+        let (admitted_addr_tx, admitted_addr_rx) = tokio::sync::oneshot::channel();
+        let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
+        let report = DialReport {
+            admitted_addr: admitted_addr_tx,
+            registration: registration_tx,
+        };
+        let endpoint = node.endpoint();
+        let limits = node.limits().clone();
+        let dial = tokio::spawn(async move {
+            serve_reported_native_dial_connection(
+                &endpoint,
+                peer_addr,
+                &limits,
+                Some(report),
+                NativeDialKind::Maintained,
+            )
+            .await
+        });
+        (dial, admitted_addr_rx, registration_rx)
+    }
+
+    /// A dial that names a node only by its ID cannot refuse another node in
+    /// TLS. When another node answers at the first address, the dial moves on
+    /// to the next one, and reports only the address of the node it dialed.
+    #[tokio::test]
+    async fn an_id_only_dial_passes_over_an_address_another_node_answers_at() {
+        use crate::zakura::handler::DialRegistration;
+
+        let peer = ZakuraTestNode::builder(9211).spawn().await.expect("peer");
+        let other = ZakuraTestNode::builder(9213).spawn().await.expect("other");
+        let node = ZakuraTestNode::builder(9215).spawn().await.expect("dialer");
+        let peer_loopback = ipv4_loopback_addr(&peer.node_addr().await);
+        let other_loopback = ipv4_loopback_addr(&other.node_addr().await);
+        let peer_id = peer_loopback.id.as_bytes().to_vec();
+        let other_first = NodeAddr::with_addrs(
+            peer_loopback.id,
+            other_loopback
+                .direct
+                .iter()
+                .chain(&peer_loopback.direct)
+                .copied(),
+        );
+        assert_eq!(other_first.key, None, "the dial names the node by ID alone");
+
+        let mut peer_set_rx = node.supervisor().subscribe();
+        let (dial, admitted_addr_rx, registration_rx) = reported_dial(&node, other_first);
+        tokio::time::timeout(
+            TEST_NET_TIMEOUT,
+            wait_for_peer_registration(&mut peer_set_rx, peer_id.as_slice()),
+        )
+        .await
+        .expect("the dialed node registers before the timeout")
+        .expect("peer-set watcher stays open");
+        let admitted_addr = tokio::time::timeout(TEST_NET_TIMEOUT, admitted_addr_rx)
+            .await
+            .expect("the dial reports its address before the timeout")
+            .expect("the dial reports the address it reached the node at");
+        assert!(
+            peer_loopback.direct.contains(&admitted_addr),
+            "the dial reported {admitted_addr}, where another node answered",
+        );
+        assert_eq!(
+            tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)
+                .await
+                .expect("the dial reports its registration before the timeout")
+                .ok(),
+            Some(DialRegistration::Registered),
+        );
+        let registered = node.supervisor().registered_ids().await;
+        assert_eq!(
+            registered
+                .iter()
+                .map(|peer| peer.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![peer_id],
+            "the node that answered first is not the dialed node and never registers",
+        );
+
+        dial.abort();
+        node.shutdown().await;
+        other.shutdown().await;
+        peer.shutdown().await;
+    }
+
+    /// A dial to a node ID ends with an identity failure when every address
+    /// is answered by another node, and reports no address for the node.
+    #[tokio::test]
+    async fn an_id_only_dial_fails_when_only_another_node_answers() {
+        let other = ZakuraTestNode::builder(9217).spawn().await.expect("other");
+        let node = ZakuraTestNode::builder(9219).spawn().await.expect("dialer");
+        let absent_id = LocalEndpointFactory::secret_key(9221).public();
+        let other_loopback = ipv4_loopback_addr(&other.node_addr().await);
+        let wrong_node = NodeAddr::with_addrs(absent_id, other_loopback.direct.iter().copied());
+
+        let (dial, admitted_addr_rx, registration_rx) = reported_dial(&node, wrong_node);
+        let result = tokio::time::timeout(TEST_NET_TIMEOUT, dial)
+            .await
+            .expect("the dial ends before the timeout")
+            .expect("the dial task does not panic");
+        assert!(
+            matches!(
+                result,
+                Err(crate::zakura::ZakuraHandlerError::Validation(
+                    crate::zakura::ZakuraValidationError::IdentityMismatch
+                ))
+            ),
+            "{result:?}",
+        );
+        assert!(
+            admitted_addr_rx.await.is_err(),
+            "another node's address is never reported as the dialed node's",
+        );
+        assert!(registration_rx.await.is_err());
+        assert!(node.supervisor().registered_ids().await.is_empty());
+
+        node.shutdown().await;
+        other.shutdown().await;
+    }
+
+    /// A node whose key list holds an entry this release cannot read still
+    /// connects, in both directions, and every node knows it by the ID of its
+    /// whole list.
+    #[tokio::test]
+    async fn a_node_with_an_unreadable_key_entry_connects_under_its_whole_list_id() {
+        const UNREADABLE_KEY_TAG: u16 = 0x7f00;
+
+        let extended = ZakuraTestNode::builder(9223)
+            .extra_key(UNREADABLE_KEY_TAG, [0xab; KEY_LENGTH])
+            .spawn()
+            .await
+            .expect("a node with a two-entry key list spawns");
+        let dialer = ZakuraTestNode::builder(9225).spawn().await.expect("dialer");
+        let dialed = ZakuraTestNode::builder(9227).spawn().await.expect("dialed");
+
+        let secret_key = LocalEndpointFactory::secret_key(9223);
+        let extended_id = extended.node_addr().await.id;
+        assert_ne!(
+            extended_id,
+            secret_key.public(),
+            "the extra entry changes the node's ID"
+        );
+        assert_eq!(
+            extended.node_addr().await.key,
+            Some(secret_key.public_key()),
+            "the node still proves its Ed25519 key"
+        );
+
+        // A plain node dials it by key, and by ID alone.
+        dialer
+            .connect_native(&extended, TEST_NET_TIMEOUT)
+            .await
+            .expect("a plain node connects to the node and registers its whole-list ID");
+        let by_id = ZakuraTestNode::builder(9229).spawn().await.expect("dialer");
+        let extended_loopback = ipv4_loopback_addr(&extended.node_addr().await);
+        by_id
+            .connect_native_to_addr(
+                NodeAddr::with_addrs(extended_id, extended_loopback.direct.iter().copied()),
+                TEST_NET_TIMEOUT,
+            )
+            .await
+            .expect("a plain node connects to the node by its ID alone");
+
+        // It dials a plain node, which learns the same ID from its hello.
+        let mut dialed_peer_set = dialed.supervisor().subscribe();
+        extended
+            .connect_native(&dialed, TEST_NET_TIMEOUT)
+            .await
+            .expect("the node connects to a plain node");
+        tokio::time::timeout(
+            TEST_NET_TIMEOUT,
+            wait_for_peer_registration(&mut dialed_peer_set, extended_id.as_bytes()),
+        )
+        .await
+        .expect("the plain node registers the dialing node before the timeout")
+        .expect("peer-set watcher stays open");
+
+        by_id.shutdown().await;
+        dialed.shutdown().await;
+        dialer.shutdown().await;
+        extended.shutdown().await;
     }
 }

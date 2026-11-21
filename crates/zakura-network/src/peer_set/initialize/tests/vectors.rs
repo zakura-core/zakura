@@ -1118,7 +1118,7 @@ async fn pinned_unconditional_peer_name_is_exempt_only_while_its_node_id_is_prov
 
     let (node_id, peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+        "p2p_stack = 'dual'\nunconditional_peers = ['id:{node_id}@peer.example.com:18233']"
     ))
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
@@ -1178,7 +1178,7 @@ async fn pinned_unconditional_peer_name_is_not_held_by_another_peer_at_its_addre
 
     let (node_id, _peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+        "p2p_stack = 'dual'\nunconditional_peers = ['id:{node_id}@peer.example.com:18233']"
     ))
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
@@ -1213,7 +1213,7 @@ async fn pinned_unconditional_peer_is_followed_to_the_address_that_proves_it() {
 
     let (node_id, peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+        "p2p_stack = 'dual'\nunconditional_peers = ['id:{node_id}@peer.example.com:18233']"
     ))
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
@@ -1250,7 +1250,7 @@ async fn pinned_unconditional_peer_exempts_the_address_of_the_connection_that_pr
 
     let (node_id, peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+        "p2p_stack = 'dual'\nunconditional_peers = ['id:{node_id}@peer.example.com:18233']"
     ))
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
@@ -1292,7 +1292,7 @@ async fn pinned_unconditional_peer_name_closes_legacy_connections() {
 
     let (node_id, _peer_id) = test_node_id();
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+        "p2p_stack = 'dual'\nunconditional_peers = ['id:{node_id}@peer.example.com:18233']"
     ))
     .unwrap();
     let mut dialer = spawn_unconditional_peer_dialer(

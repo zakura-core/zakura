@@ -26,7 +26,7 @@ pub(super) use zn::constants::BLOCK_GOSSIP_TIMEOUT;
 const BLOCK_SIZE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A spawned committed mined-block broadcast finished.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MinedBlockBroadcastCompleted {
     block: zn::AdvertisedBlock,
     succeeded: bool,
@@ -115,11 +115,14 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending, admission }) = early else {
+                let Some(event) = early else {
                     mined_block_receiver = None;
                     continue;
                 };
-                (hash, height, true, Some((pending, submitted_at, submission, admission)), Some(size))
+                {
+                    let size = event.size;
+                    (event.hash, event.height, true, Some(event), Some(size))
+                }
             }
             committed = announcements.recv(close_to_tip) => {
                 let committed = committed.ok_or(AnnouncementsClosed)?;
@@ -163,39 +166,28 @@ where
             mined_block_completion_sender.clone()
         });
         tokio::spawn(async move {
-            let block = match size {
+            let mut block = match size {
                 Some(size) => zn::AdvertisedBlock::new(hash, size),
                 None => zn::AdvertisedBlock {
                     size: committed_block_size(read_state, hash).await,
                     ..hash.into()
                 },
             };
+            if let Some(event) = &early {
+                block.pending_send = Some(event.pending.send_permit());
+            }
             // block broadcasts inform other nodes about new blocks,
             // so our internal Grow or Reset state doesn't matter to them
-            let request = if is_block_submission {
-                zn::Request::AdvertiseMinedBlock(block)
+            let trusted_early = early.as_ref().is_some_and(|event| {
+                matches!(event.relay, zakura_rpc::EarlyBlockRelay::TrustedSubmission)
+            });
+            let request = if is_block_submission && !trusted_early {
+                zn::Request::AdvertiseMinedBlock(block.clone())
             } else {
-                zn::Request::AdvertiseBlock(block, None)
+                zn::Request::AdvertiseBlock(block.clone(), None)
             };
             let succeeded = match early {
-                Some((mut pending, submitted_at, submission, admission)) => {
-                    if !pending.is_valid() {
-                        false
-                    } else {
-                        let succeeded = tokio::select! {
-                            biased;
-                            _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast_early_with_timeout(network, request, admission) => succeeded,
-                        };
-                        if succeeded {
-                            metrics::counter!("mining.optimistic_inventory.early_inventories")
-                                .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
-                                .record(submitted_at.elapsed().as_secs_f64());
-                        }
-                        succeeded
-                    }
-                }
+                Some(event) => broadcast_submission(network, request, event).await,
                 None => broadcast_with_timeout(network, request).await,
             };
 
@@ -203,6 +195,48 @@ where
                 let _ = completion_tx.send(MinedBlockBroadcastCompleted { block, succeeded });
             }
         });
+    }
+}
+
+/// Routes an early submission through its explicit cancellation policy, retaining shared metrics.
+async fn broadcast_submission<ZN>(network: ZN, request: zn::Request, event: EarlyMinedBlock) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    if !event.pending.is_valid() {
+        return false;
+    }
+    let succeeded = match event.relay {
+        zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => {
+            broadcast_state_authorized(network, request, admission, event.pending).await
+        }
+        zakura_rpc::EarlyBlockRelay::TrustedSubmission => {
+            broadcast_trusted_with_timeout(network, request, event.pending).await
+        }
+    };
+    if succeeded {
+        metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
+        metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => event.submission.rpc_method())
+            .record(event.submitted_at.elapsed().as_secs_f64());
+    }
+    succeeded
+}
+
+/// Failure cancels even a dispatched state-authorized broadcast; commitment only cancels
+/// readiness inside `broadcast_early_with_timeout` and lets active uploads finish.
+async fn broadcast_state_authorized<ZN>(
+    network: ZN,
+    request: zn::Request,
+    admission: zs::BlockAdmission,
+    mut pending: zakura_rpc::PendingBlockSignal,
+) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    tokio::select! {
+        biased;
+        _ = pending.wait_for_failure() => false,
+        succeeded = broadcast_early_with_timeout(network, request, admission) => succeeded,
     }
 }
 
@@ -238,6 +272,51 @@ where
     tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, network.oneshot(request))
         .await
         .is_ok_and(|result| result.is_ok())
+}
+
+/// Commitment suppresses an undispatched trusted announcement, but preserves active uploads
+/// so the committed broadcast can join their per-connection claims without another inventory.
+/// Failure still cancels dispatched work; cancellation does not record completion metrics.
+async fn broadcast_trusted_with_timeout<ZN>(
+    mut network: ZN,
+    request: zn::Request,
+    mut pending: zakura_rpc::PendingBlockSignal,
+) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, async {
+        let ready = tokio::select! {
+            biased;
+            _ = pending.wait_for_resolution() => return false,
+            ready = network.ready() => ready,
+        };
+        let Ok(ready) = ready else {
+            return false;
+        };
+        if !pending.is_pending() {
+            return false;
+        }
+        let dispatched_at = std::time::Instant::now();
+        let dispatch_signal = pending.clone();
+        let succeeded = tokio::select! {
+            biased;
+            _ = pending.wait_for_failure() => return false,
+            result = async {
+                dispatch_signal.mark_dispatched();
+                metrics::counter!("rpc.trusted_submission.relay_dispatched").increment(1);
+                ready.call(request).await
+            } => result.is_ok(),
+        };
+        metrics::histogram!("rpc.trusted_submission.relay.duration_seconds")
+            .record(dispatched_at.elapsed().as_secs_f64());
+        if !succeeded {
+            metrics::counter!("rpc.trusted_submission.relay_failed").increment(1);
+        }
+        succeeded
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Dispatches early inventory only while the submission has not committed.
@@ -283,7 +362,7 @@ fn finish_mined_block_broadcast<ZN>(
     ZN::Future: Send,
 {
     let hash = completed.block.hash;
-    let needs_fallback = mined_block_broadcasts.finish(completed);
+    let needs_fallback = mined_block_broadcasts.finish(&completed);
 
     if completed.succeeded {
         return;
@@ -328,7 +407,7 @@ impl MinedBlockBroadcasts {
     ///
     /// Returns `true` if the hash now needs the committed-tip fallback: this broadcast failed, no
     /// other broadcast of the hash is in flight, and none has succeeded.
-    fn finish(&mut self, completed: MinedBlockBroadcastCompleted) -> bool {
+    fn finish(&mut self, completed: &MinedBlockBroadcastCompleted) -> bool {
         let MinedBlockBroadcastCompleted { block, succeeded } = completed;
         let hash = block.hash;
 
@@ -339,7 +418,7 @@ impl MinedBlockBroadcasts {
             }
         }
 
-        if succeeded {
+        if *succeeded {
             self.delivered = Some(hash);
             return false;
         }
@@ -367,12 +446,12 @@ mod tests {
         assert!(broadcasts.is_in_flight(&hash));
 
         assert!(
-            !broadcasts.finish(failed),
+            !broadcasts.finish(&failed),
             "another broadcast of the hash can still succeed",
         );
         assert!(broadcasts.is_in_flight(&hash));
 
-        assert!(broadcasts.finish(failed));
+        assert!(broadcasts.finish(&failed));
         assert!(!broadcasts.is_in_flight(&hash));
     }
 
@@ -384,14 +463,18 @@ mod tests {
         broadcasts.start(hash);
         broadcasts.start(hash);
 
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
+        assert!(!broadcasts.finish(&MinedBlockBroadcastCompleted {
             block: hash.into(),
             succeeded: true,
         }));
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
+        assert!(!broadcasts.finish(&MinedBlockBroadcastCompleted {
             block: hash.into(),
             succeeded: false,
         }));
         assert!(!broadcasts.is_in_flight(&hash));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/trusted_relay.rs"]
+mod trusted_relay;

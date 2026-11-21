@@ -1034,6 +1034,40 @@ class FleetBurstTests(WatchdogFixture, unittest.TestCase):
         self.run_snapshot(self.arriving(180), now=self.NOW + 120)
         self.assertEqual(len(self.posted), 1)
 
+    def test_compat_sidecar_alert_resumes_after_deploy_cleanup_or_expiry(self):
+        down = self.row("zcashd-compat", None, None, "rpc_error", "")
+        recovered = self.row("zcashd-compat", self.HEIGHT, 0, "healthy")
+        expires_at = self.NOW + 1200
+        for outcome in ("recovered", "still down", "runner lost"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                self.state = {}
+                self.posted.clear()
+                marker = Path(directory) / "deploy-suppressed-until"
+                marker.write_text(f"{int(expires_at)}\n")
+                self.args.suppression_file = marker
+                self.run_snapshot([down])
+
+                # The deployment restarts the watchdog while the sidecar is down.
+                self.instance = watchdog.Watchdog([self.fleet], self.args)
+                self.run_snapshot([down], now=self.NOW + 600)
+                self.assertEqual(self.posted, [])
+
+                if outcome == "runner lost":
+                    self.run_snapshot([down], now=expires_at)
+                elif outcome == "still down":
+                    marker.unlink()
+                    self.run_snapshot([down], now=self.NOW + 660)
+                else:
+                    self.run_snapshot([recovered], now=self.NOW + 660)
+                    marker.unlink()
+                    self.run_snapshot([recovered], now=self.NOW + 720)
+
+                if outcome == "recovered":
+                    self.assertEqual(self.posted, [])
+                else:
+                    self.assertEqual(len(self.posted), 1)
+                    self.assertIn("`zcashd-compat` down", self.posted[0])
+
     def test_loopback_webhook_receives_one_payload_for_each_eleven_node_transition(self):
         payloads = []
 

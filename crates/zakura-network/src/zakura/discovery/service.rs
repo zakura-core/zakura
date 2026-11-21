@@ -32,7 +32,7 @@ use super::protocol::{
     DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
-use super::requester::{reservation_pool, ClaimedAnswer, Queries, SettlingHold};
+use super::requester::{reservation_pool, ClaimedAnswer, Queries, SettlingHold, Unclaimed};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity, OUTPUT_BYTES};
 use super::state::DiscoverySessionKey;
 use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, ViolationStage};
@@ -798,13 +798,18 @@ async fn read_frame(
     let answer = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
-        .map_err(|error| {
-            (
+        .map(|answer| answer.map(|claimed| TracedAnswer::claimed(claimed, sink)));
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(Unclaimed::Refused(error)) => {
+            return Err((
                 ViolationStage::Claim,
                 SinkReject::protocol(error.close_row(), error),
-            )
-        })?
-        .map(|claimed| TracedAnswer::claimed(claimed, sink));
+            ))
+        }
+        // The session ended, so the reader drops the answer unjudged.
+        Err(Unclaimed::Retired) => return Ok(()),
+    };
     if let Flow::Reject(reject) = pipe.run_one(frame) {
         return Err((ViolationStage::Decode, reject));
     }

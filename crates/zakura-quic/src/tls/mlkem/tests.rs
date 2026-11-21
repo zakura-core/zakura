@@ -80,7 +80,7 @@ impl Script {
 
 impl SecureRandom for Script {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        let mut draws = self.0.lock().unwrap();
+        let mut draws = self.0.lock().map_err(|_| GetRandomFailed)?;
         match draws.front() {
             Some(draw) if draw.len() == buf.len() => {
                 buf.copy_from_slice(draw);

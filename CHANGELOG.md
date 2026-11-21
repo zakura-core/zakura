@@ -11,6 +11,64 @@ independently.
 
 ## [Unreleased]
 
+## [1.9.0-rc1] - 2026-11-21
+
+### Changed
+
+- Finalized transaction bodies now move from RocksDB into append-only static files in the state directory, on a background thread, in batches of at least 50 blocks. Existing databases migrate in place under state format v32, a major version that reuses the v31 cache, so older releases can't open the upgraded cache
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A pruned node that started as an archive no longer serves transaction bodies below its pruning marker after upgrading. Online pruning used to leave that older history in place, but after the first static file move it reads as pruned
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Stop and restart read-only RPC secondaries around `zakurad rollback-state`, because rollback deletes and shortens transaction static files in place
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Upgrade read-only RPC secondaries together with their primary. A v31 secondary can't follow a primary that has migrated to v32, because the migration renames the cache directory and moves bodies out of the tables the old secondary reads
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Back up the `static_files` directory along with RocksDB. A RocksDB checkpoint alone no longer holds finalized transaction bodies. Copy the whole state directory with zakurad stopped, or take a filesystem snapshot, and don't hard link static files into a restore, because rollback shortens them in place
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Leave free disk space for the upgrade. An archive node holds new static files next to the old RocksDB files until they are freed, about 11 GB above its starting size at the peak on mainnet. If a static file write fails, for example on a full disk, moves stop until zakurad restarts, so free space and restart it
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- The overview dashboard's Database Size panel now includes static files, and the RocksDB dashboard charts them next to RocksDB
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- With `[mempool] implementation = "core"`, a new block no longer scans the
+  whole pool for conflicting and expired transactions. The pool core finds
+  them through indexes of what each pooled transaction spends and when it
+  expires, as the classic pool does, so a block's cost follows the block's
+  size and what leaves, not the pool's size
+  ([#2636](https://github.com/zakura-core/zakura/pull/2636)).
+- With the experimental `[network.zakura.tx_relay]` enabled, the counter of
+  announced ids received is now `zakura.p2p.tx_relay.have_ids`, replacing
+  `zakura.p2p.tx_relay.inv_ids`, since tx-relay's announcement message is now
+  called `Have`. Dashboards that read the old name need updating. The wire
+  format is unchanged
+  ([#2665](https://github.com/zakura-core/zakura/pull/2665)).
+
+### Fixed
+
+- With the experimental `[network.zakura.tx_relay]` enabled, a new connection
+  accepts at most its peer's 544 KB `Inv` opening allowance up front, plus
+  what the 256 KB/s rate earns since the handshake, instead of about 44 MB.
+  A peer can no longer reconnect to announce another 650,000 transaction ids
+  at once ([#2637](https://github.com/zakura-core/zakura/pull/2637)).
+- Header sync now gives equal peer offers turns in arrival order instead of
+  ranking them by peer key, and a status that claims more work than the node
+  has no longer moves ahead of other offers or evicts their unstarted work.
+  Peers that stalled and reconnected under fresh keys, or inflated their
+  claimed work, could otherwise keep an honest peer's headers from ever
+  being requested ([#2638](https://github.com/zakura-core/zakura/pull/2638)).
+
+### Security
+
+- With the experimental `[network.zakura.tx_relay]` enabled, a peer whose
+  request window grew can no longer keep pool slots busy for free with orphan
+  transactions or late `notfound` answers: each one now takes a step off its
+  window, down to the starting 5
+  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
+- With the experimental `[network.zakura.tx_relay]` enabled, `tx-relay` fetches
+  can hold at most 250 of the pool core's 500 slots, so peers can no longer fill
+  the pool and leave no room for local submissions, legacy peers or
+  re-admissions after a reset
+  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
+
 ## [1.9.0-rc0] - 2026-11-20
 
 ### Added

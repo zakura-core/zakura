@@ -325,15 +325,34 @@ impl StartCmd {
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
     }
 
-    /// Refuses `mining.miner_mesh` on a node that cannot be a gateway.
+    /// Refuses `mining.miner_mesh` on a node that cannot be a gateway, and warns when the
+    /// gateway it names would be of no use to other miners.
     ///
     /// Other miners find the gateway by its v2 node ID, so it needs the v2 stack.
     fn validate_miner_mesh_config(config: &ZakuradConfig) -> Result<(), Report> {
-        if config.mining.miner_mesh && !config.network.v2_p2p() {
+        if !config.mining.miner_mesh {
+            return Ok(());
+        }
+
+        if !config.network.v2_p2p() {
             return Err(eyre!(
                 "mining.miner_mesh requires the Zakura P2P v2 stack; set network.p2p_stack to \
                  \"zakura\" or \"dual\""
             ));
+        }
+
+        if config.network.zakura.listen_addr.is_none() {
+            warn!(
+                "mining.miner_mesh is set but network.zakura.listen_addr is not, so the v2 \
+                 endpoint listens on loopback only and other miners cannot dial this gateway"
+            );
+        }
+
+        if config.mining.miner_address.is_none() {
+            warn!(
+                "mining.miner_mesh is set but mining.miner_address is not, so this node builds \
+                 no coinbase and names no gateway"
+            );
         }
 
         Ok(())
@@ -1004,7 +1023,9 @@ impl StartCmd {
                     eyre!("mining.miner_mesh is set but the v2 endpoint is not running")
                 })?
                 .local_node_id();
-            info!(%gateway, "coinbases this node builds name it as the miner's gateway");
+            if config.mining.miner_address.is_some() {
+                info!(%gateway, "coinbases this node builds name it as the miner's gateway");
+            }
             rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
         } else {
             rpc_impl

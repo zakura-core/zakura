@@ -131,6 +131,18 @@ impl PeerMachine {
         self.ended
     }
 
+    /// The time of its last input.
+    #[cfg(zakura_sim)]
+    pub(crate) fn clock(&self) -> Time {
+        self.now
+    }
+
+    /// Whether its peer's park let it in, so a stall closes its connection.
+    #[cfg(zakura_sim)]
+    pub(crate) fn readmitted(&self) -> bool {
+        self.readmitted
+    }
+
     // Inputs from its peer.
 
     /// The peer's `Hello` arrived.

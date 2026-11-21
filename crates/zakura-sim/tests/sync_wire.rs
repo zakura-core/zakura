@@ -76,7 +76,7 @@ fn run_scenario_judged_by_caller(
 
 /// Runs a full fuzz input as `zakura-sim record --input` does.
 fn replay(input: &[u8]) -> (RunReport, Vec<String>, SyncPorts) {
-    let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES.min(input.len()));
     run_scenario(&SyncWire::draw(prefix), Plan::from_fuzz(plan))
 }
 
@@ -793,7 +793,12 @@ fn mid_write_reset(report: &RunReport) -> Option<(String, PropertyOutcome)> {
 #[test]
 fn a_mid_write_reset_keeps_an_honest_connection() {
     let search = ReachSearch {
-        prefix: FORK_AT_SUBMISSION_STALLED.to_vec(),
+        // The scenario prefix, widened with zeros, so every drawn byte is Plan.
+        prefix: {
+            let mut prefix = FORK_AT_SUBMISSION_STALLED.to_vec();
+            prefix.resize(SyncWire::SCENARIO_BYTES, 0);
+            prefix
+        },
         max_bytes: MID_WRITE_PLAN_BYTES,
         steer: Some(WriterLast::for_input),
         ..ReachSearch::new(support::REACH_SEED, MID_WRITE_RESET_RUNS)

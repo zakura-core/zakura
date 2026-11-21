@@ -162,21 +162,21 @@ class RoutineTests(unittest.TestCase):
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--harness-runs", "block-sync/storage=20")
         self.assertIsNone(plan["latest"])
         self.assertEqual(
-            [step["name"] for step in plan["steps"]], ["qa-store-pull", "suite-manifest", "suite", "loop"]
+            [step["name"] for step in plan["steps"]], ["qa-store-pull", "suite-manifest", "suite", "loop", "reach"]
         )
         self.assertEqual(
             plan["order"],
-            ["qa-store-pull", "suite-manifest", "suite", "loop", "cases", "triage-loop", "triage-libfuzzer",
-             "completeness"],
+            ["qa-store-pull", "suite-manifest", "suite", "loop", "reach", "cases", "triage-loop",
+             "triage-libfuzzer", "completeness"],
         )
-        pull, manifest, suite, loop = plan["steps"]
+        pull, manifest, suite, loop, reach = plan["steps"]
         store = str(Path(state).resolve() / "qa-store")
         self.assertEqual(plan["store"], store)
         self.assertEqual(pull["argv"][2:5], ["pull", "--dest", store])
         self.assertEqual(manifest["argv"][:3], ["cargo", "xtask", "sim-suite"])
         self.assertIn("--frozen", manifest["argv"])
         self.assertEqual(suite["env"], {"RUSTFLAGS": "--cfg zakura_sim", joint.STORE_ENV: store})
-        for step in [manifest, loop, plan["cases"], *plan["triage"]]:
+        for step in [manifest, loop, reach, plan["cases"], *plan["triage"]]:
             self.assertEqual(step["env"][joint.STORE_ENV], store, step["name"])
         self.assertIn("planted", suite["argv"])
         self.assertNotIn("--changed-since", loop["argv"])
@@ -185,14 +185,44 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(
             loop["argv"][loop["argv"].index("--generate-harness-runs") + 1], "block-sync/storage=20"
         )
+        self.assertEqual(loop["argv"][loop["argv"].index("--generate-draws") + 1], "mix")
+        self.assertEqual(reach["argv"][2], "reach")
+        self.assertEqual(reach["argv"][reach["argv"].index("--runs") + 1], "30")
+        self.assertEqual(reach["argv"][reach["argv"].index("--harness-runs") + 1], "block-sync/storage=20")
+        completeness = plan["completeness"]["argv"]
+        self.assertTrue(completeness[completeness.index("--reach") + 1].endswith("reach.json"))
+
+    def test_reach_runs_zero_turns_the_reach_step_off(self):
+        with tempfile.TemporaryDirectory() as state:
+            plan = self.dry_run(state, "--reach-runs", "0", "--generate-draws", "cycle")
+        names = [step["name"] for step in plan["steps"]]
+        self.assertNotIn("reach", names)
+        self.assertNotIn("--reach", plan["completeness"]["argv"])
+        loop = plan["steps"][names.index("loop")]["argv"]
+        self.assertEqual(loop[loop.index("--generate-draws") + 1], "cycle")
+
+    def test_a_reach_finding_is_news_only_after_reach_misses_runs_in_a_row(self):
+        """A property fails the routine once, on its `REACH_MISSES`th miss in a row; one reach restarts its count."""
+        self.assertEqual(joint.REACH_MISSES, 3)
+        days = [["a", "b"], ["a", "b"], ["a"], ["a", "b"], ["a", "b"], ["b"], ["b"]]
+        previous, news = None, []
+        for unreached in days:
+            found = joint.reach_findings({"unreached": unreached}, previous)
+            self.assertEqual(found["unreached"], unreached)
+            news.append(found["new_unreached"])
+            previous = {"unreached": unreached, "misses": found["misses"]}
+        # `a` misses days 1–3 and fails on day 3 only; `b` is reached on
+        # day 3, so its misses restart and reach three on day 6.
+        self.assertEqual(news, [[], [], ["a"], [], [], ["b"], []])
+        self.assertEqual(previous["misses"], {"b": 4})
 
     def test_a_later_run_covers_what_changed_since_the_last_pin(self):
         with tempfile.TemporaryDirectory() as state:
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60", "--", "--jobs", "4")
         names = [step["name"] for step in plan["steps"]]
-        self.assertEqual(names, ["qa-store-pull", "suite-manifest", "suite", "loop", "libfuzzer"])
-        for step in plan["steps"][3:]:
+        self.assertEqual(names, ["qa-store-pull", "suite-manifest", "suite", "loop", "libfuzzer", "reach"])
+        for step in plan["steps"][3:5]:
             self.assertEqual(step["argv"][step["argv"].index("--changed-since") + 1], "a" * 40)
             changed = step["argv"][step["argv"].index("--store-changed") + 1]
             self.assertEqual(Path(changed).name, joint.STORE_CHANGED_FILES[step["name"]])
@@ -206,7 +236,8 @@ class RoutineTests(unittest.TestCase):
             (Path(state) / joint.LATEST_FILE).write_text(json.dumps({"pinned": "a" * 40}))
             (Path(state) / joint.LIBFUZZER_LATEST_FILE).write_text(json.dumps({"pinned": "b" * 40}))
             plan = self.dry_run(state, "--libfuzzer-seconds", "60")
-        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][3:]}
+        since = {step["name"]: step["argv"][step["argv"].index("--changed-since") + 1] for step in plan["steps"][3:]
+                 if step["name"] != "reach"}
         self.assertEqual(since, {"loop": "a" * 40, "libfuzzer": "b" * 40})
 
     def test_a_fuzz_budget_adds_the_suite_fuzz_and_its_archive_before_the_cases(self):
@@ -214,7 +245,7 @@ class RoutineTests(unittest.TestCase):
             plan = self.dry_run(state, "--fuzz-seconds", "600", "--fuzz-jobs", "2")
             suite_only = self.dry_run(state, "--suite-fuzz")
         self.assertEqual(plan["order"], [
-            "qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive",
+            "qa-store-pull", "suite-manifest", "suite", "loop", "reach", "suite-fuzz", "archive",
             "cases", "triage-loop", "triage-libfuzzer", "completeness",
         ])
         steps = {step["name"]: step["argv"] for step in plan["steps"]}
@@ -237,6 +268,7 @@ class RoutineTests(unittest.TestCase):
         args = joint.argparse.Namespace(
             store=None, planted_shards=7, planted_targets=True, sim_targets=True, harness_runs=[],
             loop_args=[], generate_runs=1, libfuzzer_seconds=0, suite_fuzz=False, fuzz_seconds=0,
+            generate_draws="mix", reach_runs=0,
         )
         steps = joint.routine_steps("/c", "/s", "/s/run", None, args, day=7 * 1000 + 3)
         names = [step["name"] for step in steps]
@@ -374,7 +406,7 @@ class CumulativeTests(unittest.TestCase):
             self.assertEqual(self.routine(state, {}, triage=record), 0)
             self.assertEqual(
                 [step["name"] for step in self.ran],
-                ["qa-store-pull", "suite-manifest", "suite", "loop", "triage-loop", "completeness"],
+                ["qa-store-pull", "suite-manifest", "suite", "loop", "reach", "triage-loop", "completeness"],
             )
             second = sorted(Path(state, "runs").iterdir())[1]
             changes = json.loads((second / "loop" / joint.DIFF_FILE).read_text())
@@ -511,12 +543,13 @@ class CumulativeTests(unittest.TestCase):
             record = json.loads((run_dir / joint.ROUTINE_FILE).read_text())
         self.assertEqual(status, 1, "the first survivor is news")
         self.assertEqual(seen["order"], [
-            "qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "triage-loop",
+            "qa-store-pull", "suite-manifest", "suite", "loop", "reach", "suite-fuzz", "archive", "triage-loop",
             "completeness",
         ])
         self.assertEqual(
             list(seen["routine"]["steps"]),
-            ["qa-store-pull", "suite-manifest", "suite", "loop", "suite-fuzz", "archive", "cases", "triage-loop"],
+            ["qa-store-pull", "suite-manifest", "suite", "loop", "reach", "suite-fuzz", "archive", "cases",
+             "triage-loop"],
         )
         self.assertEqual(len(seen["findings"]["loop"]["newly_surviving"]), 1)
         self.assertEqual(set(seen["findings"]["loop"]), set(joint.diff({}, {})))

@@ -16,6 +16,12 @@
 //!   reports the property, else on the first harness that does, as
 //!   `zakura-sim generators` lists them. `--generate-harness <name>` runs
 //!   every case on that harness.
+//! - **Draws.** An `inproc` search passes `--generate-draws` to
+//!   `zakura-sim generate --draws`, `mix` by default: its runs take turns
+//!   between a cycled family under the Plan, a cycled family under PCT, and
+//!   a free draw, so each seed's runs cover every family, the schedules a
+//!   Plan's bytes rarely order, and scenarios no family names. The report
+//!   records the policy, and each lane the mode of the run that stopped it.
 //! - **Budget.** An `inproc` search draws `--generate-runs` inputs, or the
 //!   count `--generate-harness-runs <harness>=<n>` sets for its harness. A
 //!   harness whose runs take seconds gets a smaller count, and the report
@@ -100,6 +106,13 @@ use crate::{
     sim_minimize::{self, ChildEnd},
     BoxError,
 };
+
+/// The draw policy an `inproc` search takes by default
+/// (`zakura-sim generate --draws`).
+pub(in crate::planted) const DEFAULT_DRAWS: &str = "mix";
+
+/// Every draw policy `zakura-sim generate --draws` takes.
+const DRAW_POLICIES: &[&str] = &["uniform", "cycle", "free", "mix"];
 
 /// The seeds a lane searches by default: the pilot's discovery seeds.
 const DEFAULT_SEEDS: &[u64] = &[11, 23, 47, 89, 179];
@@ -216,6 +229,9 @@ pub(in crate::planted) struct GenerateFlags {
     /// `--generate-harness-runs`: the runs an `inproc` search on a harness
     /// draws instead of `runs`.
     pub(in crate::planted) harness_runs: BTreeMap<String, u64>,
+    /// `--generate-draws`: how an `inproc` search draws each run's
+    /// scenario family and schedule.
+    pub(in crate::planted) draws: String,
 }
 
 impl Default for GenerateFlags {
@@ -227,6 +243,7 @@ impl Default for GenerateFlags {
             mode: GenerateMode::Inproc,
             seconds: DEFAULT_SECONDS,
             harness_runs: BTreeMap::new(),
+            draws: DEFAULT_DRAWS.to_owned(),
         }
     }
 }
@@ -272,6 +289,15 @@ impl GenerateFlags {
                     }
                 };
             }
+            "--generate-draws" => {
+                if !DRAW_POLICIES.contains(&value) {
+                    return Err(format!(
+                        "--generate-draws takes one of {}, not `{value}`",
+                        DRAW_POLICIES.join(", ")
+                    ));
+                }
+                self.draws = value.to_owned();
+            }
             "--generate-seconds" => {
                 self.seconds = number(value)?;
                 if self.seconds == 0 {
@@ -310,6 +336,10 @@ pub(in crate::planted) struct GenerateConfig {
     /// A `libfuzzer` campaign's budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) seconds: Option<u64>,
+    /// An `inproc` search's draw policy. Reports from before the flag
+    /// drew uniformly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) draws: Option<String>,
     /// How many seed inputs every search excludes.
     pub(in crate::planted) excluded_inputs: usize,
 }
@@ -359,6 +389,10 @@ pub(in crate::planted) struct GeneratorReport {
     /// `zakura-sim generate` reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) family: Option<String>,
+    /// The stopping run's mode under `--generate-draws mix`, such as
+    /// `free/pct`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::planted) run_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::planted) confirmation: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,6 +482,7 @@ impl GeneratorReport {
             millis: None,
             input: None,
             family: None,
+            run_mode: None,
             confirmation: None,
             shrunk: None,
             unpatched: Vec::new(),
@@ -934,6 +969,14 @@ impl Search {
         }
     }
 
+    /// The mode of the run that stopped a mixed `inproc` search.
+    fn run_mode(&self) -> Option<String> {
+        match &self.searched {
+            Searched::Inproc(ran) => ran.generated.as_ref()?.mode.clone(),
+            Searched::Campaign(_) => None,
+        }
+    }
+
     /// The runs the search took: to its kill, or all of them.
     fn runs(&self) -> Option<u64> {
         match &self.searched {
@@ -1353,6 +1396,7 @@ impl Runner {
             seeds: flags.seeds.clone(),
             harness: flags.harness.clone().unwrap_or_else(|| "auto".to_owned()),
             seconds: libfuzzer.then_some(flags.seconds),
+            draws: (!libfuzzer).then(|| flags.draws.clone()),
             excluded_inputs,
         };
         let mut lanes = Lanes {
@@ -1404,6 +1448,7 @@ impl Runner {
                     seed,
                     runs: lanes.flags.runs_for(harness),
                     exclude: lanes.exclude.clone(),
+                    draws: lanes.flags.draws.clone(),
                 };
                 Searched::Inproc(self.witness(slot, built, &runnable, dir, source, deadline, cap)?)
             }
@@ -1899,6 +1944,7 @@ impl Runner {
                         lane.unpatched = checks;
                         lane.input = kill.input.map(|input| self.relative(&input));
                         lane.family = search.family();
+                        lane.run_mode = search.run_mode();
                         lane.violated = Some(kill.id);
                     }
                     println!(

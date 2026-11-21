@@ -20,6 +20,8 @@ pub(crate) mod service;
 #[cfg(all(test, not(zakura_sim)))]
 mod service_tests;
 pub(crate) mod sessions;
+#[cfg(zakura_sim)]
+pub mod sim;
 #[cfg(all(test, not(zakura_sim)))]
 mod test_node;
 pub(crate) mod wire;

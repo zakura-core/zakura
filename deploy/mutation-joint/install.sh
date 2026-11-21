@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs the joint-run timer on the remote host (mutation plan, mut-4.6).
+# Installs the joint-run timer and the daily cleanup timer on the remote host
+# (mutation plan, mut-4.6 and R0).
 #
 # Usage, as root on the host, from any checkout:
 #
@@ -7,9 +8,10 @@
 #
 # It clones the repository into --checkout (default
 # /root/mutation-joint/zakura) if it isn't there, writes
-# /etc/zakura-mutation-joint.env from the example if it's missing, installs
-# the service and timer, and enables the timer. It never starts a run; start
-# one with `systemctl start zakura-mutation-joint.service`.
+# /etc/zakura-mutation-joint.env from the example if it's missing, adds the
+# example's cleanup line to it if it has none, installs the services and
+# timers, and enables the timers. It never starts a run; start one with
+# `systemctl start zakura-mutation-joint.service`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -32,9 +34,12 @@ if [ ! -e "${env}" ]; then
     sed -e "s|^ZAKURA_MUTATION_CHECKOUT=.*|ZAKURA_MUTATION_CHECKOUT=${checkout}|" \
         -e "s|^ZAKURA_MUTATION_STATE=.*|ZAKURA_MUTATION_STATE=${state}|" \
         "${here}/zakura-mutation-joint.env.example" > "${env}"
+    chmod 600 "${env}"
 fi
-install -m 0644 "${here}/zakura-mutation-joint.service" "${here}/zakura-mutation-joint.timer" \
-    /etc/systemd/system/
+if ! grep -q '^ZAKURA_CLEANUP_ARGS=' "${env}"; then
+    grep '^ZAKURA_CLEANUP_ARGS=' "${here}/zakura-mutation-joint.env.example" >> "${env}"
+fi
+install -m 0644 "${here}"/zakura-mutation-joint{,-cleanup}.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now zakura-mutation-joint.timer
-systemctl list-timers zakura-mutation-joint.timer --no-pager
+systemctl enable --now zakura-mutation-joint.timer zakura-mutation-joint-cleanup.timer
+systemctl list-timers 'zakura-mutation-joint*.timer' --no-pager

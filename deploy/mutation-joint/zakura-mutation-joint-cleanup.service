@@ -1,0 +1,13 @@
+# Daily cleanup of the host's old build trees and run directories. See
+# README.md.
+[Unit]
+Description=Delete the sim host's old build trees and run directories
+
+[Service]
+Type=oneshot
+# Sets ZAKURA_MUTATION_CHECKOUT, ZAKURA_MUTATION_STATE and
+# ZAKURA_CLEANUP_ARGS. install.sh writes it.
+EnvironmentFile=/etc/zakura-mutation-joint.env
+ExecStart=/usr/bin/python3 ${ZAKURA_MUTATION_CHECKOUT}/scripts/mutation_joint_cleanup.py --state ${ZAKURA_MUTATION_STATE} $ZAKURA_CLEANUP_ARGS
+Nice=10
+IOSchedulingClass=idle

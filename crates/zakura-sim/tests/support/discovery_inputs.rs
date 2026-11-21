@@ -31,12 +31,18 @@ pub fn wait_complete_input() -> Vec<u8> {
     INPUT.get_or_init(build_wait_complete).clone()
 }
 
-/// [`SavedPlan::LateResponse`]'s full input, its tag and then the Plan
-/// [`late_response_plan`] builds, built once per process.
+/// [`SavedPlan::LateResponse`]'s full input, built once per process: its
+/// tag, padded to the scenario prefix's length, then the Plan
+/// [`late_response_plan`] builds.
 pub fn late_response_input() -> Vec<u8> {
     static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
     INPUT
-        .get_or_init(|| [&SavedPlan::LateResponse.tag()[..], &late_response_plan()].concat())
+        .get_or_init(|| {
+            let mut input = SavedPlan::LateResponse.tag().to_vec();
+            input.resize(DiscoveryWire::SCENARIO_BYTES, 0);
+            input.extend_from_slice(&late_response_plan());
+            input
+        })
         .clone()
 }
 

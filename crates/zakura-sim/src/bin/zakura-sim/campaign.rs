@@ -152,6 +152,12 @@ pub fn targets(args: Vec<String>) -> Result<(), Error> {
             missing.harness, missing.reason
         );
     }
+    for excluded in &report.excluded_harnesses {
+        println!(
+            "no target ({}): excluded-harness: {}",
+            excluded.harness, excluded.reason
+        );
+    }
     println!("report in {}", options.out.join(READINESS_FILE).display());
     let not_ready: Vec<String> = report
         .not_ready()

@@ -399,31 +399,30 @@ package = "sim"
 name = "feedback_probe"
 reason = "runs no registered harness; `cargo xtask sim-feedback` builds it to check that libFuzzer keeps an input for a semantic feature alone"
 
-# Harnesses no target runs yet. Each stays in the report as unimplemented.
-[[missing-target]]
+# Harnesses no target runs by design (phase F of the property wrap-up).
+# Each is a fixed fixture whose input picks among a handful of scenarios,
+# so a target would fuzz only its schedule. Its tests still run in the
+# suite. The reach report (`scripts/suite_fuzz_run.py reach`) lists any
+# property that only these fixtures apply as a reach finding.
+[[excluded-harness]]
 harness = "header-sync/smoke"
-owner = "E5a"
-reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
+reason = "no peers and no storage scenario: it checks only the sim/* properties, which every harness checks"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/flood"
-owner = "E5a"
-reason = "no target: the harness has two fixed scenarios, the flood fixtures, and no plan maps it to a target"
+reason = "two fixed flood fixtures: header-sync/storage's grammar can't express 17 mirrors, Flood, Churn, Commit or an All trigger, so watch-observed-under-flood and watch-observed-under-lifecycle-flood stay witness-only; its storage properties are header-sync/storage's, which that grammar searches"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/release-wake"
-owner = "E5a"
-reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
+reason = "two fixed wake fixtures: the grammar can't express their long chains, the HeadroomWait trigger or the Settle source, and capacity-release-wakes needs the WakeFixture evidence its prepare arms; its storage properties are header-sync/storage's"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/repair"
-owner = "E5a"
-reason = "no target: the harness has four fixed scenarios, the repair fixtures, and no plan maps it to a target"
+reason = "four fixed repair fixtures: the grammar can't express RepairStatus, SessionEnded or Retired, or the checkpoint ceiling its prepare sets; it registers only header-sync/storage's properties, which that grammar searches"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/liveness"
-owner = "E5a"
-reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
+reason = "42 fixed liveness fixtures: the grammar can't express an All trigger, hold deadlines, or the evidence and sources its prepare and build add, so hold-release-wakes stays witness-only; bounded-adversary-progress and the storage properties are header-sync/storage's"
 
 # Preserved machine drivers run without the simulator. The semantic work
 # target uses the shared artifact pipeline without starting Sim or QUIC.
@@ -578,4 +577,16 @@ package = "sim"
 name = "header_publisher_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
+timeout-secs = 1800
+
+# `tx-relay/wire` runs production `tx-relay` behind its real transport on
+# simulated QUIC, with a test pool. Its 24-byte prefix composes the pool's
+# verdicts, the node's own bodies, the links, and each peer's answers and
+# steps from `tx-relay`'s whole message alphabet, so the target fuzzes the
+# order, count and mix of the peers' messages.
+[[target]]
+package = "sim"
+name = "tx_relay_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800

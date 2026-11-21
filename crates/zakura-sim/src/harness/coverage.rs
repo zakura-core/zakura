@@ -313,6 +313,51 @@ const fn handshake_guard(
     }
 }
 
+/// The file of `tx-relay/wire`'s witness tests (#2577).
+const TX_RELAY_WITNESSES: &str = "tests/tx_relay_wire.rs";
+
+/// A `tx-relay` domain property's row: its witness test runs its named
+/// prefix, and its bypass test feeds the oracle the hook history of a node
+/// that breaks it.
+const fn tx_relay(property: &'static str, test: &'static str, bypass: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(TX_RELAY_WITNESSES, test),
+        bypass: Bypass::Test(sim_test(TX_RELAY_WITNESSES, bypass)),
+    }
+}
+
+/// The scripted bypass that violates every `tx-relay` generated ID.
+const TX_RELAY_BYPASS: Bypass = Bypass::Test(sim_test(
+    TX_RELAY_WITNESSES,
+    "scripted_bypasses_violate_every_generated_id",
+));
+
+/// The test where every reachable `tx-relay` generated ID holds, and every
+/// unreachable one stays unreached.
+const TX_RELAY_GENERATED: &str = "every_generated_property_holds_in_a_witness";
+
+/// A `tx-relay` generated property's row.
+const fn tx_relay_table(property: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(TX_RELAY_WITNESSES, TX_RELAY_GENERATED),
+        bypass: TX_RELAY_BYPASS,
+    }
+}
+
+/// A `tx-relay` generated property no scenario reaches, for `reason`.
+const fn tx_relay_unreachable(property: &'static str, reason: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(TX_RELAY_WITNESSES, TX_RELAY_GENERATED),
+        },
+        bypass: TX_RELAY_BYPASS,
+    }
+}
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     handshake_guard(
@@ -1600,4 +1645,105 @@ pub static COVERAGE: &[Coverage] = &[
              refusal bug can reach this check yet; checker tests cover crafted refusals",
         ),
     },
+    tx_relay(
+        crate::domain::tx_relay::REQUESTS_WITHIN_LIMIT,
+        "requests_within_limit_holds_in_its_witness",
+        "requests_within_limit_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::SERVING_WITHIN_LIMIT,
+        "serving_within_limit_holds_in_its_witness",
+        "serving_within_limit_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::PENDING_WITHIN_BOUND,
+        "pending_within_bound_holds_in_its_witness",
+        "pending_within_bound_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::SKIP_SET_WITHIN_BOUND,
+        "skip_set_within_bound_holds_in_its_witness",
+        "skip_set_within_bound_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::REQUESTED_BODIES_ONLY,
+        "requested_bodies_only_holds_in_its_witness",
+        "requested_bodies_only_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::COOLING_BODIES_DROPPED,
+        "cooling_bodies_dropped_holds_in_its_witness",
+        "cooling_bodies_dropped_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::STALLED_PEERS_PARKED,
+        "stalled_peers_parked_holds_in_its_witness",
+        "stalled_peers_parked_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::HELLO_FIRST,
+        "hello_first_holds_in_its_witness",
+        "hello_first_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::NO_PROBE,
+        "no_probe_holds_in_its_witness",
+        "no_probe_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::ANNOUNCE_AFTER_ADMISSION,
+        "announce_after_admission_holds_in_its_witness",
+        "announce_after_admission_breaks_in_its_bypass",
+    ),
+    tx_relay(
+        crate::domain::tx_relay::FAULT_CLOSE_NAMES_A_BROKEN_ROW,
+        "fault_close_names_a_broken_row_holds_in_its_witness",
+        "fault_close_names_a_broken_row_breaks_in_its_bypass",
+    ),
+    tx_relay_table("tx-relay/s9v1/conformant-never-closes"),
+    tx_relay_table("tx-relay/s9v1/undeclared-type-closes"),
+    tx_relay_table("tx-relay/s9v1/inv/reserved-flags-closes"),
+    tx_relay_table("tx-relay/s9v1/inv/short-payload-closes"),
+    tx_relay_table("tx-relay/s9v1/inv/long-payload-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s9v1/inv/over-rate-closes",
+        "no peer can tell which flooded Inv overran the node's byte bucket: the node refills it while it reads the flood, by an amount the run's schedule sets",
+    ),
+    tx_relay_table("tx-relay/s9v1/inv/bad-content-closes"),
+    tx_relay_table("tx-relay/s9v1/tx/reserved-flags-closes"),
+    tx_relay_table("tx-relay/s9v1/tx/short-payload-closes"),
+    tx_relay_table("tx-relay/s9v1/tx/long-payload-closes"),
+    tx_relay_table("tx-relay/s9v1/tx/unsolicited-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s9v1/tx/over-owed-closes",
+        "each request owes one answer, and a second answer to it is unrequested, so the peer labels it unsolicited, never over-owed",
+    ),
+    tx_relay_table("tx-relay/s9v1/tx/bad-content-closes"),
+    tx_relay_table("tx-relay/s10v1/conformant-never-closes"),
+    tx_relay_table("tx-relay/s10v1/undeclared-type-closes"),
+    tx_relay_table("tx-relay/s10v1/hello/reserved-flags-closes"),
+    tx_relay_table("tx-relay/s10v1/hello/short-payload-closes"),
+    tx_relay_table("tx-relay/s10v1/hello/long-payload-closes"),
+    tx_relay_table("tx-relay/s10v1/hello/bad-content-closes"),
+    tx_relay_table("tx-relay/s10v1/hello/cadence-never-closes"),
+    tx_relay_table("tx-relay/s10v1/get-txs/reserved-flags-closes"),
+    tx_relay_table("tx-relay/s10v1/get-txs/short-payload-closes"),
+    tx_relay_table("tx-relay/s10v1/get-txs/long-payload-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/get-txs/over-margin-closes",
+        "a request past the node's Hello is refused only while the node's writer holds the earlier ones unstarted, which no peer sees, so the peer labels it conformant and the node's close is neutral",
+    ),
+    tx_relay_table("tx-relay/s10v1/get-txs/bad-content-closes"),
+    tx_relay_table("tx-relay/s10v1/not-found/reserved-flags-closes"),
+    tx_relay_table("tx-relay/s10v1/not-found/short-payload-closes"),
+    tx_relay_table("tx-relay/s10v1/not-found/long-payload-closes"),
+    tx_relay_table("tx-relay/s10v1/not-found/unsolicited-closes"),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/not-found/over-owed-closes",
+        "each request owes one answer, and a second answer to it is unrequested, so the peer labels it unsolicited, never over-owed",
+    ),
+    tx_relay_unreachable(
+        "tx-relay/s10v1/not-found/bad-content-closes",
+        "a NotFound has no content rule of its own: one for an id the node never asked for breaks row 9, which the peer labels unsolicited",
+    ),
 ];

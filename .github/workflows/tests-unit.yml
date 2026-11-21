@@ -525,10 +525,9 @@ jobs:
   # simulator build behind `--cfg zakura_sim` that no other job compiles.
   # `zakura-storage` serves the simulator, so it runs here too. Changing RUSTFLAGS
   # rebuilds every crate, so this job uses its own target directory and cache
-  # key. `zakura-network`'s library and its scheduler tests build under the
-  # flag too. Its unit tests still name tokio's types, so they don't. Its
-  # suites take minutes, so it runs nightly and on manual dispatch, never on
-  # pull requests or pushes.
+  # key. `zakura-network`'s library and all its tests build under the flag
+  # too. Its suites take minutes, so it runs nightly and on manual dispatch,
+  # never on pull requests or pushes.
   sim-build:
     name: zakura_sim build
     if: vars.TEMPORARY_PR_CI != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -552,7 +551,7 @@ jobs:
       - name: Lint the simulator build
         run: |
           cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets -- -D warnings
-          cargo clippy --locked -p zakura-network --lib --test sim_header_sync --test sim_block_sync -- -D warnings
+          cargo clippy --locked -p zakura-network --lib --tests -- -D warnings
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build

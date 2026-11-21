@@ -72,7 +72,7 @@ fn input(plan: SavedPlan) -> Vec<u8> {
 /// prefix picks the scenario, and the rest is the Plan.
 fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
     let input = input(plan);
-    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     run(&DiscoveryWire::draw(prefix), plan)
 }
 

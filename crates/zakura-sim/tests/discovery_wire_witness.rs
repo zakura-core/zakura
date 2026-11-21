@@ -598,7 +598,7 @@ fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
 #[test]
 fn late_response_admitted_applies_in_its_saved_plan() {
     let input = support::discovery_inputs::late_response_input();
-    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
     let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);
     witnessed(

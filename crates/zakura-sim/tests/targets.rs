@@ -1,6 +1,6 @@
 //! Fuzz target readiness: every target `qa/suite.toml` declares resolves
-//! to its registered harness and has curated seeds that apply the
-//! harness's own properties, and `zakura-sim targets` gives each target
+//! to its registered harness and has curated seeds or a built corpus that
+//! apply the harness's own properties, and `zakura-sim targets` gives each target
 //! one status (explorer implementation plan, E5a, acceptance test 1).
 //!
 //! The build and the fuzzer run need the pinned nightly and cargo-fuzz, so
@@ -76,6 +76,10 @@ fn manifest() -> String {
 /// that apply every own property. A listed property that an input now
 /// applies fails the test until it leaves the list, so the list only
 /// shrinks.
+///
+/// `tx-relay/stalled-peers-parked` applies only after a parked peer's
+/// readmission, three virtual minutes in. That witness runs too long for a
+/// fuzz input, and `tests/tx_relay_wire.rs` applies the property.
 const UNAPPLIED: &[(&str, &[&str])] = &[
     (
         "block_sync_storage",
@@ -260,6 +264,36 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
         ],
     ),
     ("sync_wire", &["block-sync/frontier-work-consistent"]),
+    (
+        "tx_relay_wire",
+        &[
+            "tx-relay/s10v1/get-txs/long-payload-closes",
+            "tx-relay/s10v1/get-txs/over-margin-closes",
+            "tx-relay/s10v1/get-txs/reserved-flags-closes",
+            "tx-relay/s10v1/get-txs/short-payload-closes",
+            "tx-relay/s10v1/hello/cadence-never-closes",
+            "tx-relay/s10v1/hello/long-payload-closes",
+            "tx-relay/s10v1/hello/reserved-flags-closes",
+            "tx-relay/s10v1/hello/short-payload-closes",
+            "tx-relay/s10v1/not-found/bad-content-closes",
+            "tx-relay/s10v1/not-found/long-payload-closes",
+            "tx-relay/s10v1/not-found/over-owed-closes",
+            "tx-relay/s10v1/not-found/reserved-flags-closes",
+            "tx-relay/s10v1/not-found/short-payload-closes",
+            "tx-relay/s10v1/undeclared-type-closes",
+            "tx-relay/s9v1/inv/long-payload-closes",
+            "tx-relay/s9v1/inv/over-rate-closes",
+            "tx-relay/s9v1/inv/reserved-flags-closes",
+            "tx-relay/s9v1/inv/short-payload-closes",
+            "tx-relay/s9v1/tx/long-payload-closes",
+            "tx-relay/s9v1/tx/over-owed-closes",
+            "tx-relay/s9v1/tx/reserved-flags-closes",
+            "tx-relay/s9v1/tx/short-payload-closes",
+            "tx-relay/s9v1/tx/unsolicited-closes",
+            "tx-relay/s9v1/undeclared-type-closes",
+            "tx-relay/stalled-peers-parked",
+        ],
+    ),
 ];
 
 /// The target's own properties that [`UNAPPLIED`] lists, sorted.
@@ -310,7 +344,8 @@ fn fixed_race(fixture: Which) -> Vec<u8> {
 
 /// `entry`'s inputs, named: the empty input, which runs the default scenario
 /// under the empty Plan, then each scenario family's tag under the empty
-/// Plan, but the [`SLOW_FAMILIES`]. A machine runs its written op tapes
+/// Plan, but the [`SLOW_FAMILIES`], then the harness's built corpus
+/// ([`HarnessEntry::corpus`]). A machine runs its written op tapes
 /// ([`support::machine_tapes`]) and the first [`PLANS_WITHOUT_FAMILIES`]
 /// generated ones, each at most
 /// `max_len` bytes, and `fixtures/all` runs each race fixture's fix
@@ -341,6 +376,9 @@ fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
         if !SLOW_FAMILIES.contains(&name.as_str()) {
             inputs.push((name, family.tag));
         }
+    }
+    for (index, input) in (entry.corpus)().into_iter().enumerate() {
+        inputs.push((format!("{} corpus {index}", entry.name), input));
     }
     inputs
 }
@@ -768,8 +806,13 @@ fn the_report_lists_every_missing_target() {
     };
     let report = check_targets(&options, |_| {}).unwrap();
     let missing = suite().missing_target;
-    assert!(!missing.is_empty(), "{SUITE_FILE} lists missing targets");
+    let excluded = suite().excluded_harness;
+    assert!(
+        !excluded.is_empty(),
+        "{SUITE_FILE} lists harnesses no target runs"
+    );
     assert_eq!(report.missing_targets, missing);
+    assert_eq!(report.excluded_harnesses, excluded);
     // The one checked target is unresolved, so it's the only row not ready.
     let not_ready: Vec<&str> = report.not_ready().map(|row| row.target.as_str()).collect();
     assert_eq!(not_ready, ["discovery_wait_complete"]);
@@ -779,7 +822,7 @@ fn the_report_lists_every_missing_target() {
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
     assert_eq!(
-        json["missing_targets"][0]["harness"],
-        missing[0].harness.as_str()
+        json["excluded_harnesses"][0]["harness"],
+        excluded[0].harness.as_str()
     );
 }

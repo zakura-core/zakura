@@ -117,6 +117,7 @@ use crate::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
+        miner_mesh,
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
@@ -1236,6 +1237,14 @@ impl StartCmd {
             mempool_crawler_task_handle,
             error_exit_status,
         );
+
+        // A mining node counts the gateways recent blocks name, to choose which mining
+        // gateways to stay connected to.
+        if config.mining.miner_address.is_some() {
+            let miner_mesh_task_handle =
+                miner_mesh::spawn(read_only_state_service.clone(), chain_tip_change.clone());
+            node_tasks.supervise("miner mesh tracker", miner_mesh_task_handle, |()| Ok(()));
+        }
 
         info!("spawning syncer task");
         // In regtest, commit the genesis block directly (bypassing the syncer's genesis

@@ -121,7 +121,8 @@ pub enum TransportEvent {
         /// Whether the source address was validated before TLS, which picks
         /// the ledger charged or refunded.
         validated: bool,
-        /// Admitted, exhausted, capacity, registered, or cancelled.
+        /// Admitted, exhausted, node-exhausted, capacity, refused, or
+        /// cancelled.
         action: &'static str,
         /// Tokens in a full bucket.
         capacity: u32,
@@ -257,6 +258,29 @@ pub enum TransportEvent {
         /// The frame's position among this stream's reads.
         seq: u64,
     },
+    /// The service's receive handle returned the frame, which stays funded
+    /// until the handle releases it.
+    FrameHeld {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+        /// The frame's wire bytes, header included, before its gate clamps
+        /// them.
+        bytes: u64,
+    },
+    /// The service's receive handle released the frame it returned last: its
+    /// next receive started, or the handle dropped.
+    FrameReleased {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+    },
     /// A regulation table changed state. It's reported inside the lock that
     /// applies the change, before the lock is released.
     Regulated {
@@ -313,8 +337,8 @@ pub enum TransportEvent {
         remote: SocketAddr,
         /// The connection, once registered.
         conn_id: Option<ZakuraConnId>,
-        /// The first recorded cause.
-        cause: Option<&'static str>,
+        /// The first recorded outcome.
+        cause: Option<super::CloseOutcome>,
     },
     /// The connection's workers drained and its peer was unregistered. A
     /// drain that times out with a worker still running reports no
@@ -513,7 +537,7 @@ impl ConnTap {
 
     /// Reports `CloseDecided` with `cause`, unless a decision was already
     /// reported.
-    pub(crate) fn decide(&self, cause: Option<&'static str>) {
+    pub(crate) fn decide(&self, cause: Option<super::CloseOutcome>) {
         if self.decided.swap(1, Ordering::AcqRel) == 0 {
             self.emit(TransportEvent::CloseDecided {
                 remote: self.remote,
@@ -582,6 +606,26 @@ impl StreamTap {
             conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq: self.reading(),
+        });
+    }
+
+    /// Reports `FrameHeld` for the frame numbered `seq`, of `bytes` wire
+    /// bytes.
+    pub(crate) fn frame_held(&self, seq: u64, bytes: u64) {
+        self.conn.emit(TransportEvent::FrameHeld {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            seq,
+            bytes,
+        });
+    }
+
+    /// Reports `FrameReleased` for the frame numbered `seq`.
+    pub(crate) fn frame_released(&self, seq: u64) {
+        self.conn.emit(TransportEvent::FrameReleased {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            seq,
         });
     }
 

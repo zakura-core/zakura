@@ -263,6 +263,15 @@ impl PeerState {
         requested.chain(reserving).map(u64::from).sum()
     }
 
+    /// A request ended without an admission: the window loses one, to no
+    /// less than [`INITIAL_WINDOW`], so a grown window can't hold pool
+    /// slots for free.
+    pub(crate) fn not_admitted(&mut self) {
+        if self.window > INITIAL_WINDOW {
+            self.window -= 1;
+        }
+    }
+
     /// Ids reserving, requested or awaiting a verdict on this session.
     pub(crate) fn in_flight(&self) -> usize {
         self.reserving
@@ -672,7 +681,7 @@ impl Known {
     }
 
     /// How many short ids are known.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(crate) fn len(&self) -> usize {
         self.by_short.len()
     }

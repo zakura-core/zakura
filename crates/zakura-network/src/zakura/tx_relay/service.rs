@@ -34,6 +34,8 @@ use zakura_rt::{
     time::{self, Instant},
 };
 
+#[cfg(zakura_sim)]
+use super::sim::{Received, SimEffect, SimState, TxRelayEvent, TxRelayObserver};
 use super::{
     machine::{
         peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
@@ -42,8 +44,8 @@ use super::{
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
-        tx_frame, TxRelayMessage, INV_RATE, MAX_TX_BYTES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
-        TX_RELAY_STREAMS,
+        tx_frame, TxRelayMessage, INV_RATE, MAX_INV_ENTRIES, MAX_TX_BYTES, TX_RELAY_DATA_KIND,
+        TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
     },
     ZakuraTxRelayConfig,
 };
@@ -54,8 +56,8 @@ use crate::{
         resume_task_panic,
         transport::OrderedStreamFailure,
         wire_codec::{decode_frame, encode_frame},
-        Frame, FrameGuard, FramedRecv, FramedSend, Peer, Service, SessionOpening, SessionPolicy,
-        Stream, ZakuraConnId, ZakuraPeerId,
+        CloseOutcome, CloseRow, Frame, FrameGuard, FramedRecv, FramedSend, NeutralCause, Peer,
+        Service, SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId,
     },
 };
 
@@ -203,6 +205,33 @@ impl TxRelayService {
         unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
+        Arc::new(Self::start(pool, may_cool, config, unconditional, sessions))
+    }
+
+    /// [`Self::spawn`], with every session reporting its steps to
+    /// `observer`.
+    #[cfg(zakura_sim)]
+    pub(crate) fn spawn_observed(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+        observer: TxRelayObserver,
+    ) -> Arc<Self> {
+        let mut service = Self::start(pool, may_cool, config, unconditional, sessions);
+        service.wiring.observer = Some(observer);
+        Arc::new(service)
+    }
+
+    /// Starts the reactor task and returns the service. See [`Self::spawn`].
+    fn start(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+    ) -> Self {
         let mut key = [0; 8];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let node = Node {
@@ -223,6 +252,8 @@ impl TxRelayService {
             inv_buckets: InvBuckets::default(),
             base: Instant::now(),
             unconditional,
+            #[cfg(zakura_sim)]
+            observer: None,
         };
         // The reactor task holds a reader, not a handle, so it does not keep
         // the core running, and it stops once the service, every routine
@@ -244,7 +275,7 @@ impl TxRelayService {
             .hash_length(8)
             .key(&key)
             .personal(b"Zakura_TxPeerKey");
-        Arc::new(Self { wiring, peer_key })
+        Self { wiring, peer_key }
     }
 
     /// The machine's name for `peer`, the same for every connection to it: a
@@ -353,7 +384,7 @@ struct Closer {
 
 impl Closer {
     /// Records `reason`, if nothing came first, and closes the connection.
-    fn close(&self, reason: &'static str) {
+    fn close(&self, reason: CloseOutcome) {
         self.close_cause.record(reason);
         self.conn_cancel.cancel();
     }
@@ -624,6 +655,9 @@ struct Wiring {
     /// Bodies from these addresses are never charged. See
     /// [`Routine::exempt`].
     unconditional: UnconditionalPeers,
+    /// Hears each session's steps, in the simulator.
+    #[cfg(zakura_sim)]
+    observer: Option<TxRelayObserver>,
 }
 
 /// One session's routine. See the module docs.
@@ -675,6 +709,15 @@ impl Routine {
             let node = &mut *node;
             let marks = Marks::of(&node.shared);
             let machine = PeerMachine::connect(&mut node.shared, &view, peer, now);
+            #[cfg(zakura_sim)]
+            if let Some(observer) = &wiring.observer {
+                observer(TxRelayEvent::Opened {
+                    session: machine.session().0,
+                    peer: io.connection.0.clone(),
+                    readmitted: machine.readmitted(),
+                    parked: machine.is_ended(),
+                });
+            }
             node.sessions.insert(
                 machine.session(),
                 Handle {
@@ -748,7 +791,7 @@ impl Routine {
                 () = self.cancel.cancelled() => break,
                 frame = data.recv() => {
                     let Some(frame) = frame else { break };
-                    if !self.frame(&frame).await {
+                    if !self.data_frame(&frame, &mut data).await {
                         break;
                     }
                 }
@@ -820,6 +863,8 @@ impl Routine {
             }
             let result = input(&mut self.machine, &mut node.shared, &view, now);
             let effects = std::mem::take(&mut node.shared.effects);
+            #[cfg(zakura_sim)]
+            self.report_step(&node.shared, &effects);
             let closes = closers(node, &effects, Some(session));
             let wakes = route(node, marks, Some(session));
             (result, effects, closes, wakes)
@@ -828,7 +873,7 @@ impl Routine {
             wake.notify_one();
         }
         for (close, reason) in closes {
-            close.close(close_reason(reason));
+            close.close(close_outcome(reason));
         }
         for effect in effects {
             self.effect(effect);
@@ -907,17 +952,53 @@ impl Routine {
                 true
             }
             Err(_) => {
-                // Row 3 of the close table.
-                self.io.close.close("tx-relay: malformed frame");
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
                 false
             }
         }
+    }
+
+    /// Handles one frame from the data stream. An `Inv` also takes the `Inv`
+    /// frames already queued behind it, up to [`MAX_INV_ENTRIES`] entries in
+    /// all, and hands them to the machine as one, so a peer that sends
+    /// one-entry frames costs a lock step per queued run, not per frame. The
+    /// first frame that does not join is handled after them, in order.
+    /// Returns `false` as [`Self::frame`] does.
+    async fn data_frame(&mut self, frame: &Frame, data: &mut FramedRecv) -> bool {
+        let mut first = decode_frame::<TxRelayMessage>(frame);
+        let mut next = None;
+        if let Ok(TxRelayMessage::Inv(entries)) = &mut first {
+            // The data stream's inbound queue bounds how many frames wait.
+            while let Ok(frame) = data.try_recv() {
+                match decode_frame::<TxRelayMessage>(&frame) {
+                    Ok(TxRelayMessage::Inv(more))
+                        if entries.len() + more.len() <= MAX_INV_ENTRIES =>
+                    {
+                        entries.extend(more);
+                    }
+                    other => {
+                        next = Some(other);
+                        break;
+                    }
+                }
+            }
+        }
+        for decoded in std::iter::once(first).chain(next) {
+            let Ok(message) = decoded else {
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
+                return false;
+            };
+            self.message(message).await;
+        }
+        true
     }
 
     /// Hands one decoded message to the machine. A `Tx` body waits for its
     /// decode on the blocking pool first.
     async fn message(&mut self, message: TxRelayMessage) {
         count(&message, "received");
+        #[cfg(zakura_sim)]
+        self.report_received(&message);
         match message {
             TxRelayMessage::Hello {
                 serves,
@@ -1123,6 +1204,93 @@ impl Routine {
         self.io.live = None;
     }
 
+    /// Reports a decoded message from the peer, before its step.
+    #[cfg(zakura_sim)]
+    fn report_received(&self, message: &TxRelayMessage) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let message = match message {
+            TxRelayMessage::Hello { .. } => Received::Hello,
+            TxRelayMessage::Inv(entries) => Received::Inv(entries.clone()),
+            TxRelayMessage::GetTxs(id) => Received::GetTxs(*id),
+            TxRelayMessage::Tx { id, body } => Received::Tx {
+                id: *id,
+                size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+            },
+            TxRelayMessage::NotFound(id) => Received::NotFound(*id),
+        };
+        observer(TxRelayEvent::Received {
+            session: self.machine.session().0,
+            message,
+        });
+    }
+
+    /// Reports the step that produced `effects`, under the node's lock, so
+    /// every session's steps reach the observer in order.
+    #[cfg(zakura_sim)]
+    fn report_step(&self, shared: &Shared, effects: &[RelayEffect]) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let session = self.machine.session();
+        let peer = self.machine.state.peer;
+        let cooling = shared.reactor.is_cooling(peer, self.machine.clock());
+        let effects = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RelayEffect::Ask { id, .. } => Some(SimEffect::Ask(*id)),
+                RelayEffect::Serve { id, .. } => Some(SimEffect::Serve(*id)),
+                RelayEffect::Submit {
+                    reservation, body, ..
+                } => Some(SimEffect::Submit {
+                    requested: self.reservations.get(reservation).map(Reservation::tx_id),
+                    body: body.id(),
+                    size: transaction_size(body.size()),
+                    cooling,
+                }),
+                RelayEffect::Park { session: parked } if *parked == session => {
+                    Some(SimEffect::Park)
+                }
+                RelayEffect::Close {
+                    session: closed,
+                    reason,
+                } => Some(SimEffect::Close {
+                    session: closed.0,
+                    outcome: close_outcome(*reason),
+                }),
+                _ => None,
+            })
+            .collect();
+        let state = &self.machine.state;
+        // An ended session handed its reserve calls and submissions to the
+        // reactor, which `unsettled` counts, so it reports none of its own.
+        let (asking, in_flight) = if self.machine.is_ended() {
+            (0, 0)
+        } else {
+            (
+                state.requests.len().saturating_add(state.reserving.len()),
+                state.in_flight(),
+            )
+        };
+        observer(TxRelayEvent::Stepped {
+            session: session.0,
+            effects,
+            state: SimState {
+                hello_serves: state.hello.map(|hello| hello.serves),
+                window: state.window,
+                asking,
+                in_flight,
+                unsettled: shared.reactor.unsettled_count(peer),
+                serving: state.serving.len(),
+                pending: state.pending.len(),
+                waiting: state.waiting.len(),
+                known: state.known.len(),
+                cooling,
+            },
+        });
+    }
+
     /// Performs one of this session's effects.
     fn effect(&mut self, effect: RelayEffect) {
         match effect {
@@ -1138,7 +1306,7 @@ impl Routine {
             }
             RelayEffect::Close { session, reason } => {
                 if session == self.machine.session() {
-                    self.io.close.close(close_reason(reason));
+                    self.io.close.close(close_outcome(reason));
                 }
             }
             // Ending the session leaves the connection, and its other
@@ -1155,7 +1323,7 @@ impl Routine {
                     // A core that does not answer in time is busy, so the
                     // machine tries again later.
                     let answer = pool
-                        .reserve(id, Instant::now() + POOL_ANSWER)
+                        .reserve_relayed(id, Instant::now() + POOL_ANSWER)
                         .await
                         .unwrap_or(Err(PortUnreserved::NoRoom));
                     PoolResult::Reserved { call, answer }
@@ -1286,6 +1454,15 @@ impl Routine {
                 .is_ok()
             {
                 count(&message, "sent");
+                #[cfg(zakura_sim)]
+                if let (Some(observer), TxRelayMessage::Inv(entries)) =
+                    (&self.wiring.observer, &message)
+                {
+                    observer(TxRelayEvent::InvSent {
+                        session: self.machine.session().0,
+                        entries: entries.clone(),
+                    });
+                }
             }
         }
     }
@@ -1452,7 +1629,7 @@ fn ended_result(
         wake.notify_one();
     }
     for (close, reason) in closes {
-        close.close(close_reason(reason));
+        close.close(close_outcome(reason));
     }
 }
 
@@ -1498,19 +1675,51 @@ fn verdict_of(verdict: PortVerdict) -> Verdict {
     }
 }
 
-/// The recorded cause for a close the machine asked for, as the close
+/// A fault of `row` on the `tx-relay` session, which its first stream
+/// names.
+fn fault(row: CloseRow) -> CloseOutcome {
+    let [primary, _] = TX_RELAY_STREAMS;
+    CloseOutcome::fault(primary.kind, primary.version, row)
+}
+
+/// The recorded outcome for a close the machine asked for, as the close
 /// table's row for it gives.
-fn close_reason(reason: CloseReason) -> &'static str {
+///
+/// A request past the `Hello`'s limit, or for an id already outstanding,
+/// depends on when this node's writer freed the earlier request's place,
+/// which no peer sees, so those closes stay neutral. So do the pool's
+/// verdicts on a body, which a conformant peer can relay.
+fn close_outcome(reason: CloseReason) -> CloseOutcome {
+    use NeutralCause::{LocalCancellation, ResourceRefusal, StallPolicy};
     match reason {
-        CloseReason::Violation(Violation::Undecodable) => "tx-relay: undecodable transaction",
-        CloseReason::Violation(Violation::RequestedTwice) => "tx-relay: id requested twice",
-        CloseReason::Violation(Violation::TooManyRequests) => "tx-relay: too many requests",
-        CloseReason::Violation(_) => "tx-relay: protocol violation",
-        CloseReason::Ban => "tx-relay: banned transaction",
-        CloseReason::RepeatedCooldown => "tx-relay: repeated cooldown",
-        CloseReason::CooldownsFull => "tx-relay: cooldown table full",
-        CloseReason::Unresponsive => "tx-relay: unanswered request",
-        CloseReason::StoppedReading => "tx-relay: peer stopped reading",
+        CloseReason::Violation(violation) => match violation {
+            Violation::HelloTwice => fault(CloseRow::RELAY_CLOSE_4),
+            Violation::BadHello => fault(CloseRow::RELAY_CLOSE_5),
+            Violation::NoHelloFirst => fault(CloseRow::RELAY_CLOSE_6),
+            Violation::Unrequested => fault(CloseRow::RELAY_CLOSE_9),
+            Violation::WrongSize => fault(CloseRow::RELAY_CLOSE_10),
+            Violation::WrongId => fault(CloseRow::RELAY_CLOSE_11),
+            Violation::Undecodable => fault(CloseRow::RELAY_CLOSE_12),
+            Violation::RequestedTwice => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: id requested twice")
+            }
+            Violation::TooManyRequests => {
+                CloseOutcome::neutral(ResourceRefusal, "tx-relay: too many requests")
+            }
+        },
+        CloseReason::Ban => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: banned transaction")
+        }
+        CloseReason::RepeatedCooldown => {
+            CloseOutcome::neutral(LocalCancellation, "tx-relay: repeated cooldown")
+        }
+        CloseReason::CooldownsFull => {
+            CloseOutcome::neutral(ResourceRefusal, "tx-relay: cooldown table full")
+        }
+        CloseReason::Unresponsive => CloseOutcome::stall_policy("tx-relay: unanswered request"),
+        CloseReason::StoppedReading => {
+            CloseOutcome::neutral(StallPolicy, "tx-relay: peer stopped reading")
+        }
     }
 }
 

@@ -40,12 +40,19 @@ use crate::{
     zakura::{
         testkit::{await_until, stream_conformance::RawLayoutPeer, HostilePeer, TEST_NET_TIMEOUT},
         wire_codec::{decode_frame, encode_frame},
-        LegacyGossipFrame, SessionStep, TransportEvent, TransportObserver, ZakuraConnId,
-        ZakuraLocalLimits, ZakuraPeerId, ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION,
-        ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+        CloseOutcome, CloseRow, LegacyGossipFrame, SessionStep, TransportEvent, TransportObserver,
+        ZakuraConnId, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_CAP_DISCOVERY,
+        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE,
+        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
     },
     BoxError, Config, Request,
 };
+
+/// A fault of `row` on the `tx-relay` session's first stream.
+fn fault(row: CloseRow) -> CloseOutcome {
+    let [primary, _] = TX_RELAY_STREAMS;
+    CloseOutcome::fault(primary.kind, primary.version, row)
+}
 
 /// The bound on every wait for something that should happen.
 const NET: Duration = TEST_NET_TIMEOUT;
@@ -192,7 +199,7 @@ struct Seen {
     /// Each connection's id, by the TLS-derived id both ends share.
     connections: HashMap<[u8; 16], ZakuraConnId>,
     /// Each connection's first close cause.
-    causes: HashMap<ZakuraConnId, Option<&'static str>>,
+    causes: HashMap<ZakuraConnId, Option<CloseOutcome>>,
     /// `tx-relay` setups that expired before they completed.
     expired: usize,
     /// How many `tx-relay` sessions each connection's transport saw exit.
@@ -234,7 +241,7 @@ impl TransportObserver for Observed {
 
 impl Observed {
     /// The cause the node recorded for closing `peer`'s connection.
-    fn cause(&self, peer: &RawRelay) -> Option<&'static str> {
+    fn cause(&self, peer: &RawRelay) -> Option<CloseOutcome> {
         let seen = self.0.lock().expect("no test panics while holding it");
         let conn_id = seen.connections.get(&peer.raw.connection.shared_id())?;
         seen.causes.get(conn_id).copied().flatten()
@@ -922,10 +929,13 @@ async fn discovery_keeps_a_tx_relay_connection_while_the_pool_attaches_and_betwe
         .raw
         .open_stream(ZAKURA_STREAM_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION)
         .await?;
-    // Discovery retires the control's session, whose own request is still
-    // unanswered, so the writer fence closes the connection.
+    // The control's exchange times out. Discovery owns the connection alone,
+    // so it closes it.
     control.closed().await?;
-    assert_eq!(observed.cause(&control), Some("unfinished_exchange"));
+    assert_eq!(
+        observed.cause(&control).map(CloseOutcome::label),
+        Some("discovery_exchange_timed_out")
+    );
     // The control connected after the peer, so the peer's look came first;
     // a short bounded window covers scheduling.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1316,7 +1326,10 @@ async fn requests_past_our_hello_with_their_answers_waiting_close_the_peer() -> 
         }
     }
     peer.closed().await?;
-    assert_eq!(observed.cause(&peer), Some("tx-relay: too many requests"));
+    assert_eq!(
+        observed.cause(&peer).map(CloseOutcome::label),
+        Some("tx-relay: too many requests")
+    );
 
     victim.node.shutdown().await;
     Ok(())
@@ -1493,6 +1506,11 @@ async fn a_small_transaction_reaches_the_window_at_once_and_the_rest_after_the_d
         observed_node(120, TestPool::new(Held::default()), cools(), 64).await?;
     let mut peers = Vec::with_capacity(PEERS);
     for n in 0..PEERS {
+        // The node refuses a handshake once one host has started more than
+        // its limit refills. One dial per refill never reaches that limit,
+        // however fast this machine dials.
+        tokio::time::sleep(crate::zakura::transport::node_handshake_cadence().refill_interval)
+            .await;
         let mut peer = RawRelay::connect(&victim, 1_200 + u64::try_from(n)?).await?;
         peer.start().await?;
         peers.push(peer);
@@ -1681,7 +1699,10 @@ async fn a_ban_closes_the_supplier_even_after_its_session_was_replaced() -> Resu
     peer.start().await?;
     supply(&mut peer, &banned).await?;
     peer.closed().await?;
-    assert_eq!(observed.cause(&peer), Some("tx-relay: banned transaction"));
+    assert_eq!(
+        observed.cause(&peer).map(CloseOutcome::label),
+        Some("tx-relay: banned transaction")
+    );
 
     // The verdict waits while the supplier's session is replaced.
     pool.change(|held| held.slow = true, Vec::new());
@@ -1701,7 +1722,7 @@ async fn a_ban_closes_the_supplier_even_after_its_session_was_replaced() -> Resu
     pool.change(|held| held.slow = false, Vec::new());
     replacement.closed().await?;
     assert_eq!(
-        observed.cause(&replacement),
+        observed.cause(&replacement).map(CloseOutcome::label),
         Some("tx-relay: banned transaction")
     );
 
@@ -1726,7 +1747,7 @@ async fn a_wire_violation_closes_the_connection() -> Result<(), BoxError> {
         })
         .await?;
     twice.closed().await?;
-    assert_eq!(observed.cause(&twice), Some("tx-relay: protocol violation"));
+    assert_eq!(observed.cause(&twice), Some(fault(CloseRow::RELAY_CLOSE_4)));
 
     let tx = transaction();
     let mut resized = RawRelay::connect(&victim, 1_129).await?;
@@ -1739,7 +1760,7 @@ async fn a_wire_violation_closes_the_connection() -> Result<(), BoxError> {
     resized.closed().await?;
     assert_eq!(
         observed.cause(&resized),
-        Some("tx-relay: protocol violation")
+        Some(fault(CloseRow::RELAY_CLOSE_10))
     );
 
     victim.node.shutdown().await;
@@ -1755,7 +1776,7 @@ async fn an_undecodable_body_closes_the_connection() -> Result<(), BoxError> {
     let (victim, observed) =
         observed_node(145, TestPool::new(Held::default()), cools(), 16).await?;
     let pool = victim.pool.as_ref().expect("the node runs tx-relay");
-    let undecodable = "tx-relay: undecodable transaction";
+    let undecodable = fault(CloseRow::RELAY_CLOSE_12);
 
     let garbage = unknown(1);
     let mut peer = RawRelay::connect(&victim, 1_145).await?;
@@ -1831,7 +1852,7 @@ async fn an_answer_nobody_asked_for_closes_the_connection() -> Result<(), BoxErr
     reaches(&victim, &txs[0]).await?;
     both.send(&TxRelayMessage::NotFound(id(&txs[0]))).await?;
     both.closed().await?;
-    assert_eq!(observed.cause(&both), Some("tx-relay: protocol violation"));
+    assert_eq!(observed.cause(&both), Some(fault(CloseRow::RELAY_CLOSE_9)));
     assert_eq!(
         count(&txs[0]),
         1,
@@ -1848,7 +1869,7 @@ async fn an_answer_nobody_asked_for_closes_the_connection() -> Result<(), BoxErr
     twice.send(&answer(&txs[1])).await?;
     twice.send(&answer(&txs[1])).await?;
     twice.closed().await?;
-    assert_eq!(observed.cause(&twice), Some("tx-relay: protocol violation"));
+    assert_eq!(observed.cause(&twice), Some(fault(CloseRow::RELAY_CLOSE_9)));
     assert_eq!(
         count(&txs[1]),
         1,
@@ -1861,7 +1882,7 @@ async fn an_answer_nobody_asked_for_closes_the_connection() -> Result<(), BoxErr
     pushy.start().await?;
     pushy.send(&answer(&unasked)).await?;
     pushy.closed().await?;
-    assert_eq!(observed.cause(&pushy), Some("tx-relay: protocol violation"));
+    assert_eq!(observed.cause(&pushy), Some(fault(CloseRow::RELAY_CLOSE_9)));
     assert_eq!(
         count(&unasked),
         0,

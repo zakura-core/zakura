@@ -624,7 +624,7 @@ impl BlockActionDispatched {
                 hash: hash(block.hash()),
                 height: block.coinbase_height().map(height),
             },
-            BlockSyncAction::Misbehavior { peer, reason } => BlockActionDetail::Misbehavior {
+            BlockSyncAction::Misbehavior { peer, reason, .. } => BlockActionDetail::Misbehavior {
                 peer: peer_label(peer),
                 reason: block_misbehavior_label(reason),
             },

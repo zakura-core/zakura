@@ -120,7 +120,7 @@ impl PeerState {
     pub(super) fn assert_invariants(&self) {
         self.window.outstanding.assert_consistent();
         assert!(
-            self.window.outstanding.is_empty() || self.window.block_liveness_deadline.is_some(),
+            self.window.outstanding.is_empty() || self.window.block_liveness_deadline().is_some(),
             "outstanding work keeps a liveness deadline"
         );
     }

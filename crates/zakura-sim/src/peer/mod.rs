@@ -42,6 +42,7 @@ pub mod handshake;
 pub mod honest;
 pub mod limit;
 mod stage;
+pub mod tx_relay;
 
 use std::{
     cell::{Cell, RefCell},
@@ -132,7 +133,28 @@ pub fn peer_addr(index: usize, dial: usize) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::new(10, octet(index), 0, octet(dial)), 4000))
 }
 
-/// The peer that binds `addr`, by index, if [`peer_addr`] gives it.
+/// The globally routable address a [`PeerSpec::public`] peer `index` binds
+/// for its `dial`-th connection: `11.<index + 1>.0.<dial + 1>:4000`.
+/// Production's discovery dials and samples a record only if each of its
+/// addresses is globally routable, which [`peer_addr`]'s RFC 1918 range
+/// isn't (#2267).
+///
+/// # Panics
+///
+/// If `index` or `dial` is past 253, which no scenario reaches.
+pub fn public_peer_addr(index: usize, dial: usize) -> SocketAddr {
+    let SocketAddr::V4(private) = peer_addr(index, dial) else {
+        unreachable!("peer_addr gives IPv4 addresses")
+    };
+    let [_, index, zero, dial] = private.ip().octets();
+    SocketAddr::from((Ipv4Addr::new(PUBLIC_OCTET, index, zero, dial), 4000))
+}
+
+/// The first octet of [`public_peer_addr`]'s range.
+const PUBLIC_OCTET: u8 = 11;
+
+/// The peer that binds `addr`, by index, if [`peer_addr`] or
+/// [`public_peer_addr`] gives it.
 pub fn peer_of(addr: SocketAddr) -> Option<usize> {
     if addr.port() >= 4001 {
         return Some(usize::from((addr.port() - 4001) % 256));
@@ -140,9 +162,13 @@ pub fn peer_of(addr: SocketAddr) -> Option<usize> {
     let SocketAddr::V4(v4) = addr else {
         return None;
     };
-    let [ten, index, zero, dial] = v4.ip().octets();
+    let [first, index, zero, dial] = v4.ip().octets();
     let given = |octet: u8| (1..255).contains(&octet);
-    (ten == 10 && zero == 0 && given(index) && given(dial) && v4.port() == 4000)
+    ((first == 10 || first == PUBLIC_OCTET)
+        && zero == 0
+        && given(index)
+        && given(dial)
+        && v4.port() == 4000)
         .then(|| usize::from(index - 1))
 }
 
@@ -229,6 +255,12 @@ pub struct PeerSpec {
     /// false, so saved ones keep their form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spams: bool,
+    /// Whether the peer binds [`public_peer_addr`] in place of
+    /// [`peer_addr`], and its discovery `Hello` record names that address.
+    /// A discovery node then dials and samples its record. Left out of a
+    /// serialized scenario when false, so saved ones keep their form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
 }
 
 /// How long a discovery act may wait to become ready before a peer with
@@ -245,7 +277,18 @@ impl PeerSpec {
                 u16::try_from(4001 + index + 256 * dial)
                     .expect("a handshake scenario has bounded peers and retries"),
             ),
-            None => peer_addr(index, dial),
+            None => self.listen_addr(index, dial),
+        }
+    }
+
+    /// The address peer `index` listens on for its `dial`-th connection
+    /// and names in its discovery `Hello` record: [`public_peer_addr`] if
+    /// it's [`public`](Self::public), else [`peer_addr`].
+    pub fn listen_addr(&self, index: usize, dial: usize) -> SocketAddr {
+        if self.public {
+            public_peer_addr(index, dial)
+        } else {
+            peer_addr(index, dial)
         }
     }
 
@@ -263,6 +306,7 @@ impl PeerSpec {
             discovery: None,
             skip_stale_acts: false,
             spams: false,
+            public: false,
         }
     }
 
@@ -386,7 +430,7 @@ pub struct PeerFailure(Arc<Mutex<Option<String>>>);
 impl PeerFailure {
     /// Records `why`, unless a failure is already recorded. The lock is
     /// never held across another call.
-    fn record(&self, why: String) {
+    pub(crate) fn record(&self, why: String) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -540,6 +584,22 @@ impl PeerControl {
             kind: stream.kind,
             version: stream.version,
         });
+        self
+    }
+
+    /// Also logs the peers' frames on tx-relay's `streams`, which the
+    /// evidence judges at their label's stage.
+    pub(crate) fn with_tx_relay(mut self, streams: &[Stream]) -> Self {
+        let evidence = std::mem::take(&mut self.evidence);
+        self.evidence = evidence.with_tx_relay(
+            streams
+                .iter()
+                .map(|stream| StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                })
+                .collect(),
+        );
         self
     }
 
@@ -839,7 +899,7 @@ impl Crafted {
 }
 
 /// `header`'s 8 bytes, then `payload`, as a peer writes them.
-fn frame_bytes(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn frame_bytes(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     // Written lengths stay far below 4 GiB.
     let len = u32::try_from(header.payload_len).expect("a written payload fits u32");
     let mut bytes = Vec::with_capacity(8 + payload.len());
@@ -1186,7 +1246,7 @@ struct HeaderStream {
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
-fn bind_config(addr: SocketAddr) -> QuicBindConfig {
+pub(crate) fn bind_config(addr: SocketAddr) -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![addr],
         max_bidi_streams: 16,
@@ -1428,7 +1488,12 @@ impl PeerTask {
         let discovery = match (self.spec.discovery.clone(), discovery) {
             (Some(script), Some(stream)) => {
                 let secret = SeededInputs::node_key(self.seed, key_index(self.index));
-                match DiscoveryPeer::new(stream, script, secret, peer_addr(self.index, 0)) {
+                match DiscoveryPeer::new(
+                    stream,
+                    script,
+                    secret,
+                    self.spec.listen_addr(self.index, 0),
+                ) {
                     Ok(mut peer) => {
                         peer.lenient = self.spec.skip_stale_acts;
                         Some(peer)

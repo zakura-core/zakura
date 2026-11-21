@@ -2333,6 +2333,35 @@ mod floor_bias_tests {
         assert_eq!(changes(&log).len(), 1);
     }
 
+    /// The shortest time a session runs without accepted block progress
+    /// before block-liveness parks it.
+    fn shortest_liveness_deadline(
+        config: &super::super::ZakuraBlockSyncConfig,
+    ) -> std::time::Duration {
+        config.effective_liveness_timeout()
+    }
+
+    /// bsync-26 `park-history-bounded`, for parks from block liveness.
+    ///
+    /// Such a park needs a session that ran the liveness deadline without
+    /// progress, and it holds its entry for the cooldown after its
+    /// connection closes. Each block-sync session slot therefore holds at
+    /// most one park on a live connection, plus one detached park per
+    /// liveness deadline in the cooldown: 1 + ⌈cooldown / deadline⌉ parks.
+    #[test]
+    fn liveness_parks_stay_within_seven_per_session() {
+        /// The row's figure: liveness parks per block-sync session slot.
+        const PARKS_PER_SESSION: u128 = 7;
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let deadline = shortest_liveness_deadline(&config).as_millis();
+        let cooldown = config.effective_no_progress_peer_cooldown().as_millis();
+        let parks_per_session = 1 + cooldown.div_ceil(deadline);
+        assert!(
+            parks_per_session <= PARKS_PER_SESSION,
+            "{parks_per_session} parks per session: cooldown {cooldown} ms over a {deadline} ms deadline"
+        );
+    }
+
     #[test]
     fn parked_peer_expires_after_cooldown() {
         let reg = PeerRegistry::new();

@@ -349,6 +349,9 @@ impl SubscriberState {
         if !live.caps.allow(count, payload_len) {
             return Err(SubscriberFault::AboveAdvertised);
         }
+        // A page above its credit faults before the loop hashes any header.
+        // The claim below spends the credit once the cursor is known.
+        tools.check_page(&live.id, count, payload_len)?;
         // Hash each header once. An unlinked page must fault here: preparation
         // verifies Equihash before the planner notices the break, and that
         // refusal is local, so the peer would otherwise stay connected.

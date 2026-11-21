@@ -167,6 +167,9 @@ The Zakura maintainers provide the following resources:
 
 - The [Zakura website](https://zakura.com/) for user guides and announcements.
 
+- The [trusted block submission guide](docs/trusted-block-submission.md) for
+  authenticated early relay and the recommended upstream-validation workflow.
+
 - The [documentation of the public
   APIs](https://docs.rs/zakura/latest/zakurad/#zakura-crates) for the latest
   releases of the individual Zakura crates.

@@ -34,7 +34,8 @@
 //! xtask planted --targets` runs each one through its target.
 //!
 //! The report also lists each harness no target runs, with its
-//! `[[missing-target]]` row, so it accounts for every harness.
+//! `[[missing-target]]` or `[[excluded-harness]]` row, so it accounts for
+//! every harness.
 
 use std::{
     collections::BTreeSet,
@@ -61,7 +62,7 @@ use crate::{
     planted::{self, PLANTED_DIR},
     seed::{self, sha256, Seed, SeedSet},
     sim::NO_LIVELOCK,
-    suite::{MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
+    suite::{ExcludedHarness, MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
 };
 
@@ -215,6 +216,11 @@ pub struct Readiness {
     /// `qa/suite.toml`'s order. [`Readiness::not_ready`] doesn't count
     /// them, since the suite accounts for each.
     pub missing_targets: Vec<MissingTarget>,
+    /// Each harness no target runs by design, with its
+    /// `[[excluded-harness]]` row, in `qa/suite.toml`'s order. Reports from
+    /// before the row existed have none.
+    #[serde(default)]
+    pub excluded_harnesses: Vec<ExcludedHarness>,
 }
 
 impl Readiness {
@@ -415,14 +421,15 @@ pub fn max_len(args: &[String]) -> Option<usize> {
 }
 
 /// The retained production bypasses under `repo`'s `qa/planted/` whose
-/// seed is one of `seeds`, by name. A typed case names no seed, so no
-/// target runs it. A case naming neither a seed nor a typed case, or both,
-/// is an error, as `cargo xtask planted` reports it.
+/// seed is one of `seeds`, by name. A typed or search case names no seed,
+/// so no target runs it. A case that names no seed, typed case or search,
+/// or more than one, is an error, as `cargo xtask planted` reports it.
 pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
         seed: Option<String>,
         typed: Option<toml::Table>,
+        search: Option<toml::Table>,
     }
     let mut cases = Vec::new();
     let root = repo.join(PLANTED_DIR);
@@ -436,15 +443,19 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
             .map_err(|error| format!("reading {}: {error}", case.display()))?;
         let file: CaseFile = toml::from_str(&text)
             .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-        let name = match (file.seed, file.typed) {
-            (Some(name), None) => name,
-            (None, Some(_)) => continue,
-            (name, _) => {
+        let name = match (file.seed, file.typed, file.search) {
+            (Some(name), None, None) => name,
+            (None, Some(_), None) | (None, None, Some(_)) => continue,
+            (seed, typed, search) => {
+                let named = [seed.is_some(), typed.is_some(), search.is_some()]
+                    .into_iter()
+                    .filter(|named| *named)
+                    .count();
                 return Err(format!(
-                    "{}: a case names either `seed` or `[typed]`, and this names {}",
+                    "{}: a case names one of `seed`, `[typed]` and `[search]`, and this names \
+                     {named}",
                     case.display(),
-                    if name.is_some() { "both" } else { "neither" }
-                ))
+                ));
             }
         };
         if !seeds.iter().any(|seed| seed.name == name) {
@@ -509,6 +520,7 @@ pub fn check_targets(
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
         missing_targets: suite.missing_target.clone(),
+        excluded_harnesses: suite.excluded_harness.clone(),
     };
     for target in selected {
         let row = check_target(options, &manifest, target)?;
@@ -564,7 +576,8 @@ fn check_target(
             ),
         ));
     }
-    if loaded.admitted.is_empty() {
+    let corpus = (entry.corpus)();
+    if loaded.admitted.is_empty() && corpus.is_empty() {
         return Ok(row.with(
             TargetStatus::NoSeeds,
             format!("{} has no admitted seed", entry.name),
@@ -579,14 +592,22 @@ fn check_target(
             .map_err(CampaignError::io(format!("creating {}", sub.display())))?;
     }
     let mut files = Vec::new();
-    for seed in &loaded.admitted {
-        let digest = sha256(seed.input());
+    let built = corpus
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (format!("{}-corpus-{index}", entry.name), input.as_slice()));
+    let registry = loaded
+        .admitted
+        .iter()
+        .map(|seed| (seed.name.clone(), seed.input()));
+    for (name, input) in registry.chain(built) {
+        let digest = sha256(input);
         let file = seeds_dir.join(&digest);
-        fs::write(&file, seed.input())
+        fs::write(&file, input)
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
-        files.push((file, seed.input().len()));
+        files.push((file, input.len()));
         row.seeds.push(SeedFile {
-            name: seed.name.clone(),
+            name,
             sha256: digest,
         });
     }

@@ -6,12 +6,19 @@ use std::{
 };
 
 use thiserror::Error;
-use zakura_chain::block::{Hash, Height};
+
+use crate::zakura::CloseRow;
+use zakura_chain::block::{Hash, Height, MAX_BLOCK_BYTES};
 use zakura_rt::{collections::HashMap, time::Instant};
 
-use super::wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES};
+use super::{
+    session::PEER_EXECUTION,
+    wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES},
+};
 use crate::zakura::{
-    block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES},
+    block_sync::{
+        admission::min_rate_transfer_time, config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+    },
     regulation::{
         shrink_after_peak, ClaimRefused, Claimed, Exchange, ExchangeWriter, PoolEntry,
         Reservations, ReserveRefused,
@@ -43,6 +50,19 @@ pub(super) enum ResponseError {
     Ending,
 }
 
+impl ResponseError {
+    /// The close-spec row this error breaks. `Identity` names its row, but
+    /// the requester retires the session for it instead of closing.
+    pub(super) fn close_row(&self) -> CloseRow {
+        match self {
+            Self::Claim(refused) => refused.close_row(),
+            Self::Identity => CloseRow::BSYNC_CLOSE_19,
+            Self::BodyBytes => CloseRow::BSYNC_CLOSE_14,
+            Self::Ending => CloseRow::BSYNC_CLOSE_12,
+        }
+    }
+}
+
 /// A consumed ending. It names the original request, not the reported count,
 /// so the scheduler reconsiders every unreceived height of that request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -60,6 +80,19 @@ struct Pending {
     body_bytes: usize,
     max_body_bytes: u32,
     retirement_started_at: Option<Instant>,
+}
+
+impl Pending {
+    /// Body bytes this range may still send: its remaining response-byte
+    /// limit, at most one protocol-maximum body per unreceived block.
+    fn owed_body_bytes(&self) -> u64 {
+        // A range holds at most 128 heights, so the count fits.
+        let bodies = self.expected.len().saturating_sub(self.received) as u64;
+        // Received body bytes stay within the u32 response limit.
+        u64::from(self.max_body_bytes)
+            .saturating_sub(self.body_bytes as u64)
+            .min(bodies.saturating_mul(MAX_BLOCK_BYTES))
+    }
 }
 
 /// Each range owns one node pool entry and at most 128 expected hashes.
@@ -131,6 +164,46 @@ impl Requester {
     /// Live ranges whose every body arrived but whose ending has not.
     pub(super) fn pending_endings(&self) -> usize {
         self.pending_endings
+    }
+
+    /// Body bytes the peer may still send under every live range, including
+    /// one the scheduler abandoned after its timeout, up to one
+    /// protocol-maximum body: the caller needs only the next body on the
+    /// ordered stream.
+    pub(super) fn owed_body_bytes(&self) -> u64 {
+        let mut owed: u64 = 0;
+        for pending in self.ranges.values() {
+            owed = owed.saturating_add(pending.owed_body_bytes());
+            if owed >= MAX_BLOCK_BYTES {
+                return MAX_BLOCK_BYTES;
+            }
+        }
+        owed
+    }
+
+    /// Read-active time an honest server's ordered stream may spend on other
+    /// bodies before `start`'s ending.
+    ///
+    /// The server queues an ending right after its last body, but ready-order
+    /// output can put one body from each other running job between them.
+    /// Those jobs answer ranges that still owe a body, and a peer runs at most
+    /// `PEER_EXECUTION` of them. Each body takes its transfer time at the
+    /// deadline floor rate.
+    fn bodies_ahead_of_ending(&self, start: Height) -> Duration {
+        // PEER_EXECUTION is 12, so the product fits.
+        let cap = (PEER_EXECUTION as u64 - 1) * MAX_BLOCK_BYTES;
+        let mut ahead: u64 = 0;
+        for (other, pending) in &self.ranges {
+            if *other != start {
+                ahead = ahead
+                    .saturating_add(pending.owed_body_bytes().min(MAX_BLOCK_BYTES))
+                    .min(cap);
+                if ahead == cap {
+                    break;
+                }
+            }
+        }
+        min_rate_transfer_time(ahead)
     }
 
     /// Old abandoned work must not pin a height forever while other work advances.
@@ -220,7 +293,7 @@ impl Requester {
     }
 
     /// Only for a request whose publication failed. Dropping a started exchange
-    /// through this path closes the connection via the shared writer fence.
+    /// through this path resets the session via the shared writer fence.
     pub(super) fn retract(&mut self, start: Height) {
         self.remove_range(start);
         self.reservations.retract(&start);
@@ -286,8 +359,14 @@ impl Requester {
             );
         } else {
             // The ordered response must still end. Keep an earlier abandonment
-            // deadline, or start one when the last block is claimed.
-            let at = *pending.retirement_started_at.get_or_insert(now);
+            // deadline, or start one once the bodies that can precede the
+            // ending had time to arrive.
+            let ahead = self.bodies_ahead_of_ending(start);
+            let pending = self
+                .ranges
+                .get_mut(&start)
+                .expect("the claimed range is live");
+            let at = *pending.retirement_started_at.get_or_insert(now + ahead);
             self.retiring.insert((at, start));
             self.pending_endings += 1;
         }
@@ -347,10 +426,7 @@ mod tests {
     use zakura_rt::sync::CancellationToken;
 
     use super::*;
-    use crate::zakura::{
-        regulation::{ReservationPool, WriterFence},
-        CloseCause,
-    };
+    use crate::zakura::regulation::{ReservationPool, WriterFence};
 
     /// Ranges that end after every block arrived still return the `next`
     /// map's peak capacity.
@@ -358,7 +434,7 @@ mod tests {
     fn complete_responses_shrink_the_next_hash_map() {
         const RANGES: u32 = 256;
         let slots = usize::try_from(RANGES).expect("256 fits usize");
-        let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+        let fence = WriterFence::new(CancellationToken::new());
         let pool = ReservationPool::new(slots).unwrap();
         let mut book = Requester::new(slots);
         let hash = |index: u32| {

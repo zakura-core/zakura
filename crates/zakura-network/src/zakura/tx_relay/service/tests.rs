@@ -171,6 +171,8 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
         inv_buckets: InvBuckets::default(),
         base: Instant::now(),
         unconditional: UnconditionalPeers::default(),
+        #[cfg(zakura_sim)]
+        observer: None,
     };
     (wiring, handed)
 }
@@ -307,7 +309,10 @@ async fn an_id_requested_again_while_its_job_waits_closes_the_peer() {
     session.deliver(TxRelayMessage::GetTxs(id)).await;
     assert!(!session.cancel.is_cancelled());
     session.deliver(TxRelayMessage::GetTxs(id)).await;
-    assert_eq!(session.cause.get(), Some("tx-relay: id requested twice"));
+    assert_eq!(
+        session.cause.get().map(CloseOutcome::label),
+        Some("tx-relay: id requested twice")
+    );
 }
 
 /// Applies `session`'s pool calls as its routine does, up to and including
@@ -367,7 +372,7 @@ fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
 
             // The core grants the fetch.
             let grant = async {
-                let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
+                let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
                     panic!("the session reserves the id it was offered");
                 };
                 let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());
@@ -431,7 +436,7 @@ fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
             .await
             .expect("the verdict arrives");
 
-            let cause = session.cause.get();
+            let cause = session.cause.get().map(CloseOutcome::label);
             if listed {
                 assert_eq!(cause, None, "an unconditional supplier is never charged");
             } else {
@@ -460,4 +465,57 @@ fn a_connection_stays_owned_through_the_reopen_gap() {
     let ownership = &owned[&connection];
     assert!(ownership.claims(ended + Duration::from_secs(8)));
     assert!(!ownership.claims(ended + REOPEN_GAP));
+}
+
+/// `Inv` frames queued on the data stream reach the machine as one `Inv`,
+/// so a peer that sends one-entry frames costs one lock step per queued
+/// run. The frame after them is still handled, after them: here a body
+/// nobody asked for, which closes the peer only once all three ids are
+/// taken.
+#[tokio::test]
+async fn queued_inv_frames_reach_the_machine_as_one() {
+    let (handle, inbox) = pool_port();
+    publish(&inbox, Vec::new(), Vec::new());
+    let (wiring, _handed) = wiring(handle);
+    let mut session = Session::open(&wiring);
+    session
+        .deliver(TxRelayMessage::Hello {
+            serves: 16,
+            max_tx_bytes: MAX_TX_BYTES,
+        })
+        .await;
+
+    let announced = transactions(4);
+    let frame = |message: &TxRelayMessage| encode_frame(message).expect("a valid frame");
+    let inv = |tx: &VerifiedUnminedTx| {
+        let size = u32::try_from(tx.transaction.size()).expect("a test body is small");
+        frame(&TxRelayMessage::Inv(vec![(tx.transaction.id(), size)]))
+    };
+    let (send, mut data) = framed_channel(8);
+    for tx in &announced[1..3] {
+        send.try_send(inv(tx)).expect("the queue has room");
+    }
+    let unrequested = TxRelayMessage::Tx {
+        id: announced[3].transaction.id(),
+        body: vec![0],
+    };
+    send.try_send(frame(&unrequested))
+        .expect("the queue has room");
+
+    let open = session
+        .routine
+        .data_frame(&inv(&announced[0]), &mut data)
+        .await;
+    assert!(open, "every frame decodes");
+    assert!(data.try_recv().is_err(), "every queued frame is taken");
+    assert_eq!(
+        session.routine.calls.len(),
+        3,
+        "each announced id is reserved"
+    );
+    assert_eq!(
+        session.cause.get(),
+        Some(fault(CloseRow::RELAY_CLOSE_9)),
+        "the unrequested body closes the peer"
+    );
 }

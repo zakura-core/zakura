@@ -63,7 +63,7 @@ fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
         .expect("each saved Plan has a seed")
         .input()
         .to_vec();
-    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     run(&DiscoveryWire::draw(prefix), plan)
 }
 
@@ -88,8 +88,8 @@ fn times(report: &RunReport) -> Vec<Duration> {
         .collect()
 }
 
-/// The causes the node closed connections with, by connection, in log
-/// order.
+/// The labels of the causes the node closed connections with, by
+/// connection, in log order.
 fn closes(report: &RunReport) -> Vec<(u64, String)> {
     report
         .log
@@ -97,7 +97,7 @@ fn closes(report: &RunReport) -> Vec<(u64, String)> {
         .iter()
         .filter_map(|entry| match &entry.obs {
             Observation::ConnectionClosed { connection, cause } => {
-                Some((*connection, cause.clone()))
+                Some((*connection, cause.label().to_owned()))
             }
             _ => None,
         })

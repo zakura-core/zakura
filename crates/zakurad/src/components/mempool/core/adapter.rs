@@ -1887,7 +1887,7 @@ mod tests {
         };
         let _ = reply.send(Default::default());
         let mut reserved = Vec::new();
-        while let Ok(Some(PoolCommand::Reserve { tx_id, reply })) =
+        while let Ok(Some(PoolCommand::Reserve { tx_id, reply, .. })) =
             tokio::time::timeout(std::time::Duration::from_millis(200), inbox.next()).await
         {
             if tx_id == elsewhere {

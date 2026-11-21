@@ -270,6 +270,14 @@ impl Bench {
         (answer, self.took(step))
     }
 
+    /// Reserves `tx` for a `tx-relay` fetch. Returns the answer, and what else
+    /// the input caused.
+    fn reserve_relayed(&mut self, tx: &Tx) -> (Result<ReservationId, Unreserved>, Step) {
+        let (answer, step) = self.machine.reserve_relayed(tx.id(), self.at());
+        self.tracker.reserve_answered(tx.id(), &answer);
+        (answer, self.took(step))
+    }
+
     /// Reserves `tx`, and expects a grant.
     fn reserved(&mut self, tx: &Tx) -> ReservationId {
         match self.reserve(tx).0 {

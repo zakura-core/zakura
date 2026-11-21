@@ -197,7 +197,7 @@ impl RequestIdentity {
                 failure: None,
                 availability: Some(*availability),
             },
-            BlockSyncAction::Misbehavior { peer, reason } => RequestIdentity::Misbehavior {
+            BlockSyncAction::Misbehavior { peer, reason, .. } => RequestIdentity::Misbehavior {
                 peer: peer.clone(),
                 reason: format!("{reason:?}"),
             },

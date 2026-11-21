@@ -421,6 +421,44 @@ impl StorageScenario {
         }
     }
 
+    /// The node at A8 serving four mirrors at A2, which dial it. Each
+    /// mirror's link closes once the node completes its `k`th read, for `k`
+    /// from 1 to 4, and relinks once it has closed. So each mirror leaves
+    /// while the node's publisher may still hold its subscription.
+    pub fn serving_churn() -> Self {
+        let mirrors = 4;
+        StorageScenario {
+            node: Chain::main(8),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(2),
+                    dialer: Dialer::Mirror,
+                    max_headers_per_response: None,
+                };
+                mirrors
+            ],
+            controls: (0..mirrors)
+                .flat_map(|index| {
+                    let peer = mirror(index);
+                    let nth = u32::try_from(index + 1).expect("four mirrors");
+                    [
+                        step(
+                            &peer,
+                            ControlAction::Close,
+                            Some(Trigger::Completed(Select::nth(OpKind::Read, nth))),
+                        ),
+                        step(
+                            &peer,
+                            ControlAction::Relink,
+                            Some(Trigger::Closed(peer.clone())),
+                        ),
+                    ]
+                })
+                .collect(),
+            ..StorageScenario::default()
+        }
+    }
+
     /// Three mirrors whose chains grow while the node syncs: `mirror-0`
     /// once the node applies its first headers, `mirror-2`'s fork once
     /// `mirror-0` has grown, then `mirror-0` again from A13, after which its
@@ -1607,9 +1645,19 @@ impl Subsystem for Storage {
     }
 
     /// The grammar's version byte: a prefix without it draws the default
-    /// scenario.
+    /// scenario. A uniform grammar prefix rarely decodes to a control step,
+    /// so `serving-churn` tags the whole prefix of
+    /// [`StorageScenario::serving_churn`], and the input's Plan bytes alone
+    /// vary its runs.
     fn families() -> Vec<ScenarioFamily> {
-        vec![ScenarioFamily::new("grammar", [grammar::LAYOUT.version])]
+        vec![
+            ScenarioFamily::free("grammar", [grammar::LAYOUT.version]),
+            ScenarioFamily::new(
+                "serving-churn",
+                grammar::encode(&StorageScenario::serving_churn())
+                    .expect("the grammar encodes serving churn"),
+            ),
+        ]
     }
 
     /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its

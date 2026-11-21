@@ -1883,7 +1883,7 @@ where
         submitted_at: std::time::Instant,
         submission: MinedBlockSubmission,
     ) -> Result<SubmitBlockResponse> {
-        let mut block_verifier_router = self.gbt.block_verifier_router();
+        let block_verifier_router = self.gbt.block_verifier_router();
         let height = block
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
@@ -1895,78 +1895,40 @@ where
         // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
         // runs only after the reservation rejects duplicate and over-capacity submissions.
         let size = block.zcash_serialized_size();
-        let admission = zakura_state::BlockAdmission::pending();
-        let request = zakura_consensus::Request::CommitMined {
-            block: block.clone().into(),
+        let lifecycle = submission_lifecycle::Submission {
+            block,
+            hash: block_hash,
+            height,
             size,
-            admission: admission.clone(),
-        };
-        let pending_blocks = self.gbt.pending_blocks();
-        let mined_block_sender = self.gbt.mined_block_sender();
-        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
-
-        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
-        let lifecycle = tokio::spawn(async move {
-            let _submission_guard = submission_guard;
-            let verification =
-                async move { block_verifier_router.ready().await?.call(request).await };
-            tokio::pin!(verification);
-
-            let admission_start = std::time::Instant::now();
-            let mut pending_registration = None;
-            let mut early_sent = false;
-            let verification_result = tokio::select! {
-                biased;
-
-                // Observe a completed commit before advertising its pending body.
-                result = &mut verification => result,
-                admitted = admission.wait() => {
-                    metrics::histogram!("mining.state_admission.duration_seconds")
-                        .record(admission_start.elapsed().as_secs_f64());
-                    if admitted
-                        && admission.optimistic_relay_authorized()
-                        && optimistic_block_inventory
-                    {
-                        if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = EarlyMinedBlock {
-                                admission: admission.clone(),
-                                hash: block_hash,
-                                height,
-                                size,
-                                submitted_at,
-                                submission,
-                                pending: registration.signal(),
-                            };
-                            if mined_block_sender.send(event).is_ok() {
-                                early_sent = true;
-                                pending_registration = Some(registration);
-                            }
-                        }
-                    }
-                    verification.await
-                },
-            };
-
-            if let Some(registration) = pending_registration {
-                registration.resolve(
-                    verification_result
-                        .as_ref()
-                        .map(|_| block.clone())
-                        .map_err(|_| ()),
-                );
-            }
-
-            if verification_result.is_err() && early_sent {
-                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
-                    .increment(1);
-                tracing::warn!(
-                    ?block_hash,
-                    ?height,
-                    "mined block failed contextual commit after state admission"
-                );
-            }
-            verification_result
-        });
+            submitted_at,
+            method: submission,
+            reservation: submission_guard,
+        }
+        .spawn(
+            block_verifier_router,
+            self.gbt.mined_block_sender(),
+            submission_lifecycle::RelayPolicy::AfterStateAdmission {
+                pending_blocks: self.gbt.pending_blocks(),
+                optimistic_block_inventory: self.gbt.optimistic_block_inventory(),
+            },
+            move |outcome| {
+                let submission_lifecycle::VerificationOutcome::Completed(result) =
+                    outcome.verification
+                else {
+                    unreachable!("ordinary submissions use the verifier's existing deadlines")
+                };
+                if result.is_err() && outcome.relay.requested {
+                    metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                        .increment(1);
+                    tracing::warn!(
+                        ?block_hash,
+                        ?height,
+                        "mined block failed contextual commit after state admission"
+                    );
+                }
+                result
+            },
+        );
 
         let block_verifier_router_response = lifecycle.await.map_err(|error| {
             ErrorObject::new(
@@ -1975,13 +1937,23 @@ where
             )
         })?;
 
+        Self::mined_block_response(
+            block_verifier_router_response,
+            block_hash,
+            height,
+            submission,
+        )
+    }
+
+    fn mined_block_response(
+        block_verifier_router_response: std::result::Result<block::Hash, tower::BoxError>,
+        block_hash: block::Hash,
+        height: Height,
+        submission: MinedBlockSubmission,
+    ) -> Result<SubmitBlockResponse> {
         let chain_error = match block_verifier_router_response {
-            // Currently, this match arm returns `null` (Accepted) for blocks committed
-            // to any chain, but Accepted is only for blocks in the best chain.
-            //
-            // TODO (#5487):
-            // - Inconclusive: check if the block is on a side-chain
-            // The difference is important to miners, because they want to mine on the best chain.
+            // Acceptance means local commitment, including a side chain. It does not
+            // promise best-chain selection or delivery to any peer.
             Ok(hash) => {
                 tracing::info!(
                     ?hash,
@@ -2013,6 +1985,12 @@ where
 
         let response = match chain_error {
             Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(source)
+                if submission == MinedBlockSubmission::TrustedBlock
+                    && source.is_verification_unavailable() =>
+            {
+                SubmitBlockErrorResponse::Inconclusive
+            }
             Ok(RouterError::Block { source })
                 if matches!(
                     source.as_ref(),
@@ -2042,8 +2020,10 @@ where
             // if mining pools really need it.
             Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
 
-            // This match arm is currently unreachable, but if future changes add extra error types,
-            // we want to turn them into `Rejected`.
+            // A closed verifier buffer can fail readiness without returning a block verdict.
+            Err(_) if submission == MinedBlockSubmission::TrustedBlock => {
+                SubmitBlockErrorResponse::Inconclusive
+            }
             Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
         };
 
@@ -6423,3 +6403,6 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+
+mod submission_lifecycle;
+mod trusted_block;

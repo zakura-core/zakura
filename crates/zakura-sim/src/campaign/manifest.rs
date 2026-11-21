@@ -329,8 +329,8 @@ pub struct StartOptions {
     pub workers: Vec<WorkerPlan>,
     /// Each worker's budget.
     pub budget: Budget,
-    /// Whether the initial snapshot holds the harness's corpus seeds.
-    /// `false` starts from no input, as cold-start discovery measurements
+    /// Whether the initial snapshot holds the harness's corpus seeds and
+    /// its [`HarnessEntry::corpus`]. `false` starts from no input, as cold-start discovery measurements
     /// do.
     pub seeds: bool,
     /// The full-suite manifest the run belongs to, if any.
@@ -471,7 +471,8 @@ impl Store {
 /// run locked for [`Prepared::run`].
 ///
 /// The run's initial snapshot holds `options.harness`'s corpus seeds, which
-/// must all validate, or no seed if `options.seeds` is `false`. With
+/// must all validate, and its [`HarnessEntry::corpus`], or no input if
+/// `options.seeds` is `false`. With
 /// [`Migration::Carry`] it holds the previous segment's last snapshot too, which
 /// needs clean fuzzer builds in both segments. A store with a run must name
 /// it as `options.parent`, since a store holds one campaign.
@@ -539,10 +540,16 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
             reasons.join("; ")
         )));
     }
+    let corpus = if options.seeds {
+        (options.harness.corpus)()
+    } else {
+        Vec::new()
+    };
     let mut sources: Vec<Source<'_>> = report
         .admitted
         .iter()
         .map(|seed| Source::Input(seed.input()))
+        .chain(corpus.iter().map(|input| Source::Input(input)))
         .collect();
     let carried = previous
         .as_ref()

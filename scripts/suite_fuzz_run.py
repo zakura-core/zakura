@@ -9,11 +9,17 @@ The three subcommands read the manifest that `cargo xtask sim-suite --frozen
 `<state>/campaigns/<target>` with `sim-campaign build`, and then runs one
 campaign run there: `sim-campaign start` if the store holds no run, else
 `sim-campaign resume`. It then runs `sim-campaign verify` and
-`sim-campaign evidence`. `sim-campaign build` builds only qa/fuzz/sim's
-targets, so `run` lists every other target as not run, with that reason.
-Each target's budget is its `[campaign.sim]` budget in `qa/suite.toml`, as
-`scripts/check-fuzz-campaign.py --matrix sim` joins it with the row's own;
-`--seconds` overrides each budget's length. `--target` runs a subset, and
+`sim-campaign evidence`. The campaign store records a harness's versions
+and properties, which a qa/fuzz/p2p or qa/fuzz/header-chain machine target
+doesn't have, so `run` fuzzes those targets in a plain libFuzzer lane
+instead: `cargo fuzz build`, then one `cargo fuzz run` on the target's
+corpus under `<state>/corpora/<package>/<target>/`, which each run keeps
+growing, with its crash artifacts beside it. The lane's evidence is
+libFuzzer's run count and the artifacts the run added, and a run with an
+artifact or a nonzero exit didn't end `complete`. Each target's budget is
+its package's `[campaign.<package>]` budget in `qa/suite.toml`, as
+`scripts/check-fuzz-campaign.py --matrix <package>` joins it with the row's
+own; `--seconds` overrides each budget's length. `--target` runs a subset, and
 `suite-fuzz.json` then marks `subset` and lists the omitted rows.
 
 The campaign tool decides when a run starts a new segment, and `run` follows
@@ -28,11 +34,21 @@ change, else `--corpus seeds`.
 `cargo xtask sim-verify-archive`, and writes each bundle's path and verdict
 to `archive.json`.
 
+`reach` builds `zakura-sim` and runs one `zakura-sim generate --draws mix`
+search on every harness `zakura-sim generators` lists, at once up to
+`--jobs`. A mixed search's runs take turns between cycled families under
+the Plan and PCT, and free draws, whose scenario no family names. It writes
+`reach.json`: each harness's search, and for each property, how many runs
+applied it (held with an applicable evaluation, or violated) and how many
+free runs did. A property no free run applied is unreached: only a planned
+family, a witness, or nothing reaches it.
+
 `completeness` diffs the manifest's rows against what the routine ran, and
 writes `completeness.json`: the rows it ran, the rows it didn't run with the
-reason, the ran rows whose evidence is inconclusive, and the unimplemented
-rows. It reports coverage only. Correctness findings stay in the routine's
-`findings.json`, and `completeness` exits 0 whatever it lists.
+reason, the ran rows whose evidence is inconclusive, the unimplemented rows,
+and, with `--reach`, each property's reach. It reports coverage only.
+Correctness findings stay in the routine's `findings.json`, and
+`completeness` exits 0 whatever it lists.
 """
 
 import argparse
@@ -48,12 +64,25 @@ import sys
 from typing import NamedTuple
 
 SUITE_FUZZ_FILE = "suite-fuzz.json"
+REACH_FILE = "reach.json"
+# What a `zakura-sim generate` search writes in its `--out`.
+GENERATE_FILE = "generate.json"
+# The draw policy a reach search takes: cycled families under the Plan and
+# PCT, and free draws.
+REACH_DRAWS = "mix"
 ARCHIVE_FILE = "archive.json"
 COMPLETENESS_FILE = "completeness.json"
 EVIDENCE_FILE = "evidence.json"
 SUITE_FILE = "qa/suite.toml"
 # The fuzz package that `sim-campaign build` builds from.
 CAMPAIGN_PACKAGE = "sim"
+# The fuzz packages whose machine targets the plain libFuzzer lane runs.
+MACHINE_PACKAGES = ("p2p", "header-chain")
+# The nightly toolchain cargo-fuzz builds with: `zakura_sim::suite::NIGHTLY`,
+# which the fuzz workflows pin too.
+NIGHTLY = "nightly-2026-07-15"
+# libFuzzer's last line of a run, with the count of inputs it ran.
+DONE_RUNS = re.compile(r"^Done (\d+) runs in ", re.MULTILINE)
 MATRIX_SCRIPT = Path(__file__).resolve().parent / "check-fuzz-campaign.py"
 BUILT = re.compile(r" as build ([0-9a-f]{64})$", re.MULTILINE)
 CHECKSUM_MISMATCH = re.compile(r"bundles don't match their checksums$", re.MULTILINE)
@@ -105,12 +134,16 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
+def sha256_text(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def campaign_budgets(checkout, manifest):
-    """Return each sim target's campaign budget by name, from the suite file the manifest froze.
+    """Return each target's campaign budget by package and name, from the suite file the manifest froze.
 
     Refuses a checkout whose `qa/suite.toml` isn't the one the manifest
     digests, since its budgets could then belong to other rows.
@@ -121,13 +154,20 @@ def campaign_budgets(checkout, manifest):
     spec = importlib.util.spec_from_file_location("check_fuzz_campaign", MATRIX_SCRIPT)
     matrix = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(matrix)
-    return {row["target"]: row for row in matrix.campaign_matrix(Path(checkout), CAMPAIGN_PACKAGE)["include"]}
+    return {
+        (package, row["target"]): row
+        for package in (CAMPAIGN_PACKAGE, *MACHINE_PACKAGES)
+        for row in matrix.campaign_matrix(Path(checkout), package)["include"]
+    }
 
 
 def not_runnable(row, versions):
     """Return why `run` can't fuzz a target row, or None if it can."""
+    if row["package"] in MACHINE_PACKAGES:
+        return None
     if row["package"] != CAMPAIGN_PACKAGE:
-        return f"`sim-campaign build` builds only qa/fuzz/{CAMPAIGN_PACKAGE}'s targets, not qa/fuzz/{row['package']}'s"
+        return f"`run` fuzzes only qa/fuzz/{CAMPAIGN_PACKAGE}'s and the machine packages' targets, " \
+               f"not qa/fuzz/{row['package']}'s"
     if not row.get("harness"):
         return "the target maps to no harness, and `sim-campaign start` needs one"
     if row["harness"] not in versions:
@@ -222,9 +262,9 @@ class Fuzz:
         self.out = Path(out)
         self.manifest_path = Path(manifest_path)
 
-    def call(self, argv, log, env=None):
-        """Run one command from the checkout with its log under `suite-fuzz/`, and return its status and output."""
-        return run_logged(argv, self.checkout, self.out / "suite-fuzz" / log, {**build_env(), **(env or {})})
+    def call(self, argv, log, env=None, cwd=None):
+        """Run one command from the checkout, or `cwd`, with its log under `suite-fuzz/`, and return its status and output."""
+        return run_logged(argv, cwd or self.checkout, self.out / "suite-fuzz" / log, {**build_env(), **(env or {})})
 
 
 def prepare_target(fuzz, row, budget, versions):
@@ -250,10 +290,64 @@ def prepare_target(fuzz, row, budget, versions):
     return record
 
 
+def libfuzzer_args(budget, artifacts):
+    """Return the libFuzzer flags of a machine target's run: its budget's limits, then its row's own."""
+    args = [f"-max_total_time={budget['seconds']}", f"-rss_limit_mb={budget['rss_mb']}",
+            f"-max_len={budget['max_len']}", f"-detect_leaks={budget['detect_leaks']}",
+            f"-artifact_prefix={artifacts}/"]
+    return args + budget["extra_args"].split()
+
+
+def prepare_machine(fuzz, row, budget):
+    """Build one machine target with cargo-fuzz. Return its record."""
+    name, package = row["name"], row["package"]
+    store = fuzz.state / "corpora" / package / name
+    record = {"id": row["id"], "target": name, "package": package, "store": str(store), "budget": budget,
+              "lane": "libfuzzer", "steps": {}}
+    built = fuzz.call(["cargo", f"+{NIGHTLY}", "fuzz", "build", "--fuzz-dir", ".", name],
+                      f"{package}-{name}/build.log", cwd=fuzz.checkout / "qa" / "fuzz" / package)
+    record["steps"]["build"] = built.code
+    if built.code != 0:
+        record["error"] = "the build failed"
+    return record
+
+
+def run_machine(fuzz, record):
+    """Run one built machine target on its kept corpus, and record its run's evidence."""
+    store = Path(record["store"])
+    corpus, artifacts = store / "corpus", store / "artifacts"
+    corpus.mkdir(parents=True, exist_ok=True)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    before = {path.name for path in artifacts.iterdir()}
+    name, package, budget = record["target"], record["package"], record["budget"]
+    argv = ["cargo", f"+{NIGHTLY}", "fuzz", "run", "--fuzz-dir", ".", name, str(corpus), "--",
+            *libfuzzer_args(budget, artifacts)]
+    ran = fuzz.call(argv, f"{package}-{name}/campaign.log",
+                    {"ASAN_OPTIONS": f"detect_leaks={budget['detect_leaks']}"},
+                    cwd=fuzz.checkout / "qa" / "fuzz" / package)
+    record["steps"]["campaign"] = ran.code
+    added = sorted(path for path in artifacts.iterdir() if path.name not in before)
+    done = DONE_RUNS.findall(ran.output)
+    record["run"] = f"libfuzzer-{sha256_text(ran.output)[:12]}"
+    record["failures"] = len(added)
+    record["artifacts"] = [str(path) for path in added]
+    record["end_status"] = "complete" if ran.code == 0 and not added else "failed"
+    evidence = fuzz.out / "suite-fuzz" / f"{package}-{name}" / EVIDENCE_FILE
+    write_json(evidence, {
+        "status": record["end_status"], "runs": int(done[-1]) if done else None,
+        "corpus": sum(1 for _ in corpus.iterdir()), "artifacts": record["artifacts"],
+        "unapplied": [], "incomplete": [] if done else ["libFuzzer printed no run count"],
+    })
+    record["evidence"] = str(evidence)
+    return record
+
+
 def run_campaign(fuzz, record):
     """Run one prepared target's campaign, then verify its store and sum its run's evidence."""
     if "error" in record:
         return record
+    if record.get("lane") == "libfuzzer":
+        return run_machine(fuzz, record)
     store, name = record["store"], record["target"]
     argv, env = campaign_command(record["plan"], store, name, record["harness"], record["build"],
                                  record["budget"], fuzz.manifest_path)
@@ -292,10 +386,13 @@ def fuzz_suite(fuzz, manifest, budgets, selected, seconds=None, workers=1, jobs=
         if reason:
             not_run.append({"id": row["id"], "reason": reason})
             continue
-        budget = dict(budgets[row["name"]], workers=workers)
+        budget = dict(budgets[(row["package"], row["name"])], workers=workers)
         if seconds:
             budget["seconds"] = seconds
-        prepared.append(prepare_target(fuzz, row, budget, versions))
+        if row["package"] in MACHINE_PACKAGES:
+            prepared.append(prepare_machine(fuzz, row, budget))
+        else:
+            prepared.append(prepare_target(fuzz, row, budget, versions))
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         targets = list(pool.map(lambda record: run_campaign(fuzz, record), prepared))
     return {
@@ -351,6 +448,13 @@ def archive(suite_fuzz, archive_dir, out, checkout, minimize_runs, minimize_wall
     for target in suite_fuzz["targets"]:
         if "run" not in target:
             continue
+        if target.get("lane") == "libfuzzer":
+            # A machine target runs no harness that triage could confirm, so
+            # its crash artifacts stay listed beside its corpus.
+            campaigns.append({"target": target["target"], "run": target["run"],
+                              "inputs": len(target.get("artifacts", [])), "triage": None,
+                              "artifacts": target.get("artifacts", [])})
+            continue
         store = Path(target["store"])
         end = read_json(store / "runs" / target["run"] / "end.json") or {}
         inputs = [str(store / path) for path in failure_inputs(end)]
@@ -400,6 +504,121 @@ def evidence_gaps(path):
     return reasons
 
 
+def harness_key(name):
+    """Return a harness name as a directory name: its slashes as dashes."""
+    return name.replace("/", "-")
+
+
+def build_sim(checkout, log):
+    """Build `zakura-sim` in the planted profile, and return its path, or None with the log holding why."""
+    argv = ["cargo", "build", "-p", "zakura-sim", "--bin", "zakura-sim", "--profile", "planted", "--locked",
+            "--message-format=json-render-diagnostics"]
+    env = {**build_env(), "RUSTFLAGS": "--cfg zakura_sim"}
+    Path(log).parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "w") as err:
+        ended = subprocess.run(argv, cwd=checkout, env=env, stdout=subprocess.PIPE, stderr=err, text=True,
+                               check=False)
+    if ended.returncode != 0:
+        return None
+    for line in ended.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("executable") \
+                and message["target"]["name"] == "zakura-sim":
+            return message["executable"]
+    return None
+
+
+def reach_harnesses(generators):
+    """Return every harness of `zakura-sim generators`' map, sorted."""
+    return sorted({harness for harnesses in generators.values() for harness in harnesses})
+
+
+def applied(counts):
+    """Return how many runs an applicability record says applied its property."""
+    return counts.get("held", 0) + counts.get("violated", 0)
+
+
+# The stop kind of a search that ran every drawn input.
+CLEAN_STOP = "clean"
+
+
+def search_failure(exit_code, report):
+    """Return why a reach search failed, or None: a nonzero exit, no report, or a stop before its last input."""
+    if exit_code != 0:
+        return f"`zakura-sim generate` exited {exit_code}"
+    if report is None:
+        return f"the search wrote no {GENERATE_FILE}"
+    stop = report.get("stop", {})
+    if stop.get("kind") != CLEAN_STOP:
+        return f"the search stopped: {json.dumps(stop, sort_keys=True)}"
+    return None
+
+
+def reach_report(generators, searches, seed, runs, failed=None):
+    """Return `reach.json` from the generator map and each harness's search report, or None for a search that wrote none.
+
+    A property's counts sum over every harness that reports it. A harness
+    whose search wrote no report counts nowhere, and the property lists it
+    under `unsearched`. `failed` maps each failed search's harness to
+    `search_failure`'s reason.
+    """
+    harnesses = {}
+    for name, report in sorted(searches.items()):
+        if report is None:
+            harnesses[name] = {"searched": False}
+            continue
+        harnesses[name] = {
+            "searched": True, "executed": report.get("executed", 0), "random_runs": report.get("random_runs", 0),
+            "modes": report.get("modes", {}), "stop": report.get("stop", {}).get("kind"),
+            "violated": report.get("violated"), "millis": report.get("millis"),
+        }
+    properties = {}
+    for prop, names in sorted(generators.items()):
+        row = {"harnesses": sorted(names), "runs": 0, "random_runs": 0, "unsearched": []}
+        for name in names:
+            report = searches.get(name)
+            if report is None:
+                row["unsearched"].append(name)
+                continue
+            row["runs"] += applied(report.get("properties", {}).get(prop, {}))
+            row["random_runs"] += applied(report.get("random_properties", {}).get(prop, {}))
+        properties[prop] = row
+    return {
+        "seed": seed, "runs": runs, "draws": REACH_DRAWS, "harnesses": harnesses, "properties": properties,
+        "unreached": sorted(prop for prop, row in properties.items() if row["random_runs"] == 0),
+        "failed": dict(sorted((failed or {}).items())),
+    }
+
+
+def reach(checkout, out, seed, runs, harness_runs, jobs):
+    """Run a mixed generator search on every generator harness, and return `reach.json`'s record."""
+    out = Path(out)
+    sim = build_sim(checkout, out / "reach" / "build.log")
+    if sim is None:
+        return {"error": "the zakura-sim build failed", "seed": seed, "runs": runs}
+    listed = subprocess.run([sim, "generators"], cwd=checkout, capture_output=True, text=True, check=False)
+    if listed.returncode != 0:
+        return {"error": f"`zakura-sim generators` exited {listed.returncode}", "seed": seed, "runs": runs}
+    generators = json.loads(listed.stdout)
+
+    def search(name):
+        directory = out / "reach" / harness_key(name)
+        argv = [sim, "generate", "--sim", name, "--seed", str(seed), "--runs", str(harness_runs.get(name, runs)),
+                "--draws", REACH_DRAWS, "--out", str(directory)]
+        ended = run_logged(argv, checkout, directory / "generate.log")
+        report = read_json(directory / GENERATE_FILE)
+        return name, report, search_failure(ended.code, report)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        ended = list(pool.map(search, reach_harnesses(generators)))
+    searches = {name: report for name, report, _ in ended}
+    failed = {name: reason for name, _, reason in ended if reason is not None}
+    return reach_report(generators, searches, seed, runs, failed)
+
+
 # Why the routine runs no row of each command kind but targets and tests.
 NOT_RUN_REASONS = {
     "planted": "the routine runs `planted loop` on mutation cases, not `cargo xtask planted`",
@@ -410,8 +629,8 @@ NOT_RUN_REASONS = {
 DERIVED_KINDS = ("harnesses", "properties", "coverage")
 
 
-def completeness(manifest, steps, suite_fuzz, loop_report):
-    """Return each manifest row as ran, not run with a reason, inconclusive or unimplemented.
+def completeness(manifest, steps, suite_fuzz, loop_report, reach_record=None):
+    """Return each manifest row as ran, not run with a reason, inconclusive or unimplemented, and each property's reach.
 
     `steps` maps each routine step to its exit status. The `suite` step runs
     every zakura-sim test row. `suite_fuzz` is `run`'s record, or None if it
@@ -467,7 +686,7 @@ def completeness(manifest, steps, suite_fuzz, loop_report):
             if lane["result"]["class"] in RUN_FAILURES:
                 inconclusive.append({"loop_case": case["patch"], "property": case["property"], "lane": name,
                                      "class": lane["result"]["class"], "reason": lane["result"].get("reason")})
-    return {
+    record = {
         "pinned": manifest["build"]["git"],
         "ran": ran,
         "not_run": not_run,
@@ -476,6 +695,16 @@ def completeness(manifest, steps, suite_fuzz, loop_report):
         "excluded": [{"id": row["id"], "reason": row["reason"]} for row in manifest.get("excluded", [])],
         "derived": {kind: len(manifest.get(kind, [])) for kind in DERIVED_KINDS},
     }
+    if reach_record is not None:
+        record["reach"] = {
+            prop: {"runs": row["runs"], "random_runs": row["random_runs"], "harnesses": row["harnesses"],
+                   **({"unsearched": row["unsearched"]} if row["unsearched"] else {})}
+            for prop, row in reach_record.get("properties", {}).items()
+        }
+        record["unreached"] = reach_record.get("unreached", [])
+        if "error" in reach_record:
+            inconclusive.append({"id": "reach", "reasons": [reach_record["error"]]})
+    return record
 
 
 def run_command(args):
@@ -528,9 +757,26 @@ def completeness_command(args):
         (routine or {}).get("steps", {}),
         read_json(args.suite_fuzz) if args.suite_fuzz else None,
         read_json(args.loop_report) if args.loop_report else None,
+        read_json(args.reach) if args.reach else None,
     )
     write_json(Path(args.out) / COMPLETENESS_FILE, record)
     return 0
+
+
+def reach_command(args):
+    harness_runs = {}
+    for value in args.harness_runs:
+        name, _, runs = value.partition("=")
+        harness_runs[name] = int(runs)
+    record = reach(Path(args.checkout).resolve(), Path(args.out).resolve(), args.seed, args.runs, harness_runs,
+                   args.jobs)
+    write_json(Path(args.out) / REACH_FILE, record)
+    if "error" in record:
+        print(record["error"], file=sys.stderr)
+        return 1
+    for name, reason in record["failed"].items():
+        print(f"{name}: {reason}", file=sys.stderr)
+    return int(bool(record["failed"]))
 
 
 def main(argv=None):
@@ -553,17 +799,28 @@ def main(argv=None):
     store.add_argument("--minimize-runs", type=int, default=MINIMIZE_RUNS,
                        help="the minimizer's runs per confirmed active failure; 0 turns minimization off")
     store.add_argument("--minimize-wall-secs", type=int, default=MINIMIZE_WALL_SECS, help="the minimizer's time limit")
+    searches = commands.add_parser("reach", help="search every generator harness with mixed draws, and count reach")
+    searches.add_argument("--checkout", required=True, help="the checkout to build zakura-sim from")
+    searches.add_argument("--out", required=True, help="where reach.json and each search go")
+    searches.add_argument("--seed", type=int, required=True, help="every search's seed")
+    searches.add_argument("--runs", type=int, default=30, help="each search's runs")
+    searches.add_argument("--harness-runs", action="append", default=[], metavar="HARNESS=RUNS",
+                          help="a harness's own runs, repeatable")
+    searches.add_argument("--jobs", type=int, default=4, help="how many searches run at once")
     account = commands.add_parser("completeness", help="diff the manifest's rows against what the routine ran")
     account.add_argument("--manifest", required=True, help="the frozen manifest")
     account.add_argument("--routine", help="the routine.json whose steps ran")
     account.add_argument("--suite-fuzz", help="the suite-fuzz.json `run` wrote, if it ran")
     account.add_argument("--loop-report", help="the loop's report.json, if it wrote one")
+    account.add_argument("--reach", help="the reach.json `reach` wrote, if it ran")
     account.add_argument("--out", required=True, help="where completeness.json goes")
     args = parser.parse_args(argv)
     if args.command == "run":
         return run_command(args)
     if args.command == "archive":
         return archive_command(args)
+    if args.command == "reach":
+        return reach_command(args)
     return completeness_command(args)
 
 

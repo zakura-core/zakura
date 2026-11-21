@@ -5,17 +5,11 @@ use super::{
     requester::{RequestError, Requester, ResponseError},
     wire::{Range, RangeEnding},
 };
-use crate::zakura::{
-    regulation::{ReservationPool, WriterFence},
-    CloseCause,
-};
+use crate::zakura::regulation::{ReservationPool, WriterFence};
 
 fn fence() -> (WriterFence, CancellationToken) {
     let connection = CancellationToken::new();
-    (
-        WriterFence::new(connection.clone(), CloseCause::default()),
-        connection,
-    )
+    (WriterFence::new(connection.clone()), connection)
 }
 
 fn range(start: u32, count: u32) -> Range {
@@ -330,4 +324,53 @@ fn unfinished_ranges_keep_capacity_and_do_not_extend_their_retirement_deadline()
     assert!(!book.blocks_retry(Height(1)));
     book.finish(RangeEnding::done(Height(2), 1)).unwrap();
     assert!(book.retirement_deadline(grace).is_none());
+}
+
+/// An honest server's ready-order output can put one body from each other
+/// running job between a range's last body and its ending. So the ending's
+/// clock starts after those bodies' floor-rate transfer time, at most
+/// `PEER_EXECUTION - 1` protocol-maximum bodies. With no other live range,
+/// it starts at the claim.
+#[test]
+fn an_endings_clock_waits_for_the_bodies_that_can_precede_it() {
+    use std::time::Duration;
+    use zakura_chain::block::MAX_BLOCK_BYTES;
+    use zakura_rt::time::Instant;
+
+    use super::super::admission::min_rate_transfer_time;
+    use super::session::PEER_EXECUTION;
+
+    let grace = Duration::from_secs(32);
+    let max_body = u32::try_from(2 * MAX_BLOCK_BYTES).unwrap();
+    let ranges = u32::try_from(PEER_EXECUTION + 2).unwrap();
+    let (fence, _) = fence();
+    let pool = ReservationPool::new(usize::try_from(ranges).unwrap()).unwrap();
+    let mut book = Requester::new(usize::try_from(ranges).unwrap());
+    for start in 1..=ranges {
+        let byte = u8::try_from(start).unwrap();
+        book.reserve(
+            range(start, 1),
+            &[hash(byte)],
+            max_body,
+            pool.try_entry().unwrap(),
+            fence.open().unwrap(),
+        )
+        .unwrap();
+    }
+    let before = Instant::now();
+    book.claim_block(hash(1), 3).unwrap();
+    let after = Instant::now();
+    let ahead = min_rate_transfer_time((PEER_EXECUTION as u64 - 1) * MAX_BLOCK_BYTES);
+    let deadline = book.retirement_deadline(grace).unwrap();
+    assert!(before + grace + ahead <= deadline && deadline <= after + grace + ahead);
+
+    book.finish(RangeEnding::done(Height(1), 1)).unwrap();
+    for start in 3..=ranges {
+        book.retract(Height(start));
+    }
+    let before = Instant::now();
+    book.claim_block(hash(2), 3).unwrap();
+    let after = Instant::now();
+    let deadline = book.retirement_deadline(grace).unwrap();
+    assert!(before + grace <= deadline && deadline <= after + grace);
 }

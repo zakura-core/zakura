@@ -9,7 +9,6 @@ use std::{
 use zakura_network::zakura::{ZakuraBlockSyncConfig, ZAKURA_STREAM_BLOCK_SYNC};
 
 use crate::{
-    model::is_fault_cause,
     observe::{BlockSyncFact, Entry, SessionStepFact, TransportFact},
     peer::peer_of,
     property::{
@@ -70,9 +69,7 @@ fn honest_frame_judged<V: HonestPeers>(view: &V, log: &ObservationLog) -> bool {
         let connection = match &entry.obs {
             Observation::FrameJudged { connection, .. }
             | Observation::Misbehavior { connection } => *connection,
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
-                *connection
-            }
+            Observation::ConnectionClosed { connection, cause } if cause.is_fault() => *connection,
             _ => return false,
         };
         remote_of(&entries[..at], connection)
@@ -114,7 +111,7 @@ where
             {
                 verdict = Verdict::Holds;
             }
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause } if cause.is_fault() => {
                 punished.push((at, *connection, format!("a close with cause {cause}")));
             }
             Observation::Misbehavior { connection } => {

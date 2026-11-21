@@ -911,7 +911,10 @@ header hashes expected by live ranges. A block that does not match the next expe
 one live range MUST retire the connection as a local incompatibility, without a peer-fault report or
 penalty. Height-only requests do not commit the publisher to the requester's chain. The receiver
 MUST retain the exchange fences until connection cleanup and requeue unreceived work. Local waits
-for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits MUST NOT
+for decode or sequencer capacity MUST pause the ending deadline. After a range's last body, its
+ending deadline MUST first allow the floor-rate transfer time of the bodies that ready-order output
+can put before the ending: one per other running job, from ranges that still owe a body, at most
+`PEER_EXECUTION - 1` maximum-size bodies. Crediting local waits MUST NOT
 release reservations or excuse a withheld ending while the reader remains active. It SHOULD briefly
 avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across
 reconnects, without delaying other suppliers. Invalid framing, excess response bytes, and invalid
@@ -1055,7 +1058,9 @@ charge.
 - **Capacity**
   - requester: ids requested or awaiting a verdict per peer within a window that starts at 5,
     grows by one on each admitted body while full, up to what the peer's `Hello` serves, and
-    halves when requests miss their deadlines. Its requests also stay within 10,000,000 announced
+    halves when requests miss their deadlines. A `NotFound` for a fetch that still holds its
+    reservation, or any verdict but an admission, takes one off a window above 5, so each slot a
+    peer holds above 5 costs an admitted body. Its requests also stay within 10,000,000 announced
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
   - requester's pending ids: at most 8,000 per session. Past 256 in a session, an id is taken

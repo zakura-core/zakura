@@ -17,7 +17,7 @@
 //! no frame until the node's service attaches its response precheck, checks
 //! each header against the stream's table and that precheck before it
 //! forwards the frame, and holds the precheck until the connection closes.
-//! A refused header closes the connection with `ordered_read_rejected`, as
+//! A refused header closes the connection with its fault row, as
 //! the QUIC reader does, and the relay records that the node judged the
 //! frame. The relay then runs the QUIC worker's admission step on each
 //! admitted frame, which charges the connection's cadence buckets, and
@@ -62,8 +62,8 @@ use std::{
 use zakura_chain::block::{self, merkle, MAX_BLOCK_BYTES};
 use zakura_network::zakura::{
     block_sync_streams, framed_channel, read_framed_channel, BlockSyncMessage, BlockSyncStatus,
-    CloseCauseReader, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, StreamReader,
-    MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
+    CloseCauseReader, CloseOutcome, Frame, FramedRecv, FramedSend, MessageRole, MessageRule,
+    StreamReader, MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
 };
 use zakura_rt::time::Instant;
 use zakura_scheduler::{hooks, SimInstant};
@@ -1067,7 +1067,7 @@ impl Wire {
 
     /// Each connection that closed since the last call, with its cause.
     /// Its exchanges end.
-    pub(crate) fn closes(&self) -> Vec<(u64, &'static str)> {
+    pub(crate) fn closes(&self) -> Vec<(u64, CloseOutcome)> {
         let mut state = self.0.borrow_mut();
         let state = &mut *state;
         let mut closed = Vec::new();
@@ -1176,7 +1176,7 @@ async fn forward(
             // Record the judgment before the close, which the tap can see
             // as soon as the reader refuses.
             wire.refused(connection, seq);
-            reader.refuse();
+            reader.refuse(&frame);
             return;
         }
         if let Err(cause) = admission.admit(&frame) {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased_named;
@@ -6,8 +6,12 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_rt::sync::mpsc;
 use zakura_rt::{
     collections::HashMap,
-    sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError,
+    },
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -28,15 +32,15 @@ use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
     handle_pipe_exit,
     regulation::{
-        CadenceSendError, CadenceSender, Current, ExchangeWriter, Replacement, SessionKey,
-        SessionTable, WriterFence,
+        CadenceSendError, CadenceSender, Current, ExchangeWriter, SessionKey, SessionTable,
+        SharedBucket, StallClose, WriterFence,
     },
     spawn_supervised_pipe,
     transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
-    BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
-    ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
-    ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
+    BoxRunFuture, CloseCause, CloseOutcome, CloseRow, Frame, FramedRecv, FramedSend, NeutralCause,
+    OrderedSendError, Peer, Service, ServicePeerDirection, SessionDemand, SessionOpening,
+    SessionPolicy, Sink, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::{RegulationTap, SessionOrigin};
@@ -86,7 +90,7 @@ mod session_tests {
         for retire in [false, true] {
             let connection = CancellationToken::new();
             let close_cause = CloseCause::new();
-            let fence = WriterFence::new(connection.clone(), close_cause.clone());
+            let fence = WriterFence::new(connection.clone());
             let (send, mut outbound) = framed_channel(8);
             let subscriber =
                 Subscriber::new(REGTEST_HEADER_BYTES, fence.clone(), &framed_channel(1).1);
@@ -99,7 +103,7 @@ mod session_tests {
                 connection.clone(),
                 close_cause,
                 subscriber,
-                Arc::new(StdMutex::new(CadenceSender::new())),
+                Arc::new(HeaderConnectionState::new()),
             );
             session
                 .try_open(&status, &[genesis], AuxSchema::None, 4)
@@ -154,14 +158,32 @@ struct PeerSessionInner {
     /// The writer of the last `Open` this session queued. Each later `Grant`
     /// and `Close` follows it, so retirement that skips the `Open` skips them.
     open_writer: StdMutex<Option<ExchangeWriter>>,
-    /// The connection's `Status` cadence.
-    status: StatusCadence,
+    /// Completion of the current subscription's `Close` write, if queued.
+    close_write: StdMutex<Option<Arc<OnceLock<Instant>>>>,
+    connection: Arc<HeaderConnectionState>,
 }
 
-/// One connection's `Status` cadence, which every session of the connection
-/// shares, so a reopened stream cannot reset it. `Status` rows match on every
-/// network.
-type StatusCadence = Arc<StdMutex<CadenceSender<CommonMessage>>>;
+/// State shared by all header-sync sessions of one live connection.
+#[derive(Debug)]
+pub(super) struct HeaderConnectionState {
+    status: StdMutex<CadenceSender<CommonMessage>>,
+    stalled: AtomicBool,
+    /// The meter on the `Status` events this connection's sessions forward.
+    status_events: SharedBucket,
+    /// The meter on the locator walks this connection's `Open`s cost.
+    open_walks: SharedBucket,
+}
+
+impl HeaderConnectionState {
+    pub(super) fn new() -> Self {
+        Self {
+            status: StdMutex::new(CadenceSender::new()),
+            stalled: AtomicBool::new(false),
+            status_events: SharedBucket::new(super::peer::STATUS_EVENTS),
+            open_walks: SharedBucket::new(super::v9::OPEN_WALKS),
+        }
+    }
+}
 
 impl PeerSession {
     /// A session for `peer_id` that sends through `send`, subscribes with
@@ -176,7 +198,7 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
         subscriber: Subscriber,
-        status: StatusCadence,
+        connection: Arc<HeaderConnectionState>,
     ) -> Self {
         Self {
             peer_id,
@@ -189,7 +211,8 @@ impl PeerSession {
                 close_cause,
                 subscriber: StdMutex::new(subscriber),
                 open_writer: StdMutex::new(None),
-                status,
+                close_write: StdMutex::new(None),
+                connection,
             }),
             #[cfg(any(test, zakura_sim))]
             origin: None,
@@ -200,6 +223,14 @@ impl PeerSession {
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn with_origin(self, origin: Option<SessionOrigin>) -> Self {
         Self { origin, ..self }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_connection_state(mut self, connection: Arc<HeaderConnectionState>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the test sets connection state before sharing the session")
+            .connection = connection;
+        self
     }
 
     /// Where the transport got this session, if its [`Peer`] said.
@@ -284,7 +315,7 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
     ) -> Self {
-        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        let fence = WriterFence::new(cancel_token.clone());
         // An in-process reader with no frame header check.
         let subscriber = Subscriber::new(REGTEST_HEADER_BYTES, fence, &framed_channel(1).1);
         Self::new(
@@ -296,7 +327,7 @@ impl PeerSession {
             connection_cancel_token,
             close_cause,
             subscriber,
-            Arc::new(StdMutex::new(CadenceSender::new())),
+            Arc::new(HeaderConnectionState::new()),
         )
     }
 
@@ -320,8 +351,27 @@ impl PeerSession {
         self.inner.cancel_token.clone()
     }
 
+    /// The meter on the `Status` events this session's connection forwards.
+    pub(super) fn status_events(&self) -> SharedBucket {
+        self.inner.connection.status_events.clone()
+    }
+
+    /// Record a stall for this connection and close it after a repeat.
+    pub(super) fn note_stall(&self) {
+        if self.inner.connection.stalled.swap(true, Ordering::Relaxed) {
+            StallClose::new(
+                self.inner.connection_cancel_token.clone(),
+                self.inner.close_cause.clone(),
+            )
+            .close();
+        }
+    }
+
     pub(super) fn disconnect_for_port_panic(&self) {
-        self.inner.close_cause.record("header_port_panic");
+        self.inner.close_cause.record(CloseOutcome::neutral(
+            NeutralCause::LocalCancellation,
+            "header_port_panic",
+        ));
         self.inner.connection_cancel_token.cancel();
     }
 
@@ -329,7 +379,11 @@ impl PeerSession {
     /// validation. The subscription acknowledges no further cursor.
     pub(super) fn disconnect_for_header_fault(&self, id: u64) {
         self.subscriber().validation_failed(id);
-        self.inner.close_cause.record("header_peer_fault");
+        self.inner.close_cause.record(CloseOutcome::fault(
+            ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            CloseRow::HSYNC_CLOSE_33,
+        ));
         self.inner.connection_cancel_token.cancel();
     }
 
@@ -357,6 +411,7 @@ impl PeerSession {
     pub(super) fn try_send_status(&self, status: Status) -> Result<(), OrderedSendError> {
         let mut cadence = self
             .inner
+            .connection
             .status
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -402,6 +457,7 @@ impl PeerSession {
             return Err(OrderedSendError::Closed);
         }
         *self.open_writer() = Some(writer);
+        *self.close_write() = None;
         Ok(HeaderSyncRequestId::new(id).expect("subscription IDs are nonzero"))
     }
 
@@ -433,9 +489,26 @@ impl PeerSession {
         let Ok(update) = subscriber.close() else {
             return Ok(false);
         };
-        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
-            .map_err(|_| OrderedSendError::Closed)?;
+        let written_at = Arc::new(OnceLock::new());
+        slot.send_following_with_receipt(
+            update_frame(subscriber.header_bytes(), update),
+            &writer,
+            Some(written_at.clone()),
+        )
+        .map_err(|_| OrderedSendError::Closed)?;
+        *self.close_write() = Some(written_at);
         Ok(true)
+    }
+
+    pub(super) fn close_written_at(&self) -> Option<Instant> {
+        self.close_write().as_ref()?.get().copied()
+    }
+
+    fn close_write(&self) -> MutexGuard<'_, Option<Arc<OnceLock<Instant>>>> {
+        self.inner
+            .close_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The writer of the last `Open` this session queued, if any.
@@ -547,8 +620,8 @@ pub struct HeaderSyncService {
     /// Orders admission checks with the table, so an older connection never
     /// replaces a newer one's session.
     admission: StdMutex<()>,
-    /// Each live connection's `Status` cadence.
-    status_cadences: StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>>,
+    /// State that lives until the transport removes each connection.
+    connection_states: StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), Arc<HeaderConnectionState>>>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
 }
@@ -558,7 +631,10 @@ impl HeaderSyncService {
     /// observer's capacity handle, if there is one
     /// ([`super::observe::ReactorEvent::ServiceSizes`]).
     #[cfg(any(test, zakura_sim))]
-    fn report_cadences(&self, cadences: &HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>) {
+    fn report_cadences(
+        &self,
+        cadences: &HashMap<(ZakuraPeerId, ZakuraConnId), Arc<HeaderConnectionState>>,
+    ) {
         let Some(observer) = &self.header_sync.credit_observer else {
             return;
         };
@@ -574,7 +650,7 @@ impl HeaderSyncService {
             header_sync,
             sessions: Arc::default(),
             admission: StdMutex::new(()),
-            status_cadences: StdMutex::new(HashMap::new()),
+            connection_states: StdMutex::new(HashMap::new()),
             service_demand: None,
         }
     }
@@ -719,7 +795,10 @@ impl Service for HeaderSyncService {
             || peer.negotiated & ZAKURA_CAP_HEADER_SYNC == 0
             || send.max_capacity() < 2
         {
-            peer.close_cause().record("header_sync_regulation_contract");
+            peer.close_cause().record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "header_sync_regulation_contract",
+            ));
             peer.cancel_token().cancel();
             return;
         }
@@ -733,7 +812,7 @@ impl Service for HeaderSyncService {
         let service_cancel_token = peer.service_cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        let fence = WriterFence::new(service_cancel_token.clone());
         {
             let _admission = self
                 .admission
@@ -753,37 +832,33 @@ impl Service for HeaderSyncService {
                 fence: fence.clone(),
                 session: peer.direction,
             };
-            if matches!(
-                self.sessions.replace(peer_id.clone(), current),
-                Replacement::Refused
-            ) {
-                return;
-            }
+            self.sessions.replace(peer_id.clone(), current);
         }
 
         #[cfg(not(any(test, zakura_sim)))]
-        let status = self
-            .status_cadences
+        let connection_state = self
+            .connection_states
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry((peer_id.clone(), conn_id))
-            .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+            .or_insert_with(|| Arc::new(HeaderConnectionState::new()))
             .clone();
         // The same insert, reported under the same lock, since a simulated
         // lock is a scheduling point.
         #[cfg(any(test, zakura_sim))]
-        let status = {
+        let connection_state = {
             let mut cadences = self
-                .status_cadences
+                .connection_states
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let status = cadences
+            let state = cadences
                 .entry((peer_id.clone(), conn_id))
-                .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+                .or_insert_with(|| Arc::new(HeaderConnectionState::new()))
                 .clone();
             self.report_cadences(&cadences);
-            status
+            state
         };
+        let open_walks = connection_state.open_walks.clone();
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
@@ -801,7 +876,7 @@ impl Service for HeaderSyncService {
             connection_cancel_token.clone(),
             close_cause.clone(),
             subscriber,
-            status,
+            connection_state,
         );
         #[cfg(any(test, zakura_sim))]
         let session = session.with_origin(origin);
@@ -812,6 +887,7 @@ impl Service for HeaderSyncService {
             session_id,
             send,
             service_cancel_token.clone(),
+            open_walks,
         ); (
             recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)),
             self.header_sync.credit_tap(&peer_id, session_id),
@@ -822,6 +898,7 @@ impl Service for HeaderSyncService {
         let pipe_cancel = service_cancel_token.clone();
         let protocol_connection_cancel = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
+        let stream_failure = recv.failure_cause();
         let pipe: BoxRunFuture<'static, ()> = Box::pin(async move {
             let Ok(admitted) = admitted else {
                 return;
@@ -854,6 +931,7 @@ impl Service for HeaderSyncService {
             };
             handle_pipe_exit(
                 "header-sync",
+                (ZAKURA_STREAM_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION),
                 &protocol_connection_cancel,
                 &protocol_close_cause,
                 result,
@@ -864,19 +942,31 @@ impl Service for HeaderSyncService {
         let teardown_sessions = self.sessions.clone();
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
+        let teardown_connection = connection_cancel_token.clone();
         let on_teardown = move || {
             teardown_sessions.remove(&teardown_peer, key);
             // Replaced sessions still own a reserved teardown slot. The reactor checks generations.
-            let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
-                peer: teardown_peer,
-                session_id,
-                reason: teardown_close_cause.get_or("stream_closed"),
-            });
+            let event = if !teardown_connection.is_cancelled()
+                && stream_failure.and_then(|cause| cause.get())
+                    == Some(crate::zakura::transport::OrderedStreamFailure::ReadTimeout)
+            {
+                Event::PeerReadTimedOut {
+                    peer: teardown_peer,
+                    session_id,
+                }
+            } else {
+                Event::PeerDisconnected {
+                    peer: teardown_peer,
+                    session_id,
+                    reason: teardown_close_cause.get_or("stream_closed"),
+                }
+            };
+            let _ = teardown_handle.send_lifecycle(event);
         };
         let panic_connection_cancel = connection_cancel_token.clone();
         let panic_close_cause = close_cause.clone();
         let on_panic = move || {
-            panic_close_cause.record("service_panic");
+            panic_close_cause.record(CloseOutcome::SERVICE_PANIC);
             panic_connection_cancel.cancel();
         };
         spawn_supervised_pipe(
@@ -911,7 +1001,7 @@ impl Service for HeaderSyncService {
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         #[cfg(not(any(test, zakura_sim)))]
-        self.status_cadences
+        self.connection_states
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(peer.clone(), conn_id));
@@ -919,7 +1009,7 @@ impl Service for HeaderSyncService {
         #[cfg(any(test, zakura_sim))]
         {
             let mut cadences = self
-                .status_cadences
+                .connection_states
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             cadences.remove(&(peer.clone(), conn_id));
@@ -952,7 +1042,9 @@ impl Service for HeaderSyncService {
 }
 
 /// Spawn the publisher for one session of `peer`, on a network whose headers
-/// take `header_bytes`. Returns its handle and its task.
+/// take `header_bytes`, metering its `Open` walks with its connection's
+/// `open_walks`. Returns its handle and its task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_publisher(
     header_sync: &HeaderSyncHandle,
     header_bytes: usize,
@@ -960,6 +1052,7 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
+    open_walks: SharedBucket,
     #[cfg(any(test, zakura_sim))] tap: (Option<RegulationTap<u64>>, Option<super::v9::CreditTap>),
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
@@ -970,9 +1063,9 @@ fn spawn_publisher(
     };
     let limits = header_sync.page_limits;
     if header_bytes == REGTEST_HEADER_BYTES {
-        sim_arg!(Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        sim_arg!(Publisher::spawn_metered::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel, open_walks); tap)
     } else {
-        sim_arg!(Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        sim_arg!(Publisher::spawn_metered::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel, open_walks); tap)
     }
 }
 

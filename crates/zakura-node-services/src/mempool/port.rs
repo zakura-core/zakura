@@ -66,6 +66,11 @@ pub const MAX_PENDING: usize = 500;
 /// Provisional.
 pub const MAX_READMITTING: usize = 400;
 
+/// Slots that `tx-relay` fetches can hold at once, so a fetch window held
+/// open by peers never takes the slots local submissions, legacy peers and
+/// re-admissions need. Provisional.
+pub const MAX_RELAYED: usize = 250;
+
 /// Entries the change log keeps. A reader that falls further behind
 /// resynchronizes from the snapshot. The pool's 8,000 transactions plus a
 /// ring of 16,384 removals.
@@ -662,6 +667,9 @@ pub enum PoolCommand {
     Reserve {
         /// The transaction id.
         tx_id: UnminedTxId,
+        /// Whether a `tx-relay` fetch asks, which also needs room under
+        /// [`MAX_RELAYED`].
+        relayed: bool,
         /// Where the answer goes.
         reply: oneshot::Sender<Result<Reservation, Unreserved>>,
     },
@@ -820,9 +828,33 @@ impl PoolHandle {
         tx_id: UnminedTxId,
         deadline: Instant,
     ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
+        self.reserve_as(tx_id, false, deadline).await
+    }
+
+    /// [`Self::reserve`] for a `tx-relay` fetch, which also needs room under
+    /// [`MAX_RELAYED`].
+    pub async fn reserve_relayed(
+        &self,
+        tx_id: UnminedTxId,
+        deadline: Instant,
+    ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
+        self.reserve_as(tx_id, true, deadline).await
+    }
+
+    /// Sends a reserve command and waits for its answer until `deadline`.
+    async fn reserve_as(
+        &self,
+        tx_id: UnminedTxId,
+        relayed: bool,
+        deadline: Instant,
+    ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
         by(deadline, async {
             let (reply, answer) = oneshot::channel();
-            let command = PoolCommand::Reserve { tx_id, reply };
+            let command = PoolCommand::Reserve {
+                tx_id,
+                relayed,
+                reply,
+            };
             if self.commands.send(command).await.is_err() {
                 return Err(Unreserved::Stopped);
             }

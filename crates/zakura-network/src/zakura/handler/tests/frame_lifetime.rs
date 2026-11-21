@@ -675,7 +675,8 @@ impl RequestResponseService for CountedRequests {
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
-            LegacyRequestFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+            LegacyRequestFrame::decode_frame(frame)
+                .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_23, error))?;
             self.started.fetch_add(1, Ordering::Relaxed);
             let _release = self.release.acquire().await;
             Ok(self.answer.clone())
@@ -685,7 +686,7 @@ impl RequestResponseService for CountedRequests {
     fn check_request(&self, _stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
         LegacyRequestFrame::decode_frame(frame.clone())
             .map(drop)
-            .map_err(SinkReject::protocol)
+            .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_23, error))
     }
 }
 
@@ -1094,7 +1095,7 @@ async fn an_already_stopped_call_reports_its_protocol_fault() -> Result<(), BoxE
     zakura_rt::pin!(stopped);
     let response = call_until_stopped(&context.connection_token, call(trailing), stopped).await;
     assert!(
-        matches!(response, Some(Err(SinkReject::Protocol(_)))),
+        matches!(response, Some(Err(SinkReject::Protocol(..)))),
         "the stop hid a protocol fault: {response:?}"
     );
     assert_eq!(requests.calls(), 0);

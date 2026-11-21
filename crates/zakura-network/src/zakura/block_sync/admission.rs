@@ -12,7 +12,13 @@ use super::{
 /// Minimum rate used for deadline estimates. One maximum-size body adds about
 /// eight seconds; earlier unreceived bodies add their bounded transfer estimates.
 /// A session with no accepted progress still reaches its separate liveness limit.
-const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+pub(super) const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// Time to move `bytes` at [`DEADLINE_MIN_BYTES_PER_SEC`], the slowest rate a
+/// block-sync deadline allows. A 2 MB body adds about eight seconds.
+pub(super) fn min_rate_transfer_time(bytes: u64) -> Duration {
+    Duration::from_millis(bytes.saturating_mul(1000) / DEADLINE_MIN_BYTES_PER_SEC)
+}
 
 /// Estimated resident-memory multiple of a *decoded* block body's serialized size.
 ///

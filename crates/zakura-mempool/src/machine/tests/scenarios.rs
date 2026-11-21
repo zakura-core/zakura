@@ -304,6 +304,7 @@ fn transactions_waiting_after_a_reset_count_against_the_cost_limit() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     bench.admit(&txs[0]);
@@ -338,6 +339,7 @@ fn a_block_that_mines_a_waiting_transaction_takes_it_out_of_the_queue() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     bench.admit(&txs[0]);
@@ -366,6 +368,7 @@ fn an_authorization_admitted_first_takes_the_place_of_the_one_waiting() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     let (waiter, job) = bench.start(&other);
@@ -463,6 +466,7 @@ fn five_slots() -> Bench {
         Limits {
             pending: 5,
             readmitting: 4,
+            relayed: 5,
         },
     )
 }
@@ -547,6 +551,7 @@ fn the_ids_a_reservation_would_refuse_are_known() {
         Limits {
             pending: 1,
             readmitting: 1,
+            relayed: 1,
         },
     );
     let mut bench = readmitting;

@@ -829,6 +829,20 @@ impl PeerWorkQueue {
         true
     }
 
+    /// Count `peer`'s staged headers as progress when its round staged a fair
+    /// share, [`MAX_HEADER_CHUNK_RESERVATION_V1`], since the last count.
+    ///
+    /// The peer picks its own page size, so one filled reservation proves
+    /// little: at one header per page, a peer could hold its round with one
+    /// header per request timeout (F-198).
+    pub(in crate::zakura::header_sync) fn credit_staged_share(
+        &mut self,
+        peer: &ZakuraPeerId,
+    ) -> bool {
+        self.policy
+            .credit_staged(peer, MAX_HEADER_CHUNK_RESERVATION_V1)
+    }
+
     /// Move `peer`'s staged headers into preparation. See [`WorkPolicy::begin_prepare`].
     pub(in crate::zakura::header_sync) fn begin_prepare(
         &mut self,
@@ -1458,13 +1472,17 @@ mod tests {
                 queue.stage(
                     peer(marker),
                     advertisement(marker),
-                    PeerWorkPriority::Normal
+                    PeerWorkPriority::LowerComparableWork
                 ),
                 QueueWorkResult::NeedsLocator
             );
         }
         assert_eq!(
-            queue.stage(peer(17), advertisement(17), PeerWorkPriority::Normal),
+            queue.stage(
+                peer(17),
+                advertisement(17),
+                PeerWorkPriority::LowerComparableWork
+            ),
             QueueWorkResult::AtCapacity
         );
 
@@ -1508,11 +1526,7 @@ mod tests {
         let request = queue.active(&peer(1)).expect("the request started").clone();
         assert_ne!(request.incarnation(), WorkIncarnation::UNSTARTED);
         assert_eq!(
-            queue.stage(
-                peer(1),
-                advertisement(43),
-                PeerWorkPriority::HigherComparableWork
-            ),
+            queue.stage(peer(1), advertisement(43), PeerWorkPriority::Normal),
             QueueWorkResult::AlreadyActive
         );
         assert_eq!(queue.active(&peer(1)), Some(&request));
@@ -1528,17 +1542,51 @@ mod tests {
             PeerWorkPriority::Normal
         );
         assert_eq!(
-            queue.stage(
-                peer(17),
-                advertisement(17),
-                PeerWorkPriority::HigherComparableWork,
-            ),
-            QueueWorkResult::NeedsLocator
+            queue.stage(peer(17), advertisement(17), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator,
+            "a normal offer supersedes unstarted work that claims less work"
         );
         let expected = advertisement(17);
         assert!(queue
             .awaiting(&peer(17), 7, hash(17), expected.scope)
             .is_some());
+    }
+
+    /// F-829: a status's claimed work is unauthenticated, so a claim above
+    /// the node's own ranks with an equal or incomparable one and can't
+    /// supersede another peer's unstarted work.
+    ///
+    /// This fails if a higher claim earns a priority of its own again.
+    #[test]
+    fn a_higher_work_claim_cannot_supersede_unstarted_work() {
+        assert_eq!(
+            PeerWorkPriority::from_work_order(Some(std::cmp::Ordering::Greater)),
+            PeerWorkPriority::Normal
+        );
+        assert_eq!(
+            PeerWorkPriority::from_work_order(Some(std::cmp::Ordering::Less)),
+            PeerWorkPriority::LowerComparableWork
+        );
+        let mut queue = PeerWorkQueue::default();
+        for marker in 1..=16 {
+            assert_eq!(
+                queue.stage(
+                    peer(marker),
+                    advertisement(marker),
+                    PeerWorkPriority::from_work_order(None)
+                ),
+                QueueWorkResult::NeedsLocator
+            );
+        }
+        assert_eq!(
+            queue.stage(
+                peer(17),
+                advertisement(17),
+                PeerWorkPriority::from_work_order(Some(std::cmp::Ordering::Greater))
+            ),
+            QueueWorkResult::AtCapacity
+        );
+        assert!(queue.awaiting_target(&peer(1)).is_some());
     }
 
     #[test]
@@ -1552,11 +1600,7 @@ mod tests {
             QueueWorkResult::NeedsLocator
         );
         assert_eq!(
-            queue.stage_distinct_target(
-                peer(2),
-                target.clone(),
-                PeerWorkPriority::HigherComparableWork
-            ),
+            queue.stage_distinct_target(peer(2), target.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::TargetAlreadyAssigned
         );
         assert_eq!(queue.len(), 1);

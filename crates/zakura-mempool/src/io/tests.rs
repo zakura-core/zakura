@@ -210,6 +210,7 @@ impl Harness {
             Limits {
                 pending: 5,
                 readmitting: 4,
+                relayed: 5,
             },
         )
     }

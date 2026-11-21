@@ -871,6 +871,9 @@ impl HeaderSyncReactor {
                 session_id,
                 reason,
             } => self.handle_peer_disconnected(&peer, session_id, reason),
+            Event::PeerReadTimedOut { peer, session_id } => {
+                self.stall_session(&peer, session_id, "frame_read_timeout");
+            }
             Event::AdvisorySummary { .. } => {}
             Event::Status {
                 peer,
@@ -1266,10 +1269,48 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
+        if self.waits_for_owed_pass(&peer, &status) {
+            // The new status supersedes the peer's unstarted target, as when
+            // header room holds the status back.
+            self.peer_work_queue.remove_unstarted(&peer);
+            return;
+        }
         // This offer is considered synchronously. If it remains blocked, changing
         // its payload cannot make another peer eligible. Shared ownership and
         // effective locator claims below invalidate the global pass when needed.
         self.consider_advertised_header_target(peer, session_id, status);
+    }
+
+    /// Whether `peer`'s fresh `status` waits for the owed cached pass,
+    /// because staging it now would overtake an offer that the pass owes a
+    /// turn first.
+    ///
+    /// A pass is owed when it waits for its refill, or when an eligibility
+    /// input changed since the last pass. The second case covers a release
+    /// earlier in the same reactor turn: the pass at the turn's end runs
+    /// after this status, so without the guard the status would take the
+    /// freed target or slot first.
+    ///
+    /// Started work can't take a new target. Unstarted work takes it in its
+    /// own slot, so it can overtake only an offer that waits for that target.
+    fn waits_for_owed_pass(&self, peer: &ZakuraPeerId, status: &Status) -> bool {
+        if !self.cached_pass_owed() || self.peer_work_queue.active(peer).is_some() {
+            return false;
+        }
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            return false;
+        };
+        let priority = PeerWorkPriority::of_status(status, local);
+        let target = status.selected_tip_hash;
+        match self.peer_work_queue.awaiting_target(peer) {
+            Some(current) => {
+                current.status.selected_tip_hash != target
+                    && self
+                        .state
+                        .overtakes_waiting_for_target(peer, priority, target)
+            }
+            None => self.state.overtakes_waiting(peer, priority, target),
+        }
     }
 
     /// Stage ordinary work for `peer`'s latest status.
@@ -1293,6 +1334,7 @@ impl HeaderSyncReactor {
             status,
         };
         let work_order = target.claimed_work_order(local);
+        let priority = PeerWorkPriority::from_work_order(work_order);
         let decision = decide_offer(
             OfferFacts {
                 pruned_pause: self.state.pruned_pause_holds(
@@ -1369,10 +1411,15 @@ impl HeaderSyncReactor {
                         }
                     );
                 }
+                // Header room is shared like a staging slot, so the offer
+                // keeps its turn for the room.
+                if !self.ordinary_discovery_paused() {
+                    self.state.note_waiting_for_slot(&peer, priority);
+                }
                 self.peer_work_queue.remove_unstarted(&peer)
             }
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
-            OfferDecision::Stage => self.stage_offer(peer, target, work_order),
+            OfferDecision::Stage => self.stage_offer(peer, target, priority),
         }
     }
 
@@ -1381,7 +1428,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         target: AdvertisedHeaderTarget,
-        work_order: Option<std::cmp::Ordering>,
+        priority: PeerWorkPriority,
     ) {
         let session_id = target.session_id;
         let target_tip_hash = target.status.selected_tip_hash;
@@ -1391,16 +1438,16 @@ impl HeaderSyncReactor {
             .awaiting_target(&peer)
             .map(|target| self.pending_locator_header_count(&target.status));
         let next_claim = self.pending_locator_header_count(&target.status);
-        match self.peer_work_queue.stage_distinct_target(
-            peer.clone(),
-            target,
-            PeerWorkPriority::from_work_order(work_order),
-        ) {
+        match self
+            .peer_work_queue
+            .stage_distinct_target(peer.clone(), target, priority)
+        {
             QueueWorkResult::NeedsLocator => {
                 if previous_claim.is_some_and(|claimed| claimed != next_claim) {
                     self.state.bump_scheduling_revision();
                 }
                 self.state.spend_status(&peer);
+                self.state.take_turn(&peer);
                 if self
                     .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                         peer: peer.clone(),
@@ -1417,9 +1464,12 @@ impl HeaderSyncReactor {
                 metrics::counter!("sync.header.target.already_active").increment(1);
             }
             QueueWorkResult::TargetAlreadyAssigned => {
+                self.state
+                    .note_waiting_for_target(&peer, priority, target_tip_hash);
                 metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
             }
             QueueWorkResult::AtCapacity => {
+                self.state.note_waiting_for_slot(&peer, priority);
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
                 observe!(
                     self,
@@ -1443,6 +1493,14 @@ impl HeaderSyncReactor {
             available_locators: self.locator_capacity.available_permits(),
             resource_stalled: self.ordinary_discovery_paused(),
         }
+    }
+
+    /// Whether a cached pass is owed: it waits for its refill, or an
+    /// eligibility input changed since the last pass, so the pass at the end
+    /// of this reactor turn runs.
+    fn cached_pass_owed(&self) -> bool {
+        self.state.cached_pass_deferred
+            || self.state.last_scheduling_opportunity != Some(self.scheduling_opportunity())
     }
 
     /// Stage idle unspent offers only after an eligibility input changes.
@@ -1486,6 +1544,7 @@ impl HeaderSyncReactor {
             );
             row.insert(hs_trace::PEERS_CONSIDERED.into(), peers.into());
         });
+        self.state.clear_waiting();
         let offers = self.state.cached_offers(
             local,
             |peer| self.peer_work_queue.has_work(peer),
@@ -1497,16 +1556,28 @@ impl HeaderSyncReactor {
                     .session_id()
             },
         );
-        for (peer, target) in offers {
+        for (peer, priority, target) in offers {
             if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
+                // The pass would serve this offer next. Every later offer
+                // comes after it in the pass, so its place covers theirs.
+                self.state.note_waiting_for_slot(&peer, priority);
                 break;
             }
             // Leave a held-back status unspent without counting it as refused on every event.
             if self
                 .peer_work_queue
                 .is_target_assigned(target.status.selected_tip_hash)
-                || self.ordinary_headroom(&peer, &target.status) == 0
             {
+                self.state.note_waiting_for_target(
+                    &peer,
+                    priority,
+                    target.status.selected_tip_hash,
+                );
+                continue;
+            }
+            if self.ordinary_headroom(&peer, &target.status) == 0 {
+                // Header room is shared like a staging slot.
+                self.state.note_waiting_for_slot(&peer, priority);
                 continue;
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);
@@ -1674,10 +1745,10 @@ impl HeaderSyncReactor {
             self.reject_page(peer, session_id);
             return;
         }
-        self.reset_unproductive_requests(&peer, session_id);
-        self.state
-            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
-
+        // A staged page is not progress yet (#2248): a peer could drip one
+        // header per deadline and hold its reservation. Progress is a
+        // prepared target, or a round that staged a fair share of headers
+        // since its last progress.
         let active = self
             .peer_work_queue
             .active(&peer)
@@ -1699,10 +1770,30 @@ impl HeaderSyncReactor {
                 if bounded_prefix && facts.checkpoint_prefix_ready {
                     metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
                 }
+                // The peer delivered the round. Its own deadline must not
+                // retire a prepare still running near it.
+                self.state.arm_request_deadline(
+                    peer.clone(),
+                    Instant::now(),
+                    self.startup.request_timeout,
+                );
                 self.prepare_staged_work(&peer, bounded_prefix);
             }
-            PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+            PageNext::Continue { staged_tip } => {
+                if self.peer_work_queue.credit_staged_share(&peer) {
+                    self.note_request_progress(&peer, session_id);
+                }
+                self.continue_round(&peer, staged_tip);
+            }
         }
+    }
+
+    /// Count progress on `peer`'s request from `session_id`: clear its
+    /// strikes and give the request a full timeout.
+    fn note_request_progress(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        self.reset_unproductive_requests(peer, session_id);
+        self.state
+            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
     }
 
     /// Judge a page for `peer`'s selected-range repair, and retry the repair
@@ -2296,11 +2387,7 @@ impl HeaderSyncReactor {
                         return;
                     }
                 }
-                self.state.arm_request_deadline(
-                    peer.clone(),
-                    Instant::now(),
-                    self.startup.request_timeout,
-                );
+                self.note_request_progress(&peer, active.owner.session_id());
                 assert!(
                     self.peer_work_queue.begin_apply(&peer),
                     "the exact preparing request passed the completion gate"
@@ -3190,8 +3277,23 @@ impl HeaderSyncReactor {
         if !self.state.charge_unproductive_request(peer, limit) {
             return false;
         }
-        self.drop_unproductive_peer(peer, session_id, reason);
+        self.stall_session(peer, session_id, reason);
         true
+    }
+
+    /// Apply the shared stall rule (`regulation::stall`) to `peer`'s exact
+    /// session: drop it and start the readmission cooldown, and close its
+    /// connection if that connection stalled before.
+    fn stall_session(&mut self, peer: &ZakuraPeerId, session_id: u64, reason: &'static str) {
+        let Some(handles) = self.sessions.get(peer) else {
+            return;
+        };
+        if handles.session.session_id() != session_id {
+            return;
+        }
+        let session = handles.session.clone();
+        session.note_stall();
+        self.drop_unproductive_peer(peer, session_id, reason);
     }
 
     /// Clears `peer`'s strike count after its session supplies usable work.
@@ -3208,7 +3310,9 @@ impl HeaderSyncReactor {
             .is_some_and(|handles| handles.session.session_id() == session_id)
     }
 
-    /// Closes one exact unproductive session and blocks its readmission for the cooldown.
+    /// Ends one exact unproductive session and blocks its readmission for the
+    /// cooldown. The session's fence resets any open subscription's streams;
+    /// the connection stays.
     fn drop_unproductive_peer(
         &mut self,
         peer: &ZakuraPeerId,
@@ -3278,8 +3382,8 @@ impl HeaderSyncReactor {
     /// its target after a committed prefix.
     ///
     /// A subscription kept for the next round still holds its `Open`'s
-    /// started exchange, so retiring the session while it is open closes the
-    /// connection, as during a round. The next round resumes it, or the peer's
+    /// started exchange, so retiring the session while it is open resets the
+    /// session, as during a round. The next round resumes it, or the peer's
     /// next status that cannot closes it; see
     /// [`Self::consider_advertised_header_target`].
     fn cancel_active_request(&mut self, active: &ActiveHeaderRequest) {
@@ -3306,13 +3410,10 @@ impl HeaderSyncReactor {
             return;
         };
         let session_id = handles.session.session_id();
-        let refused = matches!(handles.session.try_close(), Err(OrderedSendError::Full));
-        let attempt = if refused {
-            CloseAttempt::Refused
-        } else {
-            CloseAttempt::Sent {
-                live: handles.session.subscriber().live().is_some(),
-            }
+        let attempt = match handles.session.try_close() {
+            Err(OrderedSendError::Full) => CloseAttempt::Refused,
+            Ok(queued) => CloseAttempt::Sent { live: queued },
+            Err(_) => CloseAttempt::Sent { live: false },
         };
         self.state.record_close_attempt(
             peer,
@@ -3341,13 +3442,30 @@ impl HeaderSyncReactor {
     /// by its deadline.
     fn retire_unanswered_closes(&mut self, now: Instant) {
         for (peer, session_id) in self.state.take_expired_closes(now) {
-            let unanswered = self.sessions.get(&peer).is_some_and(|handles| {
+            let Some(handles) = self.sessions.get(&peer).filter(|handles| {
                 handles.session.session_id() == session_id
                     && handles.session.subscriber().live().is_some()
-            });
-            if unanswered {
-                metrics::counter!("sync.header.subscription.close_timed_out.total").increment(1);
-                self.drop_unproductive_peer(&peer, session_id, "unresponsive");
+            }) else {
+                continue;
+            };
+            // A queued Close does not start the peer's response time. Wait until
+            // the transport has accepted the whole frame before charging a stall.
+            let deadline = handles
+                .session
+                .close_written_at()
+                .map(|written_at| written_at + self.startup.request_timeout);
+            match deadline {
+                Some(deadline) if deadline <= now => {
+                    metrics::counter!("sync.header.subscription.close_timed_out.total")
+                        .increment(1);
+                    self.stall_session(&peer, session_id, "unresponsive");
+                }
+                _ => {
+                    let check_at = deadline.unwrap_or(now + state::CLOSE_RETRY_INTERVAL);
+                    self.state
+                        .close_deadlines
+                        .insert(peer, (session_id, check_at));
+                }
             }
         }
     }

@@ -1,0 +1,11 @@
+# Daily cleanup, before the joint run at 04:00 UTC.
+[Unit]
+Description=Daily cleanup of the sim host's old build trees and run directories
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

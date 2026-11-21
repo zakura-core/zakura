@@ -84,11 +84,37 @@ pending bypass. It reports coverage only: no row it lists fails the unit.
 Each target's smoke and build take minutes. Size `--fuzz-seconds` and
 `--fuzz-jobs` so that a run fits the unit's 36-hour timeout.
 
+## Cleanup
+
+A second timer, `zakura-mutation-joint-cleanup.timer`, runs
+`scripts/mutation_joint_cleanup.py` daily at 03:00 UTC, before the routine.
+Under each `--root` it deletes three kinds of directory:
+
+- cargo target directories;
+- the routine's runs under `<state>/runs/`, other than the runs a
+  `latest*.json` names;
+- the `builds/` directory of each campaign store outside `<state>/campaigns/`.
+
+It deletes each one that didn't change for `--max-age-days` (3). If the disk
+is then over `--disk-limit` (80%), it deletes the rest, least recently
+changed first, until the disk is below the limit. It never deletes what
+changed in the last 6 hours, which a running job may still use. It keeps
+every `--keep` path, the cumulative reports, `latest*.json`, `<state>/archive/`
+and the live campaign stores under `<state>/campaigns/`. A live store stays
+whole, because `sim-campaign verify` reads the build of every run the store
+records. `ZAKURA_CLEANUP_ARGS` in `/etc/zakura-mutation-joint.env` sets the
+roots, keeps and limits. Preview a cleanup with `--dry-run`:
+
+```sh
+python3 scripts/mutation_joint_cleanup.py --state <dir> --root /root --dry-run
+```
+
 ## Install
 
-Install it as root on the host with `deploy/mutation-joint/install.sh`, then
-set the budget in `/etc/zakura-mutation-joint.env`. Check a configuration
-without running anything:
+Install both timers as root on the host with
+`deploy/mutation-joint/install.sh`, then set the budget in
+`/etc/zakura-mutation-joint.env`. Check a configuration without running
+anything:
 
 ```sh
 python3 scripts/mutation_joint_run.py routine --checkout <dir> --state <dir> --dry-run

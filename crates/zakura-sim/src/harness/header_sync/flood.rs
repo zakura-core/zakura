@@ -2,19 +2,25 @@
 //! ([`FloodScenario`]), where a node-side commit publishes a new committed
 //! state while 16 mirrors flood one of the reactor's event queues. Its one
 //! scenario byte picks the fixture, and the rest of an input is Plan bytes.
-//! It checks the watch properties besides `header-sync/storage`'s.
+//! It checks `header-sync/watch-observed-under-lifecycle-flood` besides
+//! `header-sync/storage`'s properties.
+//!
+//! The wire fixture once had its own property,
+//! `header-sync/watch-observed-under-flood`, and a committed seed. Both are
+//! retired. Each session's reader meters `Status` at 2 events plus one per
+//! 500 ms. That meter bounds the wire queue, so 16 flooding mirrors no
+//! longer keep it loaded when the commit lands, and no plan reaches the
+//! property's trigger history. The lifecycle property's planted cases carry
+//! the same patches, so they keep #1566's top-of-turn watch check covered.
 
 use serde::{Deserialize, Serialize};
-use zakura_network::zakura::observe::EventQueue;
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
     StorageScenario, StorageView, Weights,
 };
 use crate::{
-    domain::header_sync::{
-        watch_end_violations, watch_observed_under_flood, watch_observed_under_lifecycle_flood,
-    },
+    domain::header_sync::{watch_end_violations, watch_observed_under_lifecycle_flood},
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -57,14 +63,6 @@ pub enum FloodScenario {
 }
 
 impl FloodScenario {
-    /// The event queue this fixture floods.
-    pub fn queue(self) -> EventQueue {
-        match self {
-            FloodScenario::Wire => EventQueue::Wire,
-            FloodScenario::Lifecycle => EventQueue::Lifecycle,
-        }
-    }
-
     /// The storage scenario this fixture runs.
     pub fn storage(self) -> StorageScenario {
         let at_tip = || MirrorSpec {
@@ -161,15 +159,13 @@ impl HasView for Flood {
         self.0.ended(end);
     }
 
-    /// The storage harness's end violations, then the flooded queue's watch
-    /// property's ([`watch_end_violations`]).
+    /// The storage harness's end violations, then, on the lifecycle
+    /// fixture, the watch property's ([`watch_end_violations`]).
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = self.0.end_violations(log);
-        found.extend(watch_end_violations(
-            &self.0.adoption,
-            self.1.queue(),
-            self.stopping(),
-        ));
+        if self.1 == FloodScenario::Lifecycle {
+            found.extend(watch_end_violations(&self.0.adoption, self.stopping()));
+        }
         found
     }
 
@@ -210,11 +206,10 @@ impl Subsystem for Flood {
         Flood(Storage::build(sim, &scenario.storage(), ports), *scenario)
     }
 
-    /// The storage harness's properties, then the two watch properties,
-    /// which apply only where a commit publishes during a flood.
+    /// The storage harness's properties, then the lifecycle watch property,
+    /// which applies only where a commit publishes during churn.
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
-        properties.push(watch_observed_under_flood());
         properties.push(watch_observed_under_lifecycle_flood());
         properties
     }

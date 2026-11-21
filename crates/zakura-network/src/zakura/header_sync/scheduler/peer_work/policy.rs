@@ -131,14 +131,7 @@ impl AdvertisedHeaderTarget {
 
     /// Compare claimed suffix work only when both snapshots use the same anchor.
     pub fn claimed_work_order(&self, local: &EngineSnapshot) -> Option<Ordering> {
-        let local_anchor = local.frontiers.finalized;
-        (self.status.work_anchor_height == local_anchor.height
-            && self.status.work_anchor_hash == local_anchor.hash)
-            .then(|| {
-                self.status
-                    .suffix_cumulative_work
-                    .cmp(&local.header_best_score.suffix_work.as_u256())
-            })
+        claimed_work_order(&self.status, local)
     }
 
     /// Whether this status names a different target that can actually serve a request.
@@ -173,6 +166,8 @@ pub struct ActiveHeaderRequest {
     pub common_ancestor: Option<Frontier>,
     /// Complete response pages staged without intermediate state mutation.
     pub entries: Vec<HeaderEntry>,
+    /// How many of `entries` already counted as the round's progress.
+    pub credited_entries: usize,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
     /// The round the queue assigned at start, or [`WorkIncarnation::UNSTARTED`] before it.
@@ -237,6 +232,7 @@ impl ActiveHeaderRequest {
             owner,
             common_ancestor: None,
             entries: Vec::new(),
+            credited_entries: 0,
             phase: HeaderTargetPhase::Receiving,
             incarnation: WorkIncarnation::UNSTARTED,
             cursor: None,
@@ -326,20 +322,45 @@ enum PeerWorkState {
 }
 
 /// Advisory discovery priority.
-/// The scheduler maps incomparable claims to normal priority.
+///
+/// A status's claimed work is unauthenticated, so a claim above the node's
+/// own work earns nothing: it ranks with equal and incomparable claims, and
+/// the rotation orders them. Otherwise an adversary could inflate its claim
+/// to stage ahead of every waiting offer, or to evict honest unstarted work,
+/// each time it reopens. A claim below the node's own work only hurts its
+/// claimant, so it ranks last.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::zakura::header_sync) enum PeerWorkPriority {
     LowerComparableWork,
     Normal,
-    HigherComparableWork,
+}
+
+/// Compare `status`'s claimed suffix work with `local`'s only when both use
+/// the same anchor.
+fn claimed_work_order(status: &Status, local: &EngineSnapshot) -> Option<Ordering> {
+    let local_anchor = local.frontiers.finalized;
+    (status.work_anchor_height == local_anchor.height
+        && status.work_anchor_hash == local_anchor.hash)
+        .then(|| {
+            status
+                .suffix_cumulative_work
+                .cmp(&local.header_best_score.suffix_work.as_u256())
+        })
 }
 
 impl PeerWorkPriority {
+    /// The priority of an offer of `status` at `local`.
+    pub(in crate::zakura::header_sync) fn of_status(
+        status: &Status,
+        local: &EngineSnapshot,
+    ) -> Self {
+        Self::from_work_order(claimed_work_order(status, local))
+    }
+
     pub(in crate::zakura::header_sync) fn from_work_order(order: Option<Ordering>) -> Self {
         match order {
-            Some(Ordering::Greater) => Self::HigherComparableWork,
             Some(Ordering::Less) => Self::LowerComparableWork,
-            Some(Ordering::Equal) | None => Self::Normal,
+            Some(Ordering::Greater | Ordering::Equal) | None => Self::Normal,
         }
     }
 }
@@ -1119,6 +1140,24 @@ impl WorkPolicy {
         self.request_mut(peer)
     }
 
+    /// Count `peer`'s staged headers as progress when the round staged at
+    /// least `share` of them since the last count. Returns whether it counted.
+    pub(super) fn credit_staged(&mut self, peer: &ZakuraPeerId, share: usize) -> bool {
+        let Some(request) = self.request_mut(peer) else {
+            return false;
+        };
+        if request
+            .entries
+            .len()
+            .saturating_sub(request.credited_entries)
+            < share
+        {
+            return false;
+        }
+        request.credited_entries = request.entries.len();
+        true
+    }
+
     fn request_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut ActiveHeaderRequest> {
         match self.work_by_peer.get_mut(peer) {
             Some(PeerWorkState::Active { request, .. }) => Some(request),
@@ -1195,6 +1234,7 @@ impl WorkPolicy {
             },
         };
         request.phase = HeaderTargetPhase::Preparing;
+        request.credited_entries = 0;
         Some(HeaderPortOperation::PrepareHeaderTarget {
             purpose: request.purpose.clone(),
             peer: peer.clone(),

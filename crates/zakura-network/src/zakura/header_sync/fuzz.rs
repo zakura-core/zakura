@@ -1000,11 +1000,10 @@ fn session(flags: u8) -> u64 {
 }
 
 fn priority(flags: u8) -> PeerWorkPriority {
-    match (flags >> 2) % 3 {
-        0 => PeerWorkPriority::LowerComparableWork,
-        1 => PeerWorkPriority::Normal,
-        2 => PeerWorkPriority::HigherComparableWork,
-        _ => unreachable!("the priority is reduced modulo three"),
+    if flags & 0b100 == 0 {
+        PeerWorkPriority::LowerComparableWork
+    } else {
+        PeerWorkPriority::Normal
     }
 }
 

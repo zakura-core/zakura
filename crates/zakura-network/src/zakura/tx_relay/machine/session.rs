@@ -131,6 +131,18 @@ impl PeerMachine {
         self.ended
     }
 
+    /// The time of its last input.
+    #[cfg(zakura_sim)]
+    pub(crate) fn clock(&self) -> Time {
+        self.now
+    }
+
+    /// Whether its peer's park let it in, so a stall closes its connection.
+    #[cfg(zakura_sim)]
+    pub(crate) fn readmitted(&self) -> bool {
+        self.readmitted
+    }
+
     // Inputs from its peer.
 
     /// The peer's `Hello` arrived.
@@ -354,7 +366,10 @@ impl PeerMachine {
         // Either way the peer had its try at this entry.
         self.tried(shared, id, request.generation);
         if let Some(reservation) = request.reservation {
-            // The fetch ended without a body, which the pool logs.
+            // The fetch ended without a body, which the pool logs. A
+            // `NotFound` past the deadline held no slot, and the deadline
+            // already shrank the window.
+            self.state.not_admitted();
             self.reservations.remove(&reservation);
             shared
                 .effects
@@ -513,7 +528,9 @@ impl PeerMachine {
         let Some((id, generation)) = self.state.submissions.remove(&waiter) else {
             return self.settle(shared, pool);
         };
-        if full && verdict == Verdict::Admitted {
+        if verdict != Verdict::Admitted {
+            self.state.not_admitted();
+        } else if full {
             let serves = self
                 .state
                 .hello

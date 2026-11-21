@@ -8,13 +8,18 @@
 //!
 //! The layout validator sizes buckets for a connection-wide outage. A single
 //! stream can stall longer while sibling streams keep the connection alive.
-//! Exhaustion therefore measures a burst, not a protocol violation. The reader
-//! records exhaustion and forwards the frame. Local read pauses add tokens.
+//! Exhaustion therefore measures a burst, not a protocol violation, and never
+//! closes. Local read pauses add tokens. On exhaustion, the reader of a
+//! stream whose every row is paced ([`parks_on_exhaustion`]) waits for the
+//! row's next token, so QUIC flow control slows the sender. Any other reader
+//! records exhaustion and forwards the frame, and its service meters the
+//! row's work itself.
 //!
 //! A [`MessageRole::Metered`] row is charged by payload bytes instead, in a
 //! [`ByteBucket`] that belongs to the connection as the cadence buckets do.
 //! Its depth already covers every byte a conformant sender can have buffered,
-//! so an overrun is a violation and closes the connection.
+//! so an overrun is a violation and closes the connection. It starts at the
+//! sender's opening allowance, so a reconnect buys no more than that.
 //!
 //! Rows without a cadence or a byte rate charge nothing. Commitments bound
 //! requests, and reservations bound responses.
@@ -37,8 +42,11 @@
 //! | A byte bucket pays its depth back to back, then refills at its rate | `a_byte_bucket_pays_its_depth_then_refills_at_its_rate` |
 //! | A metered row overruns only past the receiver's depth | `a_metered_row_overruns_only_past_the_receivers_depth` |
 //! | A conformant sender that stalls and resumes is never cut off | `a_sender_that_stalls_and_resumes_never_overruns_the_receiver` |
+//! | A receiver's byte bucket starts at the opening allowance from its epoch | `a_receivers_byte_bucket_starts_at_the_opening_allowance` |
 //! | Reopening sessions on one connection buys no bytes | `reopening_sessions_on_one_connection_buys_no_bytes` |
 //! | A charge reports a low bucket below a quarter of its capacity | `a_charge_reports_a_low_bucket_below_a_quarter_of_capacity` |
+//! | A parked frame takes the token due exactly one refill interval after the last | `a_parked_frame_takes_the_next_token_at_its_exact_instant` |
+//! | Only a stream whose every row is paced parks its reader | `only_streams_whose_every_row_is_paced_park` |
 
 use std::{sync::Arc, time::Duration};
 
@@ -73,7 +81,9 @@ pub(crate) enum CadenceCharge {
 /// Payload bytes earned at a fixed rate, up to a depth.
 ///
 /// The sender pays one for each metered frame before handing it on, and the
-/// receiver charges one for each metered frame it reads. Both start full.
+/// receiver charges one for each metered frame it reads. The sender's starts
+/// full. The receiver's starts at the sender's depth, earned from an epoch
+/// no later than the sender's could start. See [`Self::receiver`].
 #[derive(Clone, Debug)]
 pub(crate) struct ByteBucket {
     depth: u64,
@@ -94,13 +104,30 @@ impl ByteBucket {
     }
 
     /// A receiver's bucket for `rate` on a connection whose stream receive
-    /// window is `receive_window`. See [`ByteRate::receiver_depth`].
-    pub(crate) fn receiver(rate: ByteRate, receive_window: u64, now: Instant) -> Self {
-        Self::new(
-            rate.receiver_depth(receive_window),
-            rate.receiver_bytes_per_second(),
-            now,
-        )
+    /// window is `receive_window`, refilled to `now` from `epoch`. See
+    /// [`ByteRate::receiver_depth`].
+    ///
+    /// It holds the opening allowance at `epoch`, not its depth. A conformant
+    /// sender's bucket starts at that allowance no earlier than `epoch`, so
+    /// until this bucket first fills it has paid at most the allowance plus
+    /// its rate times the time since, which this bucket covers. Once full,
+    /// the depth covers the rest. So a fresh connection buys only the
+    /// allowance.
+    pub(crate) fn receiver(
+        rate: ByteRate,
+        receive_window: u64,
+        epoch: Instant,
+        now: Instant,
+    ) -> Self {
+        let depth = rate.receiver_depth(receive_window);
+        let mut bucket = Self {
+            depth,
+            bytes_per_second: rate.receiver_bytes_per_second(),
+            tokens: u64::from(rate.opening_allowance).min(depth),
+            last_refill: epoch.min(now),
+        };
+        bucket.refill(now);
+        bucket
     }
 
     fn new(depth: u64, bytes_per_second: u64, now: Instant) -> Self {
@@ -282,6 +309,15 @@ impl Bucket {
         self.last_refill += interval.saturating_mul(earned);
     }
 
+    /// Refill a dispatch or admission budget. A full bucket cannot keep a
+    /// partial token, since the burst already spends the whole capacity.
+    pub(crate) fn refill_capped(&mut self, now: Instant) {
+        self.refill(now);
+        if self.is_full() {
+            self.last_refill = now;
+        }
+    }
+
     /// Takes one token after the caller refills the bucket.
     pub(crate) fn take(&mut self) -> bool {
         if self.tokens == 0 {
@@ -296,9 +332,19 @@ impl Bucket {
         self.tokens = self.tokens.saturating_add(1).min(self.cadence.capacity);
     }
 
+    /// The tokens the bucket holds after its latest refill.
+    pub(crate) fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
     /// Whether the bucket retains no debt after its latest refill.
     pub(crate) fn is_full(&self) -> bool {
         self.tokens >= self.cadence.capacity
+    }
+
+    /// When the bucket earns its next token, as of its latest refill.
+    pub(crate) fn next_token_at(&self) -> Instant {
+        self.last_refill + self.cadence.refill_interval
     }
 
     /// Check the bucket's invariants right after a refill at `now`: less than
@@ -332,6 +378,49 @@ impl Bucket {
     }
 }
 
+/// One [`Bucket`] that every session of a connection shares, made full at
+/// its first use. A peer that reopens a session gets no fresh burst.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedBucket {
+    cadence: Cadence,
+    bucket: Arc<zakura_rt::sync::Mutex<Option<Bucket>>>,
+}
+
+impl SharedBucket {
+    /// A bucket that `cadence` paces, not yet used.
+    pub(crate) fn new(cadence: Cadence) -> Self {
+        Self {
+            cadence,
+            bucket: Arc::default(),
+        }
+    }
+
+    /// Takes one token at `now`, or returns when the next one comes.
+    pub(crate) fn take(&self, now: Instant) -> Result<(), Instant> {
+        let mut bucket = self
+            .bucket
+            .lock()
+            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner);
+        let bucket = bucket.get_or_insert_with(|| Bucket::new(self.cadence, now));
+        bucket.refill(now);
+        if bucket.take() {
+            Ok(())
+        } else {
+            Err(bucket.next_token_at())
+        }
+    }
+
+    /// When the bucket earns its next token, as of its latest refill, or
+    /// `None` before its first use.
+    pub(crate) fn next_token_at(&self) -> Option<Instant> {
+        self.bucket
+            .lock()
+            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Bucket::next_token_at)
+    }
+}
+
 /// What [`CadenceLedger::charge`] did with one frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Charged {
@@ -353,8 +442,14 @@ struct CadenceLedger {
 
 impl CadenceLedger {
     /// Charge one frame of a row with `cadence` at `now`.
-    fn charge(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> Charged {
-        let bucket = self.bucket(key, cadence, now);
+    fn charge(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+        dispatch: bool,
+    ) -> Charged {
+        let bucket = self.bucket(key, cadence, now, dispatch);
         if !bucket.take() {
             return Charged::Exhausted;
         }
@@ -363,18 +458,43 @@ impl CadenceLedger {
         }
     }
 
+    /// Take a token of a row with `cadence` at `now` for a frame that found
+    /// the bucket empty, or return when the bucket earns its next token.
+    fn take_parked(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+    ) -> Result<(), Instant> {
+        let bucket = self.bucket(key, cadence, now, true);
+        if bucket.take() {
+            return Ok(());
+        }
+        Err(bucket.next_token_at())
+    }
+
     /// Credit a local read pause of `paused` to a row with `cadence` at `now`.
     fn credit_pause(&mut self, key: CadenceKey, cadence: Cadence, paused: Duration, now: Instant) {
-        self.bucket(key, cadence, now).credit_pause(paused);
+        self.bucket(key, cadence, now, false).credit_pause(paused);
     }
 
     /// The bucket of `key`, created full on first use and refilled to `now`.
-    fn bucket(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> &mut Bucket {
+    fn bucket(
+        &mut self,
+        key: CadenceKey,
+        cadence: Cadence,
+        now: Instant,
+        dispatch: bool,
+    ) -> &mut Bucket {
         let bucket = self
             .buckets
             .entry(key)
             .or_insert_with(|| Bucket::new(cadence, now));
-        bucket.refill(now);
+        if dispatch {
+            bucket.refill_capped(now);
+        } else {
+            bucket.refill(now);
+        }
         bucket
     }
 }
@@ -383,15 +503,19 @@ impl CadenceLedger {
 ///
 /// Created with the connection. Retiring a session or reopening a stream in
 /// the same connection does not refill them. A reconnect gets fresh buckets;
-/// connection admission bounds reconnects.
+/// connection admission bounds reconnects, and a byte bucket starts at its
+/// row's opening allowance, so a reconnect buys no more than that.
 #[derive(Debug)]
 pub(crate) struct CadenceBuckets<C: Clock = RealClock> {
     ledger: CadenceLedger,
-    /// The byte bucket of each metered row, made full on first use.
+    /// The byte bucket of each metered row, made on first use as
+    /// [`ByteBucket::receiver`] says.
     bytes: HashMap<CadenceKey, ByteBucket>,
     /// The stream receive window this node granted on the connection, which
     /// deepens each byte bucket.
     receive_window: u64,
+    /// The epoch each byte bucket earns from. See [`Self::with_metered_epoch`].
+    metered_epoch: Instant,
     clock: C,
 }
 
@@ -402,11 +526,13 @@ impl Default for CadenceBuckets<RealClock> {
 }
 
 impl<C: Clock> CadenceBuckets<C> {
+    /// Buckets read through `clock`, whose byte buckets earn from now.
     pub(crate) fn new(clock: C) -> Self {
         Self {
             ledger: CadenceLedger::default(),
             bytes: HashMap::new(),
             receive_window: 0,
+            metered_epoch: clock.now(),
             clock,
         }
     }
@@ -415,6 +541,14 @@ impl<C: Clock> CadenceBuckets<C> {
     /// `receive_window`, read when the connection starts.
     pub(crate) fn with_receive_window(mut self, receive_window: u64) -> Self {
         self.receive_window = receive_window;
+        self
+    }
+
+    /// These buckets with byte buckets that earn from `epoch`: an instant no
+    /// later than the peer could first pay for a metered frame on this
+    /// connection, so no later than it could read this node's handshake.
+    pub(crate) fn with_metered_epoch(mut self, epoch: Instant) -> Self {
+        self.metered_epoch = epoch;
         self
     }
 
@@ -437,6 +571,20 @@ impl<C: Clock> CadenceBuckets<C> {
         if let MessageRole::Metered { rate } = rule.role {
             return self.charge_bytes(layout, rule.message_type, rate, payload_len);
         }
+        self.charge_messages(layout, rule, false)
+    }
+
+    /// Charge one paced row when its ordered reader has a dispatch slot.
+    pub(crate) fn charge_dispatch(&mut self, layout: u16, rule: &MessageRule) -> CadenceCharge {
+        self.charge_messages(layout, rule, true)
+    }
+
+    fn charge_messages(
+        &mut self,
+        layout: u16,
+        rule: &MessageRule,
+        dispatch: bool,
+    ) -> CadenceCharge {
         let Some(cadence) = cadence(rule) else {
             return CadenceCharge::Exempt;
         };
@@ -444,7 +592,7 @@ impl<C: Clock> CadenceBuckets<C> {
             layout,
             message_type: rule.message_type,
         };
-        match self.ledger.charge(key, cadence, self.clock.now()) {
+        match self.ledger.charge(key, cadence, self.clock.now(), dispatch) {
             Charged::Exhausted => {
                 metrics::counter!(
                     "zakura.p2p.cadence.exhausted",
@@ -478,14 +626,14 @@ impl<C: Clock> CadenceBuckets<C> {
         payload_len: usize,
     ) -> CadenceCharge {
         let now = self.clock.now();
-        let receive_window = self.receive_window;
+        let (receive_window, epoch) = (self.receive_window, self.metered_epoch);
         let bucket = self
             .bytes
             .entry(CadenceKey {
                 layout,
                 message_type,
             })
-            .or_insert_with(|| ByteBucket::receiver(rate, receive_window, now));
+            .or_insert_with(|| ByteBucket::receiver(rate, receive_window, epoch, now));
         // Widening usize to u64 is lossless on supported targets.
         if bucket.try_pay(payload_len as u64, now) {
             return CadenceCharge::Admit;
@@ -497,6 +645,24 @@ impl<C: Clock> CadenceBuckets<C> {
         )
         .increment(1);
         CadenceCharge::Overrun
+    }
+
+    /// Take a token of `rule`'s bucket on `layout` for a parked frame: one
+    /// that [`Self::charge_frame`] found its row's bucket empty for. Returns
+    /// the instant the bucket earns its next token if it holds none now.
+    ///
+    /// A row without a cadence holds no bucket and takes nothing. The frame's
+    /// first charge took no token, so a parked frame pays exactly one token,
+    /// here.
+    pub(crate) fn take_parked(&mut self, layout: u16, rule: &MessageRule) -> Result<(), Instant> {
+        let Some(cadence) = cadence(rule) else {
+            return Ok(());
+        };
+        let key = CadenceKey {
+            layout,
+            message_type: rule.message_type,
+        };
+        self.ledger.take_parked(key, cadence, self.clock.now())
     }
 
     /// Credit a local read pause on a stream of `layout` that carries `rules`.
@@ -531,6 +697,36 @@ impl<C: Clock> CadenceBuckets<C> {
             })
             .map(|bucket| bucket.tokens)
     }
+}
+
+/// Whether the reader of a stream that carries `rules` parks on an empty
+/// cadence bucket, instead of recording the exhaustion and forwarding the frame.
+///
+/// A parked reader holds back every later frame of its stream too. So a reader
+/// parks only if every row of its stream is paced: each announcement and
+/// request declares a cadence, and each response answers a request of the
+/// same stream that declares one. A subscription's pages and a metered row are
+/// not paced by a cadence, nor is the work an uncadenced request asks for, so
+/// a park would stall that traffic. On such a stream, the service meters an
+/// announcement's work itself.
+pub(crate) fn parks_on_exhaustion(rules: &[MessageRule]) -> bool {
+    let paced_request = |message_type| {
+        MessageRule::find(rules, message_type).is_some_and(|request| {
+            matches!(
+                request.role,
+                MessageRole::Request {
+                    cadence: Some(_),
+                    ..
+                }
+            )
+        })
+    };
+    rules.iter().all(|rule| match rule.role {
+        MessageRole::Announcement { .. } => true,
+        MessageRole::Request { cadence, .. } => cadence.is_some(),
+        MessageRole::Response { request, .. } => paced_request(request),
+        MessageRole::Subscription { .. } | MessageRole::Metered { .. } => false,
+    })
 }
 
 /// The row's cadence, if it declares one.

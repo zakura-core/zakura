@@ -80,9 +80,14 @@
 //!   most what the peer's `Hello` serves. It grows by one, up to that, on
 //!   each admission of a body the session fetched while the window was
 //!   full, and halves, to no less than one, when requests miss their
-//!   deadlines, as block sync's window dips on a timeout. So a peer gets
+//!   deadlines, as block sync's window dips on a timeout. A `NotFound` for a
+//!   fetch that still holds its reservation, or any verdict but an
+//!   admission, takes one off a window above [`INITIAL_WINDOW`], so a peer
+//!   can't keep a grown window's pool slots at no cost with orphans that
+//!   park or a `NotFound` sent just before each deadline. So a peer gets
 //!   more than [`INITIAL_WINDOW`] bodies verified at once only after
-//!   bodies it supplied were admitted, and a new session starts again at
+//!   bodies it supplied were admitted, each slot past it costs one more
+//!   admission, and a new session starts again at
 //!   [`INITIAL_WINDOW`]. What the session asks for at once also stays
 //!   within [`MAX_OUTSTANDING_BYTES`] of announced sizes: the oldest ready
 //!   id that would pass it waits for bytes to free, so the deadline cap

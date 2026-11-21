@@ -9,7 +9,10 @@ use crate::zakura::ServicePeerLimits;
 pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
 pub(super) const REGTEST_HEADER_BYTES: usize = 177;
 const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 3;
+/// One unproductive request is a stall: the shared stall rule
+/// (`regulation::stall`) drops the session on the first and closes the
+/// connection on a second.
+const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 1;
 const DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Header-sync configuration nested under the Zakura P2P-v2 config.
@@ -23,9 +26,11 @@ pub struct ZakuraHeaderSyncConfig {
     pub status_refresh_interval: Duration,
     /// Header-sync peer caps and queue limits owned by this reactor.
     pub peer_limits: ServicePeerLimits,
-    /// Consecutive unproductive header requests before this node drops the peer's session.
+    /// Consecutive unproductive header requests that make one stall.
     ///
-    /// A deadline marks its request as unproductive.
+    /// A deadline marks its request as unproductive. The first stall drops
+    /// the peer's session and starts [`unproductive_peer_cooldown`](Self::unproductive_peer_cooldown).
+    /// A second stall on the same connection closes the connection.
     /// Do not charge a peer that reports the selected tip.
     /// Set this value to `0` to keep all peers.
     pub max_unproductive_header_requests: u32,

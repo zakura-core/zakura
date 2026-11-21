@@ -16,13 +16,14 @@
 //! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
 //!     [--also-violates <ids>]
 //!     [--against <confirmation.json>]
-//! zakura-sim properties --sim <name>
+//! zakura-sim properties --sim <name> [--untriggered]
 //! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
 //! zakura-sim verify-archive <dir>
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! zakura-sim targets --out <dir> [--target <name>]...
 //! zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>
-//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle] [--schedule plan|pct]
+//!     [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix]
+//!     [--schedule plan|pct|enumerate] [--family <name>[,<name>]...]
 //! zakura-sim generators
 //! ```
 //!
@@ -123,13 +124,13 @@ mod cli {
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
              [--also-violates <ids>]\n      \
              [--against <confirmation.json>]\n  \
-             zakura-sim properties --sim <name>\n  \
+             zakura-sim properties --sim <name> [--untriggered]\n  \
              zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
              [--target <t> --runs <n> --wall-secs <s> [--sanitizer address|none]] <input>...\n  \
              zakura-sim verify-archive <dir>\n  \
              zakura-sim generate --sim <name> --seed <n> --runs <n> --out <dir>\n      \
-             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle]\n      \
-             [--schedule plan|pct]\n  \
+             [--max-bytes <n>] [--exclude <file>] [--draws uniform|cycle|free|mix]\n      \
+             [--schedule plan|pct|enumerate] [--family <name>[,<name>]...]\n  \
              zakura-sim generators\n",
         );
         text.push_str(super::campaign::USAGE);
@@ -180,7 +181,8 @@ mod cli {
              `--against` also holds the input to an earlier confirmation's harness,\n\
              generator, build, assumptions and cleanup.\n\
              `properties` prints the ID of each property the harness registers, one\n\
-             per line.\n\
+             per line. `--untriggered` prints only those with no trigger-history check,\n\
+             which a witness test judges only as applicable.\n\
              `triage` records each input twice, each time in a fresh process killed after\n\
              --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
              and archives the input with its runs under --out. It exits 1 only if an input\n\
@@ -204,9 +206,17 @@ mod cli {
              there. It exits 0 once the report is written, whatever the search found.\n\
              --draws picks each run's scenario family: uniform (the default) from the\n\
              seed and the run alone, or cycle, which visits every family, each of its\n\
-             variants and one untagged run once per block of runs. --schedule pct makes\n\
-             each run's live picks with a PCT steer the input seeds, and saves a stopping\n\
-             run's input as the bytes that replay it with no steer.\n\
+             variants and one untagged run once per block of runs. free draws only the\n\
+             families that compose a scenario from their bytes. mix takes turns: a\n\
+             cycled family under the Plan, a cycled family under PCT, then a free draw\n\
+             under PCT or the Plan; it sets each run's schedule itself. --schedule pct\n\
+             makes each run's live picks with a PCT steer the input seeds, and saves a\n\
+             stopping run's input as the bytes that replay it with no steer. The report\n\
+             counts each property's outcomes over the free runs apart. --schedule\n\
+             enumerate runs every schedule of each drawn input with at most two delays\n\
+             from the first enabled action, breadth first, one run each, and counts\n\
+             the inputs whose every schedule ran. --family draws\n\
+             only the named families, and passes over every other draw.\n\
              ZAKURA_SIM_KNOWN=<id>[=<issue>],... makes every command treat each named\n\
              Active property as Known, so a search records its violations and goes on\n\
              past an open bug. Replaying such a trace needs the same value.\n\
@@ -890,16 +900,30 @@ mod cli {
     }
 
     /// `properties`: prints the ID of each property `--sim` registers, one
-    /// per line, in report order.
+    /// per line, in report order. With `--untriggered`, it prints only those
+    /// that register no trigger-history check.
     #[allow(clippy::print_stdout)]
     fn properties(args: Vec<String>) -> Result<(), Error> {
-        let sim = match <[String; 2]>::try_from(args) {
-            Ok([flag, sim]) if flag == "--sim" => sim,
-            _ => return Err(Error::Usage("`properties` takes --sim <name>".to_owned())),
+        let (sim, untriggered) = match args.as_slice() {
+            [flag, sim] if flag == "--sim" => (sim, false),
+            [flag, sim, only] if flag == "--sim" && only == "--untriggered" => (sim, true),
+            _ => {
+                return Err(Error::Usage(
+                    "`properties` takes --sim <name> [--untriggered]".to_owned(),
+                ))
+            }
         };
-        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
-        for property in (entry.properties)() {
-            println!("{}", property.id);
+        let entry = harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        let ids: Vec<String> = if untriggered {
+            (entry.untriggered)()
+        } else {
+            (entry.properties)()
+                .into_iter()
+                .map(|property| property.id)
+                .collect()
+        };
+        for id in ids {
+            println!("{id}");
         }
         Ok(())
     }
@@ -1119,8 +1143,9 @@ mod cli {
             "--exclude",
             "--draws",
             "--schedule",
+            "--family",
         ];
-        let mut flags: [Option<String>; 8] = Default::default();
+        let mut flags: [Option<String>; 9] = Default::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = names
@@ -1134,7 +1159,7 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        let [sim, seed, runs, out, max_bytes, exclude, draws, schedule] = flags;
+        let [sim, seed, runs, out, max_bytes, exclude, draws, schedule, family] = flags;
         let need = |value: Option<String>, flag: &str| {
             value.ok_or_else(|| Error::Usage(format!("`generate` needs {flag}")))
         };
@@ -1171,28 +1196,52 @@ mod cli {
             draw_policy: match draws.as_deref() {
                 None | Some("uniform") => DrawPolicy::Uniform,
                 Some("cycle") => DrawPolicy::Cycle,
+                Some("free") => DrawPolicy::Free,
+                Some("mix") if schedule.is_some() => {
+                    return Err(Error::Usage(
+                        "--draws mix sets each run's schedule, so it takes no --schedule"
+                            .to_owned(),
+                    ))
+                }
+                Some("mix") => DrawPolicy::Mix,
                 Some(other) => {
                     return Err(Error::Usage(format!(
-                        "--draws: `{other}` isn't uniform or cycle"
+                        "--draws: `{other}` isn't uniform, cycle, free or mix"
                     )))
                 }
             },
             schedule: match schedule.as_deref() {
                 None | Some("plan") => Schedule::Plan,
                 Some("pct") if entry.run_steered_bytes.is_some() => Schedule::Pct,
-                Some("pct") => {
+                Some("enumerate") if entry.run_steered_bytes.is_some() => Schedule::Enumerate,
+                Some(steered @ ("pct" | "enumerate")) => {
                     return Err(Error::Usage(format!(
-                        "--schedule pct: {} makes no picks to steer",
+                        "--schedule {steered}: {} makes no picks to steer",
                         entry.name
                     )))
                 }
                 Some(other) => {
                     return Err(Error::Usage(format!(
-                        "--schedule: `{other}` isn't plan or pct"
+                        "--schedule: `{other}` isn't plan, pct or enumerate"
                     )))
                 }
             },
+            families: family
+                .iter()
+                .flat_map(|names| names.split(','))
+                .map(str::to_owned)
+                .collect(),
         };
+        if let Some(unknown) = options.families.iter().find(|name| {
+            !(entry.families)()
+                .iter()
+                .any(|family| family.name == name.as_str())
+        }) {
+            return Err(Error::Usage(format!(
+                "--family: {} has no family `{unknown}`",
+                entry.name
+            )));
+        }
         let report = generate::generate(entry, &options).map_err(|error| {
             Error::Failed(format!(
                 "writing {} in {}: {error}",

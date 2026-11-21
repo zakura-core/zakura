@@ -6,6 +6,7 @@ mod eviction;
 mod observer;
 mod peer_faults;
 mod port_panics;
+mod progress;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;

@@ -11,8 +11,8 @@ use zakura_sim::{
     harness::{coverage::COVERAGE, HARNESSES},
     seed,
     suite::{
-        self, ExcludedTarget, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage,
-        SuiteFile, Target, NIGHTLY, SUITE_FILE,
+        self, ExcludedHarness, ExcludedTarget, Expect, Ignored, MissingTarget, Pending,
+        PendingKind, SimPackage, SuiteFile, Target, NIGHTLY, SUITE_FILE,
     },
 };
 
@@ -147,6 +147,7 @@ fn scratch_suite(tests: Option<&[&str]>, ignored: &[&str]) -> SuiteFile {
             .collect(),
         excluded_target: Vec::new(),
         missing_target: Vec::new(),
+        excluded_harness: Vec::new(),
         pending: Vec::new(),
     }
 }
@@ -179,11 +180,19 @@ fn the_committed_suite_covers_the_registry() {
         .sum();
     assert_eq!(manifest.properties.len(), pairs);
     assert_eq!(manifest.witnesses.len(), 2 * COVERAGE.len());
-    // Each harness has a seed set, and each one a target or a missing-target
-    // row.
+    // Each harness has a seed set, and each one a target, a missing-target
+    // row or an excluded-harness row.
     for row in &manifest.harnesses {
         assert!(manifest.seed_sets.iter().any(|set| set.id == row.seed_set));
-        assert_ne!(row.targets.is_empty(), row.missing_target.is_none());
+        assert_eq!(
+            row.targets.is_empty(),
+            row.missing_target.is_some() || row.excluded.is_some(),
+            "{row:?}"
+        );
+        assert!(
+            row.missing_target.is_none() || row.excluded.is_none(),
+            "{row:?}"
+        );
     }
     // Each row a command decides names one that exists.
     let mut ids = BTreeSet::new();
@@ -246,7 +255,7 @@ fn the_committed_suite_covers_the_registry() {
 #[test]
 fn a_harness_without_a_target_fails() {
     let mut suite = committed();
-    remove(&mut suite.missing_target, |row| {
+    remove(&mut suite.excluded_harness, |row| {
         row.harness == "header-sync/repair"
     });
     assert_problem(
@@ -267,12 +276,50 @@ fn a_harness_both_run_and_missing_fails() {
 }
 
 #[test]
+fn an_excluded_harness_a_target_runs_or_lists_as_missing_fails() {
+    let mut suite = committed();
+    for (harness, owner) in [
+        ("discovery/wait-complete", None),
+        ("header-sync/smoke", Some("none")),
+    ] {
+        suite.excluded_harness.push(ExcludedHarness {
+            harness: harness.to_owned(),
+            reason: "none".to_owned(),
+        });
+        if let Some(owner) = owner {
+            suite.missing_target.push(MissingTarget {
+                harness: harness.to_owned(),
+                owner: owner.to_owned(),
+                reason: "none".to_owned(),
+            });
+        }
+    }
+    suite.excluded_harness.push(ExcludedHarness {
+        harness: "no/such-harness".to_owned(),
+        reason: "none".to_owned(),
+    });
+    let problems = problems(&suite);
+    assert_problem(
+        &problems,
+        "a target runs the harness `discovery/wait-complete`, and qa/suite.toml still excludes it",
+    );
+    assert_problem(
+        &problems,
+        "both excludes the harness `header-sync/smoke` and lists it as a missing target",
+    );
+    assert_problem(
+        &problems,
+        "excludes the harness `no/such-harness`, which isn't registered",
+    );
+}
+
+#[test]
 fn a_target_covering_a_harness_its_harness_doesnt_compose_fails() {
     // `header-sync/smoke` reports no property, so no property check rejects
     // it, and `fixtures/all` checks none of `header-sync/repair`'s.
     let mut suite = committed();
     for harness in ["header-sync/smoke", "header-sync/repair"] {
-        remove(&mut suite.missing_target, |row| row.harness == harness);
+        remove(&mut suite.excluded_harness, |row| row.harness == harness);
         for target in &mut suite.target {
             if target.name == "race_fixtures" {
                 target.covers.push(harness.to_owned());
@@ -516,10 +563,10 @@ fn the_generated_coverage_joins_harnesses_and_machines() {
     );
     for row in &manifest.coverage {
         let missing = row.harnesses.iter().any(|harness| {
-            manifest
-                .harnesses
-                .iter()
-                .any(|entry| entry.harness == *harness && entry.missing_target.is_some())
+            manifest.harnesses.iter().any(|entry| {
+                entry.harness == *harness
+                    && (entry.missing_target.is_some() || entry.excluded.is_some())
+            })
         });
         assert!(missing || !row.targets.is_empty(), "{row:?}");
     }
@@ -581,12 +628,12 @@ fn a_simulator_target_neither_excluded_nor_mapped_fails() {
 fn an_ignored_test_the_suite_doesnt_list_fails() {
     let mut suite = committed();
     remove(&mut suite.ignored, |row| {
-        row.file == "crates/zakura-sim/tests/header_wire_lifecycle.rs"
-            && row.test == "regenerate_saved_plans"
+        row.file == "crates/zakura-sim/tests/header_wire_witness.rs"
+            && row.test == "regenerate_planted_scenarios"
     });
     assert_problem(
         &problems(&suite),
-        "crates/zakura-sim/tests/header_wire_lifecycle.rs::regenerate_saved_plans is ignored",
+        "crates/zakura-sim/tests/header_wire_witness.rs::regenerate_planted_scenarios is ignored",
     );
 }
 
@@ -704,10 +751,24 @@ fn a_registered_pending_row_fails() {
     );
 }
 
+/// A feature family none of whose required states waits leaves the
+/// pending rows.
+#[test]
+fn a_settled_pending_feature_fails() {
+    let mut suite = committed();
+    suite
+        .pending
+        .push(pending("feature/reorg-stage", PendingKind::Feature));
+    assert_problem(
+        &problems(&suite),
+        "lists `feature/reorg-stage` as pending, and no required state of it waits",
+    );
+}
+
 #[test]
 fn every_problem_is_reported_at_once() {
     let mut suite = committed();
-    remove(&mut suite.missing_target, |row| {
+    remove(&mut suite.excluded_harness, |row| {
         row.harness == "header-sync/flood"
     });
     remove(&mut suite.ignored, |row| {

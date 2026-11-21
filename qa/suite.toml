@@ -120,12 +120,6 @@ run = false
 reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
 
 [[ignored]]
-file = "crates/zakura-sim/tests/header_wire_prepare_fault.rs"
-test = "regenerate_late_fault_fixture"
-run = false
-reason = "a tool, not a test: it rewrites the committed late-fault fixture from its builders"
-
-[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false
@@ -405,109 +399,30 @@ package = "sim"
 name = "feedback_probe"
 reason = "runs no registered harness; `cargo xtask sim-feedback` builds it to check that libFuzzer keeps an input for a semantic feature alone"
 
-# Harnesses no target runs yet. Each stays in the report as unimplemented.
-[[missing-target]]
+# Harnesses no target runs by design (phase F of the property wrap-up).
+# Each is a fixed fixture whose input picks among a handful of scenarios,
+# so a target would fuzz only its schedule. Its tests still run in the
+# suite. The reach report (`scripts/suite_fuzz_run.py reach`) lists any
+# property that only these fixtures apply as a reach finding.
+[[excluded-harness]]
 harness = "header-sync/smoke"
-owner = "E5a"
-reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
+reason = "no peers and no storage scenario: it checks only the sim/* properties, which every harness checks"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/flood"
-owner = "E5a"
-reason = "no target: the harness has two fixed scenarios, the flood fixtures, and no plan maps it to a target"
+reason = "two fixed flood fixtures: header-sync/storage's grammar can't express 17 mirrors, Flood, Churn, Commit or an All trigger, so watch-observed-under-flood and watch-observed-under-lifecycle-flood stay witness-only; its storage properties are header-sync/storage's, which that grammar searches"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/release-wake"
-owner = "E5a"
-reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
+reason = "two fixed wake fixtures: the grammar can't express their long chains, the HeadroomWait trigger or the Settle source, and capacity-release-wakes needs the WakeFixture evidence its prepare arms; its storage properties are header-sync/storage's"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/repair"
-owner = "E5a"
-reason = "no target: the harness has four fixed scenarios, the repair fixtures, and no plan maps it to a target"
+reason = "four fixed repair fixtures: the grammar can't express RepairStatus, SessionEnded or Retired, or the checkpoint ceiling its prepare sets; it registers only header-sync/storage's properties, which that grammar searches"
 
-[[missing-target]]
+[[excluded-harness]]
 harness = "header-sync/liveness"
-owner = "E5a"
-reason = "no target: the harness has fixed scenarios, the hdr-10, hdr-11 and hdr-12 liveness fixtures, and no plan maps it to a target"
-
-# Planned rows from campaign.md's requirement map and the P4 plan. Each
-# stays in the report as unimplemented until its chunk registers it, and
-# then the check fails until its row here goes.
-[[pending]]
-id = "header-sync/committed-state-adopted-under-flood"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "sync/stale-block-completion-inert"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-# The protocol-state features of the G1–G3 plan's feature table, whose
-# first eight rows campaign.md's generator coverage map repeats. G2a and G2b
-# add the actions that reach them, and E2b collects them as fuzzer feedback.
-[[pending]]
-id = "feature/request-reset"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/completion-cancellation"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/competing-forks"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/replacement"
-kind = "feature"
-owner = "G2b/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/budget"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/regulation"
-kind = "feature"
-owner = "G2b/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/hold"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/reorg-stage"
-kind = "feature"
-owner = "G2b/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/recovery"
-kind = "feature"
-owner = "G2a/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
-
-[[pending]]
-id = "feature/teardown"
-kind = "feature"
-owner = "G2b/E2b"
-plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+reason = "42 fixed liveness fixtures: the grammar can't express an All trigger, hold deadlines, or the evidence and sources its prepare and build add, so hold-release-wakes stays witness-only; bounded-adversary-progress and the storage properties are header-sync/storage's"
 
 # Preserved machine drivers run without the simulator. The semantic work
 # target uses the shared artifact pipeline without starting Sim or QUIC.
@@ -662,4 +577,16 @@ package = "sim"
 name = "header_publisher_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
+timeout-secs = 1800
+
+# `tx-relay/wire` runs production `tx-relay` behind its real transport on
+# simulated QUIC, with a test pool. Its 24-byte prefix composes the pool's
+# verdicts, the node's own bodies, the links, and each peer's answers and
+# steps from `tx-relay`'s whole message alphabet, so the target fuzzes the
+# order, count and mix of the peers' messages.
+[[target]]
+package = "sim"
+name = "tx_relay_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800

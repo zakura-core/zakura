@@ -1178,6 +1178,7 @@ this release tolerates, and keep each hard change explicit.
 | X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; it completes against an independent implementation in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | Two production configs negotiate X25519MLKEM768; with a peer that has only ring's groups, as dialer and as listener, the handshake completes on X25519 with no HelloRetryRequest. Over QUIC, a dialer with only ring's groups reaches a production listener, and a production dialer reaches a listener with only ring's groups | TLS-9 |
+| Against the released `zakura-quic` 1.1.0, which has no hybrid group, this tree's endpoint dials and is dialed over loopback: both nodes are authenticated and a stream echoes, repeatedly, in both directions (`qa/quic-compat`) | TLS-9 |
 | The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A hello with no ALPN in common is cancelled when it fits one datagram and fails as a handshake when it spans two | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
@@ -1729,4 +1730,5 @@ Changed:
 - **§4.** The introduction no longer says the profile reproduces Iroh 1.1
   exactly: the key exchange now differs.
 - **§16.** Adds the rows for ML-KEM-768, the hybrid group, its fallback to
-  X25519, its seeded form and two-datagram admission.
+  X25519, handshakes with the released crate, its seeded form and
+  two-datagram admission.

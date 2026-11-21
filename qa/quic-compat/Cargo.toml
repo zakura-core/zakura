@@ -1,0 +1,19 @@
+[package]
+name = "zakura-quic-compat"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "Handshakes between this tree's zakura-quic and a released one."
+
+# A separate workspace: the released zakura-quic has the same name and
+# version as the one in this tree, which would make `-p zakura-quic`
+# ambiguous inside the main workspace.
+[workspace]
+
+[dev-dependencies]
+futures = "0.3.31"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
+zakura-quic = { path = "../../crates/zakura-quic" }
+# The release deployed nodes run. It offers X25519 and ring's other groups,
+# not the hybrid. Repin when a release changes the handshake.
+zakura-quic-released = { package = "zakura-quic", version = "=1.1.0" }

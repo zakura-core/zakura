@@ -139,7 +139,14 @@ fn announcing_a_gateway_requires_v2_p2p() {
         .expect("a legacy node that does not announce is valid");
     config.mining.miner_mesh = true;
     config.network.p2p_stack = P2pStack::Dual;
-    cmd.override_config(config).expect("a v2 node can announce");
+    cmd.override_config(config.clone())
+        .expect("a v2 node can announce");
+
+    // A gateway others cannot dial, or a node that builds no coinbase, only gets a warning.
+    config.network.zakura.listen_addr = None;
+    config.mining.miner_address = None;
+    cmd.override_config(config)
+        .expect("a gateway without a listen address or miner address still starts");
 }
 
 /// A gateway that cannot keep a key file would come back with a new ID, so it refuses to

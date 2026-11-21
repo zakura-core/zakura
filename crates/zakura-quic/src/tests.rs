@@ -593,7 +593,10 @@ async fn wrong_identity_is_refused() {
 async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let mut crypto = raw_client_builder_with(&server, rustls::crypto::ring::default_provider())
             .with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
@@ -1203,7 +1206,10 @@ async fn client_with_an_x509_style_certificate_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         // Borrow the RPK resolver's key, but present it as an X.509 chain.
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let key = rustls::client::ResolvesClientCert::resolve(&rpk, &[], &[]).unwrap();
         let mut crypto =
             raw_client_builder(&server).with_client_cert_resolver(Arc::new(NotRawPublicKey(key)));
@@ -1231,7 +1237,10 @@ async fn raw_client_with_the_profile_is_accepted() {
     // credential succeeds.
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         dial_raw(&server, crypto).await.unwrap();
@@ -2909,6 +2918,62 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
         server.handled.recv().await.unwrap();
         assert_eq!(server.seen.lock().unwrap().len(), 1);
         pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-4, ADM-1: with the composite credential and signature, the
+/// listener's whole first flight still fits QUIC's allowance before the
+/// dialer's address is validated, three times the 2,400 bytes of the hybrid
+/// hello. The dialer completes its handshake on that flight alone, so the
+/// larger signature adds no round trip.
+#[tokio::test(start_paused = true)]
+async fn the_listeners_first_flight_fits_the_amplification_limit() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let _server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = _server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
+        assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+
+        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        assert!(
+            flight <= 3 * hello,
+            "the listener sent {flight} bytes before validation"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight of {flight} bytes"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
     })
     .await
     .unwrap();

@@ -2,6 +2,7 @@ pub(super) mod gauge_recorder;
 mod progress;
 mod query_lifecycle;
 mod retention;
+mod rival_commit;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -362,6 +363,7 @@ fn committed_view(
     epoch: u64,
 ) -> zakura_header_chain::CommittedHeaderChainView {
     zakura_header_chain::CommittedHeaderChainView::new(
+        snapshot.frontiers.verified_best,
         snapshot,
         zakura_header_chain::BodyWorkEpoch::new(epoch),
     )
@@ -785,8 +787,8 @@ fn state_is_only_frontier_publisher() {
 
     assert!(
         STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER
-                .contains("fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect)"),
+            && STATE_PUBLISHER.contains("views: watch::Sender<CommittedHeaderChainView>")
+            && STATE_PUBLISHER.contains("self.views.send_replace("),
         "state must retain the sole committed-snapshot publisher"
     );
 }
@@ -12145,15 +12147,11 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
 #[tokio::test]
 async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = header_tip_startup(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(1), blocks[0].hash()),
-        tip_rx,
+    let finalized =
+        zakura_header_chain::Frontier::new(block::Height(0), blocks[0].header.previous_block_hash);
+    let parent = zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash());
+    let (snapshots, startup) = committed_block_sync_startup(
+        committed_snapshot(1, 1, 1, finalized, parent, parent),
         immediate_body_download_config(),
     );
     let (handle, mut actions, reactor_task) =
@@ -12173,9 +12171,11 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     )
     .await;
 
-    tip_tx
-        .send((block::Height(3), blocks[2].hash()))
-        .expect("tip watch is live");
+    let old_tip = zakura_header_chain::Frontier::new(block::Height(3), blocks[2].hash());
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(2, 2, 1, finalized, parent, old_tip),
+        0,
+    )));
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks { .. }
@@ -12192,14 +12192,21 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         (block::Height(2), 1)
     );
 
-    handle
-        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        }))
-        .await
-        .expect("reset event queues");
+    // Both publications happen before this current-thread reactor can poll the watch.
+    // The switch invalidated the request even though the latest transition only extended headers.
+    let replacement = forked_block(&blocks[1], 42);
+    let replacement_tip = zakura_header_chain::Frontier::new(block::Height(2), replacement.hash());
+    let mut child = (*blocks[2]).clone();
+    Arc::make_mut(&mut child.header).previous_block_hash = replacement.hash();
+    let extended_tip = zakura_header_chain::Frontier::new(block::Height(3), child.hash());
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(3, 3, 1, finalized, parent, replacement_tip),
+        1,
+    )));
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(4, 4, 1, finalized, parent, extended_tip),
+        1,
+    )));
     // The old range stays live until its ending, so the peer ends it before the
     // new fork's height 2 can be requested without overlap.
     send_inbound(
@@ -12212,11 +12219,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     .await;
     // reset (`reset_above`) and the producer are decoupled, so re-supply the
     // new-fork metadata on every query until the height-2 re-fetch appears.
-    let new_fork_meta = vec![BlockSyncBlockMeta {
-        height: block::Height(2),
-        hash: block::Hash([222; 32]),
-        size: BlockSizeEstimate::Advertised(block_size(&blocks[1])),
-    }];
+    let new_fork_meta = vec![block_meta(&replacement)];
     loop {
         tokio::select! {
             biased;
@@ -13142,88 +13145,6 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
-
-    reactor_task.abort();
-}
-
-/// A late commit can move the verified tip off the selected chain to the
-/// selected tip's height, as when a fork with more work replaces the
-/// committed block's height. The body-work epoch changes, and block sync
-/// resets its floor to the replaced block. Only storage's needed-blocks
-/// answer names the common ancestor, so block sync must still ask once its
-/// floor reaches the selected tip, and then reset to the ancestor.
-#[tokio::test]
-async fn off_selected_commit_at_the_selected_height_requeries_the_anchor() {
-    let ancestor = (2, block::Hash([0x02; 32]));
-    let replaced = (3, block::Hash([0x33; 32]));
-    let fork_tip = (3, block::Hash([0x43; 32]));
-    let initial = test_committed_snapshot(1, 1, 1, (0, block::Hash([0; 32])), ancestor, fork_tip);
-    let (snapshots, startup) =
-        committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let sequencer_view = handle
-        .routine_wiring
-        .as_ref()
-        .expect("the test reactor exposes routine wiring")
-        .view
-        .clone();
-    let answer = |query_id, scope| BlockSyncEvent::ScopedNeededBlocks {
-        query_id,
-        scope,
-        body_anchor: zakura_header_chain::Frontier::new(block::Height(ancestor.0), ancestor.1),
-        blocks: vec![BlockSyncBlockMeta {
-            height: block::Height(fork_tip.0),
-            hash: fork_tip.1,
-            size: BlockSizeEstimate::Unknown,
-        }],
-    };
-    let BlockSyncAction::QueryNeededBlocks {
-        query_id, scope, ..
-    } = next_action(&mut actions).await
-    else {
-        panic!("startup queries the needed blocks");
-    };
-    handle
-        .send(answer(query_id, scope))
-        .await
-        .expect("the startup answer queues");
-
-    // The replaced block commits after the fork took its height.
-    snapshots
-        .send(Some(committed_view(
-            test_committed_snapshot(2, 1, 2, (0, block::Hash([0; 32])), replaced, fork_tip),
-            1,
-        )))
-        .expect("the committed snapshot receiver is live");
-    await_until(
-        "the epoch change resets the floor to the replaced block",
-        Duration::from_secs(1),
-        || sequencer_view.borrow().verified_tip == block::Height(replaced.0),
-    )
-    .await
-    .expect("the epoch change resets block sync");
-
-    // Storage answers every query with the common ancestor.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while sequencer_view.borrow().verified_tip != block::Height(ancestor.0)
-        && Instant::now() < deadline
-    {
-        if let Ok(Some(BlockSyncAction::QueryNeededBlocks {
-            query_id, scope, ..
-        })) = tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
-        {
-            handle
-                .send(answer(query_id, scope))
-                .await
-                .expect("the answer queues");
-        }
-    }
-    assert_eq!(
-        sequencer_view.borrow().verified_tip,
-        block::Height(ancestor.0),
-        "block sync resets to the common ancestor"
-    );
 
     reactor_task.abort();
 }

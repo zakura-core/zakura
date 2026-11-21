@@ -5,5 +5,6 @@
 mod mining;
 mod prop;
 mod snapshot;
+mod submission_lifecycle;
 pub mod utils;
 mod vectors;

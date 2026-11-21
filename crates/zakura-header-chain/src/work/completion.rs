@@ -391,7 +391,12 @@ mod tests {
     #[test]
     fn compatible_body_completion_rebases_to_current_authority() {
         let source = SourceId::from_digest([7; 32]);
-        let before = CommittedHeaderChainView::new(snapshot(), crate::BodyWorkEpoch::new(4));
+        let initial = snapshot();
+        let before = CommittedHeaderChainView::new(
+            initial.frontiers.verified_best,
+            initial,
+            crate::BodyWorkEpoch::new(4),
+        );
         let owner = BodyWorkAuthority::for_view(&before)
             .bind(11, NonZeroU64::new(12).expect("twelve is nonzero"));
         let mut pending = PendingOwners::default();
@@ -405,7 +410,11 @@ mod tests {
         extended_snapshot.header_generation = HeaderGeneration::new(9);
         extended_snapshot.frontiers.header_best =
             Frontier::new(block::Height(11), block::Hash([8; 32]));
-        let extended = CommittedHeaderChainView::new(extended_snapshot, before.body_work_epoch);
+        let extended = CommittedHeaderChainView::new(
+            extended_snapshot.frontiers.verified_best,
+            extended_snapshot,
+            before.body_work_epoch,
+        );
         let rebased =
             BodyWorkAuthority::for_view(&extended).bind(owner.session_id, owner.request_id);
         assert_eq!(
@@ -413,8 +422,11 @@ mod tests {
             BodyCompletionDecision::Rebased(rebased)
         );
 
-        let invalidated =
-            CommittedHeaderChainView::new(extended.snapshot.clone(), crate::BodyWorkEpoch::new(5));
+        let invalidated = CommittedHeaderChainView::new(
+            extended.snapshot.frontiers.verified_best,
+            extended.snapshot.clone(),
+            crate::BodyWorkEpoch::new(5),
+        );
         assert_eq!(
             Gate::check_body(&invalidated, &pending, source, &owner),
             BodyCompletionDecision::Stale(StaleReason::BodyWorkEpoch)

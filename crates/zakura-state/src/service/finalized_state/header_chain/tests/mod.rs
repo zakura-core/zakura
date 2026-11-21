@@ -114,6 +114,12 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     fixture_for_network(network, block)
 }
 
+fn initial_publisher_view() -> CommittedHeaderChainView {
+    let (_, _, metadata) = fixture();
+    let snapshot = metadata.snapshot();
+    CommittedHeaderChainView::new(snapshot.frontiers.finalized, snapshot, Default::default())
+}
+
 fn mainnet_fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     let block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()

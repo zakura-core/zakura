@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "17.1.0"
+version = "18.0.0"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -72,11 +72,11 @@ zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
 zakura-script = { path = "../zakura-script", version = "5.0.8" }
-zakura-state = { path = "../zakura-state", version = "18.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.2.3" }
+zakura-state = { path = "../zakura-state", version = "19.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
 zakura-chain = { path = "../zakura-chain", version = "16.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "5.3.2" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "6.0.0" }
 
 zcash_protocol.workspace = true
 
@@ -99,7 +99,7 @@ toml = { workspace = true, features = ["display"] }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
-zakura-state = { path = "../zakura-state", version = "18.0.0", features = ["proptest-impl"] }
+zakura-state = { path = "../zakura-state", version = "19.0.0", features = ["proptest-impl"] }
 zakura-chain = { path = "../zakura-chain", version = "16.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 

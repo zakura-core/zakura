@@ -142,7 +142,8 @@ fn announcing_a_gateway_requires_v2_p2p() {
     cmd.override_config(config.clone())
         .expect("a v2 node can announce");
 
-    // A gateway others cannot dial, or a node that builds no coinbase, only gets a warning.
+    // A gateway others cannot dial, or a node that builds no coinbase, is warned about but
+    // not refused. The warnings themselves are not captured here.
     config.network.zakura.listen_addr = None;
     config.mining.miner_address = None;
     cmd.override_config(config)

@@ -1701,8 +1701,9 @@ Changed:
   and the QUIC packet keys `quinn-proto` needs. The group is built here
   from ring's X25519 and `libcrux-ml-kem`, and its combiner follows rustls'
   own. Both secrets go into the keys, so a break of ML-KEM, or a wrong
-  answer from its code, can fail a handshake but can't make one weaker than
-  X25519. A peer without
+  answer from its code, can fail a handshake but can't make its keys weaker
+  than X25519; a memory-safety fault in `libcrux-ml-kem`, which reads a
+  peer's share before authentication, is not covered. A peer without
   the group connects on X25519, so there is no protocol version or
   configuration change, and nothing requires the group. Authentication
   stays Ed25519: this protects recorded traffic, not a handshake that a

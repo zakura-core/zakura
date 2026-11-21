@@ -455,6 +455,17 @@ mod tests {
             self.exchange.complete(peer)
         }
 
+        fn hybrid_component(&self) -> Option<(rustls::NamedGroup, &[u8])> {
+            self.exchange.hybrid_component()
+        }
+
+        fn complete_hybrid_component(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete_hybrid_component(peer)
+        }
+
         fn pub_key(&self) -> &[u8] {
             &self.share
         }
@@ -466,37 +477,47 @@ mod tests {
 
     /// SEC-2: a production listener refuses the handshake when the dialer's
     /// hybrid share has the wrong length or carries an ML-KEM key that
-    /// fails the modulus check. It doesn't fall back to X25519.
+    /// fails the modulus check. The hello also carries a valid plain X25519
+    /// share, as a production hello does, and the listener doesn't fall back
+    /// to it.
     #[test]
     fn a_malformed_hybrid_share_fails_the_handshake() {
         fn one_byte_short(mut share: Vec<u8>) -> Vec<u8> {
             share.pop();
             share
         }
-        fn coefficient_at_the_modulus_limit(mut share: Vec<u8>) -> Vec<u8> {
+        fn coefficient_above_the_modulus(mut share: Vec<u8>) -> Vec<u8> {
             // The first 12-bit coefficient becomes 4,095, above q = 3,329.
             share[0] = 0xff;
             share[1] |= 0x0f;
             share
         }
         let alterations: [fn(Vec<u8>) -> Vec<u8>; 2] =
-            [one_byte_short, coefficient_at_the_modulus_limit];
+            [one_byte_short, coefficient_above_the_modulus];
         for alter in alterations {
             let dialer_key = NodeSecretKey::generate();
             let listener_key = NodeSecretKey::generate();
             let group: &'static Altered = Box::leak(Box::new(Altered { alter }));
             let client = TlsConfig::with_inputs(
                 &dialer_key,
-                &EndpointInputs::default().kx_groups(vec![group]),
+                &EndpointInputs::default()
+                    .kx_groups(vec![group, rustls::crypto::ring::kx_group::X25519]),
             )
             .unwrap()
             .rustls_client(listener_key.public(), &[b"a"])
             .unwrap();
+            let client = Arc::new(client);
+            // The hello carries a valid plain X25519 share: a listener with
+            // X25519 alone completes on it in one round trip.
+            assert_eq!(
+                handshake_to(&client, &ring_only(&listener_key)),
+                (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full)
+            );
             let server = TlsConfig::new(&listener_key)
                 .rustls_server(vec![b"a".to_vec()])
                 .unwrap();
             let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
-            let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+            let mut client = rustls::ClientConnection::new(client, name).unwrap();
             let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
             let mut hello = Vec::new();
             while client.wants_write() {

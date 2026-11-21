@@ -3,7 +3,9 @@
 //! Both sides run X25519 and ML-KEM-768, and TLS derives the session keys
 //! from both secrets. The keys stay secret as long as either algorithm
 //! holds, so a break of ML-KEM, or a wrong answer from its newer code, can't
-//! make a connection weaker than X25519 alone.
+//! make a connection's keys weaker than X25519 alone. That covers the keys,
+//! not the code: a memory-safety fault in the ML-KEM library, which reads a
+//! peer's share before the peer is authenticated, is outside it.
 //!
 //! The layout is the one `draft-ietf-tls-ecdhe-mlkem` fixes for this group:
 //! each share and the secret are the ML-KEM part followed by the X25519
@@ -46,7 +48,8 @@ pub(crate) struct X25519MlKem768 {
 
 impl X25519MlKem768 {
     /// The hybrid of `x25519`, which must be an X25519 group, and ML-KEM-768
-    /// drawing from `mlkem_random`.
+    /// drawing from `mlkem_random`. Only debug builds check the group; with
+    /// another one, every share fails the fixed 32-byte split.
     pub(crate) fn new(
         x25519: &'static dyn SupportedKxGroup,
         mlkem_random: &'static dyn SecureRandom,

@@ -1904,4 +1904,3 @@ Changed:
 - **CTRL-26.** The node record cap grows by 105 bytes to hold a full key
   list, which raises an admitted connection's memory by 7,770 B, to
   141,945,123 B at the defaults.
-

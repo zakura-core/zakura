@@ -57,6 +57,8 @@ pub use trace::{
     LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
+#[cfg(zakura_sim)]
+pub use tx_relay::sim as tx_relay_sim;
 pub use tx_relay::{
     tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, ZakuraTxRelayConfig,
 };

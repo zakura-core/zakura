@@ -31,6 +31,7 @@ mod record;
 pub mod scenario;
 pub mod sync;
 pub mod sync_wire;
+pub mod tx_relay;
 pub mod wire_node;
 pub mod wire_plans;
 
@@ -150,6 +151,13 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// share of its runs. Every tag `draw` matches must be listed, and a
     /// draw that matches none lists none, the default.
     fn families() -> Vec<ScenarioFamily> {
+        Vec::new()
+    }
+
+    /// Full fuzz inputs the harness builds in code, such as its named
+    /// witnesses under the empty Plan. A fuzz campaign and the target check
+    /// start from them beside the seed registry's corpus seeds.
+    fn corpus() -> Vec<Vec<u8>> {
         Vec::new()
     }
 
@@ -655,6 +663,8 @@ pub struct HarnessEntry {
     pub untagged_free: bool,
     /// [`Subsystem::migrate`].
     pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
+    /// [`Subsystem::corpus`]. A machine has none.
+    pub corpus: fn() -> Vec<Vec<u8>>,
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
@@ -732,6 +742,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         families: S::families,
         untagged_free: S::UNTAGGED_FREE,
         migrate: S::migrate,
+        corpus: S::corpus,
     }
 }
 
@@ -771,6 +782,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<sync::SyncStorage>(),
     entry::<sync_wire::SyncWire>(),
     entry::<sync_wire::SyncComposed>(),
+    entry::<tx_relay::TxRelayWire>(),
 ];
 
 /// The harness named `name`.

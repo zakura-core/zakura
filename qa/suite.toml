@@ -578,3 +578,15 @@ name = "header_publisher_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
+
+# `tx-relay/wire` runs production `tx-relay` behind its real transport on
+# simulated QUIC, with a test pool. Its 24-byte prefix composes the pool's
+# verdicts, the node's own bodies, the links, and each peer's answers and
+# steps from `tx-relay`'s whole message alphabet, so the target fuzzes the
+# order, count and mix of the peers' messages.
+[[target]]
+package = "sim"
+name = "tx_relay_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800

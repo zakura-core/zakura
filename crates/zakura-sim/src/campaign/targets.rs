@@ -576,7 +576,8 @@ fn check_target(
             ),
         ));
     }
-    if loaded.admitted.is_empty() {
+    let corpus = (entry.corpus)();
+    if loaded.admitted.is_empty() && corpus.is_empty() {
         return Ok(row.with(
             TargetStatus::NoSeeds,
             format!("{} has no admitted seed", entry.name),
@@ -591,14 +592,22 @@ fn check_target(
             .map_err(CampaignError::io(format!("creating {}", sub.display())))?;
     }
     let mut files = Vec::new();
-    for seed in &loaded.admitted {
-        let digest = sha256(seed.input());
+    let built = corpus
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (format!("{}-corpus-{index}", entry.name), input.as_slice()));
+    let registry = loaded
+        .admitted
+        .iter()
+        .map(|seed| (seed.name.clone(), seed.input()));
+    for (name, input) in registry.chain(built) {
+        let digest = sha256(input);
         let file = seeds_dir.join(&digest);
-        fs::write(&file, seed.input())
+        fs::write(&file, input)
             .map_err(CampaignError::io(format!("writing {}", file.display())))?;
-        files.push((file, seed.input().len()));
+        files.push((file, input.len()));
         row.seeds.push(SeedFile {
-            name: seed.name.clone(),
+            name,
             sha256: digest,
         });
     }

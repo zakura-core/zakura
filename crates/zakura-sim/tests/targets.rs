@@ -1,6 +1,6 @@
 //! Fuzz target readiness: every target `qa/suite.toml` declares resolves
-//! to its registered harness and has curated seeds that apply the
-//! harness's own properties, and `zakura-sim targets` gives each target
+//! to its registered harness and has curated seeds or a built corpus that
+//! apply the harness's own properties, and `zakura-sim targets` gives each target
 //! one status (explorer implementation plan, E5a, acceptance test 1).
 //!
 //! The build and the fuzzer run need the pinned nightly and cargo-fuzz, so
@@ -75,6 +75,10 @@ fn manifest() -> String {
 /// fills, which only the slow-set capacity-release seeds
 /// reach. Those run too long for a fuzz input, so they are outside the
 /// corpus, and their own tests apply the property.
+///
+/// `tx-relay/stalled-peers-parked` applies only after a parked peer's
+/// readmission, three virtual minutes in. That witness runs too long for a
+/// fuzz input, and `tests/tx_relay_wire.rs` applies the property.
 const UNAPPLIED: &[(&str, &[&str])] = &[
     (
         "block_sync_storage",
@@ -258,6 +262,36 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "session/send-isolated",
         ],
     ),
+    (
+        "tx_relay_wire",
+        &[
+            "tx-relay/s10v1/get-txs/long-payload-closes",
+            "tx-relay/s10v1/get-txs/over-margin-closes",
+            "tx-relay/s10v1/get-txs/reserved-flags-closes",
+            "tx-relay/s10v1/get-txs/short-payload-closes",
+            "tx-relay/s10v1/hello/cadence-never-closes",
+            "tx-relay/s10v1/hello/long-payload-closes",
+            "tx-relay/s10v1/hello/reserved-flags-closes",
+            "tx-relay/s10v1/hello/short-payload-closes",
+            "tx-relay/s10v1/not-found/bad-content-closes",
+            "tx-relay/s10v1/not-found/long-payload-closes",
+            "tx-relay/s10v1/not-found/over-owed-closes",
+            "tx-relay/s10v1/not-found/reserved-flags-closes",
+            "tx-relay/s10v1/not-found/short-payload-closes",
+            "tx-relay/s10v1/undeclared-type-closes",
+            "tx-relay/s9v1/inv/long-payload-closes",
+            "tx-relay/s9v1/inv/over-rate-closes",
+            "tx-relay/s9v1/inv/reserved-flags-closes",
+            "tx-relay/s9v1/inv/short-payload-closes",
+            "tx-relay/s9v1/tx/long-payload-closes",
+            "tx-relay/s9v1/tx/over-owed-closes",
+            "tx-relay/s9v1/tx/reserved-flags-closes",
+            "tx-relay/s9v1/tx/short-payload-closes",
+            "tx-relay/s9v1/tx/unsolicited-closes",
+            "tx-relay/s9v1/undeclared-type-closes",
+            "tx-relay/stalled-peers-parked",
+        ],
+    ),
 ];
 
 /// The target's own properties that [`UNAPPLIED`] lists, sorted.
@@ -293,30 +327,40 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             target.name,
             loaded.rejected
         );
+        let corpus = (entry.corpus)();
+        let inputs: Vec<(String, &[u8])> = loaded
+            .admitted
+            .iter()
+            .map(|seed| (seed.name.clone(), seed.input()))
+            .chain(
+                corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| (format!("corpus {index}"), input.as_slice())),
+            )
+            .collect();
         assert!(
-            !loaded.admitted.is_empty(),
-            "{} ({}) has no curated seed",
+            !inputs.is_empty(),
+            "{} ({}) has no curated seed and no built corpus",
             target.name,
             entry.name
         );
         if let Some(max) = max_len(&target.args) {
-            for seed in &loaded.admitted {
+            for (name, input) in &inputs {
                 assert!(
-                    seed.input().len() <= max,
-                    "{}: -max_len={max} cuts {} ({} bytes)",
+                    input.len() <= max,
+                    "{}: -max_len={max} cuts {name} ({} bytes)",
                     target.name,
-                    seed.name,
-                    seed.input().len()
+                    input.len()
                 );
             }
         }
         let mut worker = Worker::new();
-        let reached: BTreeSet<String> = loaded
-            .admitted
+        let reached: BTreeSet<String> = inputs
             .iter()
-            .flat_map(|seed| {
-                let (outcome, applied) = run_seed(&mut worker, entry, seed.input());
-                assert_eq!(outcome, "clean", "{}", seed.name);
+            .flat_map(|(name, input)| {
+                let (outcome, applied) = run_seed(&mut worker, entry, input);
+                assert_eq!(outcome, "clean", "{name}");
                 applied
             })
             .collect();

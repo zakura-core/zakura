@@ -113,9 +113,12 @@ pub(super) struct ReactorState {
     /// The last place handed out in the ordinary-offer rotation. See
     /// [`PeerSchedule::turn`].
     last_turn: u64,
-    /// The earliest place of an idle offer held back because another peer
-    /// owns its target, by target. See [`Self::overtakes_waiting`].
-    waiting_for_target: HashMap<block::Hash, OfferPlace>,
+    /// The target and place of each admitted peer's idle offer held back
+    /// because another peer owns that target. See [`Self::overtakes_waiting`].
+    ///
+    /// Keyed by peer, so the admitted peer limits bound it: a peer's newer
+    /// wait replaces its older one, and its session's removal drops it.
+    waiting_for_target: HashMap<ZakuraPeerId, (block::Hash, OfferPlace)>,
     /// The earliest place of an idle offer held back by full staging slots.
     waiting_for_slot: Option<OfferPlace>,
 }
@@ -240,6 +243,7 @@ impl ReactorState {
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.vct_supplier_order.retain(|queued| queued != peer);
+        self.waiting_for_target.remove(peer);
     }
 
     /// Record `status` as `peer`'s unspent offer.
@@ -276,8 +280,18 @@ impl ReactorState {
         target: block::Hash,
     ) {
         if let Some(place) = self.place(peer, priority) {
-            let earliest = self.waiting_for_target.entry(target).or_insert(place);
-            *earliest = (*earliest).min(place);
+            let wait = (target, place);
+            self.waiting_for_target
+                .entry(peer.clone())
+                .and_modify(|earlier| {
+                    *earlier = if earlier.0 == target {
+                        (target, earlier.1.min(place))
+                    } else {
+                        // The peer's offer moved to another target.
+                        wait
+                    }
+                })
+                .or_insert(wait);
         }
     }
 
@@ -292,6 +306,12 @@ impl ReactorState {
             self.waiting_for_slot =
                 Some(self.waiting_for_slot.map_or(place, |slot| slot.min(place)));
         }
+    }
+
+    /// The number of target waits held.
+    #[cfg(test)]
+    pub(super) fn target_waits(&self) -> usize {
+        self.waiting_for_target.len()
     }
 
     /// Forget the waiting offers, because a full pass is about to note again
@@ -309,8 +329,8 @@ impl ReactorState {
     /// pass is owed, because it waits for its refill or a target or slot
     /// freed earlier in the reactor turn, a status that arrives just after
     /// the release would otherwise stage ahead of the offers the pass owes it
-    /// to. Ownership bounds the target entries by the staging slots, and a
-    /// stale entry only makes a fresh status wait for the next pass.
+    /// to. The admitted peer limits bound the target entries, and a stale
+    /// entry only makes a fresh status wait for the next pass.
     pub(super) fn overtakes_waiting(
         &self,
         peer: &ZakuraPeerId,
@@ -335,8 +355,10 @@ impl ReactorState {
     ) -> bool {
         self.place(peer, priority).is_some_and(|place| {
             self.waiting_for_target
-                .get(&target)
-                .is_some_and(|earliest| *earliest < place)
+                .iter()
+                .any(|(waiter, (waits_for, earlier))| {
+                    waiter != peer && *waits_for == target && *earlier < place
+                })
         })
     }
 
@@ -1061,7 +1083,8 @@ impl ReactorState {
     ///   peer;
     /// - every pending storage call and locator read carries a number already
     ///   issued, and each locator read's call is a locator call;
-    /// - the cached-pass budget holds at most [`CACHED_PASS_BURST`] passes.
+    /// - the cached-pass budget holds at most [`CACHED_PASS_BURST`] passes;
+    /// - only admitted peers hold a target wait, which bounds the waits.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn assert_invariants(&self) {
         let ordered: HashSet<&ZakuraPeerId> = self.vct_supplier_order.iter().collect();
@@ -1091,6 +1114,12 @@ impl ReactorState {
         assert!(
             self.cached_pass_budget.passes <= CACHED_PASS_BURST,
             "the cached-pass budget holds at most its burst"
+        );
+        assert!(
+            self.waiting_for_target
+                .keys()
+                .all(|peer| self.peers.contains_key(peer)),
+            "only an admitted peer holds a target wait"
         );
     }
 }

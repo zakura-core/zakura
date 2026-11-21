@@ -2979,6 +2979,42 @@ async fn later_unstarted_work_does_not_take_a_target_freed_in_the_same_turn() {
     expect_locator_query(&mut actions, &honest, target);
 }
 
+/// F-839: an owner's unstarted work can move to a new target in place, and
+/// another peer's offer of each new target leaves a wait. With no cached pass
+/// clearing them, the waits stay bounded by the admitted peers, not by the
+/// targets ever named.
+///
+/// This fails if waits are kept per target.
+#[tokio::test(start_paused = true)]
+async fn retargeted_unstarted_work_keeps_target_waits_bounded_by_peers() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (waiter, _waiter_outbound) = connect(&mut reactor, 0xF0);
+    let first = block::Hash([0x42; 32]);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, first));
+    expect_locator_query(&mut actions, &owner, first);
+    for byte in 0x42..0x42 + 100_u8 {
+        let target = block::Hash([byte; 32]);
+        reactor.handle_status(owner.clone(), 0, status_for(&snapshot, target));
+        assert_eq!(
+            reactor
+                .peer_work_queue
+                .awaiting_target(&owner)
+                .map(|work| work.status.selected_tip_hash),
+            Some(target),
+            "the owner's unstarted work moves to the new target"
+        );
+        reactor.handle_status(waiter.clone(), 0, status_for(&snapshot, target));
+    }
+    reactor.state.assert_invariants();
+    assert!(
+        reactor.state.target_waits() <= reactor.sessions.len(),
+        "{} target waits for {} peers",
+        reactor.state.target_waits(),
+        reactor.sessions.len()
+    );
+}
+
 /// F-831: the cached pass serves offers that claim less work than the node's
 /// own after the rest, so a wait record keeps the waiting offer's priority
 /// with its turn. While the pass waits for its refill, an earlier peer's

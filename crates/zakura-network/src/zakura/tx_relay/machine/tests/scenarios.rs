@@ -280,6 +280,9 @@ fn the_window_grows_on_admissions_and_halves_on_a_missed_deadline() {
     }
     assert!(bench.next(), "the requests' deadline");
     assert_eq!(window(&bench, session), MAX_SERVES / 2, "halved once");
+    // A late `NotFound` holds no slot, so it takes nothing more off.
+    bench.not_found(session, ids[30]);
+    assert_eq!(window(&bench, session), MAX_SERVES / 2, "still halved once");
 }
 
 /// A body the pool rejects never widens its supplier's window, so a peer
@@ -303,6 +306,64 @@ fn rejected_bodies_never_widen_the_window() {
         bench.verdict(waiter, rejected);
     }
     assert_eq!(window(&bench, session), INITIAL_WINDOW);
+}
+
+/// `session`'s window grown to the `Hello`'s 16 by admissions, then 16 more
+/// announced ids granted and asked for. Returns those ids and their body
+/// numbers.
+fn grown_and_asked(bench: &mut Bench, session: SessionId) -> Vec<(UnminedTxId, u32)> {
+    let grow: Vec<UnminedTxId> = (0..30).map(|n| bench.id(n)).collect();
+    bench.inv(session, &grow);
+    admit_all(bench, session, &grow);
+    assert_eq!(window(bench, session), MAX_SERVES, "grown");
+    let asked: Vec<(UnminedTxId, u32)> = (100..116).map(|n| (bench.id(n), n)).collect();
+    let ids: Vec<UnminedTxId> = asked.iter().map(|(id, _)| *id).collect();
+    bench.inv(session, &ids);
+    let calls = bench.calls();
+    assert_eq!(calls.len(), MAX_SERVES, "the whole window is claimed");
+    for (call, id) in calls {
+        bench.grant(call);
+        assert_eq!(bench.asked(), vec![(session, id)], "the grant asks");
+    }
+    asked
+}
+
+/// A body the pool does not admit takes one off a grown window, to no less
+/// than `INITIAL_WINDOW`, so a peer can't keep a window of 16 full of
+/// orphans that park for free and hold 16 of the pool's slots.
+#[test]
+fn rejected_bodies_shrink_a_grown_window() {
+    let mut bench = Bench::new();
+    let rejected = bench.rejection(RejectionScope::ExactTip, Charge::None);
+    let session = bench.join(1);
+    let asked = grown_and_asked(&mut bench, session);
+    let mut waiters = Vec::new();
+    for (id, n) in asked {
+        assert!(bench.deliver(session, id, bench.tx(n)));
+        waiters.push(bench.submitted().expect("submitted"));
+    }
+    bench.verdict(waiters[0], rejected);
+    assert_eq!(window(&bench, session), MAX_SERVES - 1, "one off");
+    for waiter in &waiters[1..] {
+        bench.verdict(*waiter, rejected);
+    }
+    assert_eq!(window(&bench, session), INITIAL_WINDOW, "never below 5");
+}
+
+/// A `NotFound` takes one off a grown window, to no less than
+/// `INITIAL_WINDOW`, so a peer can't hold 16 of the pool's slots for free by
+/// answering each request just before its deadline.
+#[test]
+fn not_found_shrinks_a_grown_window() {
+    let mut bench = Bench::new();
+    let session = bench.join(1);
+    let asked = grown_and_asked(&mut bench, session);
+    bench.not_found(session, asked[0].0);
+    assert_eq!(window(&bench, session), MAX_SERVES - 1, "one off");
+    for (id, _) in &asked[1..] {
+        bench.not_found(session, *id);
+    }
+    assert_eq!(window(&bench, session), INITIAL_WINDOW, "never below 5");
 }
 
 /// What a session asks for at once stays within `MAX_OUTSTANDING_BYTES` of

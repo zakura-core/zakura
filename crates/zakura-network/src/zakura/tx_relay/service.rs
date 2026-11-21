@@ -1288,7 +1288,7 @@ impl Routine {
                     // A core that does not answer in time is busy, so the
                     // machine tries again later.
                     let answer = pool
-                        .reserve(id, Instant::now() + POOL_ANSWER)
+                        .reserve_relayed(id, Instant::now() + POOL_ANSWER)
                         .await
                         .unwrap_or(Err(PortUnreserved::NoRoom));
                     PoolResult::Reserved { call, answer }

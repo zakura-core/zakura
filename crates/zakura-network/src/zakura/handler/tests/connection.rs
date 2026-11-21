@@ -73,6 +73,7 @@ pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
                     capability_epoch: handler.capability_epoch.load(Ordering::SeqCst),
                     limits: limits.clamp(&negotiated.limits),
                     accepted_capabilities: negotiated.accepted_capabilities,
+                    metered_epoch: negotiated.metered_epoch,
                     role: "initiator",
                     direction: ServicePeerDirection::Outbound,
                     transcript_hash: native_connection_transcript_hash(

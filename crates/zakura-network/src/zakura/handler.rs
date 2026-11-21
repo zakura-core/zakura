@@ -2434,6 +2434,8 @@ struct StreamAdmission<'a> {
 struct ConnectionServeContext {
     limits: ZakuraConnectionLimits,
     accepted_capabilities: u64,
+    /// See [`NativeHandshakeNegotiated::metered_epoch`].
+    metered_epoch: Instant,
     capability_epoch: u64,
     role: &'static str,
     direction: ServicePeerDirection,
@@ -2452,6 +2454,8 @@ struct ConnectionServeContext {
 
 struct RegisteredConnectionServeContext {
     limits: ZakuraConnectionLimits,
+    /// See [`NativeHandshakeNegotiated::metered_epoch`].
+    metered_epoch: Instant,
     conn: ZakuraConnTrace,
     conn_id: ZakuraConnId,
     connection_token: CancellationToken,
@@ -3057,6 +3061,11 @@ impl InboundMessageAdmission {
 pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) limits: ZakuraAcceptedLimits,
     pub(crate) accepted_capabilities: u64,
+    /// When this node wrote its half of the handshake: the initiator's hello
+    /// or the responder's ack. The peer can pay for no metered frame before
+    /// it reads that, so the connection's byte buckets earn from here. See
+    /// [`CadenceBuckets::with_metered_epoch`].
+    pub(crate) metered_epoch: Instant,
     /// The capability mask this node sent, as the transport observer reports
     /// it.
     #[cfg(any(test, zakura_sim))]
@@ -3617,6 +3626,7 @@ impl ZakuraProtocolHandler {
                 ConnectionServeContext {
                     limits: conn_limits,
                     accepted_capabilities: negotiated.accepted_capabilities,
+                    metered_epoch: negotiated.metered_epoch,
                     capability_epoch,
                     role: "responder",
                     direction,
@@ -3829,6 +3839,7 @@ impl ZakuraProtocolHandler {
             accepted_channels: hello.required_channels & handshake_config.supported_channels,
             accepted_limits,
         };
+        let metered_epoch = Instant::now();
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
         conn.trace_handshake(
             "control.succeeded",
@@ -3840,6 +3851,7 @@ impl ZakuraProtocolHandler {
             NativeHandshakeNegotiated {
                 limits: accepted_limits,
                 accepted_capabilities: ack.accepted_capabilities,
+                metered_epoch,
                 #[cfg(any(test, zakura_sim))]
                 local_capabilities: handshake_config.supported_capabilities,
                 #[cfg(any(test, zakura_sim))]
@@ -3906,9 +3918,10 @@ impl ZakuraProtocolHandler {
         let mut pending_sessions = PendingSessions::default();
         let mut incoming_setup: Option<BoxFuture<'static, Option<IncomingStreamSetup>>> = None;
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
-        let mut message_buckets = MessageRateBuckets::with_receive_window(u64::from(
-            self.limits.quic.stream_receive_window_bytes,
-        ));
+        let mut message_buckets = MessageRateBuckets::for_connection(
+            u64::from(self.limits.quic.stream_receive_window_bytes),
+            context.metered_epoch,
+        );
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
@@ -5131,6 +5144,7 @@ impl ZakuraProtocolHandler {
                     outbound_rx,
                     RegisteredConnectionServeContext {
                         limits: context.limits,
+                        metered_epoch: context.metered_epoch,
                         conn: context.conn,
                         conn_id,
                         connection_token: disconnect_token,
@@ -6261,6 +6275,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             ConnectionServeContext {
                 limits: conn_limits,
                 accepted_capabilities: negotiated.accepted_capabilities,
+                metered_epoch: negotiated.metered_epoch,
                 capability_epoch,
                 role: "initiator",
                 direction,
@@ -6370,6 +6385,7 @@ async fn run_native_initiator_control_steps(
         initial_limits: limits.initial_limits(),
     };
 
+    let metered_epoch = Instant::now();
     write_control_payload(&mut send, &hello.encode()?, limits.control_timeout).await?;
     let ack_bytes = read_control_payload(
         &mut recv,
@@ -6395,6 +6411,7 @@ async fn run_native_initiator_control_steps(
     Ok(NativeHandshakeNegotiated {
         limits: ack.accepted_limits,
         accepted_capabilities: ack.accepted_capabilities,
+        metered_epoch,
         #[cfg(any(test, zakura_sim))]
         local_capabilities: handshake_config.supported_capabilities,
         #[cfg(any(test, zakura_sim))]
@@ -8583,19 +8600,23 @@ struct MessageRateBuckets<C: Clock = RealClock> {
 }
 
 impl<C: Clock + Default> MessageRateBuckets<C> {
-    /// Buckets for a connection with no stream receive window, as tests use.
+    /// Buckets for a connection with no stream receive window, whose byte
+    /// buckets earn from now, as tests use.
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_receive_window(0)
+        Self::for_connection(0, C::default().now())
     }
 
     /// Buckets for a connection whose stream receive window is
-    /// `receive_window`, which deepens its byte buckets.
-    fn with_receive_window(receive_window: u64) -> Self {
+    /// `receive_window`, which deepens its byte buckets, and whose byte
+    /// buckets earn from `metered_epoch`.
+    fn for_connection(receive_window: u64, metered_epoch: Instant) -> Self {
         Self {
             streams: HashMap::new(),
             cadence: Arc::new(StdMutex::new(
-                CadenceBuckets::new(C::default()).with_receive_window(receive_window),
+                CadenceBuckets::new(C::default())
+                    .with_receive_window(receive_window)
+                    .with_metered_epoch(metered_epoch),
             )),
         }
     }
@@ -12655,14 +12676,12 @@ mod tests {
                 },
             },
         };
-        // With no receive window, the receiver's depth is the two allowances.
+        // A fresh connection's bucket holds the opening allowance.
         let context = tabled_context(Some(&[METERED]), 1);
-        for _ in 0..2 {
-            assert_eq!(
-                admit_inbound_message(&probe_frame(40, 512), &context, 900),
-                InboundMessageAdmission::Admit
-            );
-        }
+        assert_eq!(
+            admit_inbound_message(&probe_frame(40, 512), &context, 900),
+            InboundMessageAdmission::Admit
+        );
         assert_eq!(
             admit_inbound_message(&probe_frame(40, 1), &context, 900),
             InboundMessageAdmission::ByteRateOverrun

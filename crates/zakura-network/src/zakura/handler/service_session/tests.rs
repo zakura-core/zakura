@@ -712,6 +712,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
                 ConnectionServeContext {
                     capability_epoch: handler.capability_epoch.load(Ordering::SeqCst),
                     limits: local.clamp(&local.initial_limits()),
+                    metered_epoch: Instant::now(),
                     // The sibling only: the session service's kinds stay out.
                     accepted_capabilities: SIBLING.capability,
                     role: "responder",
@@ -873,6 +874,7 @@ impl RawFixture {
                     ConnectionServeContext {
                         capability_epoch: handler.capability_epoch.load(Ordering::SeqCst),
                         limits,
+                        metered_epoch: Instant::now(),
                         accepted_capabilities: DATA.capability | SIBLING.capability,
                         role: "responder",
                         direction: ServicePeerDirection::Inbound,

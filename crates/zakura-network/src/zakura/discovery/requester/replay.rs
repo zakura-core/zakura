@@ -560,7 +560,7 @@ pub(super) fn run_settlement(
                             assert_eq!(answer.admitted().kind(), kind, "{SETTLEMENT}");
                             session.answers.push(answer);
                         }
-                        Err(ClaimRefused::OverBytes { bytes })
+                        Err(Unclaimed::Refused(ClaimRefused::OverBytes { bytes }))
                             if len as u64 > cap && bytes == cap =>
                         {
                             summary.oversized += 1;

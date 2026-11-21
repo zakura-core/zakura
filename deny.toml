@@ -85,6 +85,12 @@ skip = [
     # still resolves Rand 0.9. Remove these when the workspace converges.
     { name = "rand", version = "=0.9.4" },
     { name = "rand_chacha", version = "=0.9.0" },
+
+    # libcrux-ml-kem's verification annotations, behind `cfg(hax)` and never
+    # built here: core-models still resolves hax-lib 0.3 beside libcrux's 0.4.
+    { name = "hax-lib", version = "=0.3.7" },
+    { name = "hax-lib-macros", version = "=0.3.7" },
+    { name = "hax-lib-macros-types", version = "=0.3.7" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate

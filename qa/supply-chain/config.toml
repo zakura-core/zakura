@@ -28,6 +28,22 @@ url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/
 [imports.zcashd]
 url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
+[policy."libcrux-intrinsics:0.0.10"]
+dependency-criteria = { core-models = [], hax-lib = [] }
+notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, which only libcrux's own verification and constant-time tooling sets. No Zakura build compiles them."
+
+[policy."libcrux-ml-kem:0.0.12"]
+dependency-criteria = { hax-lib = [] }
+notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, which only libcrux's own verification and constant-time tooling sets. No Zakura build compiles them."
+
+[policy."libcrux-secrets:0.0.8"]
+dependency-criteria = { crabgrind = [], hax-lib = [] }
+notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, which only libcrux's own verification and constant-time tooling sets. No Zakura build compiles them."
+
+[policy."libcrux-sha3:0.0.12"]
+dependency-criteria = { hax-lib = [] }
+notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, which only libcrux's own verification and constant-time tooling sets. No Zakura build compiles them."
+
 [policy.zakura]
 audit-as-crates-io = false
 
@@ -43,13 +59,13 @@ audit-as-crates-io = false
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
 
+[policy.zakura-mempool]
+audit-as-crates-io = false
+
 [policy.zakura-mmr-tree]
 audit-as-crates-io = false
 
 [policy.zakura-network]
-audit-as-crates-io = false
-
-[policy.zakura-mempool]
 audit-as-crates-io = false
 
 [policy.zakura-node-services]
@@ -175,6 +191,11 @@ version = "0.5.7"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the safe grow_and_insert(usize::MAX) path adds one without checked arithmetic. In release builds the length wraps to zero, grow does not allocate, and the method then performs an unchecked out-of-bounds write through get_unchecked_mut. Retain the exemption pending checked overflow handling before the raw write."
 
+[[exemptions.graviola]]
+version = "0.4.5"
+criteria = "safe-to-run"
+notes = "Test-only: an independent X25519MLKEM768 that zakura-quic's own group must interoperate with. Exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.group]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
@@ -213,6 +234,36 @@ notes = "Audit held: the generated data package embeds 249 unsafe unchecked zero
 [[exemptions.indicatif]]
 version = "0.17.11"
 criteria = "safe-to-deploy"
+
+[[exemptions.libcrux-intrinsics]]
+version = "0.0.10"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.libcrux-ml-kem]]
+version = "0.0.12"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.libcrux-platform]]
+version = "0.0.4"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.libcrux-secrets]]
+version = "0.0.8"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.libcrux-sha3]]
+version = "0.0.12"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.libcrux-traits]]
+version = "0.0.10"
+criteria = "safe-to-deploy"
+notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libm]]
 version = "0.2.16"
@@ -291,6 +342,11 @@ notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pen
 version = "0.23.45"
 criteria = "safe-to-deploy"
 notes = "Fixes RUSTSEC-2026-0285. Retain until the 0.23.41 to 0.23.45 delta is audited."
+
+[[exemptions.rustls-graviola]]
+version = "0.4.0"
+criteria = "safe-to-run"
+notes = "Test-only: an independent X25519MLKEM768 that zakura-quic's own group must interoperate with. Exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.same-file]]
 version = "1.0.6"
